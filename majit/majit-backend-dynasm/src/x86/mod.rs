@@ -9,4 +9,5 @@ pub mod callbuilder;
 pub mod cpu_ext;
 pub mod regalloc;
 pub mod reghint;
+pub mod regloc;
 pub mod rx86;

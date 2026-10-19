@@ -691,6 +691,21 @@ pub(crate) fn dynasm_nursery_addrs() -> (usize, usize) {
     with_dynasm_active_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr())).unwrap_or((0, 0))
 }
 
+/// [`dynasm_nursery_addrs`] for an inline headerless bump. A collector that
+/// is not headerless-aware (`GcAllocator::headerless_nursery`) answers
+/// `(0, 0)` as an absent nursery does, so the emitter keeps the allocation on
+/// its helper instead of writing a raw base into a headered nursery.
+pub(crate) fn dynasm_headerless_nursery_addrs() -> (usize, usize) {
+    with_dynasm_active_gc(|gc| {
+        if gc.headerless_nursery() {
+            (gc.nursery_free_addr(), gc.nursery_top_addr())
+        } else {
+            (0, 0)
+        }
+    })
+    .unwrap_or((0, 0))
+}
+
 /// `GcLLDescr_framework.max_size_of_young_obj`, consumed by
 /// `malloc_cond_varsize` before it computes `itemsize * length`.  Zero is the
 /// no-GC sentinel, paired with [`dynasm_nursery_addrs`]'s `(0, 0)` answer.
@@ -743,16 +758,6 @@ fn dynasm_is_registered_type_id(typeid: u32) -> bool {
     with_dynasm_active_gc(|gc| (typeid as usize) < gc.type_count()).unwrap_or(false)
 }
 
-/// Whether compiled `New` ops route through the active GC allocator
-/// instead of `libc::malloc`. Set via `DynasmBackend::set_new_via_gc`;
-/// off by default (pyre keeps the `malloc` stub, byte-identical codegen).
-static NEW_VIA_GC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// True when `set_new_via_gc(true)` has been called on the active backend.
-pub(crate) fn new_via_gc_enabled() -> bool {
-    NEW_VIA_GC.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Published Boehm `malloc_fixedsize` address, or `None` when it must not run.
 ///
 /// `gc.py` has one `GcLLDescr` per translation. An installed collector
@@ -780,35 +785,6 @@ fn call_malloc_fixedsize_inner(size: usize, collector_installed: bool) -> Option
     let addr = boehm_fixedsize_hook(collector_installed)?;
     let malloc: extern "C" fn(usize) -> *mut u8 = unsafe { std::mem::transmute(addr) };
     Some(malloc(size))
-}
-
-/// Address `genop_new_with_vtable` calls: the Boehm hook when published,
-/// otherwise `fallback` (`dynasm_new_alloc` or `libc::malloc`).
-pub(crate) fn malloc_fixedsize_or(fallback: i64) -> i64 {
-    malloc_fixedsize_or_inner(fallback, majit_gc::collector_installed())
-}
-
-fn malloc_fixedsize_or_inner(fallback: i64, collector_installed: bool) -> i64 {
-    match boehm_fixedsize_hook(collector_installed) {
-        Some(addr) => addr as i64,
-        None => fallback,
-    }
-}
-
-/// Compiled-code `New` allocation trampoline. Called from the machine code
-/// emitted by `genop_new` / `genop_new_with_vtable` when `new_via_gc_enabled`.
-/// Routes through the active GC's nursery allocator (mirroring cranelift's
-/// `gc_alloc_nursery_shim`), including the process-global singleton; falls back
-/// to `malloc` when no GC is installed.
-pub(crate) extern "C" fn dynasm_new_alloc(size: usize) -> *mut u8 {
-    if let Some(r) = gc_box::with_mut(|gc| gc.alloc_nursery(size)) {
-        return r.0 as *mut u8;
-    }
-    if majit_gc::gc_sync::is_initialized() {
-        majit_gc::gc_sync::gc_op(|g| g.alloc_nursery(size).0 as *mut u8)
-    } else {
-        unsafe { libc::malloc(size) as *mut u8 }
-    }
 }
 
 /// Headerless no-collect nursery trampoline for backend-agnostic callers.
@@ -1557,27 +1533,12 @@ pub extern "C" fn dynasm_nursery_slowpath_jitframe(frame_size: u64) -> u64 {
 /// overflow.  Called with `(base_size, item_size, length)`; returns the
 /// payload pointer.
 ///
-/// **TODO (str/unicode/var slowpath collapse).**
-/// PyPy `x86/assembler.py _build_malloc_slowpath(kind)` builds
-/// four distinct trampolines (`'fixed'`, `'str'`, `'unicode'`, `'var'`)
-/// stored as separate fields on the assembler
-/// (`malloc_slowpath`/`malloc_slowpath_varsize`/`malloc_slowpath_str`/
-/// `malloc_slowpath_unicode`).  Each callsite (`assembler.py:2592-2598`
-/// in `genop_call_malloc_nursery_varsize`) jumps to the trampoline
-/// matching the requested kind, which in turn calls the GC helper
-/// (`malloc_str`, `malloc_unicode`, `gc_ll_descr.malloc_slowpath_array`).
 ///
-/// Pyre collapses the three varsize kinds into this single helper —
-/// `gc.alloc_varsize(base, item, length)` covers all three since pyre's
-/// `majit-gc` does not specialise on str/unicode object headers.  The
-/// fast path (`OpCode::CallMallocNurseryVarsize` in
-/// `x86/assembler.rs`) `CALL`s this directly instead of `JMP`-ing into
-/// a per-kind trampoline; OOM propagation flows through the same
-/// `propagate_exception_path` PyPy uses, just inlined per callsite
-/// rather than reached via the trampoline's tail `JMP`.  The behaviour
-/// is observationally identical (allocate-or-OOM-propagate); the
-/// missing per-kind trampolines are a code-shape divergence to revisit
-/// if pyre adopts the PyPy-style header-specialised GC allocators.
+/// aarch64 only. x86 builds the per-kind trampolines of
+/// `_build_malloc_slowpath(kind)` (`'var'`, `'str'`, `'unicode'`), which call
+/// `dynasm_malloc_array` / `dynasm_malloc_str` / `dynasm_malloc_unicode`.
+/// The aarch64 `malloc_cond_varsize` still collapses the three kinds into
+/// this one helper.
 pub extern "C" fn dynasm_nursery_slowpath_varsize(
     base_size: u64,
     item_size: u64,
@@ -2607,18 +2568,10 @@ impl DynasmBackend {
         self.jitframe_facts = install_gc_box(gc);
     }
 
-    /// Opt in to routing `New` / `NewWithVtable` allocation through the
-    /// active GC allocator (`dynasm_new_alloc`) instead of `libc::malloc`.
-    ///
-    /// Off by default so pyre's dynasm codegen is byte-identical: the
-    /// cranelift backend already routes `New` through the active GC when
-    /// one is installed (`cranelift_gc_active`), but dynasm has always used
-    /// a `malloc` stub. A consumer whose `New` objects belong to the GC's
-    /// own pool (nursery-backed nodes, say) sets this so
-    /// compiled allocations share the same pool as the interpreter path.
-    pub fn set_new_via_gc(&mut self, enabled: bool) {
-        NEW_VIA_GC.store(enabled, std::sync::atomic::Ordering::Relaxed);
-    }
+    /// No-op, as on cranelift and wasm: the GC rewriter lowers every
+    /// `New` / `NewWithVtable` (`rewrite.py handle_new`) to the active
+    /// collector's allocation, so no compiled allocation is left to route.
+    pub fn set_new_via_gc(&mut self, _enabled: bool) {}
 
     /// llmodel.py:64-69 self.vtable_offset configuration.
     pub fn set_vtable_offset(&mut self, offset: Option<usize>) {
@@ -3408,6 +3361,14 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_varsize = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_varsize(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_str = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_str(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_unicode = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_unicode(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         // `setup_once`: `propagate_exception_path`, `_frame_realloc_slowpath`,
@@ -3448,6 +3409,10 @@ impl Backend for DynasmBackend {
             malloc_slowpath_headerless,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_varsize,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_str,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_unicode,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
@@ -3716,6 +3681,14 @@ impl Backend for DynasmBackend {
         let malloc_slowpath_varsize = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_varsize(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_str = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_str(&self.descr_attachments);
+        #[cfg(target_arch = "x86_64")]
+        let malloc_slowpath_unicode = self
+            .arch_cpu_ext
+            .ensure_malloc_slowpath_unicode(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
         // Same once-per-CPU helpers as `compile_loop`.
@@ -3753,6 +3726,10 @@ impl Backend for DynasmBackend {
             malloc_slowpath_headerless,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_varsize,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_str,
+            #[cfg(target_arch = "x86_64")]
+            malloc_slowpath_unicode,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             wb_slowpath,
             #[cfg(target_arch = "x86_64")]
@@ -4953,9 +4930,7 @@ impl Backend for DynasmBackend {
     ///
     /// PyPy's `llsupport/assembler.py setup_once` builds the
     /// propagate trampoline + every `_build_malloc_slowpath` variant
-    /// (`fixed` / `varsize` / `str` / `unicode`).  Pyre's x86 path so
-    /// far implements only `fixed`; varsize/str/unicode are inlined
-    /// at the per-callsite emitter and remain to port.
+    /// (`fixed` / `varsize` / `str` / `unicode`).
     fn setup_once(&mut self) {
         #[cfg(target_arch = "x86_64")]
         {
@@ -4965,6 +4940,12 @@ impl Backend for DynasmBackend {
                 .ensure_malloc_slowpath_fixed(&self.descr_attachments);
             self.arch_cpu_ext
                 .ensure_malloc_slowpath_headerless(&self.descr_attachments);
+            self.arch_cpu_ext
+                .ensure_malloc_slowpath_varsize(&self.descr_attachments);
+            self.arch_cpu_ext
+                .ensure_malloc_slowpath_str(&self.descr_attachments);
+            self.arch_cpu_ext
+                .ensure_malloc_slowpath_unicode(&self.descr_attachments);
             self.arch_cpu_ext.ensure_wb_slowpath();
         }
         #[cfg(target_arch = "aarch64")]
@@ -5058,22 +5039,17 @@ mod tests {
         }
         let prev = majit_gc::malloc_fixedsize_addr();
         majit_gc::set_malloc_fixedsize(Some(hook));
-        let hook_addr = hook as *const () as i64;
-        let fallback = 0x51i64;
-        // An installed collector suppresses the hook for both entry points.
+        // An installed collector suppresses the hook.
         // The flag is process-global and set-only, so the true arm is driven
         // by the argument the live `collector_installed()` call passes.
         assert!(call_malloc_fixedsize_inner(8, true).is_none());
-        assert_eq!(malloc_fixedsize_or_inner(fallback, true), fallback);
         assert!(boehm_fixedsize_hook(false).is_some());
         if majit_gc::collector_installed() {
             assert!(call_malloc_fixedsize(8).is_none());
-            assert_eq!(malloc_fixedsize_or(fallback), fallback);
         } else {
             let ptr = call_malloc_fixedsize(8).expect("published hook");
             assert!(!ptr.is_null());
             unsafe { libc::free(ptr as *mut libc::c_void) };
-            assert_eq!(malloc_fixedsize_or(fallback), hook_addr);
         }
         if prev == 0 {
             majit_gc::set_malloc_fixedsize(None);
@@ -6079,7 +6055,7 @@ mod tests {
     /// A `COND_CALL_VALUE_I` argument that is an op result — not an inputarg —
     /// and is still live after the call.
     ///
-    /// `consider_cond_call_value_j2` (`_prepare_op_cond_call`) places extra
+    /// `prepare_op_cond_call_value_i` (`_prepare_op_cond_call`) places extra
     /// args in `argument_regs`. Naming `i2` after the call keeps it live so
     /// a wrong extra-arg location surfaces in the helper result. `i2` is
     /// deliberately NOT equal to `i1`.

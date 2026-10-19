@@ -2035,6 +2035,267 @@ fn call_float_result_is_read_from_xmm0() {
     assert_float_bits(backend.get_float_value(&frame, 0), -1.5, "call float");
 }
 
+extern "C" fn singlefloat_then_double(a: f32, b: f64) -> f64 {
+    f64::from(a) * 1000.0 + b
+}
+
+#[test]
+fn call_singlefloat_movd_does_not_clobber_a_double_source() {
+    // `CallBuilder64.prepare_arguments` remaps the xmm (double) arguments
+    // before the singlefloat MOVD32s. Signature `('S', 'f')`: the double is
+    // the previous call's result, so it sits in xmm0 and goes to xmm1,
+    // while the singlefloat goes to xmm0. Installing the singlefloat first
+    // would overwrite the double before the remap reads it.
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
+    let neg = Op::new(
+        OpCode::CallF,
+        &[
+            rb(OpRef::const_int(neg_float as usize as i64)),
+            rb(inputargs[0].opref()),
+        ],
+    );
+    neg.pos().set(OpRef::float_op(1));
+    neg.setdescr(call_descr(vec![Type::Float], Type::Float, false, 8));
+    let call = Op::new(
+        OpCode::CallF,
+        &[
+            rb(OpRef::const_int(singlefloat_then_double as usize as i64)),
+            rb(OpRef::const_int(i64::from(1.5f32.to_bits()))),
+            rb(OpRef::float_op(1)),
+        ],
+    );
+    call.pos().set(OpRef::float_op(2));
+    call.setdescr(majit_ir::descr::make_call_descr_full_with_classes(
+        0,
+        "Sf".to_string(),
+        vec![Type::Int, Type::Float],
+        Type::Float,
+        'f',
+        false,
+        8,
+        no_collect_effect(),
+    ));
+    let ops = vec![
+        OpRc::new(neg),
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::float_op(2), Type::Float, 3)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile ('S', 'f') call: {err:?}"));
+    let frame = backend.execute_token(&token, &[Value::Float(2.0)]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_float_bits(
+        backend.get_float_value(&frame, 0),
+        1500.0 - 2.0,
+        "('S', 'f') call",
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn mixed_stack_args(
+    a0: f64,
+    b1: i64,
+    a2: f64,
+    b3: i64,
+    a4: f64,
+    b5: i64,
+    a6: f64,
+    b7: i64,
+    a8: f64,
+    b9: i64,
+    a10: f64,
+    b11: i64,
+    a12: f64,
+    b13: i64,
+    a14: f64,
+    b15: i64,
+    a16: f64,
+    a17: f64,
+) -> i64 {
+    let floats = [(0, a0), (2, a2), (4, a4), (6, a6), (8, a8)]
+        .into_iter()
+        .chain([(10, a10), (12, a12), (14, a14), (16, a16), (17, a17)]);
+    let ints = [(1, b1), (3, b3), (5, b5), (7, b7), (9, b9)]
+        .into_iter()
+        .chain([(11, b11), (13, b13), (15, b15)]);
+    floats
+        .map(|(k, v)| (k, (v * 4.0) as i64))
+        .chain(ints)
+        .fold(0i64, |acc, (k, v)| {
+            acc.wrapping_add((k + 1i64).wrapping_mul(v))
+        })
+}
+
+#[test]
+fn call_stack_arguments_from_frame_slots_and_constants() {
+    // 10 doubles and 8 ints: past the argument registers on both ABIs, so
+    // `prepare_arguments` hands out `RawEspLoc`s for frame-slot inputargs,
+    // `ConstFloatLoc`s and a 64-bit immediate alike. `jump.py _move` stages
+    // each memory source through the class's scratch register, except a
+    // `ConstFloatLoc`, which `regalloc_immedmem2mem` stores as two `MOV32_si`.
+    let mut backend = fresh_backend();
+    let token = JitCellToken::new(next_token_id());
+    let mut inputargs: Vec<InputArgRc> = (0..6)
+        .map(|i| InputArg::from_type_rc(Type::Float, i))
+        .collect();
+    inputargs.extend((6..10).map(|i| InputArg::from_type_rc(Type::Int, i)));
+    let arg = |i: usize| rb(inputargs[i].opref());
+    let big = 0x1_0000_0003i64;
+    let args = [
+        rb(OpRef::const_int(mixed_stack_args as usize as i64)),
+        arg(0),
+        arg(6),
+        rb(OpRef::const_float(1.25)),
+        rb(OpRef::const_int(7)),
+        arg(1),
+        arg(7),
+        arg(2),
+        rb(OpRef::const_int(big)),
+        rb(OpRef::const_float(2.5)),
+        arg(8),
+        arg(3),
+        arg(6),
+        arg(0),
+        rb(OpRef::const_int(-5)),
+        arg(4),
+        arg(9),
+        rb(OpRef::const_float(-0.75)),
+        arg(5),
+    ];
+    let types: Vec<Type> = args[1..]
+        .iter()
+        .enumerate()
+        .map(|(k, _)| match k {
+            1 | 3 | 5 | 7 | 9 | 11 | 13 | 15 => Type::Int,
+            _ => Type::Float,
+        })
+        .collect();
+    let call = Op::new(OpCode::CallI, &args);
+    call.pos().set(OpRef::int_op(10));
+    call.setdescr(call_descr(types, Type::Int, true, 8));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(OpRef::int_op(10), Type::Int, 11)),
+    ];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile 18-argument call: {err:?}"));
+    let (f, i) = (
+        [0.5, 1.75, -2.25, 3.0, 4.5, -1.5],
+        [11, -13, 1i64 << 40, 17],
+    );
+    let values: Vec<Value> = f
+        .iter()
+        .map(|&v| Value::Float(v))
+        .chain(i.iter().map(|&v| Value::Int(v)))
+        .collect();
+    let frame = backend.execute_token(&token, &values);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    let expected = mixed_stack_args(
+        f[0], i[0], 1.25, 7, f[1], i[1], f[2], big, 2.5, i[2], f[3], i[0], f[0], -5, f[4], i[3],
+        -0.75, f[5],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), expected);
+}
+
+fn finish_const_float_bits(value: f64, token_id: i64) -> u64 {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(token_id);
+    let finish = finish_of(OpRef::const_float(value), Type::Float, 0);
+    let ops = vec![OpRc::new(finish)];
+    let inputargs: Vec<InputArgRc> = vec![];
+    backend
+        .compile_loop(&inputargs, &ops, &token)
+        .unwrap_or_else(|err| panic!("compile FINISH(ConstFloat({value})): {err:?}"));
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    backend.get_float_value(&frame, 0).to_bits()
+}
+
+#[test]
+fn finish_of_a_const_float_stores_its_bits() {
+    // `consider_finish`'s `make_sure_var_in_reg` is a `FloatImmedLoc`
+    // for a ConstFloat; `genop_finish`'s `save_into_mem` stores it with
+    // `MOV`: `MOV_bi` when the bits fit imm32, else `_load_scratch` and
+    // `MOV_br`.
+    assert_eq!(finish_const_float_bits(1.5, 0x5f10), 1.5f64.to_bits());
+    let small = f64::from_bits(0x1234_5678);
+    assert_eq!(finish_const_float_bits(small, 0x5f11), 0x1234_5678);
+    assert_eq!(finish_const_float_bits(-0.0, 0x5f12), (-0.0f64).to_bits());
+}
+
+extern "C" fn threadlocalref_get_helper_must_not_run(_offset: i64) -> i64 {
+    -1
+}
+
+/// `_consider_threadlocalref_get` / `threadlocalref_get`: `MOV_rs` of
+/// `THREADLOCAL_OFS`, then `load_from_mem` at the offset. The helper address
+/// in `getarg(0)` is never called. Returns the finished frame.
+fn compile_threadlocalref_get(
+    backend: &mut DynasmBackend,
+    opcode: OpCode,
+    result: OpRef,
+    result_type: Type,
+) -> majit_backend::DeadFrame {
+    let token = JitCellToken::new(next_token_id());
+    let call = Op::new(
+        opcode,
+        &[
+            rb(OpRef::const_int(
+                threadlocalref_get_helper_must_not_run as usize as i64,
+            )),
+            rb(OpRef::const_int(8)),
+        ],
+    );
+    call.pos().set(result);
+    let effect = EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::ThreadlocalrefGet);
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![Type::Int],
+        result_type,
+        result_type == Type::Int,
+        8,
+        effect,
+    ));
+    let ops = vec![
+        OpRc::new(call),
+        OpRc::new(finish_of(result, result_type, 2)),
+    ];
+    backend
+        .compile_loop(&[], &ops, &token)
+        .unwrap_or_else(|err| panic!("compile threadlocalref_get {opcode:?}: {err:?}"));
+    let frame = backend.execute_token(&token, &[]);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    frame
+}
+
+#[test]
+fn threadlocalref_get_loads_inline_from_threadlocal_ofs() {
+    majit_backend_dynasm::jit_threadlocalref_set(8, 0x1234_5678_9abc);
+    let mut backend = fresh_backend();
+    let frame =
+        compile_threadlocalref_get(&mut backend, OpCode::CallI, OpRef::int_op(1), Type::Int);
+    assert_eq!(backend.get_int_value(&frame, 0), 0x1234_5678_9abc);
+}
+
+#[test]
+fn threadlocalref_get_with_a_ref_result_loads_inline() {
+    // `_consider_threadlocalref_get` takes either result kind; a CALL_R
+    // reaches the same `threadlocalref_get`, not the ordinary call emitter.
+    majit_backend_dynasm::jit_threadlocalref_set(8, 0x1234_5678_9abc);
+    let mut backend = fresh_backend();
+    let frame =
+        compile_threadlocalref_get(&mut backend, OpCode::CallR, OpRef::ref_op(1), Type::Ref);
+    assert_eq!(
+        backend.get_ref_value(&frame, 0).as_usize(),
+        0x1234_5678_9abc
+    );
+}
+
 #[derive(Debug)]
 struct AssemblerLoopDescr {
     token: Arc<JitCellToken>,
@@ -3841,6 +4102,58 @@ fn call_malloc_nursery_varsize_small_and_large() {
     assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, 42);
 }
 
+/// `malloc_cond_varsize` with `FLAG_STR` / `FLAG_UNICODE`: a length past
+/// `maxlength` calls `malloc_slowpath_str` / `_unicode`, whose helper
+/// (`malloc_str(length)`) stamps the tid and the length itself.
+fn run_varsize_string_kind(kind: i64, base_size: usize, itemsize: usize, length: i64) {
+    let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        nursery_size: 1 << 20,
+        large_object_threshold: 4096,
+        ..majit_gc::collector::GcConfig::default()
+    });
+    let tid = gc.register_type(majit_gc::TypeInfo::varsize(
+        base_size,
+        itemsize,
+        8,
+        false,
+        Vec::new(),
+    ));
+    let mut backend = wb_backend(gc);
+    let len = OpRef::input_arg_int(0);
+    let obj = OpRef::ref_op(1);
+    let alloc = op_at(
+        OpCode::CallMallocNurseryVarsize,
+        &[
+            OpRef::const_int(kind),
+            OpRef::const_int(itemsize as i64),
+            len,
+        ],
+        obj,
+    );
+    alloc.setdescr(Arc::new(majit_ir::descr::SimpleArrayDescr::new(
+        0,
+        base_size,
+        itemsize,
+        tid,
+        Type::Int,
+    )));
+    let ops = vec![alloc, finish_ref(obj, 2)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(&token, &[Value::Int(length)]);
+    let ptr = finished_ref(&backend, &frame);
+    assert!(!ptr.is_null());
+    assert!(!majit_gc::can_move(ptr));
+    assert_eq!(unsafe { (*header_of(ptr.0)).type_id() }, tid);
+    assert_eq!(unsafe { *((ptr.0 + 8) as *const i64) }, length);
+}
+
+#[test]
+fn call_malloc_nursery_varsize_str_and_unicode_slowpaths() {
+    run_varsize_string_kind(1, majit_backend::BUILTIN_STR_TOKEN_BASE_SIZE, 1, 140_000);
+    run_varsize_string_kind(2, 16, 4, 140_000);
+}
+
 /// `consider_call_malloc_nursery_varsize`: the length is an `INT_ADD`
 /// result, so it lives in a register. When that box dies at the alloc,
 /// `spill_or_move_registers_before_call` must not run — it would unbind
@@ -5052,18 +5365,37 @@ fn r11_imm_call(addr: i64) -> Vec<u8> {
     bytes
 }
 
-/// Thread-local load immediately followed by the callee call. `_load_scratch`
-/// is `MOV_ri` when r11 is unknown and `LEA r11, [r11+disp]` when a cached
+/// The length of a `push_gcmap` at the start of `code`, or 0: `MOV_bi` of
+/// `jf_gcmap`, or `_load_scratch` (`MOV_ri64` / `LEA`) then `MOV_br`.
+fn push_gcmap_len(code: &[u8]) -> usize {
+    let ofs = majit_backend::jitframe::JF_GCMAP_OFS as u8;
+    let store = [0x4C, 0x89, 0x5D, ofs];
+    let load = match code {
+        [0x48, 0xC7, 0x45, o, ..] if *o == ofs => return 8,
+        [0x49, 0xBB, ..] => 10,
+        [0x4D, 0x8D, 0x5B, ..] => 4,
+        [0x4D, 0x8D, 0x9B, ..] => 7,
+        _ => return 0,
+    };
+    if code.len() >= load + store.len() && code[load..load + store.len()] == store {
+        load + store.len()
+    } else {
+        0
+    }
+}
+
+/// Thread-local load, the gcmap push `AbstractCallBuilder.emit` places
+/// after `prepare_arguments`, then the callee call. `_load_scratch` is
+/// `MOV_ri` when r11 is unknown and `LEA r11, [r11+disp]` when a cached
 /// scratch value is near the target.
 fn threadlocal_then_scratch_call(code: &[u8], addr: i64) -> bool {
     let threadlocal = threadlocal_arg1_load();
     let exact = r11_imm_call(addr);
-    let need = threadlocal.len() + exact.len();
-    code.windows(need).any(|window| {
-        if !window.starts_with(&threadlocal) {
+    (0..code.len()).any(|i| {
+        let Some(rest) = code[i..].strip_prefix(threadlocal.as_slice()) else {
             return false;
-        }
-        let rest = &window[threadlocal.len()..];
+        };
+        let rest = &rest[push_gcmap_len(rest)..];
         rest.starts_with(&exact)
             || matches!(
                 rest,
@@ -5071,6 +5403,48 @@ fn threadlocal_then_scratch_call(code: &[u8], addr: i64) -> bool {
                     | [0x4D, 0x8D, 0x9B, _, _, _, _, 0x41, 0xFF, 0xD3, ..]
             )
     })
+}
+
+/// The values r11 holds at each `CALL r11` (`41 FF D3`), following the
+/// `_load_scratch` sequence in front of it: `MOV_ri` (`41 BB imm32`,
+/// `49 C7 C3 imm32`, `49 BB imm64`) and `LEA r11, [r11+disp8/disp32]`.
+/// A `LEA` with no known r11 before it yields no target.
+fn r11_call_targets(code: &[u8]) -> Vec<i64> {
+    let mut r11: Option<i64> = None;
+    let mut targets = Vec::new();
+    let mut i = 0;
+    while i < code.len() {
+        let rest = &code[i..];
+        let read32 = |at: usize| i32::from_le_bytes(rest[at..at + 4].try_into().unwrap());
+        match rest {
+            [0x49, 0xBB, ..] if rest.len() >= 10 => {
+                r11 = Some(i64::from_le_bytes(rest[2..10].try_into().unwrap()));
+                i += 10;
+            }
+            [0x41, 0xBB, ..] if rest.len() >= 6 => {
+                r11 = Some(i64::from(read32(2) as u32));
+                i += 6;
+            }
+            [0x49, 0xC7, 0xC3, ..] if rest.len() >= 7 => {
+                r11 = Some(i64::from(read32(3)));
+                i += 7;
+            }
+            [0x4D, 0x8D, 0x5B, d, ..] => {
+                r11 = r11.map(|v| v.wrapping_add(i64::from(*d as i8)));
+                i += 4;
+            }
+            [0x4D, 0x8D, 0x9B, ..] if rest.len() >= 7 => {
+                r11 = r11.map(|v| v.wrapping_add(i64::from(read32(3))));
+                i += 7;
+            }
+            [0x41, 0xFF, 0xD3, ..] => {
+                targets.extend(r11.take());
+                i += 3;
+            }
+            _ => i += 1,
+        }
+    }
+    targets
 }
 
 /// `mov ARGUMENTS_GPR[1], [rsp + THREADLOCAL_OFS]`.
@@ -5215,7 +5589,8 @@ fn arg_gpr_call(index: usize) -> Vec<u8> {
     call_reg_bytes(majit_backend_dynasm::x86::callbuilder::ARGUMENTS_GPR[index].value)
 }
 
-/// `CALL [rbp+ofs]` for input 0 (`get_ebp_ofs` / `CALL_b`).
+/// `CALL [rbp+ofs]` for input 0 (`get_ebp_ofs` / `CALL_b`), the shape a
+/// frame fnloc must not keep.
 fn call_input0_frame() -> Vec<u8> {
     let offset = majit_backend_dynasm::regalloc::get_ebp_ofs(
         majit_backend::jitframe::FIRST_ITEM_OFFSET as i32,
@@ -5328,17 +5703,24 @@ fn residual_call_register_fnloc_is_call_reg() {
 }
 
 #[test]
-fn residual_call_frame_fnloc_is_call_rbp() {
-    // The function pointer is an untouched input, so its location stays the
-    // frame slot. `emit_raw_call` is `CALL [rbp+ofs]`.
-    let expect = call_input0_frame();
+fn residual_call_frame_fnloc_moves_into_an_argument_register() {
+    // The function pointer is an untouched input, so its location is the
+    // frame slot. `CallBuilderX86.__init__` appends it to the arguments all
+    // the same, and `prepare_arguments` moves it into the next free
+    // argument register: the call is that register, never `CALL [rbp+ofs]`.
     let (backend, token) = compile_indirect_call(false, None, &[], vec![]);
     let frame = backend.execute_token(&token, &[Value::Int(indirect_const as usize as i64)]);
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 99);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_call_site(code, &expect, "call [rbp+input0]");
+    assert_call_site(code, &arg_gpr_call(0), "call ARGUMENTS_GPR[0]");
+    assert!(
+        !code
+            .windows(call_input0_frame().len())
+            .any(|window| window == call_input0_frame()),
+        "the frame fnloc must not stay CALL [rbp+ofs]"
+    );
 
     let (backend, token) =
         compile_indirect_call(false, None, &[rb(OpRef::const_int(42))], vec![Type::Int]);
@@ -5347,7 +5729,7 @@ fn residual_call_frame_fnloc_is_call_rbp() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_call_site(code, &expect, "call [rbp+input0]");
+    assert_call_site(code, &arg_gpr_call(1), "call ARGUMENTS_GPR[1]");
 }
 
 #[test]
@@ -5410,7 +5792,11 @@ fn residual_call_fnloc_survives_errno_and_lasterror() {
     );
     let code = compiled_bytes(&token);
     assert_no_rax_fnloc_park(code);
-    assert_has(code, &call_input0_frame(), "call [rbp+input0]");
+    assert_has(
+        code,
+        &arg_gpr_call(1),
+        "frame fnloc called through ARGUMENTS_GPR[1] after write_real_errno",
+    );
 }
 
 fn e9_rel32(from: u64, to: u64) -> [u8; 5] {
@@ -5523,19 +5909,16 @@ fn follow_jump_calls_the_final_e9_target() {
     );
     let (got, code) = run_immediate_call(thunk);
     assert_eq!(got, 123);
-    assert_has(&code, &r11_imm_call(final_addr), "call followed E9 target");
+    let targets = r11_call_targets(&code);
     assert!(
-        !code
-            .windows(r11_imm_call(thunk).len())
-            .any(|window| window == r11_imm_call(thunk)),
+        targets.contains(&final_addr),
+        "call followed E9 target missing: {targets:x?}"
+    );
+    assert!(
+        !targets.contains(&thunk),
         "call must not use the first thunk"
     );
-    assert!(
-        !code
-            .windows(r11_imm_call(mid).len())
-            .any(|window| window == r11_imm_call(mid)),
-        "call must not stop after one E9"
-    );
+    assert!(!targets.contains(&mid), "call must not stop after one E9");
 }
 
 #[test]
@@ -5563,17 +5946,17 @@ fn follow_jump_stops_on_a_non_e9_prefix() {
     );
     let (got, code) = run_immediate_call(thunk);
     assert_eq!(got, 123);
-    assert_has(&code, &r11_imm_call(thunk), "call keeps the non-E9 thunk");
+    let targets = r11_call_targets(&code);
     assert!(
-        !code
-            .windows(r11_imm_call(wrong).len())
-            .any(|window| window == r11_imm_call(wrong)),
+        targets.contains(&thunk),
+        "call keeps the non-E9 thunk: {targets:x?}"
+    );
+    assert!(
+        !targets.contains(&wrong),
         "the skipped E9 must not become the call target"
     );
     assert!(
-        !code
-            .windows(r11_imm_call(real).len())
-            .any(|window| window == r11_imm_call(real)),
+        !targets.contains(&real),
         "the E9 after EB must not become the call target"
     );
 }

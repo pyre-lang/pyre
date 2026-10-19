@@ -36,7 +36,7 @@ use crate::jitframe::{
     JF_GUARD_EXC_OFS,
 };
 use crate::jump::RegallocMoves;
-use crate::regalloc::{RegAlloc, RegAllocOp, park_float_const};
+use crate::regalloc::{RegAlloc, RegAllocAssembler, park_float_const};
 use crate::regloc::{Loc, RegLoc};
 use crate::runner::GuardGcTypeInfo;
 
@@ -122,6 +122,7 @@ fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
             ebp_offset: e.value,
             is_float: e.is_float,
         },
+        Loc::Esp(e) => panic!("LABEL target argloc must not be a RawEspLoc, got {e:?}"),
         Loc::Frame(f) => TargetArgLoc::Frame {
             position: f.get_position(),
             ebp_offset: f.ebp_loc.value,
@@ -225,9 +226,12 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
             reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
         ),
         Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
-        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::ConstFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => {
-            None
-        }
+        Loc::Immed(_)
+        | Loc::ImmedFloat(_)
+        | Loc::ConstFloat(_)
+        | Loc::Ebp(_)
+        | Loc::Esp(_)
+        | Loc::Addr(_) => None,
     }
 }
 
@@ -696,9 +700,11 @@ pub struct AssemblerARM64<'a> {
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
     pending_guard_tokens: Vec<GuardToken>,
     /// GC bitmap to push before the current collecting call (e.g.,
-    /// CallMallocNursery slow path). Set by the `RegAllocOp::Perform`
-    /// emit path when `gcmap: Some(..)` is carried, cleared after.
+    /// CallMallocNursery slow path). Set by `regalloc_perform` when the
+    /// regalloc captured one, cleared after.
     pending_malloc_nursery_gcmap: Option<usize>,
+    /// Index of the next guard / FINISH descr in `fail_descrs`.
+    fail_index: u32,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
     /// `BaseAssembler._previous_rd_locs`.
@@ -761,7 +767,7 @@ pub struct AssemblerARM64<'a> {
     /// Stores an abstract condition code (CC_* constants).
     guard_success_cc: Option<u8>,
     /// `(result location, condition code)` of the comparison emitted by the
-    /// immediately preceding `RegAllocOp`, so a `GUARD_TRUE`/`GUARD_FALSE`
+    /// immediately preceding op, so a `GUARD_TRUE`/`GUARD_FALSE`
     /// that consumes exactly that result can branch on the live NZCV flags
     /// instead of re-testing the materialized boolean.
     /// `assembler.py:1186-1198 _walk_operations` folds the pair by handing
@@ -770,8 +776,8 @@ pub struct AssemblerARM64<'a> {
     /// returns the comparison's own `fcond`; the guard then emits only the
     /// conditional branch.  pyre's regalloc emits the two ops separately,
     /// so the pairing is recognised here at emit time instead.
-    /// Cleared by every non-guard `RegAllocOp`, so only an ADJACENT pair
-    /// folds — the same `operations[i + 1]` window upstream uses.
+    /// Cleared by every other op and by every `regalloc_mov`, so only an
+    /// ADJACENT pair folds — the same `operations[i + 1]` window upstream uses.
     pending_cmp_cc: Option<(RegLoc, u8)>,
 
     /// Whether guards must use the two-instruction long-branch form.
@@ -921,23 +927,10 @@ struct RecoveryStub {
     pos_jump_offset: Option<usize>,
 }
 
-fn fail_cell_capacity(ra_ops: &[RegAllocOp], ops: &[OpRc]) -> usize {
-    let mut n = 0;
-    for ra in ra_ops {
-        match ra {
-            RegAllocOp::PerformGuard { .. } | RegAllocOp::PerformGuard1 { .. } => n += 1,
-            RegAllocOp::Perform { op_index, .. }
-            | RegAllocOp::Perform1 { op_index, .. }
-            | RegAllocOp::PerformDiscard { op_index, .. }
-            | RegAllocOp::PerformDiscardGcStore { op_index, .. }
-                if ops[*op_index].opcode == OpCode::Finish =>
-            {
-                n += 1;
-            }
-            _ => {}
-        }
-    }
-    n
+fn fail_cell_capacity(ops: &[OpRc]) -> usize {
+    ops.iter()
+        .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish)
+        .count()
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -1035,6 +1028,7 @@ impl<'a> AssemblerARM64<'a> {
             asm_memory_manager,
             pending_guard_tokens: Vec::new(),
             pending_malloc_nursery_gcmap: None,
+            fail_index: 0,
             frame_depth: JITFRAME_FIXED_SIZE,
             previous_rd_locs: majit_ir::RdLocs::new(),
             frame_depth_to_patch: Vec::new(),
@@ -1341,7 +1335,7 @@ impl<'a> AssemblerARM64<'a> {
     fn emit_binop_3op(&mut self, opcode: OpCode, dst_reg: u8, lhs: &Loc, src: &Loc) {
         // Fold a small non-negative ConstInt rhs into the `add/sub Rd,Rn,#imm12`
         // immediate form instead of materialising it into a scratch register.
-        // The regalloc (`consider_int_ri_j2` / `consider_int_sub_j2`) only keeps
+        // The regalloc (`prepare_int_ri` / `prepare_op_int_sub`) only keeps
         // add/sub rhs as `Loc::Immed`; the range mirrors `check_imm_box`
         // (`0 <= v < DEFAULT_IMM_SIZE` = 4096, the AArch64 `#imm12` range).
         if matches!(
@@ -2109,8 +2103,8 @@ impl<'a> AssemblerARM64<'a> {
         &self,
         fail_arg_types: &[Type],
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) -> *mut usize {
-        let frame_depth = self.frame_depth.saturating_sub(JITFRAME_FIXED_SIZE);
         let gcmap = allocate_gcmap(frame_depth, JITFRAME_FIXED_SIZE);
         for (tp, loc) in fail_arg_types.iter().zip(faillocs.iter()) {
             if *tp != Type::Ref {
@@ -2476,13 +2470,22 @@ impl<'a> AssemblerARM64<'a> {
             let gcmap = ra.get_gcmap(&[], false);
             self.emit_check_frame_depth(gcmap);
         }
-        // `VFPRegisterManager.assembler.datablockwrapper`. `prepare_*`
-        // rebuilds `xrm`, and `emit_check_frame_depth` borrows this assembler,
-        // so the pointer is installed immediately before the walk.
-        ra.xrm.set_datablockwrapper(&mut self.datablockwrapper);
-        // assembler.py:374 walk_operations — get allocation decisions.
-        let ra_ops = ra.walk_operations()?;
-        self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(&ra_ops, ops));
+        if crate::majit_ops_log_enabled() {
+            eprintln!("[dynasm] _assemble: {} ops", ops.len());
+        }
+        // assembler.py:374 walk_operations — the regalloc drives this
+        // assembler op by op (`regalloc_perform*`). The VFP manager reaches
+        // `assembler.datablockwrapper` during it, so the wrapper leaves
+        // `self` for the walk instead of being reachable two ways.
+        self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(ops));
+        self.fail_index = 0;
+        let mut datablockwrapper = std::mem::replace(
+            &mut self.datablockwrapper,
+            MachineDataBlockWrapper::new(Arc::clone(&self.asm_memory_manager)),
+        );
+        let walked = ra.walk_operations_with_datablockwrapper(&mut datablockwrapper, self);
+        self.datablockwrapper = datablockwrapper;
+        walked?;
         // ra.get_final_frame_depth() returns a USER-position count; convert
         // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
         let frame_slot_depth =
@@ -2490,7 +2493,7 @@ impl<'a> AssemblerARM64<'a> {
         self.frame_depth = self.frame_depth.max(frame_slot_depth);
 
         // Sync regalloc frame positions to opref_to_slot, the map `resolve_opref`
-        // reads. No live emitter reaches it any more: every remaining consumer
+        // reads, once the walk is over. No live emitter reaches it any more: every remaining consumer
         // (`load_arg_to_rax` / `load_arg_to_rcx` / `resolve_const_or` and the
         // genops that call them) is `#[allow(dead_code)]`, kept for the upstream
         // method boundary. The map cannot express what the regalloc actually
@@ -2514,204 +2517,11 @@ impl<'a> AssemblerARM64<'a> {
         // frame_slot_depth is already absolute (see calculation above).
         self.next_slot = frame_slot_depth;
 
-        let mut fail_index = 0u32;
-
-        if crate::majit_ops_log_enabled() {
-            eprintln!(
-                "[dynasm] _assemble: {} ops → {} ra_ops, frame_depth={}",
-                ops.len(),
-                ra_ops.len(),
-                self.frame_depth
-            );
-        }
-
-        // ── Emit code from regalloc decisions ──
-        for ra_op in &ra_ops {
-            match ra_op {
-                RegAllocOp::Skip => {
-                    // Dead operation — skip.
-                    continue;
-                }
-                RegAllocOp::Move { src, dst } => {
-                    if majit_ir::debug::have_debug_prints() {
-                        majit_ir::debug::log_one(
-                            "jit-backend",
-                            &format!("move: {src:?} → {dst:?}"),
-                        );
-                    }
-                    self.regalloc_mov(src, dst);
-                    // A reload/spill/register move sits between the
-                    // comparison and its guard, so they are no longer the
-                    // adjacent pair `_walk_operations` folds.
-                    self.pending_cmp_cc = None;
-                    continue;
-                }
-                RegAllocOp::Perform {
-                    op_index,
-                    arglocs_start,
-                    arglocs_len,
-                    result_loc,
-                    gcmap,
-                } => {
-                    let arglocs = ra.arglocs(*arglocs_start, *arglocs_len);
-                    let op = &ops[*op_index];
-                    if crate::majit_ops_log_enabled() {
-                        let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
-                        eprintln!(
-                            "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
-                            op_index,
-                            op.opcode,
-                            al.join(", "),
-                            result_loc
-                        );
-                    }
-                    // Byte offset where this op's code begins: the span from
-                    // the last LABEL to the JUMP is one loop iteration, the
-                    // window `jit-log-opt` brackets with its `+508:` prefixes.
-                    if crate::majit_dump_enabled() {
-                        eprintln!(
-                            "[dynasm] @{:#06x} op[{}] {:?}",
-                            self.mc.offset().0,
-                            op_index,
-                            op.opcode
-                        );
-                    }
-                    self.pending_malloc_nursery_gcmap = *gcmap;
-                    self.regalloc_perform(
-                        op,
-                        *op_index,
-                        arglocs,
-                        result_loc.as_ref(),
-                        fail_index,
-                        ops,
-                    );
-                    self.pending_malloc_nursery_gcmap = None;
-                }
-                RegAllocOp::Perform1 {
-                    op_index,
-                    loc,
-                    result_loc,
-                    gcmap,
-                } => {
-                    let op = &ops[*op_index];
-                    let locs = [*loc];
-                    self.pending_malloc_nursery_gcmap = *gcmap;
-                    self.regalloc_perform(
-                        op,
-                        *op_index,
-                        &locs,
-                        result_loc.as_ref(),
-                        fail_index,
-                        ops,
-                    );
-                    self.pending_malloc_nursery_gcmap = None;
-                }
-                RegAllocOp::PerformGuard {
-                    op_index,
-                    arglocs_start,
-                    arglocs_len,
-                    result_loc,
-                    faillocs_start,
-                    faillocs_len,
-                } => {
-                    let arglocs = ra.arglocs(*arglocs_start, *arglocs_len);
-                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
-                    let op = &ops[*op_index];
-                    if crate::majit_ops_log_enabled() {
-                        eprintln!(
-                            "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
-                            op_index,
-                            op.opcode,
-                            arglocs
-                                .iter()
-                                .map(|l| format!("{:?}", l))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            faillocs.len()
-                        );
-                    }
-                    // A guard owns bytes like any other op, so it opens its
-                    // own span. Without this line the guard's code is read as
-                    // part of the preceding op's span and every span after the
-                    // trace's first guard names the wrong operation.
-                    if crate::majit_dump_enabled() {
-                        eprintln!(
-                            "[dynasm] @{:#06x} op[{}] {:?}",
-                            self.mc.offset().0,
-                            op_index,
-                            op.opcode
-                        );
-                    }
-                    self.regalloc_perform_guard(
-                        op,
-                        *op_index,
-                        arglocs,
-                        result_loc.as_ref(),
-                        faillocs,
-                        fail_index,
-                    );
-                    fail_index += 1;
-                }
-                RegAllocOp::PerformGuard1 {
-                    op_index,
-                    loc,
-                    result_loc,
-                    faillocs_start,
-                    faillocs_len,
-                } => {
-                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
-                    let op = &ops[*op_index];
-                    let locs = [*loc];
-                    self.regalloc_perform_guard(
-                        op,
-                        *op_index,
-                        &locs,
-                        result_loc.as_ref(),
-                        faillocs,
-                        fail_index,
-                    );
-                    fail_index += 1;
-                }
-                RegAllocOp::PerformDiscard { op_index, arglocs } => {
-                    self.emit_discard(*op_index, arglocs, fail_index, ops);
-                    let op = &ops[*op_index];
-                    if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-                        fail_index += 1;
-                    }
-                }
-                RegAllocOp::PerformDiscardGcStore {
-                    op_index,
-                    value,
-                    base,
-                    ofs,
-                    size,
-                } => {
-                    let locs = [*value, *base, *ofs, Loc::immed(*size)];
-                    self.emit_discard(*op_index, &locs, fail_index, ops);
-                    let op = &ops[*op_index];
-                    if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-                        fail_index += 1;
-                    }
-                }
-                RegAllocOp::PerformGcLoad {
-                    op_index,
-                    base,
-                    ofs,
-                    res,
-                    nsize,
-                } => {
-                    let op = &ops[*op_index];
-                    let locs = [*base, *ofs, *res, Loc::immed(*nsize)];
-                    self.regalloc_perform(op, *op_index, &locs, Some(res), fail_index, ops);
-                }
-            }
-        }
-
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble done: pending_guard_tokens={} fail_index={}",
                 self.pending_guard_tokens.len(),
-                fail_index
+                self.fail_index
             );
         }
         // Closes the last op's span, the way `--end of the loop--` closes a
@@ -2732,32 +2542,11 @@ impl<'a> AssemblerARM64<'a> {
         Ok(())
     }
 
-    fn emit_discard(&mut self, op_index: usize, arglocs: &[Loc], fail_index: u32, ops: &[OpRc]) {
-        let op = &ops[op_index];
-        if crate::majit_ops_log_enabled() {
-            let al: Vec<String> = arglocs.iter().map(|l| format!("{l:?}")).collect();
-            eprintln!(
-                "[dynasm] discard[{}]: {:?} args=[{}]",
-                op_index,
-                op.opcode,
-                al.join(", ")
-            );
-        }
-        if crate::majit_dump_enabled() {
-            eprintln!(
-                "[dynasm] @{:#06x} op[{}] {:?}",
-                self.mc.offset().0,
-                op_index,
-                op.opcode
-            );
-        }
-        self.regalloc_perform(op, op_index, arglocs, None, fail_index, ops);
-    }
-
-    /// assembler.py:326 regalloc_perform — emit code for a non-guard op.
-    /// Called from the regalloc dispatch loop with pre-computed locations.
-    fn regalloc_perform(
+    /// assembler.py `asm_operations[opnum]` — emit code for a non-guard op
+    /// from its regalloc locations (`regalloc_perform`).
+    fn asm_operations(
         &mut self,
+        regalloc: &RegAlloc<'_>,
         op: &Op,
         op_index: usize,
         arglocs: &[Loc],
@@ -3410,7 +3199,7 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
                 // `rewrite.rs transform_to_gc_load` lowers both opcodes to
                 // GC_STORE / GC_STORE_INDEXED through `emit_gc_store_or_indexed`
-                // before the regalloc ever sees them, and `consider_setfield_j2`
+                // before the regalloc ever sees them, and `prepare_op_setfield`
                 // force-allocates a register for every non-constant base, so the
                 // only shape that could reach the else arm is a constant base on
                 // an op the rewriter did not consume.  Emitting it from
@@ -3923,9 +3712,13 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
                 self.genop_cond_call_value(op, arglocs);
             }
+            // `rewrite.py handle_new` lowers every NEW / NEW_WITH_VTABLE,
+            // vtable store included (`gen_initialize_vtable`), and the
+            // assembler has no genop for either.
+            OpCode::New | OpCode::NewWithVtable => {
+                panic!("not implemented operation with res: {:?}", op.opcode)
+            }
             // ── Allocation (raw, when GC rewriter is not active) ──
-            OpCode::New => self.genop_new(op),
-            OpCode::NewWithVtable => self.genop_new_with_vtable(op),
             OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op, arglocs),
             OpCode::Newstr => self.genop_newstr(op, arglocs),
             OpCode::Newunicode => self.genop_newunicode(op, arglocs),
@@ -4073,7 +3866,11 @@ impl<'a> AssemblerARM64<'a> {
                 // by regalloc.  Only the two failing comparisons enter the
                 // collecting helper; a short array commits the bump, stamps
                 // its tid, and returns the payload directly.
-                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+                let (nf_addr, nt_addr) = if headerless {
+                    crate::runner::dynasm_headerless_nursery_addrs()
+                } else {
+                    crate::runner::dynasm_nursery_addrs()
+                };
                 let max_young = crate::runner::dynasm_max_size_of_young_obj();
                 let slow_path = self.mc.new_dynamic_label();
                 let done = self.mc.new_dynamic_label();
@@ -4326,7 +4123,7 @@ impl<'a> AssemblerARM64<'a> {
             }
             // aarch64/opassembler.py _write_barrier_fastpath parity.
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                self.emit_write_barrier_fastpath(op, arglocs);
+                self.emit_write_barrier_fastpath(regalloc, op, arglocs);
             }
             // aarch64/opassembler.py emit_op_zero_array.  This is a
             // result-less operation, but it is the initialization contract
@@ -4349,9 +4146,8 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::SaveException => self.emit_store_and_reset_exception(result_loc),
             OpCode::SaveExcClass => self.genop_save_exc_class(result_loc),
             OpCode::RestoreException => self.genop_restore_exception(arglocs),
-            // Guards never reach the non-guard regalloc dispatch — they
-            // are emitted exclusively from `regalloc_perform_guard` via
-            // the `RegAllocOp::PerformWithGuard` arm.
+            // Guards never reach the non-guard dispatch — the regalloc
+            // hands them to `regalloc_perform_guard`.
             _ if op.opcode.is_guard() => unreachable!(
                 "regalloc_perform reached with guard {:?}; guards must \
                  route through regalloc_perform_guard",
@@ -4362,8 +4158,9 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    /// assembler.py:329 regalloc_perform_guard — emit guard with faillocs.
-    fn regalloc_perform_guard(
+    /// assembler.py `asm_guard_operations[opnum]` — emit a guard with its
+    /// faillocs (`regalloc_perform_guard`).
+    fn asm_guard_operations(
         &mut self,
         op: &Op,
         op_index: usize,
@@ -4371,6 +4168,7 @@ impl<'a> AssemblerARM64<'a> {
         result_loc: Option<&Loc>,
         faillocs: &[Option<Loc>],
         fail_index: u32,
+        frame_depth: usize,
     ) {
         let guard_argloc = arglocs.first().copied();
         match op.opcode {
@@ -4385,6 +4183,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             // `assembler.py genop_guard_guard_false` inverts the
@@ -4401,6 +4200,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             // aarch64/opassembler.py `emit_op_guard_value`, then EQ.
@@ -4415,6 +4215,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardClass => {
@@ -4428,6 +4229,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardGcType => {
@@ -4441,6 +4243,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardIsObject => {
@@ -4454,6 +4257,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardSubclass => {
@@ -4467,6 +4271,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardException => {
@@ -4480,6 +4285,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
                 self.emit_store_and_reset_exception(result_loc);
             }
@@ -4496,6 +4302,7 @@ impl<'a> AssemblerARM64<'a> {
                         fail_label,
                         guard_argloc,
                         faillocs,
+                        frame_depth,
                     );
                 }
             }
@@ -4507,6 +4314,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardNoOverflow => {
@@ -4516,6 +4324,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardOverflow => {
@@ -4535,6 +4344,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardNotForced => {
@@ -4546,6 +4356,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardNotForced2 => {
@@ -4555,6 +4366,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardNotInvalidated => {
@@ -4564,6 +4376,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardAlwaysFails => {
@@ -4573,6 +4386,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             _ => {
@@ -4582,6 +4396,7 @@ impl<'a> AssemblerARM64<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
         }
@@ -4932,10 +4747,10 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// The comparison NZCV flags are still live iff the immediately
-    /// preceding `RegAllocOp` was a comparison writing exactly `loc` — the
+    /// preceding emission was a comparison writing exactly `loc` — the
     /// `operations[i + 1]` adjacency `assembler.py:1186 _walk_operations`
     /// requires before folding a comparison into its guard.  Every other
-    /// `RegAllocOp` clears the record, so nothing in between can have
+    /// op and every `regalloc_mov` clears the record, so nothing in between can have
     /// clobbered the flags.  Returns the condition under which the
     /// comparison was TRUE.
     fn take_pending_cmp_cc(&mut self, loc: &Loc) -> Option<u8> {
@@ -4972,6 +4787,7 @@ impl<'a> AssemblerARM64<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let cc = self
             .guard_success_cc
@@ -4986,6 +4802,7 @@ impl<'a> AssemblerARM64<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
     }
 
@@ -4997,6 +4814,7 @@ impl<'a> AssemblerARM64<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let fail_label = self.mc.new_dynamic_label();
         self.append_guard_token_with_faillocs(
@@ -5006,6 +4824,7 @@ impl<'a> AssemblerARM64<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
     }
 
@@ -5016,6 +4835,7 @@ impl<'a> AssemblerARM64<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let fail_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch aarch64 ; b =>fail_label);
@@ -5026,6 +4846,7 @@ impl<'a> AssemblerARM64<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
     }
 
@@ -5046,6 +4867,7 @@ impl<'a> AssemblerARM64<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         // `_emit_guard`: `pos = self.mc.currpos()`, `token.offset = pos`.
         let pos = self.mc.offset().0;
@@ -5060,6 +4882,7 @@ impl<'a> AssemblerARM64<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
         self.pending_guard_tokens
             .last_mut()
@@ -5076,6 +4899,7 @@ impl<'a> AssemblerARM64<'a> {
         fail_label: DynamicLabel,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         // assembler.py _store_force_index parity:
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
@@ -5192,7 +5016,8 @@ impl<'a> AssemblerARM64<'a> {
                 descr_fd.rd_locs()
             );
         }
-        let gcmap = self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs);
+        let gcmap =
+            self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs, frame_depth);
 
         // Reuse the cell pre-allocated by `_store_force_index_if_next_guard`
         // when this guard is paired with a CALL_ASSEMBLER's force-store —
@@ -5227,6 +5052,7 @@ impl<'a> AssemblerARM64<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let unused_label = self.mc.new_dynamic_label();
         self.append_guard_token_with_faillocs(
@@ -5236,6 +5062,7 @@ impl<'a> AssemblerARM64<'a> {
             unused_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
         let token = self
             .pending_guard_tokens
@@ -6653,13 +6480,6 @@ impl<'a> AssemblerARM64<'a> {
             self.reload_frame_if_necessary();
             self.pop_gcmap();
         }
-        if !op.pos().get().is_none() {
-            if op.opcode.result_type() == Type::Float {
-                self.store_d0_to_result(op.pos().get());
-            } else {
-                self.store_rax_to_result(op.pos().get());
-            }
-        }
         if crate::trace_call_diag_id() == Some(self.trace_id) {
             self.emit_push_all_volatile_regs();
             self.emit_mov_imm64(0, op.pos().get().raw() as i64);
@@ -6689,12 +6509,13 @@ impl<'a> AssemblerARM64<'a> {
     /// sound because the op is still a call: the optimizer's residual-call
     /// emission fences pending setfields before the allocation, so a collector
     /// that walks the interpreter's own structures finds roots that are
-    /// current.
+    /// current. A collector that is not headerless-aware
+    /// (`dynasm_headerless_nursery_addrs`) gets the residual call alone.
     fn genop_nursery_alloc_inline(&mut self, op: &Op, arglocs: &[Loc]) {
         // Two-word headerless node: value@0, link@8.
         const NURSERY_ALLOC_NODE_SIZE: u32 = 16;
 
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
         if nf_addr == 0 || nt_addr == 0 {
             self.genop_call_with_arglocs(op, arglocs);
             return;
@@ -6755,9 +6576,6 @@ impl<'a> AssemblerARM64<'a> {
         let nreg = self.load_loc_to_reg(&next_loc, 14);
         dynasm!(self.mc ; .arch aarch64 ; str X(nreg), [x17, 8]); // next @ base+8
         dynasm!(self.mc ; .arch aarch64 ; mov x0, x17); // result = base
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
         dynasm!(self.mc ; .arch aarch64 ; b =>done);
 
         dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
@@ -6989,33 +6807,8 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    // genop_* — allocation
-    // x86/assembler.py:2338 genop_new etc.
-    // These require GC runtime support. Emit trap for now.
-
-    /// NEW: allocate a fixed-size object. Requires GC runtime.
-    /// Emits a trap (UD2/BRK) until GC nursery allocation is wired.
-    /// Zero-initialize `size` bytes at address in x0 (preserved).
-    /// Avoids clobbering callee-saved registers (x19-x28).
-    fn inline_memzero(&mut self, size: i64) {
-        let mut ofs = 0i32;
-        while ofs + 16 <= size as i32 {
-            dynasm!(self.mc ; .arch aarch64 ; stp xzr, xzr, [x0, ofs]);
-            ofs += 16;
-        }
-        if ofs + 8 <= size as i32 {
-            let u = ofs as u32;
-            dynasm!(self.mc ; .arch aarch64 ; str xzr, [x0, u]);
-            ofs += 8;
-        }
-        if ofs + 4 <= size as i32 {
-            let u = ofs as u32;
-            dynasm!(self.mc ; .arch aarch64 ; str wzr, [x0, u]);
-        }
-    }
-
     /// aarch64/opassembler.py _write_barrier_fastpath parity.
-    fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
+    fn emit_write_barrier_fastpath(&mut self, regalloc: &RegAlloc<'_>, op: &Op, arglocs: &[Loc]) {
         // `mc.LDRB_ri(r.ip0.value, loc_base.value, ...)` indexes the base as
         // a core register; upstream guarantees that in
         // `ARMRegisterManager.return_constant` (aarch64/regalloc.py), which
@@ -7038,12 +6831,8 @@ impl<'a> AssemblerARM64<'a> {
         } else {
             None
         };
-        // `len(self._regalloc.vfprm.reg_bindings)`, carried by regalloc as
-        // the trailing immediate (`consider_cond_call_gc_wb_j2`).
-        let withfloats = matches!(
-            arglocs.get(if is_array { 2 } else { 1 }),
-            Some(Loc::Immed(imm)) if imm.value != 0
-        );
+        // `len(self._regalloc.vfprm.reg_bindings)`.
+        let withfloats = regalloc.xrm.reg_bindings_len() > 0;
         self.emit_write_barrier_fastpath_for_base(loc_base, is_array, false, withfloats, loc_index);
     }
 
@@ -7359,15 +7148,15 @@ impl<'a> AssemblerARM64<'a> {
     /// Headerless fixed-size nursery allocation.  `size` excludes any GC
     /// header; result is the old nursery base.
     ///
-    /// The fast path raw-bumps `dynasm_nursery_addrs()`, so it is correct only
-    /// when the active dynasm GC is headerless-aware — its nursery must yield a
-    /// raw base carrying no `GcHeader` — what an interpreter that runs its own
-    /// collector over its own object arena supplies.  A headered collector such
-    /// as MiniMarkGC must never back this op:
-    /// its nursery walk reads a `GcHeader` at `base - GcHeader::SIZE`, which a
-    /// raw base lacks.  The overflow slowpath enforces this via
-    /// `alloc_nursery_headerless`'s panicking default; the fast path relies on
-    /// the same invariant being upheld by whoever declares `headerless_structs`.
+    /// The fast path raw-bumps the nursery, so it is correct only when the
+    /// active dynasm GC is headerless-aware — its nursery must yield a raw base
+    /// carrying no `GcHeader` — what an interpreter that runs its own collector
+    /// over its own object arena supplies.  A headered collector such as
+    /// MiniMarkGC must never back this op: its nursery walk reads a `GcHeader`
+    /// at `base - GcHeader::SIZE`, which a raw base lacks.
+    /// `dynasm_headerless_nursery_addrs` answers no nursery for such a
+    /// collector, so the op goes straight to the slowpath, where
+    /// `alloc_nursery_headerless`'s panicking default fails loudly.
     fn genop_call_malloc_nursery_headerless(&mut self, op: &Op) {
         let size_ref = op.arg(0).to_opref();
         let size = size_ref.inline_const_bits().unwrap_or_else(|| {
@@ -7376,7 +7165,7 @@ impl<'a> AssemblerARM64<'a> {
                 .map(|c| c.as_raw_i64())
                 .unwrap_or(size_ref.raw() as i64)
         });
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
         if nf_addr == 0 || nt_addr == 0 {
             self.emit_mov_imm64(0, size);
             self.emit_mov_imm64(
@@ -7468,66 +7257,6 @@ impl<'a> AssemblerARM64<'a> {
         dynasm!(self.mc ; .arch aarch64 ; =>done);
     }
 
-    /// aarch64/assembler.py malloc_cond parity.
-    /// Inline nursery bump allocation for NEW.
-    fn new_alloc_fn_addr() -> i64 {
-        if crate::runner::new_via_gc_enabled() {
-            crate::runner::dynasm_new_alloc as *const () as i64
-        } else {
-            libc::malloc as *const () as i64
-        }
-    }
-
-    fn genop_new(&mut self, op: &Op) {
-        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
-        self.emit_mov_imm64(0, obj_size);
-        self.emit_mov_imm64(2, Self::new_alloc_fn_addr());
-        dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        self.inline_memzero(obj_size);
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
-    }
-
-    fn genop_new_with_vtable(&mut self, op: &Op) {
-        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
-        let (vtable, w_class_init) = op
-            .with_size_descr(|sd| {
-                let w_class_init = sd.w_class_obj().and_then(|w_class| {
-                    sd.class_word_field()
-                        .map(|fd| (fd.offset() as i64, w_class))
-                });
-                (sd.vtable() as i64, w_class_init)
-            })
-            .unwrap_or((0, None));
-        self.emit_mov_imm64(0, obj_size);
-        // One read of the published hook picks both the call target and
-        // whether the raw fallback still needs to be cleared.
-        let fallback = Self::new_alloc_fn_addr();
-        let malloc_ptr = crate::runner::malloc_fixedsize_or(fallback);
-        self.emit_mov_imm64(2, malloc_ptr);
-        dynasm!(self.mc ; .arch aarch64 ; blr x2);
-        // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
-        // (`malloc_zero_filled`). A raw `malloc` is not, so only that
-        // fallback is cleared here — never both.
-        if malloc_ptr == fallback {
-            self.inline_memzero(obj_size);
-        }
-        if vtable != 0 {
-            self.emit_mov_imm64(1, vtable);
-            dynasm!(self.mc ; .arch aarch64 ; str x1, [x0]);
-        }
-        if let Some((w_class_offset, w_class)) = w_class_init
-            && w_class != 0
-        {
-            self.emit_mov_imm64(1, w_class);
-            dynasm!(self.mc ; .arch aarch64 ; str x1, [x0, w_class_offset as u32]);
-        }
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
-    }
-
     /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate a typed GC array.
     ///
     /// Rewrite normally replaces these with `CALL_MALLOC_NURSERY_VARSIZE` /
@@ -7565,9 +7294,6 @@ impl<'a> AssemblerARM64<'a> {
             ; blr x8
             ; ldp x29, x30, [sp], #16
         );
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
     // genop_* — misc
@@ -7721,7 +7447,7 @@ impl<'a> AssemblerARM64<'a> {
 
     /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
     ///
-    /// arglocs come from the regalloc plan (`consider_discard_nargs_j2`):
+    /// arglocs come from the regalloc plan (`prepare_op_copystrcontent`):
     /// `[condition, fn, call_args...]`. aarch64 has no cc-fusion (the compare
     /// result is always materialised into a register), so the condition can
     /// be register-resident — `resolve_opref` only handles slots/constants and
@@ -7731,7 +7457,7 @@ impl<'a> AssemblerARM64<'a> {
     /// regalloc locations rather than re-resolving the op operands.
     /// COND_CALL: if arg(0) != 0, call arg(1)(arg(2..)); discard result.
     ///
-    /// `consider_discard_nargs_j2` emits no `before_call`, so the regalloc
+    /// `prepare_op_copystrcontent` emits no `before_call`, so the regalloc
     /// does NOT spill caller-saved registers across this op. On the taken
     /// path the callee clobbers x0..x13 + d0..d7, which would destroy any
     /// value live across the cond_call (e.g. a residual-call result stored
@@ -7913,14 +7639,14 @@ impl<'a> AssemblerARM64<'a> {
     /// extra_item_after_alloc null terminator.
     fn genop_newstr(&mut self, op: &Op, arglocs: &[Loc]) {
         let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 1);
-        self.genop_alloc_lowlevel_string(op, arglocs, type_id, base_size, item_size);
+        self.genop_alloc_lowlevel_string(arglocs, type_id, base_size, item_size);
     }
 
     /// NEWUNICODE: allocate a unicode string (4-byte chars).
     /// Basesize = 16 (no extra_item_after_alloc), itemsize = 4.
     fn genop_newunicode(&mut self, op: &Op, arglocs: &[Loc]) {
         let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 4);
-        self.genop_alloc_lowlevel_string(op, arglocs, type_id, base_size, item_size);
+        self.genop_alloc_lowlevel_string(arglocs, type_id, base_size, item_size);
     }
 
     /// Read `(base_size, item_size)` from the injected ArrayDescr.
@@ -7939,7 +7665,6 @@ impl<'a> AssemblerARM64<'a> {
 
     fn genop_alloc_lowlevel_string(
         &mut self,
-        op: &Op,
         arglocs: &[Loc],
         type_id: i64,
         base_size: i64,
@@ -7967,9 +7692,6 @@ impl<'a> AssemblerARM64<'a> {
             ; blr x8
             ; ldp x29, x30, [sp], #16
         );
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
     /// Shared implementation for NEW_ARRAY.
@@ -7977,7 +7699,7 @@ impl<'a> AssemblerARM64<'a> {
     /// and writes length to the header.
     #[allow(dead_code)] // assembler.py genop_new_array / genop_alloc_varsize
     fn genop_alloc_varsize(&mut self, op: &Op, arglocs: &[Loc], base_size: i64, item_size: i64) {
-        // The length comes from its regalloc location.  `consider_raw_call_like_j2`
+        // The length comes from its regalloc location.  `prepare_raw_call_like`
         // plans these opcodes, and `before_call` leaves a value bound to a
         // callee-saved member of the allocation pool in its register, where
         // `resolve_opref` cannot see it.  The load is consumed by the very next
@@ -8806,10 +8528,23 @@ mod tests {
 /// them is one shared implementation in `crate::jump`; only these differ per
 /// backend, which is what makes them the trait and it the free function.
 impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
+    /// aarch64/jump.py `_move`.
+    fn _move(&mut self, src: &Loc, dst: &Loc, tmpreg: &Loc) {
+        let mut src = *src;
+        if dst.is_stack() && src.is_stack() {
+            self.regalloc_mov(&src, tmpreg);
+            src = *tmpreg;
+        }
+        self.regalloc_mov(&src, dst);
+    }
+
     fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
         if majit_ir::debug::have_debug_prints() {
             majit_ir::debug::log_one("jit-backend", &format!("remap-mov: {src:?} -> {dst:?}"));
         }
+        // A reload/spill/register move between a comparison and its guard
+        // leaves them no longer the adjacent pair `_walk_operations` folds.
+        self.pending_cmp_cc = None;
         match (src, dst) {
             (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
             (Loc::Reg(s), Loc::Reg(d)) => {
@@ -8919,5 +8654,136 @@ impl<'a> crate::jump::RegallocMoves for AssemblerARM64<'a> {
                  nothing here would leave the stack pointer shifted",
             ),
         }
+    }
+}
+
+/// aarch64/assembler.py `_walk_operations`: the regalloc hands each op's
+/// locations to its emitter while the register managers still hold the
+/// state of that op.
+impl RegAllocAssembler for AssemblerARM64<'_> {
+    fn regalloc_perform(
+        &mut self,
+        regalloc: &RegAlloc<'_>,
+        op_index: usize,
+        arglocs: &[Loc],
+        result_loc: Option<Loc>,
+        gcmap: Option<usize>,
+    ) {
+        let ops = self.operations;
+        let op = &ops[op_index];
+        if crate::majit_ops_log_enabled() {
+            let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
+            eprintln!(
+                "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
+                op_index,
+                op.opcode,
+                al.join(", "),
+                result_loc
+            );
+        }
+        // Byte offset where this op's code begins: the span from
+        // the last LABEL to the JUMP is one loop iteration, the
+        // window `jit-log-opt` brackets with its `+508:` prefixes.
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        self.pending_malloc_nursery_gcmap = gcmap;
+        let fail_index = self.fail_index;
+        self.asm_operations(
+            regalloc,
+            op,
+            op_index,
+            arglocs,
+            result_loc.as_ref(),
+            fail_index,
+            ops,
+        );
+        self.pending_malloc_nursery_gcmap = None;
+    }
+
+    fn regalloc_perform_discard(
+        &mut self,
+        regalloc: &RegAlloc<'_>,
+        op_index: usize,
+        arglocs: &[Loc],
+    ) {
+        let ops = self.operations;
+        let op = &ops[op_index];
+        if crate::majit_ops_log_enabled() {
+            let al: Vec<String> = arglocs.iter().map(|l| format!("{l:?}")).collect();
+            eprintln!(
+                "[dynasm] discard[{}]: {:?} args=[{}]",
+                op_index,
+                op.opcode,
+                al.join(", ")
+            );
+        }
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        let fail_index = self.fail_index;
+        self.asm_operations(regalloc, op, op_index, arglocs, None, fail_index, ops);
+        if op.opcode.is_guard() || op.opcode == OpCode::Finish {
+            self.fail_index += 1;
+        }
+    }
+
+    fn regalloc_perform_guard(
+        &mut self,
+        _regalloc: &RegAlloc<'_>,
+        op_index: usize,
+        faillocs: &[Option<Loc>],
+        arglocs: &[Loc],
+        result_loc: Option<Loc>,
+        frame_depth: usize,
+    ) {
+        let ops = self.operations;
+        let op = &ops[op_index];
+        if crate::majit_ops_log_enabled() {
+            eprintln!(
+                "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
+                op_index,
+                op.opcode,
+                arglocs
+                    .iter()
+                    .map(|l| format!("{:?}", l))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                faillocs.len()
+            );
+        }
+        // A guard owns bytes like any other op, so it opens its
+        // own span. Without this line the guard's code is read as
+        // part of the preceding op's span and every span after the
+        // trace's first guard names the wrong operation.
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        let fail_index = self.fail_index;
+        self.asm_guard_operations(
+            op,
+            op_index,
+            arglocs,
+            result_loc.as_ref(),
+            faillocs,
+            fail_index,
+            frame_depth,
+        );
+        self.fail_index += 1;
     }
 }

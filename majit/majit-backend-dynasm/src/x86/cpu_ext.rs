@@ -15,6 +15,7 @@
 
 use crate::codebuf::ArenaExecutableBuffer;
 use crate::guard::CpuDescrHandle;
+use crate::x86::assembler::MallocSlowpathKind;
 use majit_backend::AsmMemoryManager;
 use std::sync::Arc;
 
@@ -44,6 +45,11 @@ pub(crate) struct X86CpuExt {
     /// this address. Built once per CPU, same as `malloc_slowpath_fixed`.
     malloc_slowpath_varsize: Option<usize>,
     _malloc_slowpath_varsize_buffer: Option<ArenaExecutableBuffer>,
+    /// `_build_malloc_slowpath(kind='str')` / `(kind='unicode')`.
+    malloc_slowpath_str: Option<usize>,
+    _malloc_slowpath_str_buffer: Option<ArenaExecutableBuffer>,
+    malloc_slowpath_unicode: Option<usize>,
+    _malloc_slowpath_unicode_buffer: Option<ArenaExecutableBuffer>,
     /// `assembler.py:344 self.propagate_exception_path` parity.
     /// Standalone trampoline that the malloc slowpath JMPs to on OOM and
     /// the stack-check helper JMPs to on overflow.
@@ -86,6 +92,10 @@ impl X86CpuExt {
             _malloc_slowpath_headerless_buffer: None,
             malloc_slowpath_varsize: None,
             _malloc_slowpath_varsize_buffer: None,
+            malloc_slowpath_str: None,
+            _malloc_slowpath_str_buffer: None,
+            malloc_slowpath_unicode: None,
+            _malloc_slowpath_unicode_buffer: None,
             propagate_exception_path: None,
             _propagate_exception_path_buffer: None,
             frame_realloc_slowpath: None,
@@ -303,23 +313,62 @@ impl X86CpuExt {
     /// `_build_malloc_slowpath(kind='var')`: one trampoline per CPU.
     /// `ensure_propagate_exception_path` runs first; the OOM tail JMPs there.
     pub(crate) fn ensure_malloc_slowpath_varsize(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
-        if self.malloc_slowpath_varsize.is_none() {
-            let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
-            let (buffer, addr) = super::assembler::build_malloc_slowpath_varsize(
-                cpu_handle,
-                propagate_path,
-                &self.asm_memory_manager,
-            );
-            debug_assert!(
-                addr != 0,
-                "build_malloc_slowpath_varsize returned NULL entry address — \
-                 dynasm finalize is expected to yield a non-zero buffer_ptr"
-            );
-            self._malloc_slowpath_varsize_buffer = Some(buffer);
-            self.malloc_slowpath_varsize = Some(addr);
+        self.ensure_malloc_slowpath_kind(cpu_handle, MallocSlowpathKind::Var)
+    }
+
+    /// `_build_malloc_slowpath(kind='str')`.
+    pub(crate) fn ensure_malloc_slowpath_str(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
+        self.ensure_malloc_slowpath_kind(cpu_handle, MallocSlowpathKind::Str)
+    }
+
+    /// `_build_malloc_slowpath(kind='unicode')`.
+    pub(crate) fn ensure_malloc_slowpath_unicode(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
+        self.ensure_malloc_slowpath_kind(cpu_handle, MallocSlowpathKind::Unicode)
+    }
+
+    fn ensure_malloc_slowpath_kind(
+        &mut self,
+        cpu_handle: &CpuDescrHandle,
+        kind: MallocSlowpathKind,
+    ) -> usize {
+        let cached = match kind {
+            MallocSlowpathKind::Var => self.malloc_slowpath_varsize,
+            MallocSlowpathKind::Str => self.malloc_slowpath_str,
+            MallocSlowpathKind::Unicode => self.malloc_slowpath_unicode,
+            MallocSlowpathKind::Fixed => unreachable!("'fixed' is ensure_malloc_slowpath_fixed"),
+        };
+        if let Some(addr) = cached {
+            return addr;
         }
-        self.malloc_slowpath_varsize
-            .expect("malloc_slowpath_varsize was just ensured")
+        let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
+        let (buffer, addr) = super::assembler::build_malloc_slowpath_varsize(
+            cpu_handle,
+            kind,
+            propagate_path,
+            &self.asm_memory_manager,
+        );
+        debug_assert!(
+            addr != 0,
+            "build_malloc_slowpath_varsize returned NULL entry address —              dynasm finalize is expected to yield a non-zero buffer_ptr"
+        );
+        let (slot, buffer_slot) = match kind {
+            MallocSlowpathKind::Var => (
+                &mut self.malloc_slowpath_varsize,
+                &mut self._malloc_slowpath_varsize_buffer,
+            ),
+            MallocSlowpathKind::Str => (
+                &mut self.malloc_slowpath_str,
+                &mut self._malloc_slowpath_str_buffer,
+            ),
+            MallocSlowpathKind::Unicode => (
+                &mut self.malloc_slowpath_unicode,
+                &mut self._malloc_slowpath_unicode_buffer,
+            ),
+            MallocSlowpathKind::Fixed => unreachable!(),
+        };
+        *buffer_slot = Some(buffer);
+        *slot = Some(addr);
+        addr
     }
 
     /// Whether either trampoline that bakes `propagate_exception_descr`
@@ -338,6 +387,8 @@ impl X86CpuExt {
         self.malloc_slowpath_fixed.is_some()
             || self.malloc_slowpath_headerless.is_some()
             || self.malloc_slowpath_varsize.is_some()
+            || self.malloc_slowpath_str.is_some()
+            || self.malloc_slowpath_unicode.is_some()
             || self.propagate_exception_path.is_some()
             || self.stack_check_slowpath.is_some()
     }

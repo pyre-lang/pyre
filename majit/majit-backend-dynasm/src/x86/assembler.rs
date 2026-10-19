@@ -21,6 +21,7 @@ use std::sync::Arc;
 pub(crate) type Assembler = dynasmrt::VecAssembler<dynasmrt::x64::X64Relocation>;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
+use super::regloc::{LocationCodeBuilder, Operand, addr_add, addr_add_const, heap, imm};
 use super::rx86;
 
 /// `rx86.py X86_64_CodeBuilder.MULTIBYTE_NOPs`, index == length, 1..=15.
@@ -73,7 +74,7 @@ use crate::jitframe::{
     JF_GUARD_EXC_OFS,
 };
 use crate::jump::RegallocMoves;
-use crate::regalloc::{RegAlloc, RegAllocOp};
+use crate::regalloc::{RegAlloc, RegAllocAssembler};
 use crate::regloc::Loc;
 use crate::runner::GuardGcTypeInfo;
 
@@ -694,6 +695,8 @@ mod tests {
             0,
             0,
             0,
+            0,
+            0,
             [0; 5],
             0,
             0,
@@ -720,9 +723,7 @@ mod tests {
         asm.push_gcmap(gcmap as *mut usize);
         asm.push_gcmap((gcmap + 16) as *mut usize);
         asm.push_gcmap(0x1000 as *mut usize);
-        let code = std::mem::replace(&mut asm.mc, super::Assembler::new(0))
-            .finalize()
-            .expect("finalize push_gcmap bytes");
+        let code = asm.mc.take().finalize().expect("finalize push_gcmap bytes");
         let entry = asm.self_entry_addr_ptr;
         drop(asm);
         drop(unsafe { Box::from_raw(entry) });
@@ -733,34 +734,7 @@ mod tests {
 #[derive(Clone, Copy)]
 enum AbiArgPlacement {
     Gpr(u8),
-    Xmm(u8),
     Stack(i32),
-}
-
-/// Where `emit_raw_call` calls. A register fnloc has already been placed by
-/// `prepare_arguments`; a frame fnloc is still its `[rbp+ofs]` slot.
-#[derive(Clone, Copy)]
-enum PreparedFnLoc {
-    Immediate(i64),
-    Reg(u8),
-    Stack(i32),
-    Frame(i32),
-}
-
-/// `AddressLoc` from `addr_add`: `'m'` is `[base+ofs]`, `'a'` is
-/// `[base + index*scale + ofs]`.
-#[derive(Clone, Copy)]
-enum AddrAdd {
-    Mem {
-        base: u8,
-        ofs: i32,
-    },
-    Sib {
-        base: i16,
-        index: u8,
-        scale: u8,
-        ofs: i32,
-    },
 }
 
 /// `x86/assembler.py _push_all_regs_to_frame` parity — free-fn
@@ -904,27 +878,6 @@ pub(crate) fn emit_call_footer_raw(asm: &mut Assembler) {
     dynasm!(asm ; .arch x64 ; ret);
 }
 
-/// `LocationCodeBuilder._addr_as_reg_offset` over a bare `Assembler`, with
-/// the `_scratch_register_value` cache held by the caller (`-1` is unknown).
-/// Reuses r11 when `addr` is within a signed disp32 of the cached value;
-/// otherwise `MOV_ri` loads `addr` and records it.
-fn addr_as_reg_offset_raw(
-    mc: &mut Assembler,
-    scratch_register_value: &mut i64,
-    addr: i64,
-) -> (u8, i32) {
-    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-    if *scratch_register_value != -1 {
-        let offset = addr.wrapping_sub(*scratch_register_value);
-        if rx86::fits_in_32bits(offset) {
-            return (scratch, offset as i32);
-        }
-    }
-    *scratch_register_value = addr;
-    rx86::mov_ri(mc, scratch, addr);
-    (scratch, 0)
-}
-
 /// `_build_failure_recovery(exc, withfloats)`.
 ///
 /// Entered by `jmp`, not `call`, with the two words `generate_quick_failure`
@@ -934,22 +887,16 @@ fn addr_as_reg_offset_raw(
 /// `pos_exc_value`, and stores `ebx` to `jf_guard_exc`. Pops the two words
 /// into `jf_gcmap` and `jf_descr`, then `_call_footer`. Index in
 /// `failure_recovery_code` is `exc + 2 * withfloats`.
-fn emit_failure_recovery(mc: &mut Assembler, exc: bool, withfloats: bool) {
+fn emit_failure_recovery(mc: &mut LocationCodeBuilder, exc: bool, withfloats: bool) {
     push_all_regs_to_jitframe_raw(mc, &[], withfloats, false);
     if exc {
         let exc_value_addr = crate::jit_exc_value_addr() as i64;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        // `MOV(ebx, heap(pos_exc_value))`, then the two `MOV(heap(..),
-        // imm0)`. The cells do not fit a disp32, so each address goes
-        // through `_addr_as_reg_offset`; the stub starts from a fresh
-        // `MachineCodeBlockWrapper`, so r11 is unknown on entry.
-        let mut scratch_value = -1;
-        let mem = addr_as_reg_offset_raw(mc, &mut scratch_value, exc_value_addr);
-        rx86::mov_rm(mc, rx86::EBX, mem);
-        let mem = addr_as_reg_offset_raw(mc, &mut scratch_value, exc_type_addr);
-        rx86::mov_mi(mc, mem, 0);
-        let mem = addr_as_reg_offset_raw(mc, &mut scratch_value, exc_value_addr);
-        rx86::mov_mi(mc, mem, 0);
+        // We might have an exception pending.  Load it into ebx...
+        mc.MOV(crate::regloc::EBX, heap(exc_value_addr));
+        mc.MOV(heap(exc_type_addr), imm(0));
+        mc.MOV(heap(exc_value_addr), imm(0));
+        // save ebx into 'jf_guard_exc'
         rx86::mov_br(mc, JF_GUARD_EXC_OFS, rx86::EBX);
     }
     // Top of stack is the gcmap, then the descr (`generate_quick_failure`).
@@ -970,9 +917,10 @@ pub(crate) fn build_failure_recoveries(
         .into_iter()
         .enumerate()
     {
-        let mut mc = Assembler::new(0);
+        let mut mc = LocationCodeBuilder::new();
         emit_failure_recovery(&mut mc, exc, withfloats);
-        let buffer = codebuf::finalize_executable(mc, arena).expect("failure_recovery: finalize");
+        let buffer = codebuf::finalize_executable(mc.into_inner(), arena)
+            .expect("failure_recovery: finalize");
         let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
         assert!(ptr != 0, "failure_recovery_code[{index}] entry is null");
         addrs[index] = ptr;
@@ -1017,7 +965,7 @@ pub(crate) fn build_propagate_exception_path(
     cpu_handle: &crate::guard::CpuDescrHandle,
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
-    let mut asm = Assembler::new(0);
+    let mut asm = LocationCodeBuilder::new();
     let propagate_descr = cpu_handle.read().descr_ptrs().propagate_exception_descr as i64;
     assert!(
         propagate_descr != 0,
@@ -1025,95 +973,70 @@ pub(crate) fn build_propagate_exception_path(
          must be installed (pyjitpl.py:2283) before the trampoline is built \
          on this CPU"
     );
-    // assembler.py:1826-1843 `_store_and_reset_exception(self.mc, eax)`:
-    // read pos_exc_value into RAX, clear both globals.  On real OOM
+    // `_store_and_reset_exception(self.mc, eax)`. On real OOM
     // pos_exc_value is typically already NULL — the propagate descr's
-    // `handle_fail` raises MemoryError directly — but mirror the
-    // structure regardless.
-    let exc_value_addr = crate::jit_exc_value_addr() as i64;
-    let exc_type_addr = crate::jit_exc_type_addr() as i64;
-    rx86::mov_ri(&mut asm, rx86::EAX, exc_value_addr);
-    // Use R11 (X86_64_SCRATCH_REG) so RCX is free for the descr.
-    dynasm!(asm ; .arch x64
-        ; mov r11, [rax]
-        ; mov QWORD [rax], 0
-    );
-    rx86::mov_ri(&mut asm, rx86::EAX, exc_type_addr);
-    dynasm!(asm ; .arch x64 ; mov QWORD [rax], 0);
-    // assembler.py _build_propagate_exception_path — MOV [jf_guard_exc], pos_exc_value
-    rx86::mov_br(&mut asm, JF_GUARD_EXC_OFS, rx86::R11);
-    // assembler.py _build_propagate_exception_path — MOV [jf_descr], propagate_descr
-    rx86::mov_ri(&mut asm, rx86::ECX, propagate_descr);
-    rx86::mov_br(&mut asm, JF_DESCR_OFS, rx86::ECX);
+    // `handle_fail` raises MemoryError directly.
+    store_and_reset_exception(&mut asm, Some(crate::regloc::EAX), None, None);
+    rx86::mov_br(&mut asm, JF_GUARD_EXC_OFS, rx86::EAX);
+    asm.MOV(Operand::B(JF_DESCR_OFS), imm(propagate_descr));
     // assembler.py:342 `self._call_footer()` — restore callee-save,
     // set rax = rbp, ADD rsp, prologue_size, RET.
     emit_call_footer_raw(&mut asm);
-    let buffer =
-        codebuf::finalize_executable(asm, arena).expect("propagate_exception_path: finalize");
+    let buffer = codebuf::finalize_executable(asm.into_inner(), arena)
+        .expect("propagate_exception_path: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
 
-/// `assembler.py _store_and_reset_exception(mc, excvalloc, exctploc)` —
-/// free-fn variant for the helper builders: move `pos_exc_value` and
-/// `pos_exception` into the two registers and clear both.
-fn store_and_reset_exception_raw(asm: &mut Assembler, excvalloc: u8, exctploc: u8) {
+/// `assembler.py _store_and_reset_exception(mc, excvalloc, exctploc,
+/// tmploc)`: move `pos_exc_value` into `excvalloc`, or through `tmploc` into
+/// `jf_guard_exc`, and `pos_exception` into `exctploc`; then clear both.
+fn store_and_reset_exception(
+    mc: &mut LocationCodeBuilder,
+    excvalloc: Option<crate::regloc::RegLoc>,
+    exctploc: Option<crate::regloc::RegLoc>,
+    tmploc: Option<crate::regloc::RegLoc>,
+) {
     let exc_value_addr = crate::jit_exc_value_addr() as i64;
     let exc_type_addr = crate::jit_exc_type_addr() as i64;
-    let mut scratch_value = -1;
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
-    rx86::mov_rm(asm, excvalloc, mem);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
-    rx86::mov_rm(asm, exctploc, mem);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
-    rx86::mov_mi(asm, mem, 0);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
-    rx86::mov_mi(asm, mem, 0);
+    if tmploc.is_none() {
+        assert!(excvalloc.is_some());
+    }
+    if let Some(excvalloc) = excvalloc {
+        assert!(!excvalloc.is_xmm);
+        mc.MOV(excvalloc, heap(exc_value_addr));
+    } else if let Some(tmploc) = tmploc {
+        // if both are None, just ignore
+        mc.MOV(tmploc, heap(exc_value_addr));
+        mc.MOV(Operand::B(JF_GUARD_EXC_OFS), tmploc);
+    }
+    if let Some(exctploc) = exctploc {
+        assert!(!exctploc.is_xmm);
+        mc.MOV(exctploc, heap(exc_type_addr));
+    }
+    mc.MOV(heap(exc_type_addr), imm(0));
+    mc.MOV(heap(exc_value_addr), imm(0));
 }
 
-/// `assembler.py _restore_exception(mc, excvalloc, exctploc)` — free-fn
-/// variant: write the two registers back to `pos_exc_value` and
-/// `pos_exception`.
-fn restore_exception_raw(asm: &mut Assembler, excvalloc: u8, exctploc: u8) {
-    let mut scratch_value = -1;
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_value_addr() as i64);
-    rx86::mov_mr(asm, mem, excvalloc);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_type_addr() as i64);
-    rx86::mov_mr(asm, mem, exctploc);
-}
-
-/// `_store_and_reset_exception(mc, None, ebx, tmpreg)`: the value goes
-/// through `tmpreg` into `jf_guard_exc`, the type stays in `ebx`, then
-/// both cells are cleared. `ARG0` / `ARG1` are already set and must
-/// survive (`tmpreg` is `ecx` on SysV and `r12` on Win64).
-fn store_and_reset_exception_frame(asm: &mut Assembler, tmpreg: u8) {
+/// `assembler.py _restore_exception(mc, excvalloc, exctploc, tmploc)`.
+fn restore_exception(
+    mc: &mut LocationCodeBuilder,
+    excvalloc: Option<crate::regloc::RegLoc>,
+    exctploc: crate::regloc::RegLoc,
+    tmploc: Option<crate::regloc::RegLoc>,
+) {
     let exc_value_addr = crate::jit_exc_value_addr() as i64;
     let exc_type_addr = crate::jit_exc_type_addr() as i64;
-    let mut scratch_value = -1;
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
-    rx86::mov_rm(asm, tmpreg, mem);
-    rx86::mov_br(asm, JF_GUARD_EXC_OFS, tmpreg);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
-    rx86::mov_rm(asm, rx86::EBX, mem);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_type_addr);
-    rx86::mov_mi(asm, mem, 0);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, exc_value_addr);
-    rx86::mov_mi(asm, mem, 0);
+    if let Some(excvalloc) = excvalloc {
+        mc.MOV(heap(exc_value_addr), excvalloc);
+    } else {
+        let tmploc = tmploc.expect("_restore_exception: tmploc is not None");
+        mc.MOV(tmploc, Operand::B(JF_GUARD_EXC_OFS));
+        rx86::mov_bi(mc, JF_GUARD_EXC_OFS, 0);
+        mc.MOV(heap(exc_value_addr), tmploc);
+    }
+    mc.MOV(heap(exc_type_addr), exctploc);
 }
-
-/// `_restore_exception(mc, None, ebx, ecx)`. `ecx` even on Win64, where
-/// the store used `r12`: load `jf_guard_exc`, clear the slot, write
-/// `pos_exc_value`, then `pos_exception` from `ebx`.
-fn restore_exception_frame(asm: &mut Assembler) {
-    rx86::mov_rb(asm, rx86::ECX, JF_GUARD_EXC_OFS);
-    rx86::mov_bi(asm, JF_GUARD_EXC_OFS, 0);
-    let mut scratch_value = -1;
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_value_addr() as i64);
-    rx86::mov_mr(asm, mem, rx86::ECX);
-    let mem = addr_as_reg_offset_raw(asm, &mut scratch_value, crate::jit_exc_type_addr() as i64);
-    rx86::mov_mr(asm, mem, rx86::EBX);
-}
-
 /// `build_frame_realloc_slowpath`. The caller has executed
 /// `IncreaseStackSlowPath.generate_body`: depth at `[rsp + WORD]` (the
 /// `PASS_ON_MY_FRAME` scratch) and `push_gcmap` already done. `CALL` then
@@ -1121,40 +1044,32 @@ fn restore_exception_frame(asm: &mut Assembler) {
 pub(crate) fn build_frame_realloc_slowpath(
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
-    let mut asm = Assembler::new(0);
+    let mut asm = LocationCodeBuilder::new();
     push_all_regs_to_jitframe_raw(&mut asm, &[], true, false);
     #[cfg(target_os = "windows")]
-    let (arg0, arg1, tmpreg, align) = (rx86::ECX, rx86::EDX, rx86::R12, 40);
+    let (arg0, arg1, tmpreg, align) = (rx86::ECX, rx86::EDX, crate::regloc::R12, 40);
     #[cfg(not(target_os = "windows"))]
-    let (arg0, arg1, tmpreg, align) = (rx86::EDI, rx86::ESI, rx86::ECX, 8);
+    let (arg0, arg1, tmpreg, align) = (rx86::EDI, rx86::ESI, crate::regloc::ECX, 8);
     // `MOV_rs(ARG1, WORD*2)` then `MOV ARG0, ebp`.
     rx86::mov_rs(&mut asm, arg1, (WORD * 2) as i32);
     dynasm!(asm ; .arch x64 ; mov Rq(arg0), rbp);
     rx86::sub_ri(&mut asm, rx86::ESP, align);
-    store_and_reset_exception_frame(&mut asm, tmpreg);
-    rx86::mov_ri(
-        &mut asm,
-        rx86::R11,
-        crate::runner::dynasm_realloc_frame as *const () as i64,
-    );
-    dynasm!(asm
-        ; .arch x64
-        ; call r11
-        ; mov rbp, rax
-    );
-    restore_exception_frame(&mut asm);
+    let ebx = crate::regloc::EBX;
+    store_and_reset_exception(&mut asm, None, Some(ebx), Some(tmpreg));
+    asm.CALL(imm(crate::runner::dynasm_realloc_frame as *const () as i64));
+    dynasm!(asm ; .arch x64 ; mov rbp, rax);
+    restore_exception(&mut asm, None, ebx, Some(crate::regloc::ECX));
     rx86::add_ri(&mut asm, rx86::ESP, align);
     // `_load_shadowstack_top_in_ebx` then `MOV [ebx - WORD], eax`.
     // `eax` still holds the new frame; restore ran before this store.
     let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
-    rx86::mov_ri(&mut asm, rx86::R11, rst);
-    rx86::mov_rm(&mut asm, rx86::EBX, (rx86::R11, 0));
+    asm.MOV(ebx, heap(rst));
     rx86::mov_mr(&mut asm, (rx86::EBX, -(WORD as i32)), rx86::EAX);
     rx86::mov_bi(&mut asm, JF_GCMAP_OFS, 0);
     pop_all_regs_from_jitframe_raw(&mut asm, &[], true, false);
     dynasm!(asm ; .arch x64 ; ret);
-    let buffer =
-        codebuf::finalize_executable(asm, arena).expect("frame_realloc_slowpath: finalize");
+    let buffer = codebuf::finalize_executable(asm.into_inner(), arena)
+        .expect("frame_realloc_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
@@ -1172,7 +1087,7 @@ pub(crate) fn build_stack_check_slowpath(
         propagate_exception_path != 0,
         "build_stack_check_slowpath: propagate_exception_path is 0"
     );
-    let mut asm = Assembler::new(0);
+    let mut asm = LocationCodeBuilder::new();
     #[cfg(target_os = "windows")]
     let (arg0, align) = (rx86::ECX, 40);
     #[cfg(not(target_os = "windows"))]
@@ -1180,11 +1095,9 @@ pub(crate) fn build_stack_check_slowpath(
     // `MOV ARG0, esp` before the alignment `sub`.
     dynasm!(asm ; .arch x64 ; mov Rq(arg0), rsp);
     rx86::sub_ri(&mut asm, rx86::ESP, align);
-    rx86::mov_ri(&mut asm, rx86::R11, slowpath_addr as i64);
-    dynasm!(asm ; .arch x64 ; call r11);
+    asm.CALL(imm(slowpath_addr as i64));
     rx86::add_ri(&mut asm, rx86::ESP, align);
-    rx86::mov_ri(&mut asm, rx86::R11, crate::jit_exc_type_addr() as i64);
-    rx86::mov_rm(&mut asm, rx86::EAX, (rx86::R11, 0));
+    asm.MOV(crate::regloc::EAX, heap(crate::jit_exc_type_addr() as i64));
     let overflow = asm.new_dynamic_label();
     dynasm!(asm
         ; .arch x64
@@ -1197,9 +1110,9 @@ pub(crate) fn build_stack_check_slowpath(
     // drop my own return address, then `JMP(imm(propagate_exception_path))`
     // through r11, since the two helpers are separate arena blocks.
     rx86::add_ri(&mut asm, rx86::ESP, WORD as i32);
-    rx86::mov_ri(&mut asm, rx86::R11, propagate_exception_path as i64);
-    dynasm!(asm ; .arch x64 ; jmp r11);
-    let buffer = codebuf::finalize_executable(asm, arena).expect("stack_check_slowpath: finalize");
+    asm.JMP(imm(propagate_exception_path as i64));
+    let buffer = codebuf::finalize_executable(asm.into_inner(), arena)
+        .expect("stack_check_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
@@ -1237,6 +1150,8 @@ pub(crate) fn build_cond_call_slowpaths(
         0,
         0,
         0,
+        0,
+        0,
         wb_slowpath,
         0,
         0,
@@ -1255,7 +1170,7 @@ pub(crate) fn build_cond_call_slowpaths(
             .enumerate()
     {
         asm.emit_cond_call_helper_variant(supports_floats, callee_only);
-        let mc = std::mem::replace(&mut asm.mc, Assembler::new(0));
+        let mc = asm.mc.take();
         let buffer = codebuf::finalize_executable(mc, arena).expect("cond_call_slowpath: finalize");
         let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
         assert!(ptr != 0, "cond_call_slowpath[{index}] entry is null");
@@ -1305,7 +1220,7 @@ pub(crate) fn build_wb_slowpath(
         }
         crate::runner::dynasm_write_barrier_from_array as *const () as i64
     };
-    let mut mc = Assembler::new(0);
+    let mut mc = LocationCodeBuilder::new();
     let word = WORD as i32;
     // win64: 4 extra unused words before CALL
     let shadow_save: i32 = if cfg!(target_os = "windows") {
@@ -1318,7 +1233,7 @@ pub(crate) fn build_wb_slowpath(
     let arg0 = rx86::ECX;
     #[cfg(not(target_os = "windows"))]
     let arg0 = rx86::EDI;
-    let (exc0, exc1) = (rx86::EBX, rx86::R12);
+    let (exc0, exc1) = (crate::regloc::EBX, crate::regloc::R12);
     let add_to_esp;
     if !for_frame {
         push_all_regs_to_jitframe_raw(&mut mc, &[], withfloats, true);
@@ -1344,15 +1259,12 @@ pub(crate) fn build_wb_slowpath(
         rx86::mov_sr(&mut mc, shadow_save + word, rx86::EAX);
         rx86::movsd_sx(&mut mc, shadow_save + 2 * word, 0);
         dynasm!(mc ; .arch x64 ; mov Rq(arg0), rbp);
-        rx86::mov_sr(&mut mc, shadow_save + 5 * word, exc0);
-        rx86::mov_sr(&mut mc, shadow_save + 6 * word, exc1);
-        store_and_reset_exception_raw(&mut mc, exc0, exc1);
+        rx86::mov_sr(&mut mc, shadow_save + 5 * word, exc0.value);
+        rx86::mov_sr(&mut mc, shadow_save + 6 * word, exc1.value);
+        store_and_reset_exception(&mut mc, Some(exc0), Some(exc1), None);
     }
 
-    // `CALL(imm(func))`: a 64-bit target goes through the scratch register.
-    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-    rx86::mov_ri(&mut mc, scratch, func);
-    dynasm!(mc ; .arch x64 ; call Rq(scratch));
+    mc.CALL(imm(func));
 
     if withcards {
         // A final TEST8 before the RET, for the caller. Careful to not
@@ -1373,14 +1285,15 @@ pub(crate) fn build_wb_slowpath(
     } else {
         rx86::movsd_xs(&mut mc, 0, shadow_save + 2 * word);
         rx86::mov_rs(&mut mc, rx86::EAX, shadow_save + word);
-        restore_exception_raw(&mut mc, exc0, exc1);
-        rx86::mov_rs(&mut mc, exc0, shadow_save + 5 * word);
-        rx86::mov_rs(&mut mc, exc1, shadow_save + 6 * word);
+        restore_exception(&mut mc, Some(exc0), exc1, None);
+        rx86::mov_rs(&mut mc, exc0.value, shadow_save + 5 * word);
+        rx86::mov_rs(&mut mc, exc1.value, shadow_save + 6 * word);
         rx86::lea_rs(&mut mc, rx86::ESP, add_to_esp);
         dynasm!(mc ; .arch x64 ; ret);
     }
 
-    let buffer = codebuf::finalize_executable(mc, arena).expect("wb_slowpath: finalize");
+    let buffer =
+        codebuf::finalize_executable(mc.into_inner(), arena).expect("wb_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     Some((buffer, ptr))
 }
@@ -1431,7 +1344,7 @@ pub(crate) fn build_malloc_slowpath_fixed(
     // attrs).  The propagate descr itself is now baked once into the
     // standalone propagate trampoline, not re-baked here.
     let _ = cpu_handle;
-    let mut asm = Assembler::new(0);
+    let mut asm = LocationCodeBuilder::new();
 
     // assembler.py:264 `SUB_rr(edx, ecx)` — recover total_size at
     // runtime.  Both `malloc_cond` and `malloc_cond_varsize_frame`
@@ -1449,7 +1362,8 @@ pub(crate) fn build_malloc_slowpath_fixed(
         MallocSlowpathKind::Fixed,
     );
 
-    let buffer = codebuf::finalize_executable(asm, arena).expect("malloc_slowpath: finalize");
+    let buffer =
+        codebuf::finalize_executable(asm.into_inner(), arena).expect("malloc_slowpath: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
@@ -1460,7 +1374,7 @@ pub(crate) fn build_malloc_slowpath_headerless(
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
     let _ = cpu_handle;
-    let mut asm = Assembler::new(0);
+    let mut asm = LocationCodeBuilder::new();
 
     dynasm!(asm ; .arch x64 ; sub rdx, rcx);
 
@@ -1472,46 +1386,53 @@ pub(crate) fn build_malloc_slowpath_headerless(
         MallocSlowpathKind::Fixed,
     );
 
-    let buffer =
-        codebuf::finalize_executable(asm, arena).expect("malloc_slowpath_headerless: finalize");
+    let buffer = codebuf::finalize_executable(asm.into_inner(), arena)
+        .expect("malloc_slowpath_headerless: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
 
-/// `_build_malloc_slowpath(kind='var')`. Entry is `malloc_cond_varsize`'s
-/// contract: length in `edx`, tid in `ecx`, itemsize at `[rsp+WORD]` and
-/// `base_size` at `[rsp+2*WORD]`. Both words sit in the `PASS_ON_MY_FRAME`
-/// scratch (`MallocCondVarsizeSlowPath` stores itemsize with
-/// `MOV_si(WORD, itemsize)`; pyre also passes `base_size` to
-/// `dynasm_nursery_slowpath_varsize`). OOM only pops the return address:
-/// there is no callsite `sub rsp` to undo.
+/// `_build_malloc_slowpath(kind)` for `'var'`, `'str'` and `'unicode'`.
+/// Entry is `malloc_cond_varsize`'s contract: length in `edx`, tid in
+/// `ecx`, and for `'var'` the itemsize at `[rsp+WORD]` on the trace.
 pub(crate) fn build_malloc_slowpath_varsize(
     cpu_handle: &crate::guard::CpuDescrHandle,
+    kind: MallocSlowpathKind,
     propagate_path: usize,
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
     let _ = cpu_handle;
-    let mut asm = Assembler::new(0);
-    let slowpath_fn = crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64;
-    build_malloc_slowpath_body(
-        &mut asm,
-        slowpath_fn,
-        propagate_path,
-        MallocSlowpathKind::Varsize,
-    );
-    let buffer =
-        codebuf::finalize_executable(asm, arena).expect("malloc_slowpath_varsize: finalize");
+    let mut asm = LocationCodeBuilder::new();
+    // `get_malloc_slowpath_array_addr()` / `get_malloc_fn_addr('malloc_str')`
+    // / `get_malloc_fn_addr('malloc_unicode')`.
+    let slowpath_fn = match kind {
+        MallocSlowpathKind::Var => crate::runner::dynasm_malloc_array as *const () as i64,
+        MallocSlowpathKind::Str => crate::runner::dynasm_malloc_str as *const () as i64,
+        MallocSlowpathKind::Unicode => crate::runner::dynasm_malloc_unicode as *const () as i64,
+        MallocSlowpathKind::Fixed => {
+            panic!("build_malloc_slowpath_varsize: 'fixed' is build_malloc_slowpath_fixed")
+        }
+    };
+    build_malloc_slowpath_body(&mut asm, slowpath_fn, propagate_path, kind);
+    let buffer = codebuf::finalize_executable(asm.into_inner(), arena)
+        .expect("malloc_slowpath_varsize: finalize");
     let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
     (buffer, ptr)
 }
 
 /// How `_build_malloc_slowpath` turns the entry registers into the
 /// helper arguments. `Fixed` is `kind='fixed'` (size already in `edx`
-/// via the caller's `SUB rdx, rcx`). `Varsize` is `kind='var'`:
-/// length in `edx`, tid in `ecx`, and the caller's two stack words.
-enum MallocSlowpathKind {
+/// via the caller's `SUB rdx, rcx`). `Var` is `kind='var'`: length in
+/// `edx`, tid in `ecx`, itemsize in the caller's stack word. `Str` /
+/// `Unicode` are `kind='str'` / `'unicode'`: length in `edx`, and the tid
+/// `malloc_str` / `malloc_unicode` capture in `ecx` (`dynasm_malloc_str`
+/// takes it as an argument).
+#[derive(Clone, Copy)]
+pub(crate) enum MallocSlowpathKind {
     Fixed,
-    Varsize,
+    Str,
+    Unicode,
+    Var,
 }
 
 /// Body of `_build_malloc_slowpath` for `kind='fixed'` and `kind='var'`.
@@ -1525,10 +1446,11 @@ enum MallocSlowpathKind {
 
 /// `slowpath_fn` is the absolute address of the GC helper called by
 /// `MOV rax, imm64; CALL rax`.  `Fixed` passes the size in ARG0
-/// (RCX on Win64, RDI on SysV).  `Varsize` passes
-/// `(base_size, item_size, length, tid)`.  Result in RAX.
+/// (RCX on Win64, RDI on SysV).  `Var` passes
+/// `(itemsize, tid, num_elem)`; `Str` / `Unicode` pass `(tid, length)`.
+/// Result in RAX.
 fn build_malloc_slowpath_body(
-    asm: &mut Assembler,
+    asm: &mut LocationCodeBuilder,
     slowpath_fn: i64,
     propagate_path: usize,
     kind: MallocSlowpathKind,
@@ -1559,12 +1481,8 @@ fn build_malloc_slowpath_body(
     }
     // `_build_malloc_slowpath`: `kind='fixed'` passes the size
     // (`MOV ARG0, edx` after the caller's `SUB rdx, rcx`).
-    // `kind='var'` passes `(base_size, item_size, length, tid)` to
-    // `dynasm_nursery_slowpath_varsize`. After this `SUB`, the callsite's
-    // two scratch words sit above the return address: itemsize at
-    // `[rsp+align+2*WORD]`, base_size at `[rsp+align+3*WORD]`
-    // (`MallocCondVarsizeSlowPath` stored them at `[rsp+WORD]` and
-    // `[rsp+2*WORD]` on the trace).
+    // `kind='var'` reads the itemsize the callsite stored at `[rsp+WORD]`
+    // on the trace; after this `SUB` it sits at `[rsp+align+2*WORD]`.
     match kind {
         MallocSlowpathKind::Fixed => {
             #[cfg(target_os = "windows")]
@@ -1573,25 +1491,35 @@ fn build_malloc_slowpath_body(
             let arg0_reg: u8 = 7; // rdi
             dynasm!(asm ; .arch x64 ; mov Rq(arg0_reg), rdx);
         }
-        MallocSlowpathKind::Varsize => {
+        MallocSlowpathKind::Str | MallocSlowpathKind::Unicode => {
+            // `MOV_rr(ARG0, edx)` for the length; pyre's `malloc_str` takes
+            // the captured tid first, so `(tid, length)` is `(ecx, edx)`.
+            // On Win64 ARG0/ARG1 are ecx/edx already.
+            #[cfg(not(target_os = "windows"))]
+            dynasm!(asm ; .arch x64
+                ; mov rdi, rcx
+                ; mov rsi, rdx
+            );
+        }
+        MallocSlowpathKind::Var => {
+            // `malloc_array(itemsize, tid, num_elem)`. Careful ordering for
+            // Win64, where ARG0 is ecx and ARG1 is edx: ARG2 <- edx (length),
+            // ARG1 <- ecx (tid), then ARG0 <- the itemsize the callsite
+            // stored at `[rsp+WORD]`, now above the return address.
             let item_ofs = align + (WORD as i32) * 2;
-            let base_ofs = align + (WORD as i32) * 3;
             #[cfg(target_os = "windows")]
             {
-                // ARG0 is ecx and ARG1 is edx, which still hold tid and
-                // length. Move those into ARG3/ARG2 before the loads.
                 dynasm!(asm ; .arch x64
-                    ; mov r9, rcx
                     ; mov r8, rdx
+                    ; mov rdx, rcx
                 );
-                rx86::mov_rs(asm, rx86::EDX, item_ofs);
-                rx86::mov_rs(asm, rx86::ECX, base_ofs);
+                rx86::mov_rs(asm, rx86::ECX, item_ofs);
             }
             #[cfg(not(target_os = "windows"))]
             {
-                // ARG2 is edx (length) and ARG3 is ecx (tid) already.
-                rx86::mov_rs(asm, rx86::EDI, base_ofs);
-                rx86::mov_rs(asm, rx86::ESI, item_ofs);
+                // ARG2 is edx already.
+                dynasm!(asm ; .arch x64 ; mov rsi, rcx);
+                rx86::mov_rs(asm, rx86::EDI, item_ofs);
             }
         }
     }
@@ -1701,16 +1629,14 @@ fn build_malloc_slowpath_body(
     // so a relative external jump could otherwise fail with
     // `ImpossibleRelocation` and trip the caller's `expect("malloc_slowpath:
     // finalize")` on affected layouts.
-    let propagate_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
     // `ADD esp, WORD` pops the trampoline return address so
     // `_call_footer` in `propagate_exception_path` sees the trace body
-    // rsp `_call_header` left. Varsize's itemsize and base_size live in
-    // the `PASS_ON_MY_FRAME` scratch, so this tail does not pop a callsite
+    // rsp `_call_header` left. The `'var'` itemsize lives in the
+    // `PASS_ON_MY_FRAME` scratch, so this tail does not pop a callsite
     // reservation.
     dynasm!(asm ; .arch x64 ; =>oom_tail);
     rx86::add_ri(asm, rx86::ESP, WORD as i32);
-    rx86::mov_ri(asm, propagate_scratch, propagate_path as i64);
-    dynasm!(asm ; .arch x64 ; jmp Rq(propagate_scratch));
+    asm.JMP(imm(propagate_path as i64));
 }
 
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
@@ -1731,24 +1657,18 @@ fn target_argloc_from_loc(loc: Loc) -> TargetArgLoc {
             ebp_offset: e.value,
             is_float: e.is_float,
         },
+        Loc::Esp(e) => panic!("LABEL target argloc must not be a RawEspLoc, got {e:?}"),
         Loc::Frame(f) => TargetArgLoc::Frame {
             position: f.get_position(),
             ebp_offset: f.ebp_loc.value,
             is_float: f.ebp_loc.is_float,
         },
-        Loc::Immed(i) => TargetArgLoc::Immed {
-            value: i.value,
-            is_float: false,
-        },
-        Loc::ImmedFloat(i) => TargetArgLoc::Immed {
-            value: i.value,
-            is_float: true,
-        },
-        // `ConstFloatLoc` is an absolute address (`location_code` `'j'`).
-        Loc::ConstFloat(c) => TargetArgLoc::Immed {
-            value: c.value as i64,
-            is_float: true,
-        },
+        // `consider_label`: `assert not isinstance(arg, Const)`, so
+        // `_x86_arglocs` never holds an `ImmedLoc`, `FloatImmedLoc` or
+        // `ConstFloatLoc`.
+        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::ConstFloat(_) => {
+            panic!("LABEL target argloc must not be a constant location, got {loc:?}")
+        }
         Loc::Addr(a) => TargetArgLoc::Addr {
             base: a.base,
             index: a.index,
@@ -1775,15 +1695,8 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
             ebp_offset,
             is_float,
         } => Loc::Frame(crate::regloc::FrameLoc::new(position, ebp_offset, is_float)),
-        TargetArgLoc::Immed { value, is_float } => {
-            if is_float {
-                // Written by `target_argloc_from_loc` for `ConstFloatLoc`.
-                Loc::ConstFloat(crate::regloc::ConstFloatLoc {
-                    value: value as usize,
-                })
-            } else {
-                Loc::immed(value)
-            }
+        TargetArgLoc::Immed { .. } => {
+            panic!("LABEL target argloc must not be a constant location, got {loc:?}")
         }
         TargetArgLoc::Addr {
             base,
@@ -1825,10 +1738,27 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
         Loc::Reg(reg) => Some(
             reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
         ),
-        Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
-        Loc::Immed(_) | Loc::ImmedFloat(_) | Loc::ConstFloat(_) | Loc::Ebp(_) | Loc::Addr(_) => {
-            None
+        Loc::Frame(frame) => {
+            // `store_info_on_descr`: `(loc.value - base_ofs) // WORD`, with
+            // the misalignment and overflow assertions; 0xFFFF is the hole.
+            assert_eq!(
+                frame.ebp_loc.value & (WORD as i32 - 1),
+                0,
+                "store_info_on_descr: misaligned"
+            );
+            let position = frame.get_position() + JITFRAME_FIXED_SIZE;
+            assert!(
+                0 < position && position < 0xFFFF,
+                "store_info_on_descr: overflow!"
+            );
+            Some(position as u16)
         }
+        Loc::Immed(_)
+        | Loc::ImmedFloat(_)
+        | Loc::ConstFloat(_)
+        | Loc::Ebp(_)
+        | Loc::Esp(_)
+        | Loc::Addr(_) => None,
     }
 }
 
@@ -1941,6 +1871,12 @@ struct SlowPath {
     kind: SlowPathKind,
 }
 
+/// rewrite.py `FLAG_ARRAY` / `FLAG_STR` / `FLAG_UNICODE`: the `kind`
+/// argument of `CALL_MALLOC_NURSERY_VARSIZE`.
+const FLAG_ARRAY: i64 = 0;
+const FLAG_STR: i64 = 1;
+const FLAG_UNICODE: i64 = 2;
+
 /// Body selected by `SlowPath.generate`.
 enum SlowPathKind {
     WriteBarrier {
@@ -1982,13 +1918,14 @@ enum SlowPathKind {
         result_reg: u8,
         synthesize: Option<(u8, i32)>,
     },
-    /// `MallocCondVarsizeSlowPath` for `FLAG_ARRAY`. `lengthloc` is the
-    /// length operand captured before the fast path rewrites `edx`.
+    /// `MallocCondVarsizeSlowPath`. `kind` is `FLAG_ARRAY` / `FLAG_STR` /
+    /// `FLAG_UNICODE`. `lengthloc` is the length operand captured before
+    /// the fast path rewrites `edx`.
     MallocCondVarsize {
         gcmap: usize,
         result_reg: u8,
+        kind: i64,
         itemsize: i64,
-        base_size: i64,
         type_id: i64,
         lengthloc: Loc,
     },
@@ -2003,7 +1940,7 @@ enum SlowPathKind {
 /// (RPython `box.type` parity); no `value_types: HashMap` side-table.
 pub struct Assembler386<'a> {
     /// The dynasm assembler (rx86.py + codebuf.py combined).
-    pub(crate) mc: Assembler,
+    pub(crate) mc: LocationCodeBuilder,
     /// `BaseAssembler.asmmemmgr`: destination arena for materialization.
     asm_memory_manager: Arc<AsmMemoryManager>,
     /// assembler.py:83 pending_guard_tokens — guards awaiting recovery stubs.
@@ -2014,9 +1951,11 @@ pub struct Assembler386<'a> {
     /// overwrite it.
     min_bytes_before_label: usize,
     /// GC bitmap to push before the current collecting call (e.g.,
-    /// CallMallocNursery slow path). Set by the `RegAllocOp::Perform`
-    /// emit path when `gcmap: Some(..)` is carried, cleared after.
+    /// CallMallocNursery slow path). Set by `regalloc_perform` when the
+    /// regalloc captured one, cleared after.
     pending_malloc_nursery_gcmap: Option<usize>,
+    /// Index of the next guard / FINISH descr in `fail_descrs`.
+    fail_index: u32,
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
     /// `BaseAssembler._previous_rd_locs`.
@@ -2165,6 +2104,10 @@ pub struct Assembler386<'a> {
     malloc_slowpath_headerless: usize,
     /// `_build_malloc_slowpath(kind='var')`. `malloc_cond_varsize` calls it.
     malloc_slowpath_varsize: usize,
+    /// `_build_malloc_slowpath(kind='str')`.
+    malloc_slowpath_str: usize,
+    /// `_build_malloc_slowpath(kind='unicode')`.
+    malloc_slowpath_unicode: usize,
     /// `assembler.py self.wb_slowpath`, resolved by
     /// `X86CpuExt::ensure_wb_slowpath`.
     wb_slowpath: [usize; 5],
@@ -2196,10 +2139,6 @@ pub struct Assembler386<'a> {
     /// (`X86XMMRegisterManager.convert_to_imm` → `ConstFloatLoc`), not in
     /// the instruction stream.
     datablockwrapper: MachineDataBlockWrapper,
-    /// `LocationCodeBuilder._scratch_register_value`. `-1` means unknown.
-    /// `_addr_as_reg_offset` rewrites a `ConstFloatLoc` that does not fit a
-    /// signed disp32 as `X86_64_SCRATCH_REG` (r11) plus a disp32.
-    scratch_register_value: i64,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -2253,23 +2192,10 @@ struct RecoveryStub {
     guard_not_invalidated: bool,
 }
 
-fn fail_cell_capacity(ra_ops: &[RegAllocOp], ops: &[OpRc]) -> usize {
-    let mut n = 0;
-    for ra in ra_ops {
-        match ra {
-            RegAllocOp::PerformGuard { .. } | RegAllocOp::PerformGuard1 { .. } => n += 1,
-            RegAllocOp::Perform { op_index, .. }
-            | RegAllocOp::Perform1 { op_index, .. }
-            | RegAllocOp::PerformDiscard { op_index, .. }
-            | RegAllocOp::PerformDiscardGcStore { op_index, .. } => {
-                if ops[*op_index].opcode == OpCode::Finish {
-                    n += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    n
+fn fail_cell_capacity(ops: &[OpRc]) -> usize {
+    ops.iter()
+        .filter(|op| op.opcode.is_guard() || op.opcode == OpCode::Finish)
+        .count()
 }
 
 /// Compiled output from assemble_loop/assemble_bridge.
@@ -2382,6 +2308,8 @@ impl<'a> Assembler386<'a> {
         malloc_slowpath_fixed: usize,
         malloc_slowpath_headerless: usize,
         malloc_slowpath_varsize: usize,
+        malloc_slowpath_str: usize,
+        malloc_slowpath_unicode: usize,
         wb_slowpath: [usize; 5],
         propagate_exception_path: usize,
         frame_realloc_slowpath: usize,
@@ -2395,11 +2323,12 @@ impl<'a> Assembler386<'a> {
         let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
         let datablockwrapper = MachineDataBlockWrapper::new(Arc::clone(&asm_memory_manager));
         Assembler386 {
-            mc: Assembler::new(0),
+            mc: LocationCodeBuilder::new(),
             asm_memory_manager,
             pending_guard_tokens: Vec::new(),
             min_bytes_before_label: 0,
             pending_malloc_nursery_gcmap: None,
+            fail_index: 0,
             frame_depth: JITFRAME_FIXED_SIZE,
             previous_rd_locs: majit_ir::RdLocs::new(),
             fail_descrs: FailDescrStore::default(),
@@ -2442,6 +2371,8 @@ impl<'a> Assembler386<'a> {
             malloc_slowpath_fixed,
             malloc_slowpath_headerless,
             malloc_slowpath_varsize,
+            malloc_slowpath_str,
+            malloc_slowpath_unicode,
             wb_slowpath,
             propagate_exception_path,
             frame_realloc_slowpath,
@@ -2451,134 +2382,6 @@ impl<'a> Assembler386<'a> {
             gcref_table: Vec::new(),
             finish_descr_words: Vec::new(),
             datablockwrapper,
-            scratch_register_value: -1,
-        }
-    }
-
-    /// `LocationCodeBuilder.forget_scratch_register`.
-    ///
-    /// A write of `X86_64_SCRATCH_REG` drops the cached address before the
-    /// instruction (`_binaryop` INSN). `CALL` and `JMP` drop it after the
-    /// instruction (`_relative_unaryop`): the callee clobbers r11, and the
-    /// bytes after a `JMP` are not a fallthrough that still holds it.
-    /// `ret` is the same kind of boundary. Conditional jumps do not forget.
-    ///
-    /// `RegAlloc.flush_loop` reaches this through
-    /// `MachineCodeBlockWrapper.get_relative_pos` (`break_basic_block`).
-    /// A bound label that is a real join still forgets: the fallthrough's
-    /// cached value does not describe the other edge. A `SlowPath` continue
-    /// label does not. `set_continue_here` records the cache
-    /// (`saved_scratch_value_2`) and `SlowPath.generate` reloads it with
-    /// `load_scratch_if_known` before jumping back, so both edges agree.
-    /// `_addr_as_reg_offset` records a new address after its raw `MOV_ri`
-    /// instead of leaving r11 unknown.
-    fn forget_scratch_register(&mut self) {
-        self.scratch_register_value = -1;
-    }
-
-    /// `LocationCodeBuilder` INSN: forget only when the written GPR is
-    /// `X86_64_SCRATCH_REG`.
-    fn forget_if_scratch_written(&mut self, reg: u8) {
-        if reg == crate::regloc::X86_64_SCRATCH_REG.value {
-            self.forget_scratch_register();
-        }
-    }
-
-    /// `LocationCodeBuilder._relative_unaryop`: `CALL` and `JMP` forget
-    /// after the instruction. Also used after `ret`, where the next bytes
-    /// emitted are a new entry rather than a fallthrough.
-    fn forget_after_call_or_jmp(&mut self) {
-        self.forget_scratch_register();
-    }
-
-    /// `LocationCodeBuilder._addr_as_reg_offset`: a 64-bit address as
-    /// `(X86_64_SCRATCH_REG, disp32)`. Reuse the value already in r11 when
-    /// the difference fits a signed disp32; otherwise `MOV_ri` reloads it.
-    fn addr_as_reg_offset(&mut self, addr: i64) -> (u8, i32) {
-        addr_as_reg_offset_raw(&mut self.mc, &mut self.scratch_register_value, addr)
-    }
-
-    /// `LocationCodeBuilder._load_scratch`: put `value` in
-    /// `X86_64_SCRATCH_REG` for an instruction that reads it. Nothing is
-    /// emitted when r11 already holds `value`, `LEA r11, [r11 + d]` covers a
-    /// difference that fits a signed disp32, and `MOV_ri` the rest.
-    fn load_scratch(&mut self, value: i64) {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        if self.scratch_register_value != -1 {
-            if self.scratch_register_value == value {
-                return;
-            }
-            let offset = value.wrapping_sub(self.scratch_register_value);
-            if rx86::fits_in_32bits(offset) {
-                rx86::lea_rm(&mut self.mc, scratch, (scratch, offset as i32));
-                self.scratch_register_value = value;
-                return;
-            }
-        }
-        rx86::mov_ri(&mut self.mc, scratch, value);
-        self.scratch_register_value = value;
-    }
-
-    /// `Assembler386.mov` → `MOVSD` of a `ConstFloatLoc` (location code `'j'`).
-    /// An address that fits a signed disp32 is `MOVSD_xj` (`encode_abs`);
-    /// otherwise `_addr_as_reg_offset` then `MOVSD_xm`.
-    /// The pool slot was allocated by `X86XMMRegisterManager.convert_to_imm`.
-    fn emit_movsd_const_float(&mut self, dst: u8, loc: crate::regloc::ConstFloatLoc) {
-        let addr = loc.value as i64;
-        if rx86::fits_in_32bits(addr) {
-            rx86::movsd_xj(&mut self.mc, dst, addr as i32);
-        } else {
-            let (reg, offset) = self.addr_as_reg_offset(addr);
-            rx86::movsd_xm(&mut self.mc, dst, (reg, offset));
-        }
-    }
-
-    /// `_binaryop` / `_cmpop_float`: the second SSE operand keeps its
-    /// location code. `'x'` is `*_xx`, `'b'` is `*_xb`, a `ConstFloatLoc`
-    /// (`'j'`) that fits a signed disp32 is `*_xj`, and one that does not
-    /// is `_addr_as_reg_offset` then `*_xm`.
-    fn emit_sd_src(
-        &mut self,
-        dst: u8,
-        src: &Loc,
-        xx: fn(&mut Assembler, u8, u8),
-        xb: fn(&mut Assembler, u8, i32),
-        xm: fn(&mut Assembler, u8, (u8, i32)),
-        xj: fn(&mut Assembler, u8, i32),
-    ) {
-        match src {
-            Loc::Reg(s) => xx(&mut self.mc, dst, s.value),
-            ebp_loc_pat!(slot) => xb(&mut self.mc, dst, slot.value),
-            Loc::ConstFloat(c) => {
-                let addr = c.value as i64;
-                if rx86::fits_in_32bits(addr) {
-                    xj(&mut self.mc, dst, addr as i32);
-                } else {
-                    let (reg, offset) = self.addr_as_reg_offset(addr);
-                    xm(&mut self.mc, dst, (reg, offset));
-                }
-            }
-            other => panic!(
-                "SSE source must be a register, frame slot, or ConstFloatLoc \
-                 (_binaryop / convert_to_imm), got {other:?}"
-            ),
-        }
-    }
-
-    /// `heap`: location code `'j'`, or `_addr_as_reg_offset` then `'m'`
-    /// when the address does not fit a signed disp32.
-    fn emit_pd_heap(
-        &mut self,
-        xmm: u8,
-        addr: i64,
-        xm: fn(&mut Assembler, u8, (u8, i32)),
-        xj: fn(&mut Assembler, u8, i32),
-    ) {
-        if rx86::fits_in_32bits(addr) {
-            xj(&mut self.mc, xmm, addr as i32);
-        } else {
-            let (reg, offset) = self.addr_as_reg_offset(addr);
-            xm(&mut self.mc, xmm, (reg, offset));
         }
     }
 
@@ -2590,20 +2393,23 @@ impl<'a> Assembler386<'a> {
         (low, high)
     }
 
-    /// `regalloc_immedmem2mem`: a `ConstFloatLoc` stored to a frame slot is
-    /// two `MOV32_bi` of the halves already written into the data block.
-    fn regalloc_immedmem2mem(&mut self, from: crate::regloc::ConstFloatLoc, to_offset: i32) {
+    /// `regalloc_immedmem2mem`: a `ConstFloatLoc` moved directly to a
+    /// `RawEbpLoc` or `RawEspLoc` is two 32-bit immediate stores of the
+    /// halves already written into the data block (even on x86-64, because
+    /// the immediates are encoded as 32 bits).
+    fn regalloc_immedmem2mem(&mut self, from: crate::regloc::ConstFloatLoc, to_loc: &Loc) {
         let (low, high) = Self::const_float_halves(from);
-        rx86::mov32_bi(&mut self.mc, to_offset, low);
-        rx86::mov32_bi(&mut self.mc, to_offset.wrapping_add(4), high);
-    }
-
-    /// `regalloc_immedmem2mem` for a `RawEspLoc`: two `MOV32_si`.
-    /// `mov32_mi((ESP, offset))` is that encoding (`encode_stack_sp`).
-    fn regalloc_immedmem2esp(&mut self, from: crate::regloc::ConstFloatLoc, offset: i32) {
-        let (low, high) = Self::const_float_halves(from);
-        rx86::mov32_mi(&mut self.mc, (rx86::ESP, offset), low);
-        rx86::mov32_mi(&mut self.mc, (rx86::ESP, offset.wrapping_add(4)), high);
+        match to_loc {
+            ebp_loc_pat!(e) => {
+                rx86::mov32_bi(&mut self.mc, e.value, low);
+                rx86::mov32_bi(&mut self.mc, e.value.wrapping_add(4), high);
+            }
+            Loc::Esp(e) => {
+                rx86::mov32_si(&mut self.mc, e.value, low);
+                rx86::mov32_si(&mut self.mc, e.value.wrapping_add(4), high);
+            }
+            _ => panic!("regalloc_immedmem2mem to {to_loc:?}"),
+        }
     }
 
     /// `assembler.py reserve_gcref_table`: reserve `n` zeroed words,
@@ -2620,7 +2426,7 @@ impl<'a> Assembler386<'a> {
         );
         for _ in 0..n {
             let slot = self.mc.new_dynamic_label();
-            self.forget_scratch_register();
+            self.mc.forget_scratch_register();
             dynasm!(self.mc ; =>slot ; .u64 0);
             self.gcref_table.push(slot);
         }
@@ -2633,10 +2439,10 @@ impl<'a> Assembler386<'a> {
     fn emit_finish_descr_words(&mut self) {
         let words = std::mem::take(&mut self.finish_descr_words);
         for (slot, ptr) in words {
-            self.forget_scratch_register();
+            self.mc.forget_scratch_register();
             dynasm!(self.mc ; =>slot);
             for byte in ptr.to_le_bytes() {
-                DynasmApi::push(&mut self.mc, byte);
+                DynasmApi::push(&mut *self.mc, byte);
             }
         }
     }
@@ -2759,150 +2565,53 @@ impl<'a> Assembler386<'a> {
 
     /// Emit: ADD/SUB/AND/OR/XOR reg, loc
     fn emit_binop_reg_loc(&mut self, opcode: OpCode, dst_reg: u8, src: &Loc) {
-        // aarch64: load src to x16 scratch if not in register
-        match src {
-            Loc::Reg(s) => match opcode {
-                OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
-                    self.forget_if_scratch_written(dst_reg);
-                    dynasm!(self.mc ; .arch x64 ; add Rq(dst_reg), Rq(s.value));
-                }
-                OpCode::IntSub | OpCode::IntSubOvf => {
-                    self.forget_if_scratch_written(dst_reg);
-                    dynasm!(self.mc ; .arch x64 ; sub Rq(dst_reg), Rq(s.value));
-                }
-                OpCode::IntMul | OpCode::IntMulOvf => {
-                    self.forget_if_scratch_written(dst_reg);
-                    dynasm!(self.mc ; .arch x64 ; imul Rq(dst_reg), Rq(s.value));
-                }
-                OpCode::IntAnd => {
-                    self.forget_if_scratch_written(dst_reg);
-                    dynasm!(self.mc ; .arch x64 ; and Rq(dst_reg), Rq(s.value));
-                }
-                OpCode::IntOr => {
-                    self.forget_if_scratch_written(dst_reg);
-                    dynasm!(self.mc ; .arch x64 ; or  Rq(dst_reg), Rq(s.value));
-                }
-                OpCode::IntXor => {
-                    self.forget_if_scratch_written(dst_reg);
-                    dynasm!(self.mc ; .arch x64 ; xor Rq(dst_reg), Rq(s.value));
-                }
-                _ => {}
-            },
-            Loc::Frame(f) => {
-                let ofs = f.ebp_loc.value;
-                match opcode {
-                    OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::add_rb(&mut self.mc, dst_reg, ofs);
-                    }
-                    OpCode::IntSub | OpCode::IntSubOvf => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::sub_rb(&mut self.mc, dst_reg, ofs);
-                    }
-                    OpCode::IntMul | OpCode::IntMulOvf => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::imul_rb(&mut self.mc, dst_reg, ofs);
-                    }
-                    OpCode::IntAnd => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::and_rb(&mut self.mc, dst_reg, ofs);
-                    }
-                    OpCode::IntOr => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::or_rb(&mut self.mc, dst_reg, ofs);
-                    }
-                    OpCode::IntXor => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::xor_rb(&mut self.mc, dst_reg, ofs);
-                    }
-                    _ => {}
-                }
+        let dst = Operand::R(dst_reg);
+        match opcode {
+            OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
+                self.mc.ADD(dst, src)
             }
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                // genop_int_and: AND with (1<<32)-1 is one zero-extending MOV32.
-                // and r, imm32 would sign-extend 0xffffffff into an all-ones no-op.
-                if opcode == OpCode::IntAnd && i.value == (1i64 << 32) - 1 {
-                    self.forget_if_scratch_written(dst_reg);
-                    rx86::mov32_rr(&mut self.mc, dst_reg, dst_reg);
-                    return;
-                }
-                // regloc.py:456-464 — an immediate that does not fit in 32
-                // bits cannot use the imm32 form (the encoder would truncate
-                // it and the CPU sign-extend the low half, e.g. an
-                // 0xFFFF_FFFF_FFFF mask becoming an all-ones no-op);
-                // materialize it into the scratch register and retry as the
-                // reg-reg form.
-                let Ok(v) = i32::try_from(i.value) else {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG;
-                    self.load_scratch(i.value);
-                    self.emit_binop_reg_loc(opcode, dst_reg, &Loc::Reg(scratch));
-                    return;
-                };
-                match opcode {
-                    OpCode::IntAdd | OpCode::IntAddOvf | OpCode::NurseryPtrIncrement => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::add_ri(&mut self.mc, dst_reg, v);
-                    }
-                    OpCode::IntSub | OpCode::IntSubOvf => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::sub_ri(&mut self.mc, dst_reg, v);
-                    }
-                    OpCode::IntAnd => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::and_ri(&mut self.mc, dst_reg, v);
-                    }
-                    OpCode::IntOr => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::or_ri(&mut self.mc, dst_reg, v);
-                    }
-                    OpCode::IntXor => {
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::xor_ri(&mut self.mc, dst_reg, v);
-                    }
-                    OpCode::IntMul | OpCode::IntMulOvf => {
-                        // imul r64, r64, imm32 (sign-extended) — one instruction
-                        // instead of materializing the constant into a scratch reg.
-                        self.forget_if_scratch_written(dst_reg);
-                        rx86::imul_rri(&mut self.mc, dst_reg, dst_reg, v);
-                    }
-                    _ => {}
-                }
+            OpCode::IntSub | OpCode::IntSubOvf => self.mc.SUB(dst, src),
+            OpCode::IntMul | OpCode::IntMulOvf => self.mc.IMUL(dst, src),
+            // genop_int_and: AND with (1<<32)-1 is one zero-extending MOV32.
+            // and r, imm32 would sign-extend 0xffffffff into an all-ones no-op.
+            OpCode::IntAnd if matches!(src.as_immed(), Some((v, _)) if v == (1i64 << 32) - 1) => {
+                self.mc.MOV32(dst, dst)
             }
-            other => panic!(
-                "emit_binop_reg_loc: unhandled source {other:?} — no arithmetic is \
-            emitted and the destination keeps its previous value"
-            ),
+            OpCode::IntAnd => self.mc.AND(dst, src),
+            OpCode::IntOr => self.mc.OR(dst, src),
+            OpCode::IntXor => self.mc.XOR(dst, src),
+            _ => {}
         }
     }
 
     /// Emit: CMP loc0, loc1
     fn emit_cmp_loc_loc(&mut self, loc0: &Loc, loc1: &Loc) {
+        // `_binaryop('CMP')` has no xmm form: a FLOAT compare is `UCOMISD`
+        // (`genop_guard_guard_value`, `_cmpop_float`).
+        assert!(
+            !matches!(loc0, Loc::Reg(r) if r.is_xmm) && !matches!(loc1, Loc::Reg(r) if r.is_xmm),
+            "CMP on an xmm register ({loc0:?}, {loc1:?}); a FLOAT compare is UCOMISD"
+        );
         match (loc0, loc1) {
-            (Loc::Reg(r), Loc::Reg(s)) => {
-                dynasm!(self.mc ; .arch x64 ; cmp Rq(r.value), Rq(s.value));
-            }
-            (Loc::Reg(r), Loc::Frame(f)) => {
-                rx86::cmp_rb(&mut self.mc, r.value, f.ebp_loc.value);
-            }
-            (Loc::Reg(r), Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                self.emit_cmp_imm64(r.value, i.value);
-            }
-            (Loc::Frame(f), Loc::Reg(s)) => {
-                rx86::cmp_br(&mut self.mc, f.ebp_loc.value, s.value);
-            }
-            (Loc::Frame(f), Loc::Immed(i) | Loc::ImmedFloat(i)) => {
-                if let Ok(v) = i32::try_from(i.value) {
-                    rx86::cmp_bi(&mut self.mc, f.ebp_loc.value, v);
-                } else {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    self.load_scratch(i.value);
-                    rx86::cmp_br(&mut self.mc, f.ebp_loc.value, scratch);
+            (Loc::Immed(_) | Loc::ImmedFloat(_), _)
+            | (Loc::Frame(_) | Loc::Ebp(_), Loc::Frame(_) | Loc::Ebp(_)) => {
+                // No `CMP_i*` / `CMP_bb` encoding: the left operand is staged
+                // through the scratch register, which `INSN('CMP')` refuses,
+                // so the compare itself is the raw `CMP_r*` form.
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                self.mc.MOV(Operand::R(scratch), loc0);
+                match Operand::from(loc1) {
+                    Operand::R(s) => dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), Rq(s)),
+                    Operand::B(ofs) => rx86::cmp_rb(&mut self.mc, scratch, ofs),
+                    Operand::I(v) if rx86::fits_in_32bits(v) => {
+                        rx86::cmp_ri(&mut self.mc, scratch, v as i32)
+                    }
+                    // `_missing_binary_insn`: a second 64-bit operand would
+                    // need the scratch register too.
+                    _ => panic!("CMP has no encoding for ({loc0:?}, {loc1:?})"),
                 }
             }
-            _ => {
-                self.regalloc_mov(loc0, &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG));
-                self.emit_cmp_loc_loc(&Loc::Reg(crate::regloc::X86_64_SCRATCH_REG), loc1);
-            }
+            _ => self.mc.CMP(loc0, loc1),
         }
     }
 
@@ -2911,21 +2620,15 @@ impl<'a> Assembler386<'a> {
     /// the scratch register so the following branch does not read stale flags.
     fn emit_test_loc(&mut self, loc: &Loc) {
         match loc {
-            Loc::Reg(r) => {
-                dynasm!(self.mc ; .arch x64 ; test Rq(r.value), Rq(r.value));
-            }
-            Loc::Frame(f) => {
-                rx86::cmp_bi(&mut self.mc, f.ebp_loc.value, 0);
-            }
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+            Loc::Reg(r) => self.mc.TEST(*r, *r),
+            Loc::Immed(_) | Loc::ImmedFloat(_) => {
+                // Staged through the scratch register, which `INSN('TEST')`
+                // refuses, so the test is the raw `TEST_rr` form.
                 let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.load_scratch(i.value);
+                self.mc.MOV(Operand::R(scratch), loc);
                 dynasm!(self.mc ; .arch x64 ; test Rq(scratch), Rq(scratch));
             }
-            other => panic!(
-                "emit_test_loc: unhandled operand {other:?} — no test is emitted \
-            and the following branch reads stale flags"
-            ),
+            _ => self.mc.CMP(loc, imm(0)),
         }
     }
 
@@ -3077,11 +2780,10 @@ impl<'a> Assembler386<'a> {
         if self.stack_check_slowpath != 0 {
             let addrs = crate::stack_check_addresses()
                 .expect("stack_check_slowpath is built only after insert_stack_check");
-            let (sr, so) = self.addr_as_reg_offset(addrs.end_adr as i64);
-            rx86::mov_rm(&mut self.mc, rx86::EAX, (sr, so));
-            dynasm!(self.mc ; .arch x64 ; sub rax, rsp);
-            let (sr, so) = self.addr_as_reg_offset(addrs.length_adr as i64);
-            rx86::cmp_rm(&mut self.mc, rx86::EAX, (sr, so));
+            let eax = crate::regloc::EAX;
+            self.mc.MOV(eax, heap(addrs.end_adr as i64)); // MOV eax, [start]
+            self.mc.SUB(eax, crate::regloc::ESP); // SUB eax, current
+            self.mc.CMP(eax, heap(addrs.length_adr as i64)); // CMP eax, [length]
             // Condition `A`: not taken when `eax <= [length]`.
             // `set_continue_here` does not forget; the slow-path
             // epilogue reloads the r11 cache before jumping back.
@@ -3113,116 +2815,6 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    fn build_abi_arg_placements(
-        arg_types: &[Type],
-        arg_classes: &str,
-    ) -> (Vec<AbiArgPlacement>, usize) {
-        let mut placements = Vec::with_capacity(arg_types.len());
-        let mut stack_slots = 0usize;
-        let float_abi = |idx: usize, tp: Type| {
-            tp == Type::Float || arg_classes.as_bytes().get(idx) == Some(&b'S')
-        };
-        #[cfg(target_os = "windows")]
-        {
-            for (idx, tp) in arg_types.iter().copied().enumerate() {
-                let placement = if idx < 4 {
-                    if float_abi(idx, tp) {
-                        AbiArgPlacement::Xmm(idx as u8)
-                    } else {
-                        Self::abi_int_arg(idx)
-                    }
-                } else {
-                    let ofs = 32 + ((idx - 4) * WORD) as i32;
-                    stack_slots += 1;
-                    AbiArgPlacement::Stack(ofs)
-                };
-                placements.push(placement);
-            }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let mut gpr_idx = 0usize;
-            let mut xmm_idx = 0usize;
-            for (idx, tp) in arg_types.iter().copied().enumerate() {
-                let placement = if float_abi(idx, tp) {
-                    if xmm_idx < 8 {
-                        let p = AbiArgPlacement::Xmm(xmm_idx as u8);
-                        xmm_idx += 1;
-                        p
-                    } else {
-                        let p = AbiArgPlacement::Stack((stack_slots * WORD) as i32);
-                        stack_slots += 1;
-                        p
-                    }
-                } else if gpr_idx < 6 {
-                    let p = Self::abi_int_arg(gpr_idx);
-                    gpr_idx += 1;
-                    p
-                } else {
-                    let p = AbiArgPlacement::Stack((stack_slots * WORD) as i32);
-                    stack_slots += 1;
-                    p
-                };
-                placements.push(placement);
-            }
-        }
-        (placements, stack_slots)
-    }
-
-    /// `CallBuilder64.prepare_arguments` MOV32 of a spilled singlefloat.
-    fn emit_singlefloat_stack_store(&mut self, placement: AbiArgPlacement, src: Loc) {
-        let AbiArgPlacement::Stack(offset) = placement else {
-            panic!("singlefloat stack store is not a stack placement");
-        };
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        match src {
-            Loc::Reg(r) if !r.is_xmm => {
-                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), r.value);
-            }
-            Loc::Frame(f) => {
-                self.forget_if_scratch_written(scratch);
-                rx86::mov32_rm(&mut self.mc, scratch, (rx86::EBP, f.ebp_loc.value));
-                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), scratch);
-            }
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                rx86::mov32_mi(&mut self.mc, (rx86::ESP, offset), i.value as i32);
-            }
-            Loc::Reg(r) => {
-                self.forget_if_scratch_written(scratch);
-                dynasm!(self.mc ; .arch x64 ; movd Rd(scratch), Rx(r.value));
-                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), scratch);
-            }
-            other => panic!("singlefloat stack argument location {other:?}"),
-        }
-    }
-
-    /// `CallBuilder64.prepare_arguments` MOVD32 of a singlefloat argument.
-    fn emit_singlefloat_movd(&mut self, src: Loc, dst_xmm: u8) {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        match src {
-            Loc::Reg(r) if !r.is_xmm => {
-                dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(r.value));
-            }
-            Loc::Frame(f) => {
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_rb(&mut self.mc, scratch, f.ebp_loc.value);
-                dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(scratch));
-            }
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                self.load_scratch(i.value);
-                dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(scratch));
-            }
-            Loc::Reg(r) => {
-                self.forget_if_scratch_written(scratch);
-                dynasm!(self.mc ; .arch x64
-                    ; movd Rd(scratch), Rx(r.value)
-                    ; movd Rx(dst_xmm), Rd(scratch)
-                );
-            }
-            other => panic!("singlefloat argument location {other:?}"),
-        }
-    }
-
     fn emit_abi_arg_from_reg(
         &mut self,
         placement: AbiArgPlacement,
@@ -3230,83 +2822,42 @@ impl<'a> Assembler386<'a> {
         arg_type: Type,
     ) {
         match placement {
-            AbiArgPlacement::Gpr(dst) => {
-                if src.is_xmm {
-                    self.forget_if_scratch_written(dst);
-                    rx86::movdq_rx(&mut self.mc, dst, src.value);
-                } else {
-                    self.forget_if_scratch_written(dst);
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(dst), Rq(src.value));
-                }
+            AbiArgPlacement::Gpr(dst) if src.is_xmm => self.mc.MOVDQ(Operand::R(dst), src),
+            AbiArgPlacement::Gpr(dst) => self.mc.MOV(Operand::R(dst), src),
+            AbiArgPlacement::Stack(offset) if src.is_xmm && arg_type != Type::Float => {
+                rx86::movq_mx(&mut self.mc, (rx86::ESP, offset), src.value);
             }
-            AbiArgPlacement::Xmm(dst) => {
-                if src.is_xmm {
-                    rx86::movapd_xx(&mut self.mc, dst, src.value);
-                } else {
-                    rx86::movdq_xr(&mut self.mc, dst, src.value);
-                }
-            }
-            AbiArgPlacement::Stack(offset) => {
-                if src.is_xmm && arg_type == Type::Float {
-                    rx86::movsd_sx(&mut self.mc, offset, src.value);
-                } else if src.is_xmm {
-                    rx86::movq_mx(&mut self.mc, (rx86::ESP, offset), src.value);
-                } else {
-                    rx86::mov_sr(&mut self.mc, offset, src.value);
-                }
-            }
+            AbiArgPlacement::Stack(offset) if src.is_xmm => self.mc.MOVSD(Operand::S(offset), src),
+            AbiArgPlacement::Stack(offset) => self.mc.MOV(Operand::S(offset), src),
         }
     }
 
     fn emit_abi_arg_from_mem(&mut self, placement: AbiArgPlacement, offset: i32, arg_type: Type) {
+        let src = Operand::B(offset);
         match placement {
-            AbiArgPlacement::Gpr(dst) => {
-                self.forget_if_scratch_written(dst);
-                rx86::mov_rb(&mut self.mc, dst, offset);
-            }
-            AbiArgPlacement::Xmm(dst) => {
-                if arg_type == Type::Float {
-                    rx86::movsd_xb(&mut self.mc, dst, offset);
-                } else {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_rb(&mut self.mc, scratch, offset);
-                    rx86::movdq_xr(&mut self.mc, dst, scratch);
-                }
-            }
+            AbiArgPlacement::Gpr(dst) => self.mc.MOV(Operand::R(dst), src),
             AbiArgPlacement::Stack(dst_offset) => {
-                let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
+                let dst = Operand::S(dst_offset);
                 if arg_type == Type::Float {
-                    rx86::movsd_xb(&mut self.mc, scratch, offset);
-                    rx86::movsd_sx(&mut self.mc, dst_offset, scratch);
+                    let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG;
+                    self.mc.MOVSD(scratch, src);
+                    self.mc.MOVSD(dst, scratch);
                 } else {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_rb(&mut self.mc, scratch, offset);
-                    rx86::mov_sr(&mut self.mc, dst_offset, scratch);
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG;
+                    self.mc.MOV(scratch, src);
+                    self.mc.MOV(dst, scratch);
                 }
             }
         }
     }
 
     fn emit_abi_arg_from_imm(&mut self, placement: AbiArgPlacement, val: i64, arg_type: Type) {
-        match placement {
-            AbiArgPlacement::Gpr(dst) => {
-                self.forget_if_scratch_written(dst);
-                rx86::mov_ri(&mut self.mc, dst, val);
-            }
-            AbiArgPlacement::Xmm(dst) => {
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.load_scratch(val);
-                rx86::movdq_xr(&mut self.mc, dst, scratch);
-            }
-            AbiArgPlacement::Stack(offset) => {
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                let _ = arg_type;
-                self.load_scratch(val);
-                rx86::mov_sr(&mut self.mc, offset, scratch);
-            }
-        }
+        let _ = arg_type;
+        let dst = match placement {
+            AbiArgPlacement::Gpr(dst) => Operand::R(dst),
+            AbiArgPlacement::Stack(offset) => Operand::S(offset),
+        };
+        self.mc.MOV(dst, imm(val));
     }
 
     fn emit_abi_int_arg_from_reg(&mut self, idx: usize, src: u8) {
@@ -3366,29 +2917,12 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// `CallBuilderX86.subtract_esp_aligned`. Returns the bytes subtracted.
-    fn subtract_esp_aligned(&mut self, count: i32) -> i32 {
-        let bytes = super::callbuilder::aligned_esp_bytes(count);
-        if bytes != 0 {
-            rx86::sub_ri(&mut self.mc, rx86::ESP, bytes);
-        }
-        bytes
-    }
-
-    /// `CallBuilderX86.restore_stack_pointer` with `target_esp == 0`.
-    fn restore_stack_pointer(&mut self, current_esp: i32) {
-        if current_esp != 0 {
-            rx86::add_ri(&mut self.mc, rx86::ESP, current_esp);
-        }
-    }
-
     fn emit_abi_call_rax_with_extra_pushes(&mut self, extra_pushes: usize) {
         let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
         if adjust != 0 {
             rx86::sub_ri(&mut self.mc, rx86::ESP, adjust);
         }
-        dynasm!(self.mc ; .arch x64 ; call rax);
-        self.forget_after_call_or_jmp();
+        self.mc.CALL(crate::regloc::EAX);
         if adjust != 0 {
             rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
         }
@@ -3413,8 +2947,7 @@ impl<'a> Assembler386<'a> {
         if adjust != 0 {
             rx86::sub_ri(&mut self.mc, rx86::ESP, adjust);
         }
-        dynasm!(self.mc ; .arch x64 ; call Rq(reg));
-        self.forget_after_call_or_jmp();
+        self.mc.CALL(Operand::R(reg));
         if adjust != 0 {
             rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
         }
@@ -3433,7 +2966,7 @@ impl<'a> Assembler386<'a> {
     fn _call_footer(&mut self) {
         emit_call_footer_raw(&mut self.mc);
         // `RET` ends the basic block.
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
     }
 
     /// x86/assembler.py:254 `_push_all_regs_to_jitframe` parity. Writes
@@ -3522,14 +3055,13 @@ impl<'a> Assembler386<'a> {
     /// the two stores through `ebx`, which `_call_header` has saved.
     fn gen_shadowstack_header(&mut self) {
         let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
-        let (sr, so) = self.addr_as_reg_offset(rst);
-        rx86::mov_rm(&mut self.mc, rx86::EBX, (sr, so)); // MOV ebx, [rootstacktop]
+        let ebx = crate::regloc::EBX;
+        self.mc.MOV(ebx, heap(rst)); // MOV ebx, [rootstacktop]
         // the '1' is to benefit from the shadowstack 'is_minor' optimization
         rx86::mov_mi(&mut self.mc, (rx86::EBX, 0), 1); // MOV [ebx], 1
         rx86::mov_mr(&mut self.mc, (rx86::EBX, WORD as i32), rx86::EBP); // MOV [ebx + WORD], ebp
         rx86::add_ri(&mut self.mc, rx86::EBX, (WORD * 2) as i32);
-        let (sr, so) = self.addr_as_reg_offset(rst);
-        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EBX); // MOV [rootstacktop], ebx
+        self.mc.MOV(heap(rst), ebx); // MOV [rootstacktop], ebx
     }
 
     /// x86/assembler.py `_call_footer_shadowstack` parity:
@@ -3548,38 +3080,14 @@ impl<'a> Assembler386<'a> {
     fn gen_footer_shadowstack(&mut self) {
         emit_footer_shadowstack_raw(&mut self.mc);
         // `emit_footer_shadowstack_raw` writes `X86_64_SCRATCH_REG`.
-        self.forget_scratch_register();
-    }
-
-    /// `regloc.py` `_unaryop` for `PUSH(imm)`: `PUSH_i8` / `PUSH_i32`, or
-    /// `_load_scratch` and `PUSH_r` of `X86_64_SCRATCH_REG` when the word
-    /// does not fit a signed imm32. `r11` still holds `value` afterwards.
-    fn push_imm(&mut self, value: i64) {
-        if rx86::single_byte(value) {
-            rx86::push_i8(&mut self.mc, value as i8);
-        } else if rx86::fits_in_32bits(value) {
-            rx86::push_i32(&mut self.mc, value as i32);
-        } else {
-            self.load_scratch(value);
-            rx86::push_r(&mut self.mc, crate::regloc::X86_64_SCRATCH_REG.value);
-        }
+        self.mc.forget_scratch_register();
     }
 
     /// `push_gcmap(store=True)`: `MOV(raw_stack(ofs), imm(gcmap))`. A
     /// 64-bit immediate goes through `insn_with_64_bit_immediate`, which
     /// `_load_scratch`es it and stores the scratch register.
     fn push_gcmap(&mut self, gcmap: *mut usize) {
-        let gcmap_ptr = gcmap as i64;
-        if rx86::fits_in_32bits(gcmap_ptr) {
-            rx86::mov_bi(&mut self.mc, JF_GCMAP_OFS, gcmap_ptr as i32);
-        } else {
-            self.load_scratch(gcmap_ptr);
-            rx86::mov_br(
-                &mut self.mc,
-                JF_GCMAP_OFS,
-                crate::regloc::X86_64_SCRATCH_REG.value,
-            );
-        }
+        self.mc.MOV(Operand::B(JF_GCMAP_OFS), imm(gcmap as i64));
     }
 
     /// assembler.py:1000 pop_gcmap.
@@ -3591,7 +3099,7 @@ impl<'a> Assembler386<'a> {
     /// call, so the caller jitframe must publish the regalloc gcmap before
     /// entering the callee/helper and clear it only after reloading a possibly
     /// moved frame pointer.
-    fn push_pending_call_gcmap(&mut self) -> bool {
+    pub(crate) fn push_pending_call_gcmap(&mut self) -> bool {
         if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
             self.push_gcmap(gcmap as *mut usize);
             true
@@ -3600,7 +3108,7 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    fn pop_pending_call_gcmap_after_collect(&mut self, pushed: bool) {
+    pub(crate) fn pop_pending_call_gcmap_after_collect(&mut self, pushed: bool) {
         self.reload_frame_if_necessary();
         if pushed {
             self.pop_gcmap();
@@ -3662,7 +3170,7 @@ impl<'a> Assembler386<'a> {
         // `is_frame=true` calls `wb_slowpath[4]`.
         if crate::runner::dynasm_write_barrier_descr().is_some() {
             let rbp_loc = Loc::Reg(crate::regloc::EBP);
-            self.emit_write_barrier_fastpath_kind(&[rbp_loc], false, true);
+            self.emit_write_barrier_fastpath_kind(None, &[rbp_loc], false, true);
         }
     }
 
@@ -3679,8 +3187,8 @@ impl<'a> Assembler386<'a> {
         &self,
         fail_arg_types: &[Type],
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) -> *mut usize {
-        let frame_depth = self.frame_depth.saturating_sub(JITFRAME_FIXED_SIZE);
         let gcmap = allocate_gcmap(frame_depth, JITFRAME_FIXED_SIZE);
         for (tp, loc) in fail_arg_types.iter().zip(faillocs.iter()) {
             if *tp != Type::Ref {
@@ -3763,7 +3271,7 @@ impl<'a> Assembler386<'a> {
         // Create a dynamic label at the entry point for self-recursive
         // CALL_ASSEMBLER (redirect_call_assembler parity).
         let entry_label = self.mc.new_dynamic_label();
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; =>entry_label);
         self.self_entry_label = Some(entry_label);
         let entry = self.mc.offset();
@@ -3788,7 +3296,8 @@ impl<'a> Assembler386<'a> {
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
         self.emit_finish_descr_words();
-        let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
+        let mut buffer =
+            codebuf::finalize_writable(self.mc.into_inner(), &self.asm_memory_manager)?;
 
         // assembler.py:849 patch_pending_failure_recoveries
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
@@ -3924,7 +3433,8 @@ impl<'a> Assembler386<'a> {
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
         self.emit_finish_descr_words();
-        let mut buffer = codebuf::finalize_writable(self.mc, &self.asm_memory_manager)?;
+        let mut buffer =
+            codebuf::finalize_writable(self.mc.into_inner(), &self.asm_memory_manager)?;
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
@@ -4033,13 +3543,25 @@ impl<'a> Assembler386<'a> {
             let gcmap = ra.get_gcmap(&[], false);
             self.emit_check_frame_depth(gcmap);
         }
-        // `X86XMMRegisterManager.assembler.datablockwrapper`. `prepare_*`
-        // rebuilds `xrm`, and `emit_check_frame_depth` borrows this assembler,
-        // so the pointer is installed immediately before the walk.
-        ra.xrm.set_datablockwrapper(&mut self.datablockwrapper);
-        // assembler.py:374 walk_operations — get allocation decisions.
-        let ra_ops = ra.walk_operations()?;
-        self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(&ra_ops, ops));
+        if crate::majit_ops_log_enabled() {
+            eprintln!("[dynasm] _assemble: {} ops", ops.len());
+        }
+        // assembler.py:374 walk_operations — the regalloc drives this
+        // assembler op by op (`regalloc_perform*`). The XMM manager reaches
+        // `assembler.datablockwrapper` during it, so the wrapper leaves
+        // `self` for the walk instead of being reachable two ways.
+        // `LocationCodeBuilder` drops `_scratch_register_value` when
+        // `X86_64_SCRATCH_REG` is written and at the end of `CALL`/`JMP`
+        // (`_relative_unaryop`), not before every op.
+        self.fail_descrs = FailDescrStore::with_capacity(fail_cell_capacity(ops));
+        self.fail_index = 0;
+        let mut datablockwrapper = std::mem::replace(
+            &mut self.datablockwrapper,
+            MachineDataBlockWrapper::new(Arc::clone(&self.asm_memory_manager)),
+        );
+        let walked = ra.walk_operations_with_datablockwrapper(&mut datablockwrapper, self);
+        self.datablockwrapper = datablockwrapper;
+        walked?;
         // ra.get_final_frame_depth() returns a USER-position count; convert
         // to absolute by adding JITFRAME_FIXED_SIZE before comparing.
         let frame_slot_depth =
@@ -4047,7 +3569,7 @@ impl<'a> Assembler386<'a> {
         self.frame_depth = self.frame_depth.max(frame_slot_depth);
 
         // Sync regalloc frame positions to opref_to_slot, the map `resolve_opref`
-        // reads. No live emitter reaches it any more: every remaining consumer
+        // reads, once the walk is over. No live emitter reaches it any more: every remaining consumer
         // (`load_arg_to_rax` / `load_arg_to_rcx` / `resolve_const_or` and the
         // genops that call them) is `#[allow(dead_code)]`, kept for the upstream
         // method boundary. The map cannot express what the regalloc actually
@@ -4071,203 +3593,11 @@ impl<'a> Assembler386<'a> {
         // frame_slot_depth is already absolute (see calculation above).
         self.next_slot = frame_slot_depth;
 
-        let mut fail_index = 0u32;
-
-        if crate::majit_ops_log_enabled() {
-            eprintln!(
-                "[dynasm] _assemble: {} ops → {} ra_ops, frame_depth={}",
-                ops.len(),
-                ra_ops.len(),
-                self.frame_depth
-            );
-        }
-
-        // ── Emit code from regalloc decisions ──
-        // `LocationCodeBuilder` drops `_scratch_register_value` when
-        // `X86_64_SCRATCH_REG` is written and at the end of `CALL`/`JMP`
-        // (`_relative_unaryop`), not before every op.
-        for ra_op in &ra_ops {
-            match ra_op {
-                RegAllocOp::Skip => {
-                    // Dead operation — skip.
-                    continue;
-                }
-                RegAllocOp::Move { src, dst } => {
-                    if majit_ir::debug::have_debug_prints() {
-                        majit_ir::debug::log_one(
-                            "jit-backend",
-                            &format!("move: {src:?} → {dst:?}"),
-                        );
-                    }
-                    self.regalloc_mov(src, dst);
-                    continue;
-                }
-                RegAllocOp::Perform {
-                    op_index,
-                    arglocs_start,
-                    arglocs_len,
-                    result_loc,
-                    gcmap,
-                } => {
-                    let arglocs = ra.arglocs(*arglocs_start, *arglocs_len);
-                    let op = &ops[*op_index];
-                    if crate::majit_ops_log_enabled() {
-                        let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
-                        eprintln!(
-                            "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
-                            op_index,
-                            op.opcode,
-                            al.join(", "),
-                            result_loc
-                        );
-                    }
-                    // Byte offset where this op's code begins: the span from
-                    // the last LABEL to the JUMP is one loop iteration, the
-                    // window `jit-log-opt` brackets with its `+508:` prefixes.
-                    if crate::majit_dump_enabled() {
-                        eprintln!(
-                            "[dynasm] @{:#06x} op[{}] {:?}",
-                            self.mc.offset().0,
-                            op_index,
-                            op.opcode
-                        );
-                    }
-                    self.pending_malloc_nursery_gcmap = *gcmap;
-                    self.regalloc_perform(
-                        op,
-                        *op_index,
-                        arglocs,
-                        result_loc.as_ref(),
-                        fail_index,
-                        ops,
-                    );
-                    self.pending_malloc_nursery_gcmap = None;
-                }
-                RegAllocOp::Perform1 {
-                    op_index,
-                    loc,
-                    result_loc,
-                    gcmap,
-                } => {
-                    let op = &ops[*op_index];
-                    let locs = [*loc];
-                    self.pending_malloc_nursery_gcmap = *gcmap;
-                    self.regalloc_perform(
-                        op,
-                        *op_index,
-                        &locs,
-                        result_loc.as_ref(),
-                        fail_index,
-                        ops,
-                    );
-                    self.pending_malloc_nursery_gcmap = None;
-                }
-                RegAllocOp::PerformGuard {
-                    op_index,
-                    arglocs_start,
-                    arglocs_len,
-                    result_loc,
-                    faillocs_start,
-                    faillocs_len,
-                } => {
-                    let arglocs = ra.arglocs(*arglocs_start, *arglocs_len);
-                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
-                    let op = &ops[*op_index];
-                    if crate::majit_ops_log_enabled() {
-                        eprintln!(
-                            "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
-                            op_index,
-                            op.opcode,
-                            arglocs
-                                .iter()
-                                .map(|l| format!("{:?}", l))
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                            faillocs.len()
-                        );
-                    }
-                    // A guard owns bytes like any other op, so it opens its
-                    // own span. Without this line the guard's code is read as
-                    // part of the preceding op's span and every span after the
-                    // trace's first guard names the wrong operation.
-                    if crate::majit_dump_enabled() {
-                        eprintln!(
-                            "[dynasm] @{:#06x} op[{}] {:?}",
-                            self.mc.offset().0,
-                            op_index,
-                            op.opcode
-                        );
-                    }
-                    self.regalloc_perform_guard(
-                        op,
-                        *op_index,
-                        arglocs,
-                        result_loc.as_ref(),
-                        faillocs,
-                        fail_index,
-                    );
-                    fail_index += 1;
-                }
-                RegAllocOp::PerformGuard1 {
-                    op_index,
-                    loc,
-                    result_loc,
-                    faillocs_start,
-                    faillocs_len,
-                } => {
-                    let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
-                    let op = &ops[*op_index];
-                    let locs = [*loc];
-                    self.regalloc_perform_guard(
-                        op,
-                        *op_index,
-                        &locs,
-                        result_loc.as_ref(),
-                        faillocs,
-                        fail_index,
-                    );
-                    fail_index += 1;
-                }
-                RegAllocOp::PerformDiscard { op_index, arglocs } => {
-                    self.emit_discard(*op_index, arglocs, fail_index, ops);
-                    let op = &ops[*op_index];
-                    if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-                        fail_index += 1;
-                    }
-                }
-                RegAllocOp::PerformDiscardGcStore {
-                    op_index,
-                    value,
-                    base,
-                    ofs,
-                    size,
-                } => {
-                    let locs = [*value, *base, *ofs, Loc::immed(*size)];
-                    self.emit_discard(*op_index, &locs, fail_index, ops);
-                    let op = &ops[*op_index];
-                    if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-                        fail_index += 1;
-                    }
-                }
-                RegAllocOp::PerformGcLoad {
-                    op_index,
-                    base,
-                    ofs,
-                    res,
-                    nsize,
-                } => {
-                    let op = &ops[*op_index];
-                    let locs = [*base, *ofs, *res, Loc::immed(*nsize)];
-                    self.regalloc_perform(op, *op_index, &locs, Some(res), fail_index, ops);
-                }
-            }
-        }
-
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble done: pending_guard_tokens={} fail_index={}",
                 self.pending_guard_tokens.len(),
-                fail_index
+                self.fail_index
             );
         }
         // Closes the last op's span, the way `--end of the loop--` closes a
@@ -4305,32 +3635,11 @@ impl<'a> Assembler386<'a> {
         Ok(())
     }
 
-    fn emit_discard(&mut self, op_index: usize, arglocs: &[Loc], fail_index: u32, ops: &[OpRc]) {
-        let op = &ops[op_index];
-        if crate::majit_ops_log_enabled() {
-            let al: Vec<String> = arglocs.iter().map(|l| format!("{l:?}")).collect();
-            eprintln!(
-                "[dynasm] discard[{}]: {:?} args=[{}]",
-                op_index,
-                op.opcode,
-                al.join(", ")
-            );
-        }
-        if crate::majit_dump_enabled() {
-            eprintln!(
-                "[dynasm] @{:#06x} op[{}] {:?}",
-                self.mc.offset().0,
-                op_index,
-                op.opcode
-            );
-        }
-        self.regalloc_perform(op, op_index, arglocs, None, fail_index, ops);
-    }
-
-    /// assembler.py:326 regalloc_perform — emit code for a non-guard op.
-    /// Called from the regalloc dispatch loop with pre-computed locations.
-    fn regalloc_perform(
+    /// assembler.py `genop_list[op.getopnum()]` — emit code for a non-guard
+    /// op from its regalloc locations (`regalloc_perform`).
+    fn genop_list(
         &mut self,
+        regalloc: &RegAlloc<'_>,
         op: &Op,
         op_index: usize,
         arglocs: &[Loc],
@@ -4377,8 +3686,7 @@ impl<'a> Assembler386<'a> {
                                     "IntAdd LEA requires an immediate \
                                      encodable as signed disp32",
                                 );
-                                self.forget_if_scratch_written(dst.value);
-                                rx86::lea_rm(&mut self.mc, dst.value, (a.value, v));
+                                self.mc.LEA(*dst, Operand::M(a.value, i64::from(v)));
                             }
                             _ => panic!(
                                 "IntAdd: result_loc != arglocs[0] requires LEA form \
@@ -4422,8 +3730,7 @@ impl<'a> Assembler386<'a> {
                                     "IntSub LEA requires an immediate \
                                          encodable as signed disp32 after negation",
                                 );
-                                self.forget_if_scratch_written(dst.value);
-                                rx86::lea_rm(&mut self.mc, dst.value, (a.value, v));
+                                self.mc.LEA(*dst, Operand::M(a.value, i64::from(v)));
                             }
                             _ => panic!(
                                 "IntSub: result_loc != arglocs[0] requires LEA form \
@@ -4441,71 +3748,33 @@ impl<'a> Assembler386<'a> {
             // ── Unary integer (result in arglocs[0] register) ──
             OpCode::IntNeg => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    self.forget_if_scratch_written(r.value);
-                    dynasm!(self.mc ; .arch x64 ; neg Rq(r.value));
+                    self.mc.NEG(*r);
                 }
             }
             OpCode::IntInvert => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    self.forget_if_scratch_written(r.value);
-                    dynasm!(self.mc ; .arch x64 ; not Rq(r.value));
+                    self.mc.NOT(*r);
                 }
             }
             // ── Shifts ──
             OpCode::IntLshift | OpCode::IntRshift | OpCode::UintRshift => {
                 if let (Some(Loc::Reg(dst)), Some(shift_loc)) = (result_loc, arglocs.get(1)) {
-                    match shift_loc {
-                        Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                            let sh = i.value as i8;
-                            match op.opcode {
-                                OpCode::IntLshift => {
-                                    self.forget_if_scratch_written(dst.value);
-                                    rx86::shl_ri(&mut self.mc, dst.value, i32::from(sh));
-                                }
-                                OpCode::IntRshift => {
-                                    self.forget_if_scratch_written(dst.value);
-                                    rx86::sar_ri(&mut self.mc, dst.value, i32::from(sh));
-                                }
-                                OpCode::UintRshift => {
-                                    self.forget_if_scratch_written(dst.value);
-                                    rx86::shr_ri(&mut self.mc, dst.value, i32::from(sh));
-                                }
-                                _ => {}
-                            }
-                        }
-                        Loc::Reg(s) if s.value == 1 => match op.opcode {
-                            OpCode::IntLshift => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; shl Rq(dst.value), cl);
-                            }
-                            OpCode::IntRshift => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; sar Rq(dst.value), cl);
-                            }
-                            OpCode::UintRshift => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; shr Rq(dst.value), cl);
-                            }
-                            _ => {}
-                        },
+                    // The count is an immediate or `ecx`; any other location
+                    // is moved into `ecx` first.
+                    let ecx = crate::regloc::ECX;
+                    let count = match shift_loc {
+                        Loc::Immed(i) | Loc::ImmedFloat(i) => imm(i64::from(i.value as i8)),
+                        Loc::Reg(s) if *s == ecx => Operand::from(ecx),
                         _ => {
-                            self.regalloc_mov(shift_loc, &Loc::Reg(crate::regloc::ECX));
-                            match op.opcode {
-                                OpCode::IntLshift => {
-                                    self.forget_if_scratch_written(dst.value);
-                                    dynasm!(self.mc ; .arch x64 ; shl Rq(dst.value), cl);
-                                }
-                                OpCode::IntRshift => {
-                                    self.forget_if_scratch_written(dst.value);
-                                    dynasm!(self.mc ; .arch x64 ; sar Rq(dst.value), cl);
-                                }
-                                OpCode::UintRshift => {
-                                    self.forget_if_scratch_written(dst.value);
-                                    dynasm!(self.mc ; .arch x64 ; shr Rq(dst.value), cl);
-                                }
-                                _ => {}
-                            }
+                            self.regalloc_mov(shift_loc, &Loc::Reg(ecx));
+                            Operand::from(ecx)
                         }
+                    };
+                    match op.opcode {
+                        OpCode::IntLshift => self.mc.SHL(*dst, count),
+                        OpCode::IntRshift => self.mc.SAR(*dst, count),
+                        OpCode::UintRshift => self.mc.SHR(*dst, count),
+                        _ => {}
                     }
                 }
             }
@@ -4564,27 +3833,17 @@ impl<'a> Assembler386<'a> {
             OpCode::UintMulHigh => {
                 if let Some(Loc::Reg(dst)) = result_loc {
                     if let Some(src) = arglocs.first() {
-                        match src {
-                            Loc::Reg(s) => {
-                                dynasm!(self.mc ; .arch x64 ; mul Rq(s.value));
-                            }
-                            Loc::Frame(f) => {
-                                rx86::mul_b(&mut self.mc, f.ebp_loc.value);
-                            }
-                            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                                self.load_scratch(i.value);
-                                dynasm!(self.mc ; .arch x64 ; mul Rq(scratch));
-                            }
-                            other => panic!(
-                                "UINT_MUL_HIGH: unhandled source {other:?} — no mul is \
-                            emitted and edx:eax keep their previous values"
-                            ),
+                        if let Loc::Immed(_) | Loc::ImmedFloat(_) = src {
+                            // Staged through the scratch register, which
+                            // `INSN('MUL')` refuses, so the multiply is the
+                            // raw `MUL_r` form.
+                            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                            self.mc.MOV(Operand::R(scratch), src);
+                            dynasm!(self.mc ; .arch x64 ; mul Rq(scratch));
+                        } else {
+                            self.mc.MUL(src);
                         }
-                        if dst.value != crate::regloc::EDX.value {
-                            self.forget_if_scratch_written(dst.value);
-                            dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), rdx);
-                        }
+                        self.mc.MOV(*dst, crate::regloc::EDX);
                     }
                 }
             }
@@ -4592,34 +3851,21 @@ impl<'a> Assembler386<'a> {
                 // genop_int_force_ge_zero: TEST src, src; MOV res, 0; CMOVNS res, src.
                 // consider_int_force_ge_zero forbids the result from aliasing src:
                 // MOV 0 would otherwise clobber the value CMOVNS reads.
-                let (Some(src_loc), Some(Loc::Reg(res))) = (arglocs.first(), result_loc) else {
+                let (Some(Loc::Reg(src)), Some(Loc::Reg(res))) = (arglocs.first(), result_loc)
+                else {
                     panic!(
-                        "int_force_ge_zero: expected a source and a register result, \
+                        "int_force_ge_zero: expected a register source and result, \
                          got arglocs={arglocs:?} result={result_loc:?}"
                     );
                 };
-                let src = match src_loc {
-                    Loc::Reg(s) => s.value,
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        self.load_scratch(i.value);
-                        scratch
-                    }
-                    other => {
-                        let scratch = crate::regloc::X86_64_SCRATCH_REG;
-                        self.regalloc_mov(other, &Loc::Reg(scratch));
-                        scratch.value
-                    }
-                };
-                if src == res.value {
+                if src == res {
                     panic!("int_force_ge_zero: result register aliases the source");
                 }
-                dynasm!(self.mc ; .arch x64 ; test Rq(src), Rq(src));
-                self.forget_if_scratch_written(res.value);
+                self.mc.TEST(*src, *src);
                 // mov(): MOV of 0 is MOV_riu32 (zero-extending), and it does not
                 // clobber the flags TEST just set.
-                rx86::mov_ri(&mut self.mc, res.value, 0);
-                rx86::cmovns_rr(&mut self.mc, res.value, src);
+                self.mc.MOV(*res, imm(0));
+                self.mc.CMOVNS(*res, *src);
             }
             OpCode::IntSignext => {
                 // x86/assembler.py `genop_int_signext`: numbytes is an immediate,
@@ -4635,44 +3881,10 @@ impl<'a> Assembler386<'a> {
                 let (Loc::Immed(numbytes) | Loc::ImmedFloat(numbytes)) = numbytes_loc else {
                     panic!("int_signext: numbytes loc must be an immediate, got {numbytes_loc:?}");
                 };
-                let dst = res.value;
                 match numbytes.value {
-                    1 => match argloc {
-                        Loc::Reg(src) => {
-                            self.forget_if_scratch_written(dst);
-                            dynasm!(self.mc ; .arch x64 ; movsx Rq(dst), Rb(src.value));
-                        }
-                        ebp_loc_pat!(slot) => {
-                            let ofs = slot.value;
-                            self.forget_if_scratch_written(dst);
-                            rx86::movsx8_rm(&mut self.mc, dst, (rx86::EBP, ofs));
-                        }
-                        other => panic!("int_signext: unhandled arg {other:?}"),
-                    },
-                    2 => match argloc {
-                        Loc::Reg(src) => {
-                            self.forget_if_scratch_written(dst);
-                            dynasm!(self.mc ; .arch x64 ; movsx Rq(dst), Rw(src.value));
-                        }
-                        ebp_loc_pat!(slot) => {
-                            let ofs = slot.value;
-                            self.forget_if_scratch_written(dst);
-                            rx86::movsx16_rm(&mut self.mc, dst, (rx86::EBP, ofs));
-                        }
-                        other => panic!("int_signext: unhandled arg {other:?}"),
-                    },
-                    4 => match argloc {
-                        Loc::Reg(src) => {
-                            self.forget_if_scratch_written(dst);
-                            dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst), Rd(src.value));
-                        }
-                        ebp_loc_pat!(slot) => {
-                            let ofs = slot.value;
-                            self.forget_if_scratch_written(dst);
-                            rx86::movsx32_rm(&mut self.mc, dst, (rx86::EBP, ofs));
-                        }
-                        other => panic!("int_signext: unhandled arg {other:?}"),
-                    },
+                    1 => self.mc.MOVSX8(*res, argloc),
+                    2 => self.mc.MOVSX16(*res, argloc),
+                    4 => self.mc.MOVSX32(*res, argloc),
                     _ => panic!("bad number of bytes"),
                 }
             }
@@ -4690,38 +3902,10 @@ impl<'a> Assembler386<'a> {
                     };
                     let src = *src_loc;
                     match op.opcode {
-                        OpCode::FloatAdd => self.emit_sd_src(
-                            dst.value,
-                            &src,
-                            rx86::addsd_xx,
-                            rx86::addsd_xb,
-                            rx86::addsd_xm,
-                            rx86::addsd_xj,
-                        ),
-                        OpCode::FloatSub => self.emit_sd_src(
-                            dst.value,
-                            &src,
-                            rx86::subsd_xx,
-                            rx86::subsd_xb,
-                            rx86::subsd_xm,
-                            rx86::subsd_xj,
-                        ),
-                        OpCode::FloatMul => self.emit_sd_src(
-                            dst.value,
-                            &src,
-                            rx86::mulsd_xx,
-                            rx86::mulsd_xb,
-                            rx86::mulsd_xm,
-                            rx86::mulsd_xj,
-                        ),
-                        OpCode::FloatTrueDiv => self.emit_sd_src(
-                            dst.value,
-                            &src,
-                            rx86::divsd_xx,
-                            rx86::divsd_xb,
-                            rx86::divsd_xm,
-                            rx86::divsd_xj,
-                        ),
+                        OpCode::FloatAdd => self.mc.ADDSD(dst, &src),
+                        OpCode::FloatSub => self.mc.SUBSD(dst, &src),
+                        OpCode::FloatMul => self.mc.MULSD(dst, &src),
+                        OpCode::FloatTrueDiv => self.mc.DIVSD(dst, &src),
                         _ => {}
                     }
                 }
@@ -4731,7 +3915,7 @@ impl<'a> Assembler386<'a> {
                 // The sign mask from _build_float_constants flips ±0.0 and a NaN sign.
                 if let Some(Loc::Reg(r)) = result_loc {
                     let addr = &FLOAT_CONST_NEG as *const AlignedPdConst as i64;
-                    self.emit_pd_heap(r.value, addr, rx86::xorpd_xm, rx86::xorpd_xj);
+                    self.mc.XORPD(*r, heap(addr));
                 }
             }
             OpCode::FloatAbs => {
@@ -4739,7 +3923,7 @@ impl<'a> Assembler386<'a> {
                 // The mask clears the sign bit, so -0.0 becomes +0.0 and a NaN payload stays.
                 if let Some(Loc::Reg(r)) = result_loc {
                     let addr = &FLOAT_CONST_ABS as *const AlignedPdConst as i64;
-                    self.emit_pd_heap(r.value, addr, rx86::andpd_xm, rx86::andpd_xj);
+                    self.mc.ANDPD(*r, heap(addr));
                 }
             }
             // ── Float comparisons ──
@@ -4780,14 +3964,7 @@ impl<'a> Assembler386<'a> {
                              _consider_float_cmp), got {lhs:?}"
                         );
                     };
-                    self.emit_sd_src(
-                        dst.value,
-                        &rhs,
-                        rx86::ucomisd_xx,
-                        rx86::ucomisd_xb,
-                        rx86::ucomisd_xm,
-                        rx86::ucomisd_xj,
-                    );
+                    self.mc.UCOMISD(dst, &rhs);
                     if need_p {
                         self.emit_if_parity_clear_zero_and_carry();
                     }
@@ -4819,11 +3996,17 @@ impl<'a> Assembler386<'a> {
                     rx86::cvtsi2sd_xr(&mut self.mc, dst.value, sr);
                 }
             }
+            // `genop_cast_float_to_int`: `CVTTSD2SI(resloc, arglocs[0])`.
+            // rx86 has only `CVTTSD2SI_rx` / `CVTTSD2SI_rb`; any other
+            // source is `_missing_binary_insn`.
             OpCode::CastFloatToInt => {
-                if let (Some(Loc::Reg(src)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::cvttsd2si_rx(&mut self.mc, dst.value, src.value);
-                }
+                let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) else {
+                    panic!(
+                        "CAST_FLOAT_TO_INT expects a source and a register result, \
+                         got {arglocs:?} -> {result_loc:?}"
+                    );
+                };
+                self.mc.CVTTSD2SI(*dst, src);
             }
             // `genop_cast_float_to_singlefloat`: CVTSD2SS into the xmm temp,
             // then MOVD32_rx into the GPR. The f32 bits occupy the low 32.
@@ -4831,17 +4014,16 @@ impl<'a> Assembler386<'a> {
                 if let (Some(Loc::Reg(src)), Some(Loc::Reg(tmp)), Some(Loc::Reg(dst))) =
                     (arglocs.first(), arglocs.get(1), result_loc)
                 {
-                    rx86::cvtsd2ss_xx(&mut self.mc, tmp.value, src.value);
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movd32_rx(&mut self.mc, dst.value, tmp.value);
+                    self.mc.CVTSD2SS(*tmp, *src);
+                    self.mc.MOVD32(*dst, *tmp);
                 }
             }
             // `genop_cast_singlefloat_to_float`: MOVD32_xr, then CVTSS2SD
             // of the result into itself.
             OpCode::CastSinglefloatToFloat => {
                 if let (Some(Loc::Reg(src)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    rx86::movd32_xr(&mut self.mc, dst.value, src.value);
-                    rx86::cvtss2sd_xx(&mut self.mc, dst.value, dst.value);
+                    self.mc.MOVD32(*dst, *src);
+                    self.mc.CVTSS2SD(*dst, *dst);
                 }
             }
             // ── Same-as / identity ──
@@ -4874,7 +4056,6 @@ impl<'a> Assembler386<'a> {
                     .gcref_table
                     .get(idx.value as usize)
                     .expect("LoadFromGcTable index inside the reserved gcref table");
-                self.forget_if_scratch_written(dst.value);
                 dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [=>slot]);
             }
             // `assembler.py genop_cast_ptr_to_int = _genop_same_as`
@@ -4906,7 +4087,7 @@ impl<'a> Assembler386<'a> {
                 // `base_loc = self.rm.make_sure_var_in_reg(op.getarg(0), args)`
                 // and `result_loc = self.force_allocate_reg(op)` force
                 // register materialisation — pyre's
-                // `consider_getfield_j2` (regalloc.rs) does the
+                // `consider_getfield` (x86/regalloc.rs) does the
                 // same.  Silently no-op'ing on a non-Reg base or result
                 // would mask a regalloc bug (e.g. a fresh `GETFIELD_GC`
                 // arm that forgot the `make_sure_var_in_reg` call), so
@@ -4927,30 +4108,14 @@ impl<'a> Assembler386<'a> {
                 };
                 let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
                 let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
-                if dst.is_xmm {
-                    rx86::movsd_xm(&mut self.mc, dst.value, (base.value, ofs));
-                } else {
-                    match field_size {
-                        1 => {
-                            self.forget_if_scratch_written(dst.value);
-                            rx86::movzx8_rm(&mut self.mc, dst.value, (base.value, ofs));
-                        }
-                        2 => {
-                            self.forget_if_scratch_written(dst.value);
-                            rx86::movzx16_rm(&mut self.mc, dst.value, (base.value, ofs));
-                        }
-                        4 => {
-                            self.forget_if_scratch_written(dst.value);
-                            rx86::movsx32_rm(&mut self.mc, dst.value, (base.value, ofs));
-                        }
-                        _ => {
-                            // Word `mov`. For a `load_is_acquire` descr this
-                            // aligned mov is the acquire load.
-                            self.forget_if_scratch_written(dst.value);
-                            rx86::mov_rm(&mut self.mc, dst.value, (base.value, ofs));
-                        }
-                    }
-                }
+                // A 4-byte field is sign-extended whatever its descr says.
+                let sign = field_size == 4;
+                self.load_from_mem(
+                    dst,
+                    Operand::M(base.value, i64::from(ofs)),
+                    field_size,
+                    sign,
+                );
             }
             // ── Memory loads: getarrayitem pattern ──
             OpCode::GetarrayitemGcI
@@ -4992,7 +4157,8 @@ impl<'a> Assembler386<'a> {
                         }
                     };
                     if item_size != 1 {
-                        self.forget_if_scratch_written(index_reg);
+                        // `index_reg` may be the scratch register it was just
+                        // `MOV`ed into, which `INSN('IMUL')` refuses.
                         rx86::imul_ri(&mut self.mc, index_reg, item_size);
                     }
                     // Resolve the base into a register. A Loc::Immed base
@@ -5020,47 +4186,15 @@ impl<'a> Assembler386<'a> {
                             (i16::from(base_reg), index_reg, 0, 0),
                         );
                     }
-                    if dst.is_xmm {
-                        dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [rax]);
-                    } else {
-                        match item_size {
-                            1 if signed => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), BYTE [rax])
-                            }
-                            1 => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [rax]);
-                            }
-                            2 if signed => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), WORD [rax])
-                            }
-                            2 => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [rax]);
-                            }
-                            4 if signed => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [rax])
-                            }
-                            4 => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; mov Rd(dst.value), [rax]);
-                            }
-                            _ => {
-                                self.forget_if_scratch_written(dst.value);
-                                dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [rax]);
-                            }
-                        }
-                    }
+                    let src = Operand::M(rx86::EAX, 0);
+                    self.load_from_mem(*dst, src, item_size as usize, signed);
                 }
             }
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
                 // `rewrite.rs transform_to_gc_load` lowers both opcodes to
                 // GC_STORE / GC_STORE_INDEXED through `emit_gc_store_or_indexed`
-                // before the regalloc ever sees them, and `consider_setfield_j2`
+                // before the regalloc ever sees them, and `consider_setfield`
                 // force-allocates a register for every non-constant base, so the
                 // only shape that could reach the else arm is a constant base on
                 // an op the rewriter did not consume.  Emitting it from
@@ -5120,7 +4254,7 @@ impl<'a> Assembler386<'a> {
                     };
                     match arglocs.first() {
                         Some(Loc::Reg(base)) => {
-                            self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
+                            self.emit_op_gcload_regalloc(&Loc::Reg(*base), ofs_loc, dst, nsize);
                         }
                         Some(Loc::Immed(base_i) | Loc::ImmedFloat(base_i)) => {
                             let scratch = crate::regloc::X86_64_SCRATCH_REG;
@@ -5134,25 +4268,11 @@ impl<'a> Assembler386<'a> {
                                     "GcLoad: base=Immed and ofs already occupies R11",
                                 );
                             }
-                            // `addr_add_const(base_loc, ofs)` on an
-                            // immediate base is an absolute address,
-                            // reached through `_addr_as_reg_offset`.
-                            if let Loc::Immed(o) | Loc::ImmedFloat(o) = ofs_loc {
-                                let (_, disp) =
-                                    self.addr_as_reg_offset(base_i.value.wrapping_add(o.value));
-                                let abs_size = nsize.unsigned_abs() as usize;
-                                self.emit_gcload_sized(
-                                    &scratch,
-                                    disp,
-                                    None,
-                                    dst,
-                                    abs_size,
-                                    nsize < 0,
-                                );
-                            } else {
-                                self.load_scratch(base_i.value);
-                                self.emit_op_gcload_regalloc(&scratch, ofs_loc, dst, nsize);
-                            }
+                            // `addr_add(base_loc, ofs_loc)` on an immediate
+                            // base is an absolute `'j'` address, or an `'a'`
+                            // with the base as its static offset.
+                            let base_loc = Loc::Immed(*base_i);
+                            self.emit_op_gcload_regalloc(&base_loc, ofs_loc, dst, nsize);
                         }
                         other => {
                             panic!("GcLoad base_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
@@ -5160,7 +4280,7 @@ impl<'a> Assembler386<'a> {
                     }
                 }
             }
-            // ── GC store / raw store: opassembler.rs emit_op_gcstore_regalloc ──
+            // ── x86/assembler.py genop_discard_gc_store ──
             // arglocs = [value_loc, base_loc, ofs_loc, size_loc].
             // value_loc may be Loc::Immed when the source is a Const
             // (llsupport/regalloc.py return_constant), so the emitter
@@ -5187,20 +4307,11 @@ impl<'a> Assembler386<'a> {
                         "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
                     ),
                 };
-                match value_loc {
-                    Loc::Reg(val) => {
-                        self.emit_op_gcstore_regalloc(base, ofs_loc, val, size);
-                    }
-                    // `save_into_mem` stores an immediate as an integer move.
-                    // A singlefloat bit pattern is int-kind (`get_type_flag`
-                    // → FLAG_UNSIGNED), not an xmm `MOVSS`.
-                    Loc::Immed(val_imm) | Loc::ImmedFloat(val_imm) => {
-                        self.emit_op_gcstore_imm_regalloc(base, ofs_loc, val_imm.value, size);
-                    }
-                    other => {
-                        panic!("GcStore value_loc must be Loc::Reg or Loc::Immed, got {other:?}")
-                    }
-                }
+                // `save_into_mem` stores an immediate as an integer move. A
+                // singlefloat bit pattern is int-kind (`get_type_flag` →
+                // FLAG_UNSIGNED), not an xmm `MOVSS`.
+                let dest_addr = addr_add(&Loc::Reg(*base), ofs_loc, 0, 0);
+                self.save_into_mem(dest_addr, value_loc, size);
             }
             // ── x86/assembler.py genop_discard_gc_store_indexed ──
             // `base_loc, ofs_loc, value_loc, factor_loc, offset_loc, size_loc = arglocs`.
@@ -5227,82 +4338,23 @@ impl<'a> Assembler386<'a> {
                         _ => 8,
                     };
 
-                    // Dynasm's `*N` operand is a compile-time literal, so the
-                    // runtime factor is dispatched to four parallel emitters.
-                    // `save_into_mem` emits `MOV8`/`MOV16`/`MOV32`/`MOV`
-                    // (`MOV_ai`) when the constant fits that width, and
-                    // stages through `X86_64_SCRATCH_REG` otherwise.
-                    macro_rules! emit_store_scaled {
-                        ($shift:expr) => {{
-                            let addr = (
-                                i16::from(base.value),
-                                ofs_reg.value,
-                                $shift,
-                                offset,
-                            );
-                            match value_loc {
-                                Loc::Reg(val) if val.is_xmm => {
-                                    // `save_into_mem`: an xmm store is `MOVSD`.
-                                    // `get_type_flag` banks only `lltype.Float`.
-                                    debug_assert_eq!(
-                                        size, 8,
-                                        "save_into_mem: float-kind access is 8 bytes"
-                                    );
-                                    rx86::movsd_ax(&mut self.mc, addr, val.value);
-                                }
-                                Loc::Reg(val) => match size {
-                                    1 => rx86::mov8_ar(&mut self.mc, addr, val.value),
-                                    2 => rx86::mov16_ar(&mut self.mc, addr, val.value),
-                                    4 => rx86::mov32_ar(&mut self.mc, addr, val.value),
-                                    _ => rx86::mov_ar(&mut self.mc, addr, val.value),
-                                },
-                                Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                                    self.emit_indexed_imm_store(addr, i.value, size);
-                                }
-                                other => panic!(
-                                    "emit_store_scaled: unhandled value location {other:?} — no store \
-                                is emitted"
-                                ),
-                            }
-                        }};
-                    }
-                    macro_rules! emit_store_unscaled {
-                        () => {{
-                            let addr = (i16::from(base.value), ofs_reg.value, 0, offset);
-                            match value_loc {
-                                Loc::Reg(val) if val.is_xmm => {
-                                    debug_assert_eq!(
-                                        size, 8,
-                                        "save_into_mem: float-kind access is 8 bytes"
-                                    );
-                                    rx86::movsd_ax(&mut self.mc, addr, val.value);
-                                }
-                                Loc::Reg(val) => match size {
-                                    1 => rx86::mov8_ar(&mut self.mc, addr, val.value),
-                                    2 => rx86::mov16_ar(&mut self.mc, addr, val.value),
-                                    4 => rx86::mov32_ar(&mut self.mc, addr, val.value),
-                                    _ => rx86::mov_ar(&mut self.mc, addr, val.value),
-                                },
-                                Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                                    self.emit_indexed_imm_store(addr, i.value, size);
-                                }
-                                other => panic!(
-                                    "emit_store_unscaled: unhandled value location {other:?} — no store \
-                                is emitted"
-                                ),
-                            }
-                        }};
-                    }
-                    match factor {
-                        1 => emit_store_unscaled!(),
-                        2 => emit_store_scaled!(1),
-                        4 => emit_store_scaled!(2),
-                        8 => emit_store_scaled!(3),
+                    let scale = match factor {
+                        1 => 0,
+                        2 => 1,
+                        4 => 2,
+                        8 => 3,
                         other => panic!(
                             "x86 GcStoreIndexed: unsupported factor {other}; \
                              load_supported_factors = (1, 2, 4, 8)"
                         ),
-                    }
+                    };
+                    let dest_addr = addr_add(
+                        &Loc::Reg(*base),
+                        &Loc::Reg(*ofs_reg),
+                        i64::from(offset),
+                        scale,
+                    );
+                    self.save_into_mem(dest_addr, value_loc, size);
                 }
             }
             // ── x86/assembler.py _genop_gc_load_indexed ──
@@ -5373,79 +4425,24 @@ impl<'a> Assembler386<'a> {
                     other => panic!("GcLoadIndexed result_loc must be Loc::Reg, got {other:?}",),
                 };
 
-                // assembler.py `load_from_mem`: dispatch by (resloc.is_xmm,
-                // size, sign). PyPy's `addr_add` returns `AddressLoc(base,
-                // ofs, scale, disp)` which the encoder materializes as a
-                // SIB scaled-index addressing mode straight on the MOV
-                // template. dynasm-rs requires the SIB scale as a literal
-                // at macro expansion time, so we dispatch (factor, size,
-                // sign) through a `match` arm — functionally identical to
-                // PyPy's single `mc.MOV*(resloc, src_addr)` once the
-                // factor is bound. xmm targets always use MOVSD per
-                // load_from_mem:1649; integer targets pick MOV /
-                // MOVZX{8,16} / MOVSX{8,16,32} based on size+sign.
-                // assembler.py load_from_mem allows WORD, 1, 2, and
-                // (x86_64) 4; any other size is `not_implemented`.
-                macro_rules! emit_load_scaled {
-                    ($shift:expr) => {{
-                        let addr = (i16::from(base.value), ofs_reg.value, $shift, offset);
-                        if dst.is_xmm {
-                            rx86::movsd_xa(&mut self.mc, dst.value, addr);
-                        } else {
-                            match size {
-                                1 => {
-                                    if sign {
-                                        self.forget_if_scratch_written(dst.value);
-                                        rx86::movsx8_ra(&mut self.mc, dst.value, addr);
-                                    } else {
-                                        self.forget_if_scratch_written(dst.value);
-                                        rx86::movzx8_ra(&mut self.mc, dst.value, addr);
-                                    }
-                                }
-                                2 => {
-                                    if sign {
-                                        self.forget_if_scratch_written(dst.value);
-                                        rx86::movsx16_ra(&mut self.mc, dst.value, addr);
-                                    } else {
-                                        self.forget_if_scratch_written(dst.value);
-                                        rx86::movzx16_ra(&mut self.mc, dst.value, addr);
-                                    }
-                                }
-                                4 => {
-                                    if sign {
-                                        self.forget_if_scratch_written(dst.value);
-                                        rx86::movsx32_ra(&mut self.mc, dst.value, addr);
-                                    } else {
-                                        self.forget_if_scratch_written(dst.value);
-                                        rx86::mov32_ra(&mut self.mc, dst.value, addr);
-                                    }
-                                }
-                                8 => {
-                                    self.forget_if_scratch_written(dst.value);
-                                    rx86::mov_ra(&mut self.mc, dst.value, addr);
-                                }
-                                other => {
-                                    panic!("load_from_mem: size {other} not in {{1, 2, 4, WORD}}")
-                                }
-                            }
-                        }
-                    }};
-                }
-                macro_rules! emit_load_unscaled {
-                    () => {{
-                        emit_load_scaled!(0);
-                    }};
-                }
-                match factor {
-                    1 => emit_load_unscaled!(),
-                    2 => emit_load_scaled!(1),
-                    4 => emit_load_scaled!(2),
-                    8 => emit_load_scaled!(3),
+                let shift = match factor {
+                    1 => 0,
+                    2 => 1,
+                    4 => 2,
+                    8 => 3,
                     other => panic!(
                         "x86 GcLoadIndexed: unsupported factor {other}; \
                          load_supported_factors = (1, 2, 4, 8)"
                     ),
-                }
+                };
+                // `addr_add(base_loc, ofs_loc, offset, scale)`.
+                let src_addr = addr_add(
+                    &Loc::Reg(*base),
+                    &Loc::Reg(*ofs_reg),
+                    i64::from(offset),
+                    shift,
+                );
+                self.load_from_mem(*dst, src_addr, size, sign);
             }
             // `rewrite.py transform_to_gc_load` lowers SETARRAYITEM_GC to
             // GC_STORE_INDEXED (after `handle_write_barrier_setarrayitem`)
@@ -5472,14 +4469,13 @@ impl<'a> Assembler386<'a> {
                         &Loc::Reg(crate::regloc::RegLoc::new(index_reg, false)),
                     );
                     if item_size != 1 {
-                        self.forget_if_scratch_written(index_reg);
+                        // `index_reg` may be the scratch register it was just
+                        // `MOV`ed into, which `INSN('IMUL')` refuses.
                         rx86::imul_ri(&mut self.mc, index_reg, item_size);
                     }
                     if base_size != 0 {
-                        self.forget_if_scratch_written(index_reg);
                         rx86::add_ri(&mut self.mc, index_reg, base_size);
                     }
-                    self.forget_if_scratch_written(index_reg);
                     dynasm!(self.mc ; .arch x64 ; add Rq(index_reg), Rq(base.value));
 
                     match value_loc {
@@ -5542,30 +4538,13 @@ impl<'a> Assembler386<'a> {
                     target_arglocs.len()
                 };
                 for (i, src_loc) in arglocs[..remap_count].iter().enumerate() {
-                    // One classification, two consumers. It picks the location
-                    // set the pair rides — set 2 carries the floats and gets
-                    // the float scratch — and, when the destination has to be
-                    // synthesized below, the kind of the slot itself.
-                    // Hard-coding the slot's kind instead described a slot the
-                    // value never lands in: `regalloc_push` / `regalloc_pop`
-                    // read exactly this field to choose their scratch
-                    // register, and `loc_width` reads it for the width.
-                    //
-                    // `ebp_loc_pat!` rather than `Loc::Frame` alone because a
-                    // frame-pointer location has two spellings and both carry
-                    // `is_float` (`regloc.py class FrameLoc(RawEbpLoc)`);
-                    // naming one sent the other to the integer set.
-                    let is_float = match src_loc {
-                        Loc::Reg(r) => r.is_xmm,
-                        ebp_loc_pat!(e) => e.is_float,
-                        // `ConstFloatLoc.is_float` — the pool address rides the
-                        // float remap, which moves it with `MOVSD`.
-                        Loc::ConstFloat(_) => true,
-                        // An immediate is re-materialized into whichever set
-                        // its destination is in, and an address is not a legal
-                        // parallel-move operand at all.
-                        _ => false,
-                    };
+                    // `consider_jump`: the set comes from `box.type == FLOAT`,
+                    // not from the location. Set 2 carries the floats and
+                    // gets the float scratch. When the destination has to be
+                    // synthesized below, the same answer is the slot's kind:
+                    // `regalloc_push` / `regalloc_pop` read it to choose
+                    // their scratch register, and `loc_width` for the width.
+                    let is_float = op.arg(i).to_opref().ty() == Some(Type::Float);
                     let dst_loc = if i < target_arglocs.len() {
                         target_arglocs[i]
                     } else {
@@ -5615,12 +4594,12 @@ impl<'a> Assembler386<'a> {
                     .and_then(|k| self.target_tokens_currently_compiling.get(&k).copied())
                 {
                     dynasm!(self.mc ; .arch x64 ; jmp =>label);
-                    self.forget_after_call_or_jmp();
+                    self.mc.forget_scratch_register();
                 } else if let (Some(descr_ref), Some(descr)) = (descr_arc.as_ref(), jump_descr) {
                     let target = descr.ll_loop_code();
                     // External JUMP: direct JMP to target loop code.
                     // `closing_jump` is `JMP(imm(target))`.
-                    // `LocationCodeBuilder._addr_as_reg_offset` stages a
+                    // `LocationCodeBuilder._relative_unaryop` stages a
                     // 64-bit absolute target through `X86_64_SCRATCH_REG`
                     // (r11), never RAX. Using RAX clobbers a loop-carried Ref
                     // the regalloc bound there: a bridge that rejoins the loop
@@ -5637,11 +4616,7 @@ impl<'a> Assembler386<'a> {
                     } else {
                         self.jump_target_frame_depth =
                             self.jump_target_frame_depth.max(descr.target_frame_depth());
-                        let addr = target as i64;
-                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        self.load_scratch(addr);
-                        dynasm!(self.mc ; .arch x64 ; jmp Rq(scratch));
-                        self.forget_after_call_or_jmp();
+                        self.mc.JMP(imm(target as i64));
                     }
                 }
             }
@@ -5749,7 +4724,7 @@ impl<'a> Assembler386<'a> {
                         &format!("LABEL: new DynamicLabel({label:?})"),
                     );
                 }
-                self.forget_scratch_register();
+                self.mc.forget_scratch_register();
                 dynasm!(self.mc ; =>label);
                 if let Some(descr) = label_descr {
                     descr.set_target_arglocs(
@@ -5781,6 +4756,7 @@ impl<'a> Assembler386<'a> {
             //
             // What is left here is the call and the result placement.
             OpCode::CallI
+            | OpCode::CallR
             | OpCode::CallF
             | OpCode::CallN
             | OpCode::CallPureI
@@ -5802,6 +4778,11 @@ impl<'a> Assembler386<'a> {
                 let is_raw_free =
                     op.opcode == OpCode::CallN && oopspec == Some(majit_ir::OopSpecIndex::RawFree);
                 let is_math_sqrt = oopspec == Some(majit_ir::OopSpecIndex::MathSqrt);
+                let is_threadlocalref_get =
+                    oopspec == Some(majit_ir::OopSpecIndex::ThreadlocalrefGet);
+                let is_nursery_alloc = op.opcode == OpCode::CallR
+                    && op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
+                        == Some(majit_ir::RuntimeHelperKind::NurseryAlloc);
                 if matches!(
                     op.opcode,
                     OpCode::CallMayForceI
@@ -5817,16 +4798,20 @@ impl<'a> Assembler386<'a> {
                 if is_math_sqrt {
                     // assembler.py `genop_math_sqrt`: SQRTSD(arglocs[0], resloc).
                     self.genop_math_sqrt(result_loc);
+                } else if is_threadlocalref_get {
+                    // `_consider_threadlocalref_get`: [offset, size, sign].
+                    let Some(Loc::Reg(resloc)) = result_loc else {
+                        panic!("threadlocalref_get needs a register result, got {result_loc:?}");
+                    };
+                    self.threadlocalref_get(
+                        Self::argloc_imm(arglocs, 0),
+                        *resloc,
+                        Self::argloc_imm(arglocs, 1) as usize,
+                        Self::argloc_imm(arglocs, 2) != 0,
+                    );
                 } else if is_raw_free {
                     self.genop_nursery_free_inline_x86(op, arglocs);
-                } else {
-                    self.genop_call_with_arglocs(op, arglocs);
-                }
-            }
-            OpCode::CallR => {
-                let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
-                    == Some(majit_ir::RuntimeHelperKind::NurseryAlloc);
-                if is_nursery_alloc {
+                } else if is_nursery_alloc {
                     self.genop_nursery_alloc_inline_x86(op, arglocs);
                 } else {
                     self.genop_call_with_arglocs(op, arglocs);
@@ -5842,13 +4827,17 @@ impl<'a> Assembler386<'a> {
                 self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 self.genop_call_assembler(op, arglocs, result_loc);
             }
-            OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs, op_index),
+            OpCode::CondCallN => self.genop_discard_cond_call(regalloc, op, arglocs, op_index),
             OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                self.genop_cond_call_value(op, arglocs, op_index);
+                self.genop_cond_call_value(regalloc, op, arglocs, op_index);
+            }
+            // `rewrite.py handle_new` lowers every NEW / NEW_WITH_VTABLE,
+            // vtable store included (`gen_initialize_vtable`), and the
+            // assembler has no genop for either.
+            OpCode::New | OpCode::NewWithVtable => {
+                panic!("not implemented operation with res: {:?}", op.opcode)
             }
             // ── Allocation (raw, when GC rewriter is not active) ──
-            OpCode::New => self.genop_new(op),
-            OpCode::NewWithVtable => self.genop_new_with_vtable(op),
             OpCode::NewArray | OpCode::NewArrayClear => self.genop_new_array(op, arglocs),
             OpCode::Newstr => self.genop_newstr(op, arglocs),
             OpCode::Newunicode => self.genop_newunicode(op, arglocs),
@@ -5883,7 +4872,7 @@ impl<'a> Assembler386<'a> {
             }
             // x86/assembler.py genop_discard_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                self.emit_write_barrier_fastpath(op, &arglocs);
+                self.emit_write_barrier_fastpath(regalloc, op, &arglocs);
             }
             // x86/assembler.py genop_discard_zero_array.  The GC
             // rewriter leaves ZERO_ARRAY in the stream and mutates its range
@@ -5900,8 +4889,7 @@ impl<'a> Assembler386<'a> {
             // ── Misc ──
             OpCode::ForceToken => {
                 if let Some(Loc::Reg(r)) = result_loc {
-                    self.forget_if_scratch_written(r.value);
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), rbp);
+                    self.mc.MOV(*r, crate::regloc::EBP);
                 }
             }
             // assembler.py genop_save_exception IS
@@ -5909,10 +4897,8 @@ impl<'a> Assembler386<'a> {
             OpCode::SaveException => self.emit_store_and_reset_exception(result_loc),
             OpCode::SaveExcClass => self.genop_save_exc_class(result_loc),
             OpCode::RestoreException => self.genop_restore_exception(arglocs),
-            // Guards never reach the non-guard regalloc dispatch — they
-            // are emitted exclusively from `regalloc_perform_guard` via
-            // the `RegAllocOp::PerformWithGuard` arm
-            // (`assemble_loop` dispatch at line 1507).
+            // Guards never reach the non-guard dispatch — the regalloc
+            // hands them to `regalloc_perform_guard`.
             _ if op.opcode.is_guard() => unreachable!(
                 "regalloc_perform reached with guard {:?}; guards must \
                  route through regalloc_perform_guard",
@@ -5923,8 +4909,9 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// assembler.py:329 regalloc_perform_guard — emit guard with faillocs.
-    fn regalloc_perform_guard(
+    /// assembler.py `genop_guard_list[guard_opnum]` — emit a guard with its
+    /// faillocs (`regalloc_perform_guard`).
+    fn genop_guard_list(
         &mut self,
         op: &Op,
         op_index: usize,
@@ -5932,6 +4919,7 @@ impl<'a> Assembler386<'a> {
         result_loc: Option<&Loc>,
         faillocs: &[Option<Loc>],
         fail_index: u32,
+        frame_depth: usize,
     ) {
         let guard_argloc = arglocs.first().copied();
         match op.opcode {
@@ -5950,6 +4938,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             // x86/assembler.py `genop_guard_guard_false` inverts
@@ -5966,6 +4955,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             // `genop_guard_guard_value`: `UCOMISD` when `getarg(0).type ==
@@ -5982,14 +4972,7 @@ impl<'a> Assembler386<'a> {
                                 arglocs[0]
                             );
                         };
-                        self.emit_sd_src(
-                            x.value,
-                            &arglocs[1],
-                            rx86::ucomisd_xx,
-                            rx86::ucomisd_xb,
-                            rx86::ucomisd_xm,
-                            rx86::ucomisd_xj,
-                        );
+                        self.mc.UCOMISD(x, &arglocs[1]);
                     } else {
                         self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
                     }
@@ -6001,6 +4984,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardClass => {
@@ -6014,6 +4998,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardGcType => {
@@ -6027,6 +5012,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardIsObject => {
@@ -6040,6 +5026,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardSubclass => {
@@ -6053,6 +5040,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardException => {
@@ -6066,6 +5054,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
                 self.emit_store_and_reset_exception(result_loc);
             }
@@ -6087,7 +5076,7 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; jb BYTE =>jb_location);
                     self._cmp_guard_class(&arglocs[0], &arglocs[1]);
                     // patch the JB above
-                    self.forget_scratch_register();
+                    self.mc.forget_scratch_register();
                     dynasm!(self.mc ; .arch x64 ; =>jb_location);
                     self.guard_success_cc = Some(CC_E);
                     self.implement_guard_with_faillocs(
@@ -6096,6 +5085,7 @@ impl<'a> Assembler386<'a> {
                         fail_index,
                         guard_argloc,
                         faillocs,
+                        frame_depth,
                     );
                 }
             }
@@ -6114,6 +5104,7 @@ impl<'a> Assembler386<'a> {
                         fail_label,
                         guard_argloc,
                         faillocs,
+                        frame_depth,
                     );
                     // Replayed from `CondCallSlowPath` after the call, which
                     // clobbers r11. The fast-path cache is not that edge, so
@@ -6130,6 +5121,7 @@ impl<'a> Assembler386<'a> {
                         fail_index,
                         guard_argloc,
                         faillocs,
+                        frame_depth,
                     );
                 }
             }
@@ -6140,6 +5132,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardOverflow => {
@@ -6159,6 +5152,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardNotForced => {
@@ -6170,6 +5164,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardNotForced2 => {
@@ -6179,6 +5174,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardNotInvalidated => {
@@ -6188,6 +5184,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             OpCode::GuardAlwaysFails => {
@@ -6197,6 +5194,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
             _ => {
@@ -6206,6 +5204,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     guard_argloc,
                     faillocs,
+                    frame_depth,
                 );
             }
         }
@@ -6231,25 +5230,8 @@ impl<'a> Assembler386<'a> {
             panic!("GuardClass: obj_loc must be Loc::Reg, got {obj_loc:?}");
         };
         if let Some(vtable_offset) = self.vtable_offset {
-            let ofs = vtable_offset as i32;
-            match class_loc {
-                Loc::Reg(c) => {
-                    rx86::cmp_mr(&mut self.mc, (obj.value, ofs), c.value);
-                }
-                Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                    let fits_imm32 = (i.value as i32) as i64 == i.value;
-                    if fits_imm32 {
-                        rx86::cmp_mi(&mut self.mc, (obj.value, ofs), i.value as i32);
-                    } else {
-                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        self.load_scratch(i.value);
-                        rx86::cmp_mr(&mut self.mc, (obj.value, ofs), scratch);
-                    }
-                }
-                other => panic!(
-                    "GuardClass (vtable form): class_loc must be Loc::Reg or Loc::Immed, got {other:?}",
-                ),
-            }
+            self.mc
+                .CMP(Operand::M(obj.value, vtable_offset as i64), class_loc);
         } else {
             let (Loc::Immed(i) | Loc::ImmedFloat(i)) = class_loc else {
                 panic!("GuardClass (typeid form): class_loc must be Loc::Immed, got {class_loc:?}",);
@@ -6283,8 +5265,8 @@ impl<'a> Assembler386<'a> {
 
     fn emit_load_gc_typeid_into_reg(&mut self, obj_reg: u8, dst_reg: u8) {
         let tid_ofs = -(majit_gc::header::GcHeader::SIZE as i32);
-        self.forget_if_scratch_written(dst_reg);
-        rx86::mov32_rm(&mut self.mc, dst_reg, (obj_reg, tid_ofs));
+        self.mc
+            .MOV32(Operand::R(dst_reg), Operand::M(obj_reg, i64::from(tid_ofs)));
     }
 
     /// `_cmp_guard_gc_type`: one `CMP32_mi` of an immediate type id.
@@ -6314,24 +5296,6 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// `addr_add(imm(base), index, scale, offset)`, location code `'a'`.
-    /// A static offset that does not fit a signed disp32 uses
-    /// `_fix_static_offset_64_a` with `NO_BASE_REGISTER`, which is
-    /// `_addr_as_reg_offset`.
-    fn addr_add_imm_index(
-        &mut self,
-        index: u8,
-        scale: u8,
-        static_offset: i64,
-    ) -> (i16, u8, u8, i32) {
-        if rx86::fits_in_32bits(static_offset) {
-            (rx86::NO_BASE_REGISTER, index, scale, static_offset as i32)
-        } else {
-            let (reg, ofs) = self.addr_as_reg_offset(static_offset);
-            (i16::from(reg), index, scale, ofs)
-        }
-    }
-
     /// `genop_guard_guard_is_object`: `MOV32` of the typeid, then `TEST8` of
     /// `addr_add(imm(base_type_info), typeid, scale=shift_by, offset=infobits_offset)`.
     /// Success is NZ.
@@ -6345,12 +5309,11 @@ impl<'a> Assembler386<'a> {
         self.emit_load_gc_typeid_into_reg(obj.value, typeid.value);
         let (scale, shl) = Self::sib_scale_and_shl(info.shift_by);
         if shl > 0 {
-            self.forget_if_scratch_written(typeid.value);
-            rx86::shl_ri(&mut self.mc, typeid.value, i32::from(shl));
+            self.mc.SHL(*typeid, imm(i64::from(shl)));
         }
         let static_offset = (info.base_type_info as i64).wrapping_add(info.infobits_offset as i64);
-        let addr = self.addr_add_imm_index(typeid.value, scale, static_offset);
-        rx86::test8_ai(&mut self.mc, addr, i32::from(info.is_object_flag));
+        let addr = addr_add(&Loc::immed(static_offset), typeid_loc, 0, scale);
+        self.mc.TEST8(addr, imm(i64::from(info.is_object_flag)));
     }
 
     /// x86/assembler.py `genop_guard_guard_subclass`.
@@ -6374,13 +5337,10 @@ impl<'a> Assembler386<'a> {
                 majit_backend::read_vtable_subclass_range(classptr.value, range_off);
             let offset = vtable_offset as i32;
             let offset2 = range_off as i32;
-            self.forget_if_scratch_written(tmp.value);
-            dynasm!(self.mc ; .arch x64
-                ; mov Rq(tmp.value), [Rq(obj.value) + offset]
-                ; mov Rq(tmp.value), [Rq(tmp.value) + offset2]
-            );
-            self.emit_sub_imm64(tmp.value, check_min);
-            self.emit_cmp_imm64(tmp.value, check_max - check_min);
+            self.mc.MOV(*tmp, Operand::M(obj.value, i64::from(offset)));
+            self.mc.MOV(*tmp, Operand::M(tmp.value, i64::from(offset2)));
+            self.mc.SUB(*tmp, imm(check_min));
+            self.mc.CMP(*tmp, imm(check_max - check_min));
             return;
         }
         let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
@@ -6398,10 +5358,8 @@ impl<'a> Assembler386<'a> {
         if let Some(vtable_offset) = self.vtable_offset {
             let offset = vtable_offset as i32;
             let offset2 = info.subclassrange_min_offset as i32;
-            self.forget_if_scratch_written(tmp.value);
-            rx86::mov_rm(&mut self.mc, tmp.value, (obj.value, offset));
-            self.forget_if_scratch_written(tmp.value);
-            rx86::mov_rm(&mut self.mc, tmp.value, (tmp.value, offset2));
+            self.mc.MOV(*tmp, Operand::M(obj.value, i64::from(offset)));
+            self.mc.MOV(*tmp, Operand::M(tmp.value, i64::from(offset2)));
         } else {
             // genop_guard_guard_subclass typeid arm: MOV32, then
             // MOV tmp, addr_add(imm(base_type_info), tmp, scale=shift_by,
@@ -6409,63 +5367,16 @@ impl<'a> Assembler386<'a> {
             self.emit_load_gc_typeid_into_reg(obj.value, tmp.value);
             let (scale, shl) = Self::sib_scale_and_shl(info.shift_by);
             if shl > 0 {
-                self.forget_if_scratch_written(tmp.value);
-                rx86::shl_ri(&mut self.mc, tmp.value, i32::from(shl));
+                self.mc.SHL(*tmp, imm(i64::from(shl)));
             }
             let static_offset = (info.base_type_info as i64)
                 .wrapping_add(info.sizeof_ti as i64)
                 .wrapping_add(info.subclassrange_min_offset as i64);
-            let addr = self.addr_add_imm_index(tmp.value, scale, static_offset);
-            self.forget_if_scratch_written(tmp.value);
-            rx86::mov_ra(&mut self.mc, tmp.value, addr);
+            let addr = addr_add(&Loc::immed(static_offset), tmp_loc, 0, scale);
+            self.mc.MOV(*tmp, addr);
         }
-        self.emit_sub_imm64(tmp.value, check_min);
-        self.emit_cmp_imm64(tmp.value, check_max - check_min);
-    }
-
-    fn emit_sub_imm64(&mut self, reg: u8, value: i64) {
-        if let Ok(v) = i32::try_from(value) {
-            self.forget_if_scratch_written(reg);
-            rx86::sub_ri(&mut self.mc, reg, v);
-        } else {
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            self.load_scratch(value);
-            self.forget_if_scratch_written(reg);
-            dynasm!(self.mc ; .arch x64
-                            ; sub Rq(reg), Rq(scratch)
-
-            );
-        }
-    }
-
-    fn emit_cmp_imm64(&mut self, reg: u8, value: i64) {
-        if let Ok(v) = i32::try_from(value) {
-            rx86::cmp_ri(&mut self.mc, reg, v);
-        } else {
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            self.load_scratch(value);
-            dynasm!(self.mc ; .arch x64
-                            ; cmp Rq(reg), Rq(scratch)
-
-            );
-        }
-    }
-
-    fn emit_cmp_reg_loc_i64(&mut self, reg: u8, loc: &Loc) {
-        match loc {
-            Loc::Reg(other) => {
-                dynasm!(self.mc ; .arch x64 ; cmp Rq(reg), Rq(other.value));
-            }
-            Loc::Frame(frame) => {
-                let ofs = frame.ebp_loc.value;
-                rx86::cmp_rb(&mut self.mc, reg, ofs);
-            }
-            Loc::Immed(value) | Loc::ImmedFloat(value) => self.emit_cmp_imm64(reg, value.value),
-            other => panic!(
-                "emit_cmp_reg_loc_i64: unhandled operand {other:?} — no cmp is \
-            emitted and the following branch reads stale flags"
-            ),
-        }
+        self.mc.SUB(*tmp, imm(check_min));
+        self.mc.CMP(*tmp, imm(check_max - check_min));
     }
 
     /// x86/assembler.py `genop_guard_guard_exception`.
@@ -6477,10 +5388,8 @@ impl<'a> Assembler386<'a> {
         // `_addr_as_reg_offset`, so r11 stays known for the
         // `_store_and_reset_exception` that follows the guard.
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        let mem = self.addr_as_reg_offset(exc_type_addr);
-        self.forget_if_scratch_written(tmp.value);
-        rx86::mov_rm(&mut self.mc, tmp.value, mem);
-        self.emit_cmp_reg_loc_i64(tmp.value, expected_loc);
+        self.mc.MOV(*tmp, heap(exc_type_addr));
+        self.mc.CMP(*tmp, expected_loc);
     }
 
     /// `genop_discard_check_memory_error`: `TEST reg, reg` and a
@@ -6515,32 +5424,23 @@ impl<'a> Assembler386<'a> {
     /// `_store_and_reset_exception`: result = pos_exc_value; clear both
     /// pos_exception and pos_exc_value on the success fallthrough.
     fn emit_store_and_reset_exception(&mut self, result_loc: Option<&Loc>) {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         let exc_value_addr = crate::jit_exc_value_addr() as i64;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        if let Some(loc) = result_loc {
-            let (sr, so) = self.addr_as_reg_offset(exc_value_addr);
-            match loc {
-                Loc::Reg(dst) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::mov_rm(&mut self.mc, dst.value, (sr, so));
-                }
-                Loc::Frame(frame) => {
-                    let ofs = frame.ebp_loc.value;
-                    self.forget_if_scratch_written(scratch);
-                    rx86::mov_rm(&mut self.mc, scratch, (sr, so));
-                    rx86::mov_br(&mut self.mc, ofs, scratch);
-                }
-                other => panic!(
-                    "emit_store_and_reset_exception: unhandled result location \
-                {other:?} — the exception value would be dropped"
-                ),
+        match result_loc {
+            Some(Loc::Reg(dst)) => self.mc.MOV(*dst, heap(exc_value_addr)),
+            Some(loc @ Loc::Frame(_)) => {
+                let tmploc = crate::regloc::X86_64_SCRATCH_REG;
+                self.mc.MOV(tmploc, heap(exc_value_addr));
+                self.mc.MOV(loc, tmploc);
             }
+            None => {}
+            Some(other) => panic!(
+                "emit_store_and_reset_exception: unhandled result location \
+                {other:?} — the exception value would be dropped"
+            ),
         }
-        let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
-        rx86::mov_mi(&mut self.mc, (sr, so), 0);
-        let (sr, so) = self.addr_as_reg_offset(exc_value_addr);
-        rx86::mov_mi(&mut self.mc, (sr, so), 0);
+        self.mc.MOV(heap(exc_type_addr), imm(0));
+        self.mc.MOV(heap(exc_value_addr), imm(0));
     }
 
     /// Hardware condition for `SET_ir` (`rx86.py` `Conditions`).
@@ -6583,7 +5483,7 @@ impl<'a> Assembler386<'a> {
         // always clear zero and carry
         rx86::cmp_ri(&mut self.mc, rx86::EBP, 0);
         // patch the JNP above
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>ordered);
     }
 
@@ -6608,8 +5508,7 @@ impl<'a> Assembler386<'a> {
                 self.guard_success_cc = Some(cond);
                 return;
             }
-            self.forget_if_scratch_written(r.value);
-            rx86::mov_ri(&mut self.mc, r.value, 0);
+            self.mc.MOV(*r, imm(0));
             rx86::set_ir(
                 &mut self.mc,
                 Self::hw_condition(cond),
@@ -6657,6 +5556,7 @@ impl<'a> Assembler386<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let cc = self
             .guard_success_cc
@@ -6668,7 +5568,7 @@ impl<'a> Assembler386<'a> {
         // `implement_guard`: the `Jcc` does not change r11, so the cache
         // at this point is the value the recovery jump leaves in the
         // register.
-        let known_scratch_value = self.scratch_register_value;
+        let known_scratch_value = self.mc.get_scratch_register_known_value();
         self.append_guard_token_with_faillocs(
             op,
             op_index,
@@ -6676,6 +5576,7 @@ impl<'a> Assembler386<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
         self.pending_guard_tokens
             .last_mut()
@@ -6702,6 +5603,7 @@ impl<'a> Assembler386<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         // No branch from this position. Recovery is not entered with the
         // fallthrough r11 cache, so `known_scratch_value` stays unknown.
@@ -6715,6 +5617,7 @@ impl<'a> Assembler386<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
     }
 
@@ -6735,11 +5638,19 @@ impl<'a> Assembler386<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         // `genop_guard_guard_not_invalidated`: `pos` is the opcode byte of
         // the not-yet-written `JMP`; `pos + 1` is "after potential jmp".
         let pos = self.mc.offset().0;
-        self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, guard_argloc, faillocs);
+        self.implement_guard_nojump_with_faillocs(
+            op,
+            op_index,
+            fail_index,
+            guard_argloc,
+            faillocs,
+            frame_depth,
+        );
         let token = self
             .pending_guard_tokens
             .last_mut()
@@ -6749,7 +5660,7 @@ impl<'a> Assembler386<'a> {
         // `genop_guard_guard_not_invalidated` records the scratch cache.
         // `get_relative_pos(break_basic_block=False)` does not forget, and
         // the `JMP rel32` written by `invalidate_loop` does not change r11.
-        token.known_scratch_value = self.scratch_register_value;
+        token.known_scratch_value = self.mc.get_scratch_register_known_value();
         self.ensure_next_label_is_at_least_at_position(pos + 5);
     }
 
@@ -6764,7 +5675,7 @@ impl<'a> Assembler386<'a> {
     fn flush_loop(&mut self) {
         // `RegAlloc.flush_loop` calls `MachineCodeBlockWrapper.get_relative_pos`,
         // which forgets the scratch register when it breaks the basic block.
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         let current_pos = self.mc.offset().0;
         let aligned = (current_pos + 15) & !15;
         let target_pos = aligned.max(self.min_bytes_before_label);
@@ -6785,14 +5696,15 @@ impl<'a> Assembler386<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let fail_label = self.mc.new_dynamic_label();
         // The `jmp` leaves r11 unchanged. Capture the cache before
-        // `forget_after_call_or_jmp`, which only drops the fallthrough.
-        let known_scratch_value = self.scratch_register_value;
+        // the `forget_scratch_register`, which only drops the fallthrough.
+        let known_scratch_value = self.mc.get_scratch_register_known_value();
         dynasm!(self.mc ; .arch x64 ; jmp =>fail_label);
         let pos = self.mc.offset().0;
-        self.forget_after_call_or_jmp();
+        self.mc.forget_scratch_register();
         self.append_guard_token_with_faillocs(
             op,
             op_index,
@@ -6800,6 +5712,7 @@ impl<'a> Assembler386<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
         self.pending_guard_tokens
             .last_mut()
@@ -6819,6 +5732,7 @@ impl<'a> Assembler386<'a> {
         fail_label: DynamicLabel,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) -> GuardToken {
         // assembler.py _store_force_index parity:
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
@@ -6922,7 +5836,8 @@ impl<'a> Assembler386<'a> {
                 descr_fd.rd_locs()
             );
         }
-        let gcmap = self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs);
+        let gcmap =
+            self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs, frame_depth);
 
         // Reuse the cell pre-allocated by `_store_force_index_if_next_guard`
         // when this guard is paired with a CALL_ASSEMBLER's force-store —
@@ -6970,6 +5885,7 @@ impl<'a> Assembler386<'a> {
         fail_label: DynamicLabel,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let token = self.guard_token_with_faillocs(
             op,
@@ -6978,6 +5894,7 @@ impl<'a> Assembler386<'a> {
             fail_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
         self.push_built_guard_token(op, token);
     }
@@ -7028,6 +5945,7 @@ impl<'a> Assembler386<'a> {
         fail_index: u32,
         guard_argloc: Option<Loc>,
         faillocs: &[Option<Loc>],
+        frame_depth: usize,
     ) {
         let unused_label = self.mc.new_dynamic_label();
         self.append_guard_token_with_faillocs(
@@ -7037,16 +5955,16 @@ impl<'a> Assembler386<'a> {
             unused_label,
             guard_argloc,
             faillocs,
+            frame_depth,
         );
         let token = self
             .pending_guard_tokens
             .pop()
             .expect("GUARD_NOT_FORCED_2 descriptor token");
         // `store_force_descr`: `mov r11, descr`, `mov [jf_force_descr], r11`.
-        let descr_ptr = token.fail_cell_ptr as i64;
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.load_scratch(descr_ptr);
-        rx86::mov_br(&mut self.mc, JF_FORCE_DESCR_OFS, scratch);
+        let scratch = crate::regloc::X86_64_SCRATCH_REG;
+        self.mc.MOV(scratch, imm(token.fail_cell_ptr as i64));
+        self.mc.MOV(Operand::B(JF_FORCE_DESCR_OFS), scratch);
         self.finish_gcmap = Some(token.gcmap);
     }
 
@@ -7071,13 +5989,20 @@ impl<'a> Assembler386<'a> {
         // The fail label is a join, so `get_relative_pos` forgets the
         // fallthrough cache. `restore_scratch_register_known_value` then
         // installs the value recorded at the guard jump. `-1` stays unknown.
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
-        self.scratch_register_value = guard_token.known_scratch_value;
+        self.mc
+            .restore_scratch_register_known_value(guard_token.known_scratch_value);
 
         // `PUSH` descr, then `PUSH` gcmap. The recovery pops gcmap first.
-        self.push_imm(guard_token.fail_cell_ptr as i64);
-        self.push_imm(guard_token.gcmap as i64);
+        // Upstream pushes the descr from the gc table (`PUSH_p` +
+        // `_patch_load_from_gc_table`), the slot the rewriter filled with the
+        // descr's GCREF. The cell here is a prebuilt immortal leaf
+        // (`FailDescrCell`, `GC_IMMORTAL_LEAF_HEADER`) owned by `fail_descrs`
+        // and minted after the rewriter ran, so it never moves and its
+        // address is the value that slot would hold.
+        self.mc.PUSH(imm(guard_token.fail_cell_ptr as i64));
+        self.mc.PUSH(imm(guard_token.gcmap as i64));
 
         let index = Self::failure_recovery_index(&guard_token);
         let target = self.failure_recovery_code[index];
@@ -7085,11 +6010,7 @@ impl<'a> Assembler386<'a> {
             target != 0,
             "failure_recovery_code[{index}] was not built (_build_failure_recovery)"
         );
-        // `JMP(imm)` is `mov r11, imm; jmp r11` (`_relative_unaryop`).
-        self.load_scratch(target as i64);
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64 ; jmp Rq(scratch));
-        self.forget_after_call_or_jmp();
+        self.mc.JMP(imm(target as i64));
         RecoveryStub {
             fail_descr: guard_token.fail_descr,
             pos_recovery_stub: stub_start.0,
@@ -7119,7 +6040,7 @@ impl<'a> Assembler386<'a> {
         SlowPath {
             slow_label,
             continue_label,
-            saved_scratch_value_1: self.scratch_register_value,
+            saved_scratch_value_1: self.mc.get_scratch_register_known_value(),
             saved_scratch_value_2: -1,
             kind,
         }
@@ -7136,13 +6057,13 @@ impl<'a> Assembler386<'a> {
             Some(cc) => self.emit_jcc_to_label(cc, slow_label),
             None => {
                 dynasm!(self.mc ; .arch x64 ; jmp =>slow_label);
-                self.forget_after_call_or_jmp();
+                self.mc.forget_scratch_register();
             }
         }
         SlowPath {
             slow_label,
             continue_label,
-            saved_scratch_value_1: self.scratch_register_value,
+            saved_scratch_value_1: self.mc.get_scratch_register_known_value(),
             saved_scratch_value_2: -1,
             kind,
         }
@@ -7152,7 +6073,7 @@ impl<'a> Assembler386<'a> {
     /// without `forget_scratch_register`: `get_relative_pos` is asked not
     /// to break the block, so the not-taken edge keeps the r11 cache.
     fn set_continue_here(&mut self, sp: &mut SlowPath) {
-        sp.saved_scratch_value_2 = self.scratch_register_value;
+        sp.saved_scratch_value_2 = self.mc.get_scratch_register_known_value();
         let continue_label = sp.continue_label;
         dynasm!(self.mc ; .arch x64 ; =>continue_label);
     }
@@ -7172,14 +6093,12 @@ impl<'a> Assembler386<'a> {
                 let continue_label = sp.continue_label;
                 dynasm!(self.mc ; .arch x64 ; =>slow_label);
                 // `restore_scratch_register_known_value` emits no code.
-                self.scratch_register_value = sp.saved_scratch_value_1;
+                self.mc
+                    .restore_scratch_register_known_value(sp.saved_scratch_value_1);
                 self.generate_slowpath_body(sp.kind);
-                // `load_scratch_if_known`: `-1` is unknown.
-                if sp.saved_scratch_value_2 != -1 {
-                    self.load_scratch(sp.saved_scratch_value_2);
-                }
+                self.mc.load_scratch_if_known(sp.saved_scratch_value_2);
                 dynasm!(self.mc ; .arch x64 ; jmp =>continue_label);
-                self.forget_after_call_or_jmp();
+                self.mc.forget_scratch_register();
             }
         }
     }
@@ -7216,7 +6135,7 @@ impl<'a> Assembler386<'a> {
                         Loc::Reg(r) => {
                             dynasm!(self.mc ; .arch x64 ; push Rq(r.value));
                         }
-                        Loc::Immed(i) | Loc::ImmedFloat(i) => self.push_imm(i.value),
+                        Loc::Immed(i) | Loc::ImmedFloat(i) => self.mc.PUSH(imm(i.value)),
                         other => panic!("write barrier base {other:?}"),
                     }
                 }
@@ -7225,10 +6144,7 @@ impl<'a> Assembler386<'a> {
                     helper != 0,
                     "wb_slowpath[{helper_num}] was not built (X86CpuExt::ensure_wb_slowpath)"
                 );
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                self.load_scratch(helper as i64);
-                dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
-                self.forget_after_call_or_jmp();
+                self.mc.CALL(imm(helper as i64));
 
                 if let Some(card_mark) = card_mark {
                     let after_cards = self.mc.new_dynamic_label();
@@ -7236,10 +6152,10 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; =>card_mark);
                     let loc_index = loc_index.expect("card marking records loc_index");
                     // A register base copies the index through r11 and does not
-                    // update `scratch_register_value`. An immediate index is
+                    // update `_scratch_register_value`. An immediate index is
                     // `OR8` via `addr_add_const`.
                     if matches!(loc_index, Loc::Reg(_) | Loc::Frame(_)) {
-                        self.forget_scratch_register();
+                        self.mc.forget_scratch_register();
                     }
                     self.mark_wb_cards(loc_base, &loc_index, card_page_shift);
                     dynasm!(self.mc ; .arch x64 ; =>after_cards);
@@ -7252,10 +6168,7 @@ impl<'a> Assembler386<'a> {
                     helper != 0,
                     "StackCheck queued without stack_check_slowpath"
                 );
-                self.load_scratch(helper as i64);
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
-                self.forget_after_call_or_jmp();
+                self.mc.CALL(imm(helper as i64));
             }
             // `IncreaseStackSlowPath.generate_body`: depth at `[rsp+WORD]`
             // (the `PASS_ON_MY_FRAME` scratch), publish the gcmap captured
@@ -7270,10 +6183,7 @@ impl<'a> Assembler386<'a> {
                     helper != 0,
                     "IncreaseStack queued without frame_realloc_slowpath"
                 );
-                self.load_scratch(helper as i64);
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
-                self.forget_after_call_or_jmp();
+                self.mc.CALL(imm(helper as i64));
             }
             SlowPathKind::CondCall {
                 gcmap,
@@ -7316,32 +6226,39 @@ impl<'a> Assembler386<'a> {
             SlowPathKind::MallocCondVarsize {
                 gcmap,
                 result_reg,
+                kind,
                 itemsize,
-                base_size,
                 type_id,
                 lengthloc,
             } => {
                 // The maxlength `ja` lands on the nursery `ja`. That edge
-                // skipped `addr_as_reg_offset`, so `saved_scratch_value_1`
+                // skipped `_addr_as_reg_offset`, so `saved_scratch_value_1`
                 // does not describe r11 here. Drop the cache before
-                // `load_scratch` (`MallocCondVarsizeSlowPath`).
-                self.forget_scratch_register();
-                // `MallocCondVarsizeSlowPath` stores itemsize with
-                // `MOV_si(WORD, itemsize)`. pyre also passes `base_size`
-                // at `[rsp+2*WORD]`. Both words sit in the
-                // `PASS_ON_MY_FRAME` scratch; the varsize trampoline reads
-                // them above its return address and OOM does not pop a
-                // callsite reservation.
-                self.store_rsp_i64(WORD as i32, itemsize);
-                self.store_rsp_i64((WORD * 2) as i32, base_size);
+                // `_load_scratch` (`MallocCondVarsizeSlowPath`).
+                self.mc.forget_scratch_register();
                 self.publish_malloc_gcmap(gcmap);
-                rx86::mov_ri(&mut self.mc, rx86::ECX, type_id);
                 debug_assert!(
                     !matches!(lengthloc, Loc::Reg(r) if r.value == rx86::ECX || r.value == rx86::EDX),
                     "malloc_cond_varsize lengthloc must not be ecx or edx"
                 );
+                let addr = match kind {
+                    FLAG_ARRAY => {
+                        // `MOV_si(WORD, itemsize)` into the `PASS_ON_MY_FRAME`
+                        // scratch; the trampoline reads it above its return
+                        // address, so OOM does not pop a callsite reservation.
+                        self.mc.MOV(Operand::S(WORD as i32), imm(itemsize));
+                        self.malloc_slowpath_varsize
+                    }
+                    FLAG_STR => self.malloc_slowpath_str,
+                    FLAG_UNICODE => self.malloc_slowpath_unicode,
+                    other => panic!("malloc_cond_varsize: unknown kind {other}"),
+                };
                 self.mov_gpr_from_loc(rx86::EDX, lengthloc);
-                self.call_malloc_helper(self.malloc_slowpath_varsize);
+                // `MOV_ri(ecx, arraydescr.tid)`. Upstream loads it for
+                // `FLAG_ARRAY` only; `malloc_str` / `malloc_unicode` capture
+                // their tid, which `dynasm_malloc_str` takes as an argument.
+                rx86::mov_ri(&mut self.mc, rx86::ECX, type_id);
+                self.call_malloc_helper(addr);
                 self.move_malloc_result(result_reg);
             }
         }
@@ -7352,7 +6269,7 @@ impl<'a> Assembler386<'a> {
     /// four `cond_call_register_arguments`, then `call rax`.
     fn emit_cond_call_helper_variant(&mut self, supports_floats: bool, callee_only: bool) {
         self.pending_slowpaths.clear();
-        self.scratch_register_value = -1;
+        self.mc.restore_scratch_register_known_value(-1);
         self.guard_success_cc = None;
         self.frame_depth_to_patch.clear();
         let arg_regs = crate::x86::regalloc::cond_call_argument_regs();
@@ -7373,8 +6290,7 @@ impl<'a> Assembler386<'a> {
         #[cfg(not(target_os = "windows"))]
         let align = WORD as i32;
         rx86::sub_ri(&mut self.mc, rx86::ESP, align);
-        dynasm!(self.mc ; .arch x64 ; call rax);
-        self.forget_after_call_or_jmp();
+        self.mc.CALL(crate::regloc::EAX);
         self.reload_frame_if_necessary();
         rx86::add_ri(&mut self.mc, rx86::ESP, align);
         self.pop_gcmap();
@@ -7385,7 +6301,7 @@ impl<'a> Assembler386<'a> {
             callee_only,
         );
         dynasm!(self.mc ; .arch x64 ; ret);
-        self.forget_after_call_or_jmp();
+        self.mc.forget_scratch_register();
         self.flush_pending_slowpaths();
     }
 
@@ -7450,7 +6366,7 @@ impl<'a> Assembler386<'a> {
             &dst,
             Loc::Reg(crate::regloc::X86_64_SCRATCH_REG),
         );
-        rx86::mov_ri(&mut self.mc, rx86::EAX, imm_func);
+        self.mc.MOV(crate::regloc::EAX, imm(imm_func));
         let helper = self
             .cond_call_slowpath
             .get(variant_num)
@@ -7460,10 +6376,7 @@ impl<'a> Assembler386<'a> {
             helper != 0,
             "cond_call_slowpath[{variant_num}] was not built (_build_cond_call_slowpath)"
         );
-        self.load_scratch(helper as i64);
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
-        self.forget_after_call_or_jmp();
+        self.mc.CALL(imm(helper as i64));
         if let Some(resloc) = resloc {
             let is_eax = matches!(resloc, Loc::Reg(r) if r == crate::regloc::EAX);
             if !is_eax {
@@ -7493,7 +6406,7 @@ impl<'a> Assembler386<'a> {
             // records the scratch cache at this `jcc`. The call forgot it;
             // `emit_guard_no_exception_check` reloaded the exception address
             // into r11, and the `jcc` leaves that value in place.
-            token.known_scratch_value = self.scratch_register_value;
+            token.known_scratch_value = self.mc.get_scratch_register_known_value();
             self.pending_guard_tokens.push(token);
         } else if expects_guard_no_exception {
             panic!("a cond-call asked for GUARD_NO_EXCEPTION and the guard never stored the token");
@@ -7524,20 +6437,17 @@ impl<'a> Assembler386<'a> {
         }
         // `generate_propagate_error_64`: one trampoline after the stubs.
         // `forget` before the bind — the label is a join, not a
-        // `SlowPath` continue edge. `jmp r11` reaches
-        // `propagate_exception_path` in its own buffer.
+        // `SlowPath` continue edge. `JMP(imm(propagate_exception_path))`
+        // goes through r11 to its own buffer.
         if let Some(label) = self.pending_memoryerror_trampoline {
             let path = self.propagate_exception_path;
             assert!(
                 path != 0,
                 "memory-error trampoline without propagate_exception_path"
             );
-            self.forget_scratch_register();
+            self.mc.forget_scratch_register();
             dynasm!(self.mc ; .arch x64 ; =>label);
-            self.load_scratch(path as i64);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            dynasm!(self.mc ; .arch x64 ; jmp Rq(scratch));
-            self.forget_after_call_or_jmp();
+            self.mc.JMP(imm(path as i64));
         }
         stub_offsets
     }
@@ -8097,8 +7007,7 @@ impl<'a> Assembler386<'a> {
     /// `CMP heap(self.cpu.pos_exception()), imm0` with success on zero.
     fn emit_guard_no_exception_check(&mut self) {
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
-        rx86::cmp_mi(&mut self.mc, (sr, so), 0);
+        self.mc.CMP(heap(exc_type_addr), imm(0));
         self.guard_success_cc = Some(CC_E);
     }
 
@@ -8161,10 +7070,9 @@ impl<'a> Assembler386<'a> {
         // put. The load is a cell pointer rather than a gc-table slot: fail
         // descrs are `FailDescrCell`s, and `recover_fail_descr_cell` reads
         // that thin pointer back.
-        self.forget_scratch_register();
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.load_scratch(descr_ptr);
-        rx86::mov_br(&mut self.mc, JF_FORCE_DESCR_OFS, scratch);
+        let scratch = crate::regloc::X86_64_SCRATCH_REG;
+        self.mc.MOV(scratch, imm(descr_ptr));
+        self.mc.MOV(Operand::B(JF_FORCE_DESCR_OFS), scratch);
     }
 
     // genop_* — control flow
@@ -8408,28 +7316,21 @@ impl<'a> Assembler386<'a> {
         ofs: i32,
         field_size: usize,
     ) {
-        if let Loc::Reg(v) = val_loc
-            && v.is_xmm
-        {
-            // `save_into_mem`: an xmm store is `MOVSD`. `get_type_flag`
-            // banks only `lltype.Float` (8 bytes).
-            debug_assert_eq!(field_size, 8, "save_into_mem: float-kind access is 8 bytes");
-            rx86::movsd_mx(&mut self.mc, (base.value, ofs), v.value);
+        let dest_addr = Operand::M(base.value, i64::from(ofs));
+        if let Loc::Reg(_) | Loc::Immed(_) | Loc::ImmedFloat(_) = val_loc {
+            self.save_into_mem(dest_addr, val_loc, field_size);
             return;
         }
-        let val_reg = match val_loc {
-            Loc::Reg(v) => v.value,
-            _ => {
-                let scratch = crate::regloc::X86_64_SCRATCH_REG;
-                self.regalloc_mov(val_loc, &Loc::Reg(scratch));
-                scratch.value
-            }
-        };
+        // A memory value is staged through the scratch register, which
+        // `INSN('MOV*')` refuses to store, so the store is the raw form.
+        let scratch = crate::regloc::X86_64_SCRATCH_REG;
+        self.mc.MOV(scratch, val_loc);
+        let mem = (base.value, ofs);
         match field_size {
-            1 => rx86::mov8_mr(&mut self.mc, (base.value, ofs), val_reg),
-            2 => rx86::mov16_mr(&mut self.mc, (base.value, ofs), val_reg),
-            4 => rx86::mov32_mr(&mut self.mc, (base.value, ofs), val_reg),
-            _ => rx86::mov_mr(&mut self.mc, (base.value, ofs), val_reg),
+            1 => rx86::mov8_mr(&mut self.mc, mem, scratch.value),
+            2 => rx86::mov16_mr(&mut self.mc, mem, scratch.value),
+            4 => rx86::mov32_mr(&mut self.mc, mem, scratch.value),
+            _ => rx86::mov_mr(&mut self.mc, mem, scratch.value),
         }
     }
 
@@ -8437,324 +7338,71 @@ impl<'a> Assembler386<'a> {
     /// `size`: byte size (1/2/4/8). Negative = signed load.
     fn emit_op_gcload_regalloc(
         &mut self,
-        base: &crate::regloc::RegLoc,
+        base_loc: &Loc,
         ofs_loc: &Loc,
         dst: &crate::regloc::RegLoc,
         size: i64,
     ) {
-        let abs_size = size.unsigned_abs() as usize;
-        let signed = size < 0;
-        match ofs_loc {
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                let o = i.value as i32;
-                self.emit_gcload_sized(base, o, None, dst, abs_size, signed);
-            }
-            Loc::Reg(ofs_r) => {
-                self.emit_gcload_sized(base, 0, Some(ofs_r), dst, abs_size, signed);
-            }
-            other => panic!(
-                "emit_op_gcload_regalloc: unhandled offset {other:?} — no load is \
-            emitted and the destination keeps its previous value"
-            ),
-        }
+        let src = addr_add(base_loc, ofs_loc, 0, 0);
+        self.load_from_mem(*dst, src, size.unsigned_abs() as usize, size < 0);
     }
 
-    /// Sized load: `[base + ofs]` or `[base + ofs_reg]` — assembler.py:1645 load_from_mem.
-    fn emit_gcload_sized(
+    /// assembler.py `load_from_mem`.
+    fn load_from_mem(
         &mut self,
-        base: &crate::regloc::RegLoc,
-        ofs: i32,
-        ofs_reg: Option<&crate::regloc::RegLoc>,
-        dst: &crate::regloc::RegLoc,
+        resloc: crate::regloc::RegLoc,
+        source_addr: Operand,
         size: usize,
-        signed: bool,
+        sign: bool,
     ) {
-        if dst.is_xmm {
-            // `load_from_mem`: an xmm location is `MOVSD`. `get_type_flag`
-            // banks `lltype.Float` only; a singlefloat access is int-kind.
+        if resloc.is_xmm {
+            // An xmm location is `MOVSD`. `get_type_flag` banks
+            // `lltype.Float` only; a singlefloat access is int-kind.
             debug_assert_eq!(size, 8, "load_from_mem: float-kind access is 8 bytes");
-            if let Some(r) = ofs_reg {
-                rx86::movsd_xa(
-                    &mut self.mc,
-                    dst.value,
-                    (i16::from(base.value), r.value, 0, 0),
-                );
-            } else {
-                rx86::movsd_xm(&mut self.mc, dst.value, (base.value, ofs));
-            }
+            self.mc.MOVSD(resloc, source_addr);
             return;
         }
-        if let Some(r) = ofs_reg {
-            let addr = (i16::from(base.value), r.value, 0, 0);
-            match (size, signed) {
-                (1, false) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movzx8_ra(&mut self.mc, dst.value, addr);
-                }
-                (1, true) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movsx8_ra(&mut self.mc, dst.value, addr);
-                }
-                (2, false) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movzx16_ra(&mut self.mc, dst.value, addr);
-                }
-                (2, true) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movsx16_ra(&mut self.mc, dst.value, addr);
-                }
-                (4, false) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::mov32_ra(&mut self.mc, dst.value, addr);
-                }
-                (4, true) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movsx32_ra(&mut self.mc, dst.value, addr);
-                }
-                _ => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::mov_ra(&mut self.mc, dst.value, addr);
-                }
-            }
-        } else {
-            let mem = (base.value, ofs);
-            match (size, signed) {
-                (1, false) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movzx8_rm(&mut self.mc, dst.value, mem);
-                }
-                (1, true) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movsx8_rm(&mut self.mc, dst.value, mem);
-                }
-                (2, false) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movzx16_rm(&mut self.mc, dst.value, mem);
-                }
-                (2, true) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movsx16_rm(&mut self.mc, dst.value, mem);
-                }
-                (4, false) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::mov32_rm(&mut self.mc, dst.value, mem);
-                }
-                (4, true) => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::movsx32_rm(&mut self.mc, dst.value, mem);
-                }
-                _ => {
-                    self.forget_if_scratch_written(dst.value);
-                    rx86::mov_rm(&mut self.mc, dst.value, mem);
-                }
-            }
+        match (size, sign) {
+            (1, true) => self.mc.MOVSX8(resloc, source_addr),
+            (1, false) => self.mc.MOVZX8(resloc, source_addr),
+            (2, true) => self.mc.MOVSX16(resloc, source_addr),
+            (2, false) => self.mc.MOVZX16(resloc, source_addr),
+            (4, true) => self.mc.MOVSX32(resloc, source_addr),
+            // zero-extending
+            (4, false) => self.mc.MOV32(resloc, source_addr),
+            (WORD, _) => self.mc.MOV(resloc, source_addr),
+            _ => panic!("load_from_mem size = {size}"),
         }
     }
 
-    /// x86/assembler.py genop_discard_gc_store — sized store via regalloc.
-    fn emit_op_gcstore_regalloc(
-        &mut self,
-        base: &crate::regloc::RegLoc,
-        ofs_loc: &Loc,
-        val: &crate::regloc::RegLoc,
-        size: usize,
-    ) {
-        match ofs_loc {
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                let o = i.value as i32;
-                self.emit_gcstore_sized(base, o, None, val, size);
-            }
-            Loc::Reg(ofs_r) => {
-                self.emit_gcstore_sized(base, 0, Some(ofs_r), val, size);
-            }
-            other => panic!("GcStore: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",),
-        }
-    }
-
-    /// Immediate-value variant of `emit_op_gcstore_regalloc`.
-    /// `llsupport/regalloc.py return_constant` may return a bare
-    /// `Loc::Immed` for a Const value, so GcStore reaches the emitter
-    /// with the literal already in hand. x86 can write the immediate
-    /// directly into memory when it fits in `imm32` (sign-extended for
-    /// QWORD stores), avoiding the need for a staging register.
-    fn emit_op_gcstore_imm_regalloc(
-        &mut self,
-        base: &crate::regloc::RegLoc,
-        ofs_loc: &Loc,
-        val: i64,
-        size: usize,
-    ) {
-        let val_fits_imm32 = (val as i32) as i64 == val;
-        let val_fits_at_size = match size {
-            1 => (val & !0xFF) == 0 || (val | 0xFF) == -1,
-            2 => (val & !0xFFFF) == 0 || (val | 0xFFFF) == -1,
-            4 => (val & !0xFFFFFFFFi64) == 0 || (val | 0xFFFFFFFFi64) == -1,
-            _ => val_fits_imm32,
-        };
-        if val_fits_at_size {
-            match ofs_loc {
-                Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                    let o = i.value as i32;
-                    self.emit_gcstore_imm_sized(base, o, None, val, size);
-                }
-                Loc::Reg(ofs_r) => {
-                    self.emit_gcstore_imm_sized(base, 0, Some(ofs_r), val, size);
-                }
-                other => {
-                    panic!("GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
-                }
-            }
-            return;
-        }
-        // regloc.py `insn_with_64_bit_immediate`: a QWORD immediate that
-        // does not fit sign-extended imm32 is loaded into a register and
-        // written with one QWORD store. Two DWORD halves would defeat
-        // store-to-load forwarding for the QWORD load that usually follows
-        // (`GUARD_CLASS` reading the vtable just written by `NEW_WITH_VTABLE`).
-        debug_assert_eq!(
-            size, 8,
-            "64-bit immediate path only reachable for QWORD stores; smaller sizes go through val_fits_at_size",
-        );
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        match ofs_loc {
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                // `_load_scratch(val2)` then `INSN(loc1, X86_64_SCRATCH_REG)`.
-                self.load_scratch(val);
-                rx86::mov_mr(&mut self.mc, (base.value, i.value as i32), scratch);
-            }
-            Loc::Reg(ofs_r) if ofs_r.value != scratch => {
-                self.load_scratch(val);
-                rx86::mov_ar(
-                    &mut self.mc,
-                    (i16::from(base.value), ofs_r.value, 0, 0),
-                    scratch,
-                );
-            }
-            Loc::Reg(ofs_r) => {
-                // The regalloc staged an out-of-range offset into the
-                // scratch register (`gc_offset_loc`), so it cannot carry the
-                // value: `find_unused_reg` + `PUSH_r` / `MOV_ri` / `INSN` /
-                // `POP_r`.
-                let freereg = [rx86::EAX, rx86::EDX, rx86::ECX]
-                    .into_iter()
-                    .find(|&r| r != base.value && r != ofs_r.value)
-                    .expect("three candidates against two address registers");
-                dynasm!(self.mc ; .arch x64 ; push Rq(freereg));
-                rx86::mov_ri(&mut self.mc, freereg, val);
-                rx86::mov_ar(
-                    &mut self.mc,
-                    (i16::from(base.value), ofs_r.value, 0, 0),
-                    freereg,
-                );
-                dynasm!(self.mc ; .arch x64 ; pop Rq(freereg));
-            }
-            other => panic!("GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",),
-        }
-    }
-
-    /// `save_into_mem` for an indexed address: `MOV8_ai` / `MOV16_ai` /
-    /// `MOV32_ai` / `MOV_ai` when the constant fits that store's immediate
-    /// (imm32, sign-extended, for an 8-byte store). Otherwise
-    /// `_load_scratch` and `MOV*_ar`.
-    fn emit_indexed_imm_store(&mut self, addr: (i16, u8, u8, i32), val: i64, size: usize) {
-        let val_fits_imm32 = (val as i32) as i64 == val;
-        let fits = match size {
-            1 => (val & !0xFF) == 0 || (val | 0xFF) == -1,
-            2 => (val & !0xFFFF) == 0 || (val | 0xFFFF) == -1,
-            4 => (val & !0xFFFF_FFFFi64) == 0 || (val | 0xFFFF_FFFFi64) == -1,
-            _ => val_fits_imm32,
-        };
-        if fits {
-            match size {
-                1 => rx86::mov8_ai(&mut self.mc, addr, val as i32),
-                2 => rx86::mov16_ai(&mut self.mc, addr, val as i32),
-                4 => rx86::mov32_ai(&mut self.mc, addr, val as i32),
-                _ => rx86::mov_ai(&mut self.mc, addr, val as i32),
-            }
-            return;
-        }
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.load_scratch(val);
-        match size {
-            1 => rx86::mov8_ar(&mut self.mc, addr, scratch),
-            2 => rx86::mov16_ar(&mut self.mc, addr, scratch),
-            4 => rx86::mov32_ar(&mut self.mc, addr, scratch),
-            _ => rx86::mov_ar(&mut self.mc, addr, scratch),
-        }
-    }
-
-    /// Sized direct memory-immediate store: `mov SIZE [base + ofs(_reg)], imm`.
-    fn emit_gcstore_imm_sized(
-        &mut self,
-        base: &crate::regloc::RegLoc,
-        ofs: i32,
-        ofs_reg: Option<&crate::regloc::RegLoc>,
-        val: i64,
-        size: usize,
-    ) {
-        if let Some(r) = ofs_reg {
-            let addr = (i16::from(base.value), r.value, 0, 0);
-            match size {
-                1 => rx86::mov8_ai(&mut self.mc, addr, val as i32),
-                2 => rx86::mov16_ai(&mut self.mc, addr, val as i32),
-                4 => rx86::mov32_ai(&mut self.mc, addr, val as i32),
-                8 => rx86::mov_ai(&mut self.mc, addr, val as i32),
-                other => panic!("GcStore imm: unsupported store size {other}"),
-            }
-        } else {
-            let mem = (base.value, ofs);
-            match size {
-                1 => rx86::mov8_mi(&mut self.mc, mem, val as i32),
-                2 => rx86::mov16_mi(&mut self.mc, mem, val as i32),
-                4 => rx86::mov32_mi(&mut self.mc, mem, val as i32),
-                8 => rx86::mov_mi(&mut self.mc, mem, val as i32),
-                other => panic!("GcStore imm: unsupported store size {other}"),
-            }
-        }
+    /// `ImmedLoc.lowest8bits`: the low byte, sign-extended.
+    fn lowest8bits(val: i64) -> i32 {
+        i32::from(val as u8 as i8)
     }
 
     /// Sized store: `[base + ofs]` or `[base + ofs_reg]` — assembler.py save_into_mem.
-    fn emit_gcstore_sized(
-        &mut self,
-        base: &crate::regloc::RegLoc,
-        ofs: i32,
-        ofs_reg: Option<&crate::regloc::RegLoc>,
-        val: &crate::regloc::RegLoc,
-        size: usize,
-    ) {
-        if val.is_xmm {
-            // `save_into_mem`: an xmm location is `MOVSD`. `get_type_flag`
-            // banks `lltype.Float` only; a singlefloat access is int-kind.
+    fn save_into_mem(&mut self, dest_addr: Operand, value_loc: &Loc, size: usize) {
+        if let Loc::Reg(v) = value_loc
+            && v.is_xmm
+        {
+            // An xmm store is `MOVSD`. `get_type_flag` banks only
+            // `lltype.Float` (8 bytes).
             debug_assert_eq!(size, 8, "save_into_mem: float-kind access is 8 bytes");
-            if let Some(r) = ofs_reg {
-                rx86::movsd_ax(
-                    &mut self.mc,
-                    (i16::from(base.value), r.value, 0, 0),
-                    val.value,
-                );
-            } else {
-                rx86::movsd_mx(&mut self.mc, (base.value, ofs), val.value);
-            }
+            self.mc.MOVSD(dest_addr, *v);
             return;
         }
-        if let Some(r) = ofs_reg {
-            let addr = (i16::from(base.value), r.value, 0, 0);
-            match size {
-                1 => rx86::mov8_ar(&mut self.mc, addr, val.value),
-                2 => rx86::mov16_ar(&mut self.mc, addr, val.value),
-                4 => rx86::mov32_ar(&mut self.mc, addr, val.value),
-                8 => rx86::mov_ar(&mut self.mc, addr, val.value),
-                other => panic!("GcStore: unsupported store size {other}"),
-            }
-        } else {
-            let mem = (base.value, ofs);
-            match size {
-                1 => rx86::mov8_mr(&mut self.mc, mem, val.value),
-                2 => rx86::mov16_mr(&mut self.mc, mem, val.value),
-                4 => rx86::mov32_mr(&mut self.mc, mem, val.value),
-                8 => rx86::mov_mr(&mut self.mc, mem, val.value),
-                other => panic!("GcStore: unsupported store size {other}"),
-            }
+        match size {
+            // `value_loc.lowest8bits()`
+            1 => match value_loc.as_immed() {
+                Some((v, _)) => self
+                    .mc
+                    .MOV8(dest_addr, imm(i64::from(Self::lowest8bits(v)))),
+                None => self.mc.MOV8(dest_addr, value_loc),
+            },
+            2 => self.mc.MOV16(dest_addr, value_loc),
+            4 => self.mc.MOV32(dest_addr, value_loc),
+            8 => self.mc.MOV(dest_addr, value_loc),
+            other => panic!("save_into_mem: unsupported store size {other}"),
         }
     }
 
@@ -8768,532 +7416,57 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// `CallBuilderX86.get_tlofs_reg`: load `THREADLOCAL_OFS` into callee-saved
-    /// r12 once. Later calls reuse it. The value is the absolute thread-local
-    /// address, so a later `add rsp` does not invalidate it.
-    fn ensure_tlofs_reg(&mut self, esp_ofs: i32, tlofs_loaded: &mut bool) {
-        if *tlofs_loaded {
-            return;
-        }
-        rx86::mov_rs(&mut self.mc, rx86::R12, THREADLOCAL_OFS as i32 + esp_ofs);
-        *tlofs_loaded = true;
-    }
-
-    /// `CallBuilderX86.write_real_errno`, just before the raw call.
-    ///
-    /// `esp_ofs` is how far rsp sits below the body rsp. eax carries the
-    /// errno word, and Win64 `SetLastError` clobbers rax and the argument
-    /// registers. `win64_save_register_args` spills every used argument
-    /// GPR — a register fnloc included — and restores it before
-    /// `emit_raw_call`. r12 keeps the thread-local address for
-    /// `read_real_errno`.
-    fn write_real_errno(
-        &mut self,
-        save_err: i64,
-        esp_ofs: i32,
-        tlofs_loaded: &mut bool,
-        win64_arg_gpr: u8,
-        win64_arg_xmm: u8,
-    ) {
-        use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_READSAVED_ERRNO, RFFI_ZERO_ERRNO_BEFORE};
-        use majit_rlib::rthread::{
-            TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
-        };
-        let _ = (win64_arg_gpr, win64_arg_xmm);
-        let p_errno = TLFIELD_P_ERRNO_OFS as i32;
-
-        #[cfg(target_os = "windows")]
-        if save_err & majit_jitcode::rffi::RFFI_READSAVED_LASTERROR != 0 {
-            use majit_rlib::rthread::{TLFIELD_ALT_LASTERROR_OFS, TLFIELD_RPY_LASTERROR_OFS};
-            let lasterror = if save_err & RFFI_ALT_ERRNO != 0 {
-                TLFIELD_ALT_LASTERROR_OFS
-            } else {
-                TLFIELD_RPY_LASTERROR_OFS
-            } as i32;
-            let set_last_error = majit_rlib::rwin32::_SetLastError as *const () as i64;
-            // `get_tlofs_reg` runs before `win64_save_register_args`, which
-            // spills only the used argument registers into the existing
-            // shadow and then `sub rsp, 4*WORD` for `SetLastError`.
-            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
-            // Win64 `ARGUMENTS_GPR`: ecx, edx, r8, r9. `rx86::R8` / `R9`
-            // are test-only names; the numbers are the register ids.
-            const GPRS: [u8; 4] = [rx86::ECX, rx86::EDX, 8, 9];
-            for i in 0..4 {
-                let bit = 1u8 << i;
-                let ofs = (i * WORD) as i32;
-                if win64_arg_gpr & bit != 0 {
-                    rx86::mov_sr(&mut self.mc, ofs, GPRS[i]);
-                } else if win64_arg_xmm & bit != 0 {
-                    rx86::movsd_sx(&mut self.mc, ofs, i as u8);
-                }
-            }
-            dynasm!(self.mc ; .arch x64 ; sub rsp, 32);
-            rx86::mov32_rm(&mut self.mc, rx86::ECX, (rx86::R12, lasterror));
-            // `CALL(imm(follow_jump(SetLastError_addr)))`.
-            self.emit_immediate_call(set_last_error);
-            dynasm!(self.mc ; .arch x64 ; add rsp, 32);
-            // `CallBuilder64.win64_restore_register_args`.
-            for i in 0..4 {
-                let bit = 1u8 << i;
-                let ofs = (i * WORD) as i32;
-                if win64_arg_gpr & bit != 0 {
-                    rx86::mov_rs(&mut self.mc, GPRS[i], ofs);
-                } else if win64_arg_xmm & bit != 0 {
-                    rx86::movsd_xs(&mut self.mc, i as u8, ofs);
-                }
-            }
-        }
-
-        if save_err & RFFI_READSAVED_ERRNO != 0 {
-            // Just before a call, read '*_errno' and write it into the
-            // real 'errno'. r10 is the temporary; eax holds the 32-bit value.
-            let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
-                TLFIELD_ALT_ERRNO_OFS
-            } else {
-                TLFIELD_RPY_ERRNO_OFS
-            } as i32;
-            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
-            rx86::mov_rm(&mut self.mc, rx86::R10, (rx86::R12, p_errno));
-            rx86::mov32_rm(&mut self.mc, rx86::EAX, (rx86::R12, rpy_errno));
-            rx86::mov32_mr(&mut self.mc, (rx86::R10, 0), rx86::EAX);
-        } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
-            // Same, but write zero.
-            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
-            rx86::mov_rm(&mut self.mc, rx86::EAX, (rx86::R12, p_errno));
-            rx86::mov32_mi(&mut self.mc, (rx86::EAX, 0), 0);
-        }
-    }
-
-    /// `CallBuilderX86.read_real_errno`, after the raw call and after the
-    /// stack pointer is restored: save the real `errno` (and on Windows the
-    /// last error) into the thread-local copy. rax/xmm0 hold the result.
-    fn read_real_errno(
-        &mut self,
-        save_err: i64,
-        esp_ofs: i32,
-        tlofs_loaded: &mut bool,
-        restype: Type,
-        singlefloat_result: bool,
-    ) {
-        use majit_jitcode::rffi::{RFFI_ALT_ERRNO, RFFI_SAVE_ERRNO};
-        #[cfg(not(target_os = "windows"))]
-        let _ = (restype, singlefloat_result);
-        use majit_rlib::rthread::{
-            TLFIELD_ALT_ERRNO_OFS, TLFIELD_P_ERRNO_OFS, TLFIELD_RPY_ERRNO_OFS,
-        };
-
-        if save_err & RFFI_SAVE_ERRNO != 0 {
-            // Just after a call, read the real 'errno' and save a copy of
-            // it inside our thread-local '*_errno'. ecx leaves rax alone.
-            let rpy_errno = if save_err & RFFI_ALT_ERRNO != 0 {
-                TLFIELD_ALT_ERRNO_OFS
-            } else {
-                TLFIELD_RPY_ERRNO_OFS
-            } as i32;
-            let p_errno = TLFIELD_P_ERRNO_OFS as i32;
-            self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
-            rx86::mov_rm(&mut self.mc, rx86::ECX, (rx86::R12, p_errno));
-            rx86::mov32_rm(&mut self.mc, rx86::ECX, (rx86::ECX, 0));
-            rx86::mov32_mr(&mut self.mc, (rx86::R12, rpy_errno), rx86::ECX);
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            use majit_jitcode::rffi::{RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR};
-            use majit_rlib::rthread::{TLFIELD_ALT_LASTERROR_OFS, TLFIELD_RPY_LASTERROR_OFS};
-            if save_err & (RFFI_SAVE_LASTERROR | RFFI_SAVE_WSALASTERROR) != 0 {
-                let get_last_error = if save_err & RFFI_SAVE_LASTERROR != 0 {
-                    majit_rlib::rwin32::_GetLastError as *const () as i64
-                } else {
-                    majit_rlib::_rsocket_rffi::_WSAGetLastError as *const () as i64
-                };
-                let lasterror = if save_err & RFFI_ALT_ERRNO != 0 {
-                    TLFIELD_ALT_LASTERROR_OFS
-                } else {
-                    TLFIELD_RPY_LASTERROR_OFS
-                } as i32;
-                // `CallBuilder64.save_result_value` stores the result at
-                // [rsp+0]. That word is the callee's shadow space on
-                // Win64, so a fresh 32-byte shadow is reserved below it
-                // for the call, as `win64_save_register_args` does around
-                // `SetLastError`. rsp is the body rsp here
-                // (`restore_stack_pointer` ran) and stays 16-byte aligned.
-                // r12 already names the thread-local block
-                // (`get_tlofs_reg`), so the `SUB` does not change it.
-                self.ensure_tlofs_reg(esp_ofs, tlofs_loaded);
-                debug_assert_eq!(esp_ofs % 16, 0);
-                self.save_result_value(restype, singlefloat_result);
-                rx86::sub_ri(&mut self.mc, rx86::ESP, 4 * WORD as i32);
-                // `CALL(imm(follow_jump(GetLastError_addr)))`.
-                self.emit_immediate_call(get_last_error);
-                rx86::mov32_mr(&mut self.mc, (rx86::R12, lasterror), rx86::EAX);
-                rx86::add_ri(&mut self.mc, rx86::ESP, 4 * WORD as i32);
-                self.restore_result_value(restype, singlefloat_result);
-            }
-        }
-    }
-
-    /// `CallBuilder64.save_result_value`: temporarily save the result
-    /// value into [ESP].
-    #[cfg(target_os = "windows")]
-    fn save_result_value(&mut self, restype: Type, singlefloat_result: bool) {
-        match restype {
-            // void return
-            Type::Void => {}
-            Type::Float => rx86::movsd_sx(&mut self.mc, 0, 0),
-            // singlefloat return: store the lower 32 bits of XMM0 into [ESP]
-            _ if singlefloat_result => {
-                dynasm!(self.mc ; .arch x64 ; movd DWORD [rsp], xmm0);
-            }
-            _ => rx86::mov_sr(&mut self.mc, 0, rx86::EAX),
-        }
-    }
-
-    /// `CallBuilder64.restore_result_value`: opposite of `save_result_value`.
-    #[cfg(target_os = "windows")]
-    fn restore_result_value(&mut self, restype: Type, singlefloat_result: bool) {
-        match restype {
-            Type::Void => {}
-            Type::Float => rx86::movsd_xs(&mut self.mc, 0, 0),
-            _ if singlefloat_result => {
-                dynasm!(self.mc ; .arch x64 ; movd xmm0, DWORD [rsp]);
-            }
-            _ => rx86::mov_rs(&mut self.mc, rx86::EAX, 0),
-        }
-    }
-
-    /// aarch64/opassembler.py _emit_call.
-    /// arglocs = [resloc, size, sign, func, args...] for normal CALLs and
-    /// [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
-    ///
-    /// Register-bound arg moves go through `remap_frame_layout_mixed`
-    /// (a parallel-move algorithm) mirroring x86/callbuilder.py prepare_arguments
-    /// `prepare_arguments` → `remap_frame_layout`.  Emitting them naively
-    /// in source order broke Win64 where two args could map to the same
-    /// dst-then-src register (e.g. arg0 → rcx clobbering Reg(rcx) before
-    /// arg1 reads it as Gpr(rdx)).  Linux SysV escaped the same code
-    /// path because its rdi/rsi placement happened not to collide with
-    /// regalloc-chosen rcx/rdx for these traces.
-    fn emit_call_from_arglocs(
-        &mut self,
-        op: &Op,
-        arglocs: &[Loc],
-        func_index: usize,
-        save_err: i64,
-    ) {
-        let arg_count = arglocs.len();
-        let call_arg_count = arg_count.saturating_sub(func_index + 1);
-        let descr_arc = op.getdescr();
-        let call_descr = descr_arc.as_ref().and_then(|descr| descr.as_call_descr());
-        let arg_types = call_descr
-            .map(|descr| descr.arg_types().to_vec())
-            .filter(|types| types.len() == call_arg_count)
-            .unwrap_or_else(|| vec![Type::Int; call_arg_count]);
-        let arg_classes = call_descr
-            .map(|descr| descr.arg_classes())
-            .filter(|classes| classes.len() == call_arg_count)
-            .unwrap_or_default();
-        let (placements, mut stack_slots) =
-            Self::build_abi_arg_placements(&arg_types, &arg_classes);
-        // `CallBuilder64._unused_gpr` / `_unused_xmm` record which of the
-        // first four Win64 argument slots were used (`win64_arg_gpr` /
-        // `win64_arg_xmm`). SysV ignores the mask.
-        let mut win64_arg_gpr = 0u8;
-        let mut win64_arg_xmm = 0u8;
-        for (i, placement) in placements.iter().enumerate().take(4) {
-            match placement {
-                AbiArgPlacement::Gpr(_) => win64_arg_gpr |= 1 << i,
-                AbiArgPlacement::Xmm(_) => win64_arg_xmm |= 1 << i,
-                AbiArgPlacement::Stack(_) => {}
-            }
-        }
-
-        // `CallBuilderX86.__init__` appends a non-immediate register fnloc
-        // as one more integer argument. `CallBuilder64.prepare_arguments`
-        // puts that word in the next unused GPR (`_unused_gpr`), or in a
-        // `RawEspLoc` once those GPRs are full, and records the Win64
-        // argument bit so `win64_save_register_args` keeps it across
-        // `SetLastError`. The extra stack slot is counted here, before
-        // `subtract_esp_aligned`, because the offset is from the final rsp.
-        //
-        // A frame fnloc stays `CALL [rbp+ofs]`. That slot is not an
-        // argument register, so `write_real_errno` does not clobber it.
-        // An immediate is not an argument: `_relative_unaryop` loads it
-        // at the call.
-        let prepared = Self::prepare_call_fnloc(
-            arglocs.get(func_index).copied(),
-            &arg_types,
-            &arg_classes,
-            &mut stack_slots,
-            &mut win64_arg_gpr,
-        );
-
-        // `CallBuilder64.prepare_arguments` then
-        // `subtract_esp_aligned(on_stack - stack_max)`. `stack_max` is
-        // `PASS_ON_MY_FRAME`, already reserved by `_call_header`. A
-        // non-positive count emits no `sub rsp`.
-        let on_stack = super::callbuilder::outgoing_stack_words(stack_slots);
-        let call_area_adjust = self.subtract_esp_aligned(on_stack - PASS_ON_MY_FRAME as i32);
-
-        // Pass 1: emit stack-dst args first.  Their sources may be
-        // registers the parallel move below will overwrite, but stack
-        // writes never disturb registers, so doing them up front keeps
-        // every register source live for Pass 2.
-        for i in (func_index + 1)..arg_count {
-            let abi_idx = i - func_index - 1;
-            let placement = placements[abi_idx];
-            if !matches!(placement, AbiArgPlacement::Stack(_)) {
-                continue;
-            }
-            let arg_type = arg_types[abi_idx];
-            let arg = &arglocs[i];
-            // `CallBuilder64.prepare_arguments`: a singlefloat that spilled
-            // past xmm7 is a 32-bit stack store, not a word move.
-            if arg_classes.as_bytes().get(abi_idx) == Some(&b'S') {
-                self.emit_singlefloat_stack_store(placement, *arg);
-                continue;
-            }
-            match arg {
-                Loc::Frame(f) => self.emit_abi_arg_from_mem(placement, f.ebp_loc.value, arg_type),
-                Loc::Reg(r) => self.emit_abi_arg_from_reg(placement, *r, arg_type),
-                Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                    self.emit_abi_arg_from_imm(placement, i.value, arg_type)
-                }
-                // `jump.py _move`: `ConstFloatLoc` and `RawEspLoc` are both
-                // memory references, so this is `regalloc_immedmem2mem`
-                // (two `MOV32_si`), not `MOVSD`. An xmm destination goes
-                // through `remap_frame_layout` → `Assembler386.mov` → `MOVSD`.
-                Loc::ConstFloat(c) => {
-                    let AbiArgPlacement::Stack(offset) = placement else {
-                        panic!("float stack argument is not a stack placement");
-                    };
-                    self.regalloc_immedmem2esp(*c, offset);
-                }
-                other => panic!("call argument {abi_idx} has unsupported location {other:?}"),
-            }
-        }
-        // Spilled register fnloc: same pass, before any argument GPR is
-        // overwritten. `CALL_s` uses this `[rsp+ofs]` after `write_real_errno`.
-        if let PreparedFnLoc::Stack(offset) = prepared {
-            let Some(Loc::Reg(r)) = arglocs.get(func_index).copied() else {
-                panic!("spilled call target is not a register");
-            };
-            self.emit_abi_arg_from_reg(AbiArgPlacement::Stack(offset), r, Type::Int);
-        }
-
-        // Pass 2: parallel-move register-bound args (GPR and XMM groups
-        // separately). A register fnloc joins the integer group with its
-        // `prepare_arguments` GPR as the destination, so a source that is
-        // also an argument register is copied before that register is
-        // overwritten. `remap_frame_layout` emits nothing for a self-move.
-        let mut int_src: Vec<Loc> = Vec::new();
-        let mut int_dst: Vec<Loc> = Vec::new();
-        let mut xmm_src: Vec<Loc> = Vec::new();
-        let mut xmm_dst: Vec<Loc> = Vec::new();
-        // `CallBuilder64.prepare_arguments`: `'S'` is an integer location
-        // moved into an XMM with MOVD32, before the GPR remap.
-        let mut single_src: Vec<Loc> = Vec::new();
-        let mut single_dst: Vec<u8> = Vec::new();
-        for i in (func_index + 1)..arg_count {
-            let abi_idx = i - func_index - 1;
-            let placement = placements[abi_idx];
-            let arg = arglocs[i];
-            match placement {
-                AbiArgPlacement::Gpr(dst_reg) => {
-                    int_src.push(arg);
-                    int_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst_reg, false)));
-                }
-                AbiArgPlacement::Xmm(dst_reg)
-                    if arg_classes.as_bytes().get(abi_idx) == Some(&b'S') =>
-                {
-                    single_src.push(arg);
-                    single_dst.push(dst_reg);
-                }
-                AbiArgPlacement::Xmm(dst_reg) => {
-                    xmm_src.push(arg);
-                    xmm_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst_reg, true)));
-                }
-                AbiArgPlacement::Stack(_) => {}
-            }
-        }
-        if let PreparedFnLoc::Reg(dst) = prepared {
-            let Some(Loc::Reg(r)) = arglocs.get(func_index).copied() else {
-                panic!("register call target is not a register");
-            };
-            int_src.push(Loc::Reg(r));
-            int_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst, false)));
-        }
-        for (src, dst) in single_src.iter().zip(&single_dst) {
-            self.emit_singlefloat_movd(*src, *dst);
-        }
-        let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
-        let tmpreg2 = Loc::Reg(crate::regloc::X86_64_XMM_SCRATCH_REG);
-        crate::jump::remap_frame_layout_mixed(
-            self, &int_src, &int_dst, tmpreg1, &xmm_src, &xmm_dst, tmpreg2,
-        );
-
-        // llsupport/callbuilder.py `emit_call_release_gil`:
-        // write_real_errno(); emit_raw_call(); restore_stack_pointer();
-        // read_real_errno(). `emit_raw_call` is `CALL(self.fnloc)` and
-        // runs after `write_real_errno`, which clobbers rax.
-        let mut tlofs_loaded = false;
-        self.write_real_errno(
-            save_err,
-            call_area_adjust,
-            &mut tlofs_loaded,
-            win64_arg_gpr,
-            win64_arg_xmm,
-        );
-        self.emit_raw_call(prepared);
-        // `CallBuilderX86.load_result` reads the one return word in rax.
-
-        self.restore_stack_pointer(call_area_adjust);
-        let singlefloat_result = call_descr.is_some_and(|cd| cd.result_class() == 'S');
-        self.read_real_errno(
-            save_err,
-            0,
-            &mut tlofs_loaded,
-            op.opcode.result_type(),
-            singlefloat_result,
-        );
-    }
-
-    /// `CallBuilder64.prepare_arguments`: Win64's next integer slot is the
-    /// shared positional index (`arg_types` length). SysV counts only the
-    /// arguments that did not take an XMM.
-    fn fnloc_gpr_index(arg_types: &[Type], arg_classes: &str) -> usize {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = arg_classes;
-            arg_types.len()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            arg_types
-                .iter()
-                .enumerate()
-                .filter(|(idx, tp)| {
-                    **tp != Type::Float && arg_classes.as_bytes().get(*idx) != Some(&b'S')
-                })
-                .count()
-        }
-    }
-
-    /// Place `fnloc` the way `CallBuilderX86.__init__` and
-    /// `CallBuilder64.prepare_arguments` do. Register targets consume the
-    /// next integer argument slot. Frame targets do not: `emit_raw_call`
-    /// calls `[rbp+ofs]` directly. Immediates do not consume a slot either.
-    fn prepare_call_fnloc(
-        func: Option<Loc>,
-        arg_types: &[Type],
-        arg_classes: &str,
-        stack_slots: &mut usize,
-        win64_arg_gpr: &mut u8,
-    ) -> PreparedFnLoc {
-        #[cfg(not(target_os = "windows"))]
-        let _ = win64_arg_gpr;
-        match func {
-            Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => PreparedFnLoc::Immediate(i.value),
-            Some(ebp_loc_pat!(slot)) => PreparedFnLoc::Frame(slot.value),
-            Some(Loc::Reg(r)) if !r.is_xmm => {
-                let index = Self::fnloc_gpr_index(arg_types, arg_classes);
-                if index < super::callbuilder::ARGUMENTS_GPR.len() {
-                    #[cfg(target_os = "windows")]
-                    {
-                        *win64_arg_gpr |= 1u8 << index;
-                    }
-                    PreparedFnLoc::Reg(super::callbuilder::ARGUMENTS_GPR[index].value)
-                } else {
-                    let offset =
-                        super::callbuilder::outgoing_stack_words(*stack_slots) * WORD as i32;
-                    *stack_slots += 1;
-                    PreparedFnLoc::Stack(offset)
-                }
-            }
-            other => panic!("unsupported x86-64 call target {other:?}"),
-        }
-    }
-
-    /// `_relative_unaryop` for `CALL` of an immediate: `follow_jump`, then
-    /// `_load_scratch`, then `CALL_r(X86_64_SCRATCH_REG)`. r11 is marked
-    /// unknown first, so `_load_scratch` emits `MOV_ri` of the followed
-    /// address.
-    fn emit_immediate_call(&mut self, addr: i64) {
-        self.forget_scratch_register();
-        self.load_scratch(super::callbuilder::follow_jump(addr));
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
-        self.forget_after_call_or_jmp();
-    }
-
-    /// `CallBuilderX86.emit_raw_call`: `CALL(self.fnloc)`. An immediate is
-    /// `follow_jump` then `_load_scratch` / `CALL_r`.
-    fn emit_raw_call(&mut self, fnloc: PreparedFnLoc) {
-        match fnloc {
-            PreparedFnLoc::Immediate(addr) => self.emit_immediate_call(addr),
-            PreparedFnLoc::Reg(reg) => {
-                dynasm!(self.mc ; .arch x64 ; call Rq(reg));
-            }
-            PreparedFnLoc::Stack(offset) => rx86::call_s(&mut self.mc, offset),
-            PreparedFnLoc::Frame(offset) => rx86::call_b(&mut self.mc, offset),
-        }
-        self.forget_after_call_or_jmp();
-    }
-
-    /// `CallBuilderX86.load_result` + `Assembler386.load_from_mem`: the
-    /// integer result is already in eax. A narrow result is extended in
-    /// place (MOVSX8 / MOVZX8 / MOVSX16 / MOVZX16 / MOVSX32 / MOV32).
-    /// A word-sized result needs no MOV.
-    fn ensure_call_result_bit_extension(&mut self, arglocs: &[Loc]) {
-        let size = Self::argloc_imm(arglocs, 1) as usize;
-        let signed = Self::argloc_imm(arglocs, 2) != 0;
-        if size >= WORD {
-            return;
-        }
-        match (size, signed) {
-            (1, true) => {
-                dynasm!(self.mc ; .arch x64 ; movsx Rq(0), Rb(0));
-            }
-            (1, false) => {
-                dynasm!(self.mc ; .arch x64 ; movzx Rq(0), Rb(0));
-            }
-            (2, true) => {
-                dynasm!(self.mc ; .arch x64 ; movsx Rq(0), Rw(0));
-            }
-            (2, false) => {
-                dynasm!(self.mc ; .arch x64 ; movzx Rq(0), Rw(0));
-            }
-            (4, true) => {
-                dynasm!(self.mc ; .arch x64 ; movsxd Rq(0), Rd(0));
-            }
-            (4, false) => rx86::mov32_rr(&mut self.mc, 0, 0),
-            _ => {}
-        }
-    }
-
-    fn _genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
-        // [resloc, size, sign, saveerr, func, args...] for CALL_RELEASE_GIL.
+    /// `_genop_call`: arglocs are `[resloc, size, sign, func, args...]`,
+    /// or `[resloc, size, sign, saveerr, func, args...]` for
+    /// CALL_RELEASE_GIL.
+    fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
         let is_call_release_gil = op.opcode.is_call_release_gil();
-        let save_err = if is_call_release_gil {
-            Self::argloc_imm(arglocs, 3)
-        } else {
-            0
-        };
         let func_index = 3 + usize::from(is_call_release_gil);
-        self.emit_call_from_arglocs(op, arglocs, func_index, save_err);
-        // `CallBuilder64.load_result`: result `'S'` is the low 32 bits of xmm0.
-        if op.opcode.result_type() == Type::Int
-            && op.getdescr().is_some_and(|descr| {
-                descr
-                    .as_call_descr()
-                    .is_some_and(|cd| cd.result_class() == 'S')
-            })
-        {
-            dynasm!(self.mc ; .arch x64 ; movd eax, xmm0);
+        let descr = op.getdescr();
+        let descr = descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("_genop_call: op without CallDescr");
+        let resloc = match arglocs[0] {
+            loc @ Loc::Reg(_) => Some(loc),
+            _ => None,
+        };
+        let mut cb = super::callbuilder::CallBuilder64::new(
+            self,
+            arglocs[func_index],
+            &arglocs[func_index + 1..],
+            resloc,
+            descr.result_class(),
+            Self::argloc_imm(arglocs, 1) as usize,
+        );
+        cb.argtypes = descr.arg_classes();
+        cb.ressign = Self::argloc_imm(arglocs, 2) != 0;
+        if is_call_release_gil {
+            cb.emit_call_release_gil(Self::argloc_imm(arglocs, 3));
+        } else if descr.get_extra_info().check_can_collect() {
+            cb.emit();
+        } else {
+            cb.emit_no_collect();
         }
-        if op.opcode.result_type() == Type::Int {
-            self.ensure_call_result_bit_extension(arglocs);
-        }
+    }
+
+    /// assembler.py `threadlocalref_get`: load the stack location
+    /// `THREADLOCAL_OFS` into `resloc`, then `load_from_mem` the value at
+    /// `offset` from it.
+    fn threadlocalref_get(
+        &mut self,
+        offset: i64,
+        resloc: crate::regloc::RegLoc,
+        size: usize,
+        sign: bool,
+    ) {
+        rx86::mov_rs(&mut self.mc, resloc.value, THREADLOCAL_OFS as i32);
+        self.load_from_mem(
+            resloc,
+            addr_add_const(&Loc::Reg(resloc), offset),
+            size,
+            sign,
+        );
     }
 
     /// assembler.py `genop_math_sqrt`: `SQRTSD(arglocs[0], resloc)`.
@@ -9303,29 +7476,6 @@ impl<'a> Assembler386<'a> {
         if let Some(Loc::Reg(r)) = result_loc {
             rx86::sqrtsd_xx(&mut self.mc, r.value, r.value);
         }
-    }
-
-    fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
-        // llsupport/callbuilder.py emit order — prepare_arguments() then
-        // push_gcmap(); emit_raw_call(); ...; pop_gcmap() — collecting calls
-        // must publish the regalloc gcmap before the raw call so live `Ref`
-        // roots survive the slow path, and clear it after reloading a
-        // possibly-moved frame pointer (assembler.py:296
-        // `_reload_frame_if_necessary`).
-        let can_collect = op
-            .with_call_descr(|descr| descr.get_extra_info().check_can_collect())
-            .unwrap_or(false);
-        let pushed_gcmap = if can_collect {
-            self.push_pending_call_gcmap()
-        } else {
-            false
-        };
-        self._genop_call_with_arglocs(op, arglocs);
-        if can_collect {
-            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-        }
-        // `CallBuilderX86.load_result`: when the result register is already
-        // eax / xmm0, emit nothing. `after_call` bound that register.
     }
 
     /// Inline nursery bump for a call tagged
@@ -9344,12 +7494,13 @@ impl<'a> Assembler386<'a> {
     /// sound because the op is still a call: the optimizer's residual-call
     /// emission fences pending setfields before the allocation, so a collector
     /// that walks the interpreter's own structures finds roots that are
-    /// current.
+    /// current. A collector that is not headerless-aware
+    /// (`dynasm_headerless_nursery_addrs`) gets the residual call alone.
     fn genop_nursery_alloc_inline_x86(&mut self, op: &Op, arglocs: &[Loc]) {
         // Two-word headerless node: value@0, link@8.
         const NURSERY_ALLOC_NODE_SIZE: i32 = 16;
 
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
         if nf_addr == 0 || nt_addr == 0 {
             self.genop_call_with_arglocs(op, arglocs);
             return;
@@ -9414,9 +7565,7 @@ impl<'a> Assembler386<'a> {
         let recycle_addr = crate::runner::dynasm_nursery_recycle_list_addr();
         if recycle_addr != 0 {
             let rl = recycle_addr as i64;
-            self.forget_if_scratch_written(scratch);
-            rx86::mov_ri(&mut self.mc, scratch, rl);
-            self.forget_if_scratch_written(base_reg);
+            self.mc.MOV(crate::regloc::X86_64_SCRATCH_REG, imm(rl));
             rx86::mov_rm(&mut self.mc, base_reg, (scratch, 0)); // cell = *recycle_head
             dynasm!(self.mc ; .arch x64
             ; test Rq(base_reg), Rq(base_reg)
@@ -9424,41 +7573,35 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64
                             ; jz =>bump                                         // empty -> bump instead
             );
-            self.forget_if_scratch_written(new_free_reg);
             rx86::mov_rm(&mut self.mc, new_free_reg, (base_reg, 8)); // cell's link word
             rx86::mov_mr(&mut self.mc, (scratch, 0), new_free_reg); // *recycle_head = link
             dynasm!(self.mc ; .arch x64
                             ; jmp =>init
 
             );
-            self.forget_after_call_or_jmp();
+            self.mc.forget_scratch_register();
         }
 
         // CallR regalloc has already spilled/moved caller-save registers via
         // before_call(). Use only those freed registers plus R11, and load
         // value/next before staging nursery slot addresses so their original
         // argloc source registers stay intact for the slow residual call.
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64
         ; =>bump
         );
-        let (sr, so) = self.addr_as_reg_offset(nf);
-        self.forget_if_scratch_written(base_reg);
-        rx86::mov_rm(&mut self.mc, base_reg, (sr, so)); // base = *nursery_free
-        self.forget_if_scratch_written(new_free_reg);
+        self.mc.MOV(Operand::R(base_reg), heap(nf)); // base = *nursery_free
         rx86::lea_rm(
             &mut self.mc,
             new_free_reg,
             (base_reg, NURSERY_ALLOC_NODE_SIZE),
         );
-        let (sr, so) = self.addr_as_reg_offset(nt);
-        rx86::cmp_rm(&mut self.mc, new_free_reg, (sr, so));
+        self.mc.CMP(Operand::R(new_free_reg), heap(nt));
         dynasm!(self.mc ; .arch x64
                     ; ja =>slow_path
         );
-        let (sr, so) = self.addr_as_reg_offset(nf);
-        rx86::mov_mr(&mut self.mc, (sr, so), new_free_reg); // *nursery_free = base + 16
-        self.forget_scratch_register();
+        self.mc.MOV(heap(nf), Operand::R(new_free_reg)); // *nursery_free = base + 16
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64
                     ; =>init
         );
@@ -9468,16 +7611,13 @@ impl<'a> Assembler386<'a> {
                     ; mov rax, Rq(base_reg)                                 // result = base
 
         );
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
-        self.forget_after_call_or_jmp();
+        self.mc.forget_scratch_register();
 
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
         self.genop_call_with_arglocs(op, arglocs);
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>done);
     }
 
@@ -9543,21 +7683,16 @@ impl<'a> Assembler386<'a> {
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
 
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, window);
-        self.forget_if_scratch_written(offset_reg);
+        self.mc.MOV(crate::regloc::X86_64_SCRATCH_REG, imm(window));
         dynasm!(self.mc ; .arch x64
                     ; mov Rq(offset_reg), Rq(cell_reg)
         );
-        self.forget_if_scratch_written(offset_reg);
         rx86::sub_rm(&mut self.mc, offset_reg, (scratch, 0)); // cell - base
         rx86::cmp_rm(&mut self.mc, offset_reg, (scratch, 8)); // vs width
         dynasm!(self.mc ; .arch x64
                     ; jae =>slow_path                                       // outside the window
         );
-        self.forget_if_scratch_written(scratch);
-        rx86::mov_ri(&mut self.mc, scratch, head);
-        self.forget_if_scratch_written(offset_reg);
+        self.mc.MOV(crate::regloc::X86_64_SCRATCH_REG, imm(head));
         rx86::mov_rm(&mut self.mc, offset_reg, (scratch, 0)); // old head
         rx86::mov_mr(&mut self.mc, (cell_reg, 8), offset_reg); // cell's link word
         rx86::mov_mr(&mut self.mc, (scratch, 0), cell_reg); // *recycle_head = cell
@@ -9565,12 +7700,12 @@ impl<'a> Assembler386<'a> {
                     ; jmp =>done
 
         );
-        self.forget_after_call_or_jmp();
+        self.mc.forget_scratch_register();
 
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
         self.genop_call_with_arglocs(op, arglocs);
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>done);
     }
 
@@ -9638,7 +7773,7 @@ impl<'a> Assembler386<'a> {
                     self.emit_abi_int_arg_from_reg(0, 0);
                 }
                 let pushed_gcmap = self.push_pending_call_gcmap();
-                rx86::mov_ri(&mut self.mc, rx86::EAX, force_addr);
+                self.mc.MOV(crate::regloc::EAX, imm(force_addr));
                 self.emit_abi_call_rax_aligned();
                 self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
             } else {
@@ -9658,50 +7793,48 @@ impl<'a> Assembler386<'a> {
         // to the resolved callee entry — skip the Rust trampoline, which
         // would otherwise add an extra indirect call and (when
         // MAJIT_LOG was probed) a `std::env::var_os` per recursion.
-        //
-        // `CallBuilder64.prepare_arguments` remaps `argloc` straight into
-        // `ARGUMENTS_GPR[0]` and the thread-local word into
-        // `ARGUMENTS_GPR[1]`. `remap_frame_layout` emits nothing for a
-        // self-move, so a frame already in the first argument register
-        // is not copied. The frame moves before the thread-local load:
-        // that load writes `ARGUMENTS_GPR[1]`.
-        let pushed_gcmap = self.push_pending_call_gcmap();
-        let arg0 = super::callbuilder::ARGUMENTS_GPR[0].value;
-        let arg1 = super::callbuilder::ARGUMENTS_GPR[1].value;
-        self.regalloc_mov(
-            &frame_loc,
-            &Loc::Reg(crate::regloc::RegLoc::new(arg0, false)),
-        );
-        rx86::mov_rs(&mut self.mc, arg1, THREADLOCAL_OFS as i32);
+        let eax = Loc::Reg(crate::regloc::EAX);
         if let Some(addr) = target_addr.immediate {
-            // `simple_call` → `CALL(imm(follow_jump(addr)))`.
-            self.emit_immediate_call(addr as i64);
-        } else {
-            let addr_ptr = self.self_entry_addr_ptr as i64;
-            rx86::mov_ri(&mut self.mc, rx86::EAX, addr_ptr);
-            dynasm!(self.mc ; .arch x64
-                            ; mov rax, [rax]
-
+            let threadlocal_loc =
+                Loc::Esp(crate::regloc::RawEspLoc::new(THREADLOCAL_OFS as i32, false));
+            self.simple_call(
+                Loc::immed(addr as i64),
+                &[frame_loc, threadlocal_loc],
+                Some(eax),
             );
+        } else {
+            // The self-entry address is only known through
+            // `self_entry_addr_ptr`; the arguments go where
+            // `CallBuilder64.prepare_arguments` would put them. The frame
+            // moves before the thread-local load, which writes
+            // `ARGUMENTS_GPR[1]`.
+            let arg0 = super::callbuilder::ARGUMENTS_GPR[0].value;
+            let arg1 = super::callbuilder::ARGUMENTS_GPR[1].value;
+            self.regalloc_mov(
+                &frame_loc,
+                &Loc::Reg(crate::regloc::RegLoc::new(arg0, false)),
+            );
+            rx86::mov_rs(&mut self.mc, arg1, THREADLOCAL_OFS as i32);
+            let pushed_gcmap = self.push_pending_call_gcmap();
+            let addr_ptr = self.self_entry_addr_ptr as i64;
+            let eax = crate::regloc::EAX;
+            self.mc.MOV(eax, imm(addr_ptr));
+            self.mc.MOV(eax, Operand::M(eax.value, 0));
             self.emit_abi_call_rax_aligned();
+            // Callee's _call_footer popped caller's rbp (= pre-GC
+            // address). Reload from shadow stack so subsequent
+            // frame-relative ops hit the moved jitframe.
+            self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         }
-        // Callee's _call_footer popped caller's rbp (= pre-GC
-        // address). Reload from shadow stack so subsequent
-        // frame-relative ops hit the moved jitframe.
-        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
 
         // ── x86/assembler.py _call_assembler_check_descr ──
-        // CMP [eax + jf_descr_ofs], imm(done_descr).
-        // x86 has no 64-bit-immediate compare-with-memory, so
-        // stage the pointer through R11 (LARGE_IMM_SCRATCH) — one
-        // mov + one cmp instead of the previous load-into-reg +
-        // load-imm + reg-reg compare. PyPy's `mc.CMP(mem, imm)`
-        // does the same staging internally.
+        // `CMP(mem(eax, ofs), imm(value))`.
         let fast_path = self.mc.new_dynamic_label();
         let merge = self.mc.new_dynamic_label();
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.load_scratch(done_descr_ptr);
-        rx86::cmp_mr(&mut self.mc, (rx86::EAX, JF_DESCR_OFS), scratch);
+        self.mc.CMP(
+            Operand::M(rx86::EAX, i64::from(JF_DESCR_OFS)),
+            imm(done_descr_ptr),
+        );
         dynasm!(self.mc ; .arch x64
                     ; je =>fast_path
 
@@ -9712,15 +7845,11 @@ impl<'a> Assembler386<'a> {
         // pyre's helper signature is (cpu_handle, callee_jf,
         // green_key) — see compile.py:665.
         let cpu_ptr = self.cpu_handle_ptr();
-        self.emit_abi_int_arg_from_imm(0, cpu_ptr);
-        self.emit_abi_int_arg_from_reg(1, 0); // arg1 = rax (callee jf)
-        self.emit_abi_int_arg_from_imm(2, green_key);
-        // `push_gcmap` writes r11, so `_load_scratch` of the helper
-        // (`follow_jump` + `CALL_r`) runs after that push.
-        let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_immediate_call(helper_addr);
-        self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-        self.forget_scratch_register();
+        self.simple_call(
+            Loc::immed(helper_addr),
+            &[Loc::immed(cpu_ptr), eax, Loc::immed(green_key)],
+            Some(eax),
+        );
         if result_type == Type::Float {
             // `call_assembler_helper_trampoline` returns the bits in rax.
             // `_call_assembler_load_result` leaves a float in xmm0.
@@ -9730,7 +7859,7 @@ impl<'a> Assembler386<'a> {
             ; jmp =>merge
             ; =>fast_path
         );
-        self.forget_after_call_or_jmp();
+        self.mc.forget_scratch_register();
 
         // x86/assembler.py `_call_assembler_load_result`: one load from the
         // dead frame's value index 0. A float stays in xmm0; int/ref/void
@@ -9744,7 +7873,7 @@ impl<'a> Assembler386<'a> {
                 (rx86::EAX, FIRST_ITEM_OFFSET as i32),
             );
         }
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>merge);
         self.move_call_assembler_result(result_type, result_loc);
     }
@@ -9761,10 +7890,7 @@ impl<'a> Assembler386<'a> {
                 }
             }
             (_, Some(Loc::Reg(r))) if !r.is_xmm => {
-                if r.value != crate::regloc::EAX.value {
-                    self.forget_if_scratch_written(r.value);
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), rax);
-                }
+                self.mc.MOV(*r, crate::regloc::EAX);
             }
             _ => panic!(
                 "CALL_ASSEMBLER result must use its regalloc result register: \
@@ -9773,18 +7899,16 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    // genop_* — allocation
-    // x86/assembler.py:2338 genop_new etc.
-    // These require GC runtime support. Emit trap for now.
-
     /// x86/assembler.py _write_barrier_fastpath parity.
-    fn emit_write_barrier_fastpath(&mut self, op: &Op, arglocs: &[Loc]) {
+    fn emit_write_barrier_fastpath(&mut self, regalloc: &RegAlloc<'_>, op: &Op, arglocs: &[Loc]) {
         let is_array = op.opcode == majit_ir::OpCode::CondCallGcWbArray;
-        self.emit_write_barrier_fastpath_kind(arglocs, is_array, false);
+        self.emit_write_barrier_fastpath_kind(Some(regalloc), arglocs, is_array, false);
     }
 
+    /// `regalloc` is `self._regalloc`, `None` outside a walk.
     fn emit_write_barrier_fastpath_kind(
         &mut self,
+        regalloc: Option<&RegAlloc<'_>>,
         arglocs: &[Loc],
         is_array: bool,
         is_frame: bool,
@@ -9824,13 +7948,8 @@ impl<'a> Assembler386<'a> {
         let helper_num = if is_frame {
             4
         } else {
-            // `self._regalloc.xrm.reg_bindings` is non-empty: the regalloc
-            // pass recorded that as the trailing argloc
-            // (`consider_cond_call_gc_wb`).
-            let withfloats = matches!(
-                arglocs.get(if is_array { 2 } else { 1 }),
-                Some(Loc::Immed(i)) if i.value != 0
-            );
+            // `self._regalloc is not None and len(self._regalloc.xrm.reg_bindings)`.
+            let withfloats = regalloc.is_some_and(|ra| ra.xrm.reg_bindings_len() > 0);
             usize::from(card_marking) + 2 * usize::from(withfloats)
         };
         let helper = self.wb_slowpath[helper_num];
@@ -9840,16 +7959,8 @@ impl<'a> Assembler386<'a> {
         );
 
         // `TEST8(loc, imm(mask))`. A frame base is `[rbp + byteofs]`.
-        match loc_base {
-            Loc::Reg(r) => {
-                rx86::test8_mi(&mut self.mc, (r.value, byteofs), i32::from(mask));
-            }
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                let addr = i.value.wrapping_add(i64::from(byteofs));
-                self.emit_test8_addr(addr, i32::from(mask));
-            }
-            _ => unreachable!("loc_base was checked above"),
-        }
+        let loc = addr_add_const(&loc_base, i64::from(byteofs));
+        self.mc.TEST8(loc, imm(i64::from(mask)));
         // `_write_barrier_fastpath`: `TEST8` then `WriteBarrierSlowPath` on
         // `NZ`. The flag-clear edge falls through `set_continue_addr`.
         // The helper call and the card mark live in `generate_body`.
@@ -9865,37 +7976,6 @@ impl<'a> Assembler386<'a> {
         );
         self.set_continue_here(&mut sp);
         self.pending_slowpaths.push(sp);
-    }
-
-    /// `TEST8_ji`, or `_addr_as_reg_offset` then `TEST8_mi`.
-    fn emit_test8_addr(&mut self, addr: i64, mask: i32) {
-        if rx86::fits_in_32bits(addr) {
-            rx86::test8_ji(&mut self.mc, addr as i32, mask);
-        } else {
-            let (reg, disp) = self.addr_as_reg_offset(addr);
-            rx86::test8_mi(&mut self.mc, (reg, disp), mask);
-        }
-    }
-
-    /// `OR8` of an `addr_add_const` result.
-    fn emit_or8_addr(&mut self, addr: i64, imm: i32) {
-        if rx86::fits_in_32bits(addr) {
-            rx86::or8_ji(&mut self.mc, addr as i32, imm);
-        } else {
-            let (reg, disp) = self.addr_as_reg_offset(addr);
-            rx86::or8_mi(&mut self.mc, (reg, disp), imm);
-        }
-    }
-
-    /// `BTS` of an `addr_add_const` result. `bit_reg` is not r11.
-    fn emit_bts_addr(&mut self, addr: i64, bit_reg: u8) {
-        debug_assert!(bit_reg != crate::regloc::X86_64_SCRATCH_REG.value);
-        if rx86::fits_in_32bits(addr) {
-            rx86::bts_jr(&mut self.mc, addr as i32, bit_reg);
-        } else {
-            let (reg, disp) = self.addr_as_reg_offset(addr);
-            rx86::bts_mr(&mut self.mc, (reg, disp), bit_reg);
-        }
     }
 
     /// Card mark. A register base keeps `encode_wb_array_card_mark`. An
@@ -9922,7 +8002,7 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; push Rq(idx.value));
                 rx86::shr_ri(&mut self.mc, idx.value, page_shift as i32);
                 rx86::xor_ri(&mut self.mc, idx.value, -8);
-                self.emit_bts_addr(base.wrapping_sub(header), idx.value);
+                self.mc.BTS(heap(base.wrapping_sub(header)), *idx);
                 dynasm!(self.mc ; .arch x64 ; pop Rq(idx.value));
             }
             Loc::Frame(idx) => {
@@ -9931,63 +8011,25 @@ impl<'a> Assembler386<'a> {
                 rx86::mov_rb(&mut self.mc, rx86::EAX, idx.ebp_loc.value);
                 rx86::shr_ri(&mut self.mc, rx86::EAX, page_shift as i32);
                 rx86::xor_ri(&mut self.mc, rx86::EAX, -8);
-                self.emit_bts_addr(base.wrapping_sub(header), rx86::EAX);
+                self.mc
+                    .BTS(heap(base.wrapping_sub(header)), crate::regloc::EAX);
                 dynasm!(self.mc ; .arch x64 ; pop rax);
             }
             Loc::Immed(idx) | Loc::ImmedFloat(idx) => {
                 let byte_index = idx.value >> page_shift;
                 let byte_ofs = !((byte_index >> 3) as i64) - header;
                 let byte_val = 1_i64 << (byte_index & 7);
-                self.emit_or8_addr(base.wrapping_add(byte_ofs), i32::from(byte_val as i8));
+                self.mc.OR8(
+                    heap(base.wrapping_add(byte_ofs)),
+                    imm(i64::from(byte_val as i8)),
+                );
             }
             _ => panic!("index is neither RegLoc nor ImmedLoc"),
         }
     }
 
     fn mov_gpr_from_loc(&mut self, dst: u8, loc: Loc) {
-        match loc {
-            Loc::Reg(r) => {
-                if r.value != dst {
-                    self.forget_if_scratch_written(dst);
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(dst), Rq(r.value));
-                }
-            }
-            Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                self.forget_if_scratch_written(dst);
-                rx86::mov_ri(&mut self.mc, dst, i.value);
-            }
-            Loc::Frame(f) => {
-                self.forget_if_scratch_written(dst);
-                rx86::mov_rb(&mut self.mc, dst, f.ebp_loc.value);
-            }
-            Loc::Ebp(e) => {
-                self.forget_if_scratch_written(dst);
-                rx86::mov_rb(&mut self.mc, dst, e.value);
-            }
-            other => panic!("malloc operand is not a GPR value: {other:?}"),
-        }
-    }
-
-    /// `CMP reg, imm`. A value outside imm32 is staged through r11.
-    fn cmp_reg_i64(&mut self, reg: u8, value: i64) {
-        if rx86::fits_in_32bits(value) {
-            rx86::cmp_ri(&mut self.mc, reg, value as i32);
-        } else {
-            self.load_scratch(value);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            dynasm!(self.mc ; .arch x64 ; cmp Rq(reg), Rq(scratch));
-        }
-    }
-
-    /// `MOV_si` when `value` fits imm32, otherwise `MOV_sr` from r11.
-    fn store_rsp_i64(&mut self, offset: i32, value: i64) {
-        if rx86::fits_in_32bits(value) {
-            rx86::mov_si(&mut self.mc, offset, value as i32);
-        } else {
-            self.load_scratch(value);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            rx86::mov_sr(&mut self.mc, offset, scratch);
-        }
+        self.mc.MOV(Operand::R(dst), &loc);
     }
 
     /// `_imul_const_scaled`. Returns the residual scale (0..3) the outer
@@ -10046,18 +8088,12 @@ impl<'a> Assembler386<'a> {
             addr != 0,
             "malloc slowpath trampoline was not built (_build_malloc_slowpath)"
         );
-        self.load_scratch(addr as i64);
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        dynasm!(self.mc ; .arch x64 ; call Rq(scratch));
-        self.forget_after_call_or_jmp();
+        self.mc.CALL(imm(addr as i64));
     }
 
     /// The trampoline returns the payload in ecx (`MOV ecx, eax`).
     fn move_malloc_result(&mut self, result_reg: u8) {
-        if result_reg != rx86::ECX {
-            self.forget_if_scratch_written(result_reg);
-            dynasm!(self.mc ; .arch x64 ; mov Rq(result_reg), rcx);
-        }
+        self.mc.MOV(Operand::R(result_reg), crate::regloc::ECX);
     }
 
     /// `malloc_cond`: nursery bump, `CMP`, not-taken `J_il(A)` into
@@ -10085,11 +8121,9 @@ impl<'a> Assembler386<'a> {
         };
         let gcmap = self.pending_malloc_nursery_gcmap.unwrap_or(0);
         let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
-        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-        rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+        self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
         rx86::lea_rm(&mut self.mc, rx86::EDX, (rx86::ECX, total_size as i32));
-        let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
-        rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+        self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
         let mut sp = self.begin_slow_path(
             Some(CC_A),
             SlowPathKind::MallocCond {
@@ -10098,9 +8132,7 @@ impl<'a> Assembler386<'a> {
                 synthesize: None,
             },
         );
-        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
-        self.forget_if_scratch_written(result_reg);
+        self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
         rx86::lea_rm(
             &mut self.mc,
             result_reg,
@@ -10150,15 +8182,13 @@ impl<'a> Assembler386<'a> {
             self.pending_slowpaths.push(sp);
             return;
         }
-        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-        rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+        self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
         rx86::lea_ra(
             &mut self.mc,
             rx86::EDX,
             (i16::from(rx86::ECX), sv, 0, gc_header_size),
         );
-        let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
-        rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+        self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
         let mut sp = self.begin_slow_path(
             Some(CC_A),
             SlowPathKind::MallocCond {
@@ -10167,8 +8197,7 @@ impl<'a> Assembler386<'a> {
                 synthesize: None,
             },
         );
-        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
+        self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
         // `gen_initialize_tid_keep_flags` stores only the type-id half.
         // Clear the whole header word on this fast path so a recycled
         // nursery slot cannot keep `GCFLAG_HAS_SHADOW`, `GCFLAG_PINNED`,
@@ -10176,13 +8205,12 @@ impl<'a> Assembler386<'a> {
         // clear: a young raw-malloced frame carries `YOUNG_RAWMALLOC`,
         // and `set_continue_here` is after this store.
         rx86::mov_mi(&mut self.mc, (rx86::ECX, 0), 0);
-        self.forget_if_scratch_written(result_reg);
         rx86::lea_rm(&mut self.mc, result_reg, (rx86::ECX, gc_header_size));
         self.set_continue_here(&mut sp);
         self.pending_slowpaths.push(sp);
     }
 
-    /// `malloc_cond_varsize` for `FLAG_ARRAY`. The maxlength `ja` lands on
+    /// `malloc_cond_varsize`. The maxlength `ja` lands on
     /// the nursery-overflow `ja` (`emit_forward_jump` / `patch_forward_jump`),
     /// so both failures share one not-taken `J_il(A)`.
     fn malloc_cond_varsize(&mut self, op: &Op, arglocs: &[Loc], result_loc: Option<&Loc>) {
@@ -10196,6 +8224,10 @@ impl<'a> Assembler386<'a> {
         let lengthloc = match arglocs.first() {
             Some(loc) => *loc,
             None => panic!("malloc_cond_varsize requires a length loc"),
+        };
+        let kind = match arglocs.get(2) {
+            Some(Loc::Immed(i)) => i.value,
+            _ => panic!("malloc_cond_varsize kind must be an immediate, got {arglocs:?}"),
         };
         debug_assert!(itemsize > 0);
         debug_assert!(
@@ -10212,16 +8244,16 @@ impl<'a> Assembler386<'a> {
         let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
         let max_young = crate::runner::dynasm_max_size_of_young_obj();
         let max_length = max_young.saturating_sub(2 * WORD);
-        let kind = || SlowPathKind::MallocCondVarsize {
+        let slow_kind = || SlowPathKind::MallocCondVarsize {
             gcmap,
             result_reg,
+            kind,
             itemsize,
-            base_size,
             type_id,
             lengthloc,
         };
         if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
-            let mut sp = self.begin_slow_path(None, kind());
+            let mut sp = self.begin_slow_path(None, slow_kind());
             self.set_continue_here(&mut sp);
             self.pending_slowpaths.push(sp);
             return;
@@ -10237,11 +8269,10 @@ impl<'a> Assembler386<'a> {
                 rx86::EDX
             }
         };
-        self.cmp_reg_i64(varsizeloc, max_length as i64);
+        self.mc.CMP(Operand::R(varsizeloc), imm(max_length as i64));
         let nursery_ja = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; ja =>nursery_ja);
-        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-        rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+        self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
         let shift = if crate::regalloc::valid_addressing_size(itemsize as usize) {
             crate::regalloc::get_scale(itemsize as usize)
         } else {
@@ -10266,20 +8297,11 @@ impl<'a> Assembler386<'a> {
         if force_realignment {
             rx86::and_ri(&mut self.mc, rx86::EDX, !(WORD as i32 - 1));
         }
-        let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
-        rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+        self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
         dynasm!(self.mc ; .arch x64 ; =>nursery_ja);
-        let mut sp = self.begin_slow_path(Some(CC_A), kind());
-        if rx86::fits_in_32bits(type_id) {
-            rx86::mov_mi(&mut self.mc, (rx86::ECX, 0), type_id as i32);
-        } else {
-            self.load_scratch(type_id);
-            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-            dynasm!(self.mc ; .arch x64 ; mov [rcx], Rq(scratch));
-        }
-        let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
-        self.forget_if_scratch_written(result_reg);
+        let mut sp = self.begin_slow_path(Some(CC_A), slow_kind());
+        self.mc.MOV(Operand::M(rx86::ECX, 0), imm(type_id));
+        self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
         rx86::lea_rm(
             &mut self.mc,
             result_reg,
@@ -10307,16 +8329,15 @@ impl<'a> Assembler386<'a> {
             Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
             _ => 8,
         };
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
         let max_young = crate::runner::dynasm_max_size_of_young_obj();
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         let max_length = max_young.saturating_sub(base_size as usize);
         debug_assert!(itemsize > 0);
         if nf_addr == 0 || nt_addr == 0 || max_length == 0 {
             dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
-            self.forget_after_call_or_jmp();
+            self.mc.forget_scratch_register();
         } else {
             match arglocs.first() {
                 Some(Loc::Reg(len_r)) => {
@@ -10337,15 +8358,11 @@ impl<'a> Assembler386<'a> {
                     panic!("CallMallocNurseryVarsizeHeaderless length is not a value: {other:?}")
                 }
             }
-            self.load_scratch(max_length as i64);
-            dynasm!(self.mc ; .arch x64
-            ; cmp rdx, Rq(scratch)
-            );
+            self.mc.CMP(Operand::R(rx86::EDX), imm(max_length as i64));
             dynasm!(self.mc ; .arch x64
                                     ; ja =>slow_path
             );
-            let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-            rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+            self.mc.MOV(Operand::R(rx86::ECX), heap(nf_addr as i64));
             rx86::imul_ri(&mut self.mc, rx86::EDX, itemsize as i32);
             rx86::add_ri(&mut self.mc, rx86::EDX, (base_size + 7) as i32);
             dynasm!(self.mc ; .arch x64
@@ -10354,20 +8371,18 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64
                                     ; add rdx, rcx
             );
-            let (sr, so) = self.addr_as_reg_offset(nt_addr as i64);
-            rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+            self.mc.CMP(Operand::R(rx86::EDX), heap(nt_addr as i64));
             dynasm!(self.mc ; .arch x64
                                     ; ja =>slow_path
             );
-            let (sr, so) = self.addr_as_reg_offset(nf_addr as i64);
-            rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
+            self.mc.MOV(heap(nf_addr as i64), Operand::R(rx86::EDX));
             dynasm!(self.mc ; .arch x64
                                     ; jmp =>done
 
             );
-            self.forget_after_call_or_jmp();
+            self.mc.forget_scratch_register();
         }
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
         self.push_all_regs_to_jitframe(&[], true);
         match arglocs.first() {
@@ -10401,29 +8416,25 @@ impl<'a> Assembler386<'a> {
                 "CallMallocNurseryVarsizeHeaderless result_loc must be a register; got {result_loc:?}"
             );
         };
-        if r.value != crate::regloc::EAX.value {
-            let rv = r.value;
-            self.forget_if_scratch_written(rv);
-            dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
-        }
+        self.mc.MOV(*r, crate::regloc::EAX);
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
-        self.forget_after_call_or_jmp();
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>done);
     }
 
     /// Headerless fixed-size nursery allocation.  `size` excludes any GC
     /// header; result is the old nursery base.
     ///
-    /// The fast path raw-bumps `dynasm_nursery_addrs()`, so it is correct only
-    /// when the active dynasm GC is headerless-aware — its nursery must yield a
-    /// raw base carrying no `GcHeader` — what an interpreter that runs its own
-    /// collector over its own object arena supplies.  A headered collector such
-    /// as MiniMarkGC must never back this op:
-    /// its nursery walk reads a `GcHeader` at `base - GcHeader::SIZE`, which a
-    /// raw base lacks.  The overflow slowpath enforces this via
-    /// `alloc_nursery_headerless`'s panicking default; the fast path relies on
-    /// the same invariant being upheld by whoever declares `headerless_structs`.
+    /// The fast path raw-bumps the nursery, so it is correct only when the
+    /// active dynasm GC is headerless-aware — its nursery must yield a raw base
+    /// carrying no `GcHeader` — what an interpreter that runs its own collector
+    /// over its own object arena supplies.  A headered collector such as
+    /// MiniMarkGC must never back this op: its nursery walk reads a `GcHeader`
+    /// at `base - GcHeader::SIZE`, which a raw base lacks.
+    /// `dynasm_headerless_nursery_addrs` answers no nursery for such a
+    /// collector, so the op goes straight to the slowpath, where
+    /// `alloc_nursery_headerless`'s panicking default fails loudly.
     fn genop_call_malloc_nursery_headerless(&mut self, op: &Op, result_loc: Option<&Loc>) {
         let size_ref = op.arg(0).to_opref();
         let size = size_ref.inline_const_bits().unwrap_or_else(|| {
@@ -10432,7 +8443,7 @@ impl<'a> Assembler386<'a> {
                 .map(|c| c.as_raw_i64())
                 .unwrap_or(size_ref.raw() as i64)
         });
-        let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+        let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
         let nf = nf_addr as i64;
         let nt = nt_addr as i64;
 
@@ -10450,13 +8461,11 @@ impl<'a> Assembler386<'a> {
                             ; jmp =>slow_path
 
             );
-            self.forget_after_call_or_jmp();
+            self.mc.forget_scratch_register();
         } else {
-            let (sr, so) = self.addr_as_reg_offset(nf);
-            rx86::mov_rm(&mut self.mc, rx86::ECX, (sr, so));
+            self.mc.MOV(Operand::R(rx86::ECX), heap(nf));
             rx86::lea_rm(&mut self.mc, rx86::EDX, (rx86::ECX, size as i32));
-            let (sr, so) = self.addr_as_reg_offset(nt);
-            rx86::cmp_rm(&mut self.mc, rx86::EDX, (sr, so));
+            self.mc.CMP(Operand::R(rx86::EDX), heap(nt));
 
             dynasm!(self.mc ; .arch x64 ; ja =>slow_path);
         }
@@ -10465,16 +8474,12 @@ impl<'a> Assembler386<'a> {
             Some(Loc::Reg(r)) => r.value,
             _ => crate::regloc::ECX.value,
         };
-        let (sr, so) = self.addr_as_reg_offset(nf);
-        rx86::mov_mr(&mut self.mc, (sr, so), rx86::EDX);
-        if result_reg != crate::regloc::ECX.value {
-            self.forget_if_scratch_written(result_reg);
-            dynasm!(self.mc ; .arch x64 ; mov Rq(result_reg), rcx);
-        }
+        self.mc.MOV(heap(nf), Operand::R(rx86::EDX));
+        self.mc.MOV(Operand::R(result_reg), crate::regloc::ECX);
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
-        self.forget_after_call_or_jmp();
+        self.mc.forget_scratch_register();
 
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
         if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
@@ -10483,118 +8488,17 @@ impl<'a> Assembler386<'a> {
             rx86::mov_bi(&mut self.mc, gcmap_ofs, 0);
         }
         let helper_addr = self.malloc_slowpath_headerless as i64;
-        let call_scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        self.forget_if_scratch_written(call_scratch);
-        rx86::mov_ri(&mut self.mc, call_scratch, helper_addr);
-        dynasm!(self.mc ; .arch x64
-                    ; call Rq(call_scratch)
-
-        );
-        self.forget_after_call_or_jmp();
+        self.mc.CALL(imm(helper_addr));
         if let Some(Loc::Reg(r)) = result_loc {
-            if r.value != crate::regloc::ECX.value {
-                let rv = r.value;
-                self.forget_if_scratch_written(rv);
-                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rcx);
-            }
+            self.mc.MOV(*r, crate::regloc::ECX);
         }
         let _ = gcmap_ofs;
 
-        self.forget_scratch_register();
+        self.mc.forget_scratch_register();
         dynasm!(self.mc ; .arch x64 ; =>done);
         // The result register is the delivery contract (see
         // `genop_call_malloc_nursery`); an extra store here grew `frame_depth`
         // by one slot per allocation.
-    }
-
-    /// NEW: allocate a fixed-size object. Requires GC runtime.
-    /// Emits a trap (UD2/BRK) until GC nursery allocation is wired.
-    /// Address of the `New` allocation helper: the active-GC trampoline
-    /// (`dynasm_new_alloc`) when `set_new_via_gc(true)`, else `libc::malloc`.
-    fn new_alloc_fn_addr() -> i64 {
-        if crate::runner::new_via_gc_enabled() {
-            crate::runner::dynasm_new_alloc as *const () as i64
-        } else {
-            libc::malloc as *const () as i64
-        }
-    }
-
-    fn genop_new(&mut self, op: &Op) {
-        // Simple allocation: call the New alloc helper(obj_size).
-        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
-        let malloc_ptr = Self::new_alloc_fn_addr();
-        // Call alloc_fn(obj_size)
-        self.emit_abi_int_arg_from_imm(0, obj_size);
-        rx86::mov_ri(&mut self.mc, rx86::EAX, malloc_ptr);
-        self.emit_abi_call_rax();
-        // rax/x0 = pointer to allocated memory
-        // Zero-initialize
-        self.emit_abi_int_arg_from_reg(0, 0);
-        self.emit_abi_int_arg_from_imm(1, 0);
-        self.emit_abi_int_arg_from_imm(2, obj_size);
-        dynasm!(self.mc ; .arch x64
-        ; push rax           // save ptr
-        );
-        rx86::mov_ri(&mut self.mc, rx86::EAX, libc::memset as *const () as i64);
-        self.emit_abi_call_rax_after_one_push();
-        dynasm!(self.mc ; .arch x64 ; pop rax); // restore ptr
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
-    }
-
-    /// NEW_WITH_VTABLE: allocate and set vtable pointer.
-    fn genop_new_with_vtable(&mut self, op: &Op) {
-        // Same as New, but also write vtable at offset 0.
-        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
-        let (vtable, w_class_init) = op
-            .with_size_descr(|sd| {
-                let w_class_init = sd.w_class_obj().and_then(|w_class| {
-                    sd.class_word_field()
-                        .map(|fd| (fd.offset() as i32, w_class))
-                });
-                (sd.vtable() as i64, w_class_init)
-            })
-            .unwrap_or((0, None));
-        // `rewrite.py gen_malloc_fixedsize` (Boehm arm): CALL malloc_fixedsize(size).
-        // One read of the published hook picks both the call target and
-        // whether the raw fallback still needs to be cleared.
-        let fallback = Self::new_alloc_fn_addr();
-        let malloc_ptr = crate::runner::malloc_fixedsize_or(fallback);
-        self.emit_abi_int_arg_from_imm(0, obj_size);
-        rx86::mov_ri(&mut self.mc, rx86::EAX, malloc_ptr);
-        self.emit_abi_call_rax();
-        // `GcLLDescr_boehm.malloc_fixedsize` is `GC_malloc`
-        // (`malloc_zero_filled`). A raw `malloc` is not, so only that
-        // fallback is cleared here — never both.
-        if malloc_ptr == fallback {
-            self.emit_abi_int_arg_from_reg(0, 0);
-            self.emit_abi_int_arg_from_imm(1, 0);
-            self.emit_abi_int_arg_from_imm(2, obj_size);
-            dynasm!(self.mc ; .arch x64
-            ; push rax
-            );
-            rx86::mov_ri(&mut self.mc, rx86::EAX, libc::memset as *const () as i64);
-            self.emit_abi_call_rax_after_one_push();
-            dynasm!(self.mc ; .arch x64 ; pop rax);
-        }
-        // Write vtable at offset 0 (`GcLLDescr_boehm`, fielddescr_vtable at 0).
-        if vtable != 0 {
-            rx86::mov_ri(&mut self.mc, rx86::ECX, vtable);
-            dynasm!(self.mc ; .arch x64
-                            ; mov [rax], rcx
-
-            );
-        }
-        if let Some((w_class_offset, w_class)) = w_class_init {
-            if w_class != 0 {
-                rx86::mov_ri(&mut self.mc, rx86::ECX, w_class);
-                rx86::mov_mr(&mut self.mc, (rx86::EAX, w_class_offset), rx86::ECX);
-            }
-        }
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
     /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate a typed GC array.
@@ -10632,22 +8536,17 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_int_arg_from_imm(2, len_ofs);
         self.emit_abi_int_arg_from_imm(3, type_id);
         self.emit_abi_int_arg_from_imm(5, clear);
-        rx86::mov_ri(
-            &mut self.mc,
-            rx86::EAX,
-            crate::runner::dynasm_malloc_new_array as *const () as i64,
+        self.mc.MOV(
+            crate::regloc::EAX,
+            imm(crate::runner::dynasm_malloc_new_array as *const () as i64),
         );
         #[cfg(target_os = "windows")]
         {
-            dynasm!(self.mc ; .arch x64 ; call rax);
-            self.forget_after_call_or_jmp();
+            self.mc.CALL(crate::regloc::EAX);
             self.emit_release_abi_call_area(call_area_adjust);
         }
         #[cfg(not(target_os = "windows"))]
         self.emit_abi_call_rax();
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
     // genop_* — misc
@@ -10658,19 +8557,13 @@ impl<'a> Assembler386<'a> {
     /// `MOV resloc, [pos_exception]`.  The regalloc always assigns the
     /// result a register (`consider_no_arg_result`).
     fn genop_save_exc_class(&mut self, result_loc: Option<&Loc>) {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         let exc_type_addr = crate::jit_exc_type_addr() as i64;
-        let (sr, so) = self.addr_as_reg_offset(exc_type_addr);
         match result_loc {
-            Some(Loc::Reg(dst)) => {
-                self.forget_if_scratch_written(dst.value);
-                rx86::mov_rm(&mut self.mc, dst.value, (sr, so));
-            }
-            Some(Loc::Frame(frame)) => {
-                let ofs = frame.ebp_loc.value;
-                self.forget_if_scratch_written(scratch);
-                rx86::mov_rm(&mut self.mc, scratch, (sr, so));
-                rx86::mov_br(&mut self.mc, ofs, scratch);
+            Some(Loc::Reg(dst)) => self.mc.MOV(*dst, heap(exc_type_addr)),
+            Some(loc @ Loc::Frame(_)) => {
+                let tmploc = crate::regloc::X86_64_SCRATCH_REG;
+                self.mc.MOV(tmploc, heap(exc_type_addr));
+                self.mc.MOV(loc, tmploc);
             }
             None => {}
             Some(other) => {
@@ -10697,28 +8590,7 @@ impl<'a> Assembler386<'a> {
     /// is `MOV_mi`; a wider one is `insn_with_64_bit_immediate`, which
     /// `PUSH`es `find_unused_reg()` (eax), loads it, stores it and `POP`s.
     fn mov_heap_loc(&mut self, addr: i64, loc: &Loc) {
-        match loc {
-            Loc::Reg(src) => {
-                let mem = self.addr_as_reg_offset(addr);
-                rx86::mov_mr(&mut self.mc, mem, src.value);
-            }
-            Loc::Immed(imm) | Loc::ImmedFloat(imm) => {
-                if rx86::fits_in_32bits(imm.value) {
-                    let mem = self.addr_as_reg_offset(addr);
-                    rx86::mov_mi(&mut self.mc, mem, imm.value as i32);
-                } else {
-                    rx86::push_r(&mut self.mc, rx86::EAX);
-                    rx86::mov_ri(&mut self.mc, rx86::EAX, imm.value);
-                    let mem = self.addr_as_reg_offset(addr);
-                    rx86::mov_mr(&mut self.mc, mem, rx86::EAX);
-                    dynasm!(self.mc ; .arch x64 ; pop rax);
-                }
-            }
-            other => panic!(
-                "MOV(heap, {other:?}): consider_restore_exception keeps the \
-                 operands in registers or immediates"
-            ),
-        }
+        self.mc.MOV(heap(addr), loc);
     }
 
     // genop_* — extended integer arithmetic
@@ -10830,10 +8702,16 @@ impl<'a> Assembler386<'a> {
     /// `set_continue_addr`. `load_condition_into_cc` emits `test` and
     /// `CC_NE` only when no compare is pending. The call, the gcmap, and
     /// `generate_guard_no_exception` live in `CondCallSlowPath`.
-    fn genop_discard_cond_call(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
-        if arglocs.len() < 4 {
+    fn genop_discard_cond_call(
+        &mut self,
+        regalloc: &RegAlloc<'_>,
+        op: &Op,
+        arglocs: &[Loc],
+        op_index: usize,
+    ) {
+        if arglocs.len() < 2 {
             panic!(
-                "cond_call arglocs are predicate, func, extras, variant, should_be_saved (consider_cond_call_n); got {arglocs:?}"
+                "cond_call arglocs are predicate, func, extras (consider_cond_call); got {arglocs:?}"
             );
         }
         self.load_condition_into_cc(&arglocs[0]);
@@ -10843,19 +8721,9 @@ impl<'a> Assembler386<'a> {
             .expect("cond_call requires guard_success_cc (load_condition_into_cc)");
         // Predicate at 0, func at 1. Extras are remapped onto
         // `cond_call_register_arguments` in the slow path
-        // (`CondCallSlowPath.generate_body`). Trailing immediates are
-        // `cond_call`'s `variant_num` and `should_be_saved` bitmask.
-        let (variant_num, should_be_saved) = Self::cond_call_variant_and_saved(arglocs);
-        let extras = &arglocs[2..arglocs.len() - 2];
-        self.enqueue_cond_call(
-            op,
-            op_index,
-            cc,
-            extras.to_vec(),
-            None,
-            variant_num,
-            should_be_saved,
-        );
+        // (`CondCallSlowPath.generate_body`).
+        let extras = arglocs[2..].to_vec();
+        self.enqueue_cond_call(regalloc, op, op_index, cc, extras, None);
     }
 
     /// `cond_call` for `COND_CALL_VALUE_I` / `COND_CALL_VALUE_R`.
@@ -10863,10 +8731,16 @@ impl<'a> Assembler386<'a> {
     /// Extra-arg locations follow `[argloc, resloc]`; the slow path remaps
     /// them into `cond_call_register_arguments`. Does not consume
     /// `guard_success_cc`.
-    fn genop_cond_call_value(&mut self, op: &Op, arglocs: &[Loc], op_index: usize) {
-        if arglocs.len() < 4 {
+    fn genop_cond_call_value(
+        &mut self,
+        regalloc: &RegAlloc<'_>,
+        op: &Op,
+        arglocs: &[Loc],
+        op_index: usize,
+    ) {
+        if arglocs.len() < 2 {
             panic!(
-                "COND_CALL_VALUE arglocs are [argloc, resloc, extras, variant, should_be_saved] (consider_cond_call), got {arglocs:?}"
+                "COND_CALL_VALUE arglocs are [argloc, resloc, extras] (consider_cond_call), got {arglocs:?}"
             );
         }
         let resloc = arglocs[1];
@@ -10875,45 +8749,20 @@ impl<'a> Assembler386<'a> {
             "cond_call value does not consume guard_success_cc"
         );
         self.emit_test_loc(&resloc);
-        let (variant_num, should_be_saved) = Self::cond_call_variant_and_saved(arglocs);
-        let extras = arglocs[2..arglocs.len() - 2].to_vec();
-        self.enqueue_cond_call(
-            op,
-            op_index,
-            CC_E,
-            extras,
-            Some(resloc),
-            variant_num,
-            should_be_saved,
-        );
-    }
-
-    /// Trailing immediates from `consider_cond_call_n` /
-    /// `consider_cond_call_value_j2`: `cond_call`'s
-    /// `variant_num = floats * 2 + callee_only`, then the
-    /// `should_be_saved` bitmask over GPR numbers.
-    fn cond_call_variant_and_saved(arglocs: &[Loc]) -> (usize, i64) {
-        match arglocs {
-            [.., Loc::Immed(variant), Loc::Immed(saved)] if (0..4).contains(&variant.value) => {
-                (variant.value as usize, saved.value)
-            }
-            other => panic!(
-                "cond_call trailing immediates are variant_num and should_be_saved (cond_call), got {other:?}"
-            ),
-        }
+        let extras = arglocs[2..].to_vec();
+        self.enqueue_cond_call(regalloc, op, op_index, CC_E, extras, Some(resloc));
     }
 
     /// `cond_call`: queue `CondCallSlowPath` and bind the continue point
     /// immediately, so the fast path is only the test plus one `jcc`.
     fn enqueue_cond_call(
         &mut self,
+        regalloc: &RegAlloc<'_>,
         op: &Op,
         op_index: usize,
         cc: u8,
         arglocs: Vec<Loc>,
         resloc: Option<Loc>,
-        variant_num: usize,
-        should_be_saved: i64,
     ) {
         let imm_func = match self.resolve_opref(op.arg(1).to_opref()) {
             ResolvedArg::Const(val) => val,
@@ -10929,6 +8778,22 @@ impl<'a> Assembler386<'a> {
             .operations
             .get(op_index + 1)
             .is_some_and(|next| next.opcode == OpCode::GuardNoException);
+        // `sp.should_be_saved = self._regalloc.rm.reg_bindings.values()`, kept
+        // as a bitmask over GPR numbers. `variant_num = floats * 2 +
+        // callee_only`: the for/else over the same bindings sets
+        // `callee_only` when every bound core register is in
+        // `save_around_call_regs` (no bindings takes that arm), and `floats`
+        // is `len(self._regalloc.xrm.reg_bindings) != 0`.
+        let mut should_be_saved = 0i64;
+        let mut callee_only = true;
+        for (_, reg) in regalloc.rm.reg_bindings_iter() {
+            should_be_saved |= 1i64 << reg.value;
+            if !regalloc.rm.save_around_call_regs.contains(&reg) {
+                callee_only = false;
+            }
+        }
+        let floats = regalloc.xrm.reg_bindings_len() > 0;
+        let variant_num = usize::from(floats) * 2 + usize::from(callee_only);
         let mut sp = self.emit_slow_jcc(
             cc,
             SlowPathKind::CondCall {
@@ -10971,79 +8836,30 @@ impl<'a> Assembler386<'a> {
                 "LoadEffectiveAddress baseofs must be Immed (rewrite.py ConstInt), got {other:?}"
             ),
         };
-        if let Loc::Immed(i) | Loc::ImmedFloat(i) = index {
-            let total = ofs.wrapping_add(i.value.wrapping_shl(shift_amt as u32));
-            self.emit_lea_base_plus_disp(dst.value, base, total);
-            return;
-        }
-        let index_reg = match index {
-            Loc::Reg(r) if !r.is_xmm => r.value,
+        // `load_effective_addr`: `LEA(result, addr_add(frm, sizereg,
+        // baseofs, scale))`. `make_sure_var_in_reg` hands a constant base
+        // back as an `ImmedLoc`, which `AddressLoc` folds into the static
+        // offset (`NO_BASE_REGISTER`, location code `'a'`).
+        let addr = match index {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                let scaled = Loc::immed(i.value.wrapping_shl(shift_amt as u32));
+                addr_add(base, &scaled, ofs, 0)
+            }
+            Loc::Reg(r) if !r.is_xmm => {
+                let shift = match shift_amt {
+                    0..=3 => shift_amt as u8,
+                    other => panic!(
+                        "LoadEffectiveAddress shift must be 0..=3 (rewrite.py itemscale), got {other}"
+                    ),
+                };
+                addr_add(base, index, ofs, shift)
+            }
             other => panic!(
                 "LoadEffectiveAddress index must be Loc::Reg after \
                  consider_load_effective_address, got {other:?}"
             ),
         };
-        let shift = match shift_amt {
-            0..=3 => shift_amt as u8,
-            other => panic!(
-                "LoadEffectiveAddress shift must be 0..=3 (rewrite.py itemscale), got {other}"
-            ),
-        };
-        // `load_effective_addr`: `LEA(result, addr_add(frm, sizereg,
-        // baseofs, scale))`. `make_sure_var_in_reg` hands a constant base
-        // back as an `ImmedLoc`, which `AddressLoc` folds into the static
-        // offset (`NO_BASE_REGISTER`, location code `'a'`).
-        let addr = match base {
-            Loc::Reg(r) if !r.is_xmm => {
-                let disp = i32::try_from(ofs).expect(
-                    "LoadEffectiveAddress baseofs must fit signed disp32 (rewrite.py str/unicode basesize)",
-                );
-                (i16::from(r.value), index_reg, shift, disp)
-            }
-            Loc::Immed(i) => self.addr_add_imm_index(index_reg, shift, i.value.wrapping_add(ofs)),
-            other => panic!(
-                "LoadEffectiveAddress base must be Loc::Reg or Loc::Immed after \
-                 consider_load_effective_address, got {other:?}"
-            ),
-        };
-        self.forget_if_scratch_written(dst.value);
-        rx86::lea_ra(&mut self.mc, dst.value, addr);
-    }
-
-    fn emit_lea_base_plus_disp(&mut self, dst: u8, base: &Loc, disp: i64) {
-        match base {
-            Loc::Reg(r) if !r.is_xmm => {
-                if let Ok(d) = i32::try_from(disp) {
-                    self.forget_if_scratch_written(dst);
-                    rx86::lea_rm(&mut self.mc, dst, (r.value, d));
-                } else {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    self.load_scratch(disp);
-                    self.forget_if_scratch_written(dst);
-                    rx86::lea_ra(&mut self.mc, dst, (i16::from(r.value), scratch, 0, 0));
-                }
-            }
-            _ => {
-                self.regalloc_mov(
-                    base,
-                    &Loc::Reg(crate::regloc::RegLoc {
-                        value: dst,
-                        is_xmm: false,
-                    }),
-                );
-                if disp != 0 {
-                    if let Ok(d) = i32::try_from(disp) {
-                        self.forget_if_scratch_written(dst);
-                        rx86::add_ri(&mut self.mc, dst, d);
-                    } else {
-                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                        self.load_scratch(disp);
-                        self.forget_if_scratch_written(dst);
-                        dynasm!(self.mc ; .arch x64 ; add Rq(dst), Rq(scratch));
-                    }
-                }
-            }
-        }
+        self.mc.LEA(*dst, addr);
     }
 
     /// NEWSTR: allocate a byte string of given length.
@@ -11053,14 +8869,14 @@ impl<'a> Assembler386<'a> {
     /// extra_item_after_alloc null terminator.
     fn genop_newstr(&mut self, op: &Op, arglocs: &[Loc]) {
         let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 1);
-        self.genop_alloc_lowlevel_string(op, arglocs, type_id, base_size, item_size);
+        self.genop_alloc_lowlevel_string(arglocs, type_id, base_size, item_size);
     }
 
     /// NEWUNICODE: allocate a unicode string (4-byte chars).
     /// Basesize = 16 (no extra_item_after_alloc), itemsize = 4.
     fn genop_newunicode(&mut self, op: &Op, arglocs: &[Loc]) {
         let (base_size, item_size, type_id) = Self::array_token_from_descr(op, 16, 4);
-        self.genop_alloc_lowlevel_string(op, arglocs, type_id, base_size, item_size);
+        self.genop_alloc_lowlevel_string(arglocs, type_id, base_size, item_size);
     }
 
     /// Read `(base_size, item_size)` from the injected ArrayDescr.
@@ -11079,7 +8895,6 @@ impl<'a> Assembler386<'a> {
 
     fn genop_alloc_lowlevel_string(
         &mut self,
-        op: &Op,
         arglocs: &[Loc],
         type_id: i64,
         base_size: i64,
@@ -11104,16 +8919,13 @@ impl<'a> Assembler386<'a> {
             crate::runner::dynasm_malloc_lowlevel_string as *const () as i64,
         );
         self.emit_abi_call_rax();
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
     /// Shared implementation for NEW_ARRAY.
     /// Allocates base_size + length * item_size bytes, zero-fills,
     /// and writes length to the header.
-    fn genop_alloc_varsize(&mut self, op: &Op, arglocs: &[Loc], base_size: i64, item_size: i64) {
-        // The length comes from its regalloc location.  `consider_raw_call_like_j2`
+    fn genop_alloc_varsize(&mut self, arglocs: &[Loc], base_size: i64, item_size: i64) {
+        // The length comes from its regalloc location.  `consider_raw_call_like`
         // plans these opcodes, and `before_call` leaves a value bound to a
         // callee-saved member of the allocation pool in its register, where
         // `resolve_opref` cannot see it.  The load is consumed by the very next
@@ -11160,129 +8972,34 @@ impl<'a> Assembler386<'a> {
             // Store length at offset 8 (RPython string header)
             ; mov [rax + 8], rcx
         );
-
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
-    /// `addr_add(base, start, offset, scale)` for ZERO_ARRAY. Immediate
-    /// start folds `start * itemsize` into the displacement (`_scaled_addr`);
-    /// a register start uses SIB scale `get_scale(itemsize)`. An immediate
-    /// base is an absolute address (`AddressLoc` with an `ImmedLoc` base),
-    /// and a displacement outside the signed 32-bit range goes through the
-    /// scratch register (`_fix_static_offset_64_m`).
+    /// `AddressLoc(base_loc, _scaled_addr(...))` for ZERO_ARRAY, as INSN
+    /// encodes it. `_scaled_addr` folds an immediate start into
+    /// `start * itemsize`; a register start uses scale `get_scale(itemsize)`.
+    /// An immediate base is `'j'` with an immediate start and `'a'` with
+    /// `NO_BASE_REGISTER` otherwise. A displacement outside the signed 32-bit
+    /// range is `_addr_as_reg_offset` for `'j'` and
+    /// `_fix_static_offset_64_m` / `_fix_static_offset_64_a` for `'m'` / `'a'`.
     fn addr_add_zero_array(
         &mut self,
         base: &Loc,
         start: &Loc,
         itemsize: i64,
         offset: i64,
-    ) -> AddrAdd {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-        match start {
-            Loc::Reg(s) => {
-                if !crate::regalloc::valid_addressing_size(itemsize as usize) {
-                    panic!("ZERO_ARRAY start scale must be 1, 2, 4, or 8, got {itemsize}");
-                }
-                let shift = crate::regalloc::get_scale(itemsize as usize);
-                let (base_reg, ofs) = match base {
-                    Loc::Reg(b) => (b.value, offset),
-                    Loc::Immed(b) | Loc::ImmedFloat(b) => {
-                        self.load_scratch(b.value.wrapping_add(offset));
-                        (scratch, 0)
-                    }
-                    other => panic!("ZERO_ARRAY base must be a GPR or immediate, got {other:?}"),
-                };
-                let ofs = i32::try_from(ofs)
-                    .unwrap_or_else(|_| panic!("ZERO_ARRAY base offset {ofs} out of range"));
-                AddrAdd::Sib {
-                    base: i16::from(base_reg),
-                    index: s.value,
-                    scale: shift,
-                    ofs,
-                }
+    ) -> Operand {
+        let (scaled, shift) = match start {
+            Loc::Reg(_) => {
+                assert!(
+                    crate::regalloc::valid_addressing_size(itemsize as usize),
+                    "rewrite did not correctly handle shift/mul!"
+                );
+                (*start, crate::regalloc::get_scale(itemsize as usize))
             }
-            Loc::Immed(s) | Loc::ImmedFloat(s) => {
-                let ofs = offset.wrapping_add(s.value.wrapping_mul(itemsize));
-                match base {
-                    Loc::Reg(b) => match i32::try_from(ofs) {
-                        Ok(ofs) => AddrAdd::Mem { base: b.value, ofs },
-                        Err(_) => {
-                            self.load_scratch(ofs);
-                            AddrAdd::Sib {
-                                base: i16::from(b.value),
-                                index: scratch,
-                                scale: 0,
-                                ofs: 0,
-                            }
-                        }
-                    },
-                    Loc::Immed(b) | Loc::ImmedFloat(b) => {
-                        self.load_scratch(b.value.wrapping_add(ofs));
-                        AddrAdd::Mem {
-                            base: scratch,
-                            ofs: 0,
-                        }
-                    }
-                    other => panic!("ZERO_ARRAY base must be a GPR or immediate, got {other:?}"),
-                }
-            }
+            Loc::Immed(s) | Loc::ImmedFloat(s) => (Loc::immed(s.value.wrapping_mul(itemsize)), 0),
             other => panic!("ZERO_ARRAY start must be a GPR or immediate, got {other:?}"),
-        }
-    }
-
-    fn emit_movups_addr(&mut self, addr: AddrAdd, xmm: u8) {
-        match addr {
-            AddrAdd::Mem { base, ofs } => rx86::movups_mx(&mut self.mc, (base, ofs), xmm),
-            AddrAdd::Sib {
-                base,
-                index,
-                scale,
-                ofs,
-            } => rx86::movups_ax(&mut self.mc, (base, index, scale, ofs), xmm),
-        }
-    }
-
-    /// `save_into_mem(addr, imm0, size)` for the ZERO_ARRAY tail.
-    fn emit_zero_imm_addr(&mut self, addr: AddrAdd, size: i64) {
-        match addr {
-            AddrAdd::Mem { base, ofs } => match size {
-                8 => rx86::mov_mi(&mut self.mc, (base, ofs), 0),
-                4 => rx86::mov32_mi(&mut self.mc, (base, ofs), 0),
-                2 => rx86::mov16_mi(&mut self.mc, (base, ofs), 0),
-                1 => rx86::mov8_mi(&mut self.mc, (base, ofs), 0),
-                other => panic!("ZERO_ARRAY tail size {other}"),
-            },
-            AddrAdd::Sib {
-                base,
-                index,
-                scale,
-                ofs,
-            } => {
-                let sib = (base, index, scale, ofs);
-                match size {
-                    8 => rx86::mov_ai(&mut self.mc, sib, 0),
-                    4 => rx86::mov32_ai(&mut self.mc, sib, 0),
-                    2 => rx86::mov16_ai(&mut self.mc, sib, 0),
-                    1 => rx86::mov8_ai(&mut self.mc, sib, 0),
-                    other => panic!("ZERO_ARRAY tail size {other}"),
-                }
-            }
-        }
-    }
-
-    fn emit_lea_addr_add(&mut self, dst: u8, addr: AddrAdd) {
-        self.forget_if_scratch_written(dst);
-        match addr {
-            AddrAdd::Mem { base, ofs } => rx86::lea_rm(&mut self.mc, dst, (base, ofs)),
-            AddrAdd::Sib {
-                base,
-                index,
-                scale,
-                ofs,
-            } => rx86::lea_ra(&mut self.mc, dst, (base, index, scale, ofs)),
-        }
+        };
+        addr_add(base, &scaled, offset, shift)
     }
 
     /// `genop_discard_zero_array`: the unrolled `XORPS` + `MOVUPS` /
@@ -11340,7 +9057,7 @@ impl<'a> Assembler386<'a> {
                     rx86::xorps_xx(&mut self.mc, null_loc, null_loc);
                     null_reg_cleared = true;
                 }
-                self.emit_movups_addr(addr, null_loc);
+                self.mc.MOVUPS(addr, Operand::X(null_loc));
             } else {
                 if current >= WORD as i64 {
                     current = WORD as i64;
@@ -11349,7 +9066,7 @@ impl<'a> Assembler386<'a> {
                 } else if current >= 2 {
                     current = 2;
                 }
-                self.emit_zero_imm_addr(addr, current);
+                self.save_into_mem(addr, &Loc::immed(0), current as usize);
             }
             i += current;
         }
@@ -11385,7 +9102,7 @@ impl<'a> Assembler386<'a> {
         };
         let dst_addr =
             self.addr_add_zero_array(base_loc, startindex_loc, itemsize.value, baseofs.value);
-        self.emit_lea_addr_add(dstaddr.value, dst_addr);
+        self.mc.LEA(*dstaddr, dst_addr);
         let mut length_loc = *length_loc;
         if len_itemsize.value > 1 {
             let (Loc::Reg(index), Loc::Reg(bytes)) = (length_loc, bytes_loc) else {
@@ -11396,47 +9113,46 @@ impl<'a> Assembler386<'a> {
                 "rewrite did not correctly handle shift/mul!"
             );
             let shift = crate::regalloc::get_scale(len_itemsize.value as usize);
-            self.emit_lea_addr_add(
-                bytes.value,
-                AddrAdd::Sib {
-                    base: rx86::NO_BASE_REGISTER,
-                    index: index.value,
-                    scale: shift,
-                    ofs: 0,
-                },
-            );
+            self.mc
+                .LEA(*bytes, addr_add(&Loc::immed(0), &Loc::Reg(index), 0, shift));
             length_loc = *bytes_loc;
         }
         let memset_addr = libc::memset as *const () as i64;
-        self.simple_call_no_collect(memset_addr, &[*dstaddr_loc, Loc::immed(0), length_loc]);
+        self.simple_call_no_collect(
+            Loc::immed(memset_addr),
+            &[*dstaddr_loc, Loc::immed(0), length_loc],
+        );
     }
 
-    /// `Assembler386.simple_call_no_collect` → `CallBuilder.emit_no_collect`
-    /// for integer register arguments: `prepare_arguments`
-    /// (`remap_frame_layout` into `ARGUMENTS_GPR`), `emit_raw_call`,
-    /// `restore_stack_pointer`.
-    fn simple_call_no_collect(&mut self, fnloc: i64, arglocs: &[Loc]) {
-        let arg_types = vec![Type::Int; arglocs.len()];
-        let (placements, stack_slots) = Self::build_abi_arg_placements(&arg_types, "");
-        let on_stack = super::callbuilder::outgoing_stack_words(stack_slots);
-        let current_esp = self.subtract_esp_aligned(on_stack - PASS_ON_MY_FRAME as i32);
-        let dst_locs: Vec<Loc> = placements
-            .iter()
-            .map(|placement| match placement {
-                AbiArgPlacement::Gpr(reg) => Loc::Reg(crate::regloc::RegLoc::new(*reg, false)),
-                AbiArgPlacement::Xmm(_) | AbiArgPlacement::Stack(_) => {
-                    panic!("simple_call_no_collect: integer argument not in a GPR")
-                }
-            })
-            .collect();
-        crate::jump::remap_frame_layout(
+    /// `Assembler386.simple_call`.
+    fn simple_call(&mut self, fnloc: Loc, arglocs: &[Loc], result_loc: Option<Loc>) {
+        let (result_type, result_size) = match result_loc {
+            Some(Loc::Reg(r)) if r == crate::regloc::XMM0 => ('f', 8),
+            None => ('v', 0),
+            Some(_) => ('i', WORD),
+        };
+        super::callbuilder::CallBuilder64::new(
             self,
+            fnloc,
             arglocs,
-            &dst_locs,
-            Loc::Reg(crate::regloc::X86_64_SCRATCH_REG),
-        );
-        self.emit_raw_call(PreparedFnLoc::Immediate(fnloc));
-        self.restore_stack_pointer(current_esp);
+            result_loc,
+            result_type,
+            result_size,
+        )
+        .emit();
+    }
+
+    /// `Assembler386.simple_call_no_collect`.
+    fn simple_call_no_collect(&mut self, fnloc: Loc, arglocs: &[Loc]) {
+        super::callbuilder::CallBuilder64::new(
+            self,
+            fnloc,
+            arglocs,
+            Some(Loc::Reg(crate::regloc::EAX)),
+            'i',
+            WORD,
+        )
+        .emit_no_collect();
     }
 
     // genop_* — address computation
@@ -11447,98 +9163,34 @@ impl<'a> Assembler386<'a> {
 /// backend, which is what makes them the trait and it the free function.
 impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
     fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
-        let scratch_reg = crate::regloc::X86_64_SCRATCH_REG.value;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG;
+        let from_xmm = matches!(src, Loc::Reg(r) if r.is_xmm);
+        let to_xmm = matches!(dst, Loc::Reg(r) if r.is_xmm);
         match (src, dst) {
             (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
-            (Loc::Reg(s), Loc::Reg(d)) => {
-                if s.is_xmm && d.is_xmm {
-                    // copy 128-bit from -> to
-                    rx86::movapd_xx(&mut self.mc, d.value, s.value);
-                } else if !s.is_xmm && !d.is_xmm {
-                    // `LocationCodeBuilder._binaryop` INSN forgets the scratch
-                    // register only when the destination (`loc1`) is
-                    // `X86_64_SCRATCH_REG`, and only for a `MOV`.
-                    self.forget_if_scratch_written(d.value);
-                    dynasm!(self.mc ; .arch x64 ; mov Rq(d.value), Rq(s.value));
-                } else if s.is_xmm && !d.is_xmm {
-                    if d.value == scratch_reg {
-                        self.forget_scratch_register();
-                    }
-                    self.forget_if_scratch_written(d.value);
-                    rx86::movdq_rx(&mut self.mc, d.value, s.value);
-                } else {
-                    rx86::movdq_xr(&mut self.mc, d.value, s.value);
-                }
+            // copy 128-bit from -> to
+            _ if from_xmm && to_xmm => self.mc.MOVAPD(dst, src),
+            // A GPR to or from an xmm register has no `MOVSD` form.
+            (Loc::Reg(_), Loc::Reg(_)) if from_xmm || to_xmm => self.mc.MOVDQ(dst, src),
+            (Loc::Immed(_), Loc::Reg(_)) if to_xmm => {
+                self.mc.MOV(scratch, src);
+                self.mc.MOVDQ(dst, scratch);
             }
-            (Loc::Reg(s), ebp_loc_pat!(e)) => {
-                let ofs = e.value;
-                if s.is_xmm {
-                    rx86::movsd_bx(&mut self.mc, ofs, s.value);
-                } else {
-                    rx86::mov_br(&mut self.mc, ofs, s.value);
-                }
-            }
-            (ebp_loc_pat!(e), Loc::Reg(d)) => {
-                let ofs = e.value;
-                if d.is_xmm {
-                    rx86::movsd_xb(&mut self.mc, d.value, ofs);
-                } else {
-                    if d.value == scratch_reg {
-                        self.forget_scratch_register();
-                    }
-                    self.forget_if_scratch_written(d.value);
-                    rx86::mov_rb(&mut self.mc, d.value, ofs);
-                }
-            }
-            (Loc::ConstFloat(loc), Loc::Reg(d)) if d.is_xmm => {
-                self.emit_movsd_const_float(d.value, *loc);
-            }
-            (Loc::Immed(i), Loc::Reg(d)) if d.is_xmm => {
-                self.forget_scratch_register();
-                self.forget_if_scratch_written(scratch_reg);
-                rx86::mov_ri(&mut self.mc, scratch_reg, i.value);
-                rx86::movdq_xr(&mut self.mc, d.value, scratch_reg);
-            }
-            // GPR `mov r, imm`. A float constant is `ConstFloatLoc` from
-            // `X86XMMRegisterManager.convert_to_imm`, matched above; an
-            // `ImmedFloat` into an xmm register is not this `mov`.
-            (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) if !d.is_xmm => {
-                if d.value == scratch_reg {
-                    self.forget_scratch_register();
-                }
-                self.forget_if_scratch_written(d.value);
-                rx86::mov_ri(&mut self.mc, d.value, i.value);
-            }
-            (Loc::ConstFloat(from), ebp_loc_pat!(e)) => {
-                self.regalloc_immedmem2mem(*from, e.value);
-            }
-            (Loc::Immed(i), ebp_loc_pat!(e)) if rx86::fits_in_32bits(i.value) => {
-                // regloc.py `MOV` with location codes 'b','i': `MOV_bi`.
-                rx86::mov_bi(&mut self.mc, e.value, i.value as i32);
-            }
-            (Loc::Immed(i), ebp_loc_pat!(e)) => {
-                // regloc.py `insn_with_64_bit_immediate`: `_load_scratch`
-                // then `MOV_br`.
-                self.forget_scratch_register();
-                let ofs = e.value;
-                self.forget_if_scratch_written(scratch_reg);
-                rx86::mov_ri(&mut self.mc, scratch_reg, i.value);
-                rx86::mov_br(&mut self.mc, ofs, scratch_reg);
+            _ if from_xmm || to_xmm => self.mc.MOVSD(dst, src),
+            (Loc::ConstFloat(from), ebp_loc_pat!(_e)) => {
+                self.regalloc_immedmem2mem(*from, dst);
             }
             (ebp_loc_pat!(e1), ebp_loc_pat!(e2)) if e1.value == e2.value => {}
-            (ebp_loc_pat!(e1), ebp_loc_pat!(e2)) => {
-                self.forget_scratch_register();
-                let o1 = e1.value;
-                let o2 = e2.value;
-                self.forget_if_scratch_written(scratch_reg);
-                rx86::mov_rb(&mut self.mc, scratch_reg, o1);
-                rx86::mov_br(&mut self.mc, o2, scratch_reg);
+            // `jump.py _move` stages a memory source through `tmpreg`; a
+            // frame-to-frame move that reaches here goes through r11.
+            (Loc::Frame(_) | Loc::Ebp(_), Loc::Frame(_) | Loc::Ebp(_)) => {
+                self.mc.MOV(scratch, src);
+                self.mc.MOV(dst, scratch);
             }
-            _ => panic!(
-                "parallel move {src:?} -> {dst:?} is outside the RegallocMoves \
-                 operand contract; emitting nothing here would leave the \
-                 destination stale",
-            ),
+            // `mov` -> `MOV(to_loc, from_loc)`: a `FloatImmedLoc` has location
+            // code 'i' like an `ImmedLoc`, so `genop_finish`'s `save_into_mem`
+            // of a ConstFloat stores its bits the same way.
+            _ => self.mc.MOV(dst, src),
         }
     }
 
@@ -11550,16 +9202,7 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             Loc::Reg(r) if r.is_xmm => {
                 dynasm!(self.mc ; .arch x64 ; sub rsp, 8 ; movsd [rsp], Rx(r.value));
             }
-            Loc::Reg(r) => {
-                dynasm!(self.mc ; .arch x64 ; push Rq(r.value));
-            }
-            ebp_loc_pat!(e) => {
-                rx86::push_b(&mut self.mc, e.value);
-            }
-            _ => panic!(
-                "parallel move cannot park {loc:?} on the stack; emitting nothing \
-                 here would leave the matching pop unbalanced",
-            ),
+            _ => self.mc.PUSH(loc),
         }
     }
 
@@ -11569,17 +9212,156 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
             Loc::Reg(r) if r.is_xmm => {
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(r.value), [rsp] ; add rsp, 8);
             }
-            Loc::Reg(r) => {
-                self.forget_if_scratch_written(r.value);
-                dynasm!(self.mc ; .arch x64 ; pop Rq(r.value));
-            }
-            ebp_loc_pat!(e) => {
-                rx86::pop_b(&mut self.mc, e.value);
-            }
-            _ => panic!(
-                "parallel move cannot restore {loc:?} from the stack; emitting \
-                 nothing here would leave the stack pointer shifted",
-            ),
+            _ => self.mc.POP(loc),
         }
+    }
+
+    /// x86/jump.py `_move`. A `ConstFloatLoc` is the one
+    /// `ImmediateAssemblerLocation` that is a memory reference; every caller
+    /// passes a `tmpreg`, so the push/pop arm for `tmpreg is None` has no
+    /// counterpart here.
+    fn _move(&mut self, src: &Loc, dst: &Loc, tmpreg: &Loc) {
+        let mut src = *src;
+        if dst.is_memory_reference() && src.is_memory_reference() {
+            if let Loc::ConstFloat(from) = src {
+                self.regalloc_immedmem2mem(from, dst);
+                return;
+            }
+            self.regalloc_mov(&src, tmpreg);
+            self.mc.forget_scratch_register();
+            src = *tmpreg;
+        }
+        self.regalloc_mov(&src, dst);
+    }
+}
+
+/// x86/regalloc.py `self.assembler`: `RegAlloc.walk_operations` reaches each
+/// op's emitter through these while its register managers still hold the
+/// state of that op.
+impl RegAllocAssembler for Assembler386<'_> {
+    fn regalloc_perform(
+        &mut self,
+        regalloc: &RegAlloc<'_>,
+        op_index: usize,
+        arglocs: &[Loc],
+        result_loc: Option<Loc>,
+        gcmap: Option<usize>,
+    ) {
+        let ops = self.operations;
+        let op = &ops[op_index];
+        if crate::majit_ops_log_enabled() {
+            let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
+            eprintln!(
+                "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
+                op_index,
+                op.opcode,
+                al.join(", "),
+                result_loc
+            );
+        }
+        // Byte offset where this op's code begins: the span from
+        // the last LABEL to the JUMP is one loop iteration, the
+        // window `jit-log-opt` brackets with its `+508:` prefixes.
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        self.pending_malloc_nursery_gcmap = gcmap;
+        let fail_index = self.fail_index;
+        self.genop_list(
+            regalloc,
+            op,
+            op_index,
+            arglocs,
+            result_loc.as_ref(),
+            fail_index,
+            ops,
+        );
+        self.pending_malloc_nursery_gcmap = None;
+    }
+
+    fn regalloc_perform_discard(
+        &mut self,
+        regalloc: &RegAlloc<'_>,
+        op_index: usize,
+        arglocs: &[Loc],
+    ) {
+        let ops = self.operations;
+        let op = &ops[op_index];
+        if crate::majit_ops_log_enabled() {
+            let al: Vec<String> = arglocs.iter().map(|l| format!("{l:?}")).collect();
+            eprintln!(
+                "[dynasm] discard[{}]: {:?} args=[{}]",
+                op_index,
+                op.opcode,
+                al.join(", ")
+            );
+        }
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        let fail_index = self.fail_index;
+        self.genop_list(regalloc, op, op_index, arglocs, None, fail_index, ops);
+        if op.opcode.is_guard() || op.opcode == OpCode::Finish {
+            self.fail_index += 1;
+        }
+    }
+
+    fn regalloc_perform_guard(
+        &mut self,
+        _regalloc: &RegAlloc<'_>,
+        op_index: usize,
+        faillocs: &[Option<Loc>],
+        arglocs: &[Loc],
+        result_loc: Option<Loc>,
+        frame_depth: usize,
+    ) {
+        let ops = self.operations;
+        let op = &ops[op_index];
+        if crate::majit_ops_log_enabled() {
+            eprintln!(
+                "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
+                op_index,
+                op.opcode,
+                arglocs
+                    .iter()
+                    .map(|l| format!("{:?}", l))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                faillocs.len()
+            );
+        }
+        // A guard owns bytes like any other op, so it opens its
+        // own span. Without this line the guard's code is read as
+        // part of the preceding op's span and every span after the
+        // trace's first guard names the wrong operation.
+        if crate::majit_dump_enabled() {
+            eprintln!(
+                "[dynasm] @{:#06x} op[{}] {:?}",
+                self.mc.offset().0,
+                op_index,
+                op.opcode
+            );
+        }
+        let fail_index = self.fail_index;
+        self.genop_guard_list(
+            op,
+            op_index,
+            arglocs,
+            result_loc.as_ref(),
+            faillocs,
+            fail_index,
+            frame_depth,
+        );
+        self.fail_index += 1;
     }
 }

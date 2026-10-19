@@ -544,6 +544,13 @@ pub(crate) fn mov_si(mc: &mut Assembler, offset: i32, immed: i32) {
     writeimm32(mc, immed);
 }
 
+/// `MOV32_si` — `mov dword [rsp + ofs], imm32`. `rex_nw`, no `REX.W`.
+pub(crate) fn mov32_si(mc: &mut Assembler, offset: i32, immed: i32) {
+    DynasmApi::push(mc, 0xC7);
+    encode_stack_sp(mc, offset, 0);
+    writeimm32(mc, immed);
+}
+
 /// `MOV32_bi` — `mov dword [rbp + ofs], imm32`. `rex_nw`, no `REX.W`.
 pub(crate) fn mov32_bi(mc: &mut Assembler, offset: i32, immed: i32) {
     DynasmApi::push(mc, 0xC7);
@@ -894,6 +901,53 @@ pub fn test8_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
     writeimm8(mc, immed);
 }
 
+/// `TEST_ri` — `test r64, imm32`.
+pub(crate) fn test_ri(mc: &mut Assembler, reg: u8, immed: i32) {
+    encode_rex(mc, rex_register(reg, 1), REX_W);
+    DynasmApi::push(mc, 0xF7);
+    DynasmApi::push(mc, 0xC0 | reg_number_3bits(reg));
+    writeimm32(mc, immed);
+}
+
+/// `TEST_mi` — `test qword [base + ofs], imm32`.
+pub(crate) fn test_mi(mc: &mut Assembler, mem: (u8, i32), immed: i32) {
+    encode_rex(mc, rex_mem_reg_plus_const(mem), REX_W);
+    DynasmApi::push(mc, 0xF7);
+    encode_m(mc, mem.0, mem.1, 0);
+    writeimm32(mc, immed);
+}
+
+/// `TEST_ai` — `test qword [base + index*scale + ofs], imm32`.
+pub(crate) fn test_ai(mc: &mut Assembler, addr: (i16, u8, u8, i32), immed: i32) {
+    encode_rex(mc, rex_mem_reg_plus_scaled_reg_plus_const(addr), REX_W);
+    DynasmApi::push(mc, 0xF7);
+    encode_mem_reg_plus_scaled_reg_plus_const(mc, addr, 0);
+    writeimm32(mc, immed);
+}
+
+/// `TEST_ji` — `test qword [abs32], imm32`.
+pub(crate) fn test_ji(mc: &mut Assembler, abs_addr: i32, immed: i32) {
+    encode_rex(mc, 0, REX_W);
+    DynasmApi::push(mc, 0xF7);
+    DynasmApi::push(mc, 0x04);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
+    writeimm32(mc, immed);
+}
+
+/// `TEST_bi` — `test qword [rbp + ofs], imm32`.
+pub(crate) fn test_bi(mc: &mut Assembler, offset: i32, immed: i32) {
+    encode_rex(mc, 0, REX_W);
+    DynasmApi::push(mc, 0xF7);
+    encode_stack_bp(mc, offset, false, 0);
+    writeimm32(mc, immed);
+}
+
+/// `TEST_br` — `test qword [rbp + ofs], r64`.
+pub(crate) fn test_br(mc: &mut Assembler, offset: i32, src: u8) {
+    op_bp(mc, RexKind::W, 0, &[0x85], src, offset);
+}
+
 /// `TEST8_ji` — `test byte [abs32], imm8`. `encode_abs`: modrm `0x04`, sib `0x25`, disp32.
 pub fn test8_ji(mc: &mut Assembler, abs_addr: i32, immed: i32) {
     DynasmApi::push(mc, 0xF6);
@@ -969,10 +1023,33 @@ pub(crate) fn mul_b(mc: &mut Assembler, offset: i32) {
     encode_stack_bp(mc, offset, false, 4 << 3);
 }
 
+/// `NOT_b` — `not qword [rbp + ofs]`.
+pub(crate) fn not_b(mc: &mut Assembler, offset: i32) {
+    encode_rex(mc, 0, REX_W);
+    DynasmApi::push(mc, 0xF7);
+    encode_stack_bp(mc, offset, false, 2 << 3);
+}
+
 /// `PUS1_b` — `push qword [rbp + ofs]`.
 pub(crate) fn push_b(mc: &mut Assembler, offset: i32) {
     DynasmApi::push(mc, 0xFF);
     encode_stack_bp(mc, offset, false, 6 << 3);
+}
+
+/// `PUS1_m` — `push qword [base + ofs]`.
+pub(crate) fn push_m(mc: &mut Assembler, mem: (u8, i32)) {
+    encode_rex_opt(mc, rex_mem_reg_plus_const(mem));
+    DynasmApi::push(mc, 0xFF);
+    encode_m(mc, mem.0, mem.1, 6 << 3);
+}
+
+/// `PUS1_j` — `push qword [abs32]`. `encode_abs`: modrm `0x04 | 6<<3`,
+/// sib `0x25`, disp32.
+pub(crate) fn push_j(mc: &mut Assembler, abs_addr: i32) {
+    DynasmApi::push(mc, 0xFF);
+    DynasmApi::push(mc, 0x34);
+    DynasmApi::push(mc, 0x25);
+    writeimm32(mc, abs_addr);
 }
 
 /// `CALL_b` — `call qword [rbp + ofs]`. No REX.W (`rx86.py` `CALL_b`).
@@ -1299,6 +1376,11 @@ pub(crate) fn cvttsd2si_rx(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0xF2, &[0x0F, 0x2C], dst, src);
 }
 
+/// `CVTTSD2SI_rb` — `cvttsd2si r64, [rbp + ofs]`.
+pub(crate) fn cvttsd2si_rb(mc: &mut Assembler, dst: u8, offset: i32) {
+    op_bp(mc, RexKind::W, 0xF2, &[0x0F, 0x2C], dst, offset);
+}
+
 /// `MOVDQ_xr` — `movq xmm, r64`.
 pub(crate) fn movdq_xr(mc: &mut Assembler, dst: u8, src: u8) {
     op_rr(mc, RexKind::W, 0x66, &[0x0F, 0x6E], dst, src);
@@ -1336,6 +1418,41 @@ mod tests {
 
     fn assert_same(got: &[u8], expected: &[u8]) {
         assert_eq!(got, expected, "encoder {got:02x?} dynasm {expected:02x?}");
+    }
+
+    #[test]
+    fn test_not_push_test_memory_forms() {
+        // `NOT_b`, `PUS1_m`, `PUS1_j`, `TEST_ri`/`_mi`/`_ai`/`_ji`/`_bi`/
+        // `_br` and `MOV32_si` against dynasm's encodings.
+        let got = enc(|mc| {
+            not_b(mc, -16);
+            push_m(mc, (R12, 8));
+            push_m(mc, (ECX, 0x1234));
+            push_j(mc, 0x1000);
+            test_ri(mc, R9, 0x7f00_0000);
+            test_mi(mc, (R13, -8), 3);
+            test_ai(mc, (i16::from(EAX), R10, 3, 16), 0x100);
+            test_ji(mc, 0x2000, 5);
+            test_bi(mc, 24, 0x40);
+            test_br(mc, -32, R11);
+            mov32_si(mc, 8, -1);
+        });
+        let mut d = Assembler::new(0);
+        dynasm!(d
+            ; .arch x64
+            ; not QWORD [rbp - 16]
+            ; push QWORD [r12 + 8]
+            ; push QWORD [rcx + 0x1234]
+            ; push QWORD [0x1000]
+            ; test r9, 0x7f00_0000
+            ; test QWORD [r13 - 8], 3
+            ; test QWORD [rax + r10 * 8 + 16], 0x100
+            ; test QWORD [0x2000], 5
+            ; test QWORD [rbp + 24], 0x40
+            ; test QWORD [rbp - 32], r11
+            ; mov DWORD [rsp + 8], -1
+        );
+        assert_same(&got, &finish(d));
     }
 
     #[test]
@@ -1779,6 +1896,22 @@ mod tests {
         let mut d = Assembler::new(0);
         dynasm!(d ; .arch x64 ; movd eax, xmm1 ; movd r8d, xmm1 ; movd eax, xmm9 ; movd r8d, xmm9);
         assert_same(&quad_rx(movd32_rx), &finish(d));
+    }
+
+    #[test]
+    fn cvttsd2si_rb_matches_dynasm() {
+        // `CVTTSD2SI_rb`: `stack_bp` with a disp8 and a disp32.
+        let got = enc(|mc| {
+            cvttsd2si_rb(mc, EAX, 16);
+            cvttsd2si_rb(mc, R8, -0x200);
+        });
+        let mut d = Assembler::new(0);
+        dynasm!(d
+            ; .arch x64
+            ; cvttsd2si rax, QWORD [rbp + 16]
+            ; cvttsd2si r8, QWORD [rbp - 0x200]
+        );
+        assert_same(&got, &finish(d));
     }
 
     #[test]

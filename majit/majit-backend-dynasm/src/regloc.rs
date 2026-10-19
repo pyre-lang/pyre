@@ -87,6 +87,30 @@ impl RawEbpLoc {
     }
 }
 
+/// regloc.py RawEspLoc — RSP-relative memory location: an outgoing call
+/// argument word, or the thread-local slot `THREADLOCAL_OFS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawEspLoc {
+    pub value: i32,
+    pub is_float: bool,
+}
+
+impl RawEspLoc {
+    pub fn new(value: i32, is_float: bool) -> Self {
+        // accessing values < 0 is forbidden on x86-32.
+        assert!(value >= 0, "RawEspLoc({value}) below the stack pointer");
+        RawEspLoc { value, is_float }
+    }
+
+    pub fn location_code(&self) -> LocationCode {
+        LocationCode::Esp
+    }
+
+    pub fn get_width(&self) -> usize {
+        if self.is_float { 8 } else { WORD }
+    }
+}
+
 /// regloc.py FrameLoc — frame slot location (position-aware RawEbpLoc).
 /// `position` is a jitframe slot index; `u32` keeps [`Loc`] in 16 B so
 /// `vec![loc]` does not mint the 24-byte class on every consider_*.
@@ -157,6 +181,7 @@ pub struct AddressLoc {
 pub enum Loc {
     Reg(RegLoc),
     Ebp(RawEbpLoc),
+    Esp(RawEspLoc),
     Frame(FrameLoc),
     Immed(ImmedLoc),
     ImmedFloat(ImmedLoc),
@@ -215,6 +240,15 @@ impl Loc {
     /// backend a memory-to-memory move no machine encodes.
     pub fn is_stack(&self) -> bool {
         matches!(self, Loc::Frame(_) | Loc::Ebp(_))
+    }
+    /// `regloc.py AssemblerLocation.is_memory_reference`: location codes
+    /// `'b'`, `'s'`, `'j'`, `'a'`, `'m'`. A `RawEspLoc` is one, although its
+    /// `is_stack` is False.
+    pub fn is_memory_reference(&self) -> bool {
+        matches!(
+            self,
+            Loc::Frame(_) | Loc::Ebp(_) | Loc::Esp(_) | Loc::ConstFloat(_) | Loc::Addr(_)
+        )
     }
     /// `ImmediateAssemblerLocation`: `ImmedLoc` and `ConstFloatLoc`.
     pub fn is_immed(&self) -> bool {

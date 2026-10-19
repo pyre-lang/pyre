@@ -680,6 +680,17 @@ pub trait GcAllocator: Send {
         );
     }
 
+    /// Whether this allocator is headerless-aware: it serves
+    /// [`Self::alloc_nursery_headerless`], so its nursery may hand out a raw
+    /// base with no `GcHeader`. A backend reads this at compile time before
+    /// it emits an inline headerless bump of `nursery_free`; a headered
+    /// collector answers false and keeps every headerless allocation on its
+    /// helper, whose panicking default is then the only path. An allocator
+    /// whose fixed-size objects are all headerless is aware by definition.
+    fn headerless_nursery(&self) -> bool {
+        self.headerless_fixedsize()
+    }
+
     /// [`Self::alloc_nursery_headerless`] for a caller that cannot survive a
     /// collection: the metainterp's jitcode tracer executes `NEW` while holding
     /// raw object pointers in its own register bank, which is not part of any
