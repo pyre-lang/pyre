@@ -4060,11 +4060,16 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
 /// mints.  Only instantiations whose type arguments are all by-value ADTs
 /// qualify: a reference, raw-pointer or `Box` argument can make the enum a
 /// null-niche pointer, which has no enum class.  A named struct keys as its
-/// class root.  `None` otherwise.
+/// class root — the same intern spelling [`class_root_from_name_path`]
+/// paints, so a residual `prepend` of a withdrawn leaf (`Arguments`)
+/// intern's the crate-relative path and unique-graph `mergeinputargs`
+/// meets the constructor (`annrpython.py` `mergeinputargs`).  `None`
+/// otherwise.
 pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
         crate::front::result_exc::tyref_result_ok(output, llbc)
@@ -4076,14 +4081,14 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let type_args = adt
         .get("generics")
         .and_then(|g| g.get("types"))
         .and_then(serde_json::Value::as_array)?;
     if type_args.is_empty() {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let by_value_args = type_args.iter().all(|arg| {
         strip_ty_indirections(arg, llbc).is_some_and(|arg| {
@@ -4506,6 +4511,23 @@ pub(in crate::front::mir) fn tyref_class_root_with(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
+}
+
+/// A stored fn-ptr argument whose Rust type is a reference or pointer
+/// (or `Option` of one) to a class-backed struct. Those arguments are
+/// `cast_instance_to_base_ptr` at the call site (`annlowlevel.py`).
+pub(in crate::front::mir) fn tyref_is_class_backed_fn_ptr_arg(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc);
+    let inner = payload.as_ref().unwrap_or(ty);
+    let is_ptr = tyref_node(inner, llbc)
+        .and_then(|n| strip_ty_indirections(n, llbc))
+        .and_then(|n| n.as_object())
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"));
+    is_ptr && tyref_class_root_with(inner, llbc, tombstoned).is_some()
 }
 
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`
@@ -6128,7 +6150,7 @@ pub(in crate::front::mir) fn adt_node_class_root_leaf(
         // (`bookkeeper.py` `getuniqueclassdef(cls)`).
         return None;
     }
-    let mut leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    let leaf = class_root_from_name_path(&name, tombstoned);
     // `harden_duplicate_leaf_metadata` clears the origin of a leaf shared
     // by two declarations (`eval::Code` and `module::struct::Code`). The
     // bare token then canonicalises to itself and matches no field row, so
@@ -6139,9 +6161,6 @@ pub(in crate::front::mir) fn adt_node_class_root_leaf(
     // A crate-root declaration (`crate::Code`) strips to the leaf itself.
     // The stripped spelling is the withdrawn token, so paint the full
     // declaration path — the same spelling the constructor joins.
-    if tombstoned.contains(&leaf) {
-        leaf = tombstoned_owner_spelling(&name, &leaf, tombstoned);
-    }
     // A reference-payload workspace enum instantiation projects to a
     // per-instantiation base class (`Result<Tuple>`) so its variant
     // payloads do not union across instantiations.  The discriminant

@@ -7285,17 +7285,12 @@ impl<'a> Lowering<'a> {
         // capture must key the full crate-stripped path the registry
         // kept — the same spelling [`tyref_input_class_root`] uses for
         // the env parameter.
-        // A tombstoned leaf uses the same spelling as
-        // [`adt_node_class_root_with`]: the crate-stripped path, or the
-        // full declaration path when stripping yields the leaf itself.
+        // Owner intern is [`class_root_from_name_path`]: a withdrawn
+        // leaf paints the crate-stripped path, otherwise the leaf.
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
-            let owner_base = if self.tombstoned_leaves.contains(&owner_leaf) {
-                tombstoned_owner_spelling(&name_path, &owner_leaf, self.tombstoned_leaves)
-            } else {
-                owner_leaf
-            };
+            let owner_base = class_root_from_name_path(&name_path, self.tombstoned_leaves);
             match adt_head_instantiation_suffix(head, self.llbc) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
                 None => match struct_instantiation_suffix(&name_path, head, self.llbc) {

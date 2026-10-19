@@ -156,18 +156,17 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///     `gen_cast` helper + the cast-table at `rbuiltin.py+`).
 ///   * rbuiltin.py — `llmemory.*` family (need `Address` /
 ///     `_fakeaddress` ports).  `cast_ptr_to_int` /
-///     `cast_int_to_ptr` (rbuiltin.py/551) are ported —
+///     `cast_int_to_ptr` (rbuiltin.py) are ported —
 ///     frontend `expr as T` for `Ref↔Int` emits `Call { target:
 ///     FunctionPath { segments: ["rpython", "rtyper", "lltypesystem",
 ///     "lltype", "cast_*"], fun_decl_id: None }, args }`, routed through the
 ///     `flowspace_adapter` module-qualified HOST_ENV resolver to
 ///     `BuiltinFunctionRepr.rtype_simple_call → BUILTIN_TYPER →
-///     rtype_cast_ptr_to_int / rtype_cast_int_to_ptr`.  The 2-arg
-///     upstream shape (`simple_call(lltype.cast_int_to_ptr, T_const,
-///     v_int)`) is reduced to a 1-arg call because pyre's surface DSL
-///     has no constant carrier for the target Ptr type; the result
-///     lltype is recovered from `hop.r_result.lowleveltype` (matches
-///     upstream's `resulttype=hop.r_result.lowleveltype`).
+///     rtype_cast_ptr_to_int / rtype_cast_int_to_ptr`.  The adapter
+///     emits the 2-arg `simple_call(lltype.cast_int_to_ptr,
+///     Constant(PTRTYPE), v_int)` shape; `rtype_cast_int_to_ptr`
+///     takes `inputargs(Void, Signed)` and genops only `v_input`
+///     (`rbuiltin.py`).
 ///     TODO: `InstanceRepr→PtrRepr` swap in
 ///     `rtype_cast_ptr_to_int` body awaits typed `&Foo` lift to
 ///     `SomePtr`.
@@ -418,6 +417,13 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "rpython.rtyper.lltypesystem.lltype",
             "cast_pointer",
             rtype_cast_pointer,
+        ),
+        // `CastObjectToPtrEntry.specialize_call` (`annlowlevel.py`)
+        // for the one-arg `cast_instance_to_base_ptr` form.
+        (
+            "rpython.rtyper.annlowlevel",
+            "cast_instance_to_base_ptr",
+            rtype_cast_instance_to_base_ptr,
         ),
         // rbuiltin.py:471-477
         (
@@ -3062,6 +3068,44 @@ pub fn rtype_cast_pointer(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -
     Ok(hop.genop("cast_pointer", vec![v_input], GenopResult::LLType(lltype)))
 }
 
+/// `CastObjectToPtrEntry.specialize_call` (`annlowlevel.py`) for the
+/// one-arg `cast_instance_to_base_ptr` form. `BuiltinFunctionRepr`
+/// has already popped the callable, so `hop.args_r[0]` is the
+/// instance. `NoneRepr` is `lltype.nullptr(PTR.TO)`; any other
+/// argument is `cast_pointer` onto `hop.r_result`.
+pub fn rtype_cast_instance_to_base_ptr(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    hop.exception_cannot_occur()?;
+    let r_arg = arg_repr(hop, 0)?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_cast_instance_to_base_ptr: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
+    if r_arg.repr_class_id() == ReprClassId::NoneRepr {
+        let LowLevelType::Ptr(ptr) = &lltype else {
+            return Err(TyperError::message(format!(
+                "rtype_cast_instance_to_base_ptr: result is not a Ptr, got {lltype:?}"
+            )));
+        };
+        return Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(ptr._defl())),
+            lltype,
+        ))));
+    }
+    let v_arg = hop.inputarg(r_arg.as_ref(), 0)?;
+    Ok(hop.genop("cast_pointer", vec![v_arg], GenopResult::LLType(lltype)))
+}
+
 /// RPython `_cast_to_Signed` table (rbuiltin.py) — opname that
 /// converts a primitive `t` value to lltype.Signed. `None` means
 /// "already Signed, no-op". Returns `None` outright for primitives
@@ -4905,33 +4949,47 @@ pub fn rtype_same_as(hop: &HighLevelOp) -> RTypeResult {
 /// Upstream takes a 2-arg `simple_call(lltype.cast_int_to_ptr, T,
 /// v_int)` shape — `args_s[0]` is the constant target type `T`
 /// (Void-typed at LL, just a marker) and `args_s[1]` is the
-/// integer value.  Upstream `rtype_cast_int_to_ptr` then calls
-/// `hop.inputargs(lltype.Void, lltype.Signed)` (rbuiltin.py)
-/// — two formal inputs.
-///
-/// `rffi.cast` emits the 2-arg form when the frontend has `CArrayPtr`.
-/// `Int → Ref` casts still emit 1-arg; that path takes a single
-/// `Signed` inputarg and recovers the Ptr from `hop.r_result.lowleveltype`.
+/// integer value.  `rtype_cast_int_to_ptr` then calls
+/// `hop.inputargs(lltype.Void, lltype.Signed)` (`rbuiltin.py`)
+/// and genops only `v_input`.
 pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
     use crate::translator::rtyper::rtyper::{ConvertedTo, GenopResult};
 
-    let r_result = hop
-        .r_result
-        .borrow()
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| TyperError::message("rtype_cast_int_to_ptr: missing r_result"))?;
-    let result_lltype = r_result.lowleveltype().clone();
-    // Upstream `inputargs(lltype.Void, lltype.Signed)` then genops only
-    // `v_input`. The type marker has no runtime value; take the integer
-    // operand (arg 1 of the 2-arg form, arg 0 of the 1-arg form).
-    let int_arg = if hop.nb_args() == 2 { 1 } else { 0 };
-    let v_input = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), int_arg)?;
+    {
+        let args_s = hop.args_s.borrow();
+        let s0 = args_s.first().ok_or_else(|| {
+            TyperError::message("rtype_cast_int_to_ptr: hop.args_s[0] missing".to_string())
+        })?;
+        if !s0.is_constant() {
+            return Err(TyperError::message(
+                "rtype_cast_int_to_ptr: hop.args_s[0] must be a constant".to_string(),
+            ));
+        }
+    }
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::LowLevelType(&LowLevelType::Void),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
     hop.exception_cannot_occur()?;
+    let v_input = vlist
+        .into_iter()
+        .nth(1)
+        .ok_or_else(|| TyperError::message("rtype_cast_int_to_ptr: missing v_input".to_string()))?;
+    let lltype = {
+        let r_result_borrow = hop.r_result.borrow();
+        r_result_borrow
+            .as_ref()
+            .ok_or_else(|| {
+                TyperError::message("rtype_cast_int_to_ptr: r_result missing".to_string())
+            })?
+            .lowleveltype()
+            .clone()
+    };
     Ok(hop.genop(
         "cast_int_to_ptr",
         vec![v_input],
-        GenopResult::LLType(result_lltype),
+        GenopResult::LLType(lltype),
     ))
 }
 
@@ -5187,6 +5245,10 @@ mod tests {
     fn host_bltin(name: &str) -> HostObject {
         HostObject::new_builtin_callable(name)
     }
+
+    /// Serializes tests that read or write the process-global
+    /// [`SWAP_FALLBACK_HITS`] counter.
+    static SWAP_FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn builtin_function_repr_has_void_lowleveltype() {
@@ -7068,6 +7130,9 @@ mod tests {
         // process-global; reset before observing so cross-test bleed
         // is excluded.  Subsequent increments through the public
         // `SWAP_FALLBACK_HITS` atomic surface in the reader.
+        let _lock = SWAP_FALLBACK_TEST_LOCK
+            .lock()
+            .expect("swap fallback test lock");
         reset_swap_fallback_hits();
         assert_eq!(swap_fallback_hits(), 0);
         SWAP_FALLBACK_HITS.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
@@ -7158,6 +7223,120 @@ mod tests {
         assert_eq!(called.concretetype(), Some(OBJECTPTR.clone()));
         assert_eq!(ops.ops[2].opname, "cast_pointer");
         assert_eq!(ops.ops[2].result, out);
+    }
+
+    #[test]
+    fn rtype_cast_instance_to_base_ptr_none_is_nullptr_constant() {
+        use crate::annotator::model::s_none;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+        use crate::translator::rtyper::rnone::none_repr;
+
+        let hop = dummy_hop();
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            )));
+        hop.args_s.borrow_mut().push(s_none());
+        hop.args_r
+            .borrow_mut()
+            .push(Some(none_repr() as std::sync::Arc<dyn Repr>));
+        let objectptr = OBJECTPTR.clone();
+        let LowLevelType::Ptr(ptr) = &objectptr else {
+            panic!("OBJECTPTR must be a Ptr");
+        };
+        *hop.r_result.borrow_mut() =
+            Some(std::sync::Arc::new(PtrRepr::new((**ptr).clone())) as std::sync::Arc<dyn Repr>);
+
+        let out = rtype_cast_instance_to_base_ptr(&hop, &HashMap::new())
+            .expect("NoneRepr arm")
+            .expect("null LLPtr constant");
+        let Hlvalue::Constant(c) = out else {
+            panic!("NoneRepr arm returns hop.inputconst(PTR, nullptr), got {out:?}");
+        };
+        assert_eq!(c.concretetype, Some(objectptr.clone()));
+        let ConstValue::LLPtr(got) = &c.value else {
+            panic!("NoneRepr arm is an LLPtr constant, got {:?}", c.value);
+        };
+        assert_eq!(**got, ptr._defl());
+        assert!(
+            hop.llops.borrow().ops.is_empty(),
+            "NoneRepr arm emits no cast_pointer"
+        );
+    }
+
+    #[test]
+    fn rtype_cast_instance_to_base_ptr_instance_emits_cast_pointer() {
+        use crate::annotator::classdesc::ClassDesc;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::SomeInstance;
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rclass::{Flavor, OBJECTPTR, getinstancerepr};
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::SpaceOperation;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        let host = HostObject::new_class("CastInstToBasePtrArg", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let DescEntry::Class(class_rc) = &entry else {
+            panic!("expected Class desc");
+        };
+        let classdef = ClassDesc::getuniqueclassdef(class_rc).unwrap();
+        let inst_repr =
+            getinstancerepr(&hop.rtyper, Some(&classdef), Flavor::Gc).expect("instance repr");
+        Repr::setup(inst_repr.as_ref()).expect("setup instance");
+        let v_inst = Variable::new();
+        v_inst.set_concretetype(Some(inst_repr.lowleveltype().clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_inst));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                Default::default(),
+            )));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(inst_repr as std::sync::Arc<dyn Repr>));
+        let objectptr = OBJECTPTR.clone();
+        let LowLevelType::Ptr(ptr) = &objectptr else {
+            panic!("OBJECTPTR must be a Ptr");
+        };
+        *hop.r_result.borrow_mut() =
+            Some(std::sync::Arc::new(PtrRepr::new((**ptr).clone())) as std::sync::Arc<dyn Repr>);
+
+        let out = rtype_cast_instance_to_base_ptr(&hop, &HashMap::new())
+            .expect("instance arm")
+            .expect("cast_pointer result");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "cast_pointer"),
+            "instance argument rtypes as cast_pointer, ops={:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        assert_eq!(ops.ops.last().map(|op| op.result.clone()), Some(out));
     }
 
     #[test]
@@ -7268,6 +7447,9 @@ mod tests {
         use crate::flowspace::model::{Hlvalue, Variable};
         use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
 
+        let _lock = SWAP_FALLBACK_TEST_LOCK
+            .lock()
+            .expect("swap fallback test lock");
         let hop = dummy_hop();
         hop.rtyper
             .initialize_exceptiondata()
@@ -7306,6 +7488,9 @@ mod tests {
         use crate::flowspace::model::{Hlvalue, Variable};
         use majit_ir::rvec::VecItemKind;
 
+        let _lock = SWAP_FALLBACK_TEST_LOCK
+            .lock()
+            .expect("swap fallback test lock");
         reset_swap_fallback_hits();
         let hop = dummy_hop();
         hop.rtyper

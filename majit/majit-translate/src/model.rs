@@ -2291,6 +2291,24 @@ pub fn cast_instance_root(kind: &OpKind) -> Option<&str> {
     }
 }
 
+/// `cast_instance_to_base_ptr(instance)` (`annlowlevel.py`).
+///
+/// A stored fn-ptr call whose argument is a class-backed instance
+/// emits this before `simple_call` of the pointer, so `SomePtr.call`
+/// sees `SomePtr(OBJECTPTR)` rather than `SomeInstance`.
+pub fn cast_instance_to_base_ptr_call(operand: crate::flowspace::model::Variable) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "annlowlevel",
+            "cast_instance_to_base_ptr",
+        ]),
+        args: call_args(vec![operand]),
+        result_ty: ValueType::Ref(None),
+    }
+}
+
 /// `cast_pointer(PTRTYPE, ptr)` marker (`lltype.py cast_pointer`).
 /// The target class is a trailing `ByteStr` Constant; the adapter
 /// interns it through the bookkeeper.

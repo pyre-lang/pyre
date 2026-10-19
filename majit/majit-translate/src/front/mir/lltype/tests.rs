@@ -2306,6 +2306,151 @@ fn tombstoned_duplicate_leaf_paints_the_declaration_path() {
     );
 }
 
+/// `argument::Arguments` and `nodes::Arguments` share a leaf, so
+/// `harden_duplicate_leaf_metadata` empties the origin. Intern paint
+/// then uses the crate-stripped path (`class_root_from_name_path`)
+/// instead of minting a second ClassDef from the bare token beside
+/// the constructor's crate-relative key. Unique leaves stay the leaf.
+/// Field type strings stay the leaf so layout keys such as
+/// `*mut PyObject` keep matching.
+#[test]
+fn colliding_arguments_paints_crate_relative_identity() {
+    let span = || {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    };
+    let item_meta = |segs: &[&str]| {
+        serde_json::json!({
+            "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": true
+        })
+    };
+    let adt = |def_id: u64, hash: u64| {
+        serde_json::json!({"Value": [hash, {
+            "Adt": {
+                "id": def_id,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }]})
+    };
+    let field = |name: &str| {
+        serde_json::json!({
+            "name": name,
+            "ty": {"Scalar": "Bool"},
+            "attr_info": null
+        })
+    };
+    let interpreter_args = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["pyre_interpreter", "argument", "Arguments"]),
+        "kind": {"Struct": [field("arguments_w")]}
+    });
+    let ruff_args = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["ruff_python_ast", "nodes", "Arguments"]),
+        "kind": {"Struct": [field("range")]}
+    });
+    let opcode = serde_json::json!({
+        "def_id": 2,
+        "item_meta": item_meta(&["fixture", "Opcode"]),
+        "kind": {"Struct": [field("code")]}
+    });
+    let string = serde_json::json!({
+        "def_id": 3,
+        "item_meta": item_meta(&["alloc", "string", "String"]),
+        "kind": {"Struct": [field("vec")]}
+    });
+    let object_root = serde_json::json!({
+        "def_id": 4,
+        "item_meta": item_meta(&["pyre_object", "pyobject", "PyObject"]),
+        "kind": {"Struct": [field("ob_type")]}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "pyre_interpreter",
+            "type_decls": [interpreter_args, ruff_args, opcode, string, object_root],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let interp_ty = serde_json::from_value::<TyRef>(adt(0, 40)).expect("interpreter Arguments");
+    let ruff_ty = serde_json::from_value::<TyRef>(adt(1, 41)).expect("ruff Arguments");
+    let opcode_ty = serde_json::from_value::<TyRef>(adt(2, 42)).expect("Opcode");
+    let string_ty = serde_json::from_value::<TyRef>(adt(3, 43)).expect("String");
+    let object_ty = serde_json::from_value::<TyRef>(adt(4, 44)).expect("PyObject");
+    let tombstoned = super::tombstoned_leaves_of(&llbc);
+    assert!(tombstoned.contains("Arguments"));
+    assert_eq!(
+        super::tyref_class_root_with(&interp_ty, &llbc, &tombstoned).as_deref(),
+        Some("argument::Arguments")
+    );
+    assert_eq!(
+        super::tyref_class_root_with(&ruff_ty, &llbc, &tombstoned).as_deref(),
+        Some("nodes::Arguments")
+    );
+    assert_eq!(super::tyref_to_ast_string(&interp_ty, &llbc), "Arguments");
+    assert_eq!(super::tyref_to_ast_string(&ruff_ty, &llbc), "Arguments");
+    assert_eq!(
+        super::tyref_class_root(&opcode_ty, &llbc).as_deref(),
+        Some("Opcode"),
+        "a unique two-segment type keeps the leaf intern key"
+    );
+    assert_eq!(
+        super::tyref_class_root(&string_ty, &llbc).as_deref(),
+        Some("String")
+    );
+    assert_eq!(super::tyref_to_ast_string(&string_ty, &llbc), "String");
+    assert_eq!(
+        super::tyref_class_root(&object_ty, &llbc).as_deref(),
+        Some("PyObject"),
+        "a unique three-segment type keeps the leaf intern key"
+    );
+    assert_eq!(super::tyref_to_ast_string(&object_ty, &llbc), "PyObject");
+    assert_eq!(
+        super::dont_look_inside_return_class_root(
+            &interp_ty,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &tombstoned
+        )
+        .as_deref(),
+        Some("argument::Arguments"),
+        "a residual returning Arguments intern's the crate-relative path"
+    );
+    assert_eq!(
+        super::dont_look_inside_return_class_root(
+            &object_ty,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &tombstoned
+        )
+        .as_deref(),
+        Some("PyObject"),
+        "a unique residual return keeps the leaf intern key"
+    );
+}
+
 /// `rclass.InstanceRepr._setup_repr` declares a subclass as
 /// `MkStruct(name, ('super', rbase.object_type), *llfields)`, so
 /// `heaptracker.all_fielddescrs` walks the embedded base first and the

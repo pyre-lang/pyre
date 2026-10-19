@@ -4644,6 +4644,28 @@ fn tombstoned_owner_spelling(
     }
 }
 
+/// Intern spelling of a type declaration path.
+///
+/// A withdrawn leaf (`harden_duplicate_leaf_metadata` emptied its origin)
+/// paints the crate-stripped path, so intern matches the constructor's
+/// crate-relative key (`synthetic_transparent_ctor_owner`) instead of
+/// minting a second ClassDef from the bare token. Unique leaves stay the
+/// leaf: Input.class_root and cast constants are compared as those
+/// tokens (`== Some("PyObject")`). Disambiguate a colliding leaf by that
+/// path, never by leaf name alone (`bookkeeper.py` keys the live class
+/// object).
+fn class_root_from_name_path(
+    name_path: &str,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
+    if tombstoned.contains(leaf) {
+        tombstoned_owner_spelling(name_path, leaf, tombstoned)
+    } else {
+        leaf.to_string()
+    }
+}
+
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
 pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
     DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
@@ -5531,6 +5553,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &fd.signature.output,
             llbc,
             static_addrs.error_carrier,
+            tombstoned_leaves,
         );
         lo.graph.return_is_str =
             dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);

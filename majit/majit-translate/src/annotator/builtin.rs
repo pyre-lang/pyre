@@ -59,6 +59,8 @@ use super::model::{
     SomeUnicodeString, SomeValue, SomeWeakRef, s_impossible_value, s_none, union, unionof,
 };
 use crate::flowspace::model::ConstValue;
+use crate::translator::rtyper::llannotation::lltype_to_annotation;
+use crate::translator::rtyper::rclass::OBJECTPTR;
 
 // Registry.
 
@@ -302,6 +304,14 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // lltype HOST_ENV module assigns (`flowspace/model.rs`'s
     // `bootstrap_std_modules`).
     analyzer_for(&mut reg, "lltype.cast_pointer", lltype_cast_pointer);
+    // `CastObjectToPtrEntry` (`annlowlevel.py`). Stored fn-ptr call
+    // sites emit `cast_instance_to_base_ptr` after the front end wraps
+    // a class-backed argument, including a null instance.
+    analyzer_for(
+        &mut reg,
+        "annlowlevel.cast_instance_to_base_ptr",
+        cast_instance_to_base_ptr,
+    );
     // `pyre_object::lltype::malloc[_typed]` — GC allocation intrinsics.
     // Keyed by the qualname the HOST_ENV `pyre_object.lltype` module assigns
     // (`flowspace/model.rs`); recognising it as a builtin keeps its body out
@@ -2812,41 +2822,38 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
 ///     return SomePtr(ll_ptrtype=PtrT.const)
 /// ```
 ///
-/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`) emits the 2-arg
-/// form with `PtrT` a `ConstValue::LowLevelType` of that array
-/// pointer. `getkind` of a raw `Ptr` is Signed (`history.py`
-/// `TYPE.TO._gckind == 'raw'`). The 1-arg `Int → Ref` lowering still
-/// has no concrete Ptr and keeps the Gc-Opaque placeholder; a gc
-/// opaque would kind as GcRef.
+/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`) and the adapter's
+/// unary leftover both emit the 2-arg form with `PtrT` a
+/// `ConstValue::LowLevelType`. `getkind` of a raw `Ptr` is Signed
+/// (`history.py` `TYPE.TO._gckind == 'raw'`).
 fn lltype_cast_int_to_ptr(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, OpaqueType, Ptr, SomePtr};
-    if args_s.len() == 2 {
-        let s_ptrt = arg_at(args_s, 0, "lltype.cast_int_to_ptr");
-        if !s_ptrt.is_constant() {
-            return Err(AnnotatorError::new(
-                "ann_cast_int_to_ptr: PtrT is not constant",
-            ));
-        }
-        let Some(ConstValue::LowLevelType(ll)) = s_ptrt.const_() else {
-            return Err(AnnotatorError::new(
-                "ann_cast_int_to_ptr: PtrT.const is not a LowLevelType",
-            ));
-        };
-        let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
-            return Err(AnnotatorError::new(
-                "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
-            ));
-        };
-        return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+    if args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: expected (PtrT, s_int)",
+        ));
     }
-    let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-    let placeholder_ptr = Ptr::from_container_type(LowLevelType::Opaque(Box::new(opaque)))
-        .expect("Opaque container yields a valid Ptr");
-    Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
+    let s_ptrt = arg_at(args_s, 0, "lltype.cast_int_to_ptr");
+    if !s_ptrt.is_constant() {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: PtrT is not constant",
+        ));
+    }
+    let Some(ConstValue::LowLevelType(ll)) = s_ptrt.const_() else {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: PtrT.const is not a LowLevelType",
+        ));
+    };
+    let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
+        ));
+    };
+    Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())))
 }
 
 /// `ForceCastEntry.compute_result_annotation` (`ll2ctypes.py`):
@@ -2979,6 +2986,23 @@ fn lltype_cast_pointer(
         can_be_none,
         Default::default(),
     )))
+}
+
+/// `CastObjectToPtrEntry.compute_result_annotation` (`annlowlevel.py`)
+/// for `cast_instance_to_base_ptr(instance)` → `SomePtr(OBJECTPTR)`.
+/// The instance argument is ignored, including `s_None`.
+fn cast_instance_to_base_ptr(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "cast_instance_to_base_ptr() expects one positional argument",
+        ));
+    }
+    let _ = arg_at(args_s, 0, "cast_instance_to_base_ptr");
+    Ok(lltype_to_annotation(OBJECTPTR.clone()))
 }
 
 /// Analyzer for `pyre_object::lltype::malloc[_typed]::<T>(value: T) -> *mut T`
@@ -3487,6 +3511,16 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    #[test]
+    fn rbuiltin_cast_instance_to_base_ptr_analyzer_accepts_s_none() {
+        let out = super::cast_instance_to_base_ptr(&bk(), &[Some(s_none())], &HashMap::new())
+            .expect("compute_result_annotation ignores s_object, including s_None");
+        assert!(
+            matches!(out, SomeValue::Ptr(_)),
+            "cast_instance_to_base_ptr(None) annotates as SomePtr(OBJECTPTR), got {out:?}"
+        );
     }
 
     /// `Option<fn>`'s null and a `fn` field read are one `SomePtr`.
@@ -6015,6 +6049,17 @@ mod tests {
         let added = lltype_direct_ptradd(&bk(), &[Some(out.clone()), Some(s_n)], &no_kwds())
             .expect("ann_direct_ptradd of CArrayPtr");
         assert_eq!(added, out);
+    }
+
+    #[test]
+    fn ann_cast_int_to_ptr_rejects_one_arg() {
+        let s_int = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let err = lltype_cast_int_to_ptr(&bk(), &[Some(s_int)], &no_kwds())
+            .expect_err("ann_cast_int_to_ptr is (PtrT, s_int)");
+        assert!(
+            err.to_string().contains("expected (PtrT, s_int)"),
+            "got {err}"
+        );
     }
 
     #[test]
