@@ -11240,10 +11240,10 @@ mod tests {
     fn build_state_field_snapshot_reads_constants_from_liveness() {
         let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
         let mut builder = JitCodeBuilder::new();
-        // Wider than a signed byte so it takes a `constants_i` slot rather
-        // than `int_copy`'s inline `USE_C_FORM` encoding — the pool read is
-        // what this test covers.
-        builder.load_const_i_value(0, 1000);
+        // Wider than u16 so it takes a `constants_i` slot rather than
+        // `int_copy`'s inline `c`/`d` encoding — the pool read is what
+        // this test covers.
+        builder.load_const_i_value(0, 70_000);
         let const_slot = 1u8;
         builder.live(&mut asm, &[const_slot], &[], &[]);
         let pc = builder.current_pos();
@@ -11265,7 +11265,7 @@ mod tests {
         assert_eq!(
             f.boxes,
             vec![crate::recorder::SnapshotTagged::Const(
-                1000,
+                70_000,
                 majit_ir::Type::Int
             )]
         );

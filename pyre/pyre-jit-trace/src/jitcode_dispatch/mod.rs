@@ -9229,9 +9229,9 @@ fn portal_vable_bookkeeping_anchor(
             // The int vable fields are `last_instr` (0) and `valuestackdepth`
             // (2), both reassigned by the rebuild; a non-`VableField` descr is
             // not frame bookkeeping.
-            "setfield_vable_i_imm/rddd" => {
-                // opcode, frame reg, u32 immediate, little-endian descr index.
-                let Some((&lo, &hi)) = code.get(op.pc + 6).zip(code.get(op.pc + 7)) else {
+            "setfield_vable_i_imm/rdd" => {
+                // opcode, frame reg, u16 immediate, little-endian descr index.
+                let Some((&lo, &hi)) = code.get(op.pc + 4).zip(code.get(op.pc + 5)) else {
                     return false;
                 };
                 let descr_index = lo as usize | ((hi as usize) << 8);
@@ -14439,7 +14439,7 @@ fn handle<Sym: WalkSym>(
         // `setfield_vable_i/rid`, `setfield_vable_r/rrd`,
         // `setfield_vable_f/rfd` — value bank differs, no dst byte.
         "setfield_vable_i/rid" => setfield_vable_via_metainterp(code, op, ctx, 'i'),
-        "setfield_vable_i_imm/rddd" => setfield_vable_int_imm(code, op, ctx),
+        "setfield_vable_i_imm/rdd" => setfield_vable_int_imm(code, op, ctx),
         "setfield_vable_r/rrd" => setfield_vable_via_metainterp(code, op, ctx, 'r'),
         "setfield_vable_f/rfd" => setfield_vable_via_metainterp(code, op, ctx, 'f'),
         // Virtualizable array reads/writes + length. RPython
@@ -15352,6 +15352,20 @@ fn handle<Sym: WalkSym>(
             // 1B signed const + 1B dst.
             let value = code[op.pc + 1] as i8 as i64;
             let dst = code[op.pc + 2] as usize;
+            write_int_reg(
+                ctx,
+                op.pc,
+                dst,
+                OpRef::ConstInt(value),
+                ConcreteValue::Int(value),
+            )?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "int_copy/d>i" => {
+            // `int_copy/d>i` — u16 immediate source. Same ConstInt dst
+            // as the `c` form so a portal merge green stays a Const.
+            let value = u16::from_le_bytes([code[op.pc + 1], code[op.pc + 2]]) as i64;
+            let dst = code[op.pc + 3] as usize;
             write_int_reg(
                 ctx,
                 op.pc,

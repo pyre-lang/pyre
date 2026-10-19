@@ -9190,7 +9190,7 @@ impl CodeWriter {
                     // coordinate `skip_python_trivia_forward` names. Trivia units
                     // (`Cache` / `ExtendedArg` / `NotTaken` / `Resume` / `Nop`) are
                     // not instruction starts. The immediate is inline
-                    // (`setfield_vable_i_imm/rddd`) so a per-instruction constant
+                    // (`setfield_vable_i_imm/rdd`) so a per-instruction constant
                     // does not consume a `constants_i` slot
                     // (`assembler.py` `check_result`).
                     {

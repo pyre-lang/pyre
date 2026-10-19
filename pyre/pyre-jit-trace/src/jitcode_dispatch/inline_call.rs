@@ -1672,6 +1672,10 @@ fn known_int_result(
             .and_then(|value| i64::try_from(value).ok()),
         "int_copy/i>i" => int(0),
         "int_copy/c>i" => immediate(0),
+        "int_copy/d>i" => code
+            .get(op.pc + 1)
+            .zip(code.get(op.pc + 2))
+            .map(|(&lo, &hi)| u16::from_le_bytes([lo, hi]) as i64),
         "int_add/ii>i" => Some(int(0)?.wrapping_add(int(1)?)),
         "int_sub/ii>i" => Some(int(0)?.wrapping_sub(int(1)?)),
         "int_mul/ii>i" => Some(int(0)?.wrapping_mul(int(1)?)),

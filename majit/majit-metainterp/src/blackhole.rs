@@ -2003,6 +2003,17 @@ impl BlackholeInterpreter {
                         position += 2;
                         continue;
                     }
+                    jitcode::insns::BC_MOVE_I_D => {
+                        unsafe {
+                            let src = u16::from_le_bytes([
+                                *code.get_unchecked(position),
+                                *code.get_unchecked(position + 1),
+                            ]) as i64;
+                            *regs_i.add(*code.get_unchecked(position + 2) as usize) = src;
+                        }
+                        position += 3;
+                        continue;
+                    }
                     jitcode::insns::BC_GETFIELD_GC_I | jitcode::insns::BC_GETFIELD_GC_I_PURE => {
                         unsafe {
                             let struct_ptr = *regs_r.add(*code.get_unchecked(position) as usize);
@@ -4473,6 +4484,7 @@ mod tests {
             // `load_const_i_value` picks the `USE_C_FORM` short encoding for
             // byte-sized constants, so both `int_copy` variants must be wired.
             entries.insert("int_copy/c>i".to_string(), insns::BC_MOVE_I_C);
+            entries.insert("int_copy/d>i".to_string(), insns::BC_MOVE_I_D);
             entries.insert("ref_copy/r>r".to_string(), insns::BC_MOVE_R);
             entries.insert("int_add/ii>i".to_string(), insns::BC_INT_ADD);
             entries.insert("int_mul/ii>i".to_string(), insns::BC_INT_MUL);
@@ -4751,12 +4763,14 @@ mod tests {
         fn setposition_ref_copies_constants_when_the_jitcode_changes() {
             let mut first = JitCodeBuilder::default();
             first.ensure_i_regs(1);
-            first.load_const_i_value(0, 0x1111);
+            // Wider than u16 so `load_const_i_value` still pools; the
+            // copy_constants window is what this test covers.
+            first.load_const_i_value(0, 0x11111);
             first.int_return(0);
             let first = std::sync::Arc::new(first.finish());
             let mut second = JitCodeBuilder::default();
             second.ensure_i_regs(1);
-            second.load_const_i_value(0, 0x2222);
+            second.load_const_i_value(0, 0x22222);
             second.int_return(0);
             let second = std::sync::Arc::new(second.finish());
             let first_slot = first.num_regs_i();
@@ -4764,9 +4778,9 @@ mod tests {
             let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             bh.setposition_ref(&first, 0);
-            assert_eq!(bh.registers_i[first_slot], 0x1111);
+            assert_eq!(bh.registers_i[first_slot], 0x11111);
             bh.setposition_ref(&second, 0);
-            assert_eq!(bh.registers_i[second_slot], 0x2222);
+            assert_eq!(bh.registers_i[second_slot], 0x22222);
         }
 
         /// A drained interpreter whose `jitcode` is unchanged must still
@@ -8123,6 +8137,18 @@ fn handler_int_copy_c(
     Ok(position + 2)
 }
 
+/// `int_copy/d>i` — u16 immediate source. Same identity `bhimpl_int_copy`
+/// as the `c` form; the operand is two little-endian bytes then dest.
+fn handler_int_copy_d(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    position: usize,
+) -> Result<usize, DispatchError> {
+    let a = u16::from_le_bytes([code[position], code[position + 1]]) as i64;
+    bh.registers_i[code[position + 2] as usize] = a;
+    Ok(position + 3)
+}
+
 /// blackhole.py `bhimpl_ref_copy(a): return a` — @arguments("r", returns="r").
 fn bhimpl_ref_copy(a: i64) -> i64 {
     a
@@ -10657,6 +10683,10 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         "int_copy/c>i".to_string(),
         majit_jitcode::insns::BC_MOVE_I_C,
     );
+    insns.insert(
+        "int_copy/d>i".to_string(),
+        majit_jitcode::insns::BC_MOVE_I_D,
+    );
     insns.insert("ref_copy/r>r".to_string(), majit_jitcode::insns::BC_MOVE_R);
     insns.insert(
         "ref_return/r".to_string(),
@@ -11184,7 +11214,7 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         majit_jitcode::insns::BC_SETFIELD_VABLE_I,
     );
     insns.insert(
-        "setfield_vable_i_imm/rddd".to_string(),
+        "setfield_vable_i_imm/rdd".to_string(),
         majit_jitcode::insns::BC_SETFIELD_VABLE_I_IMM,
     );
     insns.insert(
@@ -11686,6 +11716,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_copy/i>i", handler_int_copy);
     // `int_copy/c>i` — USE_C_FORM short-const source (`assembler.py`).
     builder.wire_handler("int_copy/c>i", handler_int_copy_c);
+    builder.wire_handler("int_copy/d>i", handler_int_copy_d);
     // pyre-only abort placeholder emitted by `Assembler::encode_op`'s
     // default branch for `OpKind::Abort { .. }`.
     builder.wire_handler("abort/>i", handler_abort_result_marker_i);
@@ -12076,7 +12107,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getfield_vable_r/rd>r", handler_getfield_vable_r);
     builder.wire_handler("getfield_vable_f/rd>f", handler_getfield_vable_f);
     builder.wire_handler("setfield_vable_i/rid", handler_setfield_vable_i);
-    builder.wire_handler("setfield_vable_i_imm/rddd", handler_setfield_vable_i_imm);
+    builder.wire_handler("setfield_vable_i_imm/rdd", handler_setfield_vable_i_imm);
     builder.wire_handler("setfield_vable_r/rrd", handler_setfield_vable_r);
     builder.wire_handler("setfield_vable_f/rfd", handler_setfield_vable_f);
     builder.wire_handler("getarrayitem_vable_i/ridd>i", handler_getarrayitem_vable_i);
@@ -12707,21 +12738,19 @@ fn handler_setfield_vable_i(
     Ok(p)
 }
 
-/// `setfield_vable_i_imm/rddd`: same `_opimpl_setfield_vable` store as
-/// `handler_setfield_vable_i`, with the int value inline as a u32
-/// (`lo` + `hi`) instead of an `i` register. Layout: 1B base, 2B lo,
-/// 2B hi, 2B `VableField` descr.
+/// `setfield_vable_i_imm/rdd`: same `_opimpl_setfield_vable` store as
+/// `handler_setfield_vable_i`, with the int value inline as a u16
+/// instead of an `i` register. Layout: 1B base, 2B imm, 2B `VableField`
+/// descr.
 fn handler_setfield_vable_i_imm(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let lo = code[p + 1] as u32 | ((code[p + 2] as u32) << 8);
-    let hi = code[p + 3] as u32 | ((code[p + 4] as u32) << 8);
-    let value = (lo | (hi << 16)) as i64;
+    let value = (code[p + 1] as u16 | ((code[p + 2] as u16) << 8)) as i64;
     let (_, struct_ptr) = vable_clear_token_and_get_vinfo(bh, struct_ptr);
-    let (descr, p) = read_descr_vable_field(bh, code, p + 5);
+    let (descr, p) = read_descr_vable_field(bh, code, p + 3);
     let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)

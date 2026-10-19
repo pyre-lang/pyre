@@ -578,6 +578,16 @@ fn insn_key(opname: &str, args: &[Operand], result: Option<&Register>) -> String
         "record_known_result_r_ir_v" => return "record_known_result_r_ir_v/riIRd".to_string(),
         _ => {}
     }
+    if opname == "int_copy" {
+        let src_code = match args.first() {
+            Some(Operand::ConstInt(value)) if (-128..=127).contains(value) => 'c',
+            Some(Operand::ConstInt(value)) if u16::try_from(*value).is_ok() => 'd',
+            Some(Operand::ConstInt(_)) => 'i',
+            Some(Operand::Register(reg)) if reg.kind == Kind::Int => 'i',
+            other => panic!("int_copy: expected Int register or ConstInt, got {other:?}"),
+        };
+        return format!("int_copy/{src_code}>i");
+    }
     if opname == "jit_merge_point" {
         let jdindex_argcode = match args {
             [Operand::ConstInt(value), ..] if (-128..=127).contains(value) => 'c',
@@ -2920,10 +2930,10 @@ mod tests {
     }
 
     #[test]
-    fn assemble_int_copy_from_constant_uses_copy_opcode_and_constant_pool() {
+    fn assemble_int_copy_from_constant_uses_u16_immediate() {
         let mut ssarepr = SSARepr::new("const_copy");
-        // Outside the signed-byte range `assembler.py:101` accepts, so the
-        // value takes a `constants_i` slot and the `i` argcode.
+        // Past the signed-byte short form, inside the u16 jump-target
+        // space: inline immediate, no `constants_i` slot.
         ssarepr.insns.push(Insn::op_with_result(
             "int_copy",
             vec![Operand::ConstInt(4242)],
@@ -2940,9 +2950,39 @@ mod tests {
         );
 
         let copy_opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
+            .get("int_copy/d>i")
+            .expect("int_copy/d>i must be registered in wellknown insns");
+        assert!(jitcode.constants_i.is_empty());
+        assert_eq!(jitcode.code[0], copy_opcode);
+        assert_eq!(jitcode.code[1], (4242u16 & 0xff) as u8);
+        assert_eq!(jitcode.code[2], (4242u16 >> 8) as u8);
+        assert_eq!(jitcode.code[3], 0);
+    }
+
+    #[test]
+    fn assemble_int_copy_from_constant_uses_copy_opcode_and_constant_pool() {
+        let mut ssarepr = SSARepr::new("const_copy_wide");
+        // Outside the u16 immediate range, so the value takes a
+        // `constants_i` slot and the `i` argcode.
+        ssarepr.insns.push(Insn::op_with_result(
+            "int_copy",
+            vec![Operand::ConstInt(70_000)],
+            Register::new(Kind::Int, 0),
+        ));
+
+        let jitcode = assemble(
+            &mut ssarepr,
+            JitCodeBuilder::default(),
+            Some(NumRegs {
+                int: 1,
+                ..NumRegs::default()
+            }),
+        );
+
+        let copy_opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
             .get("int_copy/i>i")
             .expect("int_copy must be registered in wellknown insns");
-        assert_eq!(jitcode.constants_i, vec![4242]);
+        assert_eq!(jitcode.constants_i, vec![70_000]);
         assert_eq!(jitcode.code[0], copy_opcode);
         assert_eq!(jitcode.code[1], 1);
         assert_eq!(jitcode.code[2], 0);

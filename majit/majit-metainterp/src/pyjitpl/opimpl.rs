@@ -197,6 +197,7 @@ where
         table[jitcode::insns::BC_RECORD_KNOWN_RESULT_REF as usize] = Self::opimpl_cond_call_void;
         table[jitcode::insns::BC_MOVE_I as usize] = Self::opimpl_move_i;
         table[jitcode::insns::BC_MOVE_I_C as usize] = Self::opimpl_move_i_c;
+        table[jitcode::insns::BC_MOVE_I_D as usize] = Self::opimpl_move_i_d;
         table[jitcode::insns::BC_CALL_ASSEMBLER_INT as usize] = Self::opimpl_call_assembler_int;
         table[jitcode::insns::BC_MOVE_R as usize] = Self::opimpl_move_r;
         table[jitcode::insns::BC_CALL_ASSEMBLER_REF as usize] = Self::opimpl_call_assembler_ref;
@@ -7764,6 +7765,26 @@ where
         let (value, dst) = {
             let frame = self.frames.current_mut();
             (frame.next_u8() as i8 as i64, frame.next_reg() as usize)
+        };
+        self.set_int_reg(ctx, dst, Some(OpRef::ConstInt(value)), Some(value));
+        TraceAction::Continue
+    }
+
+    // `int_copy/d>i` — u16 immediate source. Operand order `[imm][dst]`
+    // per argcode `d>i`. Writes `ConstInt` so `verify_green_args` sees
+    // a Const at a later `jit_merge_point`.
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_move_i_d(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let (value, dst) = {
+            let frame = self.frames.current_mut();
+            (frame.next_u16() as i64, frame.next_reg() as usize)
         };
         self.set_int_reg(ctx, dst, Some(OpRef::ConstInt(value)), Some(value));
         TraceAction::Continue

@@ -3047,7 +3047,9 @@ impl<S: JitState> JitDriver<S> {
     /// `warmstate.py maybe_compile_and_run` answers this from the cell it
     /// already holds; pyre's u64 door has to look the cell up. A dead
     /// procedure token still belongs to `cleanup_chain`, so it is not
-    /// treated as a ban.
+    /// treated as a ban. `disable_noninlinable_function` retries a
+    /// never-seen-token cell only while `abort_count` is below the ceiling;
+    /// `abort_tracing` stamps `JC_DONT_TRACE_HERE` at the ceiling as a ban.
     #[inline]
     pub fn cell_is_abort_ceiling_banned(&self, green_key: u64) -> bool {
         self.meta
@@ -12563,6 +12565,7 @@ mod tests {
                 .warm_state_for_driver(0)
                 .abort_tracing(key, false);
         }
+        // `abort_tracing` stamps `DONT_TRACE_HERE` at the ceiling as a ban.
         assert!(driver.cell_is_abort_ceiling_banned(key));
 
         let mut state = CountingDoorState::default();

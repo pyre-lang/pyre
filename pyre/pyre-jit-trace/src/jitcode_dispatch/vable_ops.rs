@@ -996,7 +996,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
-/// `setfield_vable_i_imm/rddd`: `_opimpl_setfield_vable` with a u32 immediate
+/// `setfield_vable_i_imm/rdd`: `_opimpl_setfield_vable` with a u16 immediate
 /// instead of an int register. Same standard-vable box update, no recorded
 /// op (`pyjitpl.py` `_opimpl_setfield_vable`).
 pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
@@ -1004,12 +1004,10 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    let lo = code[op.pc + 2] as u32 | ((code[op.pc + 3] as u32) << 8);
-    let hi = code[op.pc + 4] as u32 | ((code[op.pc + 5] as u32) << 8);
-    let imm = (lo | (hi << 16)) as i64;
+    let imm = (code[op.pc + 2] as u16 | ((code[op.pc + 3] as u16) << 8)) as i64;
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
-        let descr = read_descr(code, op, 5, ctx)?;
+        let descr = read_descr(code, op, 3, ctx)?;
         if let (Some(field_index), Some(shadow)) = (
             ctx.trace_ctx
                 .virtualizable_info()
@@ -1027,7 +1025,7 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     if obj.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let descr = read_descr(code, op, 5, ctx)?;
+    let descr = read_descr(code, op, 3, ctx)?;
     let concrete = Some(Value::Int(imm));
     let inline_field_index = ctx
         .trace_ctx
