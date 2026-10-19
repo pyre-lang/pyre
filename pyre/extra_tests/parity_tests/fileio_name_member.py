@@ -1,6 +1,7 @@
 # CPython-suite gap: test_fileio.testRepr covers del name, not assignment.
 # test_linecache keeps closed FileIO objects across minors and later traces
 # w_name; the suite does not assert that slot.
+# test_linecache MultiThreadingTest opens text files from 20 threads; a crash is its only signal.
 # parity-tests reason: interp_fileio.py interp_member_w w_name drives repr.
 # interp_fileio.py descr_init space.setattr(self, "name", w_name) stores a
 # young str on an old rawmalloced FileIO; the original w_name is a livevar,
@@ -82,5 +83,57 @@ def closed_fileio_name_stays_a_live_str_across_minors():
             pass
 
 
+def threaded_text_open_keeps_fileio_name_live():
+    import threading
+    NT = 12
+    ITERS = 40
+    tmpdir = tempfile.mkdtemp()
+    names = []
+    try:
+        for i in range(6):
+            path = os.path.join(tmpdir, "t%d.py" % i)
+            with open(path, "w") as fh:
+                fh.write("import time\nimport system\n")
+            names.append(path)
+        barrier = threading.Barrier(NT)
+        errors = []
+        kept = []
+
+        def worker():
+            barrier.wait()
+            try:
+                for _ in range(ITERS):
+                    for path in names:
+                        with open(path, encoding="utf-8") as fp:
+                            if fp.read() != "import time\nimport system\n":
+                                raise AssertionError(path)
+                            kept.append((fp.buffer.raw, path))
+            except BaseException as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(NT)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
+        gc.collect()
+        for raw, path in kept:
+            if raw.name != path:
+                raise AssertionError((raw.name, path))
+    finally:
+        for path in names:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+
+
 closed_fileio_name_stays_a_live_str_across_minors()
+threaded_text_open_keeps_fileio_name_live()
 print("OK")

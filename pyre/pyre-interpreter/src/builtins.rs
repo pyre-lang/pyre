@@ -26014,7 +26014,6 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let path_roots = pyre_object::gc_roots::push_roots();
     let path_base = path_roots.pin_roots(&[path_obj, opener_obj.unwrap_or(pyre_object::PY_NULL)]);
     let resolved_path = crate::gateway::fsencode_path_w(path_roots.get(path_base));
-    path_obj = path_roots.get(path_base);
     let resolved_path = resolved_path?;
     let path_bytes = &resolved_path.as_bytes;
     // `host_env::fs` takes a `Path`; only the seam consumes the raw bytes.
@@ -26036,7 +26035,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     {
         let flags = open_flags_for_mode(&mode);
         let _opener_roots = pyre_object::gc_roots::push_roots();
-        let path_slot = pyre_object::gc_roots::pin_roots(&[path_obj, opener]);
+        let path_slot = pyre_object::gc_roots::pin_roots(&[path_roots.get(path_base), opener]);
         let flags_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_int_new(flags as i64));
         let fd_obj = crate::call::call_function_impl_result(
@@ -26112,7 +26111,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         };
         let _wrapper_roots = pyre_object::gc_roots::push_roots();
         let path_name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(path_obj);
+        let _ = pyre_object::gc_roots::pin_root(path_roots.get(path_base));
         let wrapper_slot = new_rooted_file_wrapper();
         file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
         file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
@@ -26170,16 +26169,13 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
             }
         };
-        // `_c_set_inheritable` releases the GIL; `path_obj` is live here.
-        if let Err(error) = pyre_object::with_roots!(path_obj => {
-            fileio_set_non_inheritable(fd, resolved_path.w_path())
-        }) {
+        // `_open_fd`, `_c_set_inheritable` and `fstat` release the GIL. `w_name` stays live in the
+        // `path_roots` slot; read it back from there, never from a copy taken before them.
+        if let Err(error) = fileio_set_non_inheritable(fd, resolved_path.w_path()) {
             fileio_close_owned_fd(fd);
             return Err(error);
         }
-        let stat_atopen = match pyre_object::with_roots!(path_obj =>
-            fileio_validate_fd(fd, resolved_path.w_path())
-        ) {
+        let stat_atopen = match fileio_validate_fd(fd, resolved_path.w_path()) {
             Ok(stat) => stat,
             Err(error) => {
                 fileio_close_owned_fd(fd);
@@ -26188,7 +26184,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         };
         let _wrapper_roots = pyre_object::gc_roots::push_roots();
         let path_name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(path_obj);
+        let _ = pyre_object::gc_roots::pin_root(path_roots.get(path_base));
         let wrapper_slot = new_rooted_file_wrapper();
         file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
         file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
@@ -26233,7 +26229,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
         let _wrapper_roots = pyre_object::gc_roots::push_roots();
         let path_name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(path_obj);
+        let _ = pyre_object::gc_roots::pin_root(path_roots.get(path_base));
         let wrapper_slot = new_rooted_file_wrapper();
         file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
         file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new_managed(&mode));
