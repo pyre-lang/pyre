@@ -45768,47 +45768,125 @@ fn inner_global_id(place: &Place) -> u64 {
     }
 }
 
+/// Walk `body` from the entry block following `Goto` only, stopping at
+/// `Return`. Any other terminator, a cleanup block on the path, or a
+/// cycle is `None`.
+fn promoted_const_linear_blocks(body: &Unstructured) -> Option<Vec<&BasicBlock>> {
+    let n = body.body.len();
+    if n == 0 {
+        return None;
+    }
+    let mut blocks = Vec::new();
+    let mut seen = vec![false; n];
+    let mut bb = 0usize;
+    loop {
+        if bb >= n || seen[bb] {
+            return None;
+        }
+        seen[bb] = true;
+        let block = &body.body[bb];
+        if block.is_cleanup {
+            return None;
+        }
+        blocks.push(block);
+        let kind = block.terminator.kind_value();
+        // Charon writes `"Return"` or `{"Return": ...}`; both end the walk.
+        if kind.as_str() == Some("Return")
+            || kind
+                .as_object()
+                .is_some_and(|map| map.contains_key("Return"))
+        {
+            return Some(blocks);
+        }
+        let target = kind.get("Goto").and_then(|g| {
+            g.as_u64()
+                .or_else(|| g.get("target").and_then(serde_json::Value::as_u64))
+        })?;
+        bb = target as usize;
+    }
+}
+
+fn place_is_bare_local(place: &Place, id: u64) -> bool {
+    matches!(place.kind, PlaceKind::Local(got) if got == id)
+}
+
+fn place_is_bare_global(place: &Place) -> bool {
+    matches!(place.kind, PlaceKind::Global { .. })
+}
+
 /// The `Place::Global` a promoted-const initializer copies before returning.
 ///
-/// rustc emits `_1 = copy Global(id); _0 = &_1; return`. Anything richer
-/// (a second global, a call, a switch) is not this wrapper.
+/// `flowspace/flowcontext.py` `find_global` / `LOAD_GLOBAL` fold a
+/// module-global read to `const(value)` — the value folded is exactly
+/// the read value. rustc emits either `_1 = copy Global(id); _0 = &_1;
+/// return` or `_0 = copy Global(id); return`. A field projection on the
+/// returned local, a local-to-local copy chain, or a global copied only
+/// in an unreachable block is not that fold. `resolve_place` does not
+/// extract a field from a projected global (the fallback resolves the
+/// inner Global), so the copied place must be a bare `PlaceKind::Global`.
 fn promoted_const_copied_global(body: &Unstructured) -> Option<Place> {
-    let mut copied: Option<Place> = None;
-    for block in &body.body {
-        if block.is_cleanup {
-            continue;
-        }
+    let blocks = promoted_const_linear_blocks(body)?;
+    let mut copied: Option<(u64, Place)> = None;
+    let mut returned_ref: Option<u64> = None;
+    let mut copied_to_ret: Option<Place> = None;
+    for block in blocks {
         for stmt in &block.statements {
             match stmt.stmt_kind_ref().ok()? {
                 StmtKind::StorageLive(_)
                 | StmtKind::StorageDead(_)
                 | StmtKind::PlaceMention(_)
                 | StmtKind::Borrowck(_) => {}
-                StmtKind::Assign(_, rvalue) => match rvalue {
-                    Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) => {
-                        if matches!(place.kind, PlaceKind::Global { .. }) {
-                            if copied.is_some() {
+                StmtKind::Assign(place, rvalue) => match rvalue {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                        if !place_is_bare_global(src) {
+                            return None;
+                        }
+                        let PlaceKind::Local(dst) = place.kind else {
+                            return None;
+                        };
+                        if dst == 0 {
+                            if copied.is_some() || copied_to_ret.is_some() || returned_ref.is_some()
+                            {
                                 return None;
                             }
-                            copied = Some(clone_place(place));
+                            copied_to_ret = Some(clone_place(src));
+                        } else {
+                            if copied.is_some() || copied_to_ret.is_some() {
+                                return None;
+                            }
+                            copied = Some((dst, clone_place(src)));
                         }
                     }
-                    Rvalue::Ref { .. } | Rvalue::RawPtr { .. } => {}
+                    Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                        if !place_is_bare_local(place, 0) {
+                            return None;
+                        }
+                        let PlaceKind::Local(k) = src.kind else {
+                            return None;
+                        };
+                        if k == 0 || returned_ref.is_some() || copied_to_ret.is_some() {
+                            return None;
+                        }
+                        returned_ref = Some(k);
+                    }
                     _ => return None,
                 },
                 StmtKind::Assert(_) => {}
                 StmtKind::Unknown => return None,
             }
         }
-        let kind = block.terminator.kind_value();
-        if kind.as_str() != Some("Return")
-            && kind.get("Goto").is_none()
-            && kind.get("target").is_none()
-        {
+    }
+    if let Some(global) = copied_to_ret {
+        if copied.is_some() || returned_ref.is_some() {
             return None;
         }
+        return Some(global);
     }
-    copied
+    let (k, global) = copied?;
+    if returned_ref? != k {
+        return None;
+    }
+    Some(global)
 }
 
 /// The `Operand::Const` a promoted-const initializer copies before
@@ -45816,13 +45894,13 @@ fn promoted_const_copied_global(body: &Unstructured) -> Option<Place> {
 ///
 /// rustc emits `_1 = const C; _0 = &_1; return` for a promoted `&str`
 /// (or other by-value literal). Anything richer is not this wrapper.
+/// The block walk is the same linear `Goto`/`Return` walk as
+/// [`promoted_const_copied_global`].
 fn promoted_const_copied_const(body: &Unstructured) -> Option<serde_json::Value> {
+    let blocks = promoted_const_linear_blocks(body)?;
     let mut copied: Option<(u64, serde_json::Value)> = None;
     let mut returned_ref: Option<u64> = None;
-    for block in &body.body {
-        if block.is_cleanup {
-            continue;
-        }
+    for block in blocks {
         for stmt in &block.statements {
             match stmt.stmt_kind_ref().ok()? {
                 StmtKind::StorageLive(_)
@@ -45857,13 +45935,6 @@ fn promoted_const_copied_const(body: &Unstructured) -> Option<serde_json::Value>
                 StmtKind::Assert(_) => {}
                 StmtKind::Unknown => return None,
             }
-        }
-        let kind = block.terminator.kind_value();
-        if kind.as_str() != Some("Return")
-            && kind.get("Goto").is_none()
-            && kind.get("target").is_none()
-        {
-            return None;
         }
     }
     let (dst, value) = copied?;
@@ -85208,6 +85279,127 @@ mod tests {
             value.get("Deduplicated").and_then(|v| v.as_u64()),
             Some(20437)
         );
+    }
+
+    fn promoted_const_unstructured(
+        blocks: serde_json::Value,
+    ) -> majit_charon_reader::ullbc::Unstructured {
+        serde_json::from_value(serde_json::json!({
+            "span": {"Deduplicated": 0},
+            "locals": {"arg_count": 0, "locals": []},
+            "body": blocks
+        }))
+        .expect("promoted-const fixture parses")
+    }
+
+    fn global_place(id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {"Global": {
+                "id": id,
+                "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            }},
+            "ty": {"Deduplicated": 0}
+        })
+    }
+
+    fn local_place(id: u64) -> serde_json::Value {
+        serde_json::json!({"kind": {"Local": id}, "ty": {"Deduplicated": 0}})
+    }
+
+    fn assign_copy(dest: serde_json::Value, src: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "span": {"Deduplicated": 0},
+            "kind": {"Assign": [dest, {"Use": [{"Copy": src}, "Yes"]}]}
+        })
+    }
+
+    fn assign_shared_ref(dest: serde_json::Value, src: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "span": {"Deduplicated": 0},
+            "kind": {"Assign": [dest, {"Ref": {
+                "place": src,
+                "kind": "Shared",
+                "ptr_metadata": {"Const": {"Deduplicated": 0}}
+            }}]}
+        })
+    }
+
+    fn return_bb(statements: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "statements": statements,
+            "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
+            "is_cleanup": false
+        })
+    }
+
+    /// Shape (b): `_0 = copy Global(id); return`.
+    #[test]
+    fn promoted_const_initializer_copies_the_inner_global_by_value() {
+        let body = promoted_const_unstructured(serde_json::json!([return_bb(vec![assign_copy(
+            local_place(0),
+            global_place(31)
+        ),])]));
+        let place = super::promoted_const_copied_global(&body).expect("inner global");
+        assert_eq!(super::inner_global_id(&place), 31);
+    }
+
+    /// `_1 = copy G; _0 = &(_1.field); return` is not a read of G.
+    #[test]
+    fn promoted_const_initializer_rejects_field_projection_ref() {
+        let field = serde_json::json!({
+            "kind": {"Projection": [local_place(1), {"Field": [null, 0]}]},
+            "ty": {"Deduplicated": 0}
+        });
+        let body = promoted_const_unstructured(serde_json::json!([return_bb(vec![
+            assign_copy(local_place(1), global_place(31)),
+            assign_shared_ref(local_place(0), field),
+        ])]));
+        assert!(super::promoted_const_copied_global(&body).is_none());
+    }
+
+    /// rustc's promoted-const wrapper does not emit a local-to-local copy
+    /// chain (`_2 = copy _1; _0 = &_2`). Reject it so a copy of a copy is
+    /// not folded as the global.
+    #[test]
+    fn promoted_const_initializer_rejects_local_to_local_copy_chain() {
+        let body = promoted_const_unstructured(serde_json::json!([return_bb(vec![
+            assign_copy(local_place(1), global_place(31)),
+            assign_copy(local_place(2), local_place(1)),
+            assign_shared_ref(local_place(0), local_place(2)),
+        ])]));
+        assert!(super::promoted_const_copied_global(&body).is_none());
+    }
+
+    /// A global copied only in an unreachable block is not the returned value.
+    #[test]
+    fn promoted_const_initializer_rejects_unreachable_block_global() {
+        let unreachable = return_bb(vec![
+            assign_copy(local_place(1), global_place(31)),
+            assign_shared_ref(local_place(0), local_place(1)),
+        ]);
+        let entry = serde_json::json!({
+            "statements": [],
+            "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
+            "is_cleanup": false
+        });
+        let body = promoted_const_unstructured(serde_json::json!([entry, unreachable]));
+        assert!(super::promoted_const_copied_global(&body).is_none());
+        assert!(super::promoted_const_copied_const(&body).is_none());
+    }
+
+    /// `resolve_place` of a projected global falls back to the inner Global
+    /// and drops the field, so a copy of `G.field` is not accepted as G.
+    #[test]
+    fn promoted_const_initializer_rejects_projected_global() {
+        let projected = serde_json::json!({
+            "kind": {"Projection": [global_place(31), {"Field": [null, 0]}]},
+            "ty": {"Deduplicated": 0}
+        });
+        let body = promoted_const_unstructured(serde_json::json!([return_bb(vec![
+            assign_copy(local_place(1), projected),
+            assign_shared_ref(local_place(0), local_place(1)),
+        ])]));
+        assert!(super::promoted_const_copied_global(&body).is_none());
     }
 
     /// A fieldless-enum discriminant is the by-value constant
