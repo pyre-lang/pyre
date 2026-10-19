@@ -20305,17 +20305,17 @@ fn walker_contains_descent_callback_free(
     // no `__hash__`/`__eq__`. Every other set strategy, or a key that is not
     // `is_correct_type`, can reach a user `__eq__` (ObjectSetStrategy's
     // same-hash probe, or `switch_to_object_strategy`), so it stays on the
-    // residual.
+    // residual. The strategy is asked through the same locked helper the
+    // walked body calls, which answers -1 for any other strategy.
     if exact(haystack, &pyre_object::setobject::SET_TYPE)
         || exact(haystack, &pyre_object::setobject::FROZENSET_TYPE)
     {
         return unsafe {
-            (*(haystack as *const pyre_object::setobject::W_SetObject))
-                .strategy
-                .kind
-                == pyre_object::setobject::SetStrategyKind::Int
-                && pyre_object::listobject::is_plain_int1(needle)
-                && pyre_object::is_int(needle)
+            pyre_object::listobject::is_plain_int1(needle)
+                && pyre_object::setobject::jit_int_set_has_key(
+                    haystack,
+                    pyre_object::listobject::plain_int_w(needle),
+                ) >= 0
         };
     }
     false

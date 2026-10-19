@@ -773,6 +773,19 @@ pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result
 pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_set_or_frozenset(set) {
+            // `IntegerSetStrategy.add` with `is_correct_type(w_key)`:
+            // `d[self.unwrap(w_key)] = None`. A plain int is stored unwrapped
+            // and needs no `try_hash_value` first. The helper reads the
+            // strategy under the set's stripe lock and answers -1 for any
+            // other.
+            if pyre_object::listobject::is_plain_int1(value)
+                && pyre_object::setobject::jit_int_set_add(
+                    set,
+                    pyre_object::listobject::plain_int_w(value),
+                ) >= 0
+            {
+                return Ok(());
+            }
             // `try_hash_value` may run a user `__hash__` that allocates and
             // triggers a moving minor collection; `set`/`value` must be
             // shadow-stack roots across it, then reloaded, or the store
@@ -781,12 +794,15 @@ pub fn set_add_value(set: PyObjectRef, value: PyObjectRef) -> Result<(), PyError
             let _roots = pyre_object::gc_roots::push_roots();
             let sp = _roots.pin_roots(&[set, value]);
             let value = _roots.get(sp + 1);
-            let hash = crate::builtins::try_hash_value(value).map_err(|err| {
-                crate::baseobjspace::wrap_set_element_hash_error(
-                    pyre_object::gc_roots::shadow_stack_get(sp + 1),
-                    err,
-                )
-            })?;
+            let hash = match crate::builtins::try_hash_value(value) {
+                Ok(hash) => hash,
+                Err(err) => {
+                    return Err(crate::baseobjspace::wrap_set_element_hash_error(
+                        _roots.get(sp + 1),
+                        err,
+                    ));
+                }
+            };
             let set = pyre_object::gc_roots::shadow_stack_get(sp);
             let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
             pyre_object::w_set_add_hashed_checked(set, value, hash)
@@ -1347,6 +1363,27 @@ pub extern "C" fn jit_opcode_ops_list_extend_value(
 ) -> i64 {
     match list_extend_value(list, iterable) {
         Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+// SET_ADD's void `inline_call_r_v` calls this address. The recorded graph is
+// `set_add_value`; its Rust `Result` is a different ABI, so the two must not
+// share an address.
+#[inline(never)]
+pub extern "C" fn jit_opcode_ops_set_add_value(set: PyObjectRef, value: PyObjectRef) -> i64 {
+    match set_add_value(set, value) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+// Residual target of every jitcode call to `builtins::try_hash_value`, which
+// the codewriter does not look inside. Its Rust `Result` is a different ABI.
+#[inline(never)]
+pub extern "C" fn jit_builtins_try_hash_value(obj: PyObjectRef) -> i64 {
+    match crate::builtins::try_hash_value(obj) {
+        Ok(hash) => hash,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }

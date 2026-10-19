@@ -2256,6 +2256,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::list_extend_value",
         crate::opcode_ops::jit_opcode_ops_list_extend_value,
     );
+    // SET_ADD's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
+    // The graph is `set_add_value`; this bridge is the one-word address
+    // blackhole calls.
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::set_add_value",
+        crate::opcode_ops::jit_opcode_ops_set_add_value,
+    );
+    // `try_hash_value` is a residual in every jitcode that calls it
+    // (`set_add_value`'s non-int arm among them); this is its one-word bridge.
+    cp1!(
+        &mut entries,
+        "pyre_interpreter::builtins::try_hash_value",
+        crate::opcode_ops::jit_builtins_try_hash_value,
+    );
     // BUILD_MAP's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
     // The graph is `dict_display_setitem`; this bridge is the one-word address
     // blackhole calls.
@@ -4321,6 +4336,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::setobject::jit_int_set_has_key",
         "pyre_object::jit_int_set_has_key",
         pyre_object::setobject::jit_int_set_has_key,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_object::setobject::jit_int_set_add",
+        "pyre_object::jit_int_set_add",
+        pyre_object::setobject::jit_int_set_add,
     );
     cpa1!(
         &mut entries,
@@ -7395,6 +7416,14 @@ mod tests {
                 crate::opcode_ops::jit_baseobjspace_dict_display_setitem as *const () as usize
                     as i64,
             ),
+            (
+                "pyre_interpreter::opcode_ops::set_add_value",
+                crate::opcode_ops::jit_opcode_ops_set_add_value as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::builtins::try_hash_value",
+                crate::opcode_ops::jit_builtins_try_hash_value as *const () as usize as i64,
+            ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
         }
@@ -8088,6 +8117,12 @@ mod tests {
             set_int
         );
         assert_eq!(bindings["pyre_object::jit_int_set_has_key"], set_int);
+        let set_add_int = pyre_object::setobject::jit_int_set_add as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::setobject::jit_int_set_add"],
+            set_add_int
+        );
+        assert_eq!(bindings["pyre_object::jit_int_set_add"], set_add_int);
     }
 
     #[test]

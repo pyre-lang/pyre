@@ -1208,8 +1208,11 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
 /// (`longobject.py:157`) which raises `OverflowError` on out-of-range
 /// values; pyre treats that path as unreachable and panics on
 /// precondition violation rather than silently returning 0.
+///
+/// # Safety
+/// `item` must be a live object for which [`is_plain_int1`] answered true.
 #[inline]
-pub(crate) unsafe fn plain_int_w(item: PyObjectRef) -> i64 {
+pub unsafe fn plain_int_w(item: PyObjectRef) -> i64 {
     if is_int(item) {
         w_int_get_value(item)
     } else {

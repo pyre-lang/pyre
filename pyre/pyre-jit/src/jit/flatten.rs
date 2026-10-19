@@ -14273,11 +14273,13 @@ mod tests {
     }
 
     #[test]
-    fn lower_accumulator_hlops_emit_residual_call_r_v() {
-        // 2-Ref `set_add(set, value)` and 3-Ref `map_add(dict, key, value)`
-        // both lower to `residual_call_r_v(ConstInt(fn_idx), ListR([...]),
-        // Descr)` (void, MayForce).  Confirms opname→fn_idx dispatch, the
-        // Ref-operand count, and the absence of a result Register.
+    fn lower_accumulator_hlops_emit_inline_or_residual_call_r_v() {
+        // 2-Ref `set_add(set, value)` lowers to `inline_call_r_v(JitCode,
+        // ListR([set, value]))` of the bound `opcode_ops::set_add_value`
+        // body.  3-Ref `map_add(dict, key, value)` keeps
+        // `residual_call_r_v(ConstInt(fn_idx), ListR([...]), Descr)` (void,
+        // MayForce).  Confirms opname dispatch, the Ref-operand count, and
+        // the absence of a result Register.
         let (ctx, _, _) = load_attr_lowering_fixture();
         let mut get_register = |var: Variable| match var.id {
             VariableId(1) => Register {
@@ -14296,7 +14298,7 @@ mod tests {
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
 
-        // 2-Ref: set_add → fn_idx 120, ListR = [set, value].
+        // 2-Ref: set_add → JitCode(set_add_value), ListR = [set, value].
         let set = Variable::new(VariableId(1), Kind::Ref);
         let value = Variable::new(VariableId(2), Kind::Ref);
         let op = super::super::flow::SpaceOperation::new(
@@ -14318,8 +14320,7 @@ mod tests {
                 args,
                 result,
             } => {
-                assert_eq!(opname, "residual_call_r_v");
-                assert!(matches!(args[0], Operand::ConstInt(120)));
+                assert_eq!(opname, "inline_call_r_v");
                 match &args[1] {
                     Operand::ListOfKind(list) => {
                         assert_eq!(list.kind, Kind::Ref);
@@ -14327,7 +14328,7 @@ mod tests {
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }
-                assert_eq!(result, None, "void residual has no result");
+                assert_eq!(result, None, "set_add is void");
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }

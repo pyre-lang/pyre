@@ -6505,18 +6505,13 @@ pub(crate) fn set_contains_checked(
 ) -> Result<bool, crate::PyError> {
     unsafe {
         // `IntegerSetStrategy.has_key` with `is_correct_type(w_key)`:
-        // `self.unwrap(w_key) in d`. Hashing an exact int runs no user code,
-        // so the lookup needs no `try_hash_value` first.
-        if (*(set as *const pyre_object::setobject::W_SetObject))
-            .strategy
-            .kind
-            == pyre_object::setobject::SetStrategyKind::Int
-            && pyre_object::listobject::is_plain_int1(item)
-            && pyre_object::is_int(item)
-        {
+        // `self.unwrap(w_key) in d`. Hashing a plain int runs no user code,
+        // so the lookup needs no `try_hash_value` first. The helper reads the
+        // strategy under the set's stripe lock and answers -1 for any other.
+        if pyre_object::listobject::is_plain_int1(item) {
             let found = pyre_object::setobject::jit_int_set_has_key(
                 set,
-                pyre_object::w_int_get_value(item),
+                pyre_object::listobject::plain_int_w(item),
             );
             if found >= 0 {
                 return Ok(found != 0);

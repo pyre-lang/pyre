@@ -1171,6 +1171,24 @@ where
     Ok(())
 }
 
+/// `AbstractUnwrappedSetStrategy.add`'s correct-type arm,
+/// `d[self.unwrap(w_key)] = None`, on the set pinned at `obj_slot`. The table
+/// insert may allocate, so the set is read back from its slot.
+unsafe fn unwrapped_store<S>(strategy: &S, obj_slot: usize, unwrapped: S::Key)
+where
+    S: AbstractUnwrappedSetStrategy,
+    (S::Key, ()): crate::rordereddict::GcEntriesType,
+{
+    let inserted = {
+        let set =
+            unsafe { &mut *(crate::gc_roots::shadow_stack_get(obj_slot) as *mut W_SetObject) };
+        unsafe { (*strategy.storage_ptr(set)).insert(unwrapped, ()).is_none() }
+    };
+    if inserted {
+        publish_unwrapped_len(strategy, crate::gc_roots::shadow_stack_get(obj_slot));
+    }
+}
+
 /// `AbstractUnwrappedSetStrategy.add`.
 unsafe fn unwrapped_add<S>(
     strategy: &S,
@@ -1189,14 +1207,7 @@ where
     let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
     if unsafe { strategy.is_correct_type(key_obj) } {
         let unwrapped = unsafe { strategy.unwrap_with_hash(key_obj, key.hash) };
-        let inserted = {
-            let set =
-                unsafe { &mut *(crate::gc_roots::shadow_stack_get(obj_slot) as *mut W_SetObject) };
-            unsafe { (*strategy.storage_ptr(set)).insert(unwrapped, ()).is_none() }
-        };
-        if inserted {
-            publish_unwrapped_len(strategy, crate::gc_roots::shadow_stack_get(obj_slot));
-        }
+        unsafe { unwrapped_store(strategy, obj_slot, unwrapped) };
         return Ok(());
     }
     // Wrong type: `switch_to_object_strategy`, then `w_set.add`.
@@ -2343,6 +2354,33 @@ pub extern "C" fn jit_int_set_has_key(set: PyObjectRef, key: i64) -> i64 {
             return -1;
         }
         i64::from((*(set_obj.sstorage as *const IntSetStorage)).contains_key(&key))
+    }
+}
+
+/// `IntegerSetStrategy.add` for a key that `is_correct_type`:
+/// `self.unerase(w_set.sstorage)[self.unwrap(w_key)] = None`. The int-keyed
+/// store runs no `__hash__` or `__eq__`, so this cannot raise or force.
+///
+/// Answers `0` once the key is stored. `-1` means the set no longer holds
+/// `IntegerSetStrategy` or its stripe is contended; the caller then takes
+/// `strategy.add` with the wrapped key.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_int_set_add(set: PyObjectRef, key: i64) -> i64 {
+    unsafe {
+        let Some(_guard) = try_w_set_lock(set) else {
+            return -1;
+        };
+        {
+            let set_obj = &*(set as *const W_SetObject);
+            if set_obj.strategy.kind != SetStrategyKind::Int || set_obj.sstorage.is_null() {
+                return -1;
+            }
+        }
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(set);
+        unwrapped_store(&INTEGER_SET_STRATEGY, obj_slot, key);
+        0
     }
 }
 
@@ -4957,6 +4995,7 @@ mod tests {
         assert!(!plain_int_already_in_int_set(s, std::ptr::null_mut()));
         assert!(!plain_int_already_in_int_set(s, one));
         assert_eq!(jit_int_set_has_key(s, 1), -1);
+        assert_eq!(jit_int_set_add(s, 1), -1);
         unsafe { w_set_add(s, one) };
         assert!(plain_int_already_in_int_set(s, one));
         assert!(!plain_int_already_in_int_set(s, w_int_new(2)));
@@ -4964,6 +5003,10 @@ mod tests {
         assert_eq!(jit_int_set_has_key(s, 1), 1);
         assert_eq!(jit_int_set_has_key(s, 2), 0);
         assert_eq!(unsafe { w_set_len(s) }, 1);
+        assert_eq!(jit_int_set_add(s, 2), 0);
+        assert_eq!(jit_int_set_add(s, 2), 0);
+        assert_eq!(jit_int_set_has_key(s, 2), 1);
+        assert_eq!(unsafe { w_set_len(s) }, 2);
         unsafe { w_set_add(s, crate::w_bool_from(true)) };
         assert_eq!(
             unsafe { (*(s as *const W_SetObject)).strategy.kind },
@@ -4971,6 +5014,8 @@ mod tests {
         );
         assert!(!plain_int_already_in_int_set(s, one));
         assert_eq!(jit_int_set_has_key(s, 1), -1);
+        assert_eq!(jit_int_set_add(s, 3), -1);
+        assert_eq!(unsafe { w_set_len(s) }, 2);
     }
 
     #[test]
