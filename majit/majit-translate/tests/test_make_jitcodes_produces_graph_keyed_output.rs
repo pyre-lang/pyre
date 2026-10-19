@@ -119,23 +119,11 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
     let mut mir_wildcards = 0usize;
     let mut mir_wildcard_target = None;
     for link in &switch.exits {
-        match &link.exitcase {
-            Some(ExitCase::Const(ConstValue::Int(discriminant))) => {
-                assert!(
-                    seen_discriminants.insert(*discriminant),
-                    "Instruction discriminant {discriminant} appears twice in the MIR switch",
-                );
-                let variant = variants.get(discriminant).unwrap_or_else(|| {
-                    panic!("MIR switch discriminant {discriminant} has no Instruction variant name")
-                });
-                if let Some((_, group)) = mir_groups
-                    .iter_mut()
-                    .find(|(target, _)| *target == link.target)
-                {
-                    assert!(group.insert(variant.clone()));
-                } else {
-                    mir_groups.push((link.target, BTreeSet::from([variant.clone()])));
-                }
+        let discriminant = match &link.exitcase {
+            Some(ExitCase::Const(ConstValue::Int(discriminant))) => *discriminant,
+            // An unsigned `Instruction` repr lowers its cases as `r_uint`.
+            Some(ExitCase::Const(ConstValue::UInt(discriminant))) => {
+                i64::try_from(*discriminant).expect("Instruction discriminant fits in i64")
             }
             Some(ExitCase::Const(ConstValue::UniStr(value))) if value == "default" => {
                 mir_wildcards += 1;
@@ -143,8 +131,24 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
                     mir_wildcard_target.replace(link.target).is_none(),
                     "the MIR switch contains more than one wildcard target",
                 );
+                continue;
             }
             other => panic!("unexpected execute_opcode_step switch case: {other:?}"),
+        };
+        assert!(
+            seen_discriminants.insert(discriminant),
+            "Instruction discriminant {discriminant} appears twice in the MIR switch",
+        );
+        let variant = variants.get(&discriminant).unwrap_or_else(|| {
+            panic!("MIR switch discriminant {discriminant} has no Instruction variant name")
+        });
+        if let Some((_, group)) = mir_groups
+            .iter_mut()
+            .find(|(target, _)| *target == link.target)
+        {
+            assert!(group.insert(variant.clone()));
+        } else {
+            mir_groups.push((link.target, BTreeSet::from([variant.clone()])));
         }
     }
 

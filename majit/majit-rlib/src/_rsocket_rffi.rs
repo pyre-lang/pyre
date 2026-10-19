@@ -87,6 +87,7 @@ mod posix {
 
     // `external_c` `FD_CLR` / `FD_ISSET` / `FD_SET` / `FD_ZERO` is `macro=True`.
     // `libc`'s `FD_ISSET` returns `bool`; upstream's result is `rffi.INT`.
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     unsafe fn fd_isset(fd: INT, set: fd_set) -> INT {
         unsafe { libc::FD_ISSET(fd, set) as INT }
     }
@@ -856,9 +857,11 @@ mod winsock {
     // the WinSock headers: scan `fd_array`, append under `FD_SETSIZE`.
     // `FD_*` take `rffi.INT` on Windows too (`external_c`). The WinSock
     // array stores `SOCKET` (`uintptr`), so the body sign-extends that int.
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     unsafe fn fd_zero(set: fd_set_p) {
         unsafe { (*set).fd_count = 0 };
     }
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     unsafe fn fd_set_insert(fd: INT, set: fd_set_p) {
         let fd = fd as usize;
         unsafe {
@@ -874,9 +877,11 @@ mod winsock {
             }
         }
     }
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     unsafe fn fd_isset(fd: INT, set: fd_set_p) -> INT {
         unsafe { __WSAFDIsSet(fd as usize, set) }
     }
+    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
     unsafe fn fd_clr(fd: INT, set: fd_set_p) {
         let fd = fd as usize;
         unsafe {

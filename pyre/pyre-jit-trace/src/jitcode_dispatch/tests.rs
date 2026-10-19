@@ -15606,8 +15606,10 @@ fn helper_jitcode_fills_a_trace_too_long_miframe() {
     let jitcode = std::sync::Arc::new(runtime_jc);
     // A null `code` key collides with a reserved build-time skeleton;
     // `helper_jitcode_arc` then prefers `get_runtime_jitcode_by_index`
-    // and would fill the canonical portal instead of this helper.
-    let key = Box::leak(Box::new(0x6865_6c70_u64)) as *const u64 as *const ();
+    // and would fill the canonical portal instead of this helper. The key
+    // must be a real `PyCode`: `canonical_code_key_opt` reads its `code_ptr`.
+    let code = pyre_interpreter::compile_exec("None").expect("test code should compile");
+    let key = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.jitcode = jitcode.clone();
     let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))

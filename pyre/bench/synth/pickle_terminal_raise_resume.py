@@ -16,6 +16,9 @@
 # pickle drives it 122 times here, more than any other fixture.  It also reaches
 # `builtin_getattr`, which a corpus census found no other fixture firing: once
 # here, out of 77 consultations.
+# wasm has its own baseline: one of its two blackhole adoptions is
+# multi-frame where dynasm and cranelift adopt it single-frame. The cause is
+# not identified.
 # Pure-Python pickle terminates its unpickler loop by raising the private
 # `_Stop` exception from `load_stop`.  The JIT's after-residual guard snapshot
 # must resume from the emitted post-call `-live-` anchor even though the

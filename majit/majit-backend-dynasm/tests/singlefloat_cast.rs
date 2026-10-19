@@ -1,5 +1,8 @@
-//! Host-arch CAST_FLOAT_TO_SINGLEFLOAT / CAST_SINGLEFLOAT_TO_FLOAT through
-//! the backend public API. Inputs are arguments so the casts are not folded.
+//! x86 CAST_FLOAT_TO_SINGLEFLOAT / CAST_SINGLEFLOAT_TO_FLOAT through the
+//! backend public API. Inputs are arguments so the casts are not folded.
+//! Only x86/runner.py sets `supports_singlefloats = True`; AArch64 keeps
+//! model.py's `False` and never sees these casts.
+#![cfg(target_arch = "x86_64")]
 
 use majit_backend::{Backend, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;

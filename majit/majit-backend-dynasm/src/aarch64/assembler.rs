@@ -2910,46 +2910,6 @@ impl<'a> AssemblerARM64<'a> {
                     dynasm!(self.mc ; .arch aarch64 ; fcvtzs X(dst.value), D(src.value));
                 }
             }
-            // `emit_op_cast_float_to_singlefloat`: FCVT the source double
-            // into `vfp_ip`, then FMOV those f32 bits into the GPR result.
-            OpCode::CastFloatToSinglefloat => {
-                if let (Some(src_loc), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let src_reg = match src_loc {
-                        Loc::Reg(r) => *r,
-                        _ => {
-                            let scratch = crate::aarch64::registers::VFP_IP;
-                            self.regalloc_mov(src_loc, &Loc::Reg(scratch));
-                            scratch
-                        }
-                    };
-                    let tmp = crate::aarch64::registers::VFP_IP.value;
-                    dynasm!(self.mc ; .arch aarch64
-                        ; fcvt S(tmp), D(src_reg.value)
-                        ; fmov W(dst.value), S(tmp)
-                    );
-                }
-            }
-            // `emit_op_cast_singlefloat_to_float`: FMOV the f32 bits into
-            // `vfp_ip`, then FCVT to the double result.
-            OpCode::CastSinglefloatToFloat => {
-                if let (Some(src), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let sr = match src {
-                        Loc::Reg(s) => s.value,
-                        _ => {
-                            self.regalloc_mov(
-                                src,
-                                &Loc::Reg(crate::regloc::RegLoc::new(16, false)),
-                            );
-                            16
-                        }
-                    };
-                    let tmp = crate::aarch64::registers::VFP_IP.value;
-                    dynasm!(self.mc ; .arch aarch64
-                        ; fmov S(tmp), W(sr)
-                        ; fcvt D(dst.value), S(tmp)
-                    );
-                }
-            }
             // ── Same-as / identity ──
             OpCode::SameAsI
             | OpCode::SameAsR
@@ -6183,13 +6143,7 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    fn emit_call_from_arglocs(
-        &mut self,
-        arglocs: &[Loc],
-        func_index: usize,
-        save_err: i64,
-        arg_classes: &str,
-    ) {
+    fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize, save_err: i64) {
         let arg_count = arglocs.len();
 
         dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
@@ -6220,20 +6174,8 @@ impl<'a> AssemblerARM64<'a> {
         let mut stack_args: Vec<Loc> = Vec::new();
         let mut next_core = 0u8;
         let mut next_float = 0u8;
-        // `'S'` is an integer location passed in an S register (`fmov sN, wN`).
-        let mut singlefloats: Vec<(Loc, u8)> = Vec::new();
 
-        for (call_i, &arg) in arglocs[(func_index + 1)..arg_count].iter().enumerate() {
-            if arg_classes.as_bytes().get(call_i) == Some(&b'S') {
-                if next_float == 8 {
-                    stack_args.push(arg);
-                    continue;
-                }
-                let idx = next_float;
-                next_float += 1;
-                singlefloats.push((arg, idx));
-                continue;
-            }
+        for &arg in &arglocs[(func_index + 1)..arg_count] {
             let is_float = match arg {
                 Loc::Frame(f) => f.ebp_loc.is_float,
                 Loc::Reg(r) => r.is_xmm,
@@ -6335,28 +6277,6 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
 
-        for (src, abi_idx) in &singlefloats {
-            if let Loc::Reg(r) = src
-                && !r.is_xmm
-            {
-                dynasm!(self.mc ; .arch aarch64 ; fmov S(*abi_idx), W(r.value));
-            }
-        }
-        for (src, abi_idx) in &singlefloats {
-            match src {
-                Loc::Reg(r) if !r.is_xmm => {}
-                Loc::Frame(f) => {
-                    self.emit_ldr_fp(16, f.ebp_loc.value);
-                    dynasm!(self.mc ; .arch aarch64 ; fmov S(*abi_idx), w16);
-                }
-                Loc::Immed(im) | Loc::ImmedFloat(im) => {
-                    self.emit_mov_imm64(16, im.value);
-                    dynasm!(self.mc ; .arch aarch64 ; fmov S(*abi_idx), w16);
-                }
-                other => panic!("singlefloat argument location {other:?}"),
-            }
-        }
-
         // aarch64/callbuilder.py:62-65 — remap non-float then float args.
         let tmp_nf = Loc::Reg(crate::regloc::RegLoc::new(16, false)); // x16 (ip0)
         let tmp_fp = Loc::Reg(crate::regloc::RegLoc::new(15, true)); // d15
@@ -6440,21 +6360,19 @@ impl<'a> AssemblerARM64<'a> {
             0
         };
         let func_index = 3 + usize::from(is_call_release_gil);
-        let arg_classes = op
-            .getdescr()
-            .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
-            .unwrap_or_default();
-        self.emit_call_from_arglocs(arglocs, func_index, save_err, &arg_classes);
-        // Result `'S'` returns in s0. `fmov w0, s0` puts those bits in x0.
-        if op.opcode.result_type() == Type::Int
-            && op.getdescr().is_some_and(|descr| {
+        // aarch64/callbuilder.py `prepare_arguments` sorts arguments by
+        // location type alone, and `load_result` asserts on a `'S'` result
+        // ("not supported yet"): the AArch64 CPU keeps model.py's
+        // `supports_singlefloats = False`, so no `'S'` call reaches here.
+        assert!(
+            !op.getdescr().is_some_and(|descr| {
                 descr
                     .as_call_descr()
-                    .is_some_and(|cd| cd.result_class() == 'S')
-            })
-        {
-            dynasm!(self.mc ; .arch aarch64 ; fmov w0, s0);
-        }
+                    .is_some_and(|cd| cd.result_class() == 'S' || cd.arg_classes().contains('S'))
+            }),
+            "aarch64 does not support singlefloat calls"
+        );
+        self.emit_call_from_arglocs(arglocs, func_index, save_err);
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
         }
@@ -7492,11 +7410,7 @@ impl<'a> AssemblerARM64<'a> {
         // spilled Ref slot unforwarded.
         self.push_all_regs_to_jitframe(&[], true);
         let pushed_gcmap = self.push_pending_call_gcmap();
-        let arg_classes = op
-            .getdescr()
-            .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
-            .unwrap_or_default();
-        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes);
+        self.emit_call_from_arglocs(arglocs, 1, 0);
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.pop_all_regs_from_jitframe(&[], true);
 

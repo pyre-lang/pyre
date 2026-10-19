@@ -762,17 +762,13 @@ impl<'a> RegAlloc<'a> {
             OpCode::FloatNeg | OpCode::FloatAbs if !args.is_empty() => {
                 self.prepare_op_float_neg(dst.unwrap_or(op.pos().get()), args[0], i, asm);
             }
-            // aarch64/regalloc.py `prepare_op_cast_float_to_singlefloat` and
-            // `prepare_op_cast_singlefloat_to_float` are both `prepare_unary`:
-            // the arg in a register of its own kind, then
-            // `force_allocate_reg(op)` in a register of the result's kind.
-            // CAST_FLOAT_TO_SINGLEFLOAT is ('f','i'); CAST_SINGLEFLOAT_TO_FLOAT
-            // is ('i','f') (`resoperation.py` CastOp.cast_types).
-            OpCode::CastFloatToSinglefloat if !args.is_empty() => {
-                self.prepare_op_cast_float_to_int(dst.unwrap_or(op.pos().get()), args[0], i, asm);
-            }
-            OpCode::CastSinglefloatToFloat if !args.is_empty() => {
-                self.prepare_op_cast_int_to_float(dst.unwrap_or(op.pos().get()), args[0], i, asm);
+            // aarch64/regalloc.py has no `prepare_op_cast_float_to_singlefloat`
+            // or `prepare_op_cast_singlefloat_to_float`: the AArch64 CPU keeps
+            // model.py's `supports_singlefloats = False`, so the codewriter
+            // never emits either cast and the dispatch table's
+            // `notimplemented` entry raises.
+            OpCode::CastFloatToSinglefloat | OpCode::CastSinglefloatToFloat => {
+                panic!("{:?}: aarch64 does not support singlefloats", op.opcode)
             }
             OpCode::FloatLt
             | OpCode::FloatLe
