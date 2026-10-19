@@ -21829,6 +21829,10 @@ pub(crate) fn chain_next_w(obj: PyObjectRef) -> PyResult {
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         loop {
+            // `next_w` holds nothing across iterations; pins taken for one
+            // source are released before the next, so a long run of empty
+            // sources keeps the root stack at a fixed depth.
+            let _step_roots = pyre_object::gc_roots::push_roots();
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_it = pyre_object::interp_itertools::w_chain_get_it(w_self);
             if w_it.is_null() {

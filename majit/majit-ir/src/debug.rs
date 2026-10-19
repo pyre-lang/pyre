@@ -236,7 +236,10 @@ fn with_debug_state<R>(f: impl FnOnce(&mut ThreadDebugState, &DebugLogConfig) ->
 /// Same answer as [`have_debug_prints`]: the ready bit `debug_start` sets
 /// and `debug_stop` restores. Direct `eprintln!` sites call this so a
 /// prefix filter silences them without each site naming a category.
-#[inline]
+///
+/// `debug_print.h` `OP_HAVE_DEBUG_PRINTS(r)` inlines one load of
+/// `pypy_have_debug_prints`.
+#[inline(always)]
 pub fn majit_log_enabled() -> bool {
     have_debug_prints()
 }
@@ -264,7 +267,9 @@ static HAVE_DEBUG_PRINTS_FLAG: AtomicU8 = AtomicU8::new(0);
 /// `rlib/debug.py have_debug_prints()` — true when the next
 /// `debug_print` would be emitted. That is the low bit of this thread's
 /// ready word (`debug_print.c` `OP_HAVE_DEBUG_PRINTS`).
-#[inline]
+///
+/// `debug_print.h` `OP_HAVE_DEBUG_PRINTS(r) r = (pypy_have_debug_prints & 1)`.
+#[inline(always)]
 pub fn have_debug_prints() -> bool {
     #[cfg(test)]
     {

@@ -428,6 +428,11 @@ pub mod loop_census {
 /// `debug_stop` shifts it back. Direct `eprintln!` sites use this gate, so
 /// a prefix filter silences them outside an accepted section. The word is
 /// a thread-local load, not an environment lookup.
+///
+/// `debug_print.h` `OP_HAVE_DEBUG_PRINTS(r)` is `r = (pypy_have_debug_prints & 1)`:
+/// one load, inlined at every `have_debug_prints()` site. An out-of-line
+/// wrapper here would be a call on every compiled-entry / resume gate.
+#[inline(always)]
 pub fn majit_log_enabled() -> bool {
     debug::have_debug_prints()
 }

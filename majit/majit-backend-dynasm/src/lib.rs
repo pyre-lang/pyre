@@ -50,7 +50,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 /// prefix filter accepts, so a category filter silences these sites.
 /// Not a cached `std::env::var_os`: the ready bit changes when a section
 /// opens. Mirrors the equivalent helper in `majit-backend-cranelift`.
-#[inline]
+///
+/// `debug_print.h` `OP_HAVE_DEBUG_PRINTS(r)` inlines one load of
+/// `pypy_have_debug_prints`.
+#[inline(always)]
 pub fn majit_log_enabled() -> bool {
     majit_ir::debug::have_debug_prints()
 }

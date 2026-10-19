@@ -75,6 +75,10 @@ mod slice_x2_probe {
 
 /// `have_debug_prints` — true only inside a debug section the `MAJIT_LOG`
 /// prefix filter accepts, so a category filter silences these sites.
+///
+/// `debug_print.h` `OP_HAVE_DEBUG_PRINTS(r)` inlines one load of
+/// `pypy_have_debug_prints`.
+#[inline(always)]
 fn majit_log_enabled() -> bool {
     majit_ir::debug::have_debug_prints()
 }

@@ -1016,9 +1016,11 @@ pub fn set_gcref_diag(hook: Option<GcrefDiagFn>) {
     GCREF_DIAG.store(raw, Ordering::Release);
 }
 
-#[inline]
+/// Write-once hook. Relaxed matches `have_debug_prints` / `OP_HAVE_DEBUG_PRINTS`
+/// (`pypy_have_debug_prints & 1`): the pointer is stored once at install.
+#[inline(always)]
 pub fn gcref_diag(addr: usize, site: &'static str) {
-    let p = GCREF_DIAG.load(Ordering::Acquire);
+    let p = GCREF_DIAG.load(Ordering::Relaxed);
     if p.is_null() {
         return;
     }
