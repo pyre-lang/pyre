@@ -20772,6 +20772,106 @@ fn dense_fallthrough_seeds_only_its_missing_result_color() {
     assert_eq!(registers, vec![keep, null_ref, OpRef::NONE]);
 }
 
+#[test]
+fn mailbox_live_marker_pcdep_matches_the_following_opcode() {
+    // Producer-fixed mailbox table: first-emission `-live-` (11373), the
+    // jump floor (11376), later unrolled `-live-` (11389). Each assembled
+    // `-live-` ships its own colour→slot row equal to the opcode it
+    // precedes; absent no longer means inherit-predecessor.
+    let row = vec![(1u8, 0u16, 19u16)];
+    let table = vec![
+        (11373, row.clone()),
+        (11376, row.clone()),
+        (11389, row.clone()),
+    ];
+    let exact_row = |pc: usize| -> Option<&Vec<(u8, u16, u16)>> {
+        table
+            .binary_search_by_key(&pc, |&(off, _)| off)
+            .ok()
+            .map(|i| &table[i].1)
+    };
+    assert_eq!(exact_row(11373), exact_row(11376));
+    assert!(!exact_row(11373).expect("first-emission -live-").is_empty());
+    assert!(exact_row(11389).is_some());
+    assert!(!super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11373
+    ));
+    assert!(!super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11376
+    ));
+    assert!(!super::resume_snapshot::exact_pcdep_row_is_empty_in(
+        &table, 11389
+    ));
+    let pred = table[1].1.clone();
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11376, false, &pred),
+        pred
+    );
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11389, true, &pred),
+        pred
+    );
+    assert_eq!(
+        super::resume_snapshot::pcdep_for_snapshot_entry_in(&table, 11400, false, &pred),
+        pred
+    );
+}
+
+#[test]
+fn first_emission_branch_guard_keeps_the_first_floor() {
+    // Main #2436: carried=11373 (`-live-`), first_floor=11376 (the jump).
+    // `get_live_vars_info` walks BACK onto the marker.
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11373, Some(11376), Some(11373),),
+        11376
+    );
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11373, Some(11373), None,),
+        11373
+    );
+}
+
+#[test]
+fn later_emission_branch_guard_does_not_inherit_the_first_floor() {
+    // Same Python PC, later jit offset. first_floor is still 11376.
+    // That floor's preceding `-live-` is the first emission (11373),
+    // not this capture (11389). Use this marker; the producer ships
+    // its own colour→slot row at 11389.
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11389, Some(11376), Some(11373),),
+        11389
+    );
+    assert_eq!(
+        super::resume_snapshot::entry_pc_for_branch_guard_live(11439, Some(11376), Some(11373),),
+        11439
+    );
+}
+
+#[test]
+fn none_ref_colors_reload_from_the_callee_slot_shadow() {
+    let keep = OpRef::ref_op(3);
+    let self_box = OpRef::ref_op(11);
+    let line_box = OpRef::ref_op(13);
+    let mut registers = vec![OpRef::NONE, keep, OpRef::NONE, OpRef::NONE, keep];
+    let mut shadow = std::collections::HashMap::new();
+    shadow.insert(0, self_box);
+    shadow.insert(1, line_box);
+    // Loop-header coloring: color 0 = local 0 (`self`), color 3 = local 1
+    // (`line`). The marker's own pcdep row inverts those colours onto
+    // `CalleeLocalsShadow`.
+    let pcdep = vec![(1, 0, 0), (1, 3, 1), (1, 4, 3)];
+    let filled = super::resume_snapshot::fill_none_refs_from_callee_slots(
+        &mut registers,
+        3,
+        1,
+        &pcdep,
+        &shadow,
+        None,
+    );
+    assert_eq!(filled, 2);
+    assert_eq!(registers, vec![self_box, keep, OpRef::NONE, line_box, keep]);
+}
+
 /// `insert_renamings` routes a cyclic parallel move through the Int scratch
 /// (`int_push/i` then `int_pop/>i`).  The pop must land the source's concrete
 /// shadow in `concrete_registers_i[dst]`; leaving the destination slot's old
