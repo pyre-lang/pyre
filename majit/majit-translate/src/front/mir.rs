@@ -29092,51 +29092,19 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<Option<P> as PartialEq>::eq` / `ne` on a niche nullable
-                // Option. Operands arrive as `&Option<P>`; peel that one
-                // reference. `Rvalue::Ref` aliases the borrow to the niche
-                // word (`Some(p)` is `p`). Two payload families share this
-                // `BinOp`:
-                //
-                // * Address identity (`*mut T` / `*const T`, `NonNull<T>`,
-                //   function pointer) — `rclass.py` `rtype_eq` / `rtype_ne`
-                //   → `ptr_eq` / `ptr_ne`.
-                // * String-family (`node_is_string_value`, including
-                //   `Option<&str>` / `Option<String>`) — `rstr.py`
-                //   `AbstractStringRepr.rtype_eq` / `rtype_ne` →
-                //   `ll_streq`, which already treats a null operand
-                //   (`if not s1 or not s2: return s1 == s2`).
-                //
-                // `&T` (pointee by value), `Box<T>` (by value), and a
-                // non-niche aggregate Option stay residual.
-                if args.len() == 2
-                    && (fmt_path_ends_with(&segments, &["option", "Option", "eq"])
-                        || fmt_path_ends_with(&segments, &["option", "Option", "ne"]))
-                    && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
-                        .iter()
-                        .all(|ty| ty.is_some_and(|ty| self.option_niche_eq_ne_operand(ty)))
-                {
-                    let leaf = if fmt_path_ends_with(&segments, &["option", "Option", "ne"]) {
-                        "ne"
-                    } else {
-                        "eq"
-                    };
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::BinOp {
-                            op: leaf.to_string(),
-                            lhs: args[0].clone(),
-                            rhs: args[1].clone(),
-                            result_ty: ValueType::Int,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
+                // FunctionPath `option::Option::eq` / `ne`. The Method
+                // spelling is the same helper, called again before
+                // `CallTarget::Method` is built.
+                if self.try_lower_option_niche_eq_ne(
+                    mir_bb,
+                    &segments,
+                    method_hint.as_ref(),
+                    &args,
+                    first_arg_ty.as_ref(),
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
                     return Ok(());
                 }
                 // `<T as ToString>::to_string(x)` is `str(x)` (`ll_str`)
@@ -29400,6 +29368,24 @@ impl<'a> Lowering<'a> {
                         // panics at `flowspace_adapter.rs` ("Call::Method
                         // has empty args").  Fall back to the `FunctionPath`
                         // segments when there is no receiver to thread.
+                        // Fold niche `Option` `eq`/`ne` before the Method
+                        // target is chosen (`impl_method_owner` /
+                        // `first_is_self`). Left as `CallTarget::Method
+                        // { name: "eq" }`, the adapter getattr's `eq` off
+                        // the niche payload (`SomeInstance(PyObject,
+                        // can_be_None=True)`) and annotate blocks.
+                        if self.try_lower_option_niche_eq_ne(
+                            mir_bb,
+                            &segments,
+                            method_hint.as_ref(),
+                            &args,
+                            first_arg_ty.as_ref(),
+                            second_arg_ty.as_ref(),
+                            dest_local,
+                            target,
+                        )? {
+                            return Ok(());
+                        }
                         let same_callee =
                             segments == original_segments && method_hint == original_method_hint;
                         match method_hint {
@@ -40264,6 +40250,82 @@ impl<'a> Lowering<'a> {
             self.option_niche_payload_compares_by_address(&peeled)
                 || self.option_niche_payload_compares_as_string(&peeled)
         })
+    }
+
+    /// `<Option<P> as PartialEq>::eq` / `ne` on a niche nullable Option.
+    /// Shared by the FunctionPath spelling `option::Option::eq` / `ne`
+    /// and the `impl_method_owner` Method spelling (`name_path`
+    /// `core::option::<Impl>::eq`, `CallTarget::Method { name: "eq" }`).
+    /// Operands arrive as `&Option<P>`; peel that one reference.
+    /// `Rvalue::Ref` aliases the borrow to the niche word (`Some(p)`
+    /// is `p`). Two payload families share this `BinOp`:
+    ///
+    /// * Address identity (`*mut T` / `*const T`, `NonNull<T>`,
+    ///   function pointer) — `rclass.py` `rtype_eq` / `rtype_ne`
+    ///   → `ptr_eq` / `ptr_ne`; `rptr.py` `PtrRepr.rtype_eq`.
+    /// * String-family (`node_is_string_value`, including
+    ///   `Option<&str>` / `Option<String>`) — `rstr.py`
+    ///   `AbstractStringRepr.rtype_eq` / `rtype_ne` →
+    ///   `ll_streq`, which already treats a null operand
+    ///   (`if not s1 or not s2: return s1 == s2`).
+    ///
+    /// `&T` (pointee by value), `Box<T>` (by value), and a
+    /// non-niche aggregate Option stay residual.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_option_niche_eq_ne(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        method_hint: Option<&(String, String)>,
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let from_path = if fmt_path_ends_with(segments, &["option", "Option", "eq"]) {
+            Some("eq")
+        } else if fmt_path_ends_with(segments, &["option", "Option", "ne"]) {
+            Some("ne")
+        } else {
+            None
+        };
+        let from_method = method_hint.and_then(|(owner, name)| {
+            (owner == "Option" && matches!(name.as_str(), "eq" | "ne")).then_some(name.as_str())
+        });
+        let Some(leaf) = from_path.or(from_method) else {
+            return Ok(false);
+        };
+        if ![first_arg_ty, second_arg_ty]
+            .iter()
+            .all(|ty| ty.is_some_and(|ty| self.option_niche_eq_ne_operand(ty)))
+        {
+            return Ok(false);
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: leaf.to_string(),
+                lhs: args[0].clone(),
+                rhs: args[1].clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// Emit a null pointer for a nullable `Option` (`None`) as a
@@ -102110,6 +102172,206 @@ mod tests {
         assert!(
             ops().any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")),
             "the comparison lowers to a string `BinOp(ne)`"
+        );
+    }
+
+    /// `opt == Some(p)` on niche `Option<*mut T>`. Charon spells the
+    /// derived `PartialEq` as `core::option::<Impl>::eq` with
+    /// `first_is_self`, so `impl_method_owner` would emit
+    /// `CallTarget::Method { name: "eq" }`. The niche fold must win
+    /// and emit one address `BinOp("eq")` (`rclass.py` `rtype_eq` →
+    /// `ptr_eq`; `rptr.py` `PtrRepr.rtype_eq`).
+    #[test]
+    fn niche_option_ptr_eq_some_lowers_to_binop() {
+        use crate::model::{CallTarget, OpKind};
+
+        let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+        let meta = |name: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "name": name,
+                "span": span, "source_text": null, "is_local": true,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let payload_ty = serde_json::json!({
+            "Adt": {"id": 1, "generics": generics}
+        });
+        let ptr_ty = serde_json::json!({"RawPtr": [payload_ty, "Mut"]});
+        let option_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [ptr_ty.clone()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let option_ref = serde_json::json!({"Ref": ["Erased", option_ty.clone(), "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let impl_seg = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [0, option_ty.clone()]},
+            "kind": "InherentImplBlock"
+        }}});
+        let place =
+            |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(vec![ident("core"), ident("option"), ident("Option")]),
+                        "kind": {"Enum": [
+                            {
+                                "name": "None",
+                                "fields": [],
+                                "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}
+                            },
+                            {
+                                "name": "Some",
+                                "fields": [{
+                                    "name": null,
+                                    "is_positional": true,
+                                    "ty": ptr_ty.clone(),
+                                    "attr_info": null
+                                }],
+                                "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}
+                            }
+                        ]}
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(vec![
+                            ident("fixture"),
+                            ident("pyobject"),
+                            ident("PyObject"),
+                        ]),
+                        "kind": {"Struct": []}
+                    }
+                ],
+                "fun_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": meta(vec![ident("fixture"), ident("cmp_option_ptr_eq")]),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [option_ty.clone(), ptr_ty.clone()],
+                            "output": bool_ty.clone()
+                        },
+                        "body": {"Unstructured": {"span": span,
+                            "locals": {"arg_count": 2, "locals": [
+                                {"index": 0, "name": null, "span": span, "ty": bool_ty.clone()},
+                                {"index": 1, "name": "opt", "span": span, "ty": option_ty.clone()},
+                                {"index": 2, "name": "p", "span": span, "ty": ptr_ty.clone()},
+                                {"index": 3, "name": "some", "span": span, "ty": option_ty.clone()},
+                                {"index": 4, "name": null, "span": span, "ty": option_ref.clone()},
+                                {"index": 5, "name": null, "span": span, "ty": option_ref.clone()},
+                                {"index": 6, "name": null, "span": span, "ty": bool_ty.clone()}
+                            ]},
+                            "body": [
+                                {"statements": [
+                                    {
+                                        "span": span,
+                                        "kind": {"Assign": [
+                                            place(3, &option_ty),
+                                            {"Aggregate": [
+                                                {"Adt": [0, 1, null]},
+                                                [{"Copy": place(2, &ptr_ty)}]
+                                            ]}
+                                        ]}
+                                    },
+                                    {
+                                        "span": span,
+                                        "kind": {"Assign": [
+                                            place(4, &option_ref),
+                                            {"Ref": {
+                                                "place": place(1, &option_ty),
+                                                "kind": "Shared",
+                                                "ptr_metadata": null
+                                            }}
+                                        ]}
+                                    },
+                                    {
+                                        "span": span,
+                                        "kind": {"Assign": [
+                                            place(5, &option_ref),
+                                            {"Ref": {
+                                                "place": place(3, &option_ty),
+                                                "kind": "Shared",
+                                                "ptr_metadata": null
+                                            }}
+                                        ]}
+                                    }
+                                ], "terminator": {"span": span, "kind": {"Call": {
+                                    "call": {
+                                        "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                        "args": [
+                                            {"Copy": place(4, &option_ref)},
+                                            {"Copy": place(5, &option_ref)}
+                                        ],
+                                        "dest": place(6, &bool_ty)
+                                    },
+                                    "target": 1, "on_unwind": 2
+                                }}}},
+                                {"statements": [{
+                                    "span": span,
+                                    "kind": {"Assign": [
+                                        place(0, &bool_ty),
+                                        {"Use": [{"Copy": place(6, &bool_ty)}, "Yes"]}
+                                    ]}
+                                }], "terminator": {"span": span, "kind": "Return"}},
+                                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                            ]
+                        }}
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": meta(vec![
+                            ident("core"), ident("option"), impl_seg, ident("eq")
+                        ]),
+                        "signature": {
+                            "is_unsafe": false,
+                            "inputs": [option_ref.clone(), option_ref.clone()],
+                            "output": bool_ty
+                        },
+                        "body": "Opaque"
+                    }
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc =
+            Llbc::from_slice(file.to_string().as_bytes()).expect("option-ptr-eq fixture parses");
+        let graph =
+            super::lower_function(&llbc, "cmp_option_ptr_eq").expect("lower cmp_option_ptr_eq");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "eq"
+                ))
+                .count(),
+            0,
+            "no residual `eq` Method call survives the niche fold"
+        );
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq"))
+                .count(),
+            1,
+            "the comparison lowers to one address `BinOp(eq)`"
         );
     }
 
