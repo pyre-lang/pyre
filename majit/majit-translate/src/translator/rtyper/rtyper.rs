@@ -2754,10 +2754,10 @@ impl HighLevelOp {
     ) -> Result<Constant, TyperError> {
         match converted_to.into() {
             ConvertedTo::Repr(repr) => inputconst(repr, value),
-            ConvertedTo::LowLevelType(lltype) => {
-                let value = const_value_for_integer_lltype(value.clone(), lltype);
-                inputconst_from_lltype(lltype, &value)
-            }
+            // `rmodel.inputconst`: a `LowLevelType` reqtype validates the
+            // original value with `_contains_value` (`inputconst_from_lltype`);
+            // it does not `convert_const` / stamp the carrier.
+            ConvertedTo::LowLevelType(lltype) => inputconst_from_lltype(lltype, value),
         }
     }
 
@@ -3405,28 +3405,7 @@ pub(crate) fn variable_with_lltype(name: &str, lltype: LowLevelType) -> Variable
 }
 
 pub(crate) fn constant_with_lltype(value: ConstValue, lltype: LowLevelType) -> Hlvalue {
-    let value = const_value_for_integer_lltype(value, &lltype);
     Hlvalue::Constant(Constant::with_concretetype(value, lltype))
-}
-
-/// Stamp an integer constant so `typeOf(value)` matches `lltype`
-/// (`rmodel.inputconst` / `LowLevelType._contains_value`).
-/// `Unsigned` / `UnsignedLongLong` hold `r_uint` (`ConstValue::UInt`);
-/// `Signed` / `SignedLongLong` hold `int` (`ConstValue::Int`).
-/// `rarithmetic.build_int` interns by `(sign, bits)`.
-pub(crate) fn const_value_for_integer_lltype(
-    value: ConstValue,
-    lltype: &LowLevelType,
-) -> ConstValue {
-    match (value, lltype) {
-        (ConstValue::Int(n), LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => {
-            ConstValue::UInt(n as u64)
-        }
-        (ConstValue::UInt(n), LowLevelType::Signed | LowLevelType::SignedLongLong) => {
-            ConstValue::Int(n as i64)
-        }
-        (other, _) => other,
-    }
 }
 
 pub(crate) fn helper_pygraph_from_graph(
@@ -5569,11 +5548,16 @@ fn lowlevel_typed_zero_check_wrapper_graph(
     );
     let exc_args = exception_args("ZeroDivisionError")?;
 
+    let zero = match &lltype {
+        LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => ConstValue::UInt(0),
+        LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(0),
+        _ => ConstValue::Int(0),
+    };
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         eq_opname,
         vec![
             Hlvalue::Variable(y0.clone()),
-            constant_with_lltype(ConstValue::Int(0), lltype.clone()),
+            constant_with_lltype(zero, lltype.clone()),
         ],
         Hlvalue::Variable(is_zero.clone()),
     ));

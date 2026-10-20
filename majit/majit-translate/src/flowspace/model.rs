@@ -5509,6 +5509,28 @@ fn is_exception_exitcase(exitcase: &Hlvalue) -> bool {
     )
 }
 
+/// `checkgraph` builds `allexitcases` from raw Python values, so
+/// `1`, `True`, and `r_uint(1)` are the same key; `r_uint(2**64-1)`
+/// and `-1` stay distinct (`base_int` numeric equality).
+pub(crate) fn exitcase_numeric_i128(exitcase: &Option<Hlvalue>) -> Option<i128> {
+    match exitcase {
+        Some(Hlvalue::Constant(c)) => match &c.value {
+            ConstValue::Int(n) => Some(*n as i128),
+            ConstValue::UInt(n) => Some(*n as i128),
+            ConstValue::Bool(flag) => Some(i128::from(*flag)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn exitcases_equal(a: &Option<Hlvalue>, b: &Option<Hlvalue>) -> bool {
+    match (exitcase_numeric_i128(a), exitcase_numeric_i128(b)) {
+        (Some(ka), Some(kb)) => ka == kb,
+        _ => a == b,
+    }
+}
+
 fn is_valid_switch_exitcase(exitcase: &Hlvalue) -> bool {
     matches!(
         exitcase,
@@ -5775,7 +5797,9 @@ pub fn checkgraph(graph: &FunctionGraph) {
                 }
             }
             assert!(
-                !all_exitcases.contains(&link.exitcase),
+                !all_exitcases
+                    .iter()
+                    .any(|prev| exitcases_equal(prev, &link.exitcase)),
                 "duplicate exitcase in block exits"
             );
             all_exitcases.push(link.exitcase.clone());
@@ -6687,6 +6711,61 @@ mod tests {
             Some(bool_const(true)),
         )));
         start.closeblock(vec![false_link, true_link]);
+        checkgraph(&g);
+    }
+
+    #[test]
+    fn checkgraph_rejects_numeric_duplicate_exitcase() {
+        // `allexitcases[link.exitcase] = True`: `r_uint(1)` and `1` are
+        // the same Python dict key.
+        let x = Variable::named("x");
+        let start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let g = FunctionGraph::new("f", start.clone());
+        start.borrow_mut().exitswitch = Some(Hlvalue::Variable(x.clone()));
+        let int_one = Hlvalue::Constant(Constant::new(ConstValue::Int(1)));
+        let uint_one = Hlvalue::Constant(Constant::new(ConstValue::UInt(1)));
+        let link1 = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x.clone())],
+            Some(g.returnblock.clone()),
+            Some(int_one),
+        )));
+        let link2 = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x)],
+            Some(g.returnblock.clone()),
+            Some(uint_one),
+        )));
+        start.closeblock(vec![link1, link2]);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            checkgraph(&g);
+        }))
+        .expect_err("Int(1) and UInt(1) must be duplicate exitcases");
+        let msg = panic_message(err);
+        assert!(
+            msg.contains("duplicate exitcase"),
+            "expected duplicate exitcase, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn checkgraph_keeps_uint_max_distinct_from_minus_one() {
+        // `r_uint(2**64-1) != -1`.
+        let x = Variable::named("x");
+        let start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let g = FunctionGraph::new("f", start.clone());
+        start.borrow_mut().exitswitch = Some(Hlvalue::Variable(x.clone()));
+        let uint_max = Hlvalue::Constant(Constant::new(ConstValue::UInt(u64::MAX)));
+        let minus_one = Hlvalue::Constant(Constant::new(ConstValue::Int(-1)));
+        let link1 = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x.clone())],
+            Some(g.returnblock.clone()),
+            Some(uint_max),
+        )));
+        let link2 = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(x)],
+            Some(g.returnblock.clone()),
+            Some(minus_one),
+        )));
+        start.closeblock(vec![link1, link2]);
         checkgraph(&g);
     }
 

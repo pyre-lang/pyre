@@ -1939,21 +1939,35 @@ fn tuple_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue 
     };
     if int2.is_immutable_constant()
         && let Some(c) = &int2.base.const_box
-        && let Some(idx) = c.value.as_int()
     {
-        let idx_usize = if idx < 0 {
-            let adj = tup1.items.len() as i64 + idx;
-            if adj < 0 {
+        // `getitem((tup1, int2))` indexes with the Python value
+        // (`tup1.items[int2.const]`); `IndexError` → `s_ImpossibleValue`.
+        // A `r_uint` index is the actual positive value, never `as_int()`
+        // wrap. Out of range stays impossible.
+        match &c.value {
+            ConstValue::UInt(n) => {
+                if (*n as u128) >= tup1.items.len() as u128 {
+                    return s_impossible_value();
+                }
+                return tup1.items[*n as usize].clone();
+            }
+            ConstValue::Int(idx) => {
+                let idx_usize = if *idx < 0 {
+                    let adj = tup1.items.len() as i64 + idx;
+                    if adj < 0 {
+                        return s_impossible_value();
+                    }
+                    adj as usize
+                } else {
+                    *idx as usize
+                };
+                if idx_usize < tup1.items.len() {
+                    return tup1.items[idx_usize].clone();
+                }
                 return s_impossible_value();
             }
-            adj as usize
-        } else {
-            idx as usize
-        };
-        if idx_usize < tup1.items.len() {
-            return tup1.items[idx_usize].clone();
+            _ => {}
         }
-        return s_impossible_value();
     }
     unionof(tup1.items.iter()).expect("tuple_int_getitem: unionof failed")
 }
@@ -3369,10 +3383,33 @@ mod tests {
         ann.setbinding(&mut v1, SomeValue::Integer(const_idx));
         let hl = HLOperation::new(
             OpKind::GetItem,
-            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+            vec![Hlvalue::Variable(v0.clone()), Hlvalue::Variable(v1)],
         );
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
+
+        // `r_uint` indexes the actual positive value; ≥ len is IndexError
+        // (`s_ImpossibleValue`).
+        let mut v_u = Variable::named("iu");
+        let mut uint_idx = SomeInteger::default();
+        uint_idx.base.const_box = Some(Constant::new(ConstValue::UInt(1)));
+        ann.setbinding(&mut v_u, SomeValue::Integer(uint_idx));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v0.clone()), Hlvalue::Variable(v_u)],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
+        let mut v_oob = Variable::named("ioob");
+        let mut uint_oob = SomeInteger::default();
+        uint_oob.base.const_box = Some(Constant::new(ConstValue::UInt(u64::MAX)));
+        ann.setbinding(&mut v_oob, SomeValue::Integer(uint_oob));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v_oob)],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(matches!(r, SomeValue::Impossible), "got {:?}", r);
     }
 
     #[test]

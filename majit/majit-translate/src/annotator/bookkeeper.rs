@@ -3239,7 +3239,7 @@ impl Bookkeeper {
             ));
             super::model::add_knowntypedata(
                 &mut ktd,
-                super::model::ExitCaseKey::Int(*discr),
+                super::model::ExitCaseKey::Int(i128::from(*discr)),
                 std::slice::from_ref(receiver),
                 s_variant,
             );
@@ -7717,7 +7717,7 @@ mod tests {
         assert_eq!(ktd.len(), 2, "one knowntypedata case per variant");
         for (discr, variant_name) in [(0, "Rgb"), (1, "Named")] {
             let constraints = ktd
-                .get(&ExitCaseKey::Int(discr))
+                .get(&ExitCaseKey::Int(i128::from(discr)))
                 .unwrap_or_else(|| panic!("missing Int({discr}) case"));
             let s_refined = constraints
                 .get(&receiver)
@@ -7799,7 +7799,7 @@ mod tests {
             .expect("an already-narrowed receiver still resolves the base table");
 
         let classdef_of = |ktd: &crate::annotator::model::KnownTypeData, discr: i64| match ktd
-            .get(&ExitCaseKey::Int(discr))
+            .get(&ExitCaseKey::Int(i128::from(discr)))
             .and_then(|c| c.get(&receiver))
             .expect("case present")
         {
@@ -7870,7 +7870,7 @@ mod tests {
         assert_eq!(from_variant.len(), 3);
         for discr in [0i64, 1, 2] {
             let classdef_of = |ktd: &crate::annotator::model::KnownTypeData| match ktd
-                .get(&ExitCaseKey::Int(discr))
+                .get(&ExitCaseKey::Int(i128::from(discr)))
                 .and_then(|c| c.get(&receiver))
             {
                 Some(SomeValue::Instance(si)) => si.classdef.clone().expect("classdef"),

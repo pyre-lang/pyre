@@ -1339,42 +1339,42 @@ fn init_sometuple_overrides(
                 let stop = ann
                     .annotation(&hl.args[2])
                     .expect("tuple.getslice: stop unbound");
-                let start_c = match &start {
-                    SomeValue::Integer(i) if i.is_immutable_constant() => i
+                let slice_bound = |sv: &SomeValue, which: &str| -> usize {
+                    let i = match sv {
+                        SomeValue::Integer(i) if i.is_immutable_constant() => i,
+                        _ => panic!(
+                            "AnnotatorError: tuple slicing: needs constants ({which} not const)"
+                        ),
+                    };
+                    let c = i
                         .base
                         .const_box
                         .as_ref()
-                        .and_then(|c| match c.value {
-                            ConstValue::Int(v) => Some(v),
-                            ConstValue::UInt(v) => Some(v as i64),
-                            _ => None,
-                        })
-                        .expect("tuple.getslice: const_box mismatch"),
-                    _ => panic!("AnnotatorError: tuple slicing: needs constants (start not const)"),
-                };
-                let stop_c = match &stop {
-                    SomeValue::Integer(i) if i.is_immutable_constant() => i
-                        .base
-                        .const_box
-                        .as_ref()
-                        .and_then(|c| match c.value {
-                            ConstValue::Int(v) => Some(v),
-                            ConstValue::UInt(v) => Some(v as i64),
-                            _ => None,
-                        })
-                        .expect("tuple.getslice: const_box mismatch"),
-                    _ => panic!("AnnotatorError: tuple slicing: needs constants (stop not const)"),
-                };
-                let len = t.items.len() as i64;
-                let clamp = |idx: i64| -> usize {
-                    if idx < 0 {
-                        (len + idx).max(0) as usize
-                    } else {
-                        (idx as usize).min(t.items.len())
+                        .expect("tuple.getslice: const_box mismatch");
+                    let len = t.items.len();
+                    match &c.value {
+                        ConstValue::Int(v) => {
+                            if *v < 0 {
+                                (len as i64 + *v).max(0) as usize
+                            } else {
+                                (*v as usize).min(len)
+                            }
+                        }
+                        // `SomeTuple.getslice` indexes the Python list with
+                        // the actual positive `r_uint` value; a huge bound
+                        // clamps to `len`, never wrapping negative.
+                        ConstValue::UInt(v) => {
+                            if (*v as u128) >= len as u128 {
+                                len
+                            } else {
+                                *v as usize
+                            }
+                        }
+                        _ => panic!("tuple.getslice: const_box mismatch"),
                     }
                 };
-                let lo = clamp(start_c);
-                let hi = clamp(stop_c).max(lo);
+                let lo = slice_bound(&start, "start");
+                let hi = slice_bound(&stop, "stop").max(lo);
                 let items = t.items[lo..hi].to_vec();
                 SomeValue::Tuple(SomeTuple::new(items))
             }),
@@ -6018,6 +6018,44 @@ mod tests {
                 .unwrap_or("")
                 .contains("cannot use hash() in RPython")
         );
+    }
+
+    #[test]
+    fn consider_sometuple_getslice_constant_bounds() {
+        // unaryop.py SomeTuple.getslice — constant start/stop slice the
+        // items list. A huge `r_uint` bound clamps to len, never wraps
+        // negative.
+        let ann = mk_ann();
+        let mut v0 = Variable::named("t");
+        let mut v_start = Variable::named("start");
+        let mut v_stop = Variable::named("stop");
+        ann.setbinding(
+            &mut v0,
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::String(SomeString::new(false, false)),
+                SomeValue::Bool(SomeBool::new()),
+            ])),
+        );
+        let mut start = SomeInteger::default();
+        start.base.const_box = Some(Constant::new(ConstValue::UInt(1)));
+        let mut stop = SomeInteger::default();
+        stop.base.const_box = Some(Constant::new(ConstValue::UInt(u64::MAX)));
+        ann.setbinding(&mut v_start, SomeValue::Integer(start));
+        ann.setbinding(&mut v_stop, SomeValue::Integer(stop));
+        let hl = HLOperation::new(
+            OpKind::GetSlice,
+            vec![
+                Hlvalue::Variable(v0),
+                Hlvalue::Variable(v_start),
+                Hlvalue::Variable(v_stop),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        match r {
+            SomeValue::Tuple(t) => assert_eq!(t.items.len(), 2),
+            other => panic!("got {:?}", other),
+        }
     }
 
     #[test]

@@ -3008,17 +3008,21 @@ impl RPythonAnnotator {
                     let s_exitswitch = self.binding(exitswitch.as_ref().unwrap());
                     if s_exitswitch.is_constant() {
                         // upstream: filter by `link.exitcase == s.const`.
+                        // Python `r_uint(1) == 1`; `checkgraph` keys
+                        // integer cases the same way via
+                        // `exitcases_equal`.
                         let s_const = s_exitswitch
                             .const_()
                             .expect("is_constant() but const_() empty")
                             .clone();
+                        let s_exitcase = Some(Hlvalue::Constant(
+                            super::super::flowspace::model::Constant::new(s_const),
+                        ));
                         exits.retain(|link| {
-                            let link_b = link.borrow();
-                            match &link_b.exitcase {
-                                Some(Hlvalue::Constant(c)) => c.value == s_const,
-                                Some(Hlvalue::Variable(_)) => false,
-                                None => false,
-                            }
+                            super::super::flowspace::model::exitcases_equal(
+                                &link.borrow().exitcase,
+                                &s_exitcase,
+                            )
                         });
                     }
                 }
@@ -3152,14 +3156,20 @@ impl RPythonAnnotator {
                 // discriminant keys directly by the `Int` case constant.
                 let case_key: Option<ExitCaseKey> = match exitcase {
                     Some(Hlvalue::Constant(c)) => match &c.value {
-                        super::super::flowspace::model::ConstValue::Bool(b) => {
-                            Some(ExitCaseKey::Bool(*b))
+                        // `knowntypedata` is a Python dict keyed by the
+                        // exitcase value: `True`, `1`, and `r_uint(1)`
+                        // collide; `r_uint(2**64-1)` does not wrap to `-1`.
+                        super::super::flowspace::model::ConstValue::Bool(b) if int_keyed => {
+                            Some(ExitCaseKey::Int(i128::from(*b)))
                         }
                         super::super::flowspace::model::ConstValue::Int(i) if int_keyed => {
-                            Some(ExitCaseKey::Int(*i))
+                            Some(ExitCaseKey::Int(*i as i128))
                         }
                         super::super::flowspace::model::ConstValue::UInt(i) if int_keyed => {
-                            Some(ExitCaseKey::Int(*i as i64))
+                            Some(ExitCaseKey::Int(*i as i128))
+                        }
+                        super::super::flowspace::model::ConstValue::Bool(b) => {
+                            Some(ExitCaseKey::Bool(*b))
                         }
                         super::super::flowspace::model::ConstValue::Int(i) => {
                             Some(ExitCaseKey::Bool(*i != 0))
@@ -3712,6 +3722,55 @@ mod tests {
             !ann.blocked_blocks
                 .borrow()
                 .contains_key(&BlockKey::of(&startblock))
+        );
+    }
+
+    #[test]
+    fn flowin_constant_switch_keeps_uint_vs_int_exitcase() {
+        // Python `r_uint(1) == 1`; pruning uses `exitcases_equal`.
+        use super::super::super::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, Link,
+        };
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("uint_switch", 1);
+        let startblock = graph.borrow().startblock.clone();
+
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                let mut s = SomeInteger::new(false, true);
+                s.base.const_box = Some(Constant::new(ConstValue::UInt(1)));
+                ann.setbinding(v, SomeValue::Integer(s));
+            }
+            blk.exitswitch = Some(blk.inputargs[0].clone());
+        }
+
+        let keep_target = Block::shared(vec![]);
+        let drop_target = Block::shared(vec![]);
+        let keep_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(keep_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Int(1)))),
+        )));
+        let drop_link = Rc::new(RefCell::new(Link::new(
+            vec![],
+            Some(drop_target),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Int(2)))),
+        )));
+        startblock.closeblock(vec![keep_link.clone(), drop_link.clone()]);
+
+        ann.processblock(&graph, &startblock).unwrap();
+        assert!(
+            ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&keep_link)),
+            "UInt(1) discriminant must keep Int(1) exit"
+        );
+        assert!(
+            !ann.links_followed
+                .borrow()
+                .contains_key(&LinkKey::of(&drop_link)),
+            "UInt(1) discriminant must drop Int(2) exit"
         );
     }
 

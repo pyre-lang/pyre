@@ -473,10 +473,8 @@ impl LowLevelType {
                 matches!(value, ConstValue::Int(_) | ConstValue::Int128(_))
             }
             LowLevelType::UnsignedLongLongLong => {
-                matches!(
-                    value,
-                    ConstValue::Int(_) | ConstValue::UInt(_) | ConstValue::UInt128(_)
-                )
+                // `r_uint` is not `r_ulonglonglong` (`typeOf`).
+                matches!(value, ConstValue::Int(_) | ConstValue::UInt128(_))
             }
             // upstream `Float` / `SingleFloat` / `LongFloat` accept
             // Python `float`.
@@ -6676,6 +6674,7 @@ mod tests {
         assert!(!LowLevelType::SignedLongLong.contains_value(&ConstValue::UInt(42)));
         assert!(LowLevelType::SignedLongLongLong.contains_value(&ConstValue::Int128(i128::MIN)));
         assert!(LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::UInt128(u128::MAX)));
+        assert!(!LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::UInt(1)));
         assert!(!LowLevelType::SignedLongLongLong.contains_value(&ConstValue::UInt128(u128::MAX)));
         assert!(!LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::Int128(i128::MIN)));
         assert!(!LowLevelType::Signed.contains_value(&ConstValue::Bool(true)));

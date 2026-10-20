@@ -2014,20 +2014,21 @@ mod tests {
         let model = lower_graph(&graph);
 
         let mut calls = Vec::new();
-        let mut const_ints = 0;
+        let mut const_uints = 0;
         let mut residual = Vec::new();
         for block in &model.blocks {
             for op in &block.operations {
                 match &op.kind {
                     OpKind::Call { target, args, .. } => calls.push((target.clone(), args.len())),
-                    OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstFnAddr { .. } => {
-                        const_ints += 1
-                    }
+                    OpKind::ConstUInt(1280) => const_uints += 1,
                     other => residual.push(format!("{other:?}")),
                 }
             }
         }
-        assert_eq!(const_ints, 1, "the 1280 constant arg materialises once");
+        assert_eq!(
+            const_uints, 1,
+            "the 1280 constant arg materialises as ConstUInt(1280)"
+        );
         assert_eq!(calls.len(), 1);
         let (target, argc) = &calls[0];
         assert_eq!(

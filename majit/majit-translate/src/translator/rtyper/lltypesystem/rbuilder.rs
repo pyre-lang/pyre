@@ -5556,6 +5556,12 @@ pub fn build_ll_arrayclear_helper_graph(
         LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
             constant_with_lltype(ConstValue::float(0.0), item_lltype.clone())
         }
+        LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
+            constant_with_lltype(ConstValue::UInt(0), item_lltype.clone())
+        }
+        LowLevelType::UnsignedLongLongLong => {
+            constant_with_lltype(ConstValue::UInt128(0), item_lltype.clone())
+        }
         _ => constant_with_lltype(ConstValue::Int(0), item_lltype.clone()),
     };
 

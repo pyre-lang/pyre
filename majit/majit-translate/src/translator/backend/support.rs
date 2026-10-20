@@ -225,12 +225,11 @@ fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType
             | LowLevelType::SignedLongLongLong
             | LowLevelType::UnsignedLongLongLong,
         ) => true,
-        (
-            ConstValue::UInt(_),
-            LowLevelType::Unsigned
-            | LowLevelType::UnsignedLongLong
-            | LowLevelType::UnsignedLongLongLong,
-        ) => true,
+        (ConstValue::UInt(_), LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => true,
+        // `r_longlonglong → SignedLongLongLong`, `r_ulonglonglong →
+        // UnsignedLongLongLong`.
+        (ConstValue::Int128(_), LowLevelType::SignedLongLongLong) => true,
+        (ConstValue::UInt128(_), LowLevelType::UnsignedLongLongLong) => true,
         (ConstValue::Bool(_), LowLevelType::Bool) => true,
         // Upstream `lltype.typeOf(float) == Float`, `r_singlefloat →
         // SingleFloat`, `r_longfloat → LongFloat`. pyre flattens the
@@ -690,6 +689,22 @@ mod tests {
         let c =
             Constant::with_concretetype(ConstValue::Int(42), LowLevelType::UnsignedLongLongLong);
         assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
+        let c = Constant::with_concretetype(
+            ConstValue::Int128(i128::MIN),
+            LowLevelType::SignedLongLongLong,
+        );
+        assert_eq!(
+            llvalue_from_constant(&c),
+            Some(ConstValue::Int128(i128::MIN))
+        );
+        let c = Constant::with_concretetype(
+            ConstValue::UInt128(u128::MAX),
+            LowLevelType::UnsignedLongLongLong,
+        );
+        assert_eq!(
+            llvalue_from_constant(&c),
+            Some(ConstValue::UInt128(u128::MAX))
+        );
     }
 
     /// Upstream invariant still bites real mismatches: `Bool`

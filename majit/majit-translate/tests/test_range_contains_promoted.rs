@@ -147,10 +147,14 @@ fn const_int_of_inner(
     }
     for block in &graph.blocks {
         for op in &block.operations {
-            if let (Some(result), OpKind::ConstInt(value)) = (&op.result, &op.kind)
+            if let (Some(result), kind) = (&op.result, &op.kind)
                 && result == var
             {
-                return Some(*value);
+                match kind {
+                    OpKind::ConstInt(value) => return Some(*value),
+                    OpKind::ConstUInt(value) => return Some(*value as i64),
+                    _ => {}
+                }
             }
         }
     }
@@ -175,6 +179,7 @@ fn const_int_of_inner(
                     Some(LinkArg::Value(incoming)) => const_int_of_inner(graph, incoming, seen)?,
                     Some(LinkArg::Const(constant)) => match constant.value {
                         majit_translate::flowspace::model::ConstValue::Int(value) => value,
+                        majit_translate::flowspace::model::ConstValue::UInt(value) => value as i64,
                         _ => return None,
                     },
                     None => return None,

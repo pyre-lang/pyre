@@ -649,7 +649,7 @@ impl SomeObjectTrait for SomeInteger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ExitCaseKey {
     Bool(bool),
-    Int(i64),
+    Int(i128),
 }
 
 /// RPython `knowntypedata` carrier type — `defaultdict(dict)` keyed by

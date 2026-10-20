@@ -1064,6 +1064,9 @@ fn option_question_mark_lifts_to_direct_option_switch() {
                     Some(ExitCase::Const(majit_translate::flowspace::model::ConstValue::Int(
                         i,
                     ))) => Some(*i),
+                    Some(ExitCase::Const(majit_translate::flowspace::model::ConstValue::UInt(
+                        i,
+                    ))) => Some(*i as i64),
                     _ => None,
                 })
                 .collect();

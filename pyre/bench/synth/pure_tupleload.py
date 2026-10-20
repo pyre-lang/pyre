@@ -1,7 +1,9 @@
-# pyre-check: max-pypy-ratio=4
-# The ceiling sits between the two measured states: served this runs 2.6x pypy,
-# and with the arity-2 reader off the loop pays the opaque residual (about 198x
-# when the retired `subscr_specialised_pair` fold was the only reader).
+# pyre-check: max-pypy-ratio=3.5
+# CI measures dynasm at 1.0x-1.3x pypy and cranelift at 1.7x-2.9x. A ceiling of
+# 3.5 keeps the derived floor (0.875x) under the dynasm readings, which a ceiling
+# of 4 put at exactly parity. With the arity-2 reader off, the loop pays the
+# opaque residual (about 198x when the retired `subscr_specialised_pair` fold
+# was the only reader).
 # #171/#11 Approach C, SUBSCRIPT slice: canonical-tuple `t[i]` emits a PURE
 # getarrayitem in the JIT walker (OptPure CSEs / const-folds the element load).
 #

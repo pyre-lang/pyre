@@ -1017,9 +1017,16 @@ fn exitcase_is_default(exitcase: &Option<Hlvalue>) -> bool {
 }
 
 fn llvalue_matches_const(value: &LLValue, case: &ConstValue) -> bool {
+    // `LLFrame.eval_block` picks the link whose `llexitcase` equals the
+    // switch value. Unsigned constants convert to `LLValue::Int` via
+    // `n as i64` (`const_to_llvalue` / `any_to_llvalue`); match that
+    // bit pattern against `ConstValue::UInt` exit cases.
     if matches!(
         (value, case),
         (LLValue::Int(a), ConstValue::Int(b)) if a == b
+    ) || matches!(
+        (value, case),
+        (LLValue::Int(a), ConstValue::UInt(b)) if *a == *b as i64
     ) || matches!(
         (value, case),
         (LLValue::Bool(a), ConstValue::Bool(b)) if a == b
@@ -1721,6 +1728,65 @@ mod tests {
             )
             .expect("switch with default arm runs");
         assert_eq!(*out.downcast::<i64>().expect("Signed return"), 999);
+
+        // Unsigned switch: `llexitcase` is `ConstValue::UInt`; the
+        // switch value is the same bit pattern (`LLValue::Int`).
+        // Matching 0 takes the UInt(0) arm; 99 falls through to default.
+        let uswitch = Variable::named("us");
+        uswitch.set_concretetype(Some(LowLevelType::Unsigned));
+        let ustart = Block::shared(vec![uswitch.clone().into()]);
+        ustart.borrow_mut().exitswitch = Some(uswitch.clone().into());
+        let uretvar = Hlvalue::Variable(Variable::named("uret"));
+        if let Hlvalue::Variable(v) = &uretvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let ugraph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "switch_uint",
+            ustart.clone(),
+            uretvar,
+        )));
+        let ureturnblock = ugraph.borrow().returnblock.clone();
+        let ucase0 = Hlvalue::Constant(FlowConstant::new(ConstValue::UInt(0)));
+        let ucase1 = Hlvalue::Constant(FlowConstant::new(ConstValue::UInt(1)));
+        let udefault = Hlvalue::Constant(FlowConstant::new(ConstValue::byte_str("default")));
+        let mut ulink0 = Link::new(
+            vec![Hlvalue::Constant(FlowConstant::new(ConstValue::Int(10)))],
+            Some(ureturnblock.clone()),
+            Some(ucase0.clone()),
+        );
+        ulink0.llexitcase = Some(ucase0);
+        let mut ulink1 = Link::new(
+            vec![Hlvalue::Constant(FlowConstant::new(ConstValue::Int(20)))],
+            Some(ureturnblock.clone()),
+            Some(ucase1.clone()),
+        );
+        ulink1.llexitcase = Some(ucase1);
+        let ulink_default = Link::new(
+            vec![Hlvalue::Constant(FlowConstant::new(ConstValue::Int(999)))],
+            Some(ureturnblock),
+            Some(udefault),
+        );
+        ustart.closeblock(vec![
+            ulink0.into_ref(),
+            ulink1.into_ref(),
+            ulink_default.into_ref(),
+        ]);
+        let uout0 = interp
+            .eval_graph(
+                ugraph.clone() as Rc<dyn Any>,
+                vec![Rc::new(0_i64) as Rc<dyn Any>],
+                false,
+            )
+            .expect("unsigned switch matches UInt(0)");
+        assert_eq!(*uout0.downcast::<i64>().expect("Signed return"), 10);
+        let uout_default = interp
+            .eval_graph(
+                ugraph as Rc<dyn Any>,
+                vec![Rc::new(99_i64) as Rc<dyn Any>],
+                false,
+            )
+            .expect("unsigned switch default arm runs");
+        assert_eq!(*uout_default.downcast::<i64>().expect("Signed return"), 999);
     }
 
     #[test]
