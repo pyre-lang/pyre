@@ -122,4 +122,17 @@ none_pointer = ctypes.cast(none_pointer_base, ctypes.POINTER(ctypes.py_object))
 none_pointer[0] = None
 assert "0" not in none_pointer._objects
 
+# After CFuncPtr.__del__, a later call still reaches the Python callable.
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+def cb(x):
+    return x + 1
+
+
+recorded = cb(1)
+d = getattr(cb, "__del__", None)
+if d is not None:
+    d()
+    d()
+assert cb(1) == 2
+
 print("OK")

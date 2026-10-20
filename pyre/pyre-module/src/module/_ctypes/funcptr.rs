@@ -201,11 +201,14 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
 }
 
 fn cfuncptr_del(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    // CFuncPtr.__del__: free the thunk and prepared state, then clear `_ptr`
+    // so a later call takes the Python-callable arm instead of the freed address.
     if let Some(&obj) = args.first() {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = _roots.pin_roots(&[obj]);
         super::callbacks::free_thunk(_roots.get(obj_slot));
         free_prepared(_roots.get(obj_slot));
+        let _ = store_funcptr_addr(_roots.get(obj_slot), 0);
     }
     Ok(pyre_object::w_none())
 }

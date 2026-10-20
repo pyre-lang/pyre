@@ -60,15 +60,15 @@ mod imp {
         let wref = unsafe { pyre_object::weakref::w_weakref_new(current_obj()) };
         let mut slot = Box::new(wref as usize);
         let slot_ptr = std::ptr::from_mut(&mut *slot).cast::<usize>();
-        let rooted = unsafe {
-            pyre_object::gc_hook::try_gc_add_root(slot_ptr.cast::<pyre_object::gc_hook::GCREF>())
-        };
 
         let userdata = Box::new(ThunkUserdata {
             slot: slot_ptr,
             result_width,
         });
         let additional_arg = std::ptr::from_ref(&*userdata) as isize;
+        // Box::new and libffi prep do not collect, so the Weakref cannot move
+        // before this root is installed. Registering only after CallbackThunk::new
+        // succeeds keeps an Err from dropping a still-registered Box.
         let thunk = CallbackThunk::new(
             ffi_arg_types,
             ffi_res_type,
@@ -77,6 +77,9 @@ mod imp {
             flags,
         )
         .map_err(map_libffi_error)?;
+        let rooted = unsafe {
+            pyre_object::gc_hook::try_gc_add_root(slot_ptr.cast::<pyre_object::gc_hook::GCREF>())
+        };
         let code = thunk.code_ptr();
 
         let stored = Box::new(StoredThunk {
