@@ -1,15 +1,12 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=13
 # The ceiling is 1.25x the slowest gated reading (ubuntu cranelift 10.3x).
-# pyre-check: jitstats-band=guard_failures=15
-# `guard_failures` sits on a minor-collection boundary. Under check.py's 4MB
-# nursery, dynasm reads 4807, and cranelift and wasm read 4814 on macOS and
-# 4815 on ubuntu, with six loops and 26 bridges throughout. The extra
-# failures come from one guard that keeps failing before its bridge compiles:
-# the `counter.py` `invoke_after_minor_collection` decay lands inside that
-# guard's trace_eagerness ticks on cranelift and wasm, not on dynasm. The
-# nursery moves the reading on each backend: 2MB gives dynasm 4809 and
-# cranelift 4822, 3MB gives 4814 and 4818, and 5MB or 8MB gives 4807 on both.
-# The band covers that measured 4807-4822 range.
+# pyre-check: jitstats-band=guard_failures=20
+# `guard_failures` sits on a minor-collection boundary: one guard keeps
+# failing before its bridge compiles, and the `counter.py`
+# `invoke_after_minor_collection` decay lands inside its trace_eagerness ticks
+# at a point the nursery traffic picks. Against the 4553 baseline, ubuntu CI
+# reads 4572 on wasm with six loops and 25 bridges, while dynasm and cranelift
+# stay within 15 of it. The band covers that 4553-4572 range.
 # A set comprehension whose element call consumes the very heap it is draining,
 # so a body execution replayed or dropped by the tracer changes the heap, not
 # just the result.

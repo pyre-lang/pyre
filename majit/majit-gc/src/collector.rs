@@ -2536,6 +2536,26 @@ impl MiniMarkGC {
         self.spill_to_oldgen_or_null(type_id, total_size)
     }
 
+    /// The nursery bump of `malloc_varsize` alone: null when the request is
+    /// past `large_object_threshold`, carries an old-style finalizer, or does
+    /// not fit in the nursery's free space. Nothing collects and nothing is
+    /// born old here; the caller chooses what a null answer falls back to.
+    pub fn try_alloc_nursery_bump_typed(&mut self, type_id: u32, payload_size: usize) -> GcRef {
+        let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
+            return GcRef(0);
+        };
+        if total_size >= self.config.large_object_threshold
+            || self.type_has_old_style_finalizer(type_id)
+        {
+            return GcRef(0);
+        }
+        let ptr = self.nursery.alloc(total_size);
+        if ptr.is_null() {
+            return GcRef(0);
+        }
+        self.finish_bumped_nursery_object::<false>(ptr, type_id)
+    }
+
     /// The old-gen spill
     /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement)
     /// leaves out of line, for a large object or a nursery with no room.
@@ -5666,6 +5686,14 @@ impl MiniMarkGC {
                 let (read_addr, read_tid) = self
                     .resolve_possibly_forwarded(obj_addr, type_id)
                     .unwrap_or((obj_addr, type_id));
+                if (read_tid as usize) >= self.types.len() && (type_id as usize) >= self.types.len()
+                {
+                    panic!(
+                        "GC BUG: object header names no type: type_id={type_id:#x} \
+                         obj_addr={obj_addr:#x} nursery_start={:#x} site={site}",
+                        self.nursery.start_ptr() as usize,
+                    );
+                }
                 let type_info = self.types.get(if (read_tid as usize) < self.types.len() {
                     read_tid
                 } else {
@@ -5727,6 +5755,23 @@ impl MiniMarkGC {
         }
         let hdr_ptr = (obj_addr - GcHeader::SIZE) as *mut GcHeader;
 
+        // A poisoned header is a dead object an earlier minor collection
+        // freed. Its flag bits include PINNED, so without this check the
+        // stale edge would register the corpse as a pinned survivor.
+        if self.nursery.poison_enabled()
+            && unsafe { *(hdr_ptr as *const usize) } == (usize::MAX / 0xff) * 0xaa
+        {
+            panic!(
+                "GC BUG: traced edge reaches a poisoned nursery object: obj_addr={:#x} \
+                 slot_addr={:#x} holder_addr={:#x} holder_type_id={:?} site={} parent_site={}",
+                obj_addr,
+                slot_addr,
+                holder_addr,
+                (holder_addr != 0).then(|| unsafe { (*header_of(holder_addr)).type_id() }),
+                site,
+                parent_site,
+            );
+        }
         // `_trace_drag_out` tests forwarding before PINNED: the forwarding
         // marker has every flag bit set and must not be mistaken for a pin.
         if unsafe { (*hdr_ptr).is_forwarded() } {
@@ -7895,9 +7940,15 @@ impl MiniMarkGC {
     /// clear is only legal while it is on that list; `collect_oldrefs_to_nursery`
     /// re-sets the flag. The bug class is the flag clear and the object absent
     /// from the list.
+    ///
+    /// An object outside the managed heap (a `malloc_typed` prebuilt) carries
+    /// no barrier flag: its stores mark the prebuilt roots dirty
+    /// (`mark_prebuilt_roots_dirty`) and the minor collection walks it as a
+    /// root, which is `prebuilt_root_objects`' job upstream.
     fn debug_assert_track_young_ptrs_or_remembered(&self, obj_addr: usize, hdr: &GcHeader) {
         if hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS)
             || self.old_objects_pointing_to_young.contains(&obj_addr)
+            || !self.is_managed_heap_object(obj_addr)
         {
             return;
         }

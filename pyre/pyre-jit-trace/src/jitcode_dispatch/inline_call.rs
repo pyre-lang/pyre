@@ -9804,6 +9804,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // them is boxed. `to_pyobj` allocates for an int or a float, and that
         // collection moves a kwargs dict or a vararg tuple that is still only
         // a raw pointer later in `callee_arg_concretes`.
+        //
+        // The cell and frame records above grow the trace and can
+        // minor-collect, so the copies seeded into the register file are
+        // stale by now. Read each argument back the way `perform_call`
+        // reads `box.getref_base()`: from the forwarded box, else from its
+        // pin.
+        arg_pins.refresh(&mut callee_arg_concretes);
+        for i in 0..seeded_locals {
+            if matches!(callee_arg_concretes[i], ConcreteValue::Ref(value) if !value.is_null())
+                && let Some(live) = walker_concrete_ref_object(ctx, callee_args[i])
+            {
+                callee_arg_concretes[i] = ConcreteValue::Ref(live);
+            }
+        }
         let arg_roots = pyre_object::gc_roots::push_roots();
         let mut raw_args = Vec::with_capacity(seeded_locals);
         let mut box_later = Vec::new();

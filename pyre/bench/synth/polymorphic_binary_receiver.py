@@ -1,3 +1,10 @@
+# pyre-check: jitstats-band=guard_failures=17
+# guard_failures reads 849 or 854 on one macOS arm64 dynasm binary as
+# PYPY_GC_NURSERY moves between 2M, 4M, 8M and 16M, and ubuntu CI reads 864 on
+# dynasm and 866 on cranelift with ten loops and four bridges: `counter.py
+# invoke_after_minor_collection` runs `decay_all_counters` every 32 minor
+# collections, so one guard's count follows nursery traffic. The width is the
+# 849 -> 866 distance.
 # A BINARY_OP (`+`/`*`) whose receiver alternates at runtime between an exact
 # builtin int and a user-class (or int-subclass) instance at the SAME hot site.
 # The raw int specialization bypasses special-method dispatch, so it must only

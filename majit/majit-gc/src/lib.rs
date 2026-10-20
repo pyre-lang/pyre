@@ -3300,6 +3300,18 @@ pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
     }
 }
 
+/// The nursery bump of the active backend's GC, without a collection and
+/// without an old-generation spill: `GcRef(0)` when the nursery has no room,
+/// the request is large, or no direct backend GC is installed.
+pub fn try_alloc_nursery_bump_typed(type_id: u32, payload_size: usize) -> GcRef {
+    match ACTIVE_ALLOC_NURSERY_TYPED.get() {
+        Some(_) if !gc_box_installed() => {
+            gc_sync::gc_op(|g| g.try_alloc_nursery_bump_typed(type_id, payload_size))
+        }
+        _ => GcRef(0),
+    }
+}
+
 /// [`alloc_nursery_typed`] for a type that carries neither a finalizer nor the
 /// weakref flag: `malloc_fast` (`framework.py:361-382`), the copy
 /// `gct_fv_gc_malloc` (`framework.py`) selects for exactly that case.

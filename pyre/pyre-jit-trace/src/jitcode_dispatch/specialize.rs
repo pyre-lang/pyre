@@ -20993,6 +20993,10 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
         }
     }
 
+    // `pycode_bits` and `w_globals` are raw words read off the frame. Every
+    // record below can minor-collect, so mint the code object's ConstPtr now:
+    // the constant table forwards it, a raw word does not.
+    let pycode_const = ctx.trace_ctx.const_ref(pycode_bits);
     let debug_op = if let Some(cached) = cached_debug {
         cached
     } else {
@@ -21007,27 +21011,32 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
     } else {
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, frame_op, code_descr)
     };
-    let pycode_const = ctx.trace_ctx.const_ref(pycode_bits);
-    let promoted = if ctx.trace_ctx.const_value(pycode_op) == Some(pycode_bits) {
-        pycode_op
-    } else {
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[pycode_op, pycode_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(pycode_op, pycode_const);
-        pycode_const
-    };
+    let promoted =
+        if ctx.trace_ctx.const_value(pycode_op) == ctx.trace_ctx.const_value(pycode_const) {
+            pycode_op
+        } else {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[pycode_op, pycode_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(pycode_op, pycode_const);
+            pycode_const
+        };
     let globals_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         promoted,
         crate::descr::pycode_w_globals_quasi_descr(),
     );
     if walker_concrete_ref_object(ctx, globals_op).is_none() {
+        // Reread through the forwarded constant, not the pre-record word.
+        let Some(pycode_obj) = walker_concrete_ref_object(ctx, pycode_const) else {
+            return Ok(None);
+        };
+        let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(pycode_obj) };
         ctx.trace_ctx.set_opref_concrete(
             globals_op,
             majit_ir::Value::Ref(majit_ir::GcRef(w_globals as usize)),
@@ -21150,19 +21159,29 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
         return Ok(false);
     }
 
+    // The presence guard above and the field loads below are recorded, and a
+    // record can minor-collect and move a young debugdata. Read its fields
+    // through the forwarded box (`box.getref_base()` in
+    // `_opimpl_getfield_gc_any_pureornot`), never through `debugdata_ref`,
+    // the shadow word taken before those records.
+    let debugdata_now = |ctx: &mut WalkContext<'_, '_, Sym>| {
+        walker_concrete_ref_object(ctx, debugdata_op)
+            .map(|d| d as *const pyre_interpreter::pyframe::FrameDebugData)
+    };
     let result = match helper {
         majit_ir::RuntimeHelperKind::LoadImportLocals => {
             if !debugdata_present {
                 ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
             } else {
-                let shadow =
-                    debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
-                let w_locals = unsafe { (*shadow).w_locals };
                 let live = crate::state::opimpl_getfield_gc_r(
                     ctx.trace_ctx,
                     debugdata_op,
                     crate::descr::frame_debug_data_w_locals_descr(),
                 );
+                let Some(debugdata) = debugdata_now(ctx) else {
+                    return Ok(false);
+                };
+                let w_locals = unsafe { (*debugdata).w_locals };
                 if w_locals.is_null() {
                     walker_guard_stamped_presence(ctx, op_pc, live, false)?;
                     if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(0) {
@@ -21185,10 +21204,10 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
         }
         majit_ir::RuntimeHelperKind::LoadImportGlobals => {
             debug_assert!(debugdata_present);
-            let shadow =
-                debugdata_ref.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
-            let w_globals = unsafe { (*shadow).w_globals };
-            if w_globals.is_null() {
+            let Some(debugdata) = debugdata_now(ctx) else {
+                return Ok(false);
+            };
+            if unsafe { (*debugdata).w_globals }.is_null() {
                 return Ok(false);
             }
             let live = crate::state::opimpl_getfield_gc_r(
@@ -21196,6 +21215,10 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
                 debugdata_op,
                 crate::descr::frame_debug_data_w_globals_descr(),
             );
+            let Some(debugdata) = debugdata_now(ctx) else {
+                return Ok(false);
+            };
+            let w_globals = unsafe { (*debugdata).w_globals };
             if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(w_globals as i64) {
                 return Ok(false);
             }

@@ -203,11 +203,13 @@ fn entries_payload_bytes<K, V>(n: usize) -> usize {
 /// `n == 0` is the empty array, represented by null (an empty `RDict` holds
 /// no array until the first insert).
 ///
-/// Upstream's `lltype.malloc` is young. The block stays non-moving because
-/// mutator code hands out `&K` / `&V` into the array (`external_malloc`
-/// `alloc_young=True`). An old-gen `DICTENTRYARRAY` that holds a heap
-/// type's `__dict__` / `__weakref__` GetSet copies (`w_objclass`) enters
-/// the remembered set and promotes the type on every minor.
+/// Upstream's `lltype.malloc` is young: a nursery `malloc_varsize` that
+/// moves at the next minor collection. A caller holding the array address
+/// or a `&K` / `&V` into it across a collection reads it back from a root.
+/// An old-gen
+/// `DICTENTRYARRAY` that holds a heap type's `__dict__` / `__weakref__`
+/// GetSet copies (`w_objclass`) would enter the remembered set and promote
+/// the type on every minor, so the block is never born old on purpose.
 pub fn alloc_entries<K, V>(n: usize) -> *mut GcEntries<K, V>
 where
     (K, V): GcEntriesType,
@@ -218,23 +220,29 @@ where
     let bytes = entries_payload_bytes::<K, V>(n);
     let tid = <(K, V)>::entries_gc_type_id();
     if tid != 0 {
-        // `_ll_malloc_entries`: `malloc(ENTRIES, n, zero=True)` is a
-        // nursery GC array. Rust hands out `&K` / `&V` into the block, so
-        // the address stays non-moving (`external_malloc(alloc_young=True)`)
-        // while the lifetime stays young: MiniMark drops young-rawmalloc
-        // remembered-set entries before the minor walk
-        // (`remove_young_arrays_from_old_objects_pointing_to_young`), so a
-        // discarded `type(name, (), {})` dict dies with its GetSets instead
-        // of promoting the type through a born-old `DICTENTRYARRAY`.
-        let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_raw(tid, bytes);
+        // `_ll_malloc_entries`: `malloc(ENTRIES, n, zero=True)` is
+        // `incminimark.py malloc_varsize`: a nursery bump, and
+        // `external_malloc(..., alloc_young=True)` past the large-object
+        // threshold. A full nursery takes the same young external birth
+        // instead of `collect_and_reserve`: dict insertion callers hold raw
+        // GC pointers on the Rust stack across `ll_dict_grow`, so nothing
+        // collects here and the threshold becomes the deferred major
+        // request the interpreter safepoint serves.
+        let young = majit_gc::try_alloc_nursery_bump_typed(tid, bytes).0 as crate::gc_hook::GCREF;
+        let raw = if young.is_null() {
+            crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(tid, bytes)
+        } else {
+            young
+        };
         if !raw.is_null() {
-            // pyre adaptation of `_ll_malloc_entries`: the collecting
-            // young-nonmoving malloc does not zero-fill; `malloc(..., zero=True)`
-            // does.  The barrier is for a refused young birth, which lands
-            // in the old generation and may be filled with young items before
-            // the next minor.
+            // Neither malloc zero-fills; `malloc(..., zero=True)` does.
+            // `GCREF` points at a zero-sized `GCREFOpaque`, so the clear
+            // goes through `*mut u8`; on the GCREF it writes no bytes.
+            // The barrier is for a type whose young birth is refused and
+            // is born old, then filled with young items before the next
+            // minor.
             unsafe {
-                std::ptr::write_bytes(raw, 0, bytes);
+                std::ptr::write_bytes(raw as *mut u8, 0, bytes);
             }
             let entries = raw as *mut GcEntries<K, V>;
             unsafe {

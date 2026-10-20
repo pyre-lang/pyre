@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=24
+# pyre-check: jitstats-band=guard_failures=15
+# dynasm guard_failures reads 200, 206, 215 on one macOS arm64 binary at
+# PYPY_GC_NURSERY 8M, 4M, 2M, and 200 vs 208 on two main builds of the same
+# source: `counter.py invoke_after_minor_collection` runs
+# `decay_all_counters` every 32 minor collections, so the count follows
+# nursery traffic. The width is the 200 -> 215 distance.
 # N/ITERS are sized to prove the opcode compiles and to drive the compiled
 # loop thousands of times, not to race pypy. The ceiling is 15% over the
 # widest gated reading (macos dynasm 20.9x).

@@ -87,8 +87,12 @@ const PERTURB_SHIFT: u32 = 5;
 
 /// Walk live `d.entries` slots with `ll_getitem_fast`, not
 /// `Enumerate` / `FilterMap`.
+///
+/// `entries` is the address of the dict's `entries` field, read again at
+/// every step the way `_ll_dictnext` reads `dict.entries`: the array is a
+/// nursery object, and a collection between two steps moves it.
 pub struct LiveIter<'a, K, V> {
-    entries: *const Entry<K, V>,
+    entries: *const *mut GcEntries<K, V>,
     back: usize,
     front: usize,
     _mark: std::marker::PhantomData<&'a Entry<K, V>>,
@@ -99,8 +103,8 @@ unsafe impl<K: Sync, V: Sync> Sync for LiveIter<'_, K, V> {}
 
 impl<'a, K, V> LiveIter<'a, K, V> {
     /// `ll_getitem_fast` over `entries[0:num_ever_used_items]`. The prefix
-    /// is a pointer plus a length, not `slice::from_raw_parts`.
-    fn from_ptr(entries: *const Entry<K, V>, len: usize) -> Self {
+    /// is the field plus a length, not `slice::from_raw_parts`.
+    fn new(entries: *const *mut GcEntries<K, V>, len: usize) -> Self {
         Self {
             entries,
             front: 0,
@@ -110,7 +114,7 @@ impl<'a, K, V> LiveIter<'a, K, V> {
     }
 
     fn entry_at(&self, i: usize) -> Option<(&'a K, &'a V)> {
-        let e = unsafe { &*self.entries.add(i) };
+        let e = unsafe { &*entries_item_ptr(*self.entries).add(i) };
         if e.f_valid {
             Some((&e.key, &e.value))
         } else {
@@ -213,16 +217,17 @@ impl<K, V> DoubleEndedIterator for LiveValues<'_, K, V> {
     }
 }
 
+/// The mutable twin of [`LiveIter`], reading `d.entries` at every step.
 pub struct LiveIterMut<'a, K, V> {
-    entries: *mut Entry<K, V>,
+    entries: *const *mut GcEntries<K, V>,
     len: usize,
     front: usize,
     back: usize,
     _mark: std::marker::PhantomData<&'a mut Entry<K, V>>,
 }
 
-// `entries` is derived from the `&'a mut [Entry<K, V>]` handed to
-// `new`, so the iterator holds that slice's unique borrow, and `front` / `back`
+// `entries` is the field of the `&'a mut RDict` that built the iterator,
+// so the iterator holds that dict's unique borrow, and `front` / `back`
 // only ever move toward each other — no index is yielded twice and the two ends
 // cannot hand out the same item. That makes the raw pointer carry exactly the
 // thread-safety of `slice::IterMut`, whose bounds these mirror; storing it as a
@@ -232,10 +237,9 @@ unsafe impl<K: Send, V: Send> Send for LiveIterMut<'_, K, V> {}
 unsafe impl<K: Sync, V: Sync> Sync for LiveIterMut<'_, K, V> {}
 
 impl<'a, K, V> LiveIterMut<'a, K, V> {
-    fn new(entries: &'a mut [Entry<K, V>]) -> Self {
-        let len = entries.len();
+    fn new(entries: *const *mut GcEntries<K, V>, len: usize) -> Self {
         Self {
-            entries: entries.as_mut_ptr(),
+            entries,
             len,
             front: 0,
             back: len,
@@ -245,7 +249,7 @@ impl<'a, K, V> LiveIterMut<'a, K, V> {
 
     fn entry_at(&mut self, i: usize) -> Option<(&'a K, &'a mut V)> {
         debug_assert!(i < self.len);
-        let e = unsafe { &mut *self.entries.add(i) };
+        let e = unsafe { &mut *entries_item_ptr(*self.entries).add(i) };
         if e.f_valid {
             Some((&e.key, &mut e.value))
         } else {
@@ -489,19 +493,23 @@ impl<K, V, S> RDict<K, V, S> {
     /// An old `DICTENTRYARRAY` is remembered before the collecting
     /// malloc (`write_barrier` / `remember_young_pointer`): pinning an
     /// old object does not walk its children during Scanning.
+    ///
+    /// Answers the slot holding `d.entries`, null for an empty dict. A
+    /// nursery array moves at a collection, so the caller reads it back
+    /// with [`pinned_entries`] instead of re-reading the field.
     #[inline]
-    pub(crate) fn pin_table_and_entries(&self) {
+    pub(crate) fn pin_table_and_entries(&self) -> usize {
         self.barrier_entries();
         let table = self as *const Self as crate::gc_hook::GCREF;
         if crate::gc_hook::try_gc_owns_object(table) {
             let _ = crate::gc_roots::pin_root(table as crate::PyObjectRef);
         }
-        if !self.entries.is_null() {
-            let _ = crate::gc_roots::pin_root(self.entries as crate::PyObjectRef);
-        }
+        let entries_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(self.entries as crate::PyObjectRef);
         if !self.indexes.is_null() {
             let _ = crate::gc_roots::pin_root(self.indexes as crate::PyObjectRef);
         }
+        entries_slot
     }
 
     /// `ll_dict_copy` into a table that is already a GC object.
@@ -518,7 +526,7 @@ impl<K, V, S> RDict<K, V, S> {
         let n = src.allocated_len();
         let _roots = crate::gc_roots::push_roots();
         self.pin_table_and_entries();
-        src.pin_table_and_entries();
+        let src_slot = src.pin_table_and_entries();
         let entries = if n == 0 {
             std::ptr::null_mut()
         } else {
@@ -526,7 +534,13 @@ impl<K, V, S> RDict<K, V, S> {
             // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
             // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
             unsafe {
-                ll_arraycopy(src.entries, entries, 0, 0, src.num_ever_used_items);
+                ll_arraycopy(
+                    pinned_entries(src_slot),
+                    entries,
+                    0,
+                    0,
+                    src.num_ever_used_items,
+                );
             }
             entries
         };
@@ -597,8 +611,9 @@ impl<K, V, S> RDict<K, V, S> {
         (K, V): GcEntriesType,
     {
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let newitems = alloc_entries::<K, V>(new_allocated);
+        self.entries = pinned_entries(entries_slot);
         unsafe {
             ll_arraycopy(self.entries, newitems, 0, 0, self.allocated_len());
         }
@@ -621,9 +636,11 @@ impl<K, V, S> RDict<K, V, S> {
     {
         let _roots = crate::gc_roots::push_roots();
         self.pin_table_and_entries();
-        let cloned = self.clone();
+        let mut cloned = self.clone();
         if !cloned.entries.is_null() {
-            let _ = crate::gc_roots::pin_root(cloned.entries as crate::pyobject::PyObjectRef);
+            cloned.entries =
+                crate::gc_roots::pin_root(cloned.entries as crate::pyobject::PyObjectRef)
+                    as *mut GcEntries<K, V>;
         }
         crate::gc_storage::gc_alloc_young_storage_box(cloned, tid)
     }
@@ -775,25 +792,6 @@ impl<K, V, S> RDict<K, V, S> {
         (key, value)
     }
 
-    #[inline]
-    fn used_entries_mut(&mut self) -> &mut [Entry<K, V>] {
-        self.barrier_entries();
-        self.used_entries_mut_for_trace()
-    }
-
-    /// The live prefix without the write barrier: the collector rewrites a
-    /// moved reference in place while it traces, and `gc_trace` emits no
-    /// barrier for that write.
-    #[inline]
-    fn used_entries_mut_for_trace(&mut self) -> &mut [Entry<K, V>] {
-        let n = self.num_ever_used_items;
-        if n == 0 {
-            &mut []
-        } else {
-            unsafe { std::slice::from_raw_parts_mut(self.entry_ptr(), n) }
-        }
-    }
-
     /// `ll_getitem_nonneg` on `d.indexes`. The stored word is an `i64`;
     /// [`FREE`], [`DELETED`], and `slot + VALID_OFFSET` all fit in `u32`.
     #[inline]
@@ -937,36 +935,37 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     pub fn iter(&self) -> LiveIter<'_, K, V> {
-        LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items)
+        LiveIter::new(&self.entries, self.num_ever_used_items)
     }
 
     /// Pairs with their slot numbers, for a caller that must name an entry
     /// again after the walk.
     pub fn iter_slots(&self) -> LiveSlotIter<'_, K, V> {
         LiveSlotIter {
-            inner: LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items),
+            inner: LiveIter::new(&self.entries, self.num_ever_used_items),
         }
     }
 
     pub fn iter_mut(&mut self) -> LiveIterMut<'_, K, V> {
-        LiveIterMut::new(self.used_entries_mut())
+        self.barrier_entries();
+        self.iter_mut_for_trace()
     }
 
     pub fn keys(&self) -> LiveKeys<'_, K, V> {
         LiveKeys {
-            inner: LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items),
+            inner: LiveIter::new(&self.entries, self.num_ever_used_items),
         }
     }
 
     pub fn values(&self) -> LiveValues<'_, K, V> {
         LiveValues {
-            inner: LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items),
+            inner: LiveIter::new(&self.entries, self.num_ever_used_items),
         }
     }
 
     pub fn values_mut(&mut self) -> LiveValuesMut<'_, K, V> {
         LiveValuesMut {
-            inner: LiveIterMut::new(self.used_entries_mut()),
+            inner: self.iter_mut(),
         }
     }
 
@@ -974,14 +973,14 @@ impl<K, V, S> RDict<K, V, S> {
     /// place during a collection. Takes no write barrier; a mutator store
     /// goes through `iter_mut`.
     pub fn iter_mut_for_trace(&mut self) -> LiveIterMut<'_, K, V> {
-        LiveIterMut::new(self.used_entries_mut_for_trace())
+        LiveIterMut::new(&self.entries, self.num_ever_used_items)
     }
 
     /// [`values_mut`](Self::values_mut) for a GC walk; see
     /// [`iter_mut_for_trace`](Self::iter_mut_for_trace).
     pub fn values_mut_for_trace(&mut self) -> LiveValuesMut<'_, K, V> {
         LiveValuesMut {
-            inner: LiveIterMut::new(self.used_entries_mut_for_trace()),
+            inner: self.iter_mut_for_trace(),
         }
     }
 
@@ -1563,7 +1562,7 @@ where
         let old_len = self.allocated_len();
         let shrink = self.num_live_items < old_len / 4;
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let newitems = if shrink {
             let new_slot = crate::gc_roots::shadow_stack_len();
             let newitems = alloc_entries::<K, V>(overallocate_entries_len(self.num_live_items));
@@ -1571,6 +1570,7 @@ where
             if !newitems.is_null() {
                 crate::gc_hook::try_gc_write_barrier_managed(newitems as crate::gc_hook::GCREF);
             }
+            self.entries = pinned_entries(entries_slot);
             crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K, V>
         } else {
             // One barrier for the in-place writes (`llop.gc_writebarrier`).
@@ -1961,7 +1961,7 @@ where
             return RDict::with_hasher(S2::default());
         }
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let mut key_slots = Vec::with_capacity(n);
         for key in keys {
             key_slots.push(pin_key_gc_refs(key));
@@ -1976,12 +1976,21 @@ where
         dst.entries = crate::gc_roots::shadow_stack_get(new_slot) as *mut GcEntries<K2, V>;
         let mut live = 0usize;
         for slot in 0..n {
-            if !self.entry_valid(slot) {
+            let src_valid =
+                unsafe { &*entries_item_ptr(pinned_entries::<K, V>(entries_slot)).add(slot) }
+                    .f_valid;
+            if !src_valid {
                 continue;
             }
-            let value = self.entry_at(slot).value;
             let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
+            // `hash_of` can run a user `__hash__` and collect, so the key,
+            // the source value and both arrays are read back from their
+            // slots after it.
             let hash = dst.hash_of(&key);
+            let key = reload_key_gc_refs(keys[slot], key_slots[slot]);
+            let value =
+                unsafe { &*entries_item_ptr(pinned_entries::<K, V>(entries_slot)).add(slot) }.value;
+            dst.entries = pinned_entries::<K2, V>(new_slot);
             dst.barrier_entries();
             unsafe {
                 std::ptr::write(
@@ -2157,6 +2166,12 @@ fn reload_key_gc_refs<K: GcRefOffsets + Copy>(mut key: K, base: usize) -> K {
     key
 }
 
+/// `d.entries` read back from the slot [`RDict::pin_table_and_entries`]
+/// answered.
+fn pinned_entries<K, V>(slot: usize) -> *mut GcEntries<K, V> {
+    crate::gc_roots::shadow_stack_get(slot) as *mut GcEntries<K, V>
+}
+
 impl<K, V, S> FromIterator<(K, V)> for RDict<K, V, S>
 where
     K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
@@ -2198,7 +2213,7 @@ where
     fn clone(&self) -> Self {
         let n = self.allocated_len();
         let _roots = crate::gc_roots::push_roots();
-        self.pin_table_and_entries();
+        let entries_slot = self.pin_table_and_entries();
         let entries = if n == 0 {
             std::ptr::null_mut()
         } else {
@@ -2206,19 +2221,31 @@ where
             // rordereddict.py `ll_dict_copy`: `rgc.ll_arraycopy(dict.entries,
             // newdict.entries, 0, 0, newdict.num_ever_used_items)`.
             unsafe {
-                ll_arraycopy(self.entries, entries, 0, 0, self.num_ever_used_items);
+                ll_arraycopy(
+                    pinned_entries(entries_slot),
+                    entries,
+                    0,
+                    0,
+                    self.num_ever_used_items,
+                );
             }
 
             entries
         };
+        // The new array is a livevar across the index-block copy and the
+        // hasher clone; read it back from its slot after them.
+        let new_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(entries as crate::pyobject::PyObjectRef);
+        let indexes = self.clone_index_block();
+        let hash_builder = self.hash_builder.clone();
         Self {
-            indexes: self.clone_index_block(),
-            entries,
+            indexes,
+            entries: pinned_entries(new_slot),
             num_live_items: self.num_live_items,
             num_ever_used_items: self.num_ever_used_items,
             resize_counter: self.resize_counter,
             generation: self.generation,
-            hash_builder: self.hash_builder.clone(),
+            hash_builder,
         }
     }
 }
