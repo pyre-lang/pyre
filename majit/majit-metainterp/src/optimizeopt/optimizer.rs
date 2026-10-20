@@ -978,7 +978,25 @@ impl Optimizer {
                 let virtual_head_box = ctx
                     .get_box_replacement_operand_opt(raw)
                     .unwrap_or(Operand::None);
-                walk_visited.insert(top_key, virtual_head_box);
+                walk_visited.insert(top_key, virtual_head_box.clone());
+                // unroll.py `setinfo_from_preamble`: `if op.get_forwarded() is not None: return`.
+                // `import_state` already reinstalled the exported virtual PtrInfo
+                // (`op.set_forwarded(preamble_info)`) and the field infos via
+                // `setinfo_from_preamble_list(preamble_info.all_items(), ...)`.
+                // Rebuilding a fresh Virtual here replaces that shared cell with
+                // Phase-2 label-arg field boxes and drops the exported IntBounds.
+                if !virtual_head_box.is_none() && ctx.has_forwarding(&virtual_head_box) {
+                    for (_descr, field_info) in &iv.fields {
+                        let _ = Self::import_virtual_state_from_label_args(
+                            field_info,
+                            imported_label_args,
+                            &mut label_slot,
+                            ctx,
+                            &mut walk_visited,
+                        );
+                    }
+                    continue;
+                }
                 let mut fields = Vec::new();
                 for (descr, field_info) in &iv.fields {
                     let field_box = Self::import_virtual_state_from_label_args(
@@ -1736,7 +1754,18 @@ impl Optimizer {
                     && !resolved.is_constant()
                     && ctx.get_box_replacement_operand_opt(resolved).is_none()
                 {
-                    ctx.materialize_operand_at(resolved);
+                    // Producer-less resop: mint at this write of the export
+                    // key (`mint_box_at`), matching `ResOperation(...)` at
+                    // allocation. InputArg slots still bind through
+                    // `materialize_operand_at`'s InputArg arm.
+                    match resolved {
+                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                            ctx.materialize_operand_at(resolved);
+                        }
+                        _ => {
+                            ctx.mint_box_at(resolved);
+                        }
+                    }
                 }
                 resolved
             })
@@ -1749,7 +1778,12 @@ impl Optimizer {
             .iter()
             .map(|&arg| {
                 ctx.get_box_replacement_operand_opt(arg)
-                    .unwrap_or_else(|| ctx.materialize_operand_at(arg))
+                    .unwrap_or_else(|| match arg {
+                        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
+                            ctx.materialize_operand_at(arg)
+                        }
+                        _ => ctx.mint_box_at(arg),
+                    })
             })
             .collect();
         let preview_virtual_state =
@@ -1965,7 +1999,7 @@ impl Optimizer {
                         if arg.is_none() {
                             continue;
                         }
-                        *arg = ctx.get_box_replacement_operand(arg.to_opref());
+                        *arg = arg.get_box_replacement(false);
                     }
                     preamble_op.setfailargs(fail_args);
                 }
@@ -3650,7 +3684,10 @@ impl Optimizer {
                             "propagate_from_pass_range SameAs: source OpRef missing Box.type",
                         );
                         let same_as = OpCode::same_as_for_type(arg_type);
-                        let fresh = ctx.alloc_op_position_typed(arg_type);
+                        // history.py `record_same_as` mints the SameAs box at
+                        // allocation (`ResOperation(...)`); a later `_forwarded`
+                        // write (PtrInfo copy below) lands on that box.
+                        let (fresh, b_fresh) = ctx.reserve_virtual_box(arg_type);
                         let arg0 = ctx.materialize_operand_at(orig);
                         let mut op = Op::new(same_as, std::slice::from_ref(&arg0));
                         op.pos().set(fresh);
@@ -3693,9 +3730,7 @@ impl Optimizer {
                                 }
                                 other => other,
                             };
-                            if let Some(b) = ctx.get_box_replacement_operand_opt(fresh) {
-                                ctx.set_ptr_info(&b, fresh_info);
-                            }
+                            ctx.set_ptr_info(&b_fresh, fresh_info);
                         }
                         *arg = fresh;
                         // After allocating a fresh alias for an inputarg position,
@@ -4880,11 +4915,24 @@ impl Optimizer {
     /// optimizer.py `_clean_optimization_info(lst)` — drop `_forwarded`
     /// on each exported op so the next optimizer (the retrace body) does
     /// not inherit preamble forwarding.
-    fn clean_optimization_info(ops: &[majit_ir::OpRc]) {
+    pub(crate) fn clean_optimization_info(ops: &[majit_ir::OpRc]) {
         use majit_ir::forwarding::ForwardingHost;
         for op in ops {
             if !matches!(op.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
                 op.clear_forwarded();
+            }
+        }
+    }
+
+    /// `optimizer.py Optimizer._clean_optimization_info` over an operand
+    /// list. `unroll.py UnrollOptimizer.export_state` calls this on
+    /// `end_args` after expanding infos, so the next iteration's
+    /// `setinfo_from_preamble` does not early-return on leftover PtrInfo
+    /// (`unroll.py setinfo_from_preamble`: `if op.get_forwarded() is not None: return`).
+    pub(crate) fn clean_optimization_info_boxes(boxes: &[majit_ir::operand::Operand]) {
+        for box_ in boxes {
+            if !matches!(box_.get_forwarded(), majit_ir::forwarding::Forwarded::None) {
+                box_.clear_forwarded();
             }
         }
     }
@@ -5107,9 +5155,8 @@ impl Optimizer {
             current_op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
-            let new = current_op.arg(0).to_opref();
             let b_old = Operand::from_bound_op(op_rc);
-            let b_new = ctx.get_box_replacement_operand(new);
+            let b_new = current_op.arg(0).get_box_replacement(false);
             ctx.make_equal_to(&b_old, &b_new);
             return Ok(());
         }

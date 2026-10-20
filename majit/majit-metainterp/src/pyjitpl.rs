@@ -1706,6 +1706,10 @@ fn translate_trace_iter_box_map(
 ) -> SnapshotBoxes {
     for boxes in box_map.iter_mut().flatten() {
         for boxref in boxes.iter_mut() {
+            // Look up `_cache` by the recording position, then rewrite the
+            // OpRef. `attach_iter_cache` must run first: after the map the
+            // slot is in the fresh-iterator namespace.
+            boxref.attach_iter_cache(cache);
             *boxref = boxref.map_opref(|opref| translate_trace_iter_opref(opref, cache));
         }
     }
@@ -9534,10 +9538,18 @@ impl<M: Clone> MetaInterp<M> {
                         // are still the original trace.
                         let retry_ops: Vec<majit_ir::OpRc> =
                             preamble_data.base.operations().to_vec();
-                        simple_opt.byte_bridge_resume =
-                            snapshot_recorder.as_ref().map(|recorder| {
-                                recorder_self_feed(recorder, &trace.inputargs, &retry_ops)
-                            });
+                        let resume = snapshot_recorder.as_ref().map(|recorder| {
+                            recorder_self_feed(recorder, &trace.inputargs, &retry_ops)
+                        });
+                        if let Some(ref feed) = resume {
+                            crate::optimizeopt::attach_resume_snapshot_caches(
+                                &mut simple_opt.snapshot_boxes,
+                                &mut simple_opt.snapshot_vable_boxes,
+                                &mut simple_opt.snapshot_vref_boxes,
+                                feed.unique_cache(),
+                            );
+                        }
+                        simple_opt.byte_bridge_resume = resume;
                         let retry_result =
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 simple_opt.run_optimize_from_inputs(
@@ -12541,9 +12553,18 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
         optimizer.trace_inputarg_boxes = trace.inputargs.clone();
-        optimizer.byte_bridge_resume = snapshot_recorder
+        let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
+        if let Some(ref feed) = resume {
+            crate::optimizeopt::attach_resume_snapshot_caches(
+                &mut optimizer.snapshot_boxes,
+                &mut optimizer.snapshot_vable_boxes,
+                &mut optimizer.snapshot_vref_boxes,
+                feed.unique_cache(),
+            );
+        }
+        optimizer.byte_bridge_resume = resume;
 
         // Dumped before the call, not after: `Optimizer::propagate_from_pass_range`
         // resolves each argument in place on the op it is handed
@@ -13097,9 +13118,18 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
         optimizer.trace_inputarg_boxes = trace.inputargs.clone();
-        optimizer.byte_bridge_resume = snapshot_recorder
+        let resume = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder_self_feed(recorder, &trace.inputargs, &trace.ops));
+        if let Some(ref feed) = resume {
+            crate::optimizeopt::attach_resume_snapshot_caches(
+                &mut optimizer.snapshot_boxes,
+                &mut optimizer.snapshot_vable_boxes,
+                &mut optimizer.snapshot_vref_boxes,
+                feed.unique_cache(),
+            );
+        }
+        optimizer.byte_bridge_resume = resume;
 
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         let optimize_start = Instant::now();

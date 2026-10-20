@@ -380,10 +380,15 @@ fn snapshot_box_from_tagged<'c>(
     let decoded = untag_snapshot_pools(inputargs, value_slots, trb, tagged);
     let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded);
     // opencoder.py `SnapshotIterator._untag` returns `_cache[i]`, the box
-    // object itself. `_cache` is `_index`-keyed.
-    let cached = crate::pyjitpl::trace_iter_cached_box(snap_box.opref(), unique_cache);
+    // object itself. `_cache` is `_index`-keyed. Look up before rewriting
+    // the OpRef into the optimizer namespace.
+    let orig = snap_box.opref();
+    let cached = crate::pyjitpl::trace_iter_cached_box(orig, unique_cache);
     (
-        snap_box.map_opref(|opref| crate::pyjitpl::translate_trace_iter_opref(opref, unique_cache)),
+        crate::resume::SnapshotBox {
+            opref: crate::pyjitpl::translate_trace_iter_opref(orig, unique_cache),
+            cached: cached.cloned(),
+        },
         cached,
     )
 }
@@ -409,6 +414,10 @@ impl ByteBridgeResume {
             recorder: recorder as *const Trace,
             unique_cache,
         }
+    }
+
+    pub(crate) fn unique_cache(&self) -> &[Option<Operand>] {
+        &self.unique_cache
     }
 
     /// Highest position a numbered snapshot box can resolve to: every

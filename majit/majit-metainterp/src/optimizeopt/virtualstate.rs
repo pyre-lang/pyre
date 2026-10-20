@@ -2704,14 +2704,10 @@ fn create_state_or_none(
     if operand.is_none() {
         None
     } else {
-        let opref = operand.to_opref();
-        if opref.is_none() {
-            // Bound ResOp whose `pos` was never stamped: keep the
-            // operand so `Op.type_` can still pick the not_virtual leaf.
-            Some(export_single_operand(operand, ctx, cache))
-        } else {
-            Some(export_single_value(opref, ctx, cache))
-        }
+        // virtualstate.py VirtualStateConstructor.create_state walks the
+        // box it already holds (`box = get_box_replacement(box)`). Do not
+        // convert to OpRef and re-resolve through the producer map.
+        Some(export_single_operand(operand, ctx, cache))
     }
 }
 
