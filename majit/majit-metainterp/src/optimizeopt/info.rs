@@ -1185,8 +1185,13 @@ fn force_box_impl(
         if ctx.in_final_emission {
             // optimizer.py `Optimizer.emit_extra` → `emit` →
             // `_emit_operation`: `arg = self.force_box(op.getarg(i))`.
+            // `force_box_inline` is a no-op once the virtual flag is
+            // cleared, so also emit a parked malloc producer
+            // (`info.py AbstractVirtualPtrInfo.force_box` `getlastop`
+            // after `emit_extra` of the virtual's own allocation).
             for i in 0..op.num_args() {
                 let arg = ctx.force_box_inline(&op.arg(i));
+                ctx.emit_queued_producer(arg.to_opref());
                 op.setarg(i, arg);
             }
             ctx.emit_rc(op.clone());
@@ -2283,6 +2288,138 @@ mod tests {
 
         assert_eq!(ops[0].opcode, OpCode::NewWithVtable);
         assert_eq!(setfield_offsets(&ops), vec![24, 16]);
+    }
+
+    #[test]
+    fn force_box_emits_parked_field_alloc_before_setfield() {
+        // Window: a nested virtual was already force_box'd from a pass
+        // (virtual flag cleared, NEW_WITH_VTABLE still in the extra queue).
+        // Forcing the parent then SETFIELDs that box. `info.py`
+        // AbstractVirtualPtrInfo.force_box does emit_extra then getlastop,
+        // so the allocation is in `_newoperations` before `_force_elements`.
+        let field_descr: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Ref,
+            name: "value1",
+        });
+        let parent_descr: DescrRef = Arc::new(ForceSizeDescr {
+            all_fields: vec![field_descr.clone()],
+            gc_fields: vec![field_descr],
+            w_class: 0x1111,
+        });
+        let nested_descr: DescrRef = Arc::new(ForceSizeDescr {
+            all_fields: vec![],
+            gc_fields: vec![],
+            w_class: 0x2222,
+        });
+
+        let mut ctx = OptContext::new(32);
+        ctx.in_final_emission = false;
+
+        let mut nested_info = PtrInfo::virtual_obj(nested_descr.clone(), Some(0x2222));
+        let nested_rc = OpRc::new(Op::with_descr(OpCode::NewWithVtable, &[], nested_descr));
+        nested_rc.pos().set(OpRef::ref_op(613));
+        ctx.register_extra_producer(&nested_rc);
+        let nested_box = Operand::from_bound_op(&nested_rc);
+        nested_info.force_box(&nested_box, &mut ctx);
+        assert!(
+            !ctx.is_virtual(&nested_box),
+            "nested force_box clears the virtual flag while the alloc is still queued"
+        );
+
+        let mut parent_info = PtrInfo::virtual_obj(parent_descr.clone(), Some(0x1111));
+        parent_info.setfield(0, nested_box.clone());
+
+        let parent_rc = OpRc::new(Op::with_descr(OpCode::NewWithVtable, &[], parent_descr));
+        parent_rc.pos().set(OpRef::ref_op(636));
+        ctx.register_extra_producer(&parent_rc);
+        let parent_box = Operand::from_bound_op(&parent_rc);
+
+        ctx.in_final_emission = true;
+        parent_info.force_box(&parent_box, &mut ctx);
+
+        let ops: Vec<_> = ctx
+            .new_operations
+            .iter()
+            .map(|op| op.as_ref().clone())
+            .collect();
+        let nested_pos = nested_rc.pos().get();
+        let nested_alloc_idx = ops
+            .iter()
+            .position(|op| op.opcode == OpCode::NewWithVtable && op.pos().get() == nested_pos);
+        let setfield_idx = ops.iter().position(|op| {
+            op.opcode == OpCode::SetfieldGc
+                && op.num_args() >= 2
+                && op.arg(1).to_opref() == nested_pos
+        });
+        assert!(
+            nested_alloc_idx.is_some(),
+            "parked NEW_WITH_VTABLE for the field box must be emitted, ops={ops:?}"
+        );
+        assert!(
+            setfield_idx.is_some(),
+            "parent force must SETFIELD the field box, ops={ops:?}"
+        );
+        assert!(
+            nested_alloc_idx.unwrap() < setfield_idx.unwrap(),
+            "NEW_WITH_VTABLE must precede SETFIELD that reads the box, ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn force_box_leaves_parked_call_queued() {
+        // Window: SETFIELD of a field whose producer is a CALL extra.
+        // `info.py force_box` `getlastop` is the virtual's own allocation,
+        // not a stolen CALL. `optimizer.py _emit_operation` still
+        // force_box's CALL args through remaining passes.
+        let field_descr: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Ref,
+            name: "value1",
+        });
+        let parent_descr: DescrRef = Arc::new(ForceSizeDescr {
+            all_fields: vec![field_descr.clone()],
+            gc_fields: vec![field_descr],
+            w_class: 0x1111,
+        });
+
+        let mut ctx = OptContext::new(32);
+        ctx.in_final_emission = false;
+
+        let call_rc = OpRc::new(Op::new(OpCode::CallR, &[]));
+        call_rc.pos().set(OpRef::ref_op(700));
+        ctx.emit_extra_rc(0, call_rc.clone());
+        let call_box = Operand::from_bound_op(&call_rc);
+
+        let mut parent_info = PtrInfo::virtual_obj(parent_descr.clone(), Some(0x1111));
+        parent_info.setfield(0, call_box);
+
+        let parent_rc = OpRc::new(Op::with_descr(OpCode::NewWithVtable, &[], parent_descr));
+        parent_rc.pos().set(OpRef::ref_op(636));
+        ctx.register_extra_producer(&parent_rc);
+        let parent_box = Operand::from_bound_op(&parent_rc);
+
+        ctx.in_final_emission = true;
+        parent_info.force_box(&parent_box, &mut ctx);
+
+        let ops: Vec<_> = ctx
+            .new_operations
+            .iter()
+            .map(|op| op.as_ref().clone())
+            .collect();
+        assert!(
+            ops.iter().all(|op| !op.opcode.is_call()),
+            "parked CALL must not be emit_rc'd from force_box SETFIELD, ops={ops:?}"
+        );
+        let call_pos = call_rc.pos().get();
+        assert!(
+            ctx.extra_operations_after
+                .iter()
+                .any(|(_, op)| op.pos().get() == call_pos),
+            "CALL extra stays queued for Optimizer._emit_operation"
+        );
     }
 
     #[test]
