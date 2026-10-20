@@ -1392,16 +1392,28 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
 
 #[test]
 fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_green_key() {
+    // Hash-only `back_edge_keyed` is lookup-only: production creates cells
+    // from greens (`JitCell(*greenargs)`). This fixture keeps the descriptor
+    // assertion on the structured door that still starts a trace.
     let descriptor =
         DeclarativeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
-    let key = GreenKey::new(vec![11, 22]).hash_u64();
+    let green_key = GreenKey::new(vec![11, 22]);
+    let key = green_key.hash_u64();
     let mut driver = JitDriver::<TestState>::with_descriptor(2, descriptor.clone());
     let mut state = TestState { frame: 3, stack: 4 };
 
     assert!(
         driver
-            .back_edge_keyed(key, 11, &mut state, &(), || {})
+            .back_edge_structured(
+                key,
+                &green_key.values,
+                (GreenSlotInt, GreenSlotInt),
+                11,
+                &mut state,
+                &(),
+                || {}
+            )
             .is_none()
     );
     // Crossing the threshold starts tracing, which returns the target pc so the
@@ -1409,7 +1421,15 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
     // mean no trace started at all.
     assert_eq!(
         driver
-            .back_edge_keyed(key, 11, &mut state, &(), || {})
+            .back_edge_structured(
+                key,
+                &green_key.values,
+                (GreenSlotInt, GreenSlotInt),
+                11,
+                &mut state,
+                &(),
+                || {}
+            )
             .and_then(|resume| resume.resume_pc()),
         Some(11)
     );
@@ -1420,7 +1440,7 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
         .trace_ctx()
         .expect("trace must be active");
     assert_eq!(ctx.green_key(), key);
-    assert_eq!(ctx.green_key_values(), None);
+    assert_eq!(ctx.green_key_values(), Some(&green_key));
     let trace_descriptor = ctx
         .driver_descriptor()
         .expect("descriptor must be attached to trace");
