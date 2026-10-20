@@ -2499,13 +2499,16 @@ pub(in crate::front::mir) fn operand_is_lowlevel_string_chars_offset(
 
 /// `LOWLEVEL_STRING_CHARS_OFFSET` (`lowlevel_string.rs`) — `size_of` the
 /// rstr `STR` header (`rstr.py` `STR`).
-pub(in crate::front::mir) const LOWLEVEL_STRING_CHARS_OFFSET_PATH: &str =
+const LOWLEVEL_STRING_CHARS_OFFSET_PATH: &str =
     "pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET";
 
-pub(in crate::front::mir) fn place_is_chars_offset_global(
-    llbc: &Llbc,
-    place: Option<&Place>,
-) -> bool {
+/// Byte offset of `chars` in rstr `STR` / `BytesBlock` (`Utf8Str`):
+/// hash word, then length word (`llmemory.offsetof(STR, 'chars')`).
+pub(in crate::front::mir) fn lowlevel_string_chars_byte_offset() -> usize {
+    2 * crate::layout::target_word_size()
+}
+
+fn place_is_chars_offset_global(llbc: &Llbc, place: Option<&Place>) -> bool {
     let Some(PlaceKind::Global { id, .. }) = place.map(|place| &place.kind) else {
         return false;
     };

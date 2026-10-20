@@ -464,6 +464,9 @@ pub struct Bookkeeper {
     /// `lltype.Struct` from these records and caches it on `StructLayout.ll_struct`.
     /// `None` for unit-test fixtures that never register a layout.
     pub struct_layouts: RefCell<Option<crate::codewriter::call::StructLayoutTable>>,
+    /// By-value field-0 parents (`DeclaredGcFacts::field0_parent_ids`).
+    /// Empty for unit-test fixtures that never harvest the relation.
+    pub field0_parents: RefCell<HashSet<majit_ir::descr::StructId>>,
     /// Trait qualified-path (`name_path()`) → base `HostObject` for a
     /// receiver-driven method-dispatch family registered through
     /// [`Self::register_trait_family`] (receiver-dispatch configuration).
@@ -733,6 +736,12 @@ pub(crate) fn raw_struct_ptr_from_layout(
     {
         return None;
     }
+    // A `#[repr(transparent)]` wrapper is the inner field's repr
+    // (`TypeDecl::is_repr_transparent`), never a headerless raw ADT.
+    // `BytesKey(*mut BytesBlock)` is a STR-family GC ref, not Int.
+    if layout_for_owner(layouts, lookup).is_some_and(|(_, layout)| layout.repr_transparent) {
+        return None;
+    }
     let mut building: HashMap<String, ForwardReference> = HashMap::new();
     let container = owner_ll_container(registry, layouts, class_root, &mut building)?;
     let LowLevelType::Struct(st) = container else {
@@ -780,6 +789,50 @@ pub(crate) fn raw_enum_base_ptr_lltype(
     );
     let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
     Some(LowLevelType::Ptr(Box::new(ptr)))
+}
+
+/// `Ptr` of a declared-Gc layout Struct that is not an rclass instance.
+///
+/// Same producer as [`pointer_field_lltype`]: `owner_ll_container` plus a
+/// `Ptr` wrap. That is the Call dest of `ll_prebuilt_empty_int_items_block`
+/// (`Ptr(GcStruct TypedItemsBlock)`). `layout.gckind` is `Gc` from a
+/// `GcType` impl (or the field-0 closure). An rclass instance inlines
+/// field 0 as the parent (`Struct._first_struct`); the instance root
+/// (`PyObject`) is in `field0_parents` (`DeclaredGcFacts::record_field0`),
+/// so this returns `None` for `getinstancerepr` → `OBJECT`.
+/// A MiniMark container is a `GcType` seed that no owner inlines, so
+/// `_castdepth` of `OBJECT` is negative and `getrepr` is the `Ptr`
+/// itself (`rptr.py` `PtrRepr`).
+pub(crate) fn gc_struct_ptr_lltype_from_layout(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    field0_parents: &HashSet<majit_ir::descr::StructId>,
+    class_root: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{ForwardReference, GcKind, LowLevelType};
+
+    let mut building: HashMap<String, ForwardReference> = HashMap::new();
+    let container = owner_ll_container(registry, layouts, class_root, &mut building)?;
+    let LowLevelType::Struct(st) = &container else {
+        return None;
+    };
+    if st._gckind != GcKind::Gc {
+        return None;
+    }
+    if st._first_struct().is_some() {
+        return None;
+    }
+    if let Some(sid) = majit_ir::descr::struct_id_for_name(generic_owner_lookup(class_root))
+        && crate::front::mir::struct_id_is_field0_parent(field0_parents, sid, class_root)
+    {
+        return None;
+    }
+    Some(pointer_field_lltype(
+        registry,
+        layouts,
+        class_root,
+        &mut building,
+    ))
 }
 
 fn layout_for_owner(
@@ -1399,6 +1452,7 @@ impl Bookkeeper {
             exception_carrier_handle: RefCell::new(None),
             trait_unique_impls: RefCell::new(HashMap::new()),
             struct_layouts: RefCell::new(None),
+            field0_parents: RefCell::new(HashSet::new()),
             trait_family_bases: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
@@ -1590,6 +1644,11 @@ impl Bookkeeper {
         *self.struct_layouts.borrow_mut() = Some(layouts);
     }
 
+    /// Thread [`crate::front::mir::DeclaredGcFacts::field0_parent_ids`].
+    pub fn set_field0_parents(&self, ids: HashSet<majit_ir::descr::StructId>) {
+        *self.field0_parents.borrow_mut() = ids;
+    }
+
     /// `SomePtr(Ptr(Struct))` for a pointer to the Raw owner `class_root`.
     /// `None` when the owner is not a registered Raw struct with field rows
     /// (a fieldless enum stays the integer shell).
@@ -1598,6 +1657,24 @@ impl Bookkeeper {
         let registry = registry.as_ref()?;
         let layouts = self.struct_layouts.borrow().clone()?;
         raw_struct_ptr_from_layout(registry, &layouts, class_root)
+    }
+
+    /// `getrepr` of a declared-Gc MiniMark container `Ptr` (`rptr.py` `PtrRepr`).
+    pub fn gc_struct_ptr_lltype(
+        &self,
+        class_root: &str,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        let registry = self.struct_fields.borrow();
+        let registry = registry.as_ref()?;
+        let layouts = self.struct_layouts.borrow().clone()?;
+        let field0_parents = self.field0_parents.borrow();
+        gc_struct_ptr_lltype_from_layout(registry, &layouts, &field0_parents, class_root)
+    }
+
+    /// `SomePtr` of [`Self::gc_struct_ptr_lltype`].
+    pub fn gc_struct_ptr_annotation(&self, class_root: &str) -> Option<super::model::SomeValue> {
+        let ptr = self.gc_struct_ptr_lltype(class_root)?;
+        Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
     }
 
     /// SomeInstance of a registered named struct — the shell
@@ -10912,6 +10989,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -10962,6 +11040,168 @@ mod tests {
         );
     }
 
+    /// A `#[repr(transparent)]` wrapper is the inner field, never a
+    /// headerless raw ADT (`raw_struct_ptr_from_layout`).
+    #[test]
+    fn transparent_wrapper_is_not_a_raw_adt() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let owner = "dictmultiobject::BytesKey";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".into(), "*mut BytesBlock".into())],
+        );
+        reg.raw_word_owners.insert(owner.to_string());
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                repr_transparent: true,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "__pos_0".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let layouts = cc.struct_layouts_handle();
+        assert!(
+            raw_struct_ptr_from_layout(&reg, &layouts, owner).is_none(),
+            "repr(transparent) wrapper is the inner field, not a raw ADT"
+        );
+    }
+
+    /// `PyObject` is the inlined field-0 parent of `W_IntObject`, so
+    /// `gc_struct_ptr_lltype_from_layout` leaves it for `getinstancerepr`.
+    /// `TypedItemsBlock` is a `GcType` seed that no owner inlines.
+    #[test]
+    fn gc_struct_ptr_declines_inlined_instance_root() {
+        use crate::front::StructFieldRegistry;
+        use crate::front::mir::DeclaredGcFacts;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let pyobject = "pyobject::PyObject";
+        let w_int = "intobject::W_IntObject";
+        let items = "TypedItemsBlock";
+        let pyobject_id = majit_ir::descr::StructId::from_canonical(pyobject);
+        let w_int_id = majit_ir::descr::StructId::from_canonical(w_int);
+        let items_id = majit_ir::descr::StructId::from_canonical(items);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (pyobject.to_string(), Some(pyobject_id)),
+                (items.to_string(), Some(items_id)),
+            ]));
+
+        let mut facts = DeclaredGcFacts::default();
+        facts.record_field0(w_int_id, pyobject_id);
+        let field0_parents = facts.field0_parent_ids();
+
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            pyobject.to_string(),
+            vec![
+                ("ob_type".into(), "*const PyType".into()),
+                ("w_class".into(), "*mut pyobject::PyObject".into()),
+            ],
+        );
+        reg.fields.insert(
+            items.to_string(),
+            vec![
+                ("capacity".into(), "usize".into()),
+                ("items".into(), "[u64; 0]".into()),
+            ],
+        );
+
+        let mut cc = crate::call::CallControl::new();
+        let gc_layout = |fields: Vec<crate::call::StructFieldLayout>| crate::call::StructLayout {
+            size: 16,
+            align: 8,
+            gckind: GcKind::Gc,
+            repr_transparent: false,
+            fields,
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        cc.set_struct_layout(
+            pyobject_id,
+            gc_layout(vec![
+                crate::call::StructFieldLayout {
+                    name: "ob_type".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                },
+                crate::call::StructFieldLayout {
+                    name: "w_class".into(),
+                    offset: 8,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                },
+            ]),
+        );
+        cc.set_struct_layout(
+            items_id,
+            gc_layout(vec![
+                crate::call::StructFieldLayout {
+                    name: "capacity".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                },
+                crate::call::StructFieldLayout {
+                    name: "items".into(),
+                    offset: 8,
+                    size: 0,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                },
+            ]),
+        );
+        let layouts = cc.struct_layouts_handle();
+
+        assert!(
+            gc_struct_ptr_lltype_from_layout(&reg, &layouts, field0_parents, pyobject).is_none(),
+            "inlined instance root uses getinstancerepr, not Ptr(GcStruct PyObject)"
+        );
+        let items_ptr = gc_struct_ptr_lltype_from_layout(&reg, &layouts, field0_parents, items)
+            .expect("MiniMark container is Ptr of the layout Struct");
+        let crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr) = items_ptr
+        else {
+            panic!("TypedItemsBlock must be a Ptr, got {items_ptr:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.TO else {
+            panic!("TypedItemsBlock must point at a Struct");
+        };
+        assert_eq!(st._name, items);
+        assert_eq!(st._gckind, GcKind::Gc);
+    }
+
     #[test]
     fn gc_owner_mut_u8_field_lays_out_as_ccharp() {
         use crate::front::StructFieldRegistry;
@@ -10989,6 +11229,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "data".into(),
                     offset: 0,
@@ -11086,6 +11327,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -11170,6 +11412,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "size".into(),
@@ -11254,6 +11497,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "size".into(),
@@ -11352,6 +11596,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "__discriminant".into(),
                     offset: 0,
@@ -11426,6 +11671,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,
@@ -11497,6 +11743,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "save_point".into(),
                     offset: 0,
@@ -11578,6 +11825,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -11608,6 +11856,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: Some(HostLayout {
                     size: word as u64,
@@ -11696,6 +11945,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     crate::call::StructFieldLayout {
                         name: "ptr".into(),
@@ -11723,6 +11973,7 @@ mod tests {
             size: 24,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: Some(HostLayout {
                 size: 24,
@@ -11814,6 +12065,7 @@ mod tests {
                 size: 24,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -11824,6 +12076,7 @@ mod tests {
             size: 24,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: Some(HostLayout {
                 size: 24,
@@ -11920,6 +12173,7 @@ mod tests {
                 size: 24,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -11930,6 +12184,7 @@ mod tests {
             size: 16,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: Some(HostLayout {
                 size: 16,
@@ -12012,6 +12267,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -12022,6 +12278,7 @@ mod tests {
             size: 16,
             align: 8,
             gckind: GcKind::Raw,
+            repr_transparent: false,
             fields: vec![],
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -12081,6 +12338,7 @@ mod tests {
                 size: 8,
                 align: 8,
                 gckind: GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![crate::call::StructFieldLayout {
                     name: "__pos_0".into(),
                     offset: 0,

@@ -4514,33 +4514,6 @@ impl<S: JitState> JitDriver<S> {
                     return;
                 }
                 TraceAction::CloseLoop => {
-                    if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
-                        let (ops, header_pc, close_pc, merge_pts, greens) = self
-                            .meta
-                            .trace_ctx()
-                            .map(|ctx| {
-                                (
-                                    ctx.num_ops(),
-                                    ctx.header_pc,
-                                    ctx.close_green_pc,
-                                    ctx.current_merge_points.len(),
-                                    ctx.green_key_values()
-                                        .map(|k| format!("{:?}", k.values))
-                                        .unwrap_or_else(|| "?".into()),
-                                )
-                            })
-                            .unwrap_or((0, 0, None, 0, "?".into()));
-                        eprintln!(
-                            "[jit] CloseLoop ops={} header_pc={} close_pc={:?} merge_pts={} greens={} bridge={} has_partial={}",
-                            ops,
-                            header_pc,
-                            close_pc,
-                            merge_pts,
-                            greens,
-                            self.meta.bridge_info().is_some(),
-                            self.meta.partial_trace().is_some(),
-                        );
-                    }
                     // Snapshot the walk-final (pc, reds) off the active TraceCtx
                     // BEFORE `compile_loop` (below) drains it, stashing onto the
                     // MetaInterp so the `__merge` wrapper can read it after the
@@ -5163,34 +5136,6 @@ impl<S: JitState> JitDriver<S> {
                     jump_args,
                     loop_header_pc,
                 } => {
-                    if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
-                        let (ops, header_pc, close_pc, merge_pts, greens) = self
-                            .meta
-                            .trace_ctx()
-                            .map(|ctx| {
-                                (
-                                    ctx.num_ops(),
-                                    ctx.header_pc,
-                                    ctx.close_green_pc,
-                                    ctx.current_merge_points.len(),
-                                    ctx.green_key_values()
-                                        .map(|k| format!("{:?}", k.values))
-                                        .unwrap_or_else(|| "?".into()),
-                                )
-                            })
-                            .unwrap_or((0, 0, None, 0, "?".into()));
-                        eprintln!(
-                            "[jit] CloseLoopWithArgs loop_header_pc={:?} ops={} header_pc={} close_pc={:?} merge_pts={} greens={} bridge={} has_partial={}",
-                            loop_header_pc,
-                            ops,
-                            header_pc,
-                            close_pc,
-                            merge_pts,
-                            greens,
-                            self.meta.bridge_info().is_some(),
-                            self.meta.partial_trace().is_some(),
-                        );
-                    }
                     // pyjitpl.py reached_loop_header parity.
                     //
                     // pyjitpl.py `if not self.partial_trace:` gates the whole

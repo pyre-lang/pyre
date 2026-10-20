@@ -10374,6 +10374,76 @@ mod tests {
         );
     }
 
+    /// `W_CType` has no `DECLARED_GROUPS` row. A truncated borrowed
+    /// layout that only lists `w_class` still injects the pytype vtable,
+    /// but packed kind-0 must still mint the rest of
+    /// `heaptracker.all_fielddescrs` — including `lifeline` — so an
+    /// EffectInfo member for that field stays one `(STRUCT, fieldname)`.
+    #[cfg(feature = "pyre-module")]
+    #[test]
+    fn kind0_packed_fields_survive_a_truncated_vtable_shell() {
+        publish_pyre_class_vtables();
+        let mut found = None;
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
+            if descr
+                .struct_path
+                .ends_with("::_cffi_backend::ctypeobj::W_CType")
+                || descr.struct_path.ends_with("::ctypeobj::W_CType")
+            {
+                found = Some(descr);
+            }
+        });
+        let descr = found.expect("W_CType pyre_class descriptor");
+        let stripped = match descr.struct_path.split_once("::") {
+            Some((_, rest)) => rest,
+            None => descr.struct_path,
+        };
+        let key = majit_ir::descr::path_hash(stripped);
+        let _ = majit_ir::descr::publish_borrowed_struct_layout(
+            u32::MAX,
+            descr.object_size,
+            0,
+            key,
+            0,
+            true,
+            false,
+            &[],
+            vec![majit_ir::descr::BorrowedField {
+                index: 0,
+                name: Cow::Borrowed("ob.w_class"),
+                field_key: "w_class",
+                offset: pyre_object::pyobject::W_CLASS_OFFSET,
+                field_size: WORD,
+                field_type: Type::Ref,
+                flag: majit_ir::descr::ArrayFlag::Pointer,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: Some(true),
+                load_is_acquire: false,
+                store_is_release: false,
+            }],
+        );
+        crate::jitcode_runtime::materialize_gccache_owned_descrs();
+        let member = majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: key,
+            field_name: "lifeline".into(),
+        };
+        match descr_from_set_member(&member) {
+            SetMemberLookup::Resolved(descr) => {
+                let field = descr.as_field_descr().expect("lifeline FieldDescr");
+                assert_eq!(field.field_key(), "lifeline");
+            }
+            SetMemberLookup::AbsentContainer => {
+                panic!("W_CType.lifeline has no runtime container after kind-0 publish")
+            }
+            SetMemberLookup::Ambiguous => {
+                panic!("W_CType.lifeline is ambiguous after a truncated vtable shell")
+            }
+        }
+        crate::jitcode_runtime::rehydrate_build_descr_raw_sets();
+    }
+
     /// `W_CType` is a pyre-module `#[pyre_class]` with no `DECLARED_GROUPS`
     /// row. Publishing the class census must make a `vtable=0` mint of
     /// its parent SizeDescr `is_object()`, so a speculative `kind` read
@@ -16418,10 +16488,23 @@ pub(crate) fn force_all_declared_groups() {
 /// size descr that `register_keyed_size` then discards (the runtime group
 /// owns the vtable). A vtable-less shell still falls through: that path is
 /// the one `register_keyed_size` may upgrade.
+///
+/// Only a [`DECLARED_GROUPS`] or module-user row is that owner. A
+/// `#[pyre_class]` with no row (`W_CType`) can still carry a vtable from
+/// `publish_pyre_class_vtables` plus a truncated borrowed field list; that
+/// is not a declared group, and packed kind-0 must still run
+/// `get_field_descr` for every `heaptracker.all_fielddescrs` leaf.
 fn published_declared_group(
     spec: &majit_jitcode::jitcode::BhSizeSpec,
 ) -> Option<majit_ir::descr::SimpleDescrGroup> {
     if spec.type_id == 0 {
+        return None;
+    }
+    if !DECLARED_GROUP_BY_KEY.contains_key(&spec.type_id)
+        && !MODULE_USER_LAYOUT_DESCR_GROUPS
+            .iter()
+            .any(|entry| entry.group.size_descr.cache_key() == spec.type_id)
+    {
         return None;
     }
     let key = majit_ir::descr::LLType::Struct(spec.type_id);

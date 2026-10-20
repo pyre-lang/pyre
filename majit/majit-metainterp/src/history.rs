@@ -2516,6 +2516,7 @@ impl TraceCtx {
             // `cut_at` does not rewind `_snapshot_data`. Live guards after
             // the cut no longer name the discarded captures.
             self.snapshots.clear();
+            self.encoded_snapshot_live_refs.clear();
         } else {
             self.snapshots.truncate(pos.snapshot_data_len);
         }
@@ -2680,7 +2681,11 @@ impl TraceCtx {
             // so the snapshot stays in `self.snapshots` for that walk.
             // `snapshot_tagged_to_box` resolves each index immediately
             // before `_encode`. Dropped after: the byte stream is the
-            // record.
+            // record. Keep the TAGBOX Ref FrontendOps as live-box roots
+            // (`pyjitpl.py` `walk_active_trace_refs`): `_resref` must
+            // stay reachable after the register is overwritten, and
+            // `self.snapshots` cannot hold them (decode skip).
+            self.encoded_snapshot_live_refs = snapshot.live_ref_boxes();
             self.snapshots.push(snapshot);
             let id = self
                 .recorder

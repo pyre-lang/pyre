@@ -576,6 +576,20 @@ pub(in crate::front::mir) fn copy_concretetype(from: &Variable, to: &Variable) {
     }
 }
 
+/// Stamp `Ptr(STR)` when `ty` is a raw pointer whose pointee is rstr
+/// `STR` (`Utf8Str` / `BytesBlock` / …). A Rust pointer's lowlevel type
+/// comes from the pointee type declaration; `*const Utf8Str`,
+/// `*mut Utf8Str`, and `*const BytesBlock` are the same `STRPTR`.
+pub(in crate::front::mir) fn stamp_rstr_str_ptr_from_pointee(
+    var: &Variable,
+    ty: &TyRef,
+    llbc: &Llbc,
+) {
+    if tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
+        stamp_as_rstr_str(var);
+    }
+}
+
 /// `rutf8.unichr_as_utf8(code, allow_surrogates=True)` for a Unicode
 /// scalar constant.  Surrogates are left to the runtime helper (Rust
 /// `String` cannot hold them).

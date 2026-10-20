@@ -995,7 +995,11 @@ fn traceback_frame_names_module(co_filename: &str, module_names: &[&str]) -> boo
 ///
 /// The pointer spellings are load-bearing: the call-target trampoline
 /// reads word-sized arguments and cannot see through a reference or the
-/// `PyObjectRef` alias.
+/// `PyObjectRef` alias. The word *is* the `PyError` instance (`GcPtr`),
+/// matching `InstanceRepr.rtype_method("to_exc_object")` and
+/// `error.py OperationError.get_w_value(self)`. It is not a pointer to a
+/// stack slot holding that handle: `(*err).to_exc_object()` would read
+/// `ob_type` as the handle and materialise from the type object.
 ///
 /// Residual ABI: the argument is the `PyError` GCREF (`PyErrorObject *`),
 /// the same ref-banked word `error_carrier_edges` `lower_carrier_raises`
@@ -1003,7 +1007,7 @@ fn traceback_frame_names_module(co_filename: &str, module_names: &[&str]) -> boo
 /// handle; the word is not a pointer to a handle.
 ///
 /// # Safety
-/// `err` must be a live `PyErrorObject`.
+/// `err` must be a live `PyErrorObject` (the [`PyError`] handle word).
 #[majit_macros::dont_look_inside]
 pub unsafe fn pyerror_to_exc_object(err: *mut PyError) -> *mut pyre_object::PyObject {
     unsafe { PyError(err as *mut PyErrorObject as PyObjectRef).to_exc_object() }
@@ -6686,6 +6690,21 @@ mod tests {
     fn render_exception_omits_empty_message_separator() {
         let err = PyError::new(PyErrorKind::StopIteration, "");
         assert_eq!(err.render_exception(), "StopIteration");
+    }
+
+    #[test]
+    fn pyerror_to_exc_object_residual_word_is_the_instance() {
+        // The residual ABI word is the handle. Extra-indirection
+        // (`*mut PyError` as a stack slot) reads `ob_type` as the handle.
+        let err = PyError::new(PyErrorKind::ValueError, "x");
+        let word = err.0 as *mut PyError;
+        let extra = unsafe { (*word).0 };
+        assert_ne!(
+            extra as usize, err.0 as usize,
+            "ob_type must not round-trip as the handle"
+        );
+        let carrier = PyError(word as pyre_object::PyObjectRef);
+        assert_eq!(carrier.kind, PyErrorKind::ValueError);
     }
 
     #[test]

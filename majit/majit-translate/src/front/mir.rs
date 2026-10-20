@@ -3051,14 +3051,12 @@ impl SemanticFunctionHeader {
                 hints.push("elidable".to_string());
             }
         }
-        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, llbc, error_carrier);
         let signature_token = dont_look_inside_return_token(
             &signature.output,
             llbc,
             error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
-            pair_body.as_ref(),
         );
         let residual_return_type = signature_token.clone();
         let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
@@ -3080,7 +3078,7 @@ impl SemanticFunctionHeader {
         // A clause-spec copy may substitute a signature whose output
         // no longer looks like the empty-tuple ADT; the FunDecl's own
         // output is still unit. Either one is `FUNC.RESULT = void`.
-        let mut return_type =
+        let return_type =
             if is_unit_type(&signature.output, llbc) || is_unit_type(&fd.signature.output, llbc) {
                 Some("()".to_string())
             } else if stamp_return_token {
@@ -4697,9 +4695,20 @@ fn derive_program_metadata(
                         })
                     }),
                 };
+                // A Niche encoding seats the untagged payload on the tag
+                // word on purpose (`CodeLocations::Decoded` is a non-null
+                // fat pointer at offset 0). The explicit shell would move
+                // that payload to byte 8, and a residual `HashMap` get
+                // still hands the host layout to the match.
+                let host_tag_is_niche = enum_layout.as_ref().is_some_and(|layout| {
+                    matches!(
+                        layout.tag().map(|tag| tag.encoding),
+                        Some(majit_charon_reader::ullbc::TagEncoding::Niche { .. })
+                    )
+                });
                 let explicit_sum_shell = name == "core::result::Result"
                     || name == "core::option::Option"
-                    || (base_has_discriminant && payload_seats_on_tag);
+                    || (base_has_discriminant && payload_seats_on_tag && !host_tag_is_niche);
                 // Register the enum BASE in `exact_layouts`: a single
                 // `__discriminant` field at the tag's real byte position
                 // (`discriminator.Branch.offset` via `discriminant_offset`).
@@ -5118,32 +5127,56 @@ fn derive_program_metadata(
         );
     }
 
-    // `core::alloc::layout::Layout` is Opaque. It is the two-word
-    // `{size, align}` aggregate (`from_size_align.rs`); Charon has no
-    // field rows. `__pos_0` is size at 0, `__pos_1` is align at one word.
-    let layout_path = "core::alloc::layout::Layout";
-    if llbc
-        .iter_type_decls()
-        .any(|td| td.item_meta.name_path() == layout_path)
-    {
+    // `core::alloc::layout::Layout` is an Opaque core TypeDecl: Charon does
+    // not publish `{size, align}`, but `from_size_align::build_layout_aggregate`
+    // writes `__pos_0` / `__pos_1`. The niladic struct ctor lowers to
+    // `OpKind::New` (`jtransform` `struct_ctor_alloc_owner`), which needs a
+    // fieldful SizeDescr so the collector issues a type id. Same metadata
+    // shape as `Constants` / `Complex` above: rows on the real value, gated
+    // on the TypeDecl existing so an unrelated local `Layout` is untouched.
+    // `__pos_0` is size at 0, `__pos_1` is align at one word.
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path();
+        if !crate::front::from_size_align::is_layout_adt_owner(&name) {
+            continue;
+        }
+        if struct_fields
+            .fields
+            .get(&name)
+            .is_some_and(|rows| rows.iter().any(|row| row.name == "__pos_0"))
+        {
+            continue;
+        }
         let rows = vec![
             crate::front::semantic::FieldRow::positional("__pos_0", "usize"),
             crate::front::semantic::FieldRow::positional("__pos_1", "usize"),
         ];
-        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
-            struct_fields.fields.insert(key.to_string(), rows.clone());
-            known_struct_names.insert(key.to_string());
+        let canonical_name = strip_crate_prefix(&name);
+        let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+        for key in [name.clone(), canonical_name.clone(), leaf.clone()] {
+            struct_fields.fields.insert(key.clone(), rows.clone());
+            known_struct_names.insert(key);
         }
         let sid = majit_ir::descr::StructId::from_canonical("alloc::layout::Layout");
-        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
+        for key in [name.clone(), canonical_name.clone(), leaf.clone()] {
             record_struct_id(
                 &mut struct_ids,
                 &mut struct_fields.class_identity,
-                key.to_string(),
+                key,
                 sid,
                 "alloc::layout::Layout",
             );
         }
+        struct_origins
+            .entry(leaf)
+            .or_insert_with(|| "alloc::layout".to_string());
+        struct_field_attrs.insert(
+            canonical_name,
+            vec![
+                ("__pos_0".to_string(), ValueType::Unsigned),
+                ("__pos_1".to_string(), ValueType::Unsigned),
+            ],
+        );
         let word = crate::layout::target_word_size() as u64;
         let mut field_offsets = std::collections::HashMap::new();
         field_offsets.insert("__pos_0".to_string(), 0);
@@ -5186,18 +5219,41 @@ fn derive_program_metadata(
 /// `Struct._note_inlined_into` allows a `GcStruct` only as the first
 /// field of another `GcStruct`. The trait is identified by the
 /// declaration's crate and name (`majit_gc` + `GcType`), not by a list
-/// of payload type names. The facts are folded into
-/// [`crate::call::StructLayout::gckind`]; they are not a lookup table.
+/// of payload type names. `gc_struct_ids` is folded into
+/// [`crate::call::StructLayout::gckind`]. [`Self::field0_parent_ids`] is
+/// the inverse of the field-0 edges, kept next to them: a named struct
+/// in that set is an rclass instance root (`getinstancerepr` → OBJECT).
 #[derive(Default)]
 pub(crate) struct DeclaredGcFacts {
     seeds: Vec<majit_ir::descr::StructId>,
     field0: Vec<(majit_ir::descr::StructId, majit_ir::descr::StructId)>,
+    /// StructIds that some owner inlines as by-value field 0.
+    /// Inverse of `field0` (owner → parent). Filled in [`Self::record_field0`].
+    field0_parents: std::collections::HashSet<majit_ir::descr::StructId>,
 }
 
 impl DeclaredGcFacts {
     pub(crate) fn absorb(&mut self, other: Self) {
         self.seeds.extend(other.seeds);
         self.field0.extend(other.field0);
+        self.field0_parents.extend(other.field0_parents);
+    }
+
+    /// Record a by-value field-0 parent (`struct_field0_type_id`).
+    pub(crate) fn record_field0(
+        &mut self,
+        owner: majit_ir::descr::StructId,
+        parent: majit_ir::descr::StructId,
+    ) {
+        self.field0.push((owner, parent));
+        self.field0_parents.insert(parent);
+    }
+
+    /// StructIds that appear as by-value field 0 of some struct.
+    pub(crate) fn field0_parent_ids(
+        &self,
+    ) -> &std::collections::HashSet<majit_ir::descr::StructId> {
+        &self.field0_parents
     }
 
     /// `StructId`s whose declared kind is `Gc`.
@@ -5250,6 +5306,61 @@ pub(crate) fn struct_id_is_declared_gc(
     gc_struct_ids.contains(&sid)
         || majit_ir::descr::struct_template_id_for_name(name)
             .is_some_and(|template| gc_struct_ids.contains(&template))
+}
+
+/// Whether `sid` is a `#[repr(transparent)]` struct: the exact identity,
+/// or the generic template `name` instantiates.
+///
+/// Folded into [`crate::call::StructLayout::repr_transparent`] at layout
+/// registration. `raw_struct_ptr_from_layout` reads that field.
+pub(crate) fn struct_id_is_repr_transparent(
+    ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    sid: majit_ir::descr::StructId,
+    name: &str,
+) -> bool {
+    ids.contains(&sid)
+        || majit_ir::descr::struct_template_id_for_name(name)
+            .is_some_and(|template| ids.contains(&template))
+}
+
+/// Whether `sid` is a by-value field-0 parent of some registered struct.
+///
+/// Same identity-or-template fallback as [`struct_id_is_declared_gc`].
+/// `gc_struct_ptr_lltype_from_layout` returns `None` for these so
+/// `getinstancerepr` maps the instance root to `OBJECT`.
+pub(crate) fn struct_id_is_field0_parent(
+    ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    sid: majit_ir::descr::StructId,
+    name: &str,
+) -> bool {
+    ids.contains(&sid)
+        || majit_ir::descr::struct_template_id_for_name(name)
+            .is_some_and(|template| ids.contains(&template))
+}
+
+/// StructIds whose LLBC declaration records `#[repr(transparent)]`.
+///
+/// `TypeDecl::is_repr_transparent` is the Charon layout fact. Folded
+/// into `StructLayout::repr_transparent`; not a lookup table.
+pub(crate) fn harvest_repr_transparent_struct_ids(
+    llbc: &Llbc,
+) -> std::collections::HashSet<majit_ir::descr::StructId> {
+    let mut out = std::collections::HashSet::new();
+    for td in llbc.iter_type_decls() {
+        if type_decl_is_builtin_adt(td) {
+            continue;
+        }
+        if td.published_struct_copy {
+            continue;
+        }
+        if !matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
+            continue;
+        }
+        if td.is_repr_transparent() {
+            out.insert(struct_id_for_type_decl(td));
+        }
+    }
+    out
 }
 
 fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
@@ -5335,7 +5446,7 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
         let Some(field0) = struct_field0_type_id(llbc, td) else {
             continue;
         };
-        facts.field0.push((struct_id_for_type_decl(td), field0));
+        facts.record_field0(struct_id_for_type_decl(td), field0);
     }
     facts
 }

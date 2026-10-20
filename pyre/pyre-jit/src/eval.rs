@@ -3026,6 +3026,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::MAPPING_PROXY_TYPE as *const _ as usize,
         w_dict_proxy_tid,
     );
+    // `W_DictProxyObject` is not a `#[pyre_class]`; a `malloc_typed`
+    // spill is invisible to MiniMark, so the immortal-root walker is
+    // the path that forwards `w_mapping` (`walk_raw_immortal_roots`).
+    pyre_object::gc_hook::register_pyre_class_offsets(
+        &pyre_object::MAPPING_PROXY_TYPE as *const _ as usize,
+        &pyre_object::dictproxyobject::W_DICT_PROXY_GC_PTR_OFFSETS,
+    );
     // `pypy/objspace/std/dictmultiobject.py` — three sibling
     // W_DictView*Object classes (Keys / Values / Items) each
     // carry a `w_dict` PyObjectRef back to the source.  Pyre
@@ -13346,13 +13353,6 @@ fn compile_and_run_once(
     };
     let Some(entry) = entry else {
         majit_metainterp::mc_diag_bump(21);
-        if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
-            eprintln!(
-                "[jit] caro_no_merge_entry start={start:?} pc={target_pc} last_instr={} name={}",
-                frame_root.frame().last_instr,
-                code.obj_name.as_str(),
-            );
-        }
         return None;
     };
 

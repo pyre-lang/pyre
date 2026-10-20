@@ -231,21 +231,50 @@ fn scalar_pointer_params_match_int_callers() {
         .expect("caller invokes the callback");
     let hash_out = args[5].as_variable().expect("hash_out value").clone();
     let produced = root_op(&caller, &hash_out);
-    let passed_int = match produced {
-        Some(OpKind::Input { ty, .. }) => int_family(ty),
-        Some(OpKind::ConstInt(_) | OpKind::ConstUInt(_)) => true,
-        Some(
-            OpKind::Call { result_ty, .. }
-            | OpKind::UnaryOp { result_ty, .. }
-            | OpKind::BinOp { result_ty, .. },
-        ) => int_family(result_ty),
-        Some(OpKind::RawLoad { item_ty, .. }) => int_family(item_ty),
+    match produced {
         // `&mut keyhash` is spilled to a raw address. `_rewrite_raw_malloc`
         // types that word Int, the same bank as `hash_out`.
-        Some(OpKind::RawMalloc { .. }) => true,
-        other => panic!("caller must pass hash_out as int, producer {other:?}"),
-    };
-    assert!(passed_int, "caller passes hash_out as int");
+        Some(OpKind::RawMalloc { .. }) => {}
+        other => panic!("caller must pass hash_out as a spilled raw address, producer {other:?}"),
+    }
+    let hash = args[2].as_variable().expect("hash value");
+    assert_ne!(
+        hash,
+        &hash_out,
+        "hash by-value must stay the word, not the spill address\n{}",
+        caller
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| b.operations.iter().map(move |op| format!("bb{i}: {op:?}")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let store_value = ops(&caller).find_map(|op| match &op.kind {
+        OpKind::RawStore { value, base, .. } if base == &hash_out => Some(value.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        store_value.as_ref(),
+        Some(hash),
+        "spill must store the hash word, not the address\nstore={store_value:?} hash={hash:?} hash_out={hash_out:?}"
+    );
+    let reentrant = ops(&caller).find_map(|op| match &op.kind {
+        OpKind::Call { target, args, .. }
+            if call_leaf(target) == Some("w_dict_object_setitem_reentrant") =>
+        {
+            Some(args.clone())
+        }
+        _ => None,
+    });
+    if let Some(reentrant) = reentrant {
+        let rehash = reentrant[2].as_variable().expect("reentrant hash");
+        let rehash_op = root_op(&caller, rehash);
+        assert!(
+            matches!(rehash_op, Some(OpKind::RawLoad { .. })),
+            "reentrant hash must be the copy-out load, got {rehash_op:?}"
+        );
+    }
 
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
         std::slice::from_ref(llbc),
@@ -287,6 +316,18 @@ fn scalar_pointer_params_match_int_callers() {
             .collect::<Vec<_>>()
             .join("; ")
     );
+}
+
+#[test]
+fn eval_loop_jit_lowers() {
+    let llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-jit.ullbc"
+    ))
+    .expect("pyre-jit.ullbc is already extracted");
+    lower_function(&llbc, "eval_loop_jit").unwrap_or_else(|err| {
+        panic!("eval_loop_jit must lower: {err}");
+    });
 }
 
 fn call_segments(target: &CallTarget) -> Option<&[String]> {

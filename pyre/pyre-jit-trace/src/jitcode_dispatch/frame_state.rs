@@ -293,6 +293,20 @@ impl WalkFrameState {
             _owner: self.clone(),
         }
     }
+
+    /// Forward this frame's semantic mirrors (`pyjitpl.py`
+    /// `walk_active_trace_refs` over the same `MIFrame` fields).
+    pub(crate) fn walk_roots(
+        &self,
+        owner: majit_metainterp::FrontendResrefOwner,
+        visitor: &mut dyn FnMut(&mut GcRef),
+    ) {
+        let mut data = self
+            .0
+            .try_borrow_mut()
+            .expect("walk frame state borrow held across collection");
+        walk_frame_state_data(&mut data, owner, visitor);
+    }
 }
 
 pub(crate) struct WalkFrameStateRoot {
@@ -303,11 +317,18 @@ pub(crate) struct WalkFrameStateRoot {
 
 unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
     let area = unsafe { &*(data as *const super::FrontendBoxArea) };
-    let owner = area.owner;
     let cell = unsafe { &*(area.storage as *const RefCell<WalkFrameStateData>) };
     let mut data = cell
         .try_borrow_mut()
         .expect("walk frame state borrow held across collection");
+    walk_frame_state_data(&mut data, area.owner, visitor);
+}
+
+fn walk_frame_state_data(
+    data: &mut WalkFrameStateData,
+    owner: majit_metainterp::FrontendResrefOwner,
+    visitor: &mut dyn FnMut(&mut GcRef),
+) {
     let walk_frame_box = |op: &mut OpRef, visitor: &mut dyn FnMut(&mut GcRef)| {
         super::walk_frontend_box(op, owner, visitor);
     };
@@ -462,7 +483,7 @@ mod tests {
 
     #[test]
     fn nested_scoped_roots_forward_every_frame_mirror_and_retire_independently() {
-        const BASE: usize = 0x98_0000_0000;
+        const BASE: usize = 0x98_0000_0001;
         let _restore = [
             crate::RestoreConstPtr::intern(BASE + 0x1000),
             crate::RestoreConstPtr::intern(BASE + 0x2000),
@@ -495,7 +516,7 @@ mod tests {
 
     #[test]
     fn callee_writeback_releases_borrows_and_reads_forwarded_later_slots() {
-        const BASE: usize = 0x99_0000_0000;
+        const BASE: usize = 0x99_0000_0001;
         let _runtime = crate::trace_ctx_for_test(0);
         let _stw = majit_gc::gc_sync::quiesce_mutators();
         let mut shadow = CalleeLocalsShadow::default();

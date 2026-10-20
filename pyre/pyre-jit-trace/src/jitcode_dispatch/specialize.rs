@@ -795,8 +795,12 @@ fn walker_emit_specialised_pair_item<Sym: WalkSym>(
 /// `offset2lineno` instead of `bh_load_attr_fn`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TracebackWalkField {
-    /// `tb.tb_next` — the chain link; a null slot is the terminator and
-    /// surfaces as `None`.
+    /// `tb.tb_next` — the chain link.  A null slot is the terminator;
+    /// `descr_get_next` surfaces it as `None`.  The fold records
+    /// `GETFIELD` plus `_establish_nullity`'s `GUARD_ISNULL`, then
+    /// `replace_box` onto `None`, so a longer chain's fail path still
+    /// holds the GETFIELD result (`do_residual_call` would re-run the
+    /// getter; this keeps the field read and resumes after it).
     TbNext,
     /// `tb.tb_frame` — `interp_attrproperty_w('frame')`, the node's frame slot.
     TbFrame,
@@ -1023,28 +1027,51 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
         .unwrap_or(stored);
     let raw_value = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, descr);
-    let value = if stored.is_null() {
-        // End of the chain.  A nullity test is `pyjitpl.py
-        // _establish_nullity`'s GUARD_ISNULL plus a `replace_box` onto the null
-        // constant `constant_from_op` gives it — not a promote.  The
-        // distinction is load-bearing: `compile.py
-        // make_a_counter_per_value` keys a GUARD_VALUE's jitcounter on the
-        // *failing value*, and this slot holds a different PyTraceback on every
-        // walk, so no one value here ever reaches `trace_eagerness` and the
-        // continuation for a non-null link never gets a bridge.
-        // Stamped ahead of the guard because `stamp_guard_value_concrete` only
-        // does it for a GUARD_VALUE, and the snapshot the guard captures reads
-        // the slot's concrete.
+    if stored.is_null() {
+        // End of the chain.  `_establish_nullity` (`pyjitpl.py`) records
+        // `GUARD_ISNULL` then `replace_box`; `descr_get_next` returns
+        // `None` for a null slot, not C NULL.  `GUARD_VALUE` is the wrong
+        // pin: `compile.py make_a_counter_per_value` keys the jitcounter
+        // on the failing value, and this slot is a different PyTraceback
+        // on every walk, so the continuation never reaches
+        // `trace_eagerness`.
+        //
+        // Write the GETFIELD result into dst *before* the guard and
+        // capture it as an after-residual snapshot.  The goto-shaped
+        // `live_before` capture (`walker_emit_guard_with_snapshot` for
+        // `GUARD_ISNULL`) keys liveness on LOAD_ATTR's block-head, which
+        // does not include dst; Jump then carries Const None and a
+        // longer chain deopts as a 1-tuple.  `capture_resumedata(
+        // after_residual_call=True)` (`pyjitpl.py`) reads the trailing
+        // `-live-` of this getattr, so failargs keep the GETFIELD box.
+        // Fail resumes past LOAD_ATTR with that box (the next node);
+        // the pass path `replace_box`es it onto None for the Jump.
         ctx.trace_ctx
             .set_opref_concrete(raw_value, majit_ir::Value::Ref(majit_ir::GcRef(0)));
-        walker_guard_stamped_isnull(ctx, op_pc, raw_value)?;
-        ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
-    } else {
-        walker_guard_stamped_nonnull(ctx, op_pc, raw_value, stored)?;
-        raw_value
-    };
-
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, raw_value)?;
+        if !raw_value.is_constant() && !ctx.trace_ctx.heapcache_nullity_answered(raw_value) {
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardIsnull, &[raw_value], 0);
+            ctx.trace_ctx.heap_cache_mut().nullity_now_known(raw_value);
+            // `walker_capture_snapshot_for_last_guard_scoped` keys
+            // `after_residual_call` on the guard opcode, and
+            // `GUARD_ISNULL` is not in that set, so it would still
+            // snapshot `live_before_jit_pc`.  Call the impl with
+            // `after_residual_call=true` so failargs keep the GETFIELD
+            // box at the trailing `-live-`.
+            walker_capture_snapshot_for_last_guard_impl(
+                ctx,
+                op_pc,
+                true,
+                GuardCaptureScope::default(),
+            )?;
+        }
+        let none = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        vable_ops::walker_replace_box(ctx, raw_value, none);
+        return Ok(Some(()));
+    }
+    walker_guard_stamped_nonnull(ctx, op_pc, raw_value, stored)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, raw_value)?;
     Ok(Some(()))
 }
 
@@ -16691,6 +16718,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             )
         }
     };
+
     let active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {

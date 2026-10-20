@@ -394,10 +394,63 @@ impl EntryWords<'_> {
 }
 
 /// The frame `make_execute_token` returns, before it is wrapped as a deadframe.
+///
+/// `llmodel.py execute_token` assigns `ll_frame = func(...)` to a GC local
+/// before the caller reads it. `gen_footer_shadowstack` has already popped
+/// the jf top, so this slot is that local until [`Self::deadframe_from_run`]
+/// takes the owner-root `JitFrameDeadFrame`.
 struct RanFrame {
     head: *mut JitFrame,
     tip: *mut JitFrame,
     gc_object: bool,
+    _ll_frame: Option<majit_gc::shadow_stack::ShadowRoot>,
+}
+
+impl RanFrame {
+    /// The frame `llmodel.py execute_token` returned, re-read off the GC local.
+    ///
+    /// `_ll_frame` is that local (`ll_frame = func(...)`). A collection can
+    /// rewrite the slot; `tip` is only the host-frame address.
+    fn live_tip(&self) -> *mut JitFrame {
+        self._ll_frame
+            .as_ref()
+            .map(|root| root.get().0 as *mut JitFrame)
+            .unwrap_or(self.tip)
+    }
+}
+
+/// `llmodel.py execute_token`: `ll_frame = func(...)` is a GC local.
+///
+/// `gen_footer_shadowstack` has already popped the jf top. Root the
+/// returned pointer; MiniMark rewrites the slot if the nursery object
+/// was forwarded (`incminimark.py` `_trace_drag_out`). `jitframe.py`
+/// `jitframe_resolve` walks `jf_forward` only, and `get_latest_descr`
+/// reads `jf_descr` off that local without chasing a nursery stub —
+/// chasing the stub by hand can land on a reused nursery object
+/// (`jf_descr` 0).
+fn ran_frame_from_func_return(
+    head: *mut JitFrame,
+    returned: *mut JitFrame,
+    facts: JitframeDescrFacts,
+) -> RanFrame {
+    let gc_object = facts.is_gc_object;
+    let ll_frame = if gc_object {
+        Some(majit_gc::shadow_stack::ShadowRoot::new(GcRef(
+            returned as usize,
+        )))
+    } else {
+        None
+    };
+    let tip = ll_frame
+        .as_ref()
+        .map(|root| root.get().0 as *mut JitFrame)
+        .unwrap_or(returned);
+    RanFrame {
+        head,
+        tip,
+        gc_object,
+        _ll_frame: ll_frame,
+    }
 }
 
 /// Frame allocated the same way [`alloc_entry_jitframe`] allocates the
@@ -1949,29 +2002,14 @@ pub extern "C" fn dynasm_malloc_unicode(type_id: u64, length: u64) -> u64 {
     ))
 }
 
-/// opassembler.py:956-976: non-array write barrier slow path, for the case
-/// whose base is a JITFRAME.
-///
-/// `gc.write_barrier` re-checks null, nursery membership, heap membership and
-/// the pyobject-header registry before touching the remembered set. The frame
-/// is the one base that needs those: it can be a block built off the GC
-/// (`jitframe::alloc_off_gc_jitframe`), and a forwarded nursery header reads
-/// `0xFF` at the flag byte, so the inline test admits addresses the barrier
-/// must still decline.
-pub extern "C" fn dynasm_write_barrier(obj_ptr: u64) {
-    with_dynasm_active_gc_mut(|gc| gc.write_barrier(majit_ir::GcRef(obj_ptr as usize)));
-}
-
-/// opassembler.py:956-976: non-array write barrier slow path, for an ordinary
-/// store's base.
+/// opassembler.py:956-976: non-array write barrier slow path.
 ///
 /// `gc.py get_write_barrier_fn` resolves to
 /// `framework.py:538-544 gcdata.gc.remember_young_pointer`, whose own comment
 /// is "We know that 'addr_struct' has GCFLAG_TRACK_YOUNG_PTRS so far"
 /// (`incminimark.py`) — the inline test already made that true, so
-/// the helper neither repeats it nor guards. The base here is whatever the GC
-/// rewriter emitted `COND_CALL_GC_WB` for, which is a collector-allocated
-/// object with a real header.
+/// the helper neither repeats it nor guards. `_build_wb_slowpath` uses this
+/// for both ordinary stores and `for_frame` (`get_write_barrier_fn`).
 pub extern "C" fn dynasm_jit_remember_young_pointer(obj_ptr: u64) {
     with_dynasm_active_gc_mut(|gc| {
         gc.jit_remember_young_pointer(majit_ir::GcRef(obj_ptr as usize))
@@ -2779,7 +2817,7 @@ impl DynasmBackend {
         // (`llmodel.py execute_token` bump) instead of a TLS free list.
         // `EntryWords::Raw` is only used on that path: a collector converts
         // the words back to `Value`s and takes `EntryWords::Typed`.
-        let (jf_ptr, gc_object, needs_wb, arg_roots) = match args {
+        let (jf_ptr, _gc_object, needs_wb, arg_roots) = match args {
             EntryWords::Typed(values) if majit_gc::collector_installed() => {
                 let (ptr, gc_object, needs_wb, roots) =
                     alloc_entry_jitframe(self.jitframe_facts, frame_bytes, values);
@@ -2910,6 +2948,7 @@ impl DynasmBackend {
             debug_validate_oldgen_freeblocks(format_args!("before trace {trace_id}"));
         }
         let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
+        let ran = ran_frame_from_func_return(jf_ptr, result_jf, self.jitframe_facts);
         if diag && crate::gc_freelist_diag_enabled() {
             let trace_id = compiled.unwrap().trace_id;
             debug_validate_oldgen_freeblocks(format_args!("after trace {trace_id}"));
@@ -2918,24 +2957,21 @@ impl DynasmBackend {
         if diag && crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] execute_token returned: result_jf={:?} (expected={:?}) same={}",
-                result_jf,
+                ran.tip,
                 jf_ptr,
-                result_jf == jf_ptr
+                ran.tip == jf_ptr
             );
         }
 
-        RanFrame {
-            head: jf_ptr,
-            tip: result_jf,
-            gc_object,
-        }
+        ran
     }
 
     /// `llmodel.py return ll_frame` — the deadframe IS the frame the run
     /// returned. A collector object takes a movable owner-root slot; a
     /// host frame is owned, and its chain freed, by the deadframe.
     fn deadframe_from_run(&self, _token: &JitCellToken, ran: RanFrame) -> DeadFrame {
-        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
+        let tip = ran.live_tip();
+        let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
         let descr = self.find_descr_by_ptr(jf_descr_raw);
         let descr_fd = descr.as_fail_descr();
 
@@ -2951,7 +2987,7 @@ impl DynasmBackend {
 
         if ran.gc_object {
             DeadFrame::JitFrame(JitFrameDeadFrame::new(
-                GcRef(ran.tip as usize),
+                GcRef(tip as usize),
                 descr,
                 None,
                 None,
@@ -2960,9 +2996,9 @@ impl DynasmBackend {
             // The bound is the returned frame's own `jf_frame` length:
             // `_check_frame_depth` may have reallocated a deeper tip than the
             // `num_slots` the entry frame was built with.
-            let num_slots = unsafe { JitFrame::frame_length(ran.tip) } as usize;
+            let num_slots = unsafe { JitFrame::frame_length(tip) } as usize;
             DeadFrame::LibcJitFrame(unsafe {
-                LibcJitFrameDeadFrame::owning(ran.head, ran.tip, num_slots, descr, None)
+                LibcJitFrameDeadFrame::owning(ran.head, tip, num_slots, descr, None)
             })
         }
     }
@@ -2985,13 +3021,14 @@ impl DynasmBackend {
         let host_finish =
             !ran.gc_object && (release_under_collector || !majit_gc::collector_installed());
         if host_finish {
-            let descr_raw = unsafe { crate::llmodel::get_latest_descr(ran.tip) };
+            let tip = ran.live_tip();
+            let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
             if is_done(self, descr_raw) {
                 // Slot 0. That descr's `rd_locs` stays empty (`set_rd_locs`
                 // is resume-guard only), so the word `genop_finish` stored
                 // is `jf_frame[0]`.
-                let value = unsafe { read(JitFrame::resolve(ran.tip)) };
-                park_or_free_done_entry_frame(token, ran.head, ran.tip, ran.gc_object);
+                let value = unsafe { read(JitFrame::resolve(tip)) };
+                park_or_free_done_entry_frame(token, ran.head, tip, ran.gc_object);
                 return Ok(value);
             }
         }
@@ -3050,17 +3087,7 @@ impl DynasmBackend {
     /// Any exit other than `DoneWithThisFrameDescrInt` builds the deadframe.
     #[cold]
     #[inline(never)]
-    fn raw_entry_deadframe(
-        &self,
-        token: &JitCellToken,
-        head: *mut JitFrame,
-        tip: *mut JitFrame,
-    ) -> DeadFrame {
-        let ran = RanFrame {
-            head,
-            tip,
-            gc_object: self.jitframe_facts.is_gc_object,
-        };
+    fn raw_entry_deadframe(&self, token: &JitCellToken, ran: RanFrame) -> DeadFrame {
         self.deadframe_from_run(token, ran)
     }
 
@@ -3103,15 +3130,14 @@ impl DynasmBackend {
     /// descr still builds the deadframe from the unresolved `RanFrame`.
     fn done_ref_from_ran(&self, token: &JitCellToken, ran: RanFrame) -> Result<usize, DeadFrame> {
         // Host frames keep the descr load on the pointer the run returned
-        // (`done_word_from_ran`). A nursery frame may come back as a
-        // forwarding stub, so its descr is read from `JitFrame::resolve`.
-        let tip = unsafe { JitFrame::resolve(ran.tip) };
-        let descr_ptr = if ran.gc_object { tip } else { ran.tip };
-        let descr_raw = unsafe { crate::llmodel::get_latest_descr(descr_ptr) };
+        // (`done_word_from_ran`). A nursery frame was rooted in
+        // `ran_frame_from_func_return`; re-read the GC local.
+        let tip = ran.live_tip();
+        let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
         if self.finish_is_done_ref(descr_raw) {
             let value = done_ref_slot0(tip);
             if !ran.gc_object {
-                // Original `ran.tip`, not the resolved pointer: the
+                // Original `ran.tip`, not a later GC rewrite: the
                 // single-frame park check stays `tip == head`.
                 park_or_free_done_entry_frame(token, ran.head, ran.tip, ran.gc_object);
             }
@@ -3136,18 +3162,14 @@ impl DynasmBackend {
     }
 
     /// Raw finish entry. Allocate, store `args`, call the token, and return
-    /// `(head, tip, jf_descr)`.
+    /// the `execute_token` frame (`ll_frame = func(...)` is a GC local).
     ///
     /// `llmodel.py` `AbstractLLCPU.make_execute_token`. Both raw finish paths
     /// read slot 0 of `tip` afterwards. Allocation and the slot stores are
     /// shared (`prepare_done_raw_entry_frame`); the call is this backend's
     /// `(jitframe, threadlocal_addr)` convention.
     #[inline(always)]
-    fn run_done_raw_entry(
-        &self,
-        token: &JitCellToken,
-        args: &[i64],
-    ) -> (*mut JitFrame, *mut JitFrame, usize) {
+    fn run_done_raw_entry(&self, token: &JitCellToken, args: &[i64]) -> RanFrame {
         let entry = token.ll_function_addr() as *const u8;
         let clt = unsafe { &*token.compiled_loop_token_ptr() };
         let num_slots = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
@@ -3158,19 +3180,10 @@ impl DynasmBackend {
         let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         let returned = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
-        // Host frames keep the descr load on the pointer the run returned
-        // (`done_word_from_ran`). A moving nursery may come back as a
-        // forwarding stub (`gen_footer_shadowstack` / `_call_footer`
-        // pop then `mov x0, x29` / `emit_call_footer_raw`);
-        // `JitframeDescrFacts::resolve_returned_frame` chases that when
-        // the descr has a gcrootmap, else `jitframe_resolve` (`jf_forward`).
-        let tip = if facts.is_gc_object {
-            facts.resolve_returned_frame(returned)
-        } else {
-            returned
-        };
-        let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
-        (jf_ptr, tip, descr_raw)
+        // `llmodel.py execute_token`: `ll_frame = func(...)` is a GC local.
+        // Root the returned pointer; `get_latest_descr` reads `jf_descr`
+        // off that local without chasing a nursery stub.
+        ran_frame_from_func_return(jf_ptr, returned, facts)
     }
 
     /// Cell address published by `set_done_with_this_frame_descr_int`.
@@ -3810,20 +3823,22 @@ impl Backend for DynasmBackend {
         if raw_done_entry_use_general(exec_diag_enabled()) {
             return self.execute_token_done_int_raw_general(token, args);
         }
-        let (jf_ptr, tip, descr_raw) = self.run_done_raw_entry(token, args);
+        let ran = self.run_done_raw_entry(token, args);
+        let tip = ran.live_tip();
+        let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
         if self.finish_is_done_int(descr_raw) {
-            // A GC frame was already resolved in `run_done_raw_entry`.
+            // A GC frame was rooted in `ran_frame_from_func_return`.
             // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
-            let live = if self.jitframe_facts.is_gc_object {
+            let live = if ran.gc_object {
                 tip
             } else {
                 unsafe { JitFrame::resolve_forward(tip) }
             };
             let value = done_int_slot0(live);
-            park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
+            park_or_free_done_entry_frame(token, ran.head, tip, ran.gc_object);
             return Ok(value);
         }
-        Err(self.raw_entry_deadframe(token, jf_ptr, tip))
+        Err(self.raw_entry_deadframe(token, ran))
     }
 
     /// `warmstate.py execute_assembler` ref fast path. `done_ref_from_ran`
@@ -3849,20 +3864,22 @@ impl Backend for DynasmBackend {
         if raw_done_entry_use_general(exec_diag_enabled()) {
             return self.execute_token_done_ref_raw_general(token, args);
         }
-        let (jf_ptr, tip, descr_raw) = self.run_done_raw_entry(token, args);
+        let ran = self.run_done_raw_entry(token, args);
+        let tip = ran.live_tip();
+        let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
         if self.finish_is_done_ref(descr_raw) {
-            // A GC frame was already resolved in `run_done_raw_entry`.
+            // A GC frame was rooted in `ran_frame_from_func_return`.
             // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
-            let live = if self.jitframe_facts.is_gc_object {
+            let live = if ran.gc_object {
                 tip
             } else {
                 unsafe { JitFrame::resolve_forward(tip) }
             };
             let value = done_ref_slot0(live);
-            park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
+            park_or_free_done_entry_frame(token, ran.head, tip, ran.gc_object);
             return Ok(value);
         }
-        Err(self.raw_entry_deadframe(token, jf_ptr, tip))
+        Err(self.raw_entry_deadframe(token, ran))
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
@@ -3914,6 +3931,8 @@ impl Backend for DynasmBackend {
         let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
             unsafe { std::mem::transmute(entry) };
         let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
+        let _ll_frame = ran_frame_from_func_return(jf_ptr, result_jf, self.jitframe_facts);
+        let result_jf = _ll_frame.live_tip();
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) };
         let descr = self.find_descr_by_ptr(jf_descr_raw);

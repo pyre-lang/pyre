@@ -732,6 +732,16 @@ pub struct TraceCtx {
     /// byte-stream form carried by `TraceRecordBuffer` alongside the
     /// eventual field swap (/ #70).
     pub(crate) snapshots: Vec<crate::recorder::Snapshot>,
+    /// Live Ref boxes of the last encoded snapshot.
+    ///
+    /// Production FBW `capture_resumedata` encodes then
+    /// `self.snapshots.clear()` so `ensure_snapshots_materialized` can
+    /// decode by byte offset. `pyjitpl.py` `walk_active_trace_refs`
+    /// still traces those TAGBOX FrontendOps (`RefFrontendOp._resref`)
+    /// until the next capture or `cut_trace_with_snapshots`. Not a
+    /// HashMap: replace the list each capture, matching one snapshot's
+    /// Box objects.
+    pub(crate) encoded_snapshot_live_refs: Vec<OpRef>,
     /// pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
     /// The source loop token of the bridge trace, populated at
     /// `start_retrace_from_guard` from the failed guard descr's
@@ -2528,6 +2538,7 @@ impl TraceCtx {
             call_pure_results: crate::optimizeopt::util::args_dict(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
+            encoded_snapshot_live_refs: Vec::new(),
             resumekey_original_loop_token: None,
             cpu: None,
             cut_observer: None,
@@ -2631,6 +2642,7 @@ impl TraceCtx {
             call_pure_results: crate::optimizeopt::util::args_dict(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
+            encoded_snapshot_live_refs: Vec::new(),
             resumekey_original_loop_token: None,
             cpu: None,
             cut_observer: None,
@@ -8665,6 +8677,7 @@ mod tests {
             nargs: 0,
             ctor_tail: false,
             len_tail: false,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         }

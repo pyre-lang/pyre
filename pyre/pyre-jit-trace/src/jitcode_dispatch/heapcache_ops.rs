@@ -21,9 +21,12 @@ use super::*;
 /// there; that shadow holds the same MIFrame box value, so it answers after
 /// the ordinary OpRef carrier rather than instead of it.
 ///
-/// A null and an all-ones word are both rejected: null is no object, and
-/// all-ones is `GcRef::NO_CONCRETE`, an unresolved-ref sentinel rather
-/// than a live pointer.
+/// A null, an all-ones word, and an unaligned word are rejected: null is
+/// no object, all-ones is `GcRef::NO_CONCRETE` (an unresolved-ref sentinel
+/// rather than a live pointer), and a bit-cast small int is a non-null
+/// `Ref` that is not an object (`walker_concrete_ref_object`).
+/// `guard_class_record` loaded `ob_type` from address 1 (cranelift IPS 07:35).
+
 fn concrete_ref_operand_ptr<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
@@ -43,7 +46,10 @@ fn concrete_ref_operand_ptr<Sym: WalkSym>(
                 _ => None,
             },
         )
-        .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64)
+        .filter(|&ptr| {
+            let bits = ptr as usize;
+            bits != 0 && bits != usize::MAX && bits % std::mem::align_of::<usize>() == 0
+        })
 }
 
 /// The live value of a store's value operand, or `None` where the walk holds
@@ -1384,7 +1390,8 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
 /// value as a Const literal with no recorded op.
 ///
 /// Walker behaviour mirrors `_opimpl_getfield_gc_any_pureornot`
-/// uniformly: heapcache hit returns the cached box (no IR op);
+/// uniformly: a heapcache hit runs the live load and returns the
+/// cached box (no IR op) when it agrees, else `heapcache_sanity_failed`;
 /// heapcache miss records the opcode the dispatch selected +
 /// writes through. RPython aliases the `_pure` jitcode spelling to
 /// the plain opimpl (`pyjitpl.py`), so both spellings record the
@@ -1477,9 +1484,12 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     } else if let Some(constant) = const_pure_result {
         constant
     } else if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr_index) {
-        // Cache hit (RPython _opimpl_getfield_gc_any_pureornot):
+        // Cache hit (`_opimpl_getfield_gc_any_pureornot`):
         //   if upd.currfieldbox is not None:
-        //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
+        //       resvalue = executor.execute(...)
+        //       if resvalue != currfieldbox.getref_base():
+        //           heapcache_sanity_failed(fielddescr, " (ref)")
+        //       count_ops(GETFIELD_GC_I, HEAPCACHED_OPS)
         //       return upd.currfieldbox
         // RPython hardcodes `GETFIELD_GC_I` for the count regardless of
         // the actual rop variant (`_i` / `_r` / `_f`); match the
@@ -1488,6 +1498,42 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
             OpCode::GetfieldGcI,
             majit_metainterp::counters::HEAPCACHED_OPS,
         );
+        if opcode == OpCode::GetfieldGcR {
+            let expected_ref = match ctx.trace_ctx.box_value(cached) {
+                Some(majit_ir::Value::Ref(r)) => Some(r),
+                _ => None,
+            };
+            if let Some(cached_ref) = expected_ref {
+                if cached_ref != majit_ir::GcRef::NO_CONCRETE {
+                    if let Some(struct_ptr) = concrete_obj_ptr {
+                        let struct_ptr =
+                            majit_gc::gc_current_object_address(struct_ptr as usize) as i64;
+                        if let Some(majit_ir::Value::Ref(loaded)) =
+                            ctx.trace_ctx
+                                .field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref)
+                        {
+                            let loaded_now =
+                                majit_ir::GcRef(majit_gc::gc_current_object_address(loaded.0));
+                            let cached_now =
+                                majit_ir::GcRef(majit_gc::gc_current_object_address(cached_ref.0));
+                            let field_name = descr
+                                .as_field_descr()
+                                .map(|field| field.field_name())
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or("<unnamed>");
+                            assert_eq!(
+                                loaded_now, cached_now,
+                                "_opimpl_getfield_gc_any_pureornot sanity \
+                                 check (ref): loaded {:#x} != cached {:#x} \
+                                 (field_index={descr_index}, field={field_name}, struct_ptr=\
+                                 {struct_ptr:#x})",
+                                loaded_now.0, cached_now.0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         cached
     } else {
         // Recording a `getfield_gc_*` whose FieldDescr lacks a parent_descr

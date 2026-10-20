@@ -626,6 +626,22 @@ pub struct DescentBlockerSummary {
     pub has_reachable_abort: bool,
 }
 
+impl DescentBlockerSummary {
+    /// Lattice join of two summaries (`graphanalyze.py` `join_two_results`).
+    ///
+    /// Bools OR; each `Option` keeps any `Some` (`self.or(other)`).
+    pub fn join(self, other: Self) -> Self {
+        Self {
+            may_execute_effect: self.may_execute_effect || other.may_execute_effect,
+            blocker_effect_free: self.blocker_effect_free.or(other.blocker_effect_free),
+            blocker_after_effect: self.blocker_after_effect.or(other.blocker_after_effect),
+            body_not_walked: self.body_not_walked || other.body_not_walked,
+            first_effect_pc: self.first_effect_pc.or(other.first_effect_pc),
+            has_reachable_abort: self.has_reachable_abort || other.has_reachable_abort,
+        }
+    }
+}
+
 /// Answers computed on demand from an assembled [`JitCode`] body.
 ///
 /// Cloned along with the body they describe: a clone carries the same `code`,

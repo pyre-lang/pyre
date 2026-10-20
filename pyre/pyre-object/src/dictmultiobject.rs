@@ -301,7 +301,7 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
 /// a throwaway `W_UnicodeObject` — the per-lookup allocation that otherwise
 /// leaks at every `getitem_str`.  PyPy's string-strategy `getitem_str`
 /// (`dictmultiobject.py`) likewise probes from the raw str.
-struct StrLookupKey<'a> {
+pub struct StrLookupKey<'a> {
     hash: i64,
     key: &'a str,
 }

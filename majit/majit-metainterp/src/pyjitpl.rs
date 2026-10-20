@@ -4042,6 +4042,11 @@ impl<M: Clone> MetaInterp<M> {
         for snapshot in trace_ctx.snapshots.iter_mut() {
             snapshot.walk_const_ptr_refs(&mut visitor);
         }
+        // Production FBW encodes then clears `snapshots`; ConstPtr boxes
+        // named by that last snapshot still live here.
+        for op in &trace_ctx.encoded_snapshot_live_refs {
+            op.trace_const_ptr(&mut visitor);
+        }
         // pyjitpl.py `MetaInterp.virtualref_boxes`: each pair is
         // `[virtualbox, vrefbox]`. The OpRef is the Box; the `usize` is
         // `box.getref_base()` for the concrete `JitVirtualRef*`.
@@ -4148,6 +4153,13 @@ impl<M: Clone> MetaInterp<M> {
                     Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
                 }
             }
+        }
+        // Byte-mode `capture_resumedata` drops `snapshots` after encode.
+        // The last snapshot's TAGBOX Ref ops stay here so `_resref` is
+        // forwarded the same way (`Getfield` dest still SSA-live across
+        // a later `NewArrayClear`).
+        for op in &trace_ctx.encoded_snapshot_live_refs {
+            Self::push_frontend_live_box(*op, &mut live_boxes, &mut visited);
         }
         // `initialize_state_from_start` `self.virtualizable_boxes` stores
         // ordinary BoxPtr objects whose concrete refs the GC traces through
@@ -12366,23 +12378,6 @@ impl<M: Clone> MetaInterp<M> {
                 None => hash,
             }
         };
-        if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
-            let ctx = self.compile_tracing.as_ref().unwrap();
-            let greens = ctx
-                .green_key_values()
-                .map(|k| format!("{:?}", k.values))
-                .unwrap_or_else(|| "?".into());
-            eprintln!(
-                "[jit] finish_and_compile begin key={} greens={} ops={} header_pc={} merge_pts={} bridge={} framestack={}",
-                green_key,
-                greens,
-                ctx.num_ops(),
-                ctx.header_pc,
-                ctx.current_merge_points.len(),
-                self.bridge_info().is_some(),
-                self.framestack.len(),
-            );
-        }
 
         let call_pure_results = self
             .compile_tracing
@@ -12816,9 +12811,6 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.stats.loops_compiled += 1;
                 crate::loop_census::note_compiled(green_key, "entry-bridge");
-                if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
-                    eprintln!("[jit] interp-entry finish_and_compile key={}", green_key);
-                }
                 // compile.py send_loop_to_backend(..., "entry bridge"):
                 // ResumeFromInterpDescr.compile_and_attach mints a token
                 // and compiles the FINISH-only procedure as an entry
@@ -15657,12 +15649,6 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.stats.loops_compiled += 1;
                 crate::loop_census::note_compiled(original_green_key, "entry-bridge");
-                if std::env::var_os("PYRE_DEBUG_INTERP_ENTRY").is_some() {
-                    eprintln!(
-                        "[jit] interp-entry compile_entry_bridge orig={} tgt={}",
-                        original_green_key, green_key
-                    );
-                }
                 // `cpu.tracker.total_compiled_loops` is bumped inside
                 // `CompiledLoopToken::new` (model.py parity).
                 if let Some(ref hook) = self.hooks.on_compile_loop {
@@ -30424,6 +30410,55 @@ mod tests {
             snapshot.vref_boxes[0],
             crate::recorder::SnapshotTagged::Box(OpRef::input_arg_ref(0), Type::Ref)
         );
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_encoded_snapshot_live_ref() {
+        // Production FBW `capture_resumedata` encodes then
+        // `snapshots.clear()`. A Getfield dest still SSA-live across a
+        // later NewArrayClear is not in `registers_r`; pyjitpl.py traces
+        // that TAGBOX FrontendOp so `_resref` is forwarded.
+        const BASE: usize = 0x7E34_C100;
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test_types(&[Type::Ref]);
+        trace_ctx
+            .recorder
+            .attach_byte_buffer(Arc::new(MetaInterpStaticData::new()));
+        let dest = trace_ctx
+            .recorder
+            .record_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)]);
+        assert!(
+            trace_ctx
+                .recorder
+                .set_concrete_at(dest.raw(), Value::Ref(GcRef(BASE)))
+        );
+        let _ = trace_ctx.capture_resumedata(crate::recorder::Snapshot {
+            resume_position: -1,
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: 0,
+                boxes: vec![crate::recorder::SnapshotTagged::Box(dest, Type::Ref)],
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        });
+        assert!(trace_ctx.snapshots.is_empty());
+        assert_eq!(trace_ctx.encoded_snapshot_live_refs, vec![dest]);
+        meta.tracing = Some(Box::new(trace_ctx));
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == BASE {
+                slot.0 = BASE + 0x1000;
+            }
+        });
+
+        let forwarded = meta
+            .tracing
+            .as_ref()
+            .unwrap()
+            .recorder
+            .concrete_at(dest.raw());
+        assert_eq!(forwarded, Some(Value::Ref(GcRef(BASE + 0x1000))));
     }
 
     #[test]

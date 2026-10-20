@@ -146,6 +146,28 @@ impl Snapshot {
         }
     }
 
+    /// TAGBOX Ref FrontendOps this snapshot still names.
+    ///
+    /// `pyjitpl.py` `walk_active_trace_refs` traces those Box objects so
+    /// `RefFrontendOp._resref` stays reachable after the register is
+    /// overwritten. Production FBW `capture_resumedata` encodes then
+    /// drops `TraceCtx.snapshots` (byte offset lookup); the caller
+    /// keeps this list as the live-box set.
+    pub fn live_ref_boxes(&self) -> Vec<majit_ir::OpRef> {
+        let tagged = self
+            .frames
+            .iter()
+            .flat_map(|frame| frame.boxes.iter())
+            .chain(self.vable_boxes.iter())
+            .chain(self.vref_boxes.iter());
+        tagged
+            .filter_map(|t| match t {
+                SnapshotTagged::Box(op, Type::Ref) => Some(*op),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Guard `rd_resume_position` is the `_snapshot_data` byte offset
     /// (`opencoder.py` `create_top_snapshot` / `get_snapshot_iter(index)`),
     /// not a dense `Vec` index. Decode pushes snapshots in increasing
