@@ -1674,6 +1674,77 @@ pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> Gr
     )
 }
 
+/// One slot of a driver's green-argument TYPE spec.
+///
+/// `warmstate.py make_jitcell_subclass` / `green_args_name_spec` pairs each
+/// `gN` field with a translation-time TYPE. These markers are that TYPE as a
+/// Rust type so the door monomorphizes on the spec.
+pub trait GreenSlot: Copy + Default {
+    const TYPE: GreenType;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GreenSlotInt;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GreenSlotFloat;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GreenSlotRef;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GreenSlotStr;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GreenSlotUnicode;
+
+impl GreenSlot for GreenSlotInt {
+    const TYPE: GreenType = GreenType::Int;
+}
+
+impl GreenSlot for GreenSlotFloat {
+    const TYPE: GreenType = GreenType::Float;
+}
+
+impl GreenSlot for GreenSlotRef {
+    const TYPE: GreenType = GreenType::Ref;
+}
+
+impl GreenSlot for GreenSlotStr {
+    const TYPE: GreenType = GreenType::Str;
+}
+
+impl GreenSlot for GreenSlotUnicode {
+    const TYPE: GreenType = GreenType::Unicode;
+}
+
+/// Per-driver green-argument TYPE spec.
+///
+/// `warmstate.py make_jitcell_subclass` builds one `JitCell` class per driver
+/// whose `green_args_name_spec` is an `unrolling_iterable` of `(attrname, TYPE)`
+/// pairs. The types are class constants; `maybe_compile_and_run(*args)` passes
+/// values only. A tuple of [`GreenSlot`] markers is that class in Rust.
+pub trait GreenSpec: Copy {
+    const TYPES: &'static [GreenType];
+}
+
+macro_rules! impl_green_spec {
+    ($($name:ident),+) => {
+        impl<$($name: GreenSlot),+> GreenSpec for ($($name,)+) {
+            const TYPES: &'static [GreenType] = &[$($name::TYPE),+];
+        }
+    };
+}
+
+impl_green_spec!(A);
+impl_green_spec!(A, B);
+impl_green_spec!(A, B, C);
+impl_green_spec!(A, B, C, D);
+impl_green_spec!(A, B, C, D, E);
+impl_green_spec!(A, B, C, D, E, F);
+impl_green_spec!(A, B, C, D, E, F, G);
+impl_green_spec!(A, B, C, D, E, F, G, H);
+
 /// Macro-emitted bridge used by `#[jit_interp]` to build a typed
 /// `GreenKey` from heterogeneous green expressions.
 ///
@@ -1684,14 +1755,25 @@ pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> Gr
 /// Float (equal_float / hash_float);  reference greens widen via raw
 /// pointer bits under Ref (Ptr identity — `equal_ptr` compares the bit
 /// pattern that `hash_ptr` keyed on).
+///
+/// `Slot` is the [`GreenSlot`] marker for this value's TYPE, the same
+/// pairing `green_args_name_spec` records on the JitCell class.
 pub trait GreenAsI64 {
+    type Slot: GreenSlot;
     fn __green_repr(self) -> (i64, GreenType);
+}
+
+/// The [`GreenSlot`] marker for `T`'s green TYPE (`green_args_name_spec`).
+#[inline(always)]
+pub fn green_slot_of<T: GreenAsI64>(_: &T) -> T::Slot {
+    Default::default()
 }
 
 macro_rules! impl_green_as_i64_int {
     ($($ty:ty),*) => {
         $(
             impl GreenAsI64 for $ty {
+                type Slot = GreenSlotInt;
                 #[inline(always)]
                 fn __green_repr(self) -> (i64, GreenType) {
                     (self as i64, GreenType::Int)
@@ -1704,6 +1786,7 @@ macro_rules! impl_green_as_i64_int {
 impl_green_as_i64_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, bool);
 
 impl GreenAsI64 for f32 {
+    type Slot = GreenSlotFloat;
     #[inline(always)]
     fn __green_repr(self) -> (i64, GreenType) {
         // Promote f32 → f64 before extracting the i64 bit pattern.
@@ -1719,6 +1802,7 @@ impl GreenAsI64 for f32 {
 }
 
 impl GreenAsI64 for f64 {
+    type Slot = GreenSlotFloat;
     #[inline(always)]
     fn __green_repr(self) -> (i64, GreenType) {
         (self.to_bits() as i64, GreenType::Float)
@@ -1726,6 +1810,7 @@ impl GreenAsI64 for f64 {
 }
 
 impl<T: ?Sized> GreenAsI64 for &T {
+    type Slot = GreenSlotRef;
     #[inline(always)]
     fn __green_repr(self) -> (i64, GreenType) {
         (
@@ -1736,6 +1821,7 @@ impl<T: ?Sized> GreenAsI64 for &T {
 }
 
 impl<T: ?Sized> GreenAsI64 for &mut T {
+    type Slot = GreenSlotRef;
     #[inline(always)]
     fn __green_repr(self) -> (i64, GreenType) {
         (
@@ -2037,6 +2123,22 @@ mod tests {
             9 * 36,
             "sweep did not run the expected number of cases",
         );
+    }
+
+    #[test]
+    fn green_spec_types_match_slot_markers() {
+        assert_eq!(
+            <(GreenSlotInt, GreenSlotRef) as GreenSpec>::TYPES,
+            &[GreenType::Int, GreenType::Ref]
+        );
+        fn slot_type<S: GreenSlot>(slot: S) -> GreenType {
+            let _ = slot;
+            S::TYPE
+        }
+        assert_eq!(slot_type(green_slot_of(&0usize)), GreenType::Int);
+        let x = 0i32;
+        assert_eq!(slot_type(green_slot_of(&&x)), GreenType::Ref);
+        assert_eq!(slot_type(green_slot_of(&1.0f64)), GreenType::Float);
     }
 
     #[test]

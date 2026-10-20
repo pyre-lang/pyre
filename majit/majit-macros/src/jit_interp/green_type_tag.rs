@@ -13,8 +13,8 @@
 //! lives in `GreenSpec::parse` because that is the sole construction site for
 //! both tags.
 //!
-//! Untagged greens (the existing form) keep the
-//! `<_ as majit_ir::GreenAsI64>::__green_repr(<expr>)` path unchanged.
+//! Untagged greens (the existing form) still go through
+//! `<_ as majit_ir::GreenAsI64>::__green_repr` and `green_slot_of`.
 
 use syn::{
     Expr, Ident, Token, bracketed,

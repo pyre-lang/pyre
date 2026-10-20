@@ -5841,17 +5841,37 @@ impl<S: JitState> JitDriver<S> {
     /// compiled-entry / tracing-start bodies stay in `back_edge_internal`,
     /// which is `#[inline(never)]` so they do not land in the dispatch loop.
     #[inline]
-    pub fn back_edge_structured(
+    pub fn back_edge_structured<G: majit_ir::GreenSpec>(
         &mut self,
         green_key_hash: u64,
         green_values: &[i64],
-        green_types: &[GreenType],
+        green_spec: G,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        let greenargs = Some((green_values, green_types));
+        let _ = green_spec;
+        self.back_edge_greenargs(
+            green_key_hash,
+            Some((green_values, G::TYPES)),
+            target_pc,
+            state,
+            env,
+            pre_run,
+        )
+    }
+
+    #[inline(always)]
+    fn back_edge_greenargs(
+        &mut self,
+        green_key_hash: u64,
+        greenargs: Option<(&[i64], &[GreenType])>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> Option<PortalResume> {
         if let Some(handled) =
             self.try_empty_chain_tick(green_key_hash, greenargs, target_pc, state, env)
         {
@@ -6039,10 +6059,9 @@ impl<S: JitState> JitDriver<S> {
     ) -> Result<Option<usize>, &'static str> {
         let green_key = D::green_key(green_values)?;
         Ok(self
-            .back_edge_structured(
+            .back_edge_greenargs(
                 green_key.hash_u64(),
-                &green_key.values,
-                &green_key.types,
+                Some((&green_key.values, &green_key.types)),
                 target_pc,
                 state,
                 env,
@@ -10042,11 +10061,11 @@ impl<S: JitState> JitDriver<S> {
     /// `function_entry_internal`, which is `#[inline(never)]` so they do
     /// not land in the portal.
     #[inline]
-    pub fn function_entry_structured(
+    pub fn function_entry_structured<G: majit_ir::GreenSpec>(
         &mut self,
         green_key_hash: u64,
         green_values: &[i64],
-        green_types: &[GreenType],
+        green_spec: G,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -10054,7 +10073,7 @@ impl<S: JitState> JitDriver<S> {
         match self.function_entry_runner(
             green_key_hash,
             green_values,
-            green_types,
+            green_spec,
             target_pc,
             state,
             env,
@@ -10078,11 +10097,11 @@ impl<S: JitState> JitDriver<S> {
     /// typed entry still publish that latch; the runner drains it the way the
     /// inline door does.
     #[inline]
-    pub fn function_entry_runner(
+    pub fn function_entry_runner<G: majit_ir::GreenSpec>(
         &mut self,
         green_key_hash: u64,
         green_values: &[i64],
-        green_types: &[GreenType],
+        green_spec: G,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -10106,7 +10125,7 @@ impl<S: JitState> JitDriver<S> {
         let entry = self.enter_compiled_function_entry(
             green_key_hash,
             green_values,
-            green_types,
+            green_spec,
             target_pc,
             state,
             env,
@@ -10122,7 +10141,7 @@ impl<S: JitState> JitDriver<S> {
                 return map_runner_resume(self.function_entry_internal(
                     green_key_hash,
                     green_values,
-                    green_types,
+                    G::TYPES,
                     target_pc,
                     state,
                     env,
@@ -10134,7 +10153,7 @@ impl<S: JitState> JitDriver<S> {
         if let Some(handled) = self.try_function_entry_cold_tick(
             green_key_hash,
             green_values,
-            green_types,
+            green_spec,
             target_pc,
             state,
             env,
@@ -10144,7 +10163,7 @@ impl<S: JitState> JitDriver<S> {
         map_runner_resume(self.function_entry_internal(
             green_key_hash,
             green_values,
-            green_types,
+            G::TYPES,
             target_pc,
             state,
             env,
@@ -10174,12 +10193,13 @@ impl<S: JitState> JitDriver<S> {
     /// procedure_token = cell.get_procedure_token()
     /// ```
     #[inline(always)]
-    fn compiled_function_token(
+    fn compiled_function_token<G: majit_ir::GreenSpec>(
         &self,
         hash: u64,
         green_values: &[i64],
-        green_types: &[GreenType],
+        green_spec: G,
     ) -> Option<(u64, std::sync::Arc<majit_backend::JitCellToken>)> {
+        let _ = green_spec;
         let entry = &self.portal_entry;
         if entry.confirm_enter_jit_ptr.get().is_some() {
             return None;
@@ -10193,12 +10213,12 @@ impl<S: JitState> JitDriver<S> {
             let head = self.meta.jitcounter.lookup_chain(hash)?;
             let cell = std::cell::Ref::map(head, std::rc::Rc::as_ref);
             // `isinstance(cell, JitCell)` — one subclass per driver.
-            if cell.jitdriver_sd == entry.jd_index && cell.comparekey(green_values, green_types) {
+            if cell.jitdriver_sd == entry.jd_index && cell.comparekey(green_values, G::TYPES) {
                 Self::found_cell_entry(&cell)?
             } else {
                 let next = cell.next.borrow().clone()?;
                 drop(cell);
-                let cell = self.compiled_function_token_chain(next, green_values, green_types)?;
+                let cell = self.compiled_function_token_chain(next, green_values, G::TYPES)?;
                 Self::found_cell_entry(&cell)?
             }
         };
@@ -10248,18 +10268,18 @@ impl<S: JitState> JitDriver<S> {
     /// stored on the driver. A pending label or a cross-loop cut falls
     /// back to [`Self::back_edge_resolved`].
     #[inline(never)]
-    fn enter_compiled_function_entry(
+    fn enter_compiled_function_entry<G: majit_ir::GreenSpec>(
         &mut self,
         green_key_hash: u64,
         green_values: &[i64],
-        green_types: &[GreenType],
+        green_spec: G,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         direct_word: &mut Option<i64>,
     ) -> SteadyCompiledEntry {
         let Some((cell_key, token)) =
-            self.compiled_function_token(green_key_hash, green_values, green_types)
+            self.compiled_function_token(green_key_hash, green_values, green_spec)
         else {
             return SteadyCompiledEntry::Miss;
         };
@@ -10588,17 +10608,17 @@ impl<S: JitState> JitDriver<S> {
     /// [`crate::warmstate::WarmEnterState::function_entry_step`] does not
     /// increment a second time.
     #[inline(always)]
-    fn try_function_entry_cold_tick(
+    fn try_function_entry_cold_tick<G: majit_ir::GreenSpec>(
         &mut self,
         green_key_hash: u64,
         green_values: &[i64],
-        green_types: &[GreenType],
+        green_spec: G,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
     ) -> Option<Option<usize>> {
         if let Some((cell_key, token)) =
-            self.compiled_function_token(green_key_hash, green_values, green_types)
+            self.compiled_function_token(green_key_hash, green_values, green_spec)
         {
             return Some(
                 self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
@@ -10647,7 +10667,7 @@ impl<S: JitState> JitDriver<S> {
             return Some(self.function_entry_internal(
                 green_key_hash,
                 green_values,
-                green_types,
+                G::TYPES,
                 target_pc,
                 state,
                 env,
@@ -12013,7 +12033,7 @@ fn abort_blackhole_restore_banks<'a>(
 mod tests {
     use super::*;
     use crate::resume::ReconstructedFrame;
-    use majit_ir::{GcRef, GreenType, OpCode, OpRef, Type, Value};
+    use majit_ir::{GcRef, GreenSlotInt, GreenSlotRef, GreenType, OpCode, OpRef, Type, Value};
     use std::sync::Arc;
 
     // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
@@ -12451,10 +12471,15 @@ mod tests {
             .set_confirm_enter_jit(Some(refuse));
         let mut pre_ran = false;
 
-        let outcome =
-            driver.back_edge_structured(hash, &key.values, &key.types, 19, &mut state, &(), || {
-                pre_ran = true
-            });
+        let outcome = driver.back_edge_structured(
+            hash,
+            &key.values,
+            (GreenSlotInt, GreenSlotInt, GreenSlotRef),
+            19,
+            &mut state,
+            &(),
+            || pre_ran = true,
+        );
 
         assert_eq!(outcome, None);
         assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -12489,10 +12514,15 @@ mod tests {
             .set_confirm_enter_jit(Some(allow));
         let mut pre_ran = false;
 
-        let outcome =
-            driver.back_edge_structured(hash, &key.values, &key.types, 19, &mut state, &(), || {
-                pre_ran = true
-            });
+        let outcome = driver.back_edge_structured(
+            hash,
+            &key.values,
+            (GreenSlotInt, GreenSlotInt, GreenSlotRef),
+            19,
+            &mut state,
+            &(),
+            || pre_ran = true,
+        );
 
         assert!(outcome.is_some(), "the permissive door executes the loop");
         assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -12822,7 +12852,6 @@ mod tests {
             .set_function_threshold(2);
         let hash = 0xA11u64;
         let values = [hash as i64];
-        let types = [GreenType::Int];
         let mut state = CountingDoorState {
             build_meta_calls: std::cell::Cell::new(0),
             extract_live_values_calls: std::cell::Cell::new(0),
@@ -12830,7 +12859,7 @@ mod tests {
         };
         assert!(
             driver
-                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .function_entry_structured(hash, &values, (GreenSlotInt,), 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -12839,7 +12868,7 @@ mod tests {
         );
         assert!(
             driver
-                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .function_entry_structured(hash, &values, (GreenSlotInt,), 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -12869,12 +12898,26 @@ mod tests {
         };
         assert!(
             driver
-                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .function_entry_structured(
+                    hash,
+                    &values,
+                    (GreenSlotInt, GreenSlotRef),
+                    0,
+                    &mut state,
+                    &()
+                )
                 .is_none()
         );
         assert!(
             driver
-                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .function_entry_structured(
+                    hash,
+                    &values,
+                    (GreenSlotInt, GreenSlotRef),
+                    0,
+                    &mut state,
+                    &()
+                )
                 .is_none()
         );
         assert!(
@@ -12948,7 +12991,7 @@ mod tests {
             .warm_state_for_driver(idx1)
             .attach_procedure_to_interp_for_key(&key, std::sync::Arc::clone(&token));
 
-        let found = driver.compiled_function_token(hash, &key.values, &key.types);
+        let found = driver.compiled_function_token(hash, &key.values, (GreenSlotInt,));
         assert!(
             found.is_some_and(
                 |(cell_key, got)| cell_key == hash && std::sync::Arc::ptr_eq(&got, &token)
@@ -13013,13 +13056,13 @@ mod tests {
         }
         assert!(
             driver
-                .compiled_function_token(hash, &key.values, &key.types)
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
                 .is_some(),
             "jd1's own slot still answers after jd0 files a different slot"
         );
         assert!(
             driver
-                .compiled_function_token(foreign_hash, &foreign.values, &foreign.types)
+                .compiled_function_token(foreign_hash, &foreign.values, (GreenSlotInt,))
                 .is_none(),
             "function-entry compiled lookup on jd1 skips jd0's cell at that slot"
         );
@@ -13059,7 +13102,7 @@ mod tests {
 
         assert!(
             driver
-                .compiled_function_token(hash, &key.values, &key.types)
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
                 .is_some(),
             "the procedure is attached before the confirm hook"
         );
@@ -13071,7 +13114,7 @@ mod tests {
 
         assert!(
             driver
-                .compiled_function_token(hash, &key.values, &key.types)
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
                 .is_none(),
             "a confirm hook installed after register_descriptor stays on the occupied door"
         );
@@ -13082,7 +13125,7 @@ mod tests {
             .set_confirm_enter_jit(None);
         assert!(
             driver
-                .compiled_function_token(hash, &key.values, &key.types)
+                .compiled_function_token(hash, &key.values, (GreenSlotInt,))
                 .is_some(),
             "clearing the hook restores the compiled token"
         );
@@ -13146,12 +13189,14 @@ mod tests {
             );
         }
 
-        let found_a = driver.compiled_function_token(hash, &key_a.values, &key_a.types);
+        let found_a =
+            driver.compiled_function_token(hash, &key_a.values, (GreenSlotInt, GreenSlotInt));
         assert!(
             found_a.is_some_and(|(_, got)| std::sync::Arc::ptr_eq(&got, &token_a)),
             "comparekey selects key_a's token"
         );
-        let found_b = driver.compiled_function_token(hash, &key_b.values, &key_b.types);
+        let found_b =
+            driver.compiled_function_token(hash, &key_b.values, (GreenSlotInt, GreenSlotInt));
         assert!(
             found_b.is_some_and(|(_, got)| std::sync::Arc::ptr_eq(&got, &token_b)),
             "comparekey walk selects key_b's token on the same slot"
@@ -13159,7 +13204,7 @@ mod tests {
         let key_c = GreenKey::new(vec![3, 4]);
         assert!(
             driver
-                .compiled_function_token(hash, &key_c.values, &key_c.types)
+                .compiled_function_token(hash, &key_c.values, (GreenSlotInt, GreenSlotInt))
                 .is_none(),
             "a third key's greens match neither cell on the chain"
         );
@@ -13776,7 +13821,6 @@ mod tests {
             .set_function_threshold(1);
         let hash = 0xB0Du64;
         let values = [hash as i64];
-        let types = [GreenType::Int];
         let mut state = CountingDoorState {
             build_meta_calls: std::cell::Cell::new(0),
             extract_live_values_calls: std::cell::Cell::new(0),
@@ -13785,7 +13829,7 @@ mod tests {
         driver.suppress_function_entry();
         assert!(
             driver
-                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .function_entry_structured(hash, &values, (GreenSlotInt,), 0, &mut state, &())
                 .is_none()
         );
         assert!(
@@ -13794,7 +13838,7 @@ mod tests {
         );
         assert!(
             driver
-                .function_entry_structured(hash, &values, &types, 0, &mut state, &())
+                .function_entry_structured(hash, &values, (GreenSlotInt,), 0, &mut state, &())
                 .is_none()
         );
         assert!(

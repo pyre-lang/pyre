@@ -1,4 +1,4 @@
-use majit_ir::{GcRef, GreenKey, OpRef, Type, Value};
+use majit_ir::{GcRef, GreenKey, GreenSlotInt, OpRef, Type, Value};
 use majit_macros::jit_driver;
 use majit_metainterp::{
     DeclarativeJitDriver, JitDriver, JitState, PendingFieldWriteLayout, TraceCtx,
@@ -1350,7 +1350,7 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
             .back_edge_structured(
                 green_key.hash_u64(),
                 &green_key.values,
-                &green_key.types,
+                (GreenSlotInt, GreenSlotInt),
                 7,
                 &mut state,
                 &(),
@@ -1366,7 +1366,7 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
             .back_edge_structured(
                 green_key.hash_u64(),
                 &green_key.values,
-                &green_key.types,
+                (GreenSlotInt, GreenSlotInt),
                 7,
                 &mut state,
                 &(),

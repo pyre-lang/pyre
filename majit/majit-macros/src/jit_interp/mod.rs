@@ -3195,11 +3195,11 @@ fn emit_portal_runner(
             // `execute_assembler`'s DoneWithThisFrame fast path return without
             // entering the portal body.
             {
-                let (__green_hash, __green_values, __green_types) = #key;
+                let (__green_hash, __green_values, __green_spec) = #key;
                 match #driver.function_entry_runner(
                     __green_hash,
                     &__green_values,
-                    &__green_types,
+                    __green_spec,
                     #pc,
                     &mut #state,
                     #env,
@@ -3678,8 +3678,8 @@ fn rewrite_body(
     /// Emit a single `(i64, majit_ir::GreenType)` pair for one green
     /// expression, dispatching on the optional per-green type tag.
     /// Untagged (`None`) greens flow through the
-    /// `<_ as GreenAsI64>::__green_repr` trait. Tagged greens emit
-    /// explicit casts so
+    /// `<_ as GreenAsI64>::__green_repr` trait plus `green_slot_of`. Tagged
+    /// greens emit explicit casts so
     /// `&str`-bearing greens carry `GreenType::Str` instead of being
     /// silently routed through the blanket `impl<T: ?Sized>` Ref impl.
     fn emit_green_repr(spec_expr: &Expr, tag: Option<green_type_tag::GreenTypeTag>) -> TokenStream {
@@ -3697,22 +3697,27 @@ fn rewrite_body(
             // string) and `rstr.UNICODE` (codepoint sequence) and the
             // macro cannot pick one without an explicit declaration.
             None => quote! {
-                <_ as majit_ir::GreenAsI64>::__green_repr(#spec_expr)
+                {
+                    let __g = #spec_expr;
+                    let __s = majit_ir::green_slot_of(&__g);
+                    let (__b, __t) = <_ as majit_ir::GreenAsI64>::__green_repr(__g);
+                    (__b, __t, __s)
+                }
             },
             Some(GreenTypeTag::Int) => quote! {
-                ((#spec_expr) as i64, majit_ir::GreenType::Int)
+                ((#spec_expr) as i64, majit_ir::GreenType::Int, majit_ir::GreenSlotInt)
             },
             Some(GreenTypeTag::Float) => quote! {
                 {
                     let __green_f: f64 = (#spec_expr) as f64;
-                    (__green_f.to_bits() as i64, majit_ir::GreenType::Float)
+                    (__green_f.to_bits() as i64, majit_ir::GreenType::Float, majit_ir::GreenSlotFloat)
                 }
             },
             Some(GreenTypeTag::Ref) => quote! {
                 {
                     let (__green_bits, _) =
                         <_ as majit_ir::GreenAsI64>::__green_repr(#spec_expr);
-                    (__green_bits, majit_ir::GreenType::Ref)
+                    (__green_bits, majit_ir::GreenType::Ref, majit_ir::GreenSlotRef)
                 }
             },
             // ABI: the i64 is the address of a `'static` slot holding
@@ -3761,12 +3766,14 @@ fn rewrite_body(
                 (
                     majit_ir::make_str_slot(#spec_expr),
                     majit_ir::GreenType::Str,
+                    majit_ir::GreenSlotStr,
                 )
             },
             Some(GreenTypeTag::Unicode) => quote! {
                 (
                     majit_ir::make_str_slot(#spec_expr),
                     majit_ir::GreenType::Unicode,
+                    majit_ir::GreenSlotUnicode,
                 )
             },
         }
@@ -3803,10 +3810,14 @@ fn rewrite_body(
     ) -> Option<TokenStream> {
         if greens.is_empty() {
             None
+        } else if greens.len() > 8 {
+            Some(quote! {
+                compile_error!("#[jit_interp] greens list exceeds the 8-green GreenSpec limit")
+            })
         } else {
             // Per-green dispatch through `majit_ir::GreenAsI64::__green_repr`
-            // so the `(i64-bits, GreenType)` pair travels together for each
-            // green expression. `with_types` builds the typed schema;
+            // so the `(i64-bits, GreenType, Marker)` triple travels together
+            // for each green expression. `with_types` builds the typed schema;
             // `warmstate.py comparekey _green_args_spec` keys per-type
             // `equal_whatever`/`hash_whatever` off the green's lltype, so a
             // Ref-typed green must compare by pointer identity, a Float by
@@ -3830,8 +3841,8 @@ fn rewrite_body(
                     emit_green_repr(subst_target_for_pc(expr, pc, target), tag)
                 })
                 .collect();
-            // Each green's `(i64, GreenType)` pair is bound to a local
-            // ONCE — the green expressions must not be re-evaluated, so
+            // Each green's `(i64, GreenType, Marker)` triple is bound to a
+            // local ONCE — the green expressions must not be re-evaluated, so
             // the stack arrays below close over these `Copy` locals
             // rather than over the expressions.
             //
@@ -3865,21 +3876,22 @@ fn rewrite_body(
                 })
                 .collect();
             let values: Vec<TokenStream> = slots.iter().map(|slot| quote! { #slot.0 }).collect();
-            let types: Vec<TokenStream> = slots.iter().map(|slot| quote! { #slot.1 }).collect();
+            let spec_elems: Vec<TokenStream> =
+                slots.iter().map(|slot| quote! { #slot.2 }).collect();
             let n = slots.len();
-            // `(hash, values, types)`: `JitCell.get_uhash(*greenargs)` on
+            // `(hash, values, spec)`: `JitCell.get_uhash(*greenargs)` on
             // every back edge, `JitCell.comparekey(*greenargs2)` against
-            // these stack arrays. An owned `GreenKey` is built from the
-            // same arrays only where a cell is installed
-            // (`JitCell(*greenargs)` / `GreenKey::from_greenargs`).
+            // these stack arrays with the driver's `GreenSpec`. An owned
+            // `GreenKey` is built from the same arrays only where a cell
+            // is installed (`JitCell(*greenargs)` / `GreenKey::from_greenargs`).
             Some(quote! {
                 {
                     #(#bind)*
                     let mut __green_hash: u64 = majit_ir::GREEN_UHASH_SEED;
                     #(#fold)*
                     let __green_values: [i64; #n] = [#(#values),*];
-                    let __green_types: [majit_ir::GreenType; #n] = [#(#types),*];
-                    (__green_hash, __green_values, __green_types)
+                    let __green_spec = (#(#spec_elems,)*);
+                    (__green_hash, __green_values, __green_spec)
                 }
             })
         }
@@ -4365,8 +4377,8 @@ fn rewrite_body(
                             {
                                 quote! {
                                     {
-                                        let (__green_hash, __green_values, __green_types) = #green_key;
-                                        #driver_expr.back_edge_structured(__green_hash, &__green_values, &__green_types, #target_expr, #state_expr, #env_expr, #pre_run_expr)
+                                        let (__green_hash, __green_values, __green_spec) = #green_key;
+                                        #driver_expr.back_edge_structured(__green_hash, &__green_values, __green_spec, #target_expr, #state_expr, #env_expr, #pre_run_expr)
                                     }
                                 }
                             } else {
@@ -4544,11 +4556,11 @@ fn rewrite_body(
                 if insert_entry_door {
                     quote! {
                         {
-                            let (__green_hash, __green_values, __green_types) = #key;
+                            let (__green_hash, __green_values, __green_spec) = #key;
                             let __run_dispatch = match #driver.function_entry_structured(
                                 __green_hash,
                                 &__green_values,
-                                &__green_types,
+                                __green_spec,
                                 #pc,
                                 &mut #state,
                                 #env,
