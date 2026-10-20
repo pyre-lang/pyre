@@ -16420,17 +16420,19 @@ fn init_type_type(ns: PyObjectRef) {
 struct MroUpdate {
     w_type_root: usize,
     old_mro_roots: Option<(usize, usize)>,
-    new_mro: *mut pyre_object::object_array::FixedObjectArray,
+    new_mro_root: usize,
 }
 
 /// `typeobject.py mro_subclasses` — recompute the MRO of `w_type`
 /// through the ordinary `compute_mro` path (including a custom metaclass
 /// `mro()`), remember the exact update, then recurse over its subclasses.
 ///
-/// PyPy's `temp` is a list of `(w_type, old_mro_w, new_mro_w)`.  The Rust
-/// list stores the old immutable MRO contents plus the identity of the newly
-/// installed fixed-array block; the latter preserves the same reentrancy
-/// guard during rollback.
+/// PyPy's `temp` is a list of `(w_type, old_mro_w, new_mro_w)`
+/// (`mro_subclasses` / `descr_set__bases__`: `temp.append((cls, old_mro,
+/// cls.mro_w))`).  The Rust list stores the old immutable MRO contents
+/// plus a shadow-stack slot holding the newly installed fixed-array
+/// block, so rollback can still compare identity after a collecting
+/// `mro()`.
 unsafe fn mro_subclasses(
     w_type: PyObjectRef,
     temp: &mut Vec<MroUpdate>,
@@ -16452,10 +16454,12 @@ unsafe fn mro_subclasses(
     crate::baseobjspace::compute_and_set_mro(w_type)?;
     let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
     let new_mro = pyre_object::w_type_get_mro(w_type);
+    let new_mro_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(new_mro as pyre_object::PyObjectRef);
     temp.push(MroUpdate {
         w_type_root,
         old_mro_roots,
-        new_mro,
+        new_mro_root,
     });
     let subclasses = pyre_object::typeobject::w_type_get_subclasses(w_type, false);
     let subclass_roots = pyre_object::gc_roots::shadow_stack_len();
@@ -16716,7 +16720,10 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let err_slot = err.pin(&_mro_roots);
             for update in temp {
                 let w_updated_type = pyre_object::gc_roots::shadow_stack_get(update.w_type_root);
-                if pyre_object::w_type_get_mro(w_updated_type) == update.new_mro {
+                if pyre_object::w_type_get_mro(w_updated_type)
+                    == pyre_object::gc_roots::shadow_stack_get(update.new_mro_root)
+                        as *mut pyre_object::object_array::FixedObjectArray
+                {
                     match update.old_mro_roots {
                         Some((start, len)) => {
                             let old_mro = (start..start + len)

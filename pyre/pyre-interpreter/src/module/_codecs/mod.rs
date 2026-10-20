@@ -831,8 +831,8 @@ fn unregister(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     })
 }
 
-fn ensure_encodings_imported(state: &mut CodecState) -> Result<(), crate::PyError> {
-    if !state.codec_need_encodings {
+fn ensure_encodings_imported() -> Result<(), crate::PyError> {
+    if !with_codec_state(|state| state.codec_need_encodings) {
         return Ok(());
     }
     // PyPy `_lookup_codec_loop`: import encodings once so it can register
@@ -846,17 +846,22 @@ fn ensure_encodings_imported(state: &mut CodecState) -> Result<(), crate::PyErro
     // searches the filesystem itself, so a name reached through it consults no
     // `sys.path_hooks` entry and is parsed from source rather than read from
     // the module's bytecode cache.
+    // The import is a Python-level call, so no `&mut CodecState` is live
+    // across it (`interp_codecs.py lookup` / `_lookup_codec_loop`).
     let ec = crate::call::getexecutioncontext();
     crate::importing::call_dunder_import_name_only("encodings", ec)?;
     let _ = crate::importing::call_dunder_import_name_only("encodings.utf_8", ec);
-    state.codec_need_encodings = false;
-    if unsafe { pyre_object::w_list_len(state.codec_search_path) } == 0 {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            "no codec search functions registered: can't find encoding",
-        ));
-    }
-    Ok(())
+    with_codec_state(|state| {
+        state.codec_need_encodings = false;
+        if unsafe { pyre_object::w_list_len(state.codec_search_path) } == 0 {
+            Err(crate::PyError::new(
+                crate::PyErrorKind::LookupError,
+                "no codec search functions registered: can't find encoding",
+            ))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn lookup_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -886,66 +891,72 @@ pub(crate) fn lookup_codec_name(encoding: &str) -> Result<PyObjectRef, crate::Py
     }
     let normalized_encoding = normalize(encoding);
 
-    with_codec_state(|state| {
-        if let Some(w_result) = unsafe {
-            pyre_object::dictmultiobject::w_dict_getitem_str(
-                state.codec_search_cache,
-                &normalized_encoding,
-            )
-        } {
-            return Ok(w_result);
-        }
+    let cached = with_codec_state(|state| unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str(
+            state.codec_search_cache,
+            &normalized_encoding,
+        )
+    });
+    if let Some(w_result) = cached {
+        return Ok(w_result);
+    }
 
-        ensure_encodings_imported(state)?;
-        let w_v = w_str_new_managed(&normalized_encoding);
-        // `codec_search_path` getitem can box, and each search function is a
-        // collecting Python call (`interp_codecs.py lookup`). Keep the
-        // encoding name and the search callable on the shadow stack.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[w_v, state.codec_search_path]);
-        let v_slot = base;
-        let path_slot = base + 1;
-        let n =
-            unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(path_slot)) };
-        for i in 0..n {
-            let Some(w_search) = (unsafe {
-                pyre_object::w_list_getitem(
-                    pyre_object::gc_roots::shadow_stack_get(path_slot),
-                    i as i64,
-                )
-            }) else {
-                continue;
-            };
-            let search_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_search);
-            let w_result = crate::call::call_function_impl_result(
-                pyre_object::gc_roots::shadow_stack_get(search_slot),
-                &[pyre_object::gc_roots::shadow_stack_get(v_slot)],
-            )?;
-            if unsafe { pyre_object::is_none(w_result) } {
-                continue;
-            }
-            if !unsafe { pyre_object::is_tuple(w_result) }
-                || unsafe { pyre_object::w_tuple_len(w_result) } != 4
-            {
-                return Err(crate::PyError::type_error(
-                    "codec search functions must return 4-tuples",
-                ));
-            }
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str(
-                    state.codec_search_cache,
-                    &normalized_encoding,
-                    w_result,
-                );
-            }
-            return Ok(w_result);
+    ensure_encodings_imported()?;
+    let w_v = w_str_new_managed(&normalized_encoding);
+    // `codec_search_path` getitem can box, and each search function is a
+    // collecting Python call (`interp_codecs.py lookup`). Keep the
+    // encoding name, the search-path list, and the current search
+    // callable on the shadow stack; no `&mut CodecState` is live across
+    // those calls. Pin the name first: `with_codec_state` allocates the
+    // registry on first use (`CodecState::new`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let v_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_v);
+    let path = with_codec_state(|state| state.codec_search_path);
+    let path_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(path);
+    let n = unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(path_slot)) };
+    for i in 0..n {
+        let Some(w_search) = (unsafe {
+            pyre_object::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(path_slot),
+                i as i64,
+            )
+        }) else {
+            continue;
+        };
+        let search_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_search);
+        let w_result = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(search_slot),
+            &[pyre_object::gc_roots::shadow_stack_get(v_slot)],
+        )?;
+        if unsafe { pyre_object::is_none(w_result) } {
+            continue;
         }
-        Err(crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            format!("unknown encoding: {encoding}"),
-        ))
-    })
+        let result_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_result);
+        let w_result = pyre_object::gc_roots::shadow_stack_get(result_slot);
+        if !unsafe { pyre_object::is_tuple(w_result) }
+            || unsafe { pyre_object::w_tuple_len(w_result) } != 4
+        {
+            return Err(crate::PyError::type_error(
+                "codec search functions must return 4-tuples",
+            ));
+        }
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                with_codec_state(|state| state.codec_search_cache),
+                &normalized_encoding,
+                pyre_object::gc_roots::shadow_stack_get(result_slot),
+            );
+        }
+        return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
+    }
+    Err(crate::PyError::new(
+        crate::PyErrorKind::LookupError,
+        format!("unknown encoding: {encoding}"),
+    ))
 }
 
 #[cfg(test)]

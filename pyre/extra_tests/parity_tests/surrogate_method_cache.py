@@ -76,7 +76,47 @@ def tag_zero_mro():
     assert getattr(Subject, name) == 42
 
 
+def bases_assignment_rollback_restores_mro():
+    import gc
+
+    fail = False
+
+    class Meta(type):
+        def mro(cls):
+            junk = [object() for _ in range(256)]
+            _ = junk[-1]
+            name = getattr(cls, "__name__", "")
+            if fail and name == "C":
+                gc.collect(0)
+                raise RuntimeError("mro fail")
+            return type.mro(cls)
+
+    class A(metaclass=Meta):
+        pass
+
+    class B(A):
+        pass
+
+    class C(B):
+        pass
+
+    class D:
+        pass
+
+    try:
+        fail = True
+        B.__bases__ = (D,)
+    except RuntimeError:
+        pass
+    print(
+        "bases_assignment_rollback",
+        [c.__name__ for c in B.__bases__],
+        [c.__name__ for c in B.__mro__],
+    )
+
+
 store_delete()
 reassign_bases()
 tag_zero_mro()
+bases_assignment_rollback_restores_mro()
 print("OK")
