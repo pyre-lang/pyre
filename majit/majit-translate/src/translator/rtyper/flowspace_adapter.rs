@@ -1038,28 +1038,9 @@ fn tuple_aggregate_items(
     Some(TupleAggregate { items, at })
 }
 
-/// `true` iff `kind` is `front::mir`'s synthetic string-literal
-/// define-op (`Call(["__str_const", <text>])`, `mir.rs`).
-/// Upstream flowspace carries a string literal as a bare
-/// `Constant('text')` SSA value, so the pre-pass
-/// ([`legacy_const_define_hlvalue`]) folds the op to that Constant and
-/// [`translate_op`] emits nothing; a Constant is not an operation and
-/// raises nothing, so [`op_canraise`] is false — same contract as the
-/// unit-variant ctor elision above.
-fn is_str_const_define(kind: &OpKind) -> bool {
-    matches!(
-        kind,
-        OpKind::Call {
-            target: crate::model::CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const"
-    )
-}
-
 /// `true` iff `kind` is `front::mir`'s synthetic function-item constant
 /// define-op (`Call(["__fn_const", <real path>...])`).  Like
-/// [`is_str_const_define`], this is a constant carrier rather than a
+/// [`crate::model::is_str_const_define`], this is a constant carrier rather than a
 /// flowspace call operation.
 fn is_fn_const_define(kind: &OpKind) -> bool {
     match kind {
@@ -1076,7 +1057,7 @@ fn is_fn_const_define(kind: &OpKind) -> bool {
 /// is carried as a bare `Constant(list)` SSA value, so the pre-pass
 /// ([`legacy_const_define_hlvalue`]) folds the op to that Constant and
 /// [`translate_op`] emits nothing — same contract as
-/// [`is_str_const_define`].
+/// [`crate::model::is_str_const_define`].
 fn is_const_int_array_define(kind: &OpKind) -> bool {
     matches!(
         kind,
@@ -1472,7 +1453,7 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // A string-literal define-op pre-folds to `Constant('text')`
         // and emits no op — a Constant raises nothing.  Matched before
         // the general `Call` arm, same as the unit-variant elision.
-        kind if is_str_const_define(kind) => false,
+        kind if crate::model::is_str_const_define(kind) => false,
         // A function-item constant define-op is a bare constant carrier,
         // not a callee invocation, so it raises nothing.
         kind if is_fn_const_define(kind) => false,
@@ -2074,7 +2055,7 @@ pub fn translate_op(
     // String-literal define-ops pre-fold to `Constant('text')` the same
     // way (see `is_str_const_define`); the pre-pass owns the slot's
     // `Hlvalue::Constant`, translate_op emits no FlowspaceOp.
-    if is_str_const_define(&op.kind) {
+    if crate::model::is_str_const_define(&op.kind) {
         return Ok(Vec::new());
     }
     // Function-item define-ops pre-fold to a constant carrier the same
@@ -12566,7 +12547,7 @@ mod tests {
             result_ty: ValueType::Int,
         };
         assert!(is_fn_const_define(&define));
-        assert!(!is_str_const_define(&define));
+        assert!(!crate::model::is_str_const_define(&define));
         assert!(!is_const_int_array_define(&define));
 
         let op = SpaceOperation {
