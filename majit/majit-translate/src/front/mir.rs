@@ -33933,10 +33933,12 @@ impl<'a> Lowering<'a> {
                 let mut spans = Vec::with_capacity(fields.len());
                 for (i, field) in fields.iter().enumerate() {
                     let offset = layout.struct_field_offset(i)?;
-                    // Same width rule as the Enum payload arm: a thin
-                    // pointer, a Scalar, a `core::sync::atomic::Atomic<T>`
-                    // inner word, or a size-`<= 8` ADT (`span_raw_for_ty`).
-                    let (_, itemsize, _) = self.span_raw_for_ty(&field.ty)?;
+                    // `rffi.py` `_get_structcopy_fn.copyfn` copies a
+                    // ContainerType field by recursing into its leaves.
+                    // A nested container has no recursive plan yet, so
+                    // the whole type is declined. Proven scalars stay
+                    // one span (`struct_field_span_raw`).
+                    let (_, itemsize, _) = self.struct_field_span_raw(&field.ty)?;
                     if itemsize == 0 || itemsize > 8 {
                         return None;
                     }
@@ -34216,16 +34218,10 @@ impl<'a> Lowering<'a> {
         result
     }
 
-    /// Byte width of one field for a whole-value move. A literal uses
-    /// its Charon size. A thin pointer or a small ADT (a `Box`, a C-like
-    /// tag) is that many bytes, so a 16-byte `Union` still moves field by
-    /// field when a payload is not an integer.
-    ///
-    /// `core::sync::atomic::Atomic<T>` is Opaque and carries no Charon
-    /// layout; the stored word is `T` (`tyref_atomic_arg`), classified
-    /// with the same `json_ty_raw_store_descr` the Scalar arm uses
-    /// (`tyref_atomic_inner_value_type` paints the FieldWrite that way).
-    fn span_raw_for_ty(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
+    /// Proven scalar width: a `json_ty_raw_store_descr` word, a thin
+    /// pointer, or `core::sync::atomic::Atomic<T>` classified by `T`
+    /// (`tyref_atomic_arg`). Nested ADTs are left to the caller.
+    fn span_raw_scalar_ptr_or_atomic(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
         if let Some(node) = tyref_node(ty, self.llbc)
             && let Some(descr) = json_ty_raw_store_descr(node, self.llbc)
         {
@@ -34241,6 +34237,32 @@ impl<'a> Lowering<'a> {
         if let Some(inner) = tyref_atomic_arg(ty, self.llbc)
             && let Some(descr) = json_ty_raw_store_descr(inner, self.llbc)
         {
+            return Some(descr);
+        }
+        None
+    }
+
+    /// Byte width of one struct field for a whole-value move
+    /// (`rffi.py` `_get_structcopy_fn.copyfn`). A nested container
+    /// (struct, tuple, data-carrying enum, union) is declined until
+    /// `move_plan` can recurse into its leaves the way `copyfn` does.
+    /// A fieldless (C-like) enum is its scalar tag.
+    fn struct_field_span_raw(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
+        self.span_raw_scalar_ptr_or_atomic(ty)
+            .or_else(|| fieldless_enum_raw_store_descr(ty, self.llbc))
+    }
+
+    /// Byte width of one field for a whole-value move. A literal uses
+    /// its Charon size. A thin pointer or a small ADT (a `Box`, a C-like
+    /// tag) is that many bytes, so a 16-byte `Union` still moves field by
+    /// field when a payload is not an integer.
+    ///
+    /// `core::sync::atomic::Atomic<T>` is Opaque and carries no Charon
+    /// layout; the stored word is `T` (`tyref_atomic_arg`), classified
+    /// with the same `json_ty_raw_store_descr` the Scalar arm uses
+    /// (`tyref_atomic_inner_value_type` paints the FieldWrite that way).
+    fn span_raw_for_ty(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
+        if let Some(descr) = self.span_raw_scalar_ptr_or_atomic(ty) {
             return Some(descr);
         }
         let id = self.tyref_adt_def_id(ty)?;
@@ -113755,6 +113777,10 @@ mod tests {
         serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
     }
 
+    fn interior_u32() -> serde_json::Value {
+        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}})
+    }
+
     fn interior_adt(id: u64) -> serde_json::Value {
         serde_json::json!({
             "Adt": {
@@ -113965,6 +113991,57 @@ mod tests {
 
     fn lower_interior(llbc: &Llbc, name: &str) -> FunctionGraph {
         super::lower_function(llbc, name).unwrap_or_else(|err| panic!("lower {name}: {err:?}"))
+    }
+
+    /// `*self = fresh` through `&mut Self` of type `types[0]` (`def_id` 0).
+    fn lower_deref_store_mut_self(
+        types: Vec<serde_json::Value>,
+    ) -> Result<FunctionGraph, super::LowerError> {
+        let s_ty = interior_adt(0);
+        let mut_self = serde_json::json!({"Ref": [null, s_ty.clone(), "Mut"]});
+        let unit = serde_json::json!({
+            "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+        });
+        let caller = interior_caller(
+            "f",
+            2,
+            vec![mut_self.clone(), s_ty.clone()],
+            unit.clone(),
+            vec![
+                interior_local(0, None, &unit),
+                interior_local(1, Some("self"), &mut_self),
+                interior_local(2, Some("fresh"), &s_ty),
+            ],
+            vec![interior_bb(
+                vec![interior_assign(
+                    interior_deref(1, &mut_self, &s_ty),
+                    serde_json::json!({
+                        "Use": [{"Move": interior_place(2, &s_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            )],
+        );
+        let llbc = llbc_with_types("fixture", types, vec![caller]);
+        super::lower_function(&llbc, "f")
+    }
+
+    fn field_read_write_names<'a>(ops: &'a [&SpaceOperation]) -> (Vec<&'a str>, Vec<&'a str>) {
+        let writes = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let reads = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => Some(field.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        (writes, reads)
     }
 
     fn interior_read_block(graph: &FunctionGraph) -> &crate::model::Block {
@@ -114292,6 +114369,127 @@ mod tests {
             _ => None,
         });
         assert_eq!(atomic_write_ty, Some(&ValueType::Unsigned), "ops={ops:?}");
+    }
+
+    /// An inline nested-struct field is a ContainerType. `rffi.py`
+    /// `_get_structcopy_fn.copyfn` would recurse into its leaves;
+    /// `move_plan` has no recursive plan yet, so the store declines.
+    #[test]
+    fn deref_store_of_nested_struct_field_has_no_move_plan() {
+        let s_ty = interior_adt(0);
+        let inner_ty = interior_adt(1);
+        let u32_ty = interior_u32();
+        let usize_ty = interior_usize();
+        let s_decl = interior_struct(
+            0,
+            &["fixture", "S"],
+            &[("inner", inner_ty), ("n", usize_ty)],
+            16,
+            &[0, 8],
+            false,
+        );
+        let inner_decl = interior_struct(
+            1,
+            &["fixture", "Inner"],
+            &[("a", u32_ty.clone()), ("b", u32_ty)],
+            8,
+            &[0, 4],
+            false,
+        );
+        let err = lower_deref_store_mut_self(vec![s_decl, inner_decl])
+            .expect_err("nested container field must decline the move plan");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deref store is not a field, array element, or raw word"),
+            "s_ty={s_ty:?} err={msg}"
+        );
+    }
+
+    /// `Atomic<u32>` is Opaque; the stored word is `T` (`tyref_atomic_arg`).
+    /// The Struct arm still builds a field-wise move plan.
+    #[test]
+    fn deref_store_of_atomic_u32_field_emits_field_writes() {
+        let u32_ty = interior_u32();
+        let usize_ty = interior_usize();
+        let atomic_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [u32_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let s_decl = interior_struct(
+            0,
+            &["fixture", "S"],
+            &[("n", atomic_ty), ("extra", usize_ty)],
+            16,
+            &[0, 8],
+            false,
+        );
+        let atomic_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+            "kind": "Opaque",
+            "layout": null
+        });
+        let graph = lower_deref_store_mut_self(vec![s_decl, atomic_decl])
+            .unwrap_or_else(|err| panic!("Atomic<u32> field must keep a move plan: {err:?}"));
+        let ops = graph_ops(&graph);
+        let (write_names, read_names) = field_read_write_names(&ops);
+        assert_eq!(write_names, ["n", "extra"], "ops={ops:?}");
+        assert_eq!(read_names, ["n", "extra"], "ops={ops:?}");
+        let atomic_write_ty = ops.iter().find_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "n" => Some(ty),
+            _ => None,
+        });
+        assert_eq!(atomic_write_ty, Some(&ValueType::Unsigned), "ops={ops:?}");
+    }
+
+    /// A fieldless (C-like) enum field is its scalar tag, so the Struct
+    /// arm still builds a field-wise move plan.
+    #[test]
+    fn deref_store_of_fieldless_enum_field_emits_field_writes() {
+        let e_ty = interior_adt(1);
+        let usize_ty = interior_usize();
+        let s_decl = interior_struct(
+            0,
+            &["fixture", "S"],
+            &[("tag", e_ty), ("n", usize_ty)],
+            16,
+            &[0, 8],
+            false,
+        );
+        let e_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": interior_meta(&["fixture", "Kind"], true),
+            "kind": {"Enum": [
+                {"name": "A", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}},
+                {"name": "B", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}}
+            ]},
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "size": 4,
+                    "align": 4,
+                    "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U32"}}},
+                    "variant_layouts": [
+                        {"field_offsets": []},
+                        {"field_offsets": []}
+                    ],
+                    "repr": {"transparent": false}
+                }
+            }]
+        });
+        let graph = lower_deref_store_mut_self(vec![s_decl, e_decl])
+            .unwrap_or_else(|err| panic!("C-like enum field must keep a move plan: {err:?}"));
+        let ops = graph_ops(&graph);
+        let (write_names, read_names) = field_read_write_names(&ops);
+        assert_eq!(write_names, ["tag", "n"], "ops={ops:?}");
+        assert_eq!(read_names, ["tag", "n"], "ops={ops:?}");
     }
 
     /// A signed field constant stays a pooled int. `field_write_inline_const`
