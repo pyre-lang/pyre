@@ -116,7 +116,7 @@ pub fn skip_python_trivia_forward_public(
 
 /// Translate a resume-frame pc word to a trivia-normalized Python coordinate.
 ///
-/// A negative word (sentinel / branch-orgpc tag) has no Python coordinate; it
+/// A negative word (`NO_JITCODE_PC`) has no Python coordinate; it
 /// passes through so the caller's `pc < 0` screen rejects it (the internal
 /// metadata lookups below are bounds-checked and never index with the word, so
 /// no wrap results).
@@ -157,11 +157,10 @@ pub(crate) fn note_empty_twin_fallback(site: &'static str, jitcode_index: i32, j
 /// and negative sentinel words resolve through the trivia-normalized containing
 /// lookup.
 ///
-/// Negative words (`NO_JITCODE_PC` `-1`, tagged branch-orgpc words `<= -2`)
-/// cast to a huge `usize` twin key and would floor-resolve to a bogus
-/// predecessor entry, so they are delegated straight to
-/// `trivia_normalized_py_pc_for_jitcode_pc`, which resolves them identically to
-/// the pre-cutover call.
+/// A negative word (`NO_JITCODE_PC` `-1`) would cast to a huge `usize` twin
+/// key and floor-resolve to a bogus predecessor entry, so it is delegated
+/// straight to `trivia_normalized_py_pc_for_jitcode_pc`, which resolves it
+/// identically to the pre-cutover call.
 pub fn resume_py_pc_for_jitcode_word(jitcode_index: i32, pc_word: i32) -> i32 {
     if pc_word < 0 {
         return trivia_normalized_py_pc_for_jitcode_pc(jitcode_index, pc_word);

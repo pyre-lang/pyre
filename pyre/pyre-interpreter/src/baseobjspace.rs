@@ -22477,11 +22477,16 @@ unsafe fn shortcut_next(w_obj: PyObjectRef) -> Result<Option<PyObjectRef>, PyErr
 pub fn next(w_obj: PyObjectRef) -> PyResult {
     // use_special_method_shortcut('__next__'): an exact builtin runs its
     // type's own descr; a user subclass takes the lookup fallback.
+    // `w_obj` is a livevar across `shortcut_next`, which can collect.
     unsafe {
-        if !user_overridden_class(w_obj)
-            && let Some(w_res) = shortcut_next(w_obj)?
-        {
-            return Ok(w_res);
+        if !user_overridden_class(w_obj) {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_obj);
+            if let Some(w_res) = shortcut_next(pyre_object::gc_roots::shadow_stack_get(obj_slot))? {
+                return Ok(w_res);
+            }
+            return shortcut_fallback_next(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
     }
     shortcut_fallback_next(w_obj)

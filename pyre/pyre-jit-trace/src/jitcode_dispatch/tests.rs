@@ -1194,6 +1194,42 @@ fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
 }
 
 #[test]
+fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
+    let live = crate::state::op_live();
+    let int_copy = *insns_opname_to_byte()
+        .get("int_copy/i>i")
+        .expect("int_copy/i>i must be in the insns table");
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("branch_live_resume_test");
+    // Opcode-start `-live-` at 0, a 3-byte body op at 3, the jump's own
+    // `-live-` at 6. A FOR_ITER-shaped residual sits between those lives, so
+    // `preceding_live_marker(6)` is empty and the opcode-start twin is 0.
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![live, 0, 0, int_copy, 0, 0, live, 0, 0],
+        startpoints: Some([0_usize, 3, 6].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![(0, Some(0)), (3, Some(0)), (6, Some(0))];
+
+    assert_eq!(
+        pyjit.resume_marker_for_jitcode_pc(6),
+        Some(0),
+        "the opcode-start twin at the jump live must still name pc 0",
+    );
+    assert_eq!(
+        super::resume_snapshot::plain_guard_resume_jitcode_pc(&pyjit, 6),
+        6,
+        "a capture already sitting on the jump `-live-` must resume there",
+    );
+    assert_eq!(
+        super::resume_snapshot::plain_guard_resume_jitcode_pc(&pyjit, 9),
+        6,
+        "a capture at the goto itself still walks back one `-live-`",
+    );
+}
+
+#[test]
 fn vstack_permuted_for_iter_entry_uses_block_head_target() {
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.n_py_instrs = 19;
@@ -4137,34 +4173,6 @@ fn raw_load_i_stamps_the_loaded_word_onto_the_result_box() {
         tc.concrete_of_opref(regs_i[2]),
         Some(Value::Int(loaded)),
         "pyjitpl.py MIFrame.opimpl_raw_load_i stamps box.value via execute_with_descr"
-    );
-}
-
-/// JUMP_BACKWARD's eval-breaker `goto_if_not` keeps both arms on that
-/// opcode, so `get_list_of_active_boxes` (`pyjitpl.py`) reads the
-/// terminator's own `-live-`.  A `FOR_ITER` not-taken arm is a different
-/// opcode.  A kept-stack `POP_JUMP_IF_*` / short-circuit trampoline can
-/// share the guard's own Python opcode and must NOT take this path.
-#[test]
-fn tick_goto_if_not_stays_in_the_jump_backward_opcode() {
-    // Measured on `simple.py` `def f`: poll `goto_if_not` at jit 564,
-    // not-taken arm at 568, both exact-py JUMP_BACKWARD.
-    assert!(
-        super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(32), Some(32), true),
-        "the poll's not-taken arm is still JUMP_BACKWARD",
-    );
-    // FOR_ITER `goto_if_not` at jit 302, not-taken arm at 592 (END_FOR).
-    assert!(
-        !super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(14), Some(36), true),
-        "FOR_ITER's exhausted arm is a different Python opcode",
-    );
-    assert!(
-        !super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(14), None, true),
-        "a missing other-arm py_pc is not the same-opcode poll",
-    );
-    assert!(
-        !super::resume_snapshot::branch_not_taken_stays_in_guard_opcode(Some(8), Some(8), false),
-        "a same-opcode POP_JUMP_IF_* / short-circuit branch is not the tick",
     );
 }
 

@@ -16799,17 +16799,11 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
                 ctx.registers_r,
                 ctx.registers_f,
                 outer_jitcode_index,
-                false,
                 carried_word,
                 op_pc as i32,
                 OuterActiveBoxesEntryTwin::Plain,
                 call_site_label,
                 vstack,
-                &[],
-                // Not a branch-guard reconstruction: this is the pre-call site
-                // snapshot, so there is no kept operand-stack slot to report as
-                // unsourced.
-                None,
             )
         };
         let call_site_word = call_site_marker

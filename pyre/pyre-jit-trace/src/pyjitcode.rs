@@ -1047,11 +1047,8 @@ impl PyJitCode {
     /// The carried word is preferred only when it is a `-live-`-anchored
     /// coordinate ([`JitCode::can_decode_live_vars`]).
     pub fn resolve_resume_pc_with_jitcode_pc(&self, carried: i32, op_live: u8) -> Option<usize> {
-        // A depth-0 branch guard may carry its `orgpc` tagged into the
-        // word's negative space; expand it to the block-head marker the baseline
-        // would have carried before any offset use. No-op for offsets /
-        // NO_JITCODE_PC (the flip-off case), so byte-identical when off.
-        let carried = crate::jitcode_dispatch::expand_branch_carried(self, carried);
+        // Branch guards carry the jump's `-live-` BEFORE as a non-negative
+        // offset (`generate_guard(resumepc=orgpc)`).
         let used_carried = carried != majit_ir::resumedata::NO_JITCODE_PC
             && carried >= 0
             && self.jitcode.can_decode_live_vars(carried as usize, op_live);
@@ -1062,16 +1059,14 @@ impl PyJitCode {
         }
     }
 
-    /// Resolve a kept-stack branch guard's resume offset from its carried
-    /// direct JitCode coordinate alone — the direct coordinate is the resume
-    /// key. The full-body-walk bridge entry seam only ever reaches a
-    /// non-sentinel `carried` (both callers gate on `!= NO_JITCODE_PC`), and a
-    /// kept-stack branch guard's carried word is always a `-live-`-anchored
-    /// startpoint, so no Python pc is consulted. `None` when the carried word
-    /// does not name a decodable startpoint, which declines the bridge at the
-    /// caller.
+    /// Resolve a guard's resume offset from its carried direct JitCode
+    /// coordinate alone — the direct coordinate is the resume key. The
+    /// full-body-walk bridge entry seam only ever reaches a non-sentinel
+    /// `carried` (both callers gate on `!= NO_JITCODE_PC`), and a branch
+    /// guard's carried word is the jump's `-live-` (`generate_guard(resumepc=orgpc)`),
+    /// so no Python pc is consulted. `None` when the carried word does not
+    /// name a decodable startpoint, which declines the bridge at the caller.
     pub fn resolve_bridge_walk_entry_pc(&self, carried: i32, op_live: u8) -> Option<usize> {
-        let carried = crate::jitcode_dispatch::expand_branch_carried(self, carried);
         let used_carried = carried != majit_ir::resumedata::NO_JITCODE_PC
             && carried >= 0
             && self.jitcode.can_decode_live_vars(carried as usize, op_live);

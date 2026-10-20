@@ -946,7 +946,6 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         &regs_r,
         &regs_f,
         jitcode_index,
-        false,
         // Key the query off the same carried root-frame word the snapshot and
         // decode side read from `frames[0].jitcode_pc`, so both resolve the
         // identical liveness window.
@@ -954,8 +953,6 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         root_liveness_word,
         OuterActiveBoxesEntryTwin::Trivia,
         "bridge_root_parent",
-        None,
-        &[],
         None,
     );
     // The concrete image this paused root resumes from when a descendant

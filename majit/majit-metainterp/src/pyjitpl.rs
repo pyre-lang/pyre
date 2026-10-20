@@ -19868,11 +19868,10 @@ impl<M: Clone> MetaInterp<M> {
                 // resume.py `read_jitcode_pos_pc` stores `frame.pc`.
                 // `capture_resumedata` leaves that pc alone when `resumepc < 0`,
                 // so the stored word is never negative. Pyre can still put
-                // `NO_JITCODE_PC` (-1) or an `encode_branch_orgpc` word (<= -2)
-                // here. That is not a jitcode position: `resolve_jitcode`
-                // declines `pc < 0`, and this rebuild reports the same failure
-                // (`false` → caller aborts to blackhole) instead of seating a
-                // pc-0 frame and returning success.
+                // `NO_JITCODE_PC` (-1) here. That is not a jitcode position:
+                // `resolve_jitcode` declines `pc < 0`, and this rebuild reports
+                // the same failure (`false` → caller aborts to blackhole)
+                // instead of seating a pc-0 frame and returning success.
                 let Ok(pc) = usize::try_from(section.pc) else {
                     return false;
                 };
@@ -19992,9 +19991,9 @@ impl<M: Clone> MetaInterp<M> {
         for i in 0..n {
             let section = &frames[i];
             // Same unrepresentable coordinate as `rebuild_from_resumedata`
-            // above (`NO_JITCODE_PC` / `encode_branch_orgpc`). Upstream
-            // `read_jitcode_pos_pc` has no negative pc. Decline; this is
-            // the unrepresentable-pc abort `consume_boxes` still has.
+            // above (`NO_JITCODE_PC`). Upstream `read_jitcode_pos_pc` has no
+            // negative pc. Decline; this is the unrepresentable-pc abort
+            // `consume_boxes` still has.
             let Ok(pc) = usize::try_from(section.pc) else {
                 return false;
             };
