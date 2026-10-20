@@ -810,18 +810,17 @@ impl UnrollOptimizer {
         })
     }
 
-    /// unroll.py: jump_to_preamble(cell_token, jump_op).
+    /// unroll.py `UnrollOptimizer.jump_to_preamble`.
     ///
-    /// Redirect the closing JUMP to the preamble entry token
-    /// (`target_tokens[0]`, `virtual_state=None`). Upstream
-    /// `copy_and_change` keeps the arglist; majit then reshapes it to
-    /// `start_state.renamed_inputargs` so the assembler remap sees the
-    /// same JUMP/LABEL arity `x86/regalloc.py`
-    /// `_compute_hint_locations_from_descr` asserts for a compiled target.
+    /// Assert `target_tokens[0].virtual_state is None` and retarget the
+    /// closing JUMP with `copy_and_change(rop.JUMP, descr=target_tokens[0])`,
+    /// keeping its arglist. The JUMP is `info.jump_op`
+    /// (`optimize_peeled_loop` `end_jump` / `optimize_bridge` `jump_op`);
+    /// `target_tokens[0]` is `compile_loop` `start_descr`, whose LABEL is
+    /// `start_state.renamed_inputargs`.
     pub fn jump_to_preamble(
         body_ops: &[majit_ir::OpRc],
         preamble_target: &std::sync::Arc<TargetToken>,
-        preamble_args: &[OpRef],
     ) -> Vec<majit_ir::OpRc> {
         assert!(
             preamble_target.attrs().virtual_state.is_none(),
@@ -829,11 +828,11 @@ impl UnrollOptimizer {
         );
         let mut result = body_ops.to_vec();
         if let Some(idx) = result.iter().rposition(|op| op.opcode == OpCode::Jump) {
-            // Re-clone before the descr write: the input Rc may still be
-            // registered in the optimizer's producer stores.
-            let mut jump = (*result[idx]).clone();
-            jump.setdescr(preamble_target.as_jump_target_descr());
-            apply_preamble_shape_to_jump(&mut jump, preamble_args);
+            let jump = result[idx].copy_and_change(
+                OpCode::Jump,
+                None,
+                Some(Some(preamble_target.as_jump_target_descr())),
+            );
             result[idx] = OpRc::new(jump);
         }
         result
@@ -2140,101 +2139,56 @@ impl UnrollOptimizer {
         }
 
         if !jump_was_redirected {
-            // unroll.py: jump_to_preamble — body JUMP → preamble Label
+            // unroll.py `UnrollOptimizer.jump_to_preamble(celltoken, end_jump)`:
+            // assert `target_tokens[0].virtual_state is None`, then
+            // `copy_and_change(rop.JUMP, descr=target_tokens[0])` keeping
+            // the arglist, then `send_extra_operation`.
             //
-            // force_box_for_end_of_preamble (unroll.py:126-127) has already run
-            // over the body JUMP's args above, so each arg is a forced box rather
-            // than a virtual. That is a per-ARG property and says nothing about the
-            // arg LIST matching the preamble Label's — on a retrace it does not, and
-            // the arity check below is what catches it.
+            // `end_jump` is `info.jump_op` from `optimize_peeled_loop`:
+            // the JUMP recorded by `compile_loop` / `compile_retrace`
+            // (`history.record(rop.JUMP, jumpargs, descr=jitcell_token)`).
+            // `target_tokens[0]` is `compile_loop` `start_descr`, whose
+            // LABEL is `start_state.renamed_inputargs`. `compile_retrace`
+            // reuses that token and does not emit a start LABEL.
             let preamble_target = self
                 .target_tokens
                 .first()
                 .expect("preamble target token must exist before jump_to_preamble")
                 .clone();
-            let preamble_arity = exported_renamed_inputargs.len();
-            let body_jump_arity = body_terminal_op
-                .as_ref()
-                .map(|j| j.num_args())
-                .or_else(|| {
-                    body_ops
-                        .iter()
-                        .rev()
-                        .find(|op| op.opcode == OpCode::Jump)
-                        .map(|op| op.num_args())
-                })
-                .unwrap_or(0);
+            assert!(
+                preamble_target.attrs().virtual_state.is_none(),
+                "jump_to_preamble expects the start/preamble target token"
+            );
             if crate::majit_log_enabled() {
+                let body_jump_arity = body_terminal_op
+                    .as_ref()
+                    .map(|j| j.num_args())
+                    .or_else(|| {
+                        body_ops
+                            .iter()
+                            .rev()
+                            .find(|op| op.opcode == OpCode::Jump)
+                            .map(|op| op.num_args())
+                    })
+                    .unwrap_or(0);
                 eprintln!(
-                    "[jit] jump_to_preamble: body_jump_args={} preamble_arity={} start_label_args={:?}",
-                    body_jump_arity, preamble_arity, exported_renamed_inputargs,
+                    "[jit] jump_to_preamble: body_jump_args={} start_label_args={:?}",
+                    body_jump_arity, exported_renamed_inputargs,
                 );
             }
-            // Upstream has no arity check on this path at all, and the check
-            // below is pyre's own. `unroll.py jump_to_preamble` only
-            // asserts `target_tokens[0].virtual_state is None` and retargets the
-            // JUMP with `copy_and_change`, keeping its args; `compile.py:334`'s
-            // `assert jump_op.numargs() == loop_info.label_op.numargs()` is
-            // guarded one line above by `if jump_op.getdescr() is
-            // loop_info.label_op.getdescr()`, which is exactly what
-            // `jump_to_preamble` has just stopped being true, and
-            // `compile_retrace` checks nothing. Upstream needs no check because
-            // its `target_tokens[0]` is the preamble start label carrying
-            // `start_state.renamed_inputargs` — the same loop-carried positions
-            // the body JUMP carries — so the retarget is sound by construction.
-            //
-            // A pyre RETRACE has no start label of its own (see
-            // `emit_start_label`), so `target_tokens[0]` is the ORIGINAL loop's
-            // start label: the portal's entry contract, one boxed Ref per frame
-            // local. The optimized loop-carried set is wider and mixed, so the
-            // retarget can land N values on an M-slot label and the target then
-            // reads a raw integer as a Ref — measured as EXC_BAD_ACCESS on the
-            // loop counter inside GuardClass.
-            //
-            // Give up, which is `jump_to_preamble`'s own escape (it lets
-            // `send_extra_operation` raise `InvalidLoop`) and lands on
-            // `compile_retrace`'s cancel. Scoped to the retrace: a
-            // `compile_loop` unroll keeps its start label in the SAME artifact,
-            // so its preamble target is local and this mismatch cannot arise.
-            if !self.emit_start_label && body_jump_arity != preamble_arity {
-                crate::mc_diag_bump(57);
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] jump_to_preamble giveup: body JUMP args {body_jump_arity} \
-                         != preamble LABEL args {preamble_arity}"
-                    );
-                }
-                return Err(crate::optimize::InvalidLoop(
-                    "jump_to_preamble: body JUMP arity != preamble LABEL arity",
-                ));
-            }
-            if let Some(mut end_jump) = body_terminal_op {
-                end_jump.setdescr(preamble_target.as_jump_target_descr());
-                // Retrace mismatches already gave up above. A compile_loop
-                // close onto the same-artifact start LABEL may still be one
-                // box short of `exported_renamed_inputargs` (an entry-only
-                // invariant). Pad/truncate here so consider_jump /
-                // the assembler remap never sees JUMP 33 vs LABEL 34.
-                // A missing *middle* slot shifts later JUMP boxes onto the
-                // wrong LABEL kinds: an Int then lands in a Ref register and
-                // GuardClass loads `[loop_counter + vtable_offset]`.
-                // `unroll.py jump_to_preamble` keeps the arglist; give up
-                // rather than compile that remap.
-                if jump_and_preamble_slot_kinds_disagree(&end_jump, &exported_renamed_inputargs) {
-                    crate::mc_diag_bump(57);
-                    return Err(crate::optimize::InvalidLoop(
-                        "jump_to_preamble: JUMP/LABEL slot kinds disagree",
-                    ));
-                }
-                apply_preamble_shape_to_jump(&mut end_jump, &exported_renamed_inputargs);
+            if let Some(end_jump) = body_terminal_op {
+                let end_jump = end_jump.copy_and_change(
+                    OpCode::Jump,
+                    None,
+                    Some(Some(preamble_target.as_jump_target_descr())),
+                );
                 if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
-                    // unroll.py parity: jump_to_preamble retargets
-                    // the live end_jump and routes it through
-                    // send_extra_operation, preserving any force_box /
-                    // partial-inline operations already appended to
-                    // _newoperations.
+                    // unroll.py: jump_to_preamble retargets the live
+                    // end_jump and routes it through send_extra_operation,
+                    // preserving any force_box / partial-inline operations
+                    // already appended to _newoperations.
                     //
-                    // unroll.py:242 lets send_extra_operation raise
+                    // unroll.py lets send_extra_operation raise
                     // InvalidLoop; this function returns Result, so `?`
                     // carries it out (final_ctx is abandoned with the
                     // discarded trace).
@@ -2246,19 +2200,7 @@ impl UnrollOptimizer {
                     body_ops = replace_terminal_jump(&body_ops, end_jump);
                 }
             } else {
-                if let Some(end_jump) = body_ops.iter().rfind(|op| op.opcode == OpCode::Jump)
-                    && jump_and_preamble_slot_kinds_disagree(end_jump, &exported_renamed_inputargs)
-                {
-                    crate::mc_diag_bump(57);
-                    return Err(crate::optimize::InvalidLoop(
-                        "jump_to_preamble: JUMP/LABEL slot kinds disagree",
-                    ));
-                }
-                body_ops = Self::jump_to_preamble(
-                    &body_ops,
-                    &preamble_target,
-                    &exported_renamed_inputargs,
-                );
+                body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
             }
             crate::debug::log_one(
                 "jit-tracing",
@@ -6305,59 +6247,6 @@ fn replace_terminal_jump(body_ops: &[majit_ir::OpRc], jump_op: Op) -> Vec<majit_
     result
 }
 
-/// True when a positional JUMP box and the start LABEL box at the same
-/// index carry different `AbstractValue.type` tags.
-///
-/// `unroll.py jump_to_preamble` keeps the JUMP arglist. Pad/truncate is
-/// only sound for an extra trailing invariant of the same kind; a kind
-/// disagreement means a missing middle slot, and the assembler would
-/// remap an Int into a Ref (`x86/assembler.py` `_cmp_guard_class`).
-fn jump_and_preamble_slot_kinds_disagree(jump: &Op, preamble_args: &[OpRef]) -> bool {
-    jump.args_slice()
-        .iter()
-        .map(|a| a.to_opref())
-        .zip(preamble_args.iter().copied())
-        .any(
-            |(jump_arg, preamble_arg)| match (jump_arg.ty(), preamble_arg.ty()) {
-                (Some(jump_ty), Some(preamble_ty)) => jump_ty != preamble_ty,
-                _ => false,
-            },
-        )
-}
-
-/// Match a jump_to_preamble JUMP to the start LABEL's
-/// `ExportedState.renamed_inputargs`. Extra LABEL slots are
-/// loop-invariant entry boxes: pad with the preamble arg at that
-/// index so `x86/regalloc.py` `consider_jump` identity-remaps them.
-/// A longer JUMP is truncated to the LABEL contract
-/// (`_compute_hint_locations_from_descr` asserts equal length).
-fn reshape_jump_args_for_preamble(jump_args: &mut Vec<OpRef>, preamble_args: &[OpRef]) {
-    if jump_args.len() > preamble_args.len() {
-        jump_args.truncate(preamble_args.len());
-    }
-    while jump_args.len() < preamble_args.len() {
-        jump_args.push(preamble_args[jump_args.len()]);
-    }
-}
-
-fn apply_preamble_shape_to_jump(jump: &mut Op, preamble_args: &[OpRef]) {
-    let mut jump_args: Vec<OpRef> = jump.args_slice().iter().map(|a| a.to_opref()).collect();
-    let old_len = jump_args.len();
-    reshape_jump_args_for_preamble(&mut jump_args, preamble_args);
-    if jump_args.len() == old_len {
-        return;
-    }
-    let mut boxes: Vec<Operand> = jump.args_slice().to_vec();
-    if jump_args.len() < old_len {
-        boxes.truncate(jump_args.len());
-    } else {
-        for extra in &jump_args[old_len..] {
-            boxes.push(Operand::bound_from_opref(*extra));
-        }
-    }
-    jump.initarglist(boxes);
-}
-
 fn pick_virtual_state(
     my_vs: &crate::optimizeopt::virtualstate::VirtualState,
     target_states: &[crate::optimizeopt::virtualstate::VirtualState],
@@ -6858,8 +6747,7 @@ mod tests {
         let preamble_target = TargetToken::new_preamble(7);
 
         let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
-        let preamble_args = [OpRef::int_op(0), OpRef::int_op(2), OpRef::int_op(50)];
-        let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target, &preamble_args);
+        let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target);
         assert_eq!(result[1].opcode, OpCode::Jump);
         assert_eq!(
             result[1]
@@ -6875,63 +6763,6 @@ mod tests {
                 &preamble_target.as_jump_target_descr()
             ))
         );
-    }
-
-    #[test]
-    fn test_reshape_jump_args_for_preamble_pads_missing_invariants() {
-        let mut jump_args = vec![OpRef::int_op(0)];
-        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::int_op(0), OpRef::int_op(1)]);
-        assert_eq!(jump_args.as_slice(), &[OpRef::int_op(0), OpRef::int_op(1)]);
-    }
-
-    #[test]
-    fn test_jump_to_preamble_pads_a_short_body_jump() {
-        let body_ops = vec![Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 0)])];
-        let preamble_target = TargetToken::new_preamble(7);
-        let body_ops: Vec<majit_ir::OpRc> = body_ops.into_iter().map(OpRc::new).collect();
-        let preamble_args = [OpRef::int_op(0), OpRef::int_op(1)];
-        let result = UnrollOptimizer::jump_to_preamble(&body_ops, &preamble_target, &preamble_args);
-        assert_eq!(result[0].opcode, OpCode::Jump);
-        assert_eq!(
-            result[0]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect::<Vec<_>>(),
-            &[OpRef::int_op(0), OpRef::int_op(1)]
-        );
-        assert_eq!(
-            result[0].getdescr().as_ref().map(majit_ir::descr_identity),
-            Some(majit_ir::descr_identity(
-                &preamble_target.as_jump_target_descr()
-            ))
-        );
-    }
-
-    #[test]
-    fn test_reshape_jump_args_for_preamble_truncates_extra_slots() {
-        let mut jump_args = vec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)];
-        reshape_jump_args_for_preamble(&mut jump_args, &[OpRef::int_op(10), OpRef::int_op(11)]);
-        assert_eq!(jump_args.as_slice(), &[OpRef::int_op(0), OpRef::int_op(1)]);
-    }
-
-    #[test]
-    fn test_jump_and_preamble_slot_kinds_disagree_on_shifted_ref() {
-        let jump = Op::new(
-            OpCode::Jump,
-            &[
-                rooted_resop_operand(Type::Int, 0),
-                rooted_resop_operand(Type::Int, 1),
-            ],
-        );
-        assert!(jump_and_preamble_slot_kinds_disagree(
-            &jump,
-            &[OpRef::int_op(0), OpRef::ref_op(1)],
-        ));
-        assert!(!jump_and_preamble_slot_kinds_disagree(
-            &jump,
-            &[OpRef::int_op(0), OpRef::int_op(1), OpRef::ref_op(2)],
-        ));
     }
 
     #[test]
