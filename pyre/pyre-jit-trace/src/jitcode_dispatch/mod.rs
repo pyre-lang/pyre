@@ -699,8 +699,6 @@ pub struct WalkSession {
     /// Paused transparent-helper `SubWalkFrame` banks. Helpers are not
     /// Python `MIFrame`s and must not sit on `framestack`.
     pub(crate) helper_live: Vec<LiveFrameRegs>,
-    /// The root frame's `is_being_profiled` portal green for this walk.
-    pub is_being_profiled: bool,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
     /// when the callee sub-walk returns.
@@ -868,8 +866,6 @@ pub struct WalkSession {
 impl Default for WalkSession {
     fn default() -> Self {
         Self {
-            is_being_profiled: false,
-
             helper_live: Vec::new(),
             framestack: Vec::new(),
             next_call_id: 1,
@@ -896,6 +892,38 @@ impl Default for WalkSession {
             binop_rewind_fresh_from: None,
             finish_payload: None,
         }
+    }
+}
+
+/// `pyframe.py PyFrame.get_is_being_profiled` of the live frame this walk
+/// is in. Inlined callees use the current MIFrame concrete; the root uses
+/// `WalkSession::recording_frame_ptr` (`dispatch_via_miframe` seeds it).
+/// Callee-entry green keys read this; the portal `jit_merge_point` green
+/// is the emitted Int operand.
+pub(crate) fn live_frame_is_being_profiled<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    session_frame_is_being_profiled(ctx.session)
+}
+
+fn session_frame_is_being_profiled(session: &std::cell::RefCell<WalkSession>) -> bool {
+    let inline = residual_call::current_inline_concrete_frame();
+    let frame = if inline != 0 {
+        inline
+    } else {
+        session.borrow().recording_frame_ptr
+    };
+    crate::driver::frame_is_being_profiled(frame)
+}
+
+/// `PyFrame.get_is_being_profiled` of the frame `frame_box` names; a box
+/// with no concrete half falls back to the live frame.
+pub(crate) fn frame_box_is_being_profiled(
+    trace_ctx: &TraceCtx,
+    session: &std::cell::RefCell<WalkSession>,
+    frame_box: OpRef,
+) -> bool {
+    match trace_ctx.concrete_of_opref(frame_box) {
+        Some(Value::Ref(gcref)) if gcref.0 != 0 => crate::driver::frame_is_being_profiled(gcref.0),
+        _ => session_frame_is_being_profiled(session),
     }
 }
 
@@ -3460,11 +3488,11 @@ pub enum DispatchError {
     /// op's green operands. pyre's portal jitdriver greens =
     /// `[next_instr, is_being_profiled, pycode]` (`eval.rs`), so the
     /// green key is `make_green_key` at `(concrete(gr[0]=pycode),
-    /// concrete(gi[0]=next_instr))`, with the walk's own
-    /// `is_being_profiled`. This fires when the int/ref green
-    /// list is empty or its leading element has no concrete Int/Ref —
-    /// either a codewriter shape mismatch or (pre-Phase-5) the greens
-    /// weren't seeded with concretes. RPython parity:
+    /// concrete(gi[0]=next_instr), concrete(gi[1]=is_being_profiled))`.
+    /// This fires when the int/ref green list is empty or `gi[0]`,
+    /// `gi[1]`, or `gr[0]` has no concrete Int/Ref — either a
+    /// codewriter shape mismatch or (pre-Phase-5) the greens weren't
+    /// seeded with concretes. RPython parity:
     /// `pyjitpl.py get_procedure_token(greenboxes)` always receives
     /// concrete greens at a reached merge point.
     JitMergePointGreenKeyUnresolved { pc: usize },
@@ -9846,9 +9874,9 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let (portal_call_depth, current_call_id, is_being_profiled, already_recorded) = {
+    let is_being_profiled = live_frame_is_being_profiled(ctx);
+    let (portal_call_depth, current_call_id, already_recorded) = {
         let mut session = ctx.session.borrow_mut();
-        let is_being_profiled = session.is_being_profiled;
         let mut active_frame_index = None;
         for (index, frame) in session.framestack.iter().enumerate() {
             if frame.w_code != 0 {
@@ -9873,7 +9901,7 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
             .as_ref()
             .map(|f| f())
             .unwrap_or(0);
-        (depth, call_id, is_being_profiled, already_recorded)
+        (depth, call_id, already_recorded)
     };
     if already_recorded {
         return Ok(None);
@@ -13450,10 +13478,22 @@ fn read_portal_debugdata<Sym: WalkSym>(
     // observable side effect on every later descr index.
     let descr = info.static_field_struct_descr(field_index);
     let descr_index = descr.index();
+    // The portal header may already have read this field
+    // (`getfield_vable_r` of `debugdata` for
+    // `pyframe.py PyFrame.get_is_being_profiled`). A Const-folded
+    // vable load is not a runtime guard: `pyjitpl.py generate_guard`
+    // skips `isinstance(box, Const)`, and `ptr_iszero` of CONST_NULL
+    // folds without recording, so a cached Const is re-read to record
+    // the `GuardIsnull` / `GuardNonnull` that makes
+    // `getorcreatedebug` / `f_trace` on a running frame observable.
+    // A non-Const cached box still needs the pin when nullity is
+    // unknown.
     if let Some(read) = ctx
         .trace_ctx
         .heapcache_getfield_cached(frame_box, descr_index)
+        && !read.is_constant()
     {
+        pin_portal_debugdata_nullity(ctx, op_pc, read, concrete)?;
         return Ok(read);
     }
     let read = ctx
@@ -13463,6 +13503,24 @@ fn read_portal_debugdata<Sym: WalkSym>(
         .heapcache_getfield_now_known(frame_box, descr_index, read);
     ctx.trace_ctx
         .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(concrete)));
+    pin_portal_debugdata_nullity(ctx, op_pc, read, concrete)?;
+    Ok(read)
+}
+
+/// `compile.py patch_new_loop_to_load_virtualizable_fields` pins
+/// `debugdata` with `guard_isnull` / `guard_nonnull` at the label.
+/// `pyjitpl.py generate_guard` records nothing when the box is
+/// already a Const, so this is the runtime pin for a folded vable
+/// load of the same field.
+fn pin_portal_debugdata_nullity<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    read: OpRef,
+    concrete: usize,
+) -> Result<(), DispatchError> {
+    if ctx.trace_ctx.heapcache_nullity_known(read).is_some() {
+        return Ok(());
+    }
     let opcode = if concrete == 0 {
         OpCode::GuardIsnull
     } else {
@@ -13470,7 +13528,7 @@ fn read_portal_debugdata<Sym: WalkSym>(
     };
     walker_emit_guard_with_snapshot(ctx, op_pc, opcode, &[read])?;
     ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
-    Ok(read)
+    Ok(())
 }
 
 /// True while a trace function or a profiler is installed on the running
@@ -15971,9 +16029,6 @@ fn handle<Sym: WalkSym>(
         // slot containing the jdindex; the `c` spelling stores the jdindex
         // directly in that byte.
         "jit_merge_point/cIRFIRF" | "jit_merge_point/iIRFIRF" => {
-            // Copy the walk green before any mutable session borrow in this
-            // handler; key construction and greenboxes must use one value.
-            let is_being_profiled = ctx.session.borrow().is_being_profiled;
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.
@@ -15987,7 +16042,8 @@ fn handle<Sym: WalkSym>(
             // greens (`I`=gi, `R`=gr, `F`=gf) + reds (`I`=ri, `R`=rr,
             // `F`=rf). pyre's portal jitdriver greens =
             // `[next_instr, is_being_profiled, pycode]` (`eval.rs`),
-            // so gi[0]=next_instr (the Python pc) and gr[0]=pycode
+            // so gi[0]=next_instr (the Python pc), gi[1]=is_being_profiled
+            // (`PyFrame.get_is_being_profiled`), and gr[0]=pycode
             // (PyCode). The green key is derivable from the op's own
             // greens, and `next_instr` is the SAME Python-pc coordinate the
             // trace-start seed uses (`trace.rs add_merge_point(make_green_key(
@@ -16033,6 +16089,14 @@ fn handle<Sym: WalkSym>(
             };
             let Some(next_instr) = next_instr else {
                 return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+            };
+            // `eval.rs get_unique_id`: the Int green is true when nonzero.
+            let is_being_profiled = match gi
+                .get(1)
+                .and_then(|op| ctx.trace_ctx.concrete_of_opref(*op))
+            {
+                Some(Value::Int(v)) => v != 0,
+                _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
 
             // `MIFrame.debug_merge_point` records a real

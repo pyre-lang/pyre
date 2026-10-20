@@ -568,7 +568,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 ));
                 let last_instr_value = py_pc as i64 - 1;
                 let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes(
+                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
                     ctx.trace_ctx,
                     "last_instr",
                     last_instr_op,

@@ -1674,6 +1674,16 @@ fn dispatch_op(
                 .builder
                 .ptr_nonzero(dst, expect_reg(&args[0], Kind::Ref));
         }
+        // `jtransform.py promote_greens`: `{kind}_guard_value` on every
+        // green that is a Variable, before `jit_merge_point`.
+        "int_guard_value" => {
+            let src = expect_reg(&args[0], Kind::Int);
+            state.builder.int_guard_value(src);
+        }
+        "ref_guard_value" => {
+            let src = expect_reg(&args[0], Kind::Ref);
+            state.builder.ref_guard_value(src);
+        }
         "float_add" | "float_sub" | "float_mul" | "float_truediv" => {
             let dst = expect_result_reg(result, Kind::Float, "float binop needs result");
             let opcode = match opname {

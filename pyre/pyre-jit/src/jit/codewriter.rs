@@ -204,6 +204,7 @@ const PYTHON_PORTAL_JD_INDEX: usize = 0;
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
     next_instr: usize,
+    is_being_profiled: super::flow::Variable,
     pycode_var: super::flow::Variable,
     jitdriver_index: usize,
 ) -> Vec<super::flow::SpaceOperationArg> {
@@ -212,27 +213,13 @@ fn portal_jit_merge_point_graph_args(
     // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is
     // recovered from the live frame at every merge point via the
     // `getfield_vable_r frame, PYCODE_FIELD_IDX → pycode_var` dual-
-    // write emitted immediately upstream in the walker; reference
-    // that per-SpaceOp Variable here so the canonical
-    // `flatten_graph` driver sees no unresolved `Opaque(Ref)`
-    // constants.
-    //
-    // Deviation: the `is_being_profiled` green is the constant `0`, while
-    // `pypyjit/interp_jit.py PyFrame.dispatch` hoists
-    // `self.get_is_being_profiled()` and passes the live flag. The runtime
-    // green-key producers pass the live flag too
-    // (`make_green_key(code_ptr, pc, is_being_profiled)` at eval.rs, and
-    // `frame.get_is_being_profiled()` at call_jit.rs). The per-code walker
-    // builds its key from `WalkSession::is_being_profiled` instead of this
-    // operand, although its debug merge point does record the emitted list.
-    // The canonical machine consumes the whole list through
-    // `TraceCtx::merge_point_green_key`; routing these per-code bodies through
-    // it therefore requires a live operand first. The generated interpreter
-    // portal carries the live flag already; migrating to that graph removes
-    // this duplicated marker producer and the walk-session substitution.
+    // write emitted immediately upstream; `is_being_profiled` is the
+    // Int phi of `pyframe.py PyFrame.get_is_being_profiled` on that
+    // same frame (`interp_jit.py PyFrame.dispatch`): 0 when
+    // `debugdata` is null, else `FrameDebugData.is_being_profiled`.
     let greens = vec![
         super::flow::Constant::signed(next_instr as i64).into(),
-        super::flow::Constant::signed(0).into(),
+        is_being_profiled.into(),
         pycode_var.into(),
     ];
     let reds = vec![frame.into(), ec.into()];
@@ -2269,6 +2256,117 @@ fn emit_loop_header(
 const VABLE_LAST_INSTR_FIELD_IDX: u16 = 0;
 const VABLE_CODE_FIELD_IDX: u16 = 1;
 const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
+const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
+
+/// `pyframe.py PyFrame.get_is_being_profiled` as graph ops: the portal
+/// merge-point's second green. `interp_jit.py PyFrame.dispatch` calls
+/// that method; `debugdata` is a virtualizable field
+/// (`interp_jit.py PyFrame._virtualizable_`), so the read is
+/// `getfield_vable_r` then `goto_if_not_ptr_iszero`, then `getfield_gc_i` of
+/// `FrameDebugData.is_being_profiled` on the non-null arm and the
+/// constant 0 on the null arm. The join's extra Int inputarg is that
+/// phi. `jtransform.py promote_greens` then `int_guard_value`s it
+/// before `jit_merge_point`.
+///
+/// Emitted at loop-header start because the merge-point site itself
+/// must not append exits: `block_closed_by_terminator` is computed
+/// before merge emission and reused as the opcode-dispatch gate.
+/// The diamond closes the header; the caller switches onto the join
+/// for pycode's `getfield_vable_r`, the promote, and the marker.
+/// Back-edges still mergeblock to the header so they re-read
+/// `debugdata`.
+fn emit_portal_is_being_profiled_read(
+    graph: &mut super::flow::FunctionGraph,
+    current_block: &SpamBlockRef,
+    current_state: &FrameState,
+    frame_var: super::flow::Variable,
+    py_pc: usize,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+) -> (SpamBlockRef, super::flow::Variable) {
+    let debugdata_var = emit_graph_op_with_result(
+        graph,
+        &current_block.block(),
+        "getfield_vable_r",
+        vable_getfield_ref_graph_args(frame_var.into(), VABLE_DEBUGDATA_FIELD_IDX),
+        Kind::Ref,
+        py_pc as i64,
+    );
+    // `jtransform.py optimize_goto_if_not`: a `ptr_iszero` whose result
+    // only feeds the exitswitch folds into the tuple exitswitch, which
+    // flattens to `goto_if_not_ptr_iszero`.
+    current_block.block().borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Tuple(vec![
+        super::flow::ExitSwitchElement::Marker("ptr_iszero".to_owned()),
+        super::flow::ExitSwitchElement::Value(debugdata_var.into()),
+        super::flow::ExitSwitchElement::Marker("-live-before".to_owned()),
+    ]));
+
+    let null_state = current_state.clone();
+    let null_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(null_state.clone()));
+    null_arm.block().borrow_mut().inputargs = null_state.getvariables();
+    all_walker_blocks.push(null_arm.clone());
+
+    let debugdata_in = graph.fresh_variable(Kind::Ref);
+    let nonnull_state = current_state.clone();
+    let nonnull_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(nonnull_state.clone()));
+    let mut nonnull_inputs = nonnull_state.getvariables();
+    nonnull_inputs.push(debugdata_in.into());
+    nonnull_arm.block().borrow_mut().inputargs = nonnull_inputs;
+    all_walker_blocks.push(nonnull_arm.clone());
+
+    // `flatten.py insert_exits` 2-exit: `make_link(linktrue)` then
+    // `linkfalse`. `ptr_iszero` holds when null, so the true arm is the
+    // constant-0 join and the false arm is the field read.
+    append_exit(
+        &current_block.block(),
+        output_link(current_state, &null_state, null_arm.block()),
+    );
+    set_last_bool_exitcase(&current_block.block(), true);
+    let mut nonnull_link_args = current_state.getoutputargs(&nonnull_state);
+    nonnull_link_args.push(debugdata_var.into());
+    append_exit(
+        &current_block.block(),
+        super::flow::Link::new(nonnull_link_args, Some(nonnull_arm.block()), None).into_ref(),
+    );
+    set_last_bool_exitcase(&current_block.block(), false);
+
+    let profiled_phi = graph.fresh_variable(Kind::Int);
+    let join_state = current_state.clone();
+    let join = SpamBlockRef::new(graph.new_block(Vec::new()), Some(join_state.clone()));
+    let mut join_inputs = join_state.getvariables();
+    join_inputs.push(profiled_phi.into());
+    join.block().borrow_mut().inputargs = join_inputs;
+    all_walker_blocks.push(join.clone());
+
+    // Empty null arm + Constant(0) on the join-bound link:
+    // `simplify.py eliminate_empty_blocks` collapses it to a
+    // header→join edge carrying the constant, the RPython phi shape.
+    let mut null_join_args = null_state.getoutputargs(&join_state);
+    null_join_args.push(super::flow::Constant::signed(0).into());
+    append_exit(
+        &null_arm.block(),
+        super::flow::Link::new(null_join_args, Some(join.block()), None).into_ref(),
+    );
+
+    let field = emit_graph_op_with_result(
+        graph,
+        &nonnull_arm.block(),
+        "getfield_gc_i",
+        vec![
+            debugdata_in.into(),
+            pyre_jit_trace::descr::frame_debug_data_is_being_profiled_descr().into(),
+        ],
+        Kind::Int,
+        py_pc as i64,
+    );
+    let mut nonnull_join_args = nonnull_state.getoutputargs(&join_state);
+    nonnull_join_args.push(field.into());
+    append_exit(
+        &nonnull_arm.block(),
+        super::flow::Link::new(nonnull_join_args, Some(join.block()), None).into_ref(),
+    );
+
+    (join, profiled_phi)
+}
 
 /// interp_jit.py `PyFrame.jump_absolute` jitted arm: `ec.bytecode_trace(self,
 /// decr_by)` then `can_enter_jit`.  The walked fast path is the breaker-word
@@ -9017,10 +9115,25 @@ impl CodeWriter {
                                 ))
                     };
                     if loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator {
-                        // jtransform.py:1710-1711 op3: -live- before
-                        // jit_merge_point, "for inlined short preambles".
-                        emit_live_placeholder!(py_pc);
                         if is_true_portal {
+                            // Diamond at loop-header start: the merge-point
+                            // site cannot carry a branch, so the null test
+                            // joins here before the merge-point `-live-`.
+                            // `goto_if_not` records a data guard;
+                            // `pyjitpl.py get_list_of_active_boxes` reads
+                            // the terminator's own `-live-`, so the header
+                            // carries one before the diamond.
+                            emit_live_placeholder!(py_pc);
+                            let (join_block, profiled_var) = emit_portal_is_being_profiled_read(
+                                &mut graph,
+                                &current_block,
+                                &current_state,
+                                frame_var,
+                                py_pc,
+                                &mut all_walker_blocks,
+                            );
+                            current_block = join_block;
+                            needs_fallthrough = true;
                             let jdindex = PYTHON_PORTAL_JD_INDEX;
                             let scratch_pycode_reg =
                                 ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
@@ -9034,8 +9147,32 @@ impl CodeWriter {
                              emit_vable_getfield_ref! must return a per-SpaceOp \
                              Variable for the `pycode` green arg",
                             );
+                            // `jtransform.py promote_greens`: `-live-` then
+                            // `{kind}_guard_value` on every Variable green
+                            // (`next_instr` is a Constant), then
+                            // `handle_jit_marker__jit_merge_point`'s op3
+                            // `-live-` "for inlined short preambles".
+                            for (opname, green) in [
+                                ("int_guard_value", profiled_var),
+                                ("ref_guard_value", pycode_var),
+                            ] {
+                                emit_live_placeholder!(py_pc);
+                                let _ = emit_graph_op_void(
+                                    &current_block.block(),
+                                    opname,
+                                    vec![green.into()],
+                                    py_pc as i64,
+                                );
+                            }
+                            emit_live_placeholder!(py_pc);
+                            let scratch_profiled_reg =
+                                ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                             let graph_args = portal_jit_merge_point_graph_args(
-                                &graph, py_pc, pycode_var, jdindex,
+                                &graph,
+                                py_pc,
+                                profiled_var,
+                                pycode_var,
+                                jdindex,
                             );
                             let graph_op = emit_graph_op_void(
                                 &current_block.block(),
@@ -9043,21 +9180,23 @@ impl CodeWriter {
                                 graph_args,
                                 py_pc as i64,
                             );
-                            // Build a Ref-only regallocs that maps the
-                            // 3 portal Variables (frame / ec / pycode)
-                            // to their pre-assigned register indices.
-                            // The walker emits jit_merge_point inline
-                            // outside the canonical graph regalloc pass,
-                            // so no `regallocs[]` entry exists for them
-                            // — this site assembles one ad hoc.
+                            // Ad hoc regallocs for the walk-time serialize of
+                            // `jit_merge_point`: Int `is_being_profiled` plus
+                            // the three portal Refs (frame / ec / pycode).
+                            // Canonical `flatten_graph` recolors the same
+                            // Variables from the graph; this map exists
+                            // because the walker serializes the marker
+                            // outside that pass.
+                            let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
+                            portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
                             let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
                             portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
                             let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
-                                    coloring: crate::jit::regalloc::Coloring::default(),
-                                    num_colors: 0,
+                                    coloring: portal_int_coloring,
+                                    num_colors: scratch_profiled_reg + 1,
                                 },
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_ref_coloring,
@@ -9070,6 +9209,10 @@ impl CodeWriter {
                             ];
                             GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
                                 .serialize_op(&graph_op);
+                        } else {
+                            // jtransform.py op3: -live- before
+                            // jit_merge_point, "for inlined short preambles".
+                            emit_live_placeholder!(py_pc);
                         }
                     }
 
@@ -9106,9 +9249,11 @@ impl CodeWriter {
                     // loop headers behind an unsupported opcode.
                     //
                     // Reuses `block_closed_by_terminator` computed above the
-                    // loop-header `jit_merge_point` gate: the merge emission
-                    // only appends `operations` (never `exits` / `exitswitch`),
-                    // so the value is unchanged here.
+                    // loop-header `jit_merge_point` gate. The debugdata
+                    // diamond closes the header and switches
+                    // `current_block` to the join, which has no exits, so
+                    // the cached `false` still matches the block opcode
+                    // dispatch writes into.
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
                         current_state.blocklist =
@@ -18534,7 +18679,8 @@ mod tests {
         );
         let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Portal);
         let pycode_var = Variable::new(VariableId(9999), Kind::Ref);
-        let args = portal_jit_merge_point_graph_args(&graph, 17, pycode_var, 7);
+        let profiled_var = Variable::new(VariableId(10001), Kind::Int);
+        let args = portal_jit_merge_point_graph_args(&graph, 17, profiled_var, pycode_var, 7);
 
         assert_eq!(args.len(), 7);
         match &args[0] {
@@ -18546,10 +18692,15 @@ mod tests {
         match &args[1] {
             SpaceOperationArg::ListOfKind(list) => {
                 assert_eq!(list.kind, Kind::Int);
-                assert_eq!(
-                    list.content,
-                    vec![Constant::signed(17).into(), Constant::signed(0).into()]
-                );
+                assert_eq!(list.content.len(), 2);
+                assert_eq!(list.content[0], Constant::signed(17).into());
+                match &list.content[1] {
+                    FlowValue::Variable(variable) => {
+                        assert_eq!(variable.id, profiled_var.id);
+                        assert_eq!(variable.kind, Some(Kind::Int));
+                    }
+                    other => panic!("expected is_being_profiled int variable, got {other:?}"),
+                }
             }
             other => panic!("expected greens int list, got {other:?}"),
         }
@@ -18601,6 +18752,58 @@ mod tests {
             }
             other => panic!("expected empty reds float list, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn portal_jit_merge_point_promotes_is_being_profiled_from_debugdata() {
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal while-loop must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            opnames.contains(&"goto_if_not_ptr_iszero"),
+            "get_is_being_profiled null-tests debugdata, got {opnames:?}"
+        );
+        assert!(
+            opnames.contains(&"getfield_gc_i"),
+            "non-null arm reads FrameDebugData.is_being_profiled, got {opnames:?}"
+        );
+        assert!(
+            opnames.contains(&"int_guard_value") && opnames.contains(&"ref_guard_value"),
+            "promote_greens must guard_value the profiled and pycode greens, got {opnames:?}"
+        );
+        assert!(
+            opnames.contains(&"jit_merge_point"),
+            "portal loop header must emit jit_merge_point, got {opnames:?}"
+        );
+        let guard_pos = opnames
+            .iter()
+            .position(|&name| name == "int_guard_value")
+            .expect("int_guard_value present");
+        let merge_pos = opnames
+            .iter()
+            .position(|&name| name == "jit_merge_point")
+            .expect("jit_merge_point present");
+        assert!(
+            guard_pos < merge_pos,
+            "promote_greens must precede jit_merge_point, got {opnames:?}"
+        );
     }
 
     #[test]

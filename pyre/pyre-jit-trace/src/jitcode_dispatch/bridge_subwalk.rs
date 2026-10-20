@@ -1241,7 +1241,8 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         ));
     }
     publish_carrier_header_vsd(ctx, portal_frame_box, target_pc);
-    let is_being_profiled = ctx.session.borrow().is_being_profiled;
+    let is_being_profiled =
+        super::frame_box_is_being_profiled(ctx.trace_ctx, ctx.session, portal_frame_box);
     let w_code = ctx.inline_w_code() as *const ();
     let token_for_rebuild = token.clone();
     match super::inline_call::record_walker_loop_callee_portal_call(
@@ -1456,7 +1457,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
-    let is_being_profiled = session.borrow().is_being_profiled;
+    let is_being_profiled = crate::driver::frame_is_being_profiled(concrete_callee_frame);
 
     // Terminal descrs must be wired on MetaInterpStaticData before the walk can
     // produce a compilable FINISH (mirror `dispatch_perfn_frame`).  The walk

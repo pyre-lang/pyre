@@ -2629,7 +2629,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if super::ec_hook_installed() {
         return Ok(None);
     }
-    let is_being_profiled = ctx.session.borrow().is_being_profiled;
+    let is_being_profiled = live_frame_is_being_profiled(ctx);
     // Only a genuine `call_fn` residual is a candidate — every
     // container/builtin helper carries a distinct tag.
     if runtime_helper != majit_ir::RuntimeHelperKind::CallFn {
@@ -7838,7 +7838,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             residual_call::owner_root_if_gc(bound.receiver as usize),
         )
     });
-    let is_being_profiled = ctx.session.borrow().is_being_profiled;
+    let is_being_profiled = live_frame_is_being_profiled(ctx);
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
     // `funcrun` path still traces through `_match_signature`, which writes a

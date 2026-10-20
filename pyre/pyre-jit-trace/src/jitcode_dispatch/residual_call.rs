@@ -8257,7 +8257,7 @@ fn walker_foldable_runtime_helper<Sym: WalkSym>(
             | majit_ir::RuntimeHelperKind::CallKw
             | majit_ir::RuntimeHelperKind::CallFunctionEx
     );
-    if owes_c_call_events && ctx.session.borrow().is_being_profiled {
+    if owes_c_call_events && live_frame_is_being_profiled(ctx) {
         majit_ir::RuntimeHelperKind::None
     } else {
         ei.runtime_helper

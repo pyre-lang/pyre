@@ -1790,7 +1790,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let pre_pos = ctx.get_trace_position();
     let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
-        is_being_profiled,
         ..Default::default()
     });
     let _session_roots = crate::jitcode_dispatch::WalkSessionRoots::new(&session);
@@ -2553,7 +2552,8 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     exc_concrete: crate::state::ConcreteValue,
     catch_target: usize,
 ) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
-    let is_being_profiled = session.borrow().is_being_profiled;
+    let is_being_profiled =
+        crate::jitcode_dispatch::frame_box_is_being_profiled(ctx, session, middle.frame);
     let Some((pending, middle_argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
         ctx,
         is_being_profiled,
@@ -2738,7 +2738,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
 ) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
-    let is_being_profiled = session.borrow().is_being_profiled;
+    let is_being_profiled =
+        crate::jitcode_dispatch::frame_box_is_being_profiled(ctx, session, middle.frame);
     // `descr_call`'s tail: no frame to reconstruct and no bytecode to walk.
     // Discarding the child's result and answering with the instance IS its
     // whole body, so perform it here instead of driving a frame.
@@ -4393,7 +4394,6 @@ fn run_perfn_walk<Sym: WalkSym>(
     carrier_raise_seed: Option<crate::jitcode_dispatch::CarrierRaiseSeed>,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
-        is_being_profiled,
         carrier_raise_seed,
         ..Default::default()
     });
@@ -4572,9 +4572,12 @@ fn run_perfn_walk<Sym: WalkSym>(
     // nonstandard-virtualizable Void leg on the first `getarrayitem_vable`).
     // Decode the merge point's green-ref (`gr` = [pycode]) and red (`rr` =
     // [frame, ec], portal jitdriver convention) register lists and seed each
-    // named color.  Int greens (`gi` = next_instr, is_being_profiled) live
-    // in the int CONSTANT region and are seeded by `copy_constants` inside
-    // `dispatch_via_miframe`, so they need no entry seed.  `frame` is the
+    // named color.  `gi[0]` (`next_instr`) is a Constant seeded by
+    // `copy_constants` inside `dispatch_via_miframe`.  `gi[1]`
+    // (`is_being_profiled`) is the Int register written by
+    // `PyFrame.get_is_being_profiled` immediately before the merge
+    // point; the walk enters past that marker, so the register needs no
+    // entry seed.  `frame` is the
     // standard-vable identity box (so the body's vable reads hit the
     // standard fast path); `pycode` is a const-ref because it is green, while
     // `ec` must remain the second live red box.  PyPy's
@@ -6183,11 +6186,26 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     else {
         return None;
     };
+    // A back edge jumps to the loop's header block, which opens at the
+    // trace-entry marker. The header itself branches before the merge point
+    // (`PyFrame.get_is_being_profiled`'s debugdata null test), and the arm
+    // flattened after the whole body jumps back to the join between that
+    // marker and the merge point; that goto closes no loop. The function
+    // entry's marker can precede the same merge point, so the header is the
+    // latest marker owning it.
+    let header = pjc
+        .metadata
+        .merge_entry_by_green
+        .iter()
+        .map(|&(_, entry)| entry as usize)
+        .filter(|&entry| scan.merge_point_at_or_after(entry) == Some(merge_point))
+        .max()
+        .unwrap_or(merge_point);
 
     let back_edges: Vec<(usize, usize)> = scan
         .label_gotos
         .iter()
-        .filter(|&&(pc, target)| pc > merge_point && target <= merge_point)
+        .filter(|&&(pc, target)| pc > merge_point && target <= header)
         .map(|&(pc, target)| (target, pc))
         .collect();
     let abort_permanent_pcs = scan
