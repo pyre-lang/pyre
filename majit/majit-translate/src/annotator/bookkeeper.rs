@@ -3941,6 +3941,12 @@ impl Bookkeeper {
             // `pairtype(SomePtr, SomePtr).union`).
             return s_fn;
         }
+        // A shared `&[u8]` / `*const [u8]` is `rstr.py` `STR` (`SomeString`).
+        // Peel of `&` / `*const` would otherwise collapse it onto `[u8]`
+        // and seed a list of unsigned (`rlist.py` `Array(Char)`).
+        if majit_ir::descr::is_shared_u8_slice_spelling(t) {
+            return super::model::s_str0();
+        }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`. Projecting the pointee is right for an
         // aggregate target (`*mut Vec<T>` / `*mut Struct`): the structural
@@ -4127,7 +4133,15 @@ impl Bookkeeper {
             if let Some(s_fn) = fn_ptr_somevalue_for_spelling_in(inner.trim(), Some(self)) {
                 return s_fn;
             }
-            let s_inner = self.project_struct_field_type(inner);
+            // Charon spells `Option<&[u8]>` as `Option<[u8]>` / `Option<Slice<u8>>`.
+            // The payload is rstr `STR`, the same nullable `SomeString` as
+            // `Option<&str>`. Bare `[u8]` outside Option stays a list.
+            let inner = inner.trim();
+            let s_inner = if inner == "[u8]" || inner == "Slice<u8>" {
+                super::model::s_str0()
+            } else {
+                self.project_struct_field_type(inner)
+            };
             // Ptr inner is already int-bank (`history.getkind` Signed).
             // The pointee is Raw (`DeclaredGcFacts::gc_struct_ids`: no
             // GcType impl, no GC field-0 ancestor), so Option of it is
@@ -6559,6 +6573,53 @@ mod tests {
                 SomeValue::String(_)
             ),
             "a BytesBlock pointer must keep the same string annotation"
+        );
+        assert!(
+            matches!(bk.project_struct_field_type("&[u8]"), SomeValue::String(_)),
+            "a shared &[u8] is rstr STR"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("*const [u8]"),
+                SomeValue::String(_)
+            ),
+            "a *const [u8] is rstr STR"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("&mut [u8]"),
+                SomeValue::List(_)
+            ),
+            "a mutable &[u8] stays a list of unsigned"
+        );
+        assert!(
+            matches!(bk.project_struct_field_type("Vec<u8>"), SomeValue::List(_)),
+            "Vec<u8> stays a list of unsigned"
+        );
+        let SomeValue::String(opt_bare) = bk.project_struct_field_type("Option<[u8]>") else {
+            panic!("Option<[u8]> is Charon's Option<&[u8]>, a nullable STR");
+        };
+        assert!(
+            opt_bare.inner.can_be_none,
+            "Option of a shared u8 slice is SomeString(can_be_None)"
+        );
+        let SomeValue::String(opt_shared) = bk.project_struct_field_type("Option<&[u8]>") else {
+            panic!("Option<&[u8]> is a nullable STR");
+        };
+        assert!(
+            opt_shared.inner.can_be_none,
+            "Option<&[u8]> is SomeString(can_be_None)"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Option<&mut [u8]>"),
+                SomeValue::List(_)
+            ),
+            "Option<&mut [u8]> stays a nullable list of unsigned"
+        );
+        assert!(
+            matches!(bk.project_struct_field_type("[u8]"), SomeValue::List(_)),
+            "bare [u8] stays a list of unsigned"
         );
     }
 

@@ -1248,7 +1248,8 @@ pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHas
 /// Digested with FNV-1a rather than `RandomState`, for the reason
 /// [`crate::celldict::ModuleDictEntries`] gives: a translated `str` key carries
 /// `ll_strhash` memoized in its header, and [`BytesKey`] hashes the block's
-/// bytes on each probe (`BytesBlock` keeps no hash slot).
+/// bytes on each probe (the `hash` slot is not used as an `ll_strhash` cache
+/// here).
 pub type BytesDictStorage = crate::rordereddict::RDict<BytesKey, PyObjectRef, BytesKeyHash>;
 
 macro_rules! dict_storage_gc_type_id {

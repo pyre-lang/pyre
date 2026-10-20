@@ -3294,6 +3294,7 @@ pub fn translate_op(
                         [leaf] if leaf == crate::runtime_names::shims::ENUMERATE => {
                             Some("enumerate")
                         }
+                        [leaf] if leaf == crate::runtime_names::shims::CHR => Some("chr"),
                         _ => None,
                     };
                     if let Some(builtin) = builtin {

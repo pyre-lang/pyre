@@ -36,10 +36,13 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
         Some("[*mut PyObject]"),
         "PyPy tuple storage must project as GcArray(OBJECTPTR), not ItemsBlock"
     );
-    assert_eq!(
-        program.struct_fields.field_type("W_BytesObject", "data"),
-        Some("[u8]"),
-        "W_BytesObject.data is rstr.STR.chars (GcArray of Char), not a STR struct"
+    let data_layout = program.struct_fields.field_type("W_BytesObject", "data");
+    assert!(
+        matches!(
+            data_layout,
+            Some("*const BytesBlock") | Some("*const Utf8Str")
+        ),
+        "W_BytesObject.data is rstr.STR (`W_BytesObject._value`), a Ptr(STR); Charon spells the BytesBlock alias as Utf8Str, got {data_layout:?}"
     );
 
     let ops = function
@@ -166,8 +169,8 @@ fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
 }
 
 /// `*(&[u8]).as_ptr().add(i)` in `ll_bytes_strcmp`
-/// (`rstr.py` `AbstractStringRepr.ll_strcmp`) is `getarrayitem` on
-/// `GcArray(Char)`, not a `RawLoad`.
+/// (`rstr.py` `AbstractStringRepr.ll_strcmp`) is `__string_byte_getitem`
+/// (getitem + ord on the STR), not a `RawLoad`.
 #[test]
 fn bytes_strcmp_reads_u8_slice_as_array() {
     let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
@@ -192,12 +195,12 @@ fn bytes_strcmp_reads_u8_slice_as_array() {
     assert!(
         ops.iter().any(|op| matches!(
             &op.kind,
-            OpKind::ArrayRead {
-                array_type_id: Some(id),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } if id == "[u8]"
+            } if segments.last().map(String::as_str) == Some("__string_byte_getitem")
         )),
-        "byte slice item is getarrayitem on GcArray(Char)"
+        "byte slice item is getitem+ord on STR (`__string_byte_getitem`)"
     );
     assert!(
         !ops.iter()

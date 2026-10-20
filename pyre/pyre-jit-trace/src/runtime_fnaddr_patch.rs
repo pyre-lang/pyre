@@ -1097,11 +1097,11 @@ fn prebuilt_empty_array_addr(type_name: &str) -> i64 {
         .unwrap_or_else(|| panic!("empty-array constant {type_name} is not Array<T;0>"));
     if item_is_object_pointer(item) {
         pyre_object::prebuilt_empty_object_array() as i64
-    } else if item == "u8" {
-        pyre_object::prebuilt_empty_bytes_block() as i64
     } else {
-        // Header-only empty GcArray (`prepare_const(0)`). Length is 0, so the
-        // item stride is unused; one block per `type_name` via the caller cache.
+        // Header-only empty GcArray (`prepare_const(0)`), including
+        // `Array<u8;0>` (`_ll_prebuilt_empty_array` of `GcArray(Char)`, not
+        // a `STR`). Length is 0, so the item stride is unused; one block
+        // per `type_name` via the caller cache.
         unsafe { pyre_object::alloc_mro_block_gc(&[]) as i64 }
     }
 }
@@ -1471,7 +1471,10 @@ mod tests {
         let addr = jcs[0].body().constants_r[0].get();
         assert_ne!(addr, 0);
         assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
-        assert_eq!(addr, pyre_object::prebuilt_empty_bytes_block() as i64);
+        assert_eq!(
+            pyre_object::gcarray_len(addr as *const pyre_object::GcTypedArray),
+            0
+        );
     }
 
     fn prebuilt_instance_desc(

@@ -981,7 +981,7 @@ unsafe fn identity_set_storage_custom_trace(
     storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
-/// Custom trace for `W_BytesObject`. `data` is the `rstr.STR` `chars` array
+/// Custom trace for `W_BytesObject`. `data` is the `rstr.STR`
 /// (`BytesBlock`): a managed varsize leaf, or an immortal leaf stamped
 /// `init_gc_object_immortal` on the no-hook fallback. Grey it
 /// unconditionally; `visit` skips an immortal leaf via `NO_HEAP_PTRS`.
@@ -1004,8 +1004,8 @@ unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     };
 }
 
-/// Custom trace for `W_BytearrayObject`. Same GC-managed leaf storage box as
-/// `W_BytesObject` (off-GC storage).
+/// Custom trace for `W_BytearrayObject`. `data` is a GC-managed leaf
+/// `Vec<u8>` storage box (off-GC storage).
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -2648,12 +2648,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         <pyre_object::typedef::W_MemberDescr as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // W_BytesObject (immutable byte sequence) carries `data`, a `*const Vec<u8>`
-    // GC-managed storage box (off-GC storage). The custom trace forwards
-    // that field slot so the box stays live; no `.with_destructor_fn` — the box
-    // tid's drop glue is the sole reclaimer, exactly as the set-items box owns
-    // its reclamation. A sweep-time bytes destructor would put two reclaimers on
-    // the destructor list and double-free a box swept before its owner.
+    // W_BytesObject (immutable byte sequence) carries `data`, a
+    // `*const BytesBlock` (`rstr.py` `STR`, same type as
+    // `W_UnicodeObject._utf8`). The custom trace greys that field slot so
+    // the STR stays live; no `.with_destructor_fn` — the STR is a managed
+    // varsize leaf (or an immortal leaf on the no-hook fallback).
     let w_bytes_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_object::bytesobject::W_BytesObject>(),
         object_tid,
@@ -5139,34 +5138,6 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `publish_kind0_descrs_before_trace` via `materialize_gccache_owned_descrs`,
     // once this collector is installed. They are not registered in this
     // function: it runs before `gc_sync` publishes the collector.
-
-    // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
-    // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
-    // registers with the shape `get_array_token` reads off that one ARRAY and
-    // no destructor: the payload is inside the block, so the sweep reclaims it
-    // with the block and the collector sizes it from the block's own length
-    // header. `bytes_object_custom_trace` greys it through the `data` field
-    // slot, the same edge the storage box was reached by.
-    //
-    // Registered at the tail of the fixed layouts. Synthetic struct tids are
-    // stamped later, from `init_gc_subsystem`, and do not occupy a slot here.
-    // A tid is a
-    // position in this chain, and the interpreter spells many of them as
-    // literals — `W_BYTES_GC_TYPE_ID` is 27, `W_LIST_GC_TYPE_ID` is 7 — so an
-    // insertion anywhere earlier renumbers every registration below it while the
-    // `debug_assert_eq!`s that pair each literal with its registration are
-    // compiled out of a release build. Allocations made before this line read a
-    // zero tid and take `alloc_bytes_block`'s immortal-leaf arm
-    // (`init_gc_object_immortal`); `visit` skips those via `NO_HEAP_PTRS`.
-    let bytes_block_token = &pyre_object::bytesobject::BYTES_BLOCK_TOKEN;
-    let bytes_block_tid = gc.register_type(TypeInfo::varsize(
-        bytes_block_token.base_size,
-        bytes_block_token.item_size,
-        bytes_block_token.len_offset,
-        false,
-        Vec::new(),
-    ));
-    pyre_object::bytesobject::set_bytes_block_gc_type_id(bytes_block_tid);
 
     // `interp_deque.py Lock` is a fieldless internal GC identity token, not a
     // Python-visible rclass. Register it without a vtable or subclass-range

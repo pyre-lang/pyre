@@ -9933,6 +9933,23 @@ mod tests {
             crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
             "the declared fn type returns what the SomeString result rtypes to"
         );
+
+        let mut graph = LegacyGraph::new("bytes_like_data");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = true;
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a shared &[u8] residual declares a string");
+        let SomeValue::String(s) = declared else {
+            panic!("a shared &[u8] residual is SomeString, got {declared:?}")
+        };
+        assert!(!s.inner.can_be_none);
+        let ft = declared_funcptr_type_from_legacy(&graph)
+            .expect("a no-arg STR-returning graph has a declared fn type");
+        assert_eq!(
+            ft.result,
+            crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone(),
+            "the declared fn type returns Ptr(STR)"
+        );
     }
 
     #[test]
@@ -10030,21 +10047,6 @@ mod tests {
             classdef.borrow().name.contains("Utf8LocElem"),
             "list item class is {}",
             classdef.borrow().name
-        );
-
-        let mut graph = LegacyGraph::new("bytes_like_data");
-        graph.return_type = Some("ref".into());
-        assert_eq!(declared_return_annotation(&registry, &graph), None);
-        graph.return_container_root = Some("&[u8]".into());
-        let declared = declared_return_annotation(&registry, &graph)
-            .expect("a &[u8] residual declares a list");
-        let SomeValue::List(list) = declared else {
-            panic!("&[u8] residual is SomeList, got {declared:?}")
-        };
-        assert!(
-            matches!(list.listdef.s_value(), SomeValue::Integer(_)),
-            "u8 items are integers, got {:?}",
-            list.listdef.s_value()
         );
 
         let mut graph = LegacyGraph::new("encode_ascii");

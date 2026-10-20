@@ -82,6 +82,7 @@ pub(crate) mod graph_body;
 pub mod host_layout;
 pub(crate) mod iter_adapter;
 pub(crate) mod iter_next;
+pub(crate) mod join_chars;
 pub mod llbc_hints;
 pub mod mir;
 pub(crate) mod option_closure_select;

@@ -630,11 +630,10 @@ pub unsafe fn pointer_convert_argument_from_object(
         if ct.has(ctypeobj::CTypeFlags::ACCEPT_STR)
             && let Some(offset) = super::func::OffsetInBytes::from_obj(w_ob)
         {
-            // `process_str_from_offset_in_bytes` hands C the string's own
-            // characters only where `STR.chars` carries the final null
-            // `extra_item_after_alloc` reserves.  A `BytesBlock` reserves
-            // none, so this is that function's copy arm: the tail from
-            // `offset`, null-terminated, freed after the call.
+            // `process_str_from_offset_in_bytes` would hand C the string's
+            // own characters. The collector may move the bytes and there is
+            // no non-moving pin, so this is that function's copy arm: the
+            // tail from `offset`, null-terminated, freed after the call.
             let value = unsafe { pyre_object::bytesobject::w_bytes_data(offset.w_bytes) };
             let tail = usize::try_from(offset.offset)
                 .ok()

@@ -2653,6 +2653,14 @@ fn analyze_pipeline_from_module_paths(
     // (`func._elidable_function_`, `call.py`).
     front::slice_ascii::register_first_non_ascii_char_helpers(&mut call_control);
 
+    // `rstr.py` `LLHelpers.ll_join_chars` — look-inside copy of a list of
+    // chars into a `STR`. Minted in the rich model because the Vec<u8> →
+    // shared `&[u8]` rewrite runs on the front spine before prepass.
+    front::join_chars::register_ll_join_chars_helper(&mut call_control);
+    // Inverse: `STR` → list of unsigned (`Vec<u8>`). `list(str)` yields
+    // `Char`; a `Vec<u8>` item is `r_uint` (`ord` of each char).
+    front::join_chars::register_ll_str2uintlist_helper(&mut call_control);
+
     // `ll_math.sqrt_nonneg` assigns
     // `sqrt_nonneg.oopspec = "math.sqrt_nonneg(x)"` after the function
     // definition. The interpreter owner is `sqrt_nonneg` in

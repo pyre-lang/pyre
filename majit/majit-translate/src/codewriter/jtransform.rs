@@ -14343,13 +14343,12 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
         return StrOrUniKind::Other;
     };
     match s._name.as_str() {
-        // `Utf8Str` is `W_UnicodeObject._utf8` and carries the `rstr.py STR`
-        // layout (hash, length, chars) field for field.  The other Rust
-        // spellings the bookkeeper annotates as `SomeString` do not --
-        // `BytesBlock` has no hash word and `String` / `Wtf8Buf` are
-        // Vec-shaped -- so a `stroruni.*` oopspec on them would be lowered
-        // with STR offsets they do not have.
-        "rpy_string" | "Utf8Str" => StrOrUniKind::Str,
+        // `Utf8Str` is `W_UnicodeObject._utf8` and `BytesBlock` is
+        // `W_BytesObject._value`; both are `rstr.py` `STR`
+        // (`type BytesBlock = Utf8Str`). `String` / `Wtf8Buf` are
+        // Vec-shaped and stay out — a `stroruni.*` oopspec on them
+        // would be lowered with STR offsets they do not have.
+        "rpy_string" | "Utf8Str" | "BytesBlock" => StrOrUniKind::Str,
         "rpy_unicode" => StrOrUniKind::Unicode,
         "rpy_bytearray" => StrOrUniKind::ByteArray,
         _ => StrOrUniKind::Other,

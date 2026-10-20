@@ -5,6 +5,9 @@
 //! Immutable byte sequence. Shares the same internal layout as
 //! W_BytearrayObject but provides no mutation functions.
 
+use crate::lowlevel_string::{
+    LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_CHARS_OFFSET, lowlevel_str_gc_type_id,
+};
 use crate::pyobject::*;
 
 pub static BYTES_TYPE: PyType =
@@ -39,81 +42,13 @@ pub fn bytes_data_gc_type_id() -> u32 {
     BYTES_DATA_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `rstr.py` — `STR.become(GcStruct('rpy_string', ('hash', Signed),
-/// ('chars', Array(Char, ...))))`: the byte payload is a varsize `GcArray`
-/// inside the managed heap, not a pointer to memory the collector cannot see.
+/// `rstr.py` `STR` (`GcStruct('rpy_string', ('hash', Signed),
+/// ('chars', Array(Char)))`) — `W_BytesObject._value`.
 ///
-/// A storage box holds a `Vec<u8>` whose bytes live in the Rust heap, so the
-/// collector sizes the payload as the 24 bytes of the container and its
-/// major-collection threshold never learns about the buffer. The bytes here sit
-/// after the length header, so `encode_type_shape`'s varsize rule
-/// (`gctypelayout.py`) sizes the block from its own contents and the
-/// threshold moves by what was actually allocated.
-///
-/// Same block shape as [`crate::object_array::TypedItemsBlock`], with `Char`
-/// items instead of words.
-///
-/// The block is that `chars` Array alone, not the whole `rpy_string` struct,
-/// which is also all [`BYTES_BLOCK_TOKEN`] names -- `get_array_token(
-/// Array(Char))`. The struct's other two parts have no reader here:
-///
-/// - `('hash', Signed)` is `ll_strhash`'s cache slot. Nothing caches a
-///   byte-string hash in pyre: `bytes.__hash__` siphashes the buffer on every
-///   call (`_hash_bytes`) and the dict's structural hash runs its own hasher
-///   over `w_bytes_data`, so the slot would be written by nobody and read by
-///   nobody while costing a word per `bytes` object.
-/// - `extra_item_after_alloc: 1` reserves the char slot
-///   `ll_write_final_null_char` (`rlib/rgc.py`) writes, so that a `chars`
-///   array can be handed to C in place as a NUL-terminated string.
-///   `PyBytes_AsString` instead copies into the separate `cached_bytes`
-///   mirror, so no C caller ever reads a terminator off this block.
-#[repr(C)]
-pub struct BytesBlock {
-    /// The GcArray length header — the collector's `ofstolength`.
-    pub length: usize,
-    /// `chars` inline after the header; size known only at allocation time.
-    chars: [u8; 0],
-}
-
-/// Offset of `chars[0]` — the collector's `ofstovar`.
-pub const BYTES_BLOCK_CHARS_OFFSET: usize = std::mem::offset_of!(BytesBlock, chars);
-
-/// Offset of the length header the collector reads as the GcArray length.
-pub const BYTES_BLOCK_LEN_OFFSET: usize = std::mem::offset_of!(BytesBlock, length);
-
-/// `get_array_token(Array(Char))` — the one triple every consumer of this
-/// block's shape reads, as `encode_type_shape` reads all three from the one
-/// ARRAY.
-pub const BYTES_BLOCK_TOKEN: crate::object_array::ArrayToken = crate::object_array::ArrayToken {
-    base_size: BYTES_BLOCK_CHARS_OFFSET,
-    item_size: std::mem::size_of::<u8>(),
-    len_offset: BYTES_BLOCK_LEN_OFFSET,
-};
-
-// The collector sizes a block as `base_size + item_size * length` read at
-// `len_offset`, and `bytes_block_chars` reads the payload at `base_size`. A
-// field added to `BytesBlock` moves both silently, so pin the shape here: the
-// length header first, the chars one word in, and one byte per item.
-const _: () = {
-    assert!(BYTES_BLOCK_LEN_OFFSET == 0);
-    assert!(BYTES_BLOCK_CHARS_OFFSET == std::mem::size_of::<usize>());
-    assert!(BYTES_BLOCK_TOKEN.item_size == 1);
-};
-
-/// Runtime-assigned GC type id for [`BytesBlock`], published by
-/// `pyre-jit::eval` with the other tail registrations.
-static BYTES_BLOCK_GC_TYPE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// Record the GC type id registered for [`BytesBlock`].
-pub fn set_bytes_block_gc_type_id(id: u32) {
-    BYTES_BLOCK_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Read the runtime-assigned GC type id for [`BytesBlock`].
-#[majit_macros::dont_look_inside]
-pub fn bytes_block_gc_type_id() -> u32 {
-    BYTES_BLOCK_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
-}
+/// Same type as [`crate::unicodeobject::Utf8Str`]: hash @0, length
+/// @`LOWLEVEL_STRING_LEN_OFFSET`, chars @`LOWLEVEL_STRING_CHARS_OFFSET`,
+/// trailing NUL, GC type id `lowlevel_str_gc_type_id()`.
+pub type BytesBlock = crate::unicodeobject::Utf8Str;
 
 /// Allocate a [`BytesBlock`] holding `bytes`.
 ///
@@ -150,7 +85,7 @@ enum BlockRoute {
 /// allocated anywhere on that path, and the caller raises the `MemoryError`
 /// `collect_and_reserve` raises.
 fn route_bytes_block(size: usize) -> BlockRoute {
-    let tid = bytes_block_gc_type_id();
+    let tid = lowlevel_str_gc_type_id();
     if tid == 0 {
         return BlockRoute::Raw;
     }
@@ -168,59 +103,42 @@ fn route_bytes_block(size: usize) -> BlockRoute {
 /// `bytes(sys.maxsize)` reaches the allocator with a request it cannot meet,
 /// and `PyBytes_FromStringAndSize` reports that as `MemoryError`.
 pub fn try_alloc_bytes_block(bytes: &[u8]) -> Option<*mut BytesBlock> {
-    let size = BYTES_BLOCK_CHARS_OFFSET + bytes.len();
+    let size = LOWLEVEL_STR_BASE_SIZE + bytes.len();
     let block = match route_bytes_block(size) {
         BlockRoute::Managed(raw) => raw,
         BlockRoute::Refused => return None,
-        // Off-heap `rstr.STR` `chars` array (`rstr.py`): stamp
+        // Off-heap `rstr.STR` (`rstr.py` `mallocstr`): stamp
         // `init_gc_object_immortal` in front of the payload.
         BlockRoute::Raw => {
-            majit_gc::header::alloc_varsize_with_gc_header_immortal(size, bytes_block_gc_type_id())
+            majit_gc::header::alloc_varsize_with_gc_header_immortal(size, lowlevel_str_gc_type_id())
         }
     };
     if block.is_null() {
         return None;
     }
-    // SAFETY: `block` names `size` writable bytes, which is the header
-    // followed by `bytes.len()` char slots.
+    // SAFETY: `block` names `size` writable bytes: hash, length, `bytes.len()`
+    // chars, and the trailing NUL `mallocstr` writes.
     unsafe {
         let block = block as *mut BytesBlock;
+        (*block).hash = 0;
         (*block).length = bytes.len();
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            std::ptr::addr_of_mut!((*block).chars) as *mut u8,
-            bytes.len(),
-        );
+        let chars = (block as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), chars, bytes.len());
+        chars.add(bytes.len()).write(0);
         Some(block)
     }
-}
-
-/// `_ll_prebuilt_empty_array` for `GcArray(Char)`: one old-gen zero-length
-/// [`BytesBlock`], shared by every empty `Array<u8;0>` jitcode constant.
-pub fn prebuilt_empty_bytes_block() -> *mut BytesBlock {
-    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        // `_ll_prebuilt_empty_array` / `prepare_const(0)` malloc immortal.
-        majit_gc::header::alloc_with_gc_header_immortal(
-            BytesBlock {
-                length: 0,
-                chars: [],
-            },
-            bytes_block_gc_type_id(),
-        ) as usize
-    }) as *mut BytesBlock
 }
 
 /// Whether a bytes object of `len` chars is one a `Py_ssize_t` can measure,
 /// which `_PyBytes_FromSize` refuses with `OverflowError` before it allocates.
 pub fn bytes_length_fits(len: usize) -> bool {
-    len <= isize::MAX as usize - BYTES_BLOCK_CHARS_OFFSET
+    len <= isize::MAX as usize - LOWLEVEL_STR_BASE_SIZE
 }
 
 /// [`try_alloc_bytes_block`] for a block of `len` NUL bytes, which is the one
 /// allocation `_PyBytes_FromSize(size, 1)` makes.
 pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
-    let size = BYTES_BLOCK_CHARS_OFFSET + len;
+    let size = LOWLEVEL_STR_BASE_SIZE + len;
     let block = match route_bytes_block(size) {
         BlockRoute::Managed(raw) => {
             // SAFETY: `raw` names `size` writable bytes, and the managed heap
@@ -231,13 +149,14 @@ pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
         BlockRoute::Refused => return None,
         BlockRoute::Raw => majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(
             size,
-            bytes_block_gc_type_id(),
+            lowlevel_str_gc_type_id(),
         ),
     };
     if block.is_null() {
         return None;
     }
-    // SAFETY: `block` names the header followed by `len` zeroed char slots.
+    // SAFETY: `block` names the STR header followed by `len` zeroed char
+    // slots and the trailing NUL. Zero-fill already wrote `hash = 0`.
     unsafe {
         let block = block as *mut BytesBlock;
         (*block).length = len;
@@ -245,12 +164,12 @@ pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
     }
 }
 
-/// The `[GcHeader | length | chars]` layout of a raw-fallback block holding
-/// `len` bytes. `alloc_varsize_with_gc_header_immortal` prepends the header;
-/// this size is the abort path's reported request.
+/// The `[GcHeader | hash | length | chars | NUL]` layout of a raw-fallback
+/// block holding `len` bytes. `alloc_varsize_with_gc_header_immortal`
+/// prepends the header; this size is the abort path's reported request.
 fn bytes_block_layout(len: usize) -> std::alloc::Layout {
     std::alloc::Layout::from_size_align(
-        majit_gc::header::GcHeader::SIZE + BYTES_BLOCK_CHARS_OFFSET + len,
+        majit_gc::header::GcHeader::SIZE + LOWLEVEL_STR_BASE_SIZE + len,
         majit_gc::header::GcHeader::SIZE,
     )
     .expect("bytes block layout")
@@ -263,7 +182,7 @@ fn bytes_block_layout(len: usize) -> std::alloc::Layout {
 pub unsafe fn bytes_block_chars(block: *const BytesBlock) -> &'static [u8] {
     unsafe {
         std::slice::from_raw_parts(
-            std::ptr::addr_of!((*block).chars) as *const u8,
+            (block as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET),
             (*block).length,
         )
     }
@@ -271,9 +190,9 @@ pub unsafe fn bytes_block_chars(block: *const BytesBlock) -> &'static [u8] {
 
 /// Python bytes object — immutable byte sequence.
 ///
-/// `W_BytesObject._value` is an RPython string, whose `chars` array
-/// (`rstr.py`'s `STR`) lives in the managed heap; [`BytesBlock`] is that
-/// array. Same layout as W_BytearrayObject but without setitem/extend.
+/// `W_BytesObject._value` is an RPython string (`rstr.py` `STR`);
+/// [`BytesBlock`] is that `STR`. Same object layout as W_BytearrayObject
+/// but without setitem/extend.
 #[repr(C)]
 pub struct W_BytesObject {
     pub ob_header: PyObject,
@@ -692,7 +611,7 @@ mod tests {
 
     #[test]
     fn alloc_bytes_block_raw_stamps_init_gc_object_immortal_flags() {
-        // Unit tests take the no-hook Raw arm (`bytes_block_gc_type_id` is 0).
+        // Unit tests take the no-hook Raw arm (`lowlevel_str_gc_type_id` is 0).
         let block = alloc_bytes_block(b"leaf");
         assert!(!block.is_null());
         unsafe {

@@ -945,6 +945,33 @@ pub fn strip_instantiation_suffix(name: &str) -> &str {
     }
 }
 
+/// Shared immutable `&[u8]` / `*const [u8]` (and Charon `&Slice<u8>`).
+///
+/// RPython bytes are `str` (`rstr.py` `STR` / `SomeString`). A shared
+/// byte slice is that string; `&mut [u8]`, `*mut [u8]`, bare `[u8]`,
+/// `Vec<u8>`, and `Box<[u8]>` stay a list of unsigned.
+pub fn is_shared_u8_slice_spelling(spelling: &str) -> bool {
+    let t = spelling.trim();
+    let rest = if let Some(rest) = t.strip_prefix("*const ") {
+        rest.trim()
+    } else if let Some(rest) = t.strip_prefix('&') {
+        let rest = rest.trim();
+        if rest.starts_with("mut ") {
+            return false;
+        }
+        if rest.starts_with('\'') {
+            rest.split_once(char::is_whitespace)
+                .map(|(_, r)| r.trim())
+                .unwrap_or("")
+        } else {
+            rest
+        }
+    } else {
+        return false;
+    };
+    rest == "[u8]" || rest == "Slice<u8>"
+}
+
 /// Whether `spelling` is a list-shaped container type (`Vec<T>`,
 /// `VecDeque<T>`, `&[T]`, `[T; N]`, Charon builtin `Slice<T>`) that the
 /// annotator's `project_struct_field_type` maps to a `SomeList` element
@@ -954,7 +981,12 @@ pub fn strip_instantiation_suffix(name: &str) -> &str {
 /// classdef-less `SomeInstance(None)` shell; this recognizer lets the
 /// parameter seam route it through the list model instead.  Mirrors the
 /// `Vec<` / `[` / `Slice<` arms of `project_struct_field_type`.
+///
+/// A shared `&[u8]` is `rstr.py` `STR`, not this family.
 pub fn is_list_container_spelling(spelling: &str) -> bool {
+    if is_shared_u8_slice_spelling(spelling) {
+        return false;
+    }
     let stripped = spelling
         .trim()
         .trim_start_matches('&')
@@ -10526,8 +10558,21 @@ mod tests {
         assert!(is_list_container_spelling("Vec<PyObjectRef>"));
         assert!(is_list_container_spelling("Slice<PyObjectRef>"));
         assert!(is_list_container_spelling("&mut [u8]"));
+        assert!(is_list_container_spelling("*mut [u8]"));
+        assert!(is_list_container_spelling("Vec<u8>"));
+        assert!(is_list_container_spelling("[u8]"));
+        assert!(!is_list_container_spelling("&[u8]"));
+        assert!(!is_list_container_spelling("&'a [u8]"));
+        assert!(!is_list_container_spelling("*const [u8]"));
+        assert!(!is_list_container_spelling("&Slice<u8>"));
         assert!(!is_list_container_spelling("PyObjectRef"));
         assert!(!is_list_container_spelling("W_CType"));
+        assert!(is_shared_u8_slice_spelling("&[u8]"));
+        assert!(is_shared_u8_slice_spelling("&'static [u8]"));
+        assert!(is_shared_u8_slice_spelling("*const [u8]"));
+        assert!(!is_shared_u8_slice_spelling("&mut [u8]"));
+        assert!(!is_shared_u8_slice_spelling("[u8]"));
+        assert!(!is_shared_u8_slice_spelling("&[u8; 4]"));
     }
 
     #[test]

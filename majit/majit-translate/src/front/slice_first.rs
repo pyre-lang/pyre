@@ -352,6 +352,12 @@ fn rewire_one_slice_first_site(
             let start_in_then = map_source(&then_sources, &then_inputs, start)
                 .ok_or_else(|| format!("{name}: RangeFrom start not threaded into Some arm"))?;
             let subslice = graph.alloc_value_var();
+            // List getslice of `Vec<u8>` / `&mut [u8]` into a niche
+            // `Option<&[u8]>` is `rstr.py` `LLHelpers.ll_join_chars`:
+            // the Option payload is rstr `STR`. A `string_byte_view`
+            // receiver is already that string; identity getslice.
+            let copy_list_to_str =
+                site.niche && !site.string_byte_view && matches!(site.payload_ty, ValueType::Str);
             graph.block_mut(then_bb).operations.push(SpaceOperation {
                 result: Some(subslice.clone()),
                 kind: OpKind::Call {
@@ -360,10 +366,29 @@ fn rewire_one_slice_first_site(
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice_in_then, start_in_then]),
-                    result_ty: site.payload_ty.clone(),
+                    result_ty: if copy_list_to_str {
+                        ValueType::Ref(None)
+                    } else {
+                        site.payload_ty.clone()
+                    },
                 },
             });
-            subslice
+            if copy_list_to_str {
+                let dest = graph.alloc_value_var();
+                graph.block_mut(then_bb).operations.push(SpaceOperation {
+                    result: Some(dest.clone()),
+                    kind: OpKind::Call {
+                        target: CallTarget::function_path([
+                            crate::front::join_chars::LL_JOIN_CHARS,
+                        ]),
+                        args: crate::model::call_args(vec![subslice]),
+                        result_ty: ValueType::Str,
+                    },
+                });
+                dest
+            } else {
+                subslice
+            }
         }
     };
     let then_result = if site.niche {
@@ -1033,6 +1058,124 @@ mod tests {
                     if segments.last().map(String::as_str) == Some("first")
             )),
             "residual call survives on decline"
+        );
+    }
+
+    #[test]
+    fn rangefrom_niche_list_getslice_copies_into_str() {
+        let mut g = FunctionGraph::new("test_slice_rangefrom_join_chars");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let range = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let start = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "get".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![slice, range.clone()]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::RangeFrom { range, start };
+        site.niche = true;
+        site.payload_ty = ValueType::Str;
+        site.string_byte_view = false;
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        assert!(
+            g.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments == &["__getslice_rangefrom"]
+                    )
+                })
+            }),
+            "successful arm still emits getslice"
+        );
+        assert!(
+            g.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.first().map(String::as_str)
+                            == Some(crate::front::join_chars::LL_JOIN_CHARS)
+                    )
+                })
+            }),
+            "list getslice into a niche STR Option copies via ll_join_chars"
+        );
+    }
+
+    #[test]
+    fn rangefrom_string_byte_view_skips_join_chars() {
+        let mut g = FunctionGraph::new("test_slice_rangefrom_str_identity");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let range = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let start = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "get".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![slice, range.clone()]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::RangeFrom { range, start };
+        site.niche = true;
+        site.payload_ty = ValueType::Str;
+        site.string_byte_view = true;
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        assert!(
+            !g.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.first().map(String::as_str)
+                            == Some(crate::front::join_chars::LL_JOIN_CHARS)
+                    )
+                })
+            }),
+            "a STR receiver's getslice is already STR"
         );
     }
 }

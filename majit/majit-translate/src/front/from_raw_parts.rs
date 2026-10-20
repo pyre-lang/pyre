@@ -60,13 +60,16 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
         }
     }
     let mut rewritten = 0usize;
-    for (bi, oi, canonical, result_ty, _bytes_block) in sites.into_iter().rev() {
+    for (bi, oi, canonical, mut result_ty, bytes_block) in sites.into_iter().rev() {
         let Some(live) = ensure_live_rep(graph, bi, &canonical) else {
             continue;
         };
         let Some(live_ty) = var_value_type(graph, &live) else {
             continue;
         };
+        if bytes_block || matches!(live_ty, ValueType::Str) {
+            result_ty = ValueType::Str;
+        }
         if value_type_bank(&live_ty) != value_type_bank(&result_ty) {
             continue;
         }
@@ -503,8 +506,12 @@ mod tests {
                 OpKind::Call {
                     result_ty: ValueType::Str,
                     ..
-                } => panic!("BytesBlock view must not be Str"),
-                _ => {}
+                }
+                | OpKind::UnaryOp {
+                    result_ty: ValueType::Str,
+                    ..
+                } => {}
+                other => panic!("BytesBlock view must be Str, got {other:?}"),
             }
         }
     }

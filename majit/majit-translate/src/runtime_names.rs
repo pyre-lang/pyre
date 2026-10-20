@@ -120,6 +120,10 @@ pub(crate) mod shims {
     /// `enumerate(lst)`: the front respells `lst.iter().enumerate()` as
     /// `iter(__majit_enumerate(lst))`.
     pub(crate) const ENUMERATE: &str = "__majit_enumerate";
+    /// `chr(n)`: reserved so a pyre free-fn leaf named `chr` cannot bind
+    /// the look-inside `ll_join_chars` helper (`rbuiltin.py`
+    /// `rtype_builtin_chr`).
+    pub(crate) const CHR: &str = "__majit_chr";
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";
