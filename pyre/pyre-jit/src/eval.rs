@@ -16619,10 +16619,10 @@ pub(crate) fn build_jit_state(
     frame: &PyFrame,
     virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> PyreJitState {
-    let mut jit_state = PyreJitState {
-        frame: frame as *const PyFrame as usize,
-        execution_context: pyre_interpreter::call::getexecutioncontext() as usize,
-    };
+    let mut jit_state = PyreJitState::new(
+        frame as *const PyFrame as usize,
+        pyre_interpreter::call::getexecutioncontext() as usize,
+    );
     assert!(
         jit_state.sync_from_virtualizable(virtualizable_info),
         "build_jit_state: frame must be a valid PyFrame with readable fields"
@@ -17383,6 +17383,8 @@ mod tests {
     fn nested_trace_guard_restores_outer_after_sibling_door_start() {
         use majit_metainterp::BackEdgeAction;
 
+        // Tests run in parallel so bootstrap the GIL here.
+        init_gc_subsystem();
         let outer_key = pyre_jit_trace::driver::make_green_key_typed(
             0x4E53_5447_0000_0001 as *const (),
             0,

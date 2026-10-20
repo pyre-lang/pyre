@@ -289,6 +289,8 @@ fn abort_trace_live_clears_live_history_before_blackhole_drive() {
     // then finds no History to `write_boxes`. The profiler `finally` in
     // `compile_and_run_once` stays open until after the blackhole, so
     // `has_live_metainterp_attempt` still parks leftover driver state.
+    // Tests run in parallel so bootstrap the GIL here.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
     let mut meta = majit_metainterp::MetaInterp::<()>::new(0);
     extern "C" fn portal_runner_helper() -> i64 {
         0
@@ -2398,6 +2400,8 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
         pyre_object::w_int_new(1) as i64
     }
 
+    // Tests run in parallel so bootstrap the GIL here.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
     let pair = crate::state::ensure_trace_test_driver();
     let mut saved_runners: Vec<(usize, i64)> = Vec::new();
     {
@@ -2596,6 +2600,8 @@ fn loop_callee_portal_none_init_records_the_none_check() {
         pyre_object::w_none() as i64
     }
 
+    // Tests run in parallel so bootstrap the GIL here.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
     let pair = crate::state::ensure_trace_test_driver();
     let mut saved_runners: Vec<(usize, i64)> = Vec::new();
     {
@@ -22314,6 +22320,8 @@ fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
     use crate::state::PyreSym;
     use pyre_object::interp_exceptions::{ExcKind, w_exception_new};
 
+    // Tests run in parallel so bootstrap the GIL here.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
     let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
     let exc = w_exception_new(ExcKind::ValueError, "boom");
     // The walk now reads the concrete exception's traceback head.
@@ -23199,6 +23207,9 @@ fn call_result_register_in_reg_for_residual_call_r() {
 #[test]
 fn inlined_should_unroll_one_iteration_follows_once_then_cuts() {
     use pyre_interpreter::{CodeFlags, ConstantData, Mode, compile_source};
+
+    // Tests run in parallel so bootstrap the GIL here.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
 
     fn first_function_code(src: &str) -> pyre_interpreter::CodeObject {
         let module = compile_source(src, Mode::Exec).expect("compile");
@@ -25150,6 +25161,8 @@ fn flush_known_virtualizable_writes_every_static_and_array_item() {
     use pyre_interpreter::locals_w_mut;
     use pyre_interpreter::{Mode, compile_source};
 
+    // Tests run in parallel so bootstrap the GIL here.
+    pyre_interpreter::module::thread::ensure_runtime_thread();
     let module = compile_source("def f(a, b):\n    c = a\n    return c\n", Mode::Exec)
         .expect("compile should succeed");
     let raw_code = module
