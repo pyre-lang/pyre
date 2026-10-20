@@ -6961,12 +6961,8 @@ fn top_level_live_code<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<*
     if sym.jitcode().is_null() {
         return None;
     }
-    let raw = unsafe { (&(*sym.jitcode()).payload).code_ptr };
-    if raw.is_null() {
-        None
-    } else {
-        Some(pyre_interpreter::live_code_wrapper(raw as *const ()) as *const ())
-    }
+    let w = unsafe { (&(*sym.jitcode()).payload).w_code.get() };
+    (w != 0).then_some(w as *const ())
 }
 
 fn guard_current_frame_globals_identity<Sym: WalkSym>(
@@ -10098,7 +10094,9 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
         return Ok(None);
     };
     let py_pc = active.0.metadata.py_floor_by_jit_pc[boundary_index].1;
-    let w_code = pyre_interpreter::live_code_wrapper(active.0.code_ptr.cast()) as usize;
+    // `ActiveResumeFrame::current` already selected the innermost inline
+    // frame's payload; its `w_code` is the green `pycode`.
+    let w_code = active.0.w_code.get() as usize;
     if w_code == 0 {
         return Ok(None);
     }

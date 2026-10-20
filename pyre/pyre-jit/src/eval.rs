@@ -6696,17 +6696,16 @@ unsafe fn jitcode_constants_root_walker_area(
     unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
 }
 
-/// The `code_ptr -> wrapper` half of the population the comment above
+/// The `payload.w_code` half of the population the comment above
 /// describes, registered separately so a failing root names it.
 ///
 /// Skipped on a minor collection: `w_code_new_owned` places the wrapper with
 /// `malloc_typed_stable`, so it is born in oldgen and never relocates, and its
 /// managed children are reached through the wrapper's own trace and write
 /// barrier.  The walk is not free -- it iterates every
-/// `MetaInterpStaticData.jitcodes` entry and takes the `LIVE_CODE_WRAPPERS`
-/// lock once per entry -- so running it per nursery cycle would cost a whole
-/// registry scan for nothing.  `PYRE_PROBE14=1` tests the placement claim
-/// directly rather than by its relocation consequence.
+/// `MetaInterpStaticData.jitcodes` entry -- so running it per nursery cycle
+/// would cost a whole list scan for nothing.  `PYRE_PROBE14=1` tests the
+/// placement claim directly rather than by its relocation consequence.
 unsafe fn jitcode_code_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -7600,6 +7599,11 @@ fn init_callbacks() {
                 false
             },
             drain_backend_jit_exc: crate::call_jit::drain_backend_jit_exc,
+            walk_writer_jitcode_code_roots: |visitor| {
+                if let Some(writer) = crate::jit::codewriter::CodeWriter::existing() {
+                    writer.callcontrol().walk_jitcode_code_roots(visitor);
+                }
+            },
         }));
         callbacks::init(cb);
     });
@@ -12675,7 +12679,7 @@ fn compile_and_run_once(
     // installed before the marker-driven metainterpreter starts.  Resolve the
     // per-green static entry here; `trace_bytecode` consumes the same sidecar
     // when it constructs the root MIFrame.
-    if !crate::jit::codewriter::register_portal_jitdriver(code) {
+    if !crate::jit::codewriter::register_portal_jitdriver(code, frame_root.frame().pycode) {
         majit_metainterp::mc_diag_bump(20);
         return None;
     }
@@ -17239,7 +17243,7 @@ mod tests {
                 as *const pyre_interpreter::CodeObject
         };
         let canonical_code = unsafe { &*raw_code };
-        crate::jit::codewriter::register_portal_jitdriver(canonical_code);
+        crate::jit::codewriter::register_portal_jitdriver(canonical_code, w_code);
     }
 
     /// Post-regalloc Ref-bank color of semantic slot `slot` at `py_pc`,
@@ -18530,6 +18534,7 @@ mod tests {
             pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
         };
         let portal = live_only_pyjitcode(raw, &[]);
+        portal.stamp_w_code(w_code.cast());
         pyre_jit_trace::state::install_jitcode_for(w_code.cast(), portal);
         let portal_index =
             pyre_jit_trace::state::ensure_jitcode_index(w_code.cast()).expect("portal index");

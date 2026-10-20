@@ -6384,14 +6384,16 @@ impl CodeWriter {
         if code.instructions.len().saturating_mul(2) > u16::MAX as usize {
             return None;
         }
-        // Recover the live globals-stamped PyCode wrapper for `code` from the
-        // `code_ptr → live wrapper` registry. `frame.pycode` is the stable
-        // per-code wrapper that every compiled code has stamped (during the
-        // warm-up run that queued it) before the drain reaches this point — so
-        // every downstream const-fold / globals-fold site reads the identical
-        // pointer value.
-        let w_code = pyre_interpreter::live_code_wrapper(code as *const CodeObject as *const ())
-            as *const ();
+        // Owner PyCode stamped on the CallControl skeleton at `get_jitcode`
+        // enqueue (`payload.w_code`). Drain only processes graphs queued that
+        // way (`call.py` `enum_pending_graphs`).
+        let w_code = {
+            let cc = self.callcontrol();
+            cc.jitcodes
+                .get(&(code as *const CodeObject as usize))
+                .map(|pjc| pjc.w_code.get() as *const ())
+                .unwrap_or(std::ptr::null())
+        };
         // jtransform.py:840 — the portal `frame` (and `ec`) red args are
         // threaded into every vable op from the start. Compute the graph
         // Variables once at function entry so all vable graph-shadow
@@ -16385,11 +16387,23 @@ impl CodeWriter {
             is_drained: true,
         };
 
+        // The assembler refill has no wrapper of its own. Copy the
+        // skeleton stamp (`get_jitcode` at enqueue) onto the new
+        // payload; `replace_with` also keeps a non-zero skeleton slot
+        // when this value is null.
+        let payload_w_code = self
+            .callcontrol()
+            .jitcodes
+            .get(&(code as *const CodeObject as usize))
+            .map(|skel| skel.w_code.get() as *const ())
+            .filter(|ptr| !ptr.is_null())
+            .unwrap_or(std::ptr::null());
         Some(PyJitCode::from_parts(
             std::sync::Arc::new(jitcode),
             metadata,
             code as *const CodeObject,
             has_abort,
+            payload_w_code,
         ))
     }
 
@@ -16472,11 +16486,18 @@ impl CodeWriter {
                 // Cache the authoritative assembler result for shapes that
                 // reach this exact check. The graph is immutable, so a later
                 // drain cannot make this encoding failure disappear.
-                self.callcontrol().graph_jit_shapes.insert(
-                    code_ptr as usize,
-                    super::call::JIT_SHAPE_CONST_ENCODING_OVERFLOW,
-                );
-                pyre_interpreter::pycode::store_wrapper_jit_shape_overflow(code_ptr as *const ());
+                let w_code = {
+                    let cc = self.callcontrol();
+                    cc.graph_jit_shapes.insert(
+                        code_ptr as usize,
+                        super::call::JIT_SHAPE_CONST_ENCODING_OVERFLOW,
+                    );
+                    cc.jitcodes
+                        .get(&(code_ptr as usize))
+                        .map(|pjc| pjc.w_code.get() as pyre_object::PyObjectRef)
+                        .unwrap_or(pyre_object::PY_NULL)
+                };
+                pyre_interpreter::pycode::store_wrapper_jit_shape_overflow(w_code);
                 continue;
             };
             let key = code_ptr as usize;
@@ -16573,7 +16594,7 @@ fn backward_jump_is_handler_only_target(
 /// `warmspot.py:281-282`. Runtime trace-side lookup must observe this
 /// installed result. A false result declines the portal and leaves execution
 /// in the interpreter.
-pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
+pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject, w_code: *const ()) -> bool {
     let writer = CodeWriter::instance();
     let code_ptr = code as *const pyre_interpreter::CodeObject;
     // `call.py get_jitcode` / `self.jitcodes[graph]` after the one
@@ -16590,6 +16611,9 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
             .find_compiled_jitcode_arc(code_ptr)
             .is_some()
     {
+        if let Some(existing) = writer.callcontrol().find_compiled_jitcode_arc(code_ptr) {
+            existing.stamp_w_code(w_code);
+        }
         return true;
     }
     // codewriter.py `setup_jitdriver(jd)` — register the
@@ -16602,6 +16626,10 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
         // `Arc<PyJitCode>` from `get_jitcode(jd.portal_graph)`.
         mainjitcode: None,
     });
+    // Stamp the portal wrapper on the skeleton before
+    // `grab_initial_jitcodes` queues the same graph with no wrapper
+    // of its own. Cache-hit `get_jitcode` keeps this stamp.
+    let _ = writer.callcontrol().get_jitcode(code, w_code);
     // codewriter.py `make_jitcodes()` — drain everything pending.
     let jitcodes = writer.make_jitcodes();
     // RPython warmspot.py:281-282 stores the complete
@@ -16743,11 +16771,13 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
 /// upstream actually treats as a JIT-time constant.
 pub fn compile_jitcode_for_callee(
     code: &pyre_interpreter::CodeObject,
+    w_code: *const (),
 ) -> Vec<std::sync::Arc<PyJitCode>> {
     let writer = CodeWriter::instance();
     // call.py `get_jitcode(graph)` — insert skeleton if missing and
-    // queue the graph for the drain.
-    let _ = writer.callcontrol().get_jitcode(code);
+    // queue the graph for the drain. Stamp `payload.w_code` at enqueue
+    // from the wrapper the caller already holds.
+    let _ = writer.callcontrol().get_jitcode(code, w_code);
     // codewriter.py:79-85 — drain the queued graph(s), then assembler.finished.
     writer.drain_unfinished_graphs()
 }
@@ -16789,26 +16819,20 @@ fn compile_jitcode_via_raw_code(
         "ensure_trace_jitcode_for_w_code: w_code's embedded code pointer must match raw_code",
     );
     let code = unsafe { &*raw_code };
-    // Stamp the supplied wrapper into the `code_ptr → live wrapper` registry
-    // before the drain. `transform_graph_to_jitcode` recovers the wrapper for
-    // `code` from that registry, which is otherwise populated only when a frame
-    // stamps the code's globals. A callee body compiled from a function object
-    // before any such frame exists would miss and recover a null wrapper,
-    // emitting LOAD_CONST/LOAD_GLOBAL residuals against a null pycode. The
-    // pointer is asserted equal to `raw_code` above, and first-write-wins keeps
-    // a frame-stamped wrapper when one already exists.
-    pyre_interpreter::register_live_code_wrapper(
-        raw_code as *const (),
-        w_code as pyre_object::PyObjectRef,
-    );
     if let Some(existing) = CodeWriter::instance()
         .callcontrol()
         .find_compiled_jitcode_arc(code as *const _)
     {
+        existing.stamp_w_code(w_code);
         return Some(existing);
     }
 
-    let drained = compile_jitcode_for_callee(code);
+    // Stamp the owner PyCode on the skeleton at `get_jitcode` enqueue,
+    // before the drain.
+    let _ = CodeWriter::instance()
+        .callcontrol()
+        .get_jitcode(code, w_code);
+    let drained = compile_jitcode_for_callee(code, w_code);
     if !drained.is_empty() {
         pyre_jit_trace::state::install_jitcodes(drained);
     }
@@ -18549,7 +18573,9 @@ mod tests {
         };
         let code_ref = unsafe { &*raw_code };
 
-        let _ = writer.callcontrol().get_jitcode(code_ref);
+        let _ = writer
+            .callcontrol()
+            .get_jitcode(code_ref, w_code as *const ());
 
         let queued = writer
             .callcontrol()
@@ -18573,8 +18599,16 @@ mod tests {
         };
         let code_ref = unsafe { &*raw_code };
 
-        let first_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(code_ref));
-        let second_ptr = Arc::as_ptr(&writer.callcontrol().get_jitcode(code_ref));
+        let first_ptr = Arc::as_ptr(
+            &writer
+                .callcontrol()
+                .get_jitcode(code_ref, w_code as *const ()),
+        );
+        let second_ptr = Arc::as_ptr(
+            &writer
+                .callcontrol()
+                .get_jitcode(code_ref, w_code as *const ()),
+        );
 
         assert_eq!(
             first_ptr, second_ptr,
@@ -18598,7 +18632,9 @@ mod tests {
         let code_ref = unsafe { &*raw_code };
         let key = raw_code as usize;
 
-        let _ = writer.callcontrol().get_jitcode(code_ref);
+        let _ = writer
+            .callcontrol()
+            .get_jitcode(code_ref, w_code as *const ());
         let skeleton_ptr = {
             let slot = writer
                 .callcontrol()
@@ -18672,6 +18708,71 @@ mod tests {
             "drain must populate bytecode metadata on the existing entry"
         );
         assert_eq!(pyjit.code_ptr, raw_code);
+    }
+
+    #[test]
+    fn drain_unfinished_graphs_stamps_payload_w_code_from_get_jitcode() {
+        // The queue holds only `CodeObject*`. The wrapper travels as
+        // `get_jitcode`'s argument onto `skeleton.w_code` at enqueue;
+        // the drain refill copies that stamp onto the populated payload.
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code_ref = unsafe { &*raw_code };
+
+        let skeleton = writer
+            .callcontrol()
+            .get_jitcode(code_ref, w_code as *const ());
+        assert_eq!(skeleton.w_code.get(), w_code as i64);
+        assert_eq!(
+            writer.callcontrol().unfinished_graphs.as_slice(),
+            &[raw_code],
+            "unfinished_graphs stays a bare-graph queue"
+        );
+
+        let drained = writer.drain_unfinished_graphs();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].w_code.get(), w_code as i64);
+        assert_eq!(drained[0].code_ptr, raw_code);
+        assert!(drained[0].is_populated());
+    }
+
+    #[test]
+    fn get_jitcode_skeleton_w_code_is_forwarded_by_root_walk_before_install() {
+        // `install_jitcodes` rejects skeletons, so a `get_jitcode` stamp
+        // lives only on `CallControl.jitcodes` until the drain. The jitcode
+        // root walk must forward that slot without waiting for sd.jitcodes.
+        let writer = CodeWriter::new();
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let code_ref = unsafe { &*raw_code };
+
+        let skeleton = writer
+            .callcontrol()
+            .get_jitcode(code_ref, w_code as *const ());
+        assert!(skeleton.is_skeleton());
+        assert_eq!(skeleton.w_code.get(), w_code as i64);
+        assert!(
+            writer
+                .callcontrol()
+                .find_compiled_jitcode_arc(raw_code)
+                .is_none(),
+            "queued skeleton is not a compiled install"
+        );
+
+        let forwarded = (w_code as usize) ^ 0x10;
+        writer.callcontrol().walk_jitcode_code_roots(&mut |slot| {
+            if slot.0 == w_code as usize {
+                slot.0 = forwarded;
+            }
+        });
+        assert_eq!(skeleton.w_code.get(), forwarded as i64);
     }
 
     #[test]
@@ -19107,7 +19208,9 @@ mod tests {
         };
         let code_ref = unsafe { &*raw_code };
 
-        let _ = writer.callcontrol().get_jitcode(code_ref);
+        let _ = writer
+            .callcontrol()
+            .get_jitcode(code_ref, w_code as *const ());
         assert!(writer.callcontrol().find_jitcode_arc(raw_code).is_some());
         assert!(
             writer

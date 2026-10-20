@@ -4648,10 +4648,8 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
         if sym.jitcode().is_null() {
             return false;
         }
-        let caller_code =
-            pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ())
-                as *const ();
-        w_code as usize == caller_code as usize
+        let caller_code = (&(*sym.jitcode()).payload).w_code.get();
+        caller_code != 0 && w_code as usize == caller_code as usize
     }
 }
 

@@ -2891,9 +2891,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `w_code` already in hand) equals `getcode` — the pointer the
     // jit_merge_point green key and the portal jitcode were registered
     // under.
-    let caller_code = unsafe {
-        pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ()) as *const ()
-    };
+    let caller_code = unsafe { (&(*sym.jitcode()).payload).w_code.get() as *const () };
     // Self-fold requires callee code == portal code.  The full-portal cutover
     // additionally admits a *mutual*-recursive callee — one whose code is
     // already on the inline framestack, i.e. a
@@ -2909,7 +2907,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // screen an arbitrary foreign call (e.g. a CALL_KW-bearing leaf) would fold
     // to CALL_ASSEMBLER, building and entering a frame the callee's own loop
     // was never traced against.
-    if w_code as usize != caller_code as usize {
+    if caller_code.is_null() || w_code as usize != caller_code as usize {
         let admit_mutual = ctx
             .session
             .borrow()

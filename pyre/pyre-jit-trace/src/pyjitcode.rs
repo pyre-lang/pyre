@@ -47,6 +47,7 @@
 //! to consult — `assembler.assemble` populates `code` in place and
 //! per-PC mapping is implicit in the bytecode stream.
 
+use majit_jitcode::codewriter::jitcode::ConstSlotR;
 use majit_metainterp::jitcode::JitCode as RuntimeJitCode;
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
@@ -393,6 +394,9 @@ pub struct PyJitCodePayload {
     /// `w_code` when available, but the cached object carries the raw
     /// CodeObject pointer so the queue can stay a bare graph list.
     pub code_ptr: *const pyre_interpreter::CodeObject,
+    /// Owner `PyCode` (`pycode.py` `PyCode`; `warmspot.py` jitcodes are
+    /// reached from the code object).
+    pub w_code: ConstSlotR,
     /// True if the jitcode contains an `abort` or `abort_permanent` opcode
     /// (unsupported bytecodes / emission-time bail-outs). Precomputed at
     /// compile time to avoid repeated bytecode scanning.
@@ -583,17 +587,29 @@ impl PyJitCode {
         metadata: PyJitCodeMetadata,
         code_ptr: *const pyre_interpreter::CodeObject,
         has_abort: bool,
+        w_code: *const (),
     ) -> Self {
         Self::new(PyJitCodePayload {
             jitcode,
             metadata,
             code_ptr,
+            w_code: ConstSlotR::new(w_code as i64),
             has_abort,
             sub_descr_pool: std::cell::OnceCell::new(),
             inline_body_facts: std::cell::OnceCell::new(),
             loop_scan: std::cell::OnceCell::new(),
             helper_resume_blockers: std::cell::OnceCell::new(),
         })
+    }
+
+    /// Stamp the owner `PyCode` wrapper if this payload does not yet
+    /// carry one. First write wins so a later assembler `from_parts`
+    /// refill with a null slot cannot wipe a skeleton stamp.
+    pub fn stamp_w_code(&self, w_code: *const ()) {
+        if w_code.is_null() || self.w_code.get() != 0 {
+            return;
+        }
+        self.w_code.set(w_code as i64);
     }
 
     /// Fill the cached payload without changing the outer `PyJitCode`
@@ -627,6 +643,7 @@ impl PyJitCode {
             jitcode: next_jitcode,
             metadata,
             code_ptr,
+            w_code,
             has_abort,
             sub_descr_pool,
             inline_body_facts,
@@ -657,6 +674,12 @@ impl PyJitCode {
             *current_jitcode = next_jitcode;
             current.metadata = metadata;
             current.code_ptr = code_ptr;
+            // Assembler `from_parts` may still leave the slot null when the
+            // refill has no wrapper in hand. Keep the skeleton stamp unless
+            // the replacement payload already carries one.
+            if w_code.get() != 0 {
+                current.w_code = w_code;
+            }
             current.has_abort = has_abort;
         }
     }
@@ -1106,11 +1129,22 @@ impl PyJitCode {
     /// `get_jitcode` calls can find an existing key without recompiling
     /// (call.py `if graph in self.jitcodes: return`).
     pub fn skeleton(code_ptr: *const pyre_interpreter::CodeObject) -> Self {
+        Self::skeleton_with_w_code(code_ptr, std::ptr::null())
+    }
+
+    /// Empty `PyJitCode` slot with the owner `PyCode` already stamped.
+    /// `CallControl::get_jitcode` uses this so a Python-code skeleton
+    /// carries its wrapper from enqueue, before the drain refill.
+    pub fn skeleton_with_w_code(
+        code_ptr: *const pyre_interpreter::CodeObject,
+        w_code: *const (),
+    ) -> Self {
         Self::from_parts(
             std::sync::Arc::new(RuntimeJitCode::default()),
             PyJitCodeMetadata::degenerate(),
             code_ptr,
             false,
+            w_code,
         )
     }
 
@@ -1143,6 +1177,7 @@ impl PyJitCode {
             PyJitCodeMetadata::degenerate(),
             code_ptr,
             has_abort,
+            std::ptr::null(),
         )
     }
 }

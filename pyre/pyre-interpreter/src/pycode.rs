@@ -4113,8 +4113,6 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
         );
     }
     if !w_globals.is_null() {
-        let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr as *const () };
-        register_live_code_wrapper(code_ptr, obj);
         register_w_globals_stamped_code(obj);
     }
 }
@@ -4166,22 +4164,13 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             )
         } {
             Ok(()) => {
-                register_live_code_wrapper(unsafe { (*code).code_ptr as *const () }, obj);
                 register_w_globals_stamped_code(obj);
                 return false;
             }
             Err(winner) => published = winner,
         }
     }
-    // The wrapper may have moved since its first globals stamp. The live frame
-    // supplying `obj` is authoritative, so keep the raw-code compatibility
-    // registry synchronized even on the cache-hit path.
-    let obj = roots.get(root_base);
     let w_globals = roots.get(root_base + 1);
-    register_live_code_wrapper(
-        unsafe { (*(obj as *const PyCode)).code_ptr as *const () },
-        obj,
-    );
     !std::ptr::eq(published, w_globals)
 }
 
@@ -4212,9 +4201,8 @@ enum CodeLocations {
 /// `code_ptr` standing, so an entry can never outlive its key's validity and
 /// never has to be revisited.
 ///
-/// Process-global and keyed by `usize` for `LIVE_CODE_WRAPPERS`' reasons: the
-/// rows belong to the shared code object, and a raw `PyObjectRef` is not
-/// `Send`.
+/// Process-global and keyed by `CodeObject` address: the rows belong to the
+/// shared body, and a raw `PyObjectRef` is not `Send`.
 static CODE_LOCATIONS: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashMap<usize, CodeLocations>>,
 > = std::sync::OnceLock::new();
@@ -4544,114 +4532,18 @@ pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool
     )
 }
 
-/// Registry mapping a raw CodeObject pointer (`PyCode.code_ptr`) to the
-/// live, globals-stamped `PyCode` wrapper. Populated where a frame stamps
-/// the wrapper's `w_globals` — the only point both the raw pointer and the
-/// live wrapper are in hand — and consumed by the JIT to recover the live
-/// wrapper (and hence its `w_globals`) from a raw code pointer it already
-/// holds, so the JIT need not carry the wrapper identity as a separate
-/// `w_code` courier. First-write-wins, mirroring the first-store-wins
-/// `PyCode.w_globals` semantics in `w_code_frame_stores_global`.
-/// `MetaInterpStaticData.jitcodes` roots the wrappers it retains and forwards
-/// this mapping during every minor collection; an executing frame also
-/// refreshes the mapping from its live `pycode` field. The collector destructor
-/// removes every other mapping before its pointer can dangle.
-///
-/// Process-global, not per-thread: `pycode.py` keeps `w_globals` on the
-/// shared `PyCode` instance, and a code object stamped on one thread must be
-/// recoverable from every thread that later runs it — a thread-local map made
-/// the JIT's `recover_inline_callee_globals` answer `PY_NULL` there and
-/// decline the inline. Keys and values are `usize` because a raw
-/// `PyObjectRef` is not `Send`, as in `interp_sre`'s pattern registry.
-///
-/// Keyed by an address, so it is hashed the way `lldict.py _hash` hashes one
-/// (`majit_gc::address_dict::AddressHasher`). Rust's default `SipHash` was 4.3%
-/// of a call-heavy interpreted loop on its own, because every frame creation
-/// refreshes its own entry.
-static LIVE_CODE_WRAPPERS: std::sync::OnceLock<
-    parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>>,
-> = std::sync::OnceLock::new();
-
-fn live_code_wrappers() -> &'static parking_lot::Mutex<majit_gc::address_dict::AddressMap<usize>> {
-    LIVE_CODE_WRAPPERS
-        .get_or_init(|| parking_lot::Mutex::new(majit_gc::address_dict::AddressMap::default()))
-}
-
-/// Record `wrapper` as the live wrapper for `code_ptr`. No-op on null inputs.
-///
-/// The frame/function field supplying `wrapper` is the authoritative GC edge.
-/// Refreshing an existing entry is required now that `PyCode` follows
-/// `pycode.py class PyCode(W_Root)` and can move between calls.
-pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
-    if code_ptr.is_null() || wrapper.is_null() {
-        return;
-    }
-    let wrapper = wrapper as usize;
-    let mut wrappers = live_code_wrappers().lock();
-    match wrappers.get_mut(&(code_ptr as usize)) {
-        // The refresh exists for a wrapper that moved, and an unmoved one is
-        // the common case: every frame this code object runs comes back here.
-        // Leaving the slot alone spares the store and, on a table at its load
-        // factor, the rehash that inserting over an existing key still risks.
-        Some(live) if *live == wrapper => {}
-        Some(live) => *live = wrapper,
-        None => {
-            wrappers.insert(code_ptr as usize, wrapper);
-        }
-    }
-}
-
-/// Latch assembler overflow onto the live wrapper so the per-frame shape
-/// gate agrees with `CallControl.graph_jit_shapes` without a map probe.
-pub fn store_wrapper_jit_shape_overflow(code_ptr: *const ()) {
-    let w = live_code_wrapper(code_ptr);
-    if w.is_null() {
+/// Latch assembler overflow onto the owner wrapper so the per-frame shape
+/// gate agrees with `CallControl.graph_jit_shapes`.
+pub fn store_wrapper_jit_shape_overflow(w_code: PyObjectRef) {
+    if w_code.is_null() {
         return;
     }
     unsafe {
-        (*(w as *const PyCode)).jit_shape.store(
+        (*(w_code as *const PyCode)).jit_shape.store(
             JIT_SHAPE_STORED_CONST_ENCODING_OVERFLOW,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-}
-
-/// Recover the live wrapper previously registered for `code_ptr`, or `PY_NULL`
-/// if none has been stamped.
-pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
-    if code_ptr.is_null() {
-        return PY_NULL;
-    }
-    let mut wrappers = live_code_wrappers().lock();
-    let Some(wrapper) = wrappers.get_mut(&(code_ptr as usize)) else {
-        return PY_NULL;
-    };
-    // A collection root walk may have installed a forwarding pointer before
-    // this side table itself is visited. Follow it eagerly so every reader
-    // sees the live address and write the answer back for later readers.
-    *wrapper = pyre_object::gc_hook::try_gc_current_object_address(
-        *wrapper as pyre_object::gc_hook::GCREF,
-    ) as usize;
-    *wrapper as PyObjectRef
-}
-
-/// Forward one JitCode-retained live-wrapper entry in place.
-///
-/// Called only from the collector's per-mutator root-area walk while that
-/// mutator is quiesced. `MetaInterpStaticData.jitcodes` is the strong owner,
-/// matching `warmspot.py self.metainterp_sd.jitcodes`; the address-keyed map is
-/// only pyre's raw-CodeObject compatibility seam.
-pub fn walk_live_code_wrapper(code_ptr: *const (), forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    if code_ptr.is_null() {
-        return;
-    }
-    let mut wrappers = live_code_wrappers().lock();
-    let Some(wrapper) = wrappers.get_mut(&(code_ptr as usize)) else {
-        return;
-    };
-    let mut root = *wrapper as PyObjectRef;
-    forward(&mut root);
-    *wrapper = root as usize;
 }
 
 /// One `box_code_object` allocation graph and what still reads it.
@@ -4896,13 +4788,6 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     // compile's clone alive. Same release `property_destructor` performs for
     // `w_fget?`.
     unsafe { code.w_globals_watchers.reclaim() };
-    let wrapper = obj_addr as PyObjectRef;
-    {
-        let mut wrappers = live_code_wrappers().lock();
-        if wrappers.get(&(code.code_ptr as usize)).copied() == Some(wrapper as usize) {
-            wrappers.remove(&(code.code_ptr as usize));
-        }
-    }
     w_globals_stamped_codes().lock().remove(&obj_addr);
     mapdict_method_cache_codes().lock().remove(&obj_addr);
     if !code.cell_families.is_null() {
@@ -5545,22 +5430,6 @@ mod tests {
     fn early_break_when_start_past_offset() {
         let table = encode_table(&[(0, 2, 10, 1, false), (100, 2, 200, 2, false)]);
         assert_eq!(lookup_exceptiontable(&table, 50), None);
-    }
-
-    #[test]
-    fn live_code_wrapper_refreshes_to_latest_live_owner() {
-        let code = 0x1000usize as *const ();
-        let w1 = 0x2000usize as PyObjectRef;
-        let w2 = 0x3000usize as PyObjectRef;
-        register_live_code_wrapper(code, w1);
-        // A later authoritative GC edge refreshes the movable wrapper address.
-        register_live_code_wrapper(code, w2);
-        assert_eq!(live_code_wrapper(code), w2);
-        // An unregistered code pointer recovers to PY_NULL.
-        assert!(live_code_wrapper(0x9999usize as *const ()).is_null());
-        // Null inputs are no-ops / recover to PY_NULL.
-        register_live_code_wrapper(std::ptr::null(), w1);
-        assert!(live_code_wrapper(std::ptr::null()).is_null());
     }
 
     #[test]

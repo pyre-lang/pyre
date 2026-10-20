@@ -1334,6 +1334,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     pyjit.jitcode = std::sync::Arc::new(builder.finish());
     pyjit.metadata.is_drained = true;
     pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    pyjit.stamp_w_code(w_code);
     let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
         as *const crate::state::JitCode;
     assert!(!installed.is_null());
@@ -16070,11 +16071,12 @@ fn helper_jitcode_fills_a_trace_too_long_miframe() {
     // A null `code` key collides with a reserved build-time skeleton;
     // `helper_jitcode_arc` then prefers `get_runtime_jitcode_by_index`
     // and would fill the canonical portal instead of this helper. The key
-    // must be a real `PyCode`: `canonical_code_key_opt` reads its `code_ptr`.
+    // must be a real `PyCode`: `canonical_code_key_opt` takes the wrapper.
     let code = pyre_interpreter::compile_exec("None").expect("test code should compile");
     let key = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.jitcode = jitcode.clone();
+    pyjit.stamp_w_code(key);
     let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
         as *const crate::state::JitCode;
     let index = unsafe { (*installed).index as usize };
