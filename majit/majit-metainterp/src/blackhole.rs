@@ -9386,9 +9386,9 @@ impl CallDescrHandle {
             Self::InCalleeJitCode(jitcode) => return jitcode.calldescr(),
             Self::InCalleeCallDescr(ptr) => {
                 // SAFETY: `read_inline_call_jitcode` copied this from a
-                // live `JitCodeBody.calldescr`. The descr-pool Arc owns
-                // that body for the rest of this opcode; same contract as
-                // `handler_inline_call_nested_ext`.
+                // live `JitCode.calldescr` header field. The descr-pool
+                // Arc owns that JitCode for the rest of this opcode;
+                // same contract as `handler_inline_call_nested_ext`.
                 return unsafe { &**ptr };
             }
         };
@@ -13712,16 +13712,15 @@ fn read_inline_call_jitcode(
             let fnaddr = jitcode.fnaddr;
             // `bhimpl_inline_call_*` (`blackhole.py`) calls
             // `cpu.bh_call_*(adr2int(jitcode.fnaddr), ..., jitcode.calldescr)`.
-            // `as_jitcode_exec` already borrows those two fields; clone the
-            // Arc only when `fnaddr` is a symbolic hash and the unresolved
-            // interpreter needs the body.
+            // `calldescr` is a header field (`jitcode.py` `__init__`); a
+            // shell the codewriter has not finished has none yet.
             if is_callable_fnaddr(fnaddr)
-                && let Some(body) = jitcode.try_body()
+                && let Some(calldescr) = jitcode.calldescr.get()
             {
                 return (
                     0,
                     fnaddr,
-                    CallDescrHandle::InCalleeCallDescr(&body.calldescr as *const BhCallDescr),
+                    CallDescrHandle::InCalleeCallDescr(calldescr as *const BhCallDescr),
                     p + 2,
                 );
             }
@@ -14365,11 +14364,11 @@ fn handler_inline_call_nested_ext(
         // interpreter below runs it, which is where every callee went before.
         if let Some(sub) = entry.as_jitcode_exec()
             && is_callable_fnaddr(sub.fnaddr)
-            && let Some(body) = sub.try_body()
+            && let Some(calldescr) = sub.calldescr.get()
         {
             Some((
                 sub.fnaddr,
-                &body.calldescr as *const majit_jitcode::jitcode::BhCallDescr,
+                calldescr as *const majit_jitcode::jitcode::BhCallDescr,
             ))
         } else {
             None

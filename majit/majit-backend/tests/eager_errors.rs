@@ -72,7 +72,7 @@ impl Backend for RejectingBackend {
     fn execute_token(&self, _: &JitCellToken, _: &[Value]) -> DeadFrame {
         panic!("compile failure must not run code or a fallback");
     }
-    fn get_latest_descr<'a>(&'a self, _: &'a DeadFrame) -> &'a dyn FailDescr {
+    fn get_latest_descr<'a>(&self, _: &'a DeadFrame) -> &'a dyn FailDescr {
         unreachable!()
     }
     fn get_latest_descr_arc(&self, _: &DeadFrame) -> DescrRef {

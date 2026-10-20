@@ -314,13 +314,6 @@ impl From<i64> for ConstSlotR {
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct JitCodeBody {
-    /// RPython `jitcode.py` `self.calldescr = calldescr`. RPython sets
-    /// this at construction because rtyper has resolved the function's
-    /// arg/result types upstream; pyre's rtyper-equivalent runs inside
-    /// the codewriter pipeline so calldescr is filled here as part of
-    /// the body. `transform_graph_to_jitcode` overrides the default with
-    /// the assembled `arg_classes`.
-    pub calldescr: BhCallDescr,
     /// RPython `jitcode.py` `self.code = code` — bytecode bytes.
     pub code: Vec<u8>,
     /// RPython `jitcode.py:32` `self.constants_i`.
@@ -452,7 +445,6 @@ impl std::fmt::Debug for JitCodeBody {
     /// and overflows the stack.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JitCodeBody")
-            .field("calldescr", &self.calldescr)
             .field("code", &self.code)
             .field("constants_i", &self.constants_i)
             .field("constants_r", &self.constants_r)
@@ -494,6 +486,13 @@ pub struct JitCode {
     /// never went through that constructor (`JitCode::new`).
     #[serde(default)]
     pub fnaddr_reloc: Option<ConstIRelocKind>,
+    /// RPython `jitcode.py` `self.calldescr = calldescr`. Set in
+    /// `JitCode.__init__` (`call.py get_jitcode`) before assemble.
+    /// OnceLock because pyre hands out `Arc<JitCode>` shells before the
+    /// rtyper-equivalent has `FUNC.ARGS` / `FUNC.RESULT`; `set_calldescr`
+    /// is the one write after sharing. `setup()` does not touch this field.
+    #[serde(with = "oncelock_calldescr_serde")]
+    pub calldescr: OnceLock<BhCallDescr>,
     /// RPython `jitcode.py` `self.jitdriver_sd = None`. `Some(index)`
     /// for portal jitcodes (set by `grab_initial_jitcodes` /
     /// `drain_pending_graphs`). `OnceLock` allows the late single-set
@@ -629,6 +628,32 @@ mod oncelock_body_serde {
     }
 }
 
+mod oncelock_calldescr_serde {
+    use std::sync::OnceLock;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::BhCallDescr;
+
+    pub fn serialize<S: Serializer>(
+        lock: &OnceLock<BhCallDescr>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&lock.get(), ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<OnceLock<BhCallDescr>, D::Error> {
+        let opt: Option<BhCallDescr> = Option::deserialize(de)?;
+        let lock = OnceLock::new();
+        if let Some(v) = opt {
+            let _ = lock.set(v);
+        }
+        Ok(lock)
+    }
+}
+
 impl JitCode {
     /// RPython `jitcode.py` `JitCode.__init__(name, fnaddr=None,
     /// calldescr=None, called_from=None)`.
@@ -638,15 +663,17 @@ impl JitCode {
     /// `constants_*`, `c_num_regs_*`, `startpoints`, etc. via the
     /// assembler.
     ///
-    /// `calldescr`, `_called_from`, and `_ssarepr` from RPython are not
-    /// fully ported at construction time. `fnaddr` starts as 0 here and is
-    /// filled by `CallControl::get_jitcode()` when a graph-backed shell is
-    /// allocated.
+    /// `_called_from` and `_ssarepr` from RPython are not fully ported at
+    /// construction time. `fnaddr` starts as 0 here and is filled by
+    /// `CallControl::get_jitcode()` when a graph-backed shell is allocated.
+    /// `calldescr` is the same constructor argument; pyre's rtyper-equivalent
+    /// may fill it after the shell is already `Arc`-shared (`set_calldescr`).
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             fnaddr: 0,
             fnaddr_reloc: None,
+            calldescr: OnceLock::new(),
             jitdriver_sd: OnceLock::new(),
             index: OnceLock::new(),
             _called_from: None,
@@ -673,13 +700,10 @@ impl JitCode {
     }
 
     /// Mutable accessor for late post-assembly mutation of body fields.
-    /// Required by callers (e.g. pyre's `finalize_jitcode`) that fetch
-    /// `calldescr` from `CallControl` *after* the assembler has already
-    /// committed the body via `set_body`. RPython mutates `JitCode`
-    /// fields directly post-`setup()`; pyre routes the mutation through
-    /// `OnceLock::get_mut` so the same in-place semantics work on
-    /// canonical JitCode shells. Panics if the body has not been
-    /// committed yet.
+    /// RPython mutates `JitCode` fields directly post-`setup()`; pyre
+    /// routes the mutation through `OnceLock::get_mut` so the same
+    /// in-place semantics work on canonical JitCode shells. Panics if
+    /// the body has not been committed yet.
     pub fn body_mut(&mut self) -> &mut JitCodeBody {
         self.body
             .get_mut()
@@ -829,10 +853,44 @@ impl JitCode {
         }
     }
 
-    /// RPython `jitcode.py:17` reader. Convenience for callers that
-    /// would otherwise write `jitcode.body().calldescr`.
+    /// RPython `jitcode.py` `self.calldescr` reader.
+    ///
+    /// A jitcode built without a codewriter signature (pyre's per-code
+    /// jitcodes, test fixtures) reads the empty default `BhCallDescr`, the
+    /// value the body field carried before it moved to the header. A
+    /// reader that must tell "unset" from a real signature, such as the
+    /// blackhole's native `bh_call_*` dispatch, checks
+    /// `self.calldescr.get()`.
     pub fn calldescr(&self) -> &BhCallDescr {
-        &self.body().calldescr
+        match self.calldescr.get() {
+            Some(d) => d,
+            None => empty_calldescr(),
+        }
+    }
+
+    /// RPython `jitcode.py` `self.calldescr = calldescr`. One write after
+    /// the shell is `Arc`-shared; a second write with the same
+    /// `arg_classes` / `result_type` is a no-op (`set_index`).
+    pub fn set_calldescr(&self, d: BhCallDescr) {
+        match self.calldescr.set(d) {
+            Ok(()) => {}
+            Err(d) => {
+                let existing = self
+                    .calldescr
+                    .get()
+                    .expect("OnceLock::set returned Err but get() is empty");
+                assert_eq!(
+                    existing.arg_classes, d.arg_classes,
+                    "JitCode calldescr arg_classes already set to {:?}, cannot reassign to {:?}",
+                    existing.arg_classes, d.arg_classes
+                );
+                assert_eq!(
+                    existing.result_type, d.result_type,
+                    "JitCode calldescr result_type already set to {}, cannot reassign to {}",
+                    existing.result_type, d.result_type
+                );
+            }
+        }
     }
 }
 
@@ -1114,12 +1172,18 @@ impl Default for JitCode {
     }
 }
 
+fn empty_calldescr() -> &'static BhCallDescr {
+    static EMPTY: OnceLock<BhCallDescr> = OnceLock::new();
+    EMPTY.get_or_init(BhCallDescr::default)
+}
+
 impl Clone for JitCode {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
             fnaddr: self.fnaddr,
             fnaddr_reloc: self.fnaddr_reloc.clone(),
+            calldescr: self.calldescr.clone(),
             jitdriver_sd: self.jitdriver_sd.clone(),
             index: self.index.clone(),
             _called_from: self._called_from.clone(),

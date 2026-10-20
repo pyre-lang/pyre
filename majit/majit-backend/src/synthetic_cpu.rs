@@ -128,7 +128,7 @@ impl crate::Backend for SyntheticCpu {
         )
     }
 
-    fn get_latest_descr<'a>(&'a self, _frame: &'a crate::DeadFrame) -> &'a dyn majit_ir::FailDescr {
+    fn get_latest_descr<'a>(&self, _frame: &'a crate::DeadFrame) -> &'a dyn majit_ir::FailDescr {
         unreachable!("SyntheticCpu does not produce DeadFrames; get_latest_descr unreachable")
     }
 

@@ -23283,7 +23283,7 @@ impl majit_backend::Backend for CraneliftBackend {
         unsafe { *jf_ptr.add(JF_FORCE_DESCR_OFS as usize / 8) != 0 }
     }
 
-    fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
+    fn get_latest_descr<'a>(&self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         get_latest_descr_from_deadframe(frame).expect("get_latest_descr_from_deadframe failed")
     }
 

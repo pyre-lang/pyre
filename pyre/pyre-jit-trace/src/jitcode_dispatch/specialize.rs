@@ -15750,11 +15750,12 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    if jc.calldescr.arg_classes != "iriir" {
+    if jc.calldescr().arg_classes != "iriir" {
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[decline-why] FORMAT-INT-DECIMAL-ARG-CLASSES pc={} classes={}",
-                op.pc, jc.calldescr.arg_classes
+                op.pc,
+                jc.calldescr().arg_classes
             );
         }
         return Ok(None);

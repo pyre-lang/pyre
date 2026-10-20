@@ -1557,11 +1557,14 @@ fn real_main() {
             }
         }
         for jitcode in &mut frozen_jitcodes {
+            // `jitcode.py` `self.calldescr` is a header field, not a
+            // `setup()` body field. Freeze mutates extra_info in place.
             call_descrs.push(
-                &mut std::sync::Arc::get_mut(jitcode)
+                std::sync::Arc::get_mut(jitcode)
                     .expect("fresh frozen JitCode clone is unexpectedly shared")
-                    .body_mut()
-                    .calldescr,
+                    .calldescr
+                    .get_mut()
+                    .expect("JitCode.calldescr is set before freeze"),
             );
         }
         // `effectinfo.compute_bitstrings(self.cpu.setup_descrs())` sees every

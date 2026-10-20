@@ -2988,7 +2988,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 majit_metainterp::blackhole::BhCallDescr::from_arg_classes(
                     "iirrr".to_string(),
                     'r',
-                    bh.jitcode.calldescr.extra_info.clone(),
+                    bh.jitcode.calldescr().extra_info.clone(),
                 )
             },
             // `get_portal_runner` reaches this table by INDEX

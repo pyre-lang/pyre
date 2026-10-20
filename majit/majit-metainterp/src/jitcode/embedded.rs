@@ -101,7 +101,9 @@ impl EmbeddedJitCodeTable {
             .iter()
             .map(|code| {
                 let mut code = (**code).clone();
-                super::frozen_effects::prepare(&mut code.body_mut().calldescr.extra_info);
+                if let Some(calldescr) = code.calldescr.get_mut() {
+                    super::frozen_effects::prepare(&mut calldescr.extra_info);
+                }
                 Arc::new(code)
             })
             .collect();

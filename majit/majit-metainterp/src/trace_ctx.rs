@@ -8160,7 +8160,7 @@ mod tests {
             unimplemented!("SanityTestCpu::execute_token")
         }
         fn get_latest_descr<'a>(
-            &'a self,
+            &self,
             _frame: &'a majit_backend::DeadFrame,
         ) -> &'a dyn majit_ir::FailDescr {
             unimplemented!("SanityTestCpu::get_latest_descr")

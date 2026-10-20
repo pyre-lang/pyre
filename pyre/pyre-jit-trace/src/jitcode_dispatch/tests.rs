@@ -1732,9 +1732,9 @@ fn builtin_wrapper_args_slice_names_the_object_gcarray_descr() {
 fn gateway_positional_count_uses_rpython_signed() {
     let count =
         named_jitcode("leading_non_null_count").expect("gateway positional-count helper jitcode");
-    assert_eq!(count.calldescr.result_type, 'i');
+    assert_eq!(count.calldescr().result_type, 'i');
     assert!(
-        count.calldescr.result_signed,
+        count.calldescr().result_signed,
         "PyPy argument.py keeps num_args/upfront/input_argcount as RPython Signed"
     );
 }
@@ -3433,7 +3433,7 @@ impl majit_backend::Backend for AllocTestCpu {
         unimplemented!("AllocTestCpu::execute_token")
     }
     fn get_latest_descr<'a>(
-        &'a self,
+        &self,
         _frame: &'a majit_backend::DeadFrame,
     ) -> &'a dyn majit_ir::FailDescr {
         unimplemented!("AllocTestCpu::get_latest_descr")
@@ -5321,17 +5321,18 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
     // `(value, fill, width, align, forced_sign)` is `iriir`.
     let jc = crate::jitcode_runtime::pathed_jitcode("pyre_object::intobject::format_int_decimal")
         .expect("format_int_decimal must be a discovered jitcode");
-    let body = jc
+    let _body = jc
         .try_body()
         .expect("format_int_decimal body must be assembled");
     let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
         .map(|op| op.opname)
         .collect();
     assert_eq!(
-        body.calldescr.arg_classes, "iriir",
+        jc.calldescr().arg_classes,
+        "iriir",
         "format_int_decimal arg banks; ops={ops:?}"
     );
-    assert_eq!(body.calldescr.result_type, 'r', "ops={ops:?}");
+    assert_eq!(jc.calldescr().result_type, 'r', "ops={ops:?}");
     assert!(
         ops.iter().any(|op| *op == "getfield_gc_i"),
         "the STR length is a field read; ops={ops:?}"
@@ -5377,14 +5378,14 @@ fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
         "pyre_interpreter::baseobjspace::zip_two_tuple_next",
     )
     .expect("zip_two_tuple_next must be a discovered jitcode");
-    let body = zip
+    let _body = zip
         .try_body()
         .expect("zip_two_tuple_next body must be assembled");
     let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&zip.code)
         .map(|op| op.opname)
         .collect();
-    assert_eq!(body.calldescr.arg_classes, "r", "ops={ops:?}");
-    assert_eq!(body.calldescr.result_type, 'r', "ops={ops:?}");
+    assert_eq!(zip.calldescr().arg_classes, "r", "ops={ops:?}");
+    assert_eq!(zip.calldescr().result_type, 'r', "ops={ops:?}");
     // The item load is `tuple_exact_item`: `wrappeditems` is `[*]`, so the
     // read is `getarrayitem_gc_r_pure`, not a residual `w_tuple_getitem`.
     let item =
@@ -5431,14 +5432,14 @@ fn specialised_tuple_ii_new_jitcode_is_new_with_vtable() {
         "pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new",
     )
     .expect("w_specialised_tuple_ii_new must be a discovered jitcode");
-    let body = ii
+    let _body = ii
         .try_body()
         .expect("w_specialised_tuple_ii_new body must be assembled");
     let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&ii.code)
         .map(|op| op.opname)
         .collect();
-    assert_eq!(body.calldescr.arg_classes, "ii", "ops={ops:?}");
-    assert_eq!(body.calldescr.result_type, 'r', "ops={ops:?}");
+    assert_eq!(ii.calldescr().arg_classes, "ii", "ops={ops:?}");
+    assert_eq!(ii.calldescr().result_type, 'r', "ops={ops:?}");
     assert!(
         ops.iter().any(|op| *op == "new_with_vtable"),
         "the pair must box via new_with_vtable; ops={ops:?}"
@@ -17321,7 +17322,7 @@ impl majit_backend::Backend for PureArrayTestCpu {
         unimplemented!("PureArrayTestCpu::execute_token")
     }
     fn get_latest_descr<'a>(
-        &'a self,
+        &self,
         _frame: &'a majit_backend::DeadFrame,
     ) -> &'a dyn majit_ir::FailDescr {
         unimplemented!("PureArrayTestCpu::get_latest_descr")

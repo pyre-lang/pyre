@@ -185,8 +185,7 @@ fn use_c_form(opname: &str) -> bool {
 // `Register(kind, index)` invariant from `flatten.py`.
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{
-    BhCallDescr, ConstIRelocDescriptor, ConstIRelocKind, ConstRRelocDescriptor, JitCodeBody,
-    StrConstDescriptor,
+    ConstIRelocDescriptor, ConstIRelocKind, ConstRRelocDescriptor, JitCodeBody, StrConstDescriptor,
 };
 use crate::regalloc::RegAllocator;
 
@@ -714,7 +713,6 @@ impl AssemblerExt for Assembler {
         );
         // RPython assembler.py `jitcode._ssarepr = ssarepr`
         let body = JitCodeBody {
-            calldescr: BhCallDescr::default(),
             code: state.code,
             constants_i: state.constants_i,
             // The builder keeps plain `i64` — nothing walks a pool that is

@@ -489,7 +489,7 @@ fn w_dict_len_indirect_call_receiver_kind_matches_zst_length_self() {
         false,
         0,
     );
-    let callee_args = &callee_jit.calldescr.arg_classes;
+    let callee_args = &callee_jit.calldescr().arg_classes;
     assert!(
         callee_args.starts_with('r'),
         "ZST length impl arg_classes must start with r (DictStrategy instance self), got {callee_args:?}\n{}",

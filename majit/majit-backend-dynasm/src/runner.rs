@@ -4092,7 +4092,7 @@ impl Backend for DynasmBackend {
         }
     }
 
-    fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
+    fn get_latest_descr<'a>(&self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         match frame {
             DeadFrame::JitFrame(data) => data.fail_descr.as_fail_descr(),
             DeadFrame::LibcJitFrame(data) => data.fail_descr.as_fail_descr(),

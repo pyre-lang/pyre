@@ -13011,7 +13011,7 @@ mod tests {
             unimplemented!("FieldLoadTestCpu::execute_token")
         }
         fn get_latest_descr<'a>(
-            &'a self,
+            &self,
             _frame: &'a majit_backend::DeadFrame,
         ) -> &'a dyn majit_ir::FailDescr {
             unimplemented!("FieldLoadTestCpu::get_latest_descr")

@@ -922,7 +922,7 @@ impl CodeWriter {
         // `assemble_with_callcontrol` computes liveness internally and returns
         // the body so call descriptors can be filled before `set_body` commits
         // the JitCode shell.
-        let mut body = crate::codewriter::transform_profile::time_phase("step4_assemble", || {
+        let body = crate::codewriter::transform_profile::time_phase("step4_assemble", || {
             self.assembler
                 .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol))
         });
@@ -970,11 +970,16 @@ impl CodeWriter {
                 ),
                 _ => result_type,
             };
-            body.calldescr = crate::jitcode::BhCallDescr::from_arg_classes(
+            // `call.py` `JitCode(name, fnaddr, calldescr)` writes this
+            // header field in `get_jitcode`. Pyre allocates shells before
+            // the rtyper-equivalent publishes `FUNC.ARGS` / `FUNC.RESULT`,
+            // so the shell's `OnceLock` gets its one write here, after
+            // typing.
+            jitcode.set_calldescr(crate::jitcode::BhCallDescr::from_arg_classes(
                 arg_classes,
                 result_type,
                 majit_ir::descr::EffectInfo::MOST_GENERAL,
-            );
+            ));
         }
 
         // Commit the body to the pre-allocated `Arc<JitCode>` shell.

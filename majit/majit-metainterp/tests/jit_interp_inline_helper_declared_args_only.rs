@@ -136,11 +136,8 @@ fn helper_inline_call_i_list_matches_arg_classes_and_assembles() {
         .copied()
         .find(|jc| jc.name() == "helper")
         .expect("the inline helper jitcode must be registered");
-    let arg_classes = &helper
-        .try_body()
-        .expect("helper body")
-        .calldescr
-        .arg_classes;
+    helper.try_body().expect("helper body");
+    let arg_classes = &helper.calldescr().arg_classes;
     assert_eq!(arg_classes, "i", "helper(x: i64) declares one int argument");
 
     let lens = helper_i_list_lens(&dispatch_jc, "helper");

@@ -4003,8 +4003,10 @@ pub trait Backend: Send {
     /// The same object `get_latest_descr_arc` hands out, borrowed from the
     /// frame instead of shared: a reader that only needs the descr's fields
     /// for as long as it holds the frame takes this and pays no reference
-    /// count.
-    fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
+    /// count. The lifetime is the deadframe's (`llmodel.py`
+    /// `get_latest_descr` reads `jf_descr` off the frame); the backend is
+    /// only the method receiver.
+    fn get_latest_descr<'a>(&self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
 
     /// Owned Arc counterpart of `get_latest_descr`.
     ///

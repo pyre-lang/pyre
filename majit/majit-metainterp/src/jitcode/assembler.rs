@@ -236,13 +236,9 @@ pub struct JitCodeBuilder {
     fnaddr: i64,
     /// RPython `jitcode.py` `self.calldescr = calldescr`. RPython
     /// hands the calldescr to `JitCode.__init__` *before* the assembler
-    /// fills the body, so the field is committed alongside the
-    /// `setup()` body.  Callers stage the value here through
-    /// `set_calldescr` so `finish()` can stamp it into the body atomically;
-    /// the post-assemble `body_mut().calldescr = ...` write the previous
-    /// implementation used violated the upstream order
-    /// (`call.py` constructs `JitCode(name, fnaddr, calldescr)`
-    /// before `assembler.assemble`).
+    /// fills the body. Callers stage the value here through `set_calldescr`
+    /// so `finish()` can stamp the header field, matching
+    /// `call.py` `JitCode(name, fnaddr, calldescr)` before `assembler.assemble`.
     calldescr: majit_jitcode::jitcode::BhCallDescr,
     /// Set by [`Self::start_instr`] when the body emits an opcode whose answer
     /// comes from the blackhole's own context rather than from memory, so
@@ -345,9 +341,8 @@ impl JitCodeBuilder {
     }
 
     /// Stage the calldescr returned by `get_jitcode_calldescr`
-    /// (`call.py`) so `finish()` can stamp it into the body alongside
-    /// the bytecode/constants pool, matching the upstream
-    /// `JitCode(name, fnaddr, calldescr)` constructor order.
+    /// (`call.py`) so `finish()` can stamp the header field, matching
+    /// the upstream `JitCode(name, fnaddr, calldescr)` constructor order.
     pub fn set_calldescr(&mut self, calldescr: majit_jitcode::jitcode::BhCallDescr) {
         self.calldescr = calldescr;
     }
@@ -4474,10 +4469,11 @@ impl JitCodeBuilder {
         else {
             return;
         };
-        let Some(body) = callee.try_body() else {
+        // A callee the codewriter has not finished has no calldescr yet.
+        let Some(calldescr) = callee.calldescr.get() else {
             return;
         };
-        let declared = &body.calldescr.arg_classes;
+        let declared = &calldescr.arg_classes;
         if declared.is_empty() {
             return;
         }
@@ -6560,13 +6556,6 @@ impl JitCodeBuilder {
         // index `num_regs + len(consts) - 1 < 256`, i.e. `total <= 256`.
         debug_assert!(total_i <= 256 && total_r <= 256 && total_f <= 256);
         let body = majit_jitcode::jitcode::JitCodeBody {
-            // RPython `jitcode.py JitCode.__init__ self.calldescr = calldescr` — the
-            // value was stored on the builder via `set_calldescr` (the
-            // analog of upstream's constructor argument).  Without an
-            // explicit stage call the field remains at the
-            // `BhCallDescr::default()` zero, matching the pre-set state
-            // RPython's constructor shows when `calldescr=None`.
-            calldescr: self.calldescr,
             // Recorded on the body as well as on `exec` below, so a body that
             // makes the round trip through serialization still says where its
             // marker is. The two routes into `JitCodeBody` now carry the same
@@ -6630,6 +6619,10 @@ impl JitCodeBuilder {
         } else {
             self.fnaddr
         };
+        // `call.py` `JitCode(name, fnaddr, calldescr)` writes `calldescr`
+        // at construction, before `setup()`. Stage it on the builder via
+        // `set_calldescr` and stamp the header here.
+        jc.set_calldescr(self.calldescr);
         jc.set_body(body);
         jc.exec = super::JitCodeExecState {
             descrs: self.descrs,

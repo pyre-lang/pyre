@@ -7381,7 +7381,7 @@ impl majit_backend::Backend for WasmBackend {
         self.execute_token(token, &values)
     }
 
-    fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
+    fn get_latest_descr<'a>(&self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         // The same selection as `get_latest_descr_arc` below: the metainterp
         // descr when the optimizer stamped one, since that is the object
         // carrying `is_exit_frame_with_exception` / `get_status` /

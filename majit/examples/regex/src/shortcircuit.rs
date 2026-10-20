@@ -765,7 +765,7 @@ mod tests {
             "`shift` has no native entry, so every blackhole resume byte-interprets \
              its whole recursive descent",
         );
-        let body = jitcode.try_body().expect("a finished jitcode has a body");
+        jitcode.try_body().expect("a finished jitcode has a body");
         assert_eq!(
             (
                 jitcode.c_num_regs_i,
@@ -777,10 +777,11 @@ mod tests {
              numbering needed 36 int and 26 ref working registers",
         );
         assert_eq!(
-            body.calldescr.arg_classes, "rii",
+            jitcode.calldescr().arg_classes,
+            "rii",
             "`shift(n: usize, c: i64, mark: bool)` is one Ref then two Ints, in that order",
         );
-        assert_eq!(body.calldescr.result_type, 'i');
+        assert_eq!(jitcode.calldescr().result_type, 'i');
         let starts = jitcode.startpoints.as_ref().expect("assembled shift");
         let mut leftover = std::collections::BTreeMap::<u8, usize>::new();
         for &pc in starts {

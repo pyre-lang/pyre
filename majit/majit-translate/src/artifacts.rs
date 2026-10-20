@@ -15,7 +15,9 @@ pub use majit_jitcode::artifacts::{JitCodeIndex, ReachableSymbolicResidualTable}
 /// Wire-format version of [`EmbeddedArtifacts`]. Version 2 added the
 /// reachable-symbolic-residual table to [`JitCodeIndex`]; a version-1 index
 /// has no such table and is rejected rather than decoded as garbage.
-const ARTIFACT_VERSION: u32 = 2;
+/// Version 3 moves `JitCode.calldescr` to the header (`jitcode.py`
+/// `__init__`), so a version-2 body blob is a different bincode layout.
+const ARTIFACT_VERSION: u32 = 3;
 
 /// Encoded bodies remain bytes until requested, so this envelope is Send+Sync
 /// without publishing translation-time graphs across threads.
