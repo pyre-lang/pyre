@@ -4241,7 +4241,7 @@ struct BridgeNestedTraceGuard {
 impl BridgeNestedTraceGuard {
     fn enter() -> Self {
         let (driver, _) = crate::eval::driver_pair();
-        let (parked, _) = crate::eval::park_nested_trace_if_tracing(driver);
+        let parked = crate::eval::park_nested_trace_if_tracing(driver);
         Self { parked }
     }
 }
