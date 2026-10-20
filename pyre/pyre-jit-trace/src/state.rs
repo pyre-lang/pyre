@@ -3581,6 +3581,7 @@ pub(crate) fn pyobject_array_descr() -> DescrRef {
         Type::Ref,
         false,
         Some("pyre::pyobject_array_nolength".to_string()),
+        false,
     )
 }
 
@@ -3758,6 +3759,7 @@ pub(crate) fn int_gcarray_descr() -> DescrRef {
         Type::Int,
         true,
         Some(majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY.to_string()),
+        false,
     );
     // Same publication as `pyobject_gcarray_descr`: `register_keyed_array`
     // is first-wins, and `opimpl_new_array` / `bh_new_array` allocate from
@@ -3827,6 +3829,7 @@ pub(crate) fn float_gcarray_descr() -> DescrRef {
         Type::Float,
         false,
         Some(majit_jitcode::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY.to_string()),
+        false,
     );
     if live != majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID
         && let Some(ad) = descr.as_array_descr()
@@ -9690,6 +9693,7 @@ fn bh_field_descr_from_info(fd: &majit_ir::FieldDescrInfo) -> majit_jitcode::jit
         parent: None,
         name: String::new(),
         owner: String::new(),
+        load_is_acquire: false,
     }
 }
 

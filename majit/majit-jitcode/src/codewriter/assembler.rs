@@ -1061,6 +1061,7 @@ pub enum AssemblerDescrKey {
         parent: Option<std::sync::Arc<crate::jitcode::BhSizeSpec>>,
         name: String,
         owner: String,
+        load_is_acquire: bool,
     },
     Array {
         base_size: usize,
@@ -1087,6 +1088,7 @@ pub enum AssemblerDescrKey {
         // cache identity.
         array_type_id: Option<String>,
         interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
+        load_is_acquire: bool,
     },
     Size {
         size: usize,
@@ -1164,6 +1166,7 @@ impl AssemblerDescrKey {
                 parent,
                 name,
                 owner,
+                load_is_acquire,
             } => Self::Field {
                 offset: *offset,
                 field_size: *field_size,
@@ -1176,6 +1179,7 @@ impl AssemblerDescrKey {
                 parent: parent.clone(),
                 name: name.clone(),
                 owner: owner.clone(),
+                load_is_acquire: *load_is_acquire,
             },
             crate::jitcode::BhDescr::Array {
                 base_size,
@@ -1196,6 +1200,7 @@ impl AssemblerDescrKey {
                 is_gc_managed: _,
                 array_type_id,
                 interior_fields,
+                load_is_acquire,
             } => Self::Array {
                 base_size: *base_size,
                 itemsize: *itemsize,
@@ -1207,6 +1212,7 @@ impl AssemblerDescrKey {
                 is_item_signed: *is_item_signed,
                 array_type_id: array_type_id.clone(),
                 interior_fields: interior_fields.clone(),
+                load_is_acquire: *load_is_acquire,
             },
             crate::jitcode::BhDescr::Size {
                 size,

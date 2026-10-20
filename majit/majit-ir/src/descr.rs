@@ -2643,6 +2643,7 @@ impl GcCache {
         index: u32,
         virtualizable: bool,
         index_in_parent: Option<usize>,
+        load_is_acquire: bool,
     ) -> Arc<SimpleFieldDescr> {
         self.get_field_descr_declaring(
             struct_key,
@@ -2658,6 +2659,7 @@ impl GcCache {
             virtualizable,
             index_in_parent,
             None,
+            load_is_acquire,
         )
     }
 
@@ -2682,6 +2684,7 @@ impl GcCache {
         // `Some` when the producer declares whether this field is the class
         // word.  `None` falls back to the display name.
         declared_class_word: Option<bool>,
+        load_is_acquire: bool,
     ) -> Arc<SimpleFieldDescr> {
         // descr.py: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
@@ -2834,6 +2837,13 @@ impl GcCache {
             if let Some(is_class_word) = declared_class_word {
                 descr.declare_class_word(is_class_word);
             }
+            if load_is_acquire {
+                debug_assert_eq!(
+                    descr.stored_load_is_acquire(),
+                    load_is_acquire,
+                    "get_field_descr_declaring cache hit: load_is_acquire=true on a descr whose stored bit is false"
+                );
+            }
             return descr;
         }
         // descr.py:227: name = '%s.%s' % (STRUCT._name, fieldname)
@@ -2884,7 +2894,16 @@ impl GcCache {
                     slot.insert(simple.clone());
                     simple
                 }
-                indexmap::map::Entry::Occupied(slot) => slot.get().clone(),
+                indexmap::map::Entry::Occupied(slot) => {
+                    if load_is_acquire {
+                        debug_assert_eq!(
+                            slot.get().stored_load_is_acquire(),
+                            load_is_acquire,
+                            "get_field_descr_declaring borrowed-layout adopt: load_is_acquire=true on a descr whose stored bit is false"
+                        );
+                    }
+                    slot.get().clone()
+                }
             };
         }
         self.mint_field_descr(
@@ -2902,6 +2921,7 @@ impl GcCache {
             virtualizable,
             index_in_parent,
             declared_class_word,
+            load_is_acquire,
         )
     }
 
@@ -2925,6 +2945,7 @@ impl GcCache {
         virtualizable: bool,
         index_in_parent: Option<usize>,
         declared_class_word: Option<bool>,
+        load_is_acquire: bool,
     ) -> Arc<SimpleFieldDescr> {
         let mut fd = SimpleFieldDescr::new_with_name(
             index,
@@ -2981,6 +3002,7 @@ impl GcCache {
         // `record_quasiimmut_field` guard before the pure read
         // (`jtransform.py`).
         fd = fd.with_quasi_immutable(is_quasi_immutable);
+        fd = fd.with_load_is_acquire(load_is_acquire);
         // descr.py: fielddescr.parent_descr = get_size_descr(gccache, STRUCT, vtable)
         if let Some(ref p) = parent {
             fd.parent_descr = RwLock::new(Some(Arc::downgrade(p)));
@@ -2995,7 +3017,16 @@ impl GcCache {
                 slot.insert(descr.clone());
                 descr
             }
-            indexmap::map::Entry::Occupied(slot) => slot.get().clone(),
+            indexmap::map::Entry::Occupied(slot) => {
+                if load_is_acquire {
+                    debug_assert_eq!(
+                        slot.get().stored_load_is_acquire(),
+                        load_is_acquire,
+                        "mint_field_descr first-write-wins: load_is_acquire=true on a descr whose stored bit is false"
+                    );
+                }
+                slot.get().clone()
+            }
         }
     }
 
@@ -3029,6 +3060,7 @@ impl GcCache {
                 spec.virtualizable,
                 Some(spec.index_in_parent),
                 spec.is_class_word,
+                false,
             );
         }
         let parent = self._cache_size.get(&struct_key).cloned();
@@ -3047,6 +3079,7 @@ impl GcCache {
             spec.virtualizable,
             Some(spec.index_in_parent),
             spec.is_class_word,
+            false,
         )
     }
 
@@ -5864,18 +5897,28 @@ pub trait FieldDescr: Descr {
         self.field_name()
     }
 
-    /// This field's executable read is `AtomicPtr::load(Acquire)`.
+    /// This field's executable read is an Acquire load.
     ///
     /// `PyCode.w_globals` is published with `AtomicPtr::store(Release)`.
     /// The quasi-immutable watcher invalidates a compiled assumption of the
     /// pointer; the load itself still has to acquire that publication.
-    /// Every other field stays a plain load.
+    /// A stored bit covers `Atomic*` integer fields (`W_TypeObject.version_tag`);
+    /// the name predicate stays as a union so a `w_globals` load that was
+    /// Acquire remains Acquire (`descr.py FieldDescr`).
     fn load_is_acquire(&self) -> bool {
-        ref_field_load_is_acquire(
-            self.is_quasi_immutable(),
-            self.is_pointer_field(),
-            self.field_name(),
-        )
+        self.stored_load_is_acquire()
+            || ref_field_load_is_acquire(
+                self.is_quasi_immutable(),
+                self.is_pointer_field(),
+                self.field_name(),
+            )
+    }
+
+    /// Layout-stamped Acquire bit, independent of the `w_globals` name
+    /// predicate. Default false; `SimpleFieldDescr` stores the producer
+    /// stamp (`with_load_is_acquire`).
+    fn stored_load_is_acquire(&self) -> bool {
+        false
     }
 
     /// The class pointer is the object-header field at offset 0
@@ -6155,6 +6198,13 @@ pub trait ArrayDescr: Descr {
             self.item_size(),
             self.item_type()
         )
+    }
+
+    /// Acquire load of a raw word (`Atomic*::load(Acquire)` of a static
+    /// or `from_ptr` view). Default false; `SimpleArrayDescr` stores the
+    /// producer stamp (`with_load_is_acquire`).
+    fn load_is_acquire(&self) -> bool {
+        false
     }
 }
 
@@ -6506,6 +6556,9 @@ pub struct SimpleFieldDescr {
     /// descr.py FieldDescr.index — slot position within the
     /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
+    /// Stored Acquire stamp for `Atomic*` fields. Unioned with the
+    /// `w_globals` name predicate in `FieldDescr::load_is_acquire`.
+    load_is_acquire: bool,
     /// descr.py FieldDescr.parent_descr — backreference to the SizeDescr
     /// of the containing struct/object. Required by
     /// `OptContext::ensure_ptr_info_arg0` to dispatch Instance vs Struct
@@ -6627,6 +6680,7 @@ impl Clone for SimpleFieldDescr {
             virtualizable: self.virtualizable,
             class_word: AtomicU8::new(self.class_word.load(Ordering::Relaxed)),
             index_in_parent: self.index_in_parent,
+            load_is_acquire: self.load_is_acquire,
             parent_descr: RwLock::new(self.parent_descr.read().clone()),
             vinfo: RwLock::new(self.vinfo.read().clone()),
         }
@@ -6703,6 +6757,7 @@ impl SimpleFieldDescr {
             // settle it through `with_class_word` / `declare_class_word`.
             class_word: AtomicU8::new(ClassWordDeclaration::InferredNot as u8),
             index_in_parent: 0,
+            load_is_acquire: false,
             parent_descr: RwLock::new(None),
             vinfo: RwLock::new(None),
         }
@@ -6747,6 +6802,7 @@ impl SimpleFieldDescr {
             virtualizable: false,
             class_word: AtomicU8::new(class_word as u8),
             index_in_parent: 0,
+            load_is_acquire: false,
             parent_descr: RwLock::new(None),
             vinfo: RwLock::new(None),
         }
@@ -6758,6 +6814,13 @@ impl SimpleFieldDescr {
     /// `FieldDescr::is_quasi_immutable()` below.
     pub fn with_quasi_immutable(mut self, is_quasi_immutable: bool) -> Self {
         self.is_quasi_immutable = is_quasi_immutable;
+        self
+    }
+
+    /// Stamp an Acquire load on this descr (`Atomic*` integer fields and
+    /// raw word loads). Unioned with the `w_globals` name predicate.
+    pub fn with_load_is_acquire(mut self, load_is_acquire: bool) -> Self {
+        self.load_is_acquire = load_is_acquire;
         self
     }
 
@@ -7010,6 +7073,10 @@ impl FieldDescr for SimpleFieldDescr {
     }
     fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
         self.vinfo.read().as_ref().and_then(|w| w.upgrade())
+    }
+
+    fn stored_load_is_acquire(&self) -> bool {
+        self.load_is_acquire
     }
 }
 
@@ -7512,6 +7579,7 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
                 // themselves — the deserialized-`BhDescr::Field` path.
                 Some(spec.index_in_parent + leading_len),
                 spec.is_class_word,
+                false,
             )
         })
         .collect();
@@ -7626,6 +7694,7 @@ pub struct BorrowedField {
     pub is_quasi_immutable: bool,
     pub index_in_parent: usize,
     pub is_class_word: Option<bool>,
+    pub load_is_acquire: bool,
 }
 
 /// `descr.py` `get_field_descr` fills `cache[STRUCT][fieldname]` on lookup.
@@ -7823,6 +7892,7 @@ fn publish_borrowed_struct_layout_inner(
                     false,
                     Some(index_in_parent),
                     spec.is_class_word,
+                    spec.load_is_acquire,
                 )
             } else {
                 let parent = gc._cache_size.get(&struct_key).cloned();
@@ -7841,6 +7911,7 @@ fn publish_borrowed_struct_layout_inner(
                     false,
                     Some(index_in_parent),
                     spec.is_class_word,
+                    spec.load_is_acquire,
                 )
             }
         })
@@ -7935,6 +8006,7 @@ fn make_simple_descr_group_inner(
                         )),
                     } as u8),
                     index_in_parent: spec.index_in_parent,
+                    load_is_acquire: false,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: RwLock::new(None),
                 })
@@ -8086,6 +8158,8 @@ pub struct SimpleArrayDescr {
     /// [`ArrayDescr::non_moving`].  Atomic so a frontend can stamp it onto
     /// an already-shared descr, the way `type_id` is stamped.
     non_moving: AtomicBool,
+    /// Stored Acquire stamp for raw `Atomic*` word loads.
+    load_is_acquire: bool,
 }
 
 impl Clone for SimpleArrayDescr {
@@ -8110,6 +8184,7 @@ impl Clone for SimpleArrayDescr {
             all_interiorfielddescrs: interior,
             is_gc_managed: self.is_gc_managed,
             non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
+            load_is_acquire: self.load_is_acquire,
         }
     }
 }
@@ -8139,6 +8214,7 @@ impl SimpleArrayDescr {
             all_interiorfielddescrs: std::sync::OnceLock::new(),
             is_gc_managed: true,
             non_moving: AtomicBool::new(false),
+            load_is_acquire: false,
         }
     }
 
@@ -8167,7 +8243,15 @@ impl SimpleArrayDescr {
             all_interiorfielddescrs: std::sync::OnceLock::new(),
             is_gc_managed: true,
             non_moving: AtomicBool::new(false),
+            load_is_acquire: false,
         }
+    }
+
+    /// Stamp an Acquire load on this raw-array descr (`Atomic*` statics
+    /// and `from_ptr` views).
+    pub fn with_load_is_acquire(mut self, load_is_acquire: bool) -> Self {
+        self.load_is_acquire = load_is_acquire;
+        self
     }
 
     /// Override the allocation-generation flag (default `false`); see
@@ -8267,6 +8351,9 @@ impl ArrayDescr for SimpleArrayDescr {
     }
     fn is_item_signed(&self) -> bool {
         self.flag == ArrayFlag::Signed
+    }
+    fn load_is_acquire(&self) -> bool {
+        self.load_is_acquire
     }
     /// RPython: descr.py ArrayDescr.is_array_of_pointers()
     fn is_array_of_pointers(&self) -> bool {
@@ -8782,6 +8869,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     // word; `is_typeptr()` answers for it.
                     class_word: AtomicU8::new(ClassWordDeclaration::DeclaredNot as u8),
                     index_in_parent: 0,
+                    load_is_acquire: false,
                     parent_descr: RwLock::new(Some(parent_descr)),
                     vinfo: RwLock::new(None),
                 });
@@ -9144,6 +9232,23 @@ mod acquire_load_tests {
         )
         .with_quasi_immutable(true);
         assert!(!version.load_is_acquire());
+    }
+
+    #[test]
+    fn stored_acquire_integer_field_loads_with_acquire() {
+        let version = SimpleFieldDescr::new_with_name(
+            1,
+            8,
+            8,
+            Type::Int,
+            false,
+            ArrayFlag::Unsigned,
+            "W_TypeObject.version_tag",
+            "version_tag",
+        )
+        .with_load_is_acquire(true);
+        assert!(version.load_is_acquire());
+        assert!(!pointer_field(true, "mutate_w_globals", "mutate_w_globals").load_is_acquire());
     }
 }
 
@@ -9885,6 +9990,7 @@ mod register_keyed_size_authority_tests {
                 false,
                 // A header-counting producer's number, two slots high.
                 Some(3),
+                false,
             )
         };
         let first = lookup(&mut gc);
@@ -9914,6 +10020,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(10),
+            false,
         );
         let qualified = gc.get_field_descr(
             key.clone(),
@@ -9928,6 +10035,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(10),
+            false,
         );
         assert_eq!(short.field_key(), "flags");
         assert_eq!(qualified.field_key(), "PyFrame.flags");
@@ -9948,6 +10056,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(10),
+            false,
         );
         assert!(std::sync::Arc::ptr_eq(&short, &reverse));
     }
@@ -9972,6 +10081,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(5),
+            false,
         );
         let nested = gc.get_field_descr(
             key.clone(),
@@ -9986,6 +10096,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(7),
+            false,
         );
         assert_eq!(outer.offset(), 48);
         assert_eq!(nested.offset(), 64);
@@ -10023,6 +10134,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert_eq!(first.index_in_parent, 0);
         // Second lookup: a header-counting producer hands index 2. No parent
@@ -10041,6 +10153,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(2),
+            false,
         );
         assert_eq!(second.index_in_parent, 0, "the cached descr wins");
     }
@@ -10065,6 +10178,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert_eq!(first.offset(), 16);
         let second = gc.get_field_descr(
@@ -10080,6 +10194,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert_eq!(second.offset(), 16);
         assert!(
@@ -10099,6 +10214,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert!(std::sync::Arc::ptr_eq(&first, &third));
     }
@@ -10138,6 +10254,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert_eq!(first.offset(), 16);
         let second = gc.get_field_descr(
@@ -10153,6 +10270,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert_eq!(second.offset(), 16);
         assert!(std::sync::Arc::ptr_eq(&first, &second));
@@ -10169,6 +10287,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert!(std::sync::Arc::ptr_eq(&first, &third));
         assert_eq!(third.offset(), 16);
@@ -10194,6 +10313,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         let b = gc.get_field_descr(
             key,
@@ -10208,6 +10328,7 @@ mod register_keyed_size_authority_tests {
             0,
             false,
             Some(0),
+            false,
         );
         assert!(!std::sync::Arc::ptr_eq(&a, &b));
         assert_eq!(a.field_key(), "a.block");
@@ -10332,6 +10453,7 @@ mod register_keyed_size_authority_tests {
                 0,
                 false,
                 Some(0),
+                false,
             );
             let parent_before = field.get_parent_descr().expect("parent before");
             assert_eq!(parent_before.as_size_descr().unwrap().vtable(), 0x1000);
@@ -10509,6 +10631,7 @@ mod register_keyed_size_authority_tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: Some(false),
+                load_is_acquire: false,
             }],
         );
         assert!(
@@ -10995,6 +11118,7 @@ mod tests {
             false,
             Some(0),
             None,
+            false,
         );
         assert!(
             guessed.is_w_class(),
@@ -11017,6 +11141,7 @@ mod tests {
             false,
             Some(0),
             Some(false),
+            false,
         );
         assert!(
             Arc::ptr_eq(&guessed, &declared),
@@ -11049,6 +11174,7 @@ mod tests {
             false,
             Some(0),
             None,
+            false,
         );
         assert!(!name_only.is_w_class());
         assert_eq!(name_only.declared_w_class(), Some(false));
@@ -11287,6 +11413,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: Some(false),
+                    load_is_acquire: false,
                 }],
             );
             let struct_key = LLType::struct_key(cache_key);
@@ -11311,6 +11438,7 @@ mod tests {
                 u32::MAX,
                 false,
                 Some(0),
+                false,
             );
             assert!(Arc::ptr_eq(&again, &group.field_descrs[0]));
         }
@@ -11339,6 +11467,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: Some(false),
+                    load_is_acquire: false,
                 }],
             );
             let field = &group.field_descrs[0];
@@ -11364,6 +11493,7 @@ mod tests {
                         is_quasi_immutable: false,
                         index_in_parent: 0,
                         is_class_word: Some(false),
+                        load_is_acquire: false,
                     }],
                 )
                 .is_none(),
@@ -11392,6 +11522,7 @@ mod tests {
                 u32::MAX,
                 false,
                 Some(0),
+                false,
             );
             assert!(Arc::ptr_eq(&again, field));
         }

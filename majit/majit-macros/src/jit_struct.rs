@@ -76,6 +76,7 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 // The declaration order of the struct's own named fields — a
                 // position this macro computes, never an unresolved claim.
                 Some(#idx),
+                false,
             );
         }
     });

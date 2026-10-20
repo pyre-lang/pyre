@@ -7353,6 +7353,8 @@ impl<'a> Assembler386<'a> {
     }
 
     /// assembler.py `load_from_mem`.
+    /// Aligned MOV is Acquire on x86 TSO; no extra fence for
+    /// `FieldDescr::load_is_acquire`.
     fn load_from_mem(
         &mut self,
         resloc: crate::regloc::RegLoc,

@@ -3493,6 +3493,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: Some(false),
+                    load_is_acquire: false,
                 }],
             );
             assert!(crate::descr::kind0_size_already_published(published));
@@ -3569,6 +3570,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: Some(false),
+                    load_is_acquire: false,
                 }],
             };
             let mut bytes = Vec::new();

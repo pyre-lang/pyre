@@ -28,6 +28,7 @@ fn raw_i32_array_descr() -> BhDescr {
         array_type_id: None,
         interior_fields: Vec::new(),
         is_gc_managed: false,
+        load_is_acquire: false,
     }
 }
 

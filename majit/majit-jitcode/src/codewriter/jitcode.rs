@@ -2028,6 +2028,10 @@ pub struct BhFieldSpec {
     /// finds the same `(STRUCT, fieldname)` slot cached.
     #[serde(default)]
     pub is_class_word: Option<bool>,
+    /// Stored Acquire stamp for `Atomic*` fields. Unioned with the
+    /// `w_globals` name predicate in `BhDescr::load_is_acquire`.
+    #[serde(default)]
+    pub load_is_acquire: bool,
 }
 
 impl BhFieldSpec {
@@ -2057,6 +2061,7 @@ impl BhFieldSpec {
             && self.is_quasi_immutable == other.is_quasi_immutable
             && self.index_in_parent == other.index_in_parent
             && self.effective_class_word() == other.effective_class_word()
+            && self.load_is_acquire == other.load_is_acquire
     }
 
     /// The class-word answer this spec rebuilds to: the producer declaration
@@ -2122,6 +2127,7 @@ impl BhFieldSpec {
             // descr that only guessed from its name, and putting that on the
             // wire would make the rebuilt descr a declaration nothing declared.
             is_class_word: fd.declared_w_class(),
+            load_is_acquire: fd.stored_load_is_acquire(),
         }
     }
 }
@@ -2269,6 +2275,7 @@ impl BhSizeSpec {
                 Some(false) => 1,
                 Some(true) => 2,
             });
+            out.push(u8::from(field.load_is_acquire));
         }
         push_str(out, &self.owner);
         let body_len = u32::try_from(out.len() - body_at).expect("layout record exceeds u32");
@@ -2305,6 +2312,7 @@ impl BhSizeSpec {
                 2 => Some(true),
                 tag => panic!("layout class-word tag {tag}"),
             };
+            let load_is_acquire = cursor.u8() != 0;
             all_fielddescrs.push(BhFieldSpec {
                 index,
                 field_key,
@@ -2318,6 +2326,7 @@ impl BhSizeSpec {
                 is_quasi_immutable,
                 index_in_parent,
                 is_class_word,
+                load_is_acquire,
             });
         }
         let owner = cursor.string();
@@ -2395,6 +2404,7 @@ impl BhSizeSpec {
                 2 => Some(true),
                 tag => panic!("layout class-word tag {tag}"),
             };
+            let load_is_acquire = cursor.u8() != 0;
             fields.push(StaticParentField {
                 index,
                 name,
@@ -2408,6 +2418,7 @@ impl BhSizeSpec {
                 is_quasi_immutable,
                 index_in_parent,
                 is_class_word,
+                load_is_acquire,
             });
         }
         let _owner = cursor.str_ref();
@@ -2453,6 +2464,7 @@ pub struct StaticParentField {
     pub is_quasi_immutable: bool,
     pub index_in_parent: usize,
     pub is_class_word: Option<bool>,
+    pub load_is_acquire: bool,
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -2589,6 +2601,7 @@ mod layout_pack_tests {
                     is_quasi_immutable: true,
                     index_in_parent: 0,
                     is_class_word: Some(false),
+                    load_is_acquire: false,
                 }],
             };
             let mut bytes = Vec::new();
@@ -2738,6 +2751,10 @@ pub enum BhDescr {
         parent: Option<Arc<BhSizeSpec>>,
         name: String,
         owner: String,
+        /// Stored Acquire stamp. Unioned with the `w_globals` name
+        /// predicate in [`BhDescr::load_is_acquire`].
+        #[serde(default)]
+        load_is_acquire: bool,
     },
     /// Array descriptor: for getarrayitem/setarrayitem/arraylen.
     /// RPython: `ArrayDescr` with `itemsize`, `basesize` attributes.
@@ -2803,6 +2820,9 @@ pub enum BhDescr {
         /// keeps the flag and `make_guards` suppresses `GUARD_GC_TYPE`.
         #[serde(default = "bh_gc_managed_default")]
         is_gc_managed: bool,
+        /// Stored Acquire stamp for a raw-array word (`Atomic*` statics).
+        #[serde(default)]
+        load_is_acquire: bool,
     },
     /// Interior-field descriptor: for getinteriorfield/setinteriorfield
     /// on arrays of inline structs.  `descr.py __init__
@@ -3031,6 +3051,7 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
                 name,
                 owner,
                 parent,
+                load_is_acquire,
             } => {
                 out.string_count += 2;
                 out.string_bytes += name.len() + owner.len();
@@ -3064,7 +3085,7 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
                     .entry(format!(
                         "{owner}.{name} off={offset} sz={field_size} ty={field_type:?} \
                          flag={field_flag:?} signed={is_field_signed} imm={is_immutable} \
-                         qi={is_quasi_immutable} idx={} parent[{parent_spelling}]",
+                         qi={is_quasi_immutable} acq={load_is_acquire} idx={} parent[{parent_spelling}]",
                         index_in_parent.unwrap_or(0)
                     ))
                     .and_modify(|n| *n += 1)
@@ -3075,7 +3096,7 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
                     .push(format!(
                         "off={offset} sz={field_size} ty={field_type:?} flag={field_flag:?} \
                          signed={is_field_signed} imm={is_immutable} qi={is_quasi_immutable} \
-                         idx={idx_spelling} parent[{parent_spelling}]"
+                         acq={load_is_acquire} idx={idx_spelling} parent[{parent_spelling}]"
                     ));
                 "field"
             }
@@ -3206,8 +3227,11 @@ static EMPTY_DESCRS: [BhDescr; 0] = [];
 pub static EMPTY_DESCR_TABLE: &(dyn DescrTable + 'static) = &EMPTY_DESCRS;
 
 impl BhDescr {
-    /// Acquire load of quasi-immutable `w_globals`. See
-    /// [`majit_ir::descr::ref_field_load_is_acquire`].
+    /// Acquire load of a field or raw-array word.
+    ///
+    /// A Field is Acquire when the stored bit is set or the quasi
+    /// `w_globals` name predicate matches (`descr.py FieldDescr`). An
+    /// Array is Acquire only from the stored bit.
     pub fn load_is_acquire(&self) -> bool {
         match self {
             BhDescr::Field {
@@ -3215,13 +3239,20 @@ impl BhDescr {
                 is_quasi_immutable,
                 field_type,
                 field_flag,
+                load_is_acquire,
                 ..
-            } => majit_ir::descr::ref_field_load_is_acquire(
-                *is_quasi_immutable,
-                *field_type == majit_ir::value::Type::Ref
-                    || *field_flag == majit_ir::descr::ArrayFlag::Pointer,
-                name,
-            ),
+            } => {
+                *load_is_acquire
+                    || majit_ir::descr::ref_field_load_is_acquire(
+                        *is_quasi_immutable,
+                        *field_type == majit_ir::value::Type::Ref
+                            || *field_flag == majit_ir::descr::ArrayFlag::Pointer,
+                        name,
+                    )
+            }
+            BhDescr::Array {
+                load_is_acquire, ..
+            } => *load_is_acquire,
             _ => false,
         }
     }
@@ -3507,6 +3538,7 @@ impl BhDescr {
             // raw `pool_arrays` base flows through `add_ptr_array_descr`
             // / `from_array_descr`, never the summary).
             is_gc_managed: true,
+            load_is_acquire: false,
         }
     }
 
@@ -3540,6 +3572,7 @@ impl BhDescr {
             array_type_id: None,
             interior_fields: Vec::new(),
             is_gc_managed: array_descr.is_gc_managed(),
+            load_is_acquire: array_descr.load_is_acquire(),
         }
     }
 
@@ -3571,6 +3604,7 @@ impl BhDescr {
             parent: None,
             name: spec.field_key,
             owner: String::new(),
+            load_is_acquire: spec.load_is_acquire,
         }
     }
 
@@ -3723,6 +3757,7 @@ pub fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> BhField
         // name must round-trip as "nobody declared", so the far side re-guesses
         // instead of receiving a declaration that outranks a real one.
         is_class_word: fd.declared_w_class(),
+        load_is_acquire: fd.stored_load_is_acquire(),
     }
 }
 
@@ -3866,6 +3901,7 @@ mod tests {
             // layout in reach.  Neither name here is a class-word spelling, so
             // both resolve to `false` and the layout comparison is unaffected.
             is_class_word: None,
+            load_is_acquire: false,
         }
     }
 
@@ -3984,6 +4020,7 @@ mod tests {
             parent: None,
             name: "PyCode.w_globals".into(),
             owner: "PyCode".into(),
+            load_is_acquire: false,
         };
         assert!(descr.load_is_acquire());
         let mutate = BhDescr::Field {
@@ -3998,6 +4035,41 @@ mod tests {
             parent: None,
             name: "mutate_w_globals".into(),
             owner: "PyCode".into(),
+            load_is_acquire: false,
+        };
+        assert!(!mutate.load_is_acquire());
+    }
+
+    #[test]
+    fn stored_acquire_unsigned8_bh_field_loads_with_acquire() {
+        let descr = BhDescr::Field {
+            offset: 8,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Unsigned,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(1),
+            parent: None,
+            name: "W_TypeObject.version_tag".into(),
+            owner: "W_TypeObject".into(),
+            load_is_acquire: true,
+        };
+        assert!(descr.load_is_acquire());
+        let mutate = BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: None,
+            parent: None,
+            name: "mutate_w_globals".into(),
+            owner: "PyCode".into(),
+            load_is_acquire: false,
         };
         assert!(!mutate.load_is_acquire());
     }

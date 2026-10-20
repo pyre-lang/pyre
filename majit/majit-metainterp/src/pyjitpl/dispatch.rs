@@ -32,6 +32,28 @@ type CallValues = SmallVec<[Value; CALL_INLINE]>;
 type OpImplFn<'mi, S, R> =
     fn(&mut JitCodeMachine<'mi, S, R>, &mut TraceCtx, &mut S, &R, u8) -> TraceAction;
 
+fn intern_dispatch_array_descr(
+    cache: &parking_lot::Mutex<
+        crate::FxIndexMap<crate::pyjitpl::DispatchArrayDescrKey, majit_ir::DescrRef>,
+    >,
+    cache_key: crate::pyjitpl::DispatchArrayDescrKey,
+    mint: impl FnOnce() -> Arc<majit_ir::descr::SimpleArrayDescr>,
+) -> majit_ir::DescrRef {
+    let mut guard = cache.lock();
+    if let Some(cached) = guard.get(&cache_key) {
+        return cached.clone();
+    }
+    let load_is_acquire = cache_key.load_is_acquire;
+    let minted = mint();
+    let descr: majit_ir::DescrRef = if load_is_acquire {
+        Arc::new(Arc::unwrap_or_clone(minted).with_load_is_acquire(true))
+    } else {
+        minted
+    };
+    guard.insert(cache_key, descr.clone());
+    descr
+}
+
 /// `GcLLDescr_boehm.malloc_fixedsize` (`llmodel_alloc`).
 ///
 /// `Some` when the host published the hook, including a null OOM result.
@@ -466,6 +488,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             ),
                             false,
                             *index_in_parent,
+                            false,
                         );
                         return (*offset, fd as majit_ir::DescrRef);
                     }
@@ -572,6 +595,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         ),
                         false,
                         *index_in_parent,
+                        false,
                     );
                     return (*offset, fd as majit_ir::DescrRef);
                 }
@@ -2609,6 +2633,7 @@ where
             ei_index,
             array_type_id,
             interior_fields,
+            load_is_acquire,
         ) = match bh {
             crate::jitcode::CanonicalBhDescr::Array {
                 type_id,
@@ -2624,6 +2649,7 @@ where
                 interior_fields,
                 ei_index,
                 array_type_id,
+                load_is_acquire,
             } => (
                 *type_id,
                 *gc_type_id,
@@ -2638,6 +2664,7 @@ where
                 *ei_index,
                 array_type_id.clone(),
                 interior_fields.clone(),
+                *load_is_acquire,
             ),
             _ => return None,
         };
@@ -2668,12 +2695,9 @@ where
             is_gc_managed,
             array_type_id,
             interior_fields,
+            load_is_acquire,
         };
         let cache = &ctx.metainterp_sd().dispatch_array_descr_cache;
-        let mut guard = cache.lock();
-        if let Some(cached) = guard.get(&cache_key) {
-            return Some(cached.clone());
-        }
         // `make_array_descr_from_lltype_shape` threads
         // `BhDescr::Array` discriminators into the resulting
         // `SimpleArrayDescr`: `type_id` (so cross-trace descr identity
@@ -2712,55 +2736,55 @@ where
              relying on the new shape.",
             cache_key.interior_fields,
         );
-        // A length-prefixed array (`len_offset = Some`) needs a real
-        // lendescr: the optimizer narrows the array's lenbound on a
-        // constant-index read (`heap.py:676 getlenbound().make_gt_const`)
-        // and the short preamble re-emits `ARRAYLEN_GC`, whose GC rewrite
-        // reads `lendescr.offset()` (`rewrite.rs` ARRAYLEN_GC arm) to load
-        // the length word.  Mirrors `descr.py get_field_arraylen_descr
-        // get_field_arraylen_descr` — a `("len", ofs, WORD, FLAG_SIGNED)`
-        // FieldDescr with no parent.  `program: &[u8]` keeps
-        // `len_offset = None` (a fixed-size buffer with no length word) and
-        // stays `lendescr = None`.
-        let lendescr: Option<majit_ir::DescrRef> = len_offset.map(|ofs| {
-            let d: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
-                u32::MAX,
-                ofs,
-                std::mem::size_of::<usize>(),
-                majit_ir::value::Type::Int,
-                false,
-                majit_ir::descr::ArrayFlag::Signed,
-                "len".to_string(),
-                "len",
-            ));
-            d
-        });
-        let descr_arc = majit_ir::descr::make_array_descr_from_lltype_shape(
-            // TODO: `make_array_descr_from_lltype_shape`
-            // takes the u32 gc tid; this caller has the u64 cache key.
-            // Truncate `as u32` until gc_cache routing resolves the proper
-            // allocated tid here.
-            if gc_type_id != 0 {
-                gc_type_id
-            } else {
-                type_id as u32
-            },
-            base_size,
-            itemsize,
-            len_offset,
-            item_type,
-            is_array_of_pointers,
-            is_array_of_structs,
-            is_item_signed,
-            is_gc_managed,
-            lendescr,
-            false, // is_pure — bytecode array is mutable from the JIT's POV
-            ei_index,
-            Vec::new(),
-        );
-        let descr: majit_ir::DescrRef = descr_arc;
-        guard.insert(cache_key, descr.clone());
-        Some(descr)
+        Some(intern_dispatch_array_descr(cache, cache_key, || {
+            // A length-prefixed array (`len_offset = Some`) needs a real
+            // lendescr: the optimizer narrows the array's lenbound on a
+            // constant-index read (`heap.py:676 getlenbound().make_gt_const`)
+            // and the short preamble re-emits `ARRAYLEN_GC`, whose GC rewrite
+            // reads `lendescr.offset()` (`rewrite.rs` ARRAYLEN_GC arm) to load
+            // the length word.  Mirrors `descr.py get_field_arraylen_descr
+            // get_field_arraylen_descr` — a `("len", ofs, WORD, FLAG_SIGNED)`
+            // FieldDescr with no parent.  `program: &[u8]` keeps
+            // `len_offset = None` (a fixed-size buffer with no length word) and
+            // stays `lendescr = None`.
+            let lendescr: Option<majit_ir::DescrRef> = len_offset.map(|ofs| {
+                let d: majit_ir::DescrRef =
+                    Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                        u32::MAX,
+                        ofs,
+                        std::mem::size_of::<usize>(),
+                        majit_ir::value::Type::Int,
+                        false,
+                        majit_ir::descr::ArrayFlag::Signed,
+                        "len".to_string(),
+                        "len",
+                    ));
+                d
+            });
+            majit_ir::descr::make_array_descr_from_lltype_shape(
+                // TODO: `make_array_descr_from_lltype_shape`
+                // takes the u32 gc tid; this caller has the u64 cache key.
+                // Truncate `as u32` until gc_cache routing resolves the proper
+                // allocated tid here.
+                if gc_type_id != 0 {
+                    gc_type_id
+                } else {
+                    type_id as u32
+                },
+                base_size,
+                itemsize,
+                len_offset,
+                item_type,
+                is_array_of_pointers,
+                is_array_of_structs,
+                is_item_signed,
+                is_gc_managed,
+                lendescr,
+                false, // is_pure — bytecode array is mutable from the JIT's POV
+                ei_index,
+                Vec::new(),
+            )
+        }))
     }
 
     /// Sibling of [`dispatch_array_descr_ref`] returning the array
@@ -6350,6 +6374,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dispatch_array_descr_cache_keeps_acquire_identity() {
+        let sd = crate::MetaInterpStaticData::new();
+        fn mint() -> Arc<majit_ir::descr::SimpleArrayDescr> {
+            majit_ir::descr::make_array_descr_from_lltype_shape(
+                0,
+                0,
+                8,
+                None,
+                Type::Int,
+                false,
+                false,
+                false,
+                false,
+                None,
+                false,
+                u32::MAX,
+                Vec::new(),
+            )
+        }
+        let key = |load_is_acquire: bool| crate::pyjitpl::DispatchArrayDescrKey {
+            type_id: 0,
+            base_size: 0,
+            itemsize: 8,
+            len_offset: None,
+            item_type: Type::Int,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            is_gc_managed: false,
+            array_type_id: Some("majit::raw_carray_u64_w7_dispatch_acquire".into()),
+            interior_fields: Vec::new(),
+            load_is_acquire,
+        };
+        let a = super::intern_dispatch_array_descr(&sd.dispatch_array_descr_cache, key(true), mint);
+        let b = super::intern_dispatch_array_descr(&sd.dispatch_array_descr_cache, key(true), mint);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(a.as_array_descr().expect("ArrayDescr").load_is_acquire());
+        let plain =
+            super::intern_dispatch_array_descr(&sd.dispatch_array_descr_cache, key(false), mint);
+        assert!(!Arc::ptr_eq(&a, &plain));
+        assert!(
+            !plain
+                .as_array_descr()
+                .expect("ArrayDescr")
+                .load_is_acquire()
+        );
+    }
+
     /// A `BhDescr::Field` naming `field` of a parent that carries a flattened
     /// one-entry field list and the `type_id` given.
     fn field_descr_with_parent(
@@ -6371,6 +6444,7 @@ mod tests {
             is_quasi_immutable: false,
             index_in_parent: 0,
             is_class_word: None,
+            load_is_acquire: false,
         };
         crate::blackhole::BhDescr::Field {
             offset: 0,
@@ -6392,6 +6466,7 @@ mod tests {
             })),
             name: field.to_string(),
             owner: String::new(),
+            load_is_acquire: false,
         }
     }
 
@@ -6571,6 +6646,7 @@ mod tests {
             })),
             name: "PyFrame.flags".to_string(),
             owner: "PyFrame".to_string(),
+            load_is_acquire: false,
         };
 
         let reconstituted = field_descr_ref_from_bh(&bh).1;

@@ -360,10 +360,12 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: None,
+                    load_is_acquire: false,
                 }],
             })),
             name: "depth".into(),
             owner: "Frame".into(),
+            load_is_acquire: false,
         };
         let descrs = vec![
             field,

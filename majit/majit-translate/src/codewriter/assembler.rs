@@ -4750,6 +4750,7 @@ fn bh_field_spec_from_parts(
         // there is nothing here to declare with, so the rebuilding side falls
         // back to the name.
         is_class_word: None,
+        load_is_acquire: false,
     }
 }
 
@@ -5758,6 +5759,7 @@ fn fielddescrof(
         parent: parent.map(std::sync::Arc::new),
         name: field_key,
         owner: canonical_owner.unwrap_or_default(),
+        load_is_acquire: false,
     }
 }
 
@@ -5838,6 +5840,7 @@ fn raw_carray_descrof(
         array_type_id: Some(format!("majit::raw_carray_{prefix}{}", itemsize * 8)),
         interior_fields: Vec::new(),
         is_gc_managed: false,
+        load_is_acquire: false,
     }
 }
 
@@ -5938,6 +5941,7 @@ fn arraydescrof(
                 .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned()),
             interior_fields: super::jitcode::bh_interior_field_specs_from_array_descr(array_descr),
             is_gc_managed: array_descr.is_gc_managed(),
+            load_is_acquire: false,
         };
     }
 
@@ -6018,6 +6022,7 @@ fn arraydescrof(
         // Shape-only fallback is for GC arrays; the raw `pool_arrays`
         // base is minted only via `add_ptr_array_descr`.
         is_gc_managed: true,
+        load_is_acquire: false,
     }
 }
 
@@ -6070,6 +6075,7 @@ fn vable_arraydescrof(
         // Virtualizable frame array slots are GC-managed frame fields;
         // `ArrayPtrInfo.make_guards` emits GUARD_GC_TYPE from this identity.
         is_gc_managed: true,
+        load_is_acquire: false,
     }
 }
 
@@ -8146,6 +8152,7 @@ mod tests {
             parent: None,
             name: "value".into(),
             owner: "Cell".into(),
+            load_is_acquire: false,
         });
         let repeated = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
             offset: 0,
@@ -8159,6 +8166,7 @@ mod tests {
             parent: None,
             name: "value".into(),
             owner: "Cell".into(),
+            load_is_acquire: false,
         });
         let other = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
             offset: 0,
@@ -8172,6 +8180,7 @@ mod tests {
             parent: None,
             name: "mutate_value".into(),
             owner: "Cell".into(),
+            load_is_acquire: false,
         });
 
         assert_eq!(first, repeated);

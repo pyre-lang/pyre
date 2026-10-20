@@ -3332,19 +3332,9 @@ pub fn flush_instruction_cache(ptr: *const u8, len: usize) {
 
 /// `LLtypeMixin.read_int_at_mem` for the raw-memory backends.
 #[inline]
-fn bh_read_int_at_mem(base: i64, offset: i64, size: usize, signed: bool) -> i64 {
-    let addr = (base as usize).wrapping_add(offset as usize);
+fn bh_read_int_at_mem(base: i64, offset: i64, size: usize, signed: bool, acquire: bool) -> i64 {
     unsafe {
-        match (size, signed) {
-            (1, true) => (addr as *const i8).read_unaligned() as i64,
-            (1, false) => (addr as *const u8).read_unaligned() as i64,
-            (2, true) => (addr as *const i16).read_unaligned() as i64,
-            (2, false) => (addr as *const u16).read_unaligned() as i64,
-            (4, true) => (addr as *const i32).read_unaligned() as i64,
-            (4, false) => (addr as *const u32).read_unaligned() as i64,
-            (8, _) => (addr as *const i64).read_unaligned(),
-            other => panic!("read_int_at_mem: unsupported (size, signed) = {other:?}"),
-        }
+        crate::llmodel::read_int_at_mem(base as usize, offset as usize, size, signed, acquire)
     }
 }
 
@@ -4123,23 +4113,17 @@ pub trait Backend: Send {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
-        let addr = (struct_ptr as usize).wrapping_add(offset);
         // SAFETY: `struct_ptr` is a GC-managed struct pointer threaded
         // through from the trace recorder / blackhole; `offset`/`size`
-        // come from the field descriptor.  `read_unaligned` mirrors
-        // `llmodel.py read_int_at_mem`.
-        unsafe {
-            match (size, sign) {
-                (1, true) => (addr as *const i8).read_unaligned() as i64,
-                (1, false) => (addr as *const u8).read_unaligned() as i64,
-                (2, true) => (addr as *const i16).read_unaligned() as i64,
-                (2, false) => (addr as *const u16).read_unaligned() as i64,
-                (4, true) => (addr as *const i32).read_unaligned() as i64,
-                (4, false) => (addr as *const u32).read_unaligned() as i64,
-                (8, _) => (addr as *const i64).read_unaligned(),
-                other => panic!("bh_getfield_gc_i: unsupported (size, signed) = {:?}", other,),
-            }
-        }
+        // come from the field descriptor.  `read_int_at_mem` is
+        // `llmodel.py read_int_at_mem`; `load_is_acquire` selects Acquire.
+        bh_read_int_at_mem(
+            struct_ptr,
+            offset as i64,
+            size,
+            sign,
+            fielddescr.load_is_acquire(),
+        )
     }
     /// model.py bh_getfield_gc_r(struct, fielddescr) →
     /// `read_ref_at_mem(struct, ofs)`.  Pointer-width load at the
@@ -4743,7 +4727,7 @@ pub trait Backend: Send {
     ) -> i64 {
         let (base, size, sign) = descr.unpack_arraydescr_size();
         assert_eq!(base, 0, "bh_raw_load_i requires a lengthless raw array");
-        bh_read_int_at_mem(addr, offset, size, sign)
+        bh_read_int_at_mem(addr, offset, size, sign, descr.load_is_acquire())
     }
     /// llmodel.py bh_raw_store_i(addr, offset, newvalue, descr).
     fn bh_raw_store_i(
@@ -4771,7 +4755,13 @@ pub trait Backend: Send {
         let (base, itemsize, _) = array.unpack_arraydescr_size();
         let (field_offset, field_size, signed) = field.unpack_fielddescr_size();
         let offset = base as i64 + index * itemsize as i64 + field_offset as i64;
-        bh_read_int_at_mem(array_ptr, offset, field_size, signed)
+        bh_read_int_at_mem(
+            array_ptr,
+            offset,
+            field_size,
+            signed,
+            field.load_is_acquire(),
+        )
     }
     /// model.py: bh_getinteriorfield_gc_r(array, index, descr)
     fn bh_getinteriorfield_gc_r(
@@ -4868,7 +4858,13 @@ pub trait Backend: Send {
         bytes: i64,
     ) -> i64 {
         let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
-        bh_read_int_at_mem(addr, offset, bytes.unsigned_abs() as usize, bytes < 0)
+        bh_read_int_at_mem(
+            addr,
+            offset,
+            bytes.unsigned_abs() as usize,
+            bytes < 0,
+            false,
+        )
     }
     fn bh_gc_load_indexed_f(
         &self,

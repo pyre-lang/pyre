@@ -430,21 +430,15 @@ impl Cpu for DefaultCpu {
         // matches; mirror that with a panic. Callers that may receive
         // exotic field sizes (e.g. the trace-time fold path) MUST
         // pre-filter via `fd.field_size()` before invoking this method.
-        let addr = struct_ptr + fd.offset();
-        match (fd.field_size(), fd.is_field_signed()) {
-            (8, true) => unsafe { *(addr as *const i64) },
-            (8, false) => unsafe { *(addr as *const u64) as i64 },
-            (4, true) => unsafe { *(addr as *const i32) as i64 },
-            (4, false) => unsafe { *(addr as *const u32) as i64 },
-            (2, true) => unsafe { *(addr as *const i16) as i64 },
-            (2, false) => unsafe { *(addr as *const u16) as i64 },
-            (1, true) => unsafe { *(addr as *const i8) as i64 },
-            (1, false) => unsafe { *(addr as *const u8) as i64 },
-            (size, _) => panic!(
-                "bh_getfield_gc_i: unsupported field size {} \
-                 (llmodel.py:478 NotImplementedError)",
-                size
-            ),
+        // `load_is_acquire` selects the Acquire arm of `read_int_at_mem`.
+        unsafe {
+            crate::llmodel::read_int_at_mem(
+                struct_ptr,
+                fd.offset(),
+                fd.field_size(),
+                fd.is_field_signed(),
+                fd.load_is_acquire(),
+            )
         }
     }
 
@@ -539,6 +533,32 @@ mod tests {
         assert_eq!(
             DefaultCpu.bh_getfield_gc_r(&mut slot as *mut usize as usize, &plain),
             GcRef(published)
+        );
+    }
+
+    #[test]
+    fn acquire_integer_field_load_reads_the_published_value() {
+        let published: u64 = 0x1111_2222_3333_4444;
+        let mut slot: u64 = 0;
+        unsafe {
+            std::sync::atomic::AtomicU64::from_ptr(&mut slot as *mut u64)
+                .store(published, std::sync::atomic::Ordering::Release);
+        }
+        let fd = majit_ir::descr::SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            majit_ir::Type::Int,
+            false,
+            majit_ir::descr::ArrayFlag::Unsigned,
+            "W_TypeObject.version_tag".to_string(),
+            "version_tag",
+        )
+        .with_load_is_acquire(true);
+        assert!(fd.load_is_acquire());
+        assert_eq!(
+            DefaultCpu.bh_getfield_gc_i(&mut slot as *mut u64 as usize, &fd),
+            published as i64
         );
     }
 
