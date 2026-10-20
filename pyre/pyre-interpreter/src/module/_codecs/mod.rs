@@ -835,22 +835,45 @@ fn ensure_encodings_imported() -> Result<(), crate::PyError> {
     if !with_codec_state(|state| state.codec_need_encodings) {
         return Ok(());
     }
-    // PyPy `_lookup_codec_loop`: import encodings once so it can register
-    // `encodings.search_function` through this module's register().
-    // `space.getattr(space.builtin, '__import__')` and call it with the name
-    // alone: the binding is read here, so replacing `builtins.__import__`
-    // redirects this import, and the replacement is called with the one
-    // argument the upstream site passes it.  The binding holds `dunder_import`
-    // until something replaces it, and that hands the name to the installed
-    // `_bootstrap.__import__`.  The native `importhook` this called before
-    // searches the filesystem itself, so a name reached through it consults no
-    // `sys.path_hooks` entry and is parsed from source rather than read from
-    // the module's bytecode cache.
-    // The import is a Python-level call, so no `&mut CodecState` is live
-    // across it (`interp_codecs.py lookup` / `_lookup_codec_loop`).
+    // `_lookup_codec_loop`: capture `w_import` once and call it with each
+    // name alone.  Either import leaving an exception keeps
+    // `codec_need_encodings` set; the flag is cleared only after both
+    // succeed.  The import is a Python-level call, so no `&mut CodecState`
+    // is live across it.
     let ec = crate::call::getexecutioncontext();
-    crate::importing::call_dunder_import_name_only("encodings", ec)?;
-    let _ = crate::importing::call_dunder_import_name_only("encodings.utf_8", ec);
+    let w_builtin = if ec.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        unsafe { (*ec).get_builtin() }
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_import = if !w_builtin.is_null() && unsafe { is_module(w_builtin) } {
+        let builtin_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_builtin);
+        crate::baseobjspace::findattr_result(
+            pyre_object::gc_roots::shadow_stack_get(builtin_slot),
+            "__import__",
+        )?
+    } else {
+        None
+    };
+    let w_import = w_import.ok_or_else(|| {
+        crate::PyError::new(crate::PyErrorKind::ImportError, "__import__ not found")
+    })?;
+    let import_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_import);
+    let encodings_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("encodings"));
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(import_slot),
+        &[pyre_object::gc_roots::shadow_stack_get(encodings_slot)],
+    )?;
+    let utf8_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("encodings.utf_8"));
+    crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(import_slot),
+        &[pyre_object::gc_roots::shadow_stack_get(utf8_slot)],
+    )?;
     with_codec_state(|state| {
         state.codec_need_encodings = false;
         if unsafe { pyre_object::w_list_len(state.codec_search_path) } == 0 {
@@ -915,16 +938,25 @@ pub(crate) fn lookup_codec_name(encoding: &str) -> Result<PyObjectRef, crate::Py
     let path = with_codec_state(|state| state.codec_search_path);
     let path_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(path);
-    let n = unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(path_slot)) };
-    for i in 0..n {
+    // `_lookup_codec_loop` iterates the live search-path list, so a search
+    // function that registers another during this lookup is visited.
+    let mut i: usize = 0;
+    loop {
+        let n =
+            unsafe { pyre_object::w_list_len(pyre_object::gc_roots::shadow_stack_get(path_slot)) };
+        if i >= n {
+            break;
+        }
         let Some(w_search) = (unsafe {
             pyre_object::w_list_getitem(
                 pyre_object::gc_roots::shadow_stack_get(path_slot),
                 i as i64,
             )
         }) else {
+            i += 1;
             continue;
         };
+        i += 1;
         let search_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_search);
         let w_result = crate::call::call_function_impl_result(

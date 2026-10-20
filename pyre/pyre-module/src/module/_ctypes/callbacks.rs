@@ -39,6 +39,25 @@ mod imp {
         }
     }
 
+    /// Owns a `try_gc_add_root` registration on `slot` until the thunk is
+    /// stored, or until construction fails.  `W_CallbackPtr.__init__` builds
+    /// the weak association before libffi prep; prep enters
+    /// `before_external_block`, so another thread can collect while the
+    /// Weakref lives only in this box.
+    struct ThunkRootGuard {
+        slot: *mut pyre_object::gc_hook::GCREF,
+        rooted: bool,
+    }
+
+    impl Drop for ThunkRootGuard {
+        fn drop(&mut self) {
+            if self.rooted {
+                pyre_object::gc_hook::try_gc_remove_root(self.slot);
+                self.rooted = false;
+            }
+        }
+    }
+
     pub(super) fn build_thunk(
         obj: PyObjectRef,
     ) -> Result<Option<usize>, pyre_interpreter::PyError> {
@@ -60,15 +79,19 @@ mod imp {
         let wref = unsafe { pyre_object::weakref::w_weakref_new(current_obj()) };
         let mut slot = Box::new(wref as usize);
         let slot_ptr = std::ptr::from_mut(&mut *slot).cast::<usize>();
+        let rooted = unsafe {
+            pyre_object::gc_hook::try_gc_add_root(slot_ptr.cast::<pyre_object::gc_hook::GCREF>())
+        };
+        let guard = ThunkRootGuard {
+            slot: slot_ptr.cast::<pyre_object::gc_hook::GCREF>(),
+            rooted,
+        };
 
         let userdata = Box::new(ThunkUserdata {
             slot: slot_ptr,
             result_width,
         });
         let additional_arg = std::ptr::from_ref(&*userdata) as isize;
-        // Box::new and libffi prep do not collect, so the Weakref cannot move
-        // before this root is installed. Registering only after CallbackThunk::new
-        // succeeds keeps an Err from dropping a still-registered Box.
         let thunk = CallbackThunk::new(
             ffi_arg_types,
             ffi_res_type,
@@ -77,10 +100,9 @@ mod imp {
             flags,
         )
         .map_err(map_libffi_error)?;
-        let rooted = unsafe {
-            pyre_object::gc_hook::try_gc_add_root(slot_ptr.cast::<pyre_object::gc_hook::GCREF>())
-        };
         let code = thunk.code_ptr();
+        let rooted = guard.rooted;
+        std::mem::forget(guard);
 
         let stored = Box::new(StoredThunk {
             thunk,
@@ -94,19 +116,21 @@ mod imp {
         Ok(Some(code))
     }
 
+    pub(super) fn thunk_ptr(obj: PyObjectRef) -> Option<usize> {
+        let stored = funcptr::instance_get(obj, THUNK_KEY)?;
+        if !unsafe { pyre_object::is_int(stored) } {
+            return None;
+        }
+        let ptr = unsafe { pyre_object::w_int_get_value(stored) } as usize;
+        (ptr != 0).then_some(ptr)
+    }
+
     pub(super) fn free_thunk(obj: PyObjectRef) {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = _roots.pin_roots(&[obj]);
-        let Some(stored) = funcptr::instance_get(_roots.get(obj_slot), THUNK_KEY) else {
+        let Some(ptr) = thunk_ptr(_roots.get(obj_slot)) else {
             return;
         };
-        if !unsafe { pyre_object::is_int(stored) } {
-            return;
-        }
-        let ptr = unsafe { pyre_object::w_int_get_value(stored) } as usize;
-        if ptr == 0 {
-            return;
-        }
         funcptr::clear_thunk_ptr(_roots.get(obj_slot));
         unsafe { drop(Box::from_raw(ptr as *mut StoredThunk)) };
     }
@@ -392,4 +416,10 @@ pub(super) fn build_thunk(obj: PyObjectRef) -> Result<Option<usize>, pyre_interp
 /// `obj`.
 pub(super) fn free_thunk(obj: PyObjectRef) {
     imp::free_thunk(obj)
+}
+
+/// Whether `obj` still owns a callback thunk (`CFuncPtr.__del__` tests
+/// `isinstance(self._ptr, _rawffi.CallbackPtr)`).
+pub(super) fn has_thunk(obj: PyObjectRef) -> bool {
+    imp::thunk_ptr(obj).is_some()
 }

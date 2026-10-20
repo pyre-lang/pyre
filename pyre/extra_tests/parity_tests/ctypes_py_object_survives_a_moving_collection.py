@@ -136,7 +136,34 @@ d = getattr(cb, "__del__", None)
 if d is not None:
     d()
     d()
+    assert cb(1, 2) == 2
 assert cb(1) == 2
+
+# A CFUNCTYPE wrapping a native address keeps that address after __del__.
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+def kept(x):
+    return x + 1
+
+
+native = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)(
+    ctypes.cast(kept, ctypes.c_void_p).value
+)
+d = getattr(native, "__del__", None)
+if d is not None:
+    d()
+assert native(7) == 8
+
+try:
+    absfn = ctypes.CDLL(None).abs
+    absfn.argtypes = [ctypes.c_int]
+    absfn.restype = ctypes.c_int
+except (OSError, AttributeError, TypeError):
+    absfn = None
+if absfn is not None:
+    d = getattr(absfn, "__del__", None)
+    if d is not None:
+        d()
+    assert absfn(-9) == 9
 
 _simple_type_codes = ("h", "H", "i", "I", "l", "L", "q", "Q", "f", "d")
 _simple_names = ["T%02d" % n for n in range(50)]

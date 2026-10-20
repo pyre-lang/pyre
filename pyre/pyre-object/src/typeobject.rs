@@ -1781,6 +1781,21 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     }
 }
 
+/// Store an already-allocated MRO block without copying it.
+///
+/// `descr_set__bases__` restores `cls.mro_w = old_mro` on the original
+/// block, so a nested rollback still sees the outer identity guard.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_store_mro_block(
+    obj: PyObjectRef,
+    mro_w: *mut crate::object_array::FixedObjectArray,
+) {
+    type_write_barrier(obj);
+    (*(obj as *mut W_TypeObject)).mro_w = mro_w;
+}
+
 /// Restore the pre-`compute_mro` incomplete state (`mro_w is None`).
 ///
 /// `typeobject.py mro_subclasses` keeps the old MRO value and may

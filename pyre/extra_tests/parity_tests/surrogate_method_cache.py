@@ -113,6 +113,8 @@ def bases_assignment_rollback_restores_mro():
         [c.__name__ for c in B.__bases__],
         [c.__name__ for c in B.__mro__],
     )
+    # Hosts disagree on whether `B.__mro__ is` the tuple captured before the
+    # failed assignment, so identity is not asserted.
 
 
 store_delete()

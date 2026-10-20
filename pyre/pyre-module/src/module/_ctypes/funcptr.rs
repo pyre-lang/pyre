@@ -201,14 +201,23 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
 }
 
 fn cfuncptr_del(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    // CFuncPtr.__del__: free the thunk and prepared state, then clear `_ptr`
-    // so a later call takes the Python-callable arm instead of the freed address.
+    // CFuncPtr.__del__: `if self._needs_free: self._buffer.free(); self._buffer = None`
+    // and `if isinstance(self._ptr, _rawffi.CallbackPtr): self._ptr.free(); self._ptr = None`.
+    // The stored address is cleared only for an owned callback thunk; a
+    // function built from a native address keeps that address.  A second
+    // `__del__` finds no thunk and is a no-op for the address.
     if let Some(&obj) = args.first() {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = _roots.pin_roots(&[obj]);
-        super::callbacks::free_thunk(_roots.get(obj_slot));
+        if super::callbacks::has_thunk(_roots.get(obj_slot)) {
+            super::callbacks::free_thunk(_roots.get(obj_slot));
+            if cdata::owns_buffer(_roots.get(obj_slot)) {
+                let _ = store_funcptr_addr(_roots.get(obj_slot), 0);
+            } else {
+                instance_set(_roots.get(obj_slot), PTR_KEY, pyre_object::w_int_new(0));
+            }
+        }
         free_prepared(_roots.get(obj_slot));
-        let _ = store_funcptr_addr(_roots.get(obj_slot), 0);
     }
     Ok(pyre_object::w_none())
 }
@@ -1404,21 +1413,36 @@ fn call_python_callback(
     let callable_slot = pyre_object::gc_roots::pin_roots(&[callable]);
     let argtypes =
         resolve_argtypes(pyre_object::gc_roots::shadow_stack_get(obj_slot)).unwrap_or_default();
-    if n_args != argtypes.len() {
+    // CFuncPtr.__call__: cdecl accepts surplus positional arguments and
+    // truncates them to `len(argtypes)`; too few arguments still raise.
+    let n_declared = argtypes.len();
+    let n_used = if n_args == n_declared {
+        n_args
+    } else if funcptr_flags(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        & i64::from(ctypes_h::FUNCFLAG_CDECL)
+        != 0
+    {
+        if n_args < n_declared {
+            let plural = if n_declared > 1 { "s" } else { "" };
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "This function takes at least {n_declared} argument{plural} ({n_args} given)"
+            )));
+        }
+        n_declared
+    } else {
+        let plural = if n_declared > 1 { "s" } else { "" };
         return Err(pyre_interpreter::PyError::type_error(format!(
-            "this function takes {} arguments ({} given)",
-            argtypes.len(),
-            n_args,
+            "This function takes {n_declared} argument{plural} ({n_args} given)"
         )));
-    }
+    };
     let converted_base = pyre_object::gc_roots::shadow_stack_len();
     for (i, ty) in argtypes.into_iter().enumerate() {
         let converted =
             callback_argument(ty, pyre_object::gc_roots::shadow_stack_get(args_base + i))?;
         let _ = pyre_object::gc_roots::publish_roots(&[converted]);
     }
-    pyre_object::gc_roots::normalize_roots(converted_base, n_args);
-    let mut converted = vec![pyre_object::PY_NULL; n_args];
+    pyre_object::gc_roots::normalize_roots(converted_base, n_used);
+    let mut converted = vec![pyre_object::PY_NULL; n_used];
     pyre_object::gc_roots::shadow_stack_copy_range(converted_base, &mut converted);
     let result = pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(callable_slot),

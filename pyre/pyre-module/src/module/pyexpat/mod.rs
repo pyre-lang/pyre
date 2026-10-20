@@ -1816,15 +1816,15 @@ mod xmlparser_class {
                 self_obj: PyObjectRef,
                 file: PyObjectRef,
             ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-                // `read` is a bound method (`w_method_new` nursery allocation).
-                // Each chunk's `read` and `parse_impl` run Python and can
-                // collect, so the loop reloads the method from its slot.
+                // W_XMLParserType.ParseFile looks up `read` each iteration
+                // (`space.call_method(w_file, 'read', …)`).  Each chunk's
+                // `read` and `parse_impl` run Python and can collect, so the
+                // file object is kept in a slot and reloaded.
                 let roots = pyre_object::gc_roots::push_roots();
                 let self_slot = roots.base();
                 let _ = roots.pin_root(self_obj);
-                let read = pyre_interpreter::baseobjspace::getattr_str(file, "read")?;
-                let read_slot = self_slot + 1;
-                let _ = roots.pin_root(read);
+                let file_slot = self_slot + 1;
+                let _ = roots.pin_root(file);
                 let size_slot = self_slot + 2;
                 let _ = roots.pin_root(w_int_new(2048));
                 let data_slot = self_slot + 3;
@@ -1833,8 +1833,9 @@ mod xmlparser_class {
                 let _ = roots.pin_root(w_bool_from(false));
                 let mut result;
                 loop {
-                    let data = pyre_interpreter::call::call_function_impl_result(
-                        roots.get(read_slot),
+                    let data = pyre_interpreter::baseobjspace::call_method_result(
+                        roots.get(file_slot),
+                        "read",
                         &[roots.get(size_slot)],
                     )?;
                     roots.set(data_slot, data);
