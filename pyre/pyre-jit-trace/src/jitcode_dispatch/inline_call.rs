@@ -15828,7 +15828,7 @@ pub(crate) struct GeneratorResumeCensus {
     /// The JitCode byte offset that coordinate resolves to, once it does.
     marker_offset: Option<usize>,
     /// Whether the code object owns a Python-level loop header, read as a
-    /// `merge_entry_by_green` entry other than function entry.  This is the
+    /// `merge_entry_by_green` entry other than `after_return_generator_index`.  This is the
     /// one gate a resume cannot simply refuse: a `while` generator's own loop
     /// header sits between the resume and the yield, and upstream crosses it
     /// exactly once because `should_unroll_one_iteration` answers True for a
@@ -15838,9 +15838,9 @@ pub(crate) struct GeneratorResumeCensus {
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
     /// `loop_header` op.  A generator body is never a true portal, so that
     /// jitcode test answers `false` for every generator whatever its source
-    /// says.  `merge_entry_by_green` is `find_loop_header_pcs` plus function
-    /// entry and is built for every code object, so it survives the portal
-    /// distinction.
+    /// says.  `merge_entry_by_green` is `find_loop_header_pcs` plus
+    /// `after_return_generator_index` and is built for every code object, so
+    /// it survives the portal distinction.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.
@@ -15920,7 +15920,7 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
         .metadata
         .merge_entry_by_green
         .iter()
-        .any(|&(py, _)| py != 0);
+        .any(|&(py, _)| py as usize != pyre_interpreter::after_return_generator_index(code));
     census.n_py_instrs = pjc.metadata.n_py_instrs as usize;
     census.tables = (
         pjc.metadata.py_exact_by_jit_pc.len(),
@@ -15982,7 +15982,7 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// `resume_py_pc`.
 ///
 /// `merge_entry_for` cannot answer it: `merge_entry_by_green` is built from
-/// `find_loop_header_pcs` plus function entry, and a generator's resume
+/// `find_loop_header_pcs` plus `after_return_generator_index`, and a generator's resume
 /// coordinate is neither.  Widening THAT table is not the fix — the portal
 /// reads it, so publishing resume coordinates there would start portal traces
 /// that walk straight into the `abort_permanent` the yield bakes.
