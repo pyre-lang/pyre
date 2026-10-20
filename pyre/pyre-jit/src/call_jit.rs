@@ -90,19 +90,22 @@ impl Drop for FrameRoot {
 ///
 /// `setup_bridge_sym` publishes the consume identity (`resume.py`
 /// `consume_vable_info` `next_ref()`, `virtualizable_boxes[-1]`) onto
-/// `TraceCtx`. Copy that rooted word so later host readers
-/// (`set_valuestackdepth`) see the live frame. `FrameRoot` is the CA
-/// failarg 0 root, used only when the ctx has no identity yet.
+/// `TraceCtx`. Publish that rooted word so later host readers
+/// (`set_valuestackdepth` via `live_frame`) see the live frame.
+/// `FrameRoot` is the CA failarg 0 root, used only when the ctx has
+/// no identity yet.
 fn refresh_host_vable_frame(
     jit_state: &mut pyre_jit_trace::state::PyreJitState,
     bridge_frame_root: &mut FrameRoot,
 ) {
     let (driver, _) = crate::eval::driver_pair();
-    jit_state.frame = driver
-        .meta_interp_mut()
-        .trace_ctx()
-        .and_then(|c| c.standard_virtualizable_ptr())
-        .unwrap_or_else(|| bridge_frame_root.frame() as *const PyFrame as usize);
+    jit_state.set_frame(
+        driver
+            .meta_interp_mut()
+            .trace_ctx()
+            .and_then(|c| c.standard_virtualizable_ptr())
+            .unwrap_or_else(|| bridge_frame_root.frame() as *const PyFrame as usize),
+    );
 }
 
 // warmspot.py:449 portal result_type == REF: FINISH always boxes via
@@ -4556,7 +4559,7 @@ fn trace_and_compile_from_bridge_body(
     // uses `boxes.live_vable(0)` (`resume.py consume_vable_info`
     // `next_ref()`). Re-read `FrameRoot` after `decode_and_restore`
     // allocations so those field reads see a live object.
-    jit_state.frame = bridge_frame_root.frame() as *const PyFrame as usize;
+    jit_state.set_frame(bridge_frame_root.frame() as *const PyFrame as usize);
     let started = {
         let (driver, _) = crate::eval::driver_pair();
         driver.start_bridge_tracing(
@@ -4707,7 +4710,9 @@ fn trace_and_compile_from_bridge_body(
     }
 
     // `start_bridge_tracing` and `rebuild_portal_framestack_from_resumedata`
-    // allocate. `set_valuestackdepth` writes through `jit_state.frame`.
+    // allocate. `set_valuestackdepth` writes through `live_frame()` (the
+    // identity `set_frame` / `publish_frame` plants on `frame` and
+    // `frame_root`).
     refresh_host_vable_frame(&mut jit_state, bridge_frame_root);
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
@@ -5055,7 +5060,7 @@ fn trace_and_compile_from_bridge_body(
         let (driver, _) = crate::eval::driver_pair();
         driver.discard_pending_abort_blackhole();
     } else {
-        jit_state.frame = bridge_frame_root.frame() as *const PyFrame as usize;
+        jit_state.set_frame(bridge_frame_root.frame() as *const PyFrame as usize);
         let (driver, _) = crate::eval::driver_pair();
         if let Some(resume) = run_python_portal_abort_blackhole(driver, &mut jit_state, &env) {
             return bridge_resolution_from_abort_blackhole(

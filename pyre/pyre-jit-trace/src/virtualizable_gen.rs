@@ -14,7 +14,7 @@ use pyre_object::FIXED_OBJECT_ARRAY_TOKEN;
 majit_macros::virtualizable! {
     state = PyreJitState,
     name = "frame",
-    heap_ptr = |s: &PyreJitState| if s.frame != 0 { s.frame as *mut u8 } else { std::ptr::null_mut() },
+    heap_ptr = |s: &PyreJitState| { let p = s.live_frame(); if p != 0 { p as *mut u8 } else { std::ptr::null_mut() } },
     token_offset = PYFRAME_VABLE_TOKEN_OFFSET,
 
     // Frame pointer field in PyreJitState

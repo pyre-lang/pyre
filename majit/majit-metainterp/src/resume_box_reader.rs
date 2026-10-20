@@ -116,6 +116,19 @@ impl Drop for BridgeVirtualCache<'_> {
     }
 }
 
+/// `cpu.get_ref_value(deadframe, num)` half of the failarg vector: only
+/// Ref-typed slots carry a pointer the collector must rewrite.
+fn fail_ref_roots_from(fail_values: &[i64], fail_types: &[majit_ir::Type]) -> Vec<i64> {
+    fail_values
+        .iter()
+        .enumerate()
+        .map(|(i, &bits)| match fail_types.get(i) {
+            Some(majit_ir::Type::Ref) => bits,
+            _ => 0,
+        })
+        .collect()
+}
+
 /// One `SETARRAYITEM_GC` of a ref item that `_prepare_pendingfields`
 /// applied, kept on the reader (see `BridgeVirtualCache`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,14 +185,7 @@ impl<'a> BridgeVirtualCache<'a> {
             executing,
             pending_ref_array_writes: Vec::new(),
             fail_values: fail_values.to_vec(),
-            fail_ref_roots: fail_values
-                .iter()
-                .enumerate()
-                .map(|(i, &bits)| match fail_types.get(i) {
-                    Some(majit_ir::Type::Ref) => bits,
-                    _ => 0,
-                })
-                .collect(),
+            fail_ref_roots: fail_ref_roots_from(fail_values, fail_types),
             concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         };
@@ -2321,6 +2327,42 @@ mod tests {
         assert_eq!(
             ctx.box_value(first),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(dict_ptr)))
+        );
+    }
+
+    /// `call_jit.rs` `start_bridge_tracing(..., execute_replay=false)` builds
+    /// the recording reader after a DirectReader already applied. That reader
+    /// is still `ResumeDataBoxReader` and must carry `self.deadframe`: a
+    /// virtual field TAGBOX is `load_box_from_cpu`, including a failarg the
+    /// assembler left as a hole (`rd_locs == 0xFFFF`, `liveboxes[num] is None`).
+    #[test]
+    fn tagbox_decode_loads_from_recording_deadframe() {
+        let fail_types = [Type::Ref, Type::Ref];
+        let fail_values = [0x1110i64, 0x2220];
+        let mut ctx = crate::TraceCtx::for_test_input_layout(&fail_types, &[true, false]);
+        let hole = OpRef::input_arg_ref(1);
+        assert_eq!(ctx.box_value(hole), None);
+
+        let resume_data = empty_resume_data(fail_types.to_vec());
+        let mut cache = BridgeVirtualCache::recording(
+            1,
+            default_bridge_array_descr,
+            &[],
+            &fail_values,
+            &fail_types,
+        );
+        let tagged = tag_box(1);
+        let first = decode_fieldnum(&mut ctx, tagged, None, &resume_data, &mut cache);
+        assert_eq!(first, hole);
+        assert_eq!(
+            ctx.box_value(first),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0x2220)))
+        );
+        let second = decode_fieldnum(&mut ctx, tagged, None, &resume_data, &mut cache);
+        assert_eq!(second, first);
+        assert_eq!(
+            ctx.box_value(second),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0x2220)))
         );
     }
 
