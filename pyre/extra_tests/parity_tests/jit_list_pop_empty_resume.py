@@ -2,6 +2,11 @@
 # non-empty list.pop path before an underflow and traceback frame.clear().
 # parity-tests reason: exercise generated pop guards and exception resume
 # with both Object and Integer list storage.
+#
+# list_indexerror_traceback_not_accumulated: the suite does not catch a hot list
+# IndexError and inspect that each iteration is a fresh exception whose traceback
+# is one frame, not a chain prepended onto a CSE'd instance (residual raise caught
+# in-frame, list subscript; KeyError and ValueError siblings).
 
 import pickle
 import traceback
@@ -55,5 +60,56 @@ def run():
             raise AssertionError("expected integer list underflow")
 
 
+def names(traceback):
+    out = []
+    while traceback is not None:
+        out.append(traceback.tb_frame.f_code.co_name)
+        traceback = traceback.tb_next
+    return tuple(out)
+
+
+def missing_key(d, i):
+    try:
+        return d[i]
+    except KeyError as e:
+        return names(e.__traceback__)
+
+
+def bad_index(seq, i):
+    try:
+        seq[i]
+        raise AssertionError("expected IndexError")
+    except IndexError as e:
+        return e
+
+
+def bad_convert(s):
+    try:
+        return int(s)
+    except ValueError as e:
+        return names(e.__traceback__)
+
+
+def run_fresh_tracebacks():
+    d = {}
+    seq = []
+    key_shapes = set()
+    index_shapes = set()
+    convert_shapes = set()
+    index_exc = []
+    for i in range(5000):
+        key_shapes.add(missing_key(d, i))
+        e = bad_index(seq, i)
+        index_exc.append(e)
+        index_shapes.add(names(e.__traceback__))
+        convert_shapes.add(bad_convert("x"))
+
+    assert key_shapes == {("missing_key",)}, key_shapes
+    assert index_shapes == {("bad_index",)}, sorted(index_shapes)[:5]
+    assert convert_shapes == {("bad_convert",)}, convert_shapes
+    assert len({id(e) for e in index_exc}) == 5000, len({id(e) for e in index_exc})
+
+
 run()
+run_fresh_tracebacks()
 print("OK")
