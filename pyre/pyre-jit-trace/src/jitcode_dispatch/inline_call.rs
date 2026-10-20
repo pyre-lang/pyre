@@ -3602,9 +3602,13 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // `PyPyJitDriver.reds = ['frame', 'ec']`). `do_residual_call` records
     // that box. A `ConstPtr` of `getexecutioncontext()` would bake the
     // tracing thread's context into `CALL_MAY_FORCE_R`. Stamp a concrete
-    // shadow on the red when the sub-walk left it empty so the trace-time
+    // shadow on the red when the sub-walk left it without a concrete half
+    // (absent, `Value::Void` or `GcRef::NO_CONCRETE`) so the trace-time
     // executor can run; the recorded operand stays `callee_ec`.
-    if ctx.trace_ctx.concrete_of_opref(callee_ec).is_none() {
+    if !matches!(
+        ctx.trace_ctx.concrete_of_opref(callee_ec),
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+    ) {
         super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
     }
     // `_build_allboxes` order for the portal ABI, which
