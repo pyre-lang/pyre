@@ -69,16 +69,20 @@
 //!   niladic error closure and raises its materialised exception.  Neither the
 //!   foreign Option combinator nor its transient Result shell survives.
 //!
-//! - **Carrier `unwrap_or` rule** ([`rewire_result_unwrap_or_sites`]):
-//!   `getdict(obj).unwrap_or(default)` is the value-encoded spelling of
-//!   `try: w = getdict(obj) except OperationError: w = default`.  The
-//!   call block becomes `ExitSwitch::LastException` (`flowspace/model.py`
-//!   `Link.last_exception`, `exceptiontransform.py`): the normal link
-//!   carries the raw `T`, the catch link (`error_carrier_exitcase`, the
-//!   same `except OperationError as e` catch [`catch_and_rewrap`] builds)
-//!   carries `default`, and both join at the block after `unwrap_or`.
-//!   No `Result` shell and no residual `unwrap_or` survive.  This fusion
-//!   runs before the caller rule can [`catch_and_rewrap`] the call.
+//! - **Carrier combinator rule** ([`rewire_carrier_combinator_sites`]):
+//!   `unwrap_or` / `expect` / `unwrap` on a carrier Result fuse onto the
+//!   call's `LastException` exits before [`catch_and_rewrap`] can rebuild
+//!   a shell.  The normal link carries the raw `T`.  The catch link
+//!   (`error_carrier_exitcase`, the same `except OperationError as e`
+//!   catch [`catch_and_rewrap`] builds) is what distinguishes the
+//!   combinator: `unwrap_or` joins with `default`
+//!   (`getdict(obj).unwrap_or(default)` = `try/except OperationError`);
+//!   `expect` / `unwrap` raise the implicit `AssertionError` (`core`
+//!   `Result::expect`; `simplify.py` `remove_assertion_errors`) — the
+//!   panic on `Err` that `option_unwrap` already uses.
+//!   `interp_deque.py` `W_Deque.trimleft` / `popleft` is
+//!   `pop_left(self_obj).expect("trimleft on non-empty deque")`.
+//!   No `Result` shell and no residual combinator survive.
 //!
 //! ## Scope discipline
 //!
@@ -2508,23 +2512,46 @@ pub(crate) struct OptionOkOrElseTrySite {
     pub scalar_niche: bool,
 }
 
-/// A foreign `Result<T, PyError>::unwrap_or(r, default)` whose receiver is
-/// the exception-carrier Result of a scoped callee.
+/// Catch-link action for a carrier Result combinator fused onto
+/// `LastException`.
+///
+/// The origin walk, hop tracking, recast stripping, `install_last_exception`,
+/// and the normal link are shared; only the catch target differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarrierCatchKind {
+    /// `Result::unwrap_or(r, default)`: catch joins with `default`
+    /// (`except OperationError: w = default`).
+    JoinDefault,
+    /// `Result::expect` / `Result::unwrap`: catch raises the implicit
+    /// `AssertionError` (`core` `Result::expect`; `simplify.py`
+    /// `remove_assertion_errors`). The panic is the "shouldn't occur at
+    /// run-time" arm `option_unwrap` already uses. `interp_deque.py`
+    /// `W_Deque.trimleft` / `popleft` is the interpreter spelling
+    /// (`pop_left(self_obj).expect(...)` when `len > maxlen`).
+    RaiseImplicit,
+}
+
+/// A foreign combinator on `Result<T, PyError>` whose receiver is the
+/// exception-carrier Result of a scoped callee.
 ///
 /// RPython never materialises that Result: `getdict(obj).unwrap_or(default)`
-/// is `try: w = getdict(obj) except OperationError: w = default`
-/// (`exceptiontransform.py`, `flowspace/model.py` `Link.last_exception`).
-/// The MIR frontend records the `unwrap_or` dest while the carrier Result
-/// type is still in hand, then [`rewire_result_unwrap_or_sites`] restores
-/// that value-or-default exception join before [`catch_and_rewrap`] can
-/// rebuild a shell around the call.
+/// is `try: w = getdict(obj) except OperationError: w = default`, and
+/// `pop_left(self).expect(...)` is `W_Deque.trimleft` calling `popleft`
+/// (`exceptiontransform.py`, `flowspace/model.py` `Link.last_exception`,
+/// `interp_deque.py` `W_Deque.trimleft` / `popleft`). The MIR frontend
+/// records the combinator dest while the carrier Result type is still in
+/// hand, then [`rewire_carrier_combinator_sites`] restores that exception
+/// join before [`catch_and_rewrap`] can rebuild a shell around the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResultUnwrapOrSite {
-    /// The `unwrap_or` call result (`T`) — locates the combinator block.
+pub(crate) struct CarrierCombinatorSite {
+    /// The combinator call result (`T`) — locates the combinator block.
     pub result_var: Variable,
     /// The callee's `Ok` payload type — the reminted call result and the
-    /// joined input at the block after `unwrap_or`.
+    /// joined input at the block after the combinator.
     pub payload_ty: ValueType,
+    /// What the catch link does: join with `unwrap_or`'s default, or raise
+    /// the implicit `AssertionError` (`core` `Result::expect`).
+    pub catch: CarrierCatchKind,
 }
 
 /// Per-site disposition for [`rewire_one_call_site`].
@@ -3606,24 +3633,26 @@ fn rewire_one_option_ok_or_else_try_site(
     Ok(())
 }
 
-/// Fuse `Result<T, PyError>::unwrap_or(r, default)` into the call's
-/// `LastException` exits: the normal link carries the reminted `T`, the
-/// catch link (`error_carrier_exitcase` — `except OperationError as e`,
-/// `flowspace/model.py` `Link.last_exception`) carries `default`, and both
-/// join at the block after `unwrap_or`.  Fail-safe: a shape that does not
-/// fit is left untouched so [`catch_and_rewrap`] can still claim the call.
-pub(crate) fn rewire_result_unwrap_or_sites(
+/// Fuse a carrier `Result<T, PyError>` combinator (`unwrap_or` / `expect` /
+/// `unwrap`) into the call's `LastException` exits: the normal link carries
+/// the reminted `T`, the catch link (`error_carrier_exitcase` —
+/// `except OperationError as e`, `flowspace/model.py` `Link.last_exception`)
+/// either joins with `unwrap_or`'s default or raises the implicit
+/// `AssertionError` (`core` `Result::expect`; `simplify.py`
+/// `remove_assertion_errors`).  Fail-safe: a shape that does not fit is left
+/// untouched so [`catch_and_rewrap`] can still claim the call.
+pub(crate) fn rewire_carrier_combinator_sites(
     graph: &mut FunctionGraph,
-    sites: &[ResultUnwrapOrSite],
+    sites: &[CarrierCombinatorSite],
 ) -> usize {
     let mut rewritten = 0usize;
     for site in sites {
-        match rewire_one_result_unwrap_or_site(graph, site) {
+        match rewire_one_carrier_combinator_site(graph, site) {
             Ok(()) => rewritten += 1,
             Err(msg) => {
                 crate::decline::record_reason(
                     RESULT_EXC_CALLER_GATE,
-                    "result-unwrap-or-declined",
+                    "carrier-combinator-declined",
                     &msg,
                     &graph.name,
                 );
@@ -3633,19 +3662,22 @@ pub(crate) fn rewire_result_unwrap_or_sites(
     rewritten
 }
 
-fn rewire_one_result_unwrap_or_site(
+fn rewire_one_carrier_combinator_site(
     graph: &mut FunctionGraph,
-    site: &ResultUnwrapOrSite,
+    site: &CarrierCombinatorSite,
 ) -> Result<(), String> {
-    let plan = plan_result_unwrap_or_site(graph, site)?;
-    apply_result_unwrap_or_plan(graph, site, plan)
+    let plan = plan_carrier_combinator_site(graph, site)?;
+    apply_carrier_combinator_plan(graph, site, plan)
 }
 
 struct UnwrapOrInspect {
     u: usize,
     unwrap_idx: usize,
     recv: Variable,
-    default: LinkArg,
+    /// `Some` for [`CarrierCatchKind::JoinDefault`]; `None` for
+    /// [`CarrierCatchKind::RaiseImplicit`] (`expect`/`unwrap` drop the panic
+    /// message and have no default).
+    default: Option<LinkArg>,
     out_var: Variable,
     cast: Option<(String, ValueType)>,
     saved_exit: Link,
@@ -3677,9 +3709,9 @@ enum UnwrapOrPlan {
     },
 }
 
-fn plan_result_unwrap_or_site(
+fn plan_carrier_combinator_site(
     graph: &FunctionGraph,
-    site: &ResultUnwrapOrSite,
+    site: &CarrierCombinatorSite,
 ) -> Result<UnwrapOrPlan, String> {
     let name = graph.name.clone();
     let inspect = inspect_unwrap_or_block(graph, site)?;
@@ -3710,7 +3742,7 @@ fn plan_result_unwrap_or_site(
     }
     if shell_has_foreign_operand_use(graph, &origin, &inspect) {
         return Err(format!(
-            "{name}: carrier Result has a use besides unwrap_or"
+            "{name}: carrier Result has a use besides the combinator"
         ));
     }
     for hop in origin.hops.iter().filter(|hop| hop.block != inspect.u) {
@@ -3726,13 +3758,25 @@ fn plan_result_unwrap_or_site(
         .iter()
         .filter(|hop| hop.block != inspect.u)
         .any(|hop| !graph.blocks[hop.block].operations.is_empty());
+    let extras_at_a = join_extras_map_to(graph, &inspect, origin.a).is_ok();
+    // `expect` / `unwrap`: the catch is a fresh implicit-`AssertionError`
+    // raise (`core` `Result::expect`; `simplify.py` `remove_assertion_errors`),
+    // so hops that would materialise a default are unused. DirectJoin
+    // whenever the continuation extras are live at the call.
+    if site.catch == CarrierCatchKind::RaiseImplicit {
+        if extras_at_a {
+            return Ok(UnwrapOrPlan::DirectJoin { origin, inspect });
+        }
+        return Err(format!(
+            "{name}: carrier expect/unwrap is not a LastException join"
+        ));
+    }
     if inspect.cast.is_some() && intermediates_have_ops {
         return Err(format!(
             "{name}: trailing unwrap_or cast with extra-op hops"
         ));
     }
     let default_at_a = default_available_at_call(graph, &origin, &inspect);
-    let extras_at_a = join_extras_map_to(graph, &inspect, origin.a).is_ok();
     // DirectJoin: both LastException arms skip the hop chain and land on
     // the block after `unwrap_or`.  The default has to be a value already
     // live at the call (`callable` in `calculate_metaclass(…).unwrap_or(callable)`).
@@ -3747,9 +3791,10 @@ fn plan_result_unwrap_or_site(
     // `Link.last_exception` / `exceptiontransform.py`: the catch link
     // is `except OperationError` and continues with `default`.
     if !origin.hops.is_empty() && extras_at_a {
-        let default_at_u = match &inspect.default {
-            LinkArg::Const(_) => true,
-            LinkArg::Value(var) => defined_before(graph, inspect.u, var, inspect.unwrap_idx),
+        let default_at_u = match inspect.default.as_ref() {
+            Some(LinkArg::Const(_)) => true,
+            Some(LinkArg::Value(var)) => defined_before(graph, inspect.u, var, inspect.unwrap_idx),
+            None => false,
         };
         if !default_at_u {
             return Err(format!(
@@ -3765,21 +3810,21 @@ fn plan_result_unwrap_or_site(
 
 fn inspect_unwrap_or_block(
     graph: &FunctionGraph,
-    site: &ResultUnwrapOrSite,
+    site: &CarrierCombinatorSite,
 ) -> Result<UnwrapOrInspect, String> {
     let name = graph.name.clone();
     let u = producer_block_index(graph, &site.result_var)
-        .ok_or_else(|| format!("{name}: unwrap_or result var has no producer block"))?;
+        .ok_or_else(|| format!("{name}: combinator result var has no producer block"))?;
     let unwrap_idx = graph.blocks[u]
         .operations
         .iter()
         .position(|op| op.result.as_ref() == Some(&site.result_var))
-        .ok_or_else(|| format!("{name}: unwrap_or producer op vanished"))?;
+        .ok_or_else(|| format!("{name}: combinator producer op vanished"))?;
     let last_idx = graph.blocks[u]
         .operations
         .len()
         .checked_sub(1)
-        .ok_or_else(|| format!("{name}: unwrap_or block {u} is empty"))?;
+        .ok_or_else(|| format!("{name}: combinator block {u} is empty"))?;
     let (cast, out_var): (Option<(String, ValueType)>, Variable) = if unwrap_idx == last_idx {
         (None, site.result_var.clone())
     } else if unwrap_idx == last_idx - 1 {
@@ -3794,29 +3839,30 @@ fn inspect_unwrap_or_block(
             }
             _ => {
                 return Err(format!(
-                    "{name}: unwrap_or call is not the last op of block {u}"
+                    "{name}: combinator call is not the last op of block {u}"
                 ));
             }
         }
     } else {
         return Err(format!(
-            "{name}: unwrap_or call is not the last op of block {u}"
+            "{name}: combinator call is not the last op of block {u}"
         ));
     };
-    let (recv, default) = unwrap_or_operands(&graph.blocks[u].operations[unwrap_idx].kind)
-        .ok_or_else(|| format!("{name}: recorded unwrap_or site has a different producer"))?;
+    let (recv, default) =
+        combinator_operands(&graph.blocks[u].operations[unwrap_idx].kind, site.catch)
+            .ok_or_else(|| format!("{name}: recorded combinator site has a different producer"))?;
     let [exit] = graph.blocks[u].exits.as_slice() else {
         return Err(format!(
-            "{name}: unwrap_or block {u} does not have a single exit"
+            "{name}: combinator block {u} does not have a single exit"
         ));
     };
     if exit.exitcase.is_some() || exit.last_exception.is_some() || exit.last_exc_value.is_some() {
         return Err(format!(
-            "{name}: unwrap_or block {u} exit is not a plain goto"
+            "{name}: combinator block {u} exit is not a plain goto"
         ));
     }
     if graph.blocks[u].exitswitch.is_some() {
-        return Err(format!("{name}: unwrap_or block {u} has an exitswitch"));
+        return Err(format!("{name}: combinator block {u} has an exitswitch"));
     }
     Ok(UnwrapOrInspect {
         u,
@@ -3829,14 +3875,35 @@ fn inspect_unwrap_or_block(
     })
 }
 
-fn unwrap_or_operands(kind: &OpKind) -> Option<(Variable, LinkArg)> {
-    match kind {
-        OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } if name == "unwrap_or" && args.len() == 2 => {
-            Some((args[0].as_variable()?.clone(), args[1].clone()))
+fn combinator_leaf_name(target: &CallTarget) -> Option<&str> {
+    match target {
+        CallTarget::Method { name, .. } => Some(name.as_str()),
+        CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+        _ => None,
+    }
+}
+
+/// Receiver (and `unwrap_or` default) of a recorded carrier combinator.
+/// `expect`'s panic-message operand is dropped — it only feeds the panic
+/// string (`core` `Result::expect`).
+fn combinator_operands(
+    kind: &OpKind,
+    catch: CarrierCatchKind,
+) -> Option<(Variable, Option<LinkArg>)> {
+    let OpKind::Call { target, args, .. } = kind else {
+        return None;
+    };
+    let name = combinator_leaf_name(target)?;
+    let recv = args.first()?.as_variable()?.clone();
+    match catch {
+        CarrierCatchKind::JoinDefault if name == "unwrap_or" && args.len() == 2 => {
+            Some((recv, Some(args[1].clone())))
+        }
+        CarrierCatchKind::RaiseImplicit if name == "unwrap" && args.len() == 1 => {
+            Some((recv, None))
+        }
+        CarrierCatchKind::RaiseImplicit if name == "expect" && args.len() == 2 => {
+            Some((recv, None))
         }
         _ => None,
     }
@@ -4021,10 +4088,11 @@ fn default_available_at_call(
     origin: &CarrierOrigin,
     inspect: &UnwrapOrInspect,
 ) -> bool {
-    match &inspect.default {
-        LinkArg::Const(_) => true,
-        LinkArg::Value(var) => back_sub_to(graph, inspect.u, var.clone(), origin.a)
+    match inspect.default.as_ref() {
+        Some(LinkArg::Const(_)) => true,
+        Some(LinkArg::Value(var)) => back_sub_to(graph, inspect.u, var.clone(), origin.a)
             .is_some_and(|at_a| defined_before(graph, origin.a, &at_a, origin.call_idx)),
+        None => false,
     }
 }
 
@@ -4110,9 +4178,9 @@ fn map_join_args(
         .collect()
 }
 
-fn apply_result_unwrap_or_plan(
+fn apply_carrier_combinator_plan(
     graph: &mut FunctionGraph,
-    site: &ResultUnwrapOrSite,
+    site: &CarrierCombinatorSite,
     plan: UnwrapOrPlan,
 ) -> Result<(), String> {
     match plan {
@@ -4127,40 +4195,72 @@ fn apply_result_unwrap_or_plan(
 
 fn apply_direct_join(
     graph: &mut FunctionGraph,
-    site: &ResultUnwrapOrSite,
+    site: &CarrierCombinatorSite,
     origin: CarrierOrigin,
     inspect: UnwrapOrInspect,
 ) -> Result<(), String> {
     let payload = remint_call_as_payload(graph, origin.a, &origin.r, site.payload_ty.clone());
     drop_unwrap_or_and_recasts(graph, &origin, &inspect);
     strip_tracked_hops(graph, &origin);
-    // The combinator block is unreachable after the LastException join,
-    // but `FreshMallocs` (`writeanalyze.py`) still walks every block:
-    // leave its exit carrying `default` (defined there) rather than the
-    // dropped `unwrap_or` dest.
-    if origin.a != inspect.u {
-        forward_unwrap_or_block(graph, &inspect)?;
+    match site.catch {
+        CarrierCatchKind::JoinDefault => {
+            // The combinator block is unreachable after the LastException join,
+            // but `FreshMallocs` (`writeanalyze.py`) still walks every block:
+            // leave its exit carrying `default` (defined there) rather than the
+            // dropped `unwrap_or` dest.
+            if origin.a != inspect.u {
+                forward_unwrap_or_block(graph, &inspect)?;
+            }
+            let default = inspect
+                .default
+                .clone()
+                .ok_or_else(|| format!("{}: unwrap_or join is missing its default", graph.name))?;
+            let default_at_a = match &default {
+                LinkArg::Const(_) => default,
+                LinkArg::Value(var) => LinkArg::Value(
+                    back_sub_to(graph, inspect.u, var.clone(), origin.a)
+                        .unwrap_or_else(|| var.clone()),
+                ),
+            };
+            let (normal_target, normal_args, exc_target, exc_args) =
+                join_targets(graph, origin.a, &inspect, payload, default_at_a)?;
+            install_last_exception(
+                graph,
+                origin.a,
+                Link::new_mixed(normal_args, normal_target, None),
+                Link::new_mixed(exc_args, exc_target, None),
+            );
+        }
+        CarrierCatchKind::RaiseImplicit => {
+            // `core` `Result::expect`: Ok is the reminted `T`; Err panics.
+            // The catch is a fresh implicit-`AssertionError` raise
+            // (`simplify.py` `remove_assertion_errors`; `option_unwrap`
+            // `raise_implicit_non_payload`). `interp_deque.py`
+            // `W_Deque.trimleft` / `popleft`.
+            if origin.a != inspect.u {
+                crate::front::option_unwrap::raise_implicit_non_payload(
+                    graph,
+                    crate::model::BlockId(inspect.u),
+                );
+            }
+            let (normal_target, normal_args) =
+                join_normal_link(graph, origin.a, &inspect, payload)?;
+            let (raise_bb, _) = graph.create_block_with_arg_vars(0);
+            crate::front::option_unwrap::raise_implicit_non_payload(graph, raise_bb);
+            install_last_exception(
+                graph,
+                origin.a,
+                Link::new_mixed(normal_args, normal_target, None),
+                Link::new_mixed(Vec::new(), raise_bb, None),
+            );
+        }
     }
-    let default_at_a = match &inspect.default {
-        LinkArg::Const(_) => inspect.default.clone(),
-        LinkArg::Value(var) => LinkArg::Value(
-            back_sub_to(graph, inspect.u, var.clone(), origin.a).unwrap_or_else(|| var.clone()),
-        ),
-    };
-    let (normal_target, normal_args, exc_target, exc_args) =
-        join_targets(graph, origin.a, &inspect, payload, default_at_a)?;
-    install_last_exception(
-        graph,
-        origin.a,
-        Link::new_mixed(normal_args, normal_target, None),
-        Link::new_mixed(exc_args, exc_target, None),
-    );
     Ok(())
 }
 
 fn apply_through_hops(
     graph: &mut FunctionGraph,
-    site: &ResultUnwrapOrSite,
+    site: &CarrierCombinatorSite,
     origin: CarrierOrigin,
     inspect: UnwrapOrInspect,
 ) -> Result<(), String> {
@@ -4213,7 +4313,11 @@ fn forward_unwrap_or_block(
     graph: &mut FunctionGraph,
     inspect: &UnwrapOrInspect,
 ) -> Result<(), String> {
-    let u_args = map_join_args_local(inspect, inspect.default.clone())?;
+    let default = inspect
+        .default
+        .clone()
+        .ok_or_else(|| format!("{}: unwrap_or forward is missing its default", graph.name))?;
+    let u_args = map_join_args_local(inspect, default)?;
     graph.set_goto_mixed(
         crate::model::BlockId(inspect.u),
         inspect.saved_exit.target,
@@ -4237,6 +4341,46 @@ fn map_join_args_local(
         .collect()
 }
 
+fn join_normal_link(
+    graph: &mut FunctionGraph,
+    a: usize,
+    inspect: &UnwrapOrInspect,
+    payload: Variable,
+) -> Result<(crate::model::BlockId, Vec<LinkArg>), String> {
+    let c = inspect.saved_exit.target;
+    if inspect.cast.is_none() {
+        let normal = map_join_args(graph, inspect, a, LinkArg::Value(payload))?;
+        return Ok((c, normal));
+    }
+    let mut normal_sources = vec![payload.clone()];
+    for arg in &inspect.saved_exit.args {
+        match arg {
+            LinkArg::Value(v) if *v == inspect.out_var => {}
+            LinkArg::Value(v) => {
+                let src = back_sub_to(graph, inspect.u, v.clone(), a)
+                    .ok_or_else(|| format!("{}: join extra vanished", graph.name))?;
+                if !normal_sources.iter().any(|s| s == &src) {
+                    normal_sources.push(src);
+                }
+            }
+            LinkArg::Const(_) => {}
+        }
+    }
+    let (n_bb, n_inputs) = graph.create_block_with_arg_vars(normal_sources.len());
+    let narrowed = crate::front::option_unwrap_or::emit_narrow(
+        graph,
+        n_bb,
+        &inspect.cast,
+        n_inputs[0].clone(),
+    );
+    let n_exit = reproduce_join_from_arm(inspect, &normal_sources, &n_inputs, narrowed)?;
+    graph.set_goto_mixed(n_bb, c, n_exit);
+    Ok((
+        n_bb,
+        normal_sources.into_iter().map(LinkArg::Value).collect(),
+    ))
+}
+
 fn join_targets(
     graph: &mut FunctionGraph,
     a: usize,
@@ -4252,13 +4396,11 @@ fn join_targets(
     ),
     String,
 > {
-    let c = inspect.saved_exit.target;
+    let (n_bb, n_args) = join_normal_link(graph, a, inspect, payload)?;
     if inspect.cast.is_none() {
-        let normal = map_join_args(graph, inspect, a, LinkArg::Value(payload))?;
         let exc = map_join_args(graph, inspect, a, default)?;
-        return Ok((c, normal, c, exc));
+        return Ok((n_bb, n_args, inspect.saved_exit.target, exc));
     }
-    let mut normal_sources = vec![payload.clone()];
     let mut exc_sources: Vec<LinkArg> = vec![default.clone()];
     for arg in &inspect.saved_exit.args {
         match arg {
@@ -4266,9 +4408,6 @@ fn join_targets(
             LinkArg::Value(v) => {
                 let src = back_sub_to(graph, inspect.u, v.clone(), a)
                     .ok_or_else(|| format!("{}: join extra vanished", graph.name))?;
-                if !normal_sources.iter().any(|s| s == &src) {
-                    normal_sources.push(src.clone());
-                }
                 if !exc_sources
                     .iter()
                     .any(|s| matches!(s, LinkArg::Value(x) if x == &src))
@@ -4283,15 +4422,7 @@ fn join_targets(
             }
         }
     }
-    let (n_bb, n_inputs) = graph.create_block_with_arg_vars(normal_sources.len());
-    let narrowed = crate::front::option_unwrap_or::emit_narrow(
-        graph,
-        n_bb,
-        &inspect.cast,
-        n_inputs[0].clone(),
-    );
-    let n_exit = reproduce_join_from_arm(inspect, &normal_sources, &n_inputs, narrowed)?;
-    graph.set_goto_mixed(n_bb, c, n_exit);
+    let c = inspect.saved_exit.target;
     let exc_value_vars: Vec<Variable> = exc_sources
         .iter()
         .filter_map(LinkArg::as_variable)
@@ -4306,12 +4437,7 @@ fn join_targets(
         crate::front::option_unwrap_or::emit_narrow(graph, e_bb, &inspect.cast, default_in);
     let e_exit = reproduce_join_from_arm(inspect, &exc_value_vars, &e_inputs, narrowed_d)?;
     graph.set_goto_mixed(e_bb, c, e_exit);
-    Ok((
-        n_bb,
-        normal_sources.into_iter().map(LinkArg::Value).collect(),
-        e_bb,
-        exc_sources,
-    ))
+    Ok((n_bb, n_args, e_bb, exc_sources))
 }
 
 fn reproduce_join_from_arm(
@@ -14007,7 +14133,7 @@ mod result_unwrap_or_tests {
         (normal, exc)
     }
 
-    fn carrier_unwrap_or_two_block() -> (FunctionGraph, ResultUnwrapOrSite, Variable, Variable) {
+    fn carrier_unwrap_or_two_block() -> (FunctionGraph, CarrierCombinatorSite, Variable, Variable) {
         let mut graph = FunctionGraph::new("carrier_unwrap_or");
         let a = graph.startblock;
         let default = graph
@@ -14040,9 +14166,10 @@ mod result_unwrap_or_tests {
         graph.set_return(c, None);
         graph.set_goto(u, c, vec![w.clone()]);
         graph.set_goto(a, u, vec![r.clone(), default.clone()]);
-        let site = ResultUnwrapOrSite {
+        let site = CarrierCombinatorSite {
             result_var: w,
             payload_ty: ValueType::Ref(None),
+            catch: CarrierCatchKind::JoinDefault,
         };
         (graph, site, r, default)
     }
@@ -14050,7 +14177,7 @@ mod result_unwrap_or_tests {
     #[test]
     fn carrier_unwrap_or_rewires_to_last_exception_join() {
         let (mut graph, site, _r, default) = carrier_unwrap_or_two_block();
-        assert_eq!(rewire_result_unwrap_or_sites(&mut graph, &[site]), 1);
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
         assert!(!has_unwrap_or(&graph), "no residual unwrap_or call");
         assert_link_args_defined(&graph);
         let a = graph.startblock.0;
@@ -14117,11 +14244,12 @@ mod result_unwrap_or_tests {
         graph.set_goto(u, c, vec![w.clone()]);
         graph.set_goto(h, u, vec![h_args[0].clone(), default]);
         graph.set_goto(a, h, vec![r]);
-        let site = ResultUnwrapOrSite {
+        let site = CarrierCombinatorSite {
             result_var: w,
             payload_ty: ValueType::Ref(None),
+            catch: CarrierCatchKind::JoinDefault,
         };
-        assert_eq!(rewire_result_unwrap_or_sites(&mut graph, &[site]), 1);
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
         assert!(!has_unwrap_or(&graph), "no residual unwrap_or call");
         assert_link_args_defined(&graph);
         let (normal, exc) = last_exception_pair(&graph, a.0);
@@ -14171,11 +14299,12 @@ mod result_unwrap_or_tests {
         graph.set_return(c, None);
         graph.set_goto(u, c, vec![w.clone()]);
         graph.set_goto(a, u, vec![r]);
-        let site = ResultUnwrapOrSite {
+        let site = CarrierCombinatorSite {
             result_var: w,
             payload_ty: ValueType::Ref(None),
+            catch: CarrierCatchKind::JoinDefault,
         };
-        assert_eq!(rewire_result_unwrap_or_sites(&mut graph, &[site]), 1);
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
         assert!(!has_unwrap_or(&graph), "no residual unwrap_or call");
         assert_link_args_defined(&graph);
         let (normal, exc) = last_exception_pair(&graph, a.0);
@@ -14213,7 +14342,7 @@ mod result_unwrap_or_tests {
             kind: OpKind::ConstInt(7),
         });
         let before = format!("{:?}", graph.blocks[u].operations);
-        assert_eq!(rewire_result_unwrap_or_sites(&mut graph, &[site]), 0);
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 0);
         assert!(has_unwrap_or(&graph), "residual unwrap_or survives");
         assert!(
             !matches!(
@@ -14247,13 +14376,147 @@ mod result_unwrap_or_tests {
             )
             .expect("unwrap_or");
         graph.set_return(a, None);
-        let site = ResultUnwrapOrSite {
+        let site = CarrierCombinatorSite {
             result_var: w,
             payload_ty: ValueType::Int,
+            catch: CarrierCatchKind::JoinDefault,
         };
-        assert_eq!(rewire_result_unwrap_or_sites(&mut graph, &[site]), 0);
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 0);
         assert!(has_unwrap_or(&graph));
         assert!(graph.blocks[a.0].exitswitch.is_none());
+    }
+
+    fn has_method(graph: &FunctionGraph, method: &str) -> bool {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == method
+                )
+            })
+        })
+    }
+
+    fn raises_implicit_assertion(graph: &FunctionGraph, block: usize) -> bool {
+        let block = &graph.blocks[block];
+        block.exits.len() == 1
+            && block.exits[0].target == graph.exceptblock
+            && block.exits[0].args.len() == 2
+            && matches!(&block.exits[0].args[0], LinkArg::Const(_))
+    }
+
+    fn carrier_expect_two_block() -> (FunctionGraph, CarrierCombinatorSite, crate::model::BlockId) {
+        let mut graph = FunctionGraph::new("carrier_expect");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["pop_left"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("pop_left");
+        let (u, u_args) = graph.create_block_with_arg_vars(1);
+        let msg = graph
+            .push_op_var(u, OpKind::ConstInt(1), true)
+            .expect("msg");
+        let w = graph
+            .push_op_var(
+                u,
+                OpKind::Call {
+                    target: CallTarget::method("expect", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![u_args[0].clone(), msg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("expect");
+        let (c, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(c, None);
+        graph.set_goto(u, c, vec![w.clone()]);
+        graph.set_goto(a, u, vec![r]);
+        let site = CarrierCombinatorSite {
+            result_var: w,
+            payload_ty: ValueType::Ref(None),
+            catch: CarrierCatchKind::RaiseImplicit,
+        };
+        (graph, site, c)
+    }
+
+    #[test]
+    fn carrier_expect_rewires_to_last_exception_panic() {
+        let (mut graph, site, c) = carrier_expect_two_block();
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
+        assert!(!has_method(&graph, "expect"), "no residual expect call");
+        assert_link_args_defined(&graph);
+        let a = graph.startblock.0;
+        let (normal, exc) = last_exception_pair(&graph, a);
+        assert_eq!(normal.target, c, "normal link carries the reminted T");
+        assert!(
+            raises_implicit_assertion(&graph, exc.target.0),
+            "catch link reaches an implicit-AssertionError raise"
+        );
+        assert_eq!(exc.exitcase, Some(crate::model::error_carrier_exitcase()));
+        let payload_defined = graph.blocks[a]
+            .operations
+            .iter()
+            .any(|op| op.result.as_ref() == normal.args[0].as_variable());
+        assert!(
+            payload_defined,
+            "normal link carries the reminted call result"
+        );
+    }
+
+    #[test]
+    fn carrier_unwrap_rewires_to_last_exception_panic() {
+        let mut graph = FunctionGraph::new("carrier_unwrap");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["pop_right"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("pop_right");
+        let (u, u_args) = graph.create_block_with_arg_vars(1);
+        let w = graph
+            .push_op_var(
+                u,
+                OpKind::Call {
+                    target: CallTarget::method("unwrap", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![u_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("unwrap");
+        let (c, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(c, None);
+        graph.set_goto(u, c, vec![w.clone()]);
+        graph.set_goto(a, u, vec![r]);
+        let site = CarrierCombinatorSite {
+            result_var: w,
+            payload_ty: ValueType::Ref(None),
+            catch: CarrierCatchKind::RaiseImplicit,
+        };
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
+        assert!(!has_method(&graph, "unwrap"), "no residual unwrap call");
+        assert_link_args_defined(&graph);
+        let (normal, exc) = last_exception_pair(&graph, a.0);
+        assert_eq!(normal.target, c, "normal link carries the reminted T");
+        assert!(
+            raises_implicit_assertion(&graph, exc.target.0),
+            "catch link reaches an implicit-AssertionError raise"
+        );
+        assert_eq!(exc.exitcase, Some(crate::model::error_carrier_exitcase()));
     }
 }
 
