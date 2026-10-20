@@ -1166,7 +1166,6 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // when the C char type is u8. Rust's erased managed-byte-pointer
         // convention belongs to Rust bodies, not foreign declarations;
         // agree with tyref_to_external_lltype's Address / getkind('int').
-        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, llbc, error_carrier);
         let token = if fd.is_extern() && tyref_is_raw_pointer(&fd.signature.output, llbc) {
             Some("i64".to_string())
         } else {
@@ -1176,7 +1175,6 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 error_carrier,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
-                pair_body.as_ref(),
             )
         };
         let class_root = dont_look_inside_return_class_root(
@@ -5237,7 +5235,6 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
                 spec,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
-                None,
             )
             .unwrap_or_else(|| "()".to_string()),
         );
@@ -5271,7 +5268,6 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-    body: Option<&Unstructured>,
 ) -> Option<String> {
     // A `Result<T, PyError>` callee is reached through the residual-call
     // ABI, which hands back the `Ok` payload and routes the error through
@@ -5318,10 +5314,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     // `pair_len_shadow` leaves it without a length slot, so FUNC.RESULT
     // follows the CFG GcRef. A `BytesBlock.chars` view is one STR Ref;
     // `arraylen_gc` reads length.
-    if tyref_pair_slice_item_kind(kind_src, llbc).is_some()
-        && !(tyref_slice_elem_is_u8(kind_src, llbc)
-            && body.is_some_and(|body| body_returns_bytes_block_chars_view(body, llbc)))
-    {
+    if tyref_pair_slice_item_kind(kind_src, llbc).is_some() {
         return Some("u64".to_string());
     }
     // A function-return tuple is `model.py SomeTuple` (`rtuple.py`).

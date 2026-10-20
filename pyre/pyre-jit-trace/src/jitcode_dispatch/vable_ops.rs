@@ -39,8 +39,13 @@ fn replace_live_regs(live: &LiveFrameRegs, oldbox: OpRef, newbox: OpRef) {
     live.replace_active_box(oldbox, newbox);
 }
 
-/// Bind this walk's live banks onto the MIFrame that is about to pause
-/// for a child: the top inlined Python frame, or the portal.
+/// Bind this walk's live banks onto the current MIFrame.
+///
+/// `pyjitpl.py` `walk_active_trace_refs` walks every `framestack`
+/// `MIFrame.registers_r`, including the frame that is executing. Helper
+/// subwalks park that list on `helper_live`; a Python / portal body parks
+/// it here. Called at frame entry and again when the frame pauses for a
+/// child (`bind_paused_caller_regs` at the CALL).
 pub(super) fn bind_paused_caller_regs(
     session: &std::cell::RefCell<WalkSession>,
     registers_r: &RegisterBank,

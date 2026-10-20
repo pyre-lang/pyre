@@ -2410,6 +2410,26 @@ impl<'a> Lowering<'a> {
                         first_arg_ty.as_ref(),
                         &call.dest.ty,
                     ) {
+                        // A later window / pair `from_raw_parts` must keep
+                        // chars as a displaced ptr (`length_relaxed` is not
+                        // `ll_strlen`). Aliasing the add dest to the header
+                        // would make that dest `(header, live_len)` and
+                        // would drop the peel `ptr_add_chars_offset_header`
+                        // needs. Bind CCHARP (`direct_arrayitems` of
+                        // `STR.chars`), not `r_uint`.
+                        if self.add_dest_feeds_window_from_raw_parts(dest_local) {
+                            let chars = self.chars_ptr_of_header(
+                                mir_bb,
+                                args[0].clone(),
+                                lowlevel_string_chars_byte_offset(),
+                            );
+                            let ptr = emit_cast_int_to_ccharp(&mut self.graph, bb_id, chars);
+                            self.local_var[dest_local] = Some(LocalValue::One(ptr));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
@@ -10150,14 +10170,12 @@ impl<'a> Lowering<'a> {
             carrier,
             self.gc_struct_ids,
         );
-        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, self.llbc, carrier);
         let token = dont_look_inside_return_token(
             &signature.output,
             self.llbc,
             carrier,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
-            pair_body.as_ref(),
         );
         if class_root.is_none()
             && container_root.is_none()

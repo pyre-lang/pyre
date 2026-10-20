@@ -599,7 +599,7 @@ fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
         kind(
             serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
         ),
-        Some(VecItemKind::Int)
+        None
     );
     assert_eq!(
         kind(
