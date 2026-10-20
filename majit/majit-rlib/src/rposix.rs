@@ -441,11 +441,10 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-// `rposix_stat.c_fstat` / `c_stat` / `c_lstat` are `macro=True` and save
-// errno. The call is `libc::fstat` / `libc::stat` / `libc::lstat`, which
-// already carry the inode64 symbol. Includes are
-// `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; these
-// three calls do not use it).
+// `rposix_stat.c_fstat` is `macro=True` and saves errno. The call is
+// `libc::fstat`, which already carries the inode64 symbol. Includes are
+// `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; this
+// call does not use it). `c_stat` / `c_lstat` live in `rposix_stat`.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const STAT_ECI = {
@@ -463,25 +462,9 @@ crate::rffi::llexternal!(
     macro = libc::fstat
 );
 
+// `host_seam` and the tests below still name `rposix::c_stat` / `c_lstat`.
 #[cfg(unix)]
-crate::rffi::llexternal!(
-    pub c_stat = "stat",
-    [*const libc::c_char, *mut libc::stat],
-    crate::rffi::INT,
-    compilation_info = STAT_ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::stat
-);
-
-#[cfg(unix)]
-crate::rffi::llexternal!(
-    pub c_lstat = "lstat",
-    [*const libc::c_char, *mut libc::stat],
-    crate::rffi::INT,
-    compilation_info = STAT_ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::lstat
-);
+pub use crate::rposix_stat::{c_lstat, c_stat};
 
 // `rposix_stat.c_fstatvfs` / `c_statvfs` save errno and are not `macro=True`.
 #[cfg(all(unix, not(target_os = "redox")))]
@@ -3205,6 +3188,18 @@ mod tests {
         let mut followed: libc::stat = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { c_stat(c_link.as_ptr(), &mut followed) }, 0);
         assert_eq!(followed.st_size, 2 as libc::off_t);
+
+        let st = crate::rposix_stat::stat(dir.as_os_str().as_bytes()).expect("stat dir");
+        assert_eq!(st.st_mode as libc::mode_t & libc::S_IFMT, libc::S_IFDIR);
+        let lst = crate::rposix_stat::lstat(link.as_os_str().as_bytes()).expect("lstat link");
+        assert_eq!(lst.st_mode as libc::mode_t & libc::S_IFMT, libc::S_IFLNK);
+        let followed_st = crate::rposix_stat::stat(link.as_os_str().as_bytes()).expect("stat link");
+        assert_eq!(followed_st.st_size, 2);
+        assert_eq!(
+            crate::rposix_stat::stat(b"/no/such/pyre-rffi-stat").unwrap_err(),
+            libc::ENOENT
+        );
+        assert_eq!(crate::rposix_stat::stat(b"a\0b").unwrap_err(), libc::EINVAL);
 
         assert_eq!(unsafe { c_unlink(c_file.as_ptr()) }, 0);
         assert!(unsafe { c_stat(c_file.as_ptr(), &mut followed) } < 0);

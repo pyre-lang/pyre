@@ -41,51 +41,13 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 pub mod host {
     #[cfg(all(unix, not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pub mod fs {
-        use std::ffi::{CString, OsString};
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
         use std::path::Path;
 
         fn path_c(path: &Path) -> std::io::Result<CString> {
             CString::new(path.as_os_str().as_bytes())
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
-        }
-
-        fn posix_err() -> std::io::Error {
-            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno())
-        }
-
-        pub struct Metadata {
-            len: u64,
-            mode: libc::mode_t,
-        }
-
-        impl Metadata {
-            pub fn len(&self) -> u64 {
-                self.len
-            }
-            pub fn file_type(&self) -> FileType {
-                FileType { mode: self.mode }
-            }
-        }
-
-        pub struct FileType {
-            mode: libc::mode_t,
-        }
-
-        impl FileType {
-            pub fn is_symlink(&self) -> bool {
-                self.mode & libc::S_IFMT == libc::S_IFLNK
-            }
-        }
-
-        pub struct DirEntry {
-            name: Vec<u8>,
-        }
-
-        impl DirEntry {
-            pub fn file_name(&self) -> OsString {
-                OsString::from_vec(self.name.clone())
-            }
         }
 
         pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -127,38 +89,22 @@ pub mod host {
             Ok(out)
         }
 
-        fn stat_at(path: &Path, follow: bool) -> std::io::Result<Metadata> {
-            let c_path = path_c(path)?;
-            let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
-            let ret = if follow {
-                unsafe { majit_rlib::rposix::c_stat(c_path.as_ptr(), &mut st) }
-            } else {
-                unsafe { majit_rlib::rposix::c_lstat(c_path.as_ptr(), &mut st) }
-            };
-            if ret < 0 {
-                return Err(posix_err());
-            }
-            Ok(Metadata {
-                len: st.st_size as u64,
-                mode: st.st_mode,
-            })
+        /// `rposix_stat.stat`.
+        pub fn stat(path: &Path) -> std::io::Result<majit_rlib::rposix_stat::StatResult> {
+            majit_rlib::rposix_stat::stat(path.as_os_str().as_bytes())
+                .map_err(std::io::Error::from_raw_os_error)
         }
 
-        pub fn metadata(path: &Path) -> std::io::Result<Metadata> {
-            stat_at(path, true)
+        /// `rposix_stat.lstat`.
+        pub fn lstat(path: &Path) -> std::io::Result<majit_rlib::rposix_stat::StatResult> {
+            majit_rlib::rposix_stat::lstat(path.as_os_str().as_bytes())
+                .map_err(std::io::Error::from_raw_os_error)
         }
 
-        pub fn symlink_metadata(path: &Path) -> std::io::Result<Metadata> {
-            stat_at(path, false)
-        }
-
-        pub fn read_dir(path: &Path) -> std::io::Result<Vec<std::io::Result<DirEntry>>> {
-            let names = majit_rlib::rposix::listdir(path.as_os_str().as_bytes())
-                .map_err(std::io::Error::from_raw_os_error)?;
-            Ok(names
-                .into_iter()
-                .map(|name| Ok(DirEntry { name }))
-                .collect())
+        /// `rposix.listdir`.
+        pub fn listdir(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+            majit_rlib::rposix::listdir(path.as_os_str().as_bytes())
+                .map_err(std::io::Error::from_raw_os_error)
         }
     }
 
@@ -422,6 +368,63 @@ fn default_source_provider() -> Arc<dyn SourceProvider> {
     Arc::new(NullSourceProvider)
 }
 
+/// `st_size` of `rposix_stat.stat` on unix; the `std`-shaped metadata of
+/// `rustpython_host_env::fs` elsewhere.
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
+fn host_file_size(path: &Path) -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        host_fs::stat(path).map(|st| st.st_size as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        host_fs::metadata(path).map(|m| m.len())
+    }
+}
+
+/// The byte names `rposix.listdir` returns on unix; the `read_dir` entry
+/// names elsewhere.
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
+fn host_listdir_names(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+    #[cfg(unix)]
+    {
+        host_fs::listdir(path)
+    }
+    #[cfg(not(unix))]
+    {
+        host_fs::read_dir(path)?
+            .into_iter()
+            .map(|entry| entry.map(|entry| entry.file_name().as_encoded_bytes().to_vec()))
+            .collect()
+    }
+}
+
+/// `S_ISLNK` of `rposix_stat.lstat` on unix; the `symlink_metadata` file
+/// type elsewhere.
+#[cfg(all(
+    feature = "host_env",
+    not(target_arch = "wasm32"),
+    not(feature = "sandbox")
+))]
+fn host_is_symlink(path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        host_fs::lstat(path).map(|st| st.st_mode as libc::mode_t & libc::S_IFMT == libc::S_IFLNK)
+    }
+    #[cfg(not(unix))]
+    {
+        host_fs::symlink_metadata(path).map(|m| m.file_type().is_symlink())
+    }
+}
+
 /// Kernel-filesystem provider — the default on native and the wasmtime
 /// runner's real-FS path.  `is_file`/`is_dir` go straight to `std::fs::
 /// metadata` via the `Path` methods (matching the historical `find_in_dirs`
@@ -449,13 +452,10 @@ impl SourceProvider for HostFsProvider {
         host_fs::read(path)
     }
     fn file_size(&self, path: &Path) -> std::io::Result<u64> {
-        host_fs::metadata(path).map(|meta| meta.len())
+        host_file_size(path)
     }
     fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
-        host_fs::read_dir(path)?
-            .into_iter()
-            .map(|entry| entry.map(|entry| entry.file_name().as_encoded_bytes().to_vec()))
-            .collect()
+        host_listdir_names(path)
     }
     fn frozen_marshal_cache_ok(&self) -> bool {
         true
@@ -2927,10 +2927,10 @@ fn resolve_final_symlinks(path: &Path) -> PathBuf {
     let cwd = host_os::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut resolved = absolute_from(path.to_path_buf(), &cwd);
     loop {
-        let Ok(metadata) = host_fs::symlink_metadata(&resolved) else {
+        let Ok(is_link) = host_is_symlink(&resolved) else {
             return resolved;
         };
-        if !metadata.file_type().is_symlink() {
+        if !is_link {
             return resolved;
         }
         let Ok(target) = std::fs::read_link(&resolved) else {

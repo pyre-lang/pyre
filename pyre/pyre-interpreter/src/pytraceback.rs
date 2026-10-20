@@ -432,6 +432,68 @@ pub unsafe fn mark_traceback_escaped(w_traceback: PyObjectRef) {
     }
 }
 
+/// `pytraceback.py PyTraceback(space, frame, last_instruction, w_next)`
+///
+/// One traceback node: snap `last_instruction` to the owning opcode (the
+/// `< 0` sentinel stays), convert instruction units to bytes (`* 2`), and
+/// leave `lineno` at `LINENO_NOT_COMPUTED`.
+///
+/// # Safety
+/// `frame` must be a valid live `PyFrame`.  `w_next` is `PY_NULL` or a
+/// valid object.
+pub unsafe fn w_pytraceback_for_frame(
+    frame: *mut crate::pyframe::PyFrame,
+    last_instruction: i64,
+    w_next: PyObjectRef,
+) -> PyObjectRef {
+    unsafe {
+        let roots = pyre_object::gc_roots::push_roots();
+        let next_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_next);
+        let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(frame as PyObjectRef);
+        let frame = roots.get(frame_slot) as *mut crate::pyframe::PyFrame;
+        // `tb_lasti` names an instruction, and every fixture that pins it
+        // pins `f_lasti == tb_lasti`, so the two have to snap the same way:
+        // a caller suspended at a `CALL` carries that call's last cache word
+        // in `last_instr` (`PyFrame::executing_instr`).  The `-1` of a frame
+        // that has dispatched nothing is a sentinel, not an offset, and
+        // `PyTraceback.__init__` stores it unchanged.  Non-negative values
+        // snap to the owning opcode then convert instruction units to bytes.
+        let lasti = if last_instruction < 0 {
+            last_instruction
+        } else {
+            crate::pyopcode::owning_instruction(
+                &(*crate::pyframe::pyframe_get_pycode(&*frame)).instructions,
+                last_instruction as usize,
+            ) as i64
+                * 2
+        };
+        // `PyTraceback(space, frame, last_instruction, w_next)` leaves
+        // `lineno` at `LINENO_NOT_COMPUTED`; `get_lineno` resolves it from
+        // the code object and `lasti` on the first read.  A node whose line
+        // is never read never walks the line table.
+        //
+        // The `PyCode` PyObjectRef is captured into the `w_code` slot so the
+        // traceback's source-path / function name metadata stays GC-rooted,
+        // and the getter resolves the line from it at any later point —
+        // readers (e.g. `write_traceback_chain` in `error.rs`) MUST go
+        // through `w_code` rather than dereferencing the `frame` pointer.
+        let frame =
+            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
+        let w_code = (*frame).pycode as PyObjectRef;
+        let code_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_code);
+        // The constructor sees the forwarded frame, code, and next node
+        // rather than the locals.
+        let frame =
+            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
+        let w_next = pyre_object::gc_roots::shadow_stack_get(next_slot);
+        let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
+        w_pytraceback_new(frame, lasti, w_next, LINENO_NOT_COMPUTED, w_code)
+    }
+}
+
 /// `pytraceback.py record_application_traceback` parity:
 ///
 /// ```python
@@ -493,67 +555,26 @@ pub unsafe fn record_application_traceback(
         let _ = roots.pin_root(w_exc_object);
         let frame_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(frame as PyObjectRef);
-        let frame = roots.get(frame_slot) as *mut crate::pyframe::PyFrame;
-        // `tb_lasti` names an instruction, and every fixture that pins it
-        // pins `f_lasti == tb_lasti`, so the two have to snap the same way:
-        // a caller suspended at a `CALL` carries that call's last cache word
-        // in `last_instr` (`PyFrame::executing_instr`).  The `-1` of a frame
-        // that has dispatched nothing is a sentinel, not an offset, and stays
-        // one -- `offset2lineno` answers it as "no line".
-        let last_instruction = if last_instruction < 0 {
-            last_instruction
-        } else {
-            crate::pyopcode::owning_instruction(
-                &(*crate::pyframe::pyframe_get_pycode(&*frame)).instructions,
-                last_instruction as usize,
-            ) as i64
-        };
         // Keep the exception now being propagated GC-reachable: until a frame
         // catches it, it lives only in the in-flight Rust `PyError`, so a
         // safepoint would otherwise miss the nursery exception (and the
         // traceback chain it roots) (`tstate->current_exception` parity).
         // The in-flight cell is a walked root. The pins above cover
-        // `w_pytraceback_new`, which collects; the local is not rewritten, so
-        // re-read the pin after that constructor — the same address the
-        // walker writes back into the in-flight cell.
+        // `w_pytraceback_for_frame`, which collects; the local is not
+        // rewritten, so re-read the pin after that constructor — the same
+        // address the walker writes back into the in-flight cell.
         crate::eval::set_in_flight_exception(roots.get(exc_slot));
-        // `pytraceback.py record_application_traceback` builds
-        // `PyTraceback(space, frame, last_instruction, tb)` and leaves
-        // `lineno` at `LINENO_NOT_COMPUTED`; `get_lineno` resolves it from
-        // the code object and `lasti` on the first read.  A node whose line
-        // is never read never walks the line table.
-        //
-        // The `PyCode` PyObjectRef is captured into the `w_code` slot so the
-        // traceback's source-path / function name metadata stays GC-rooted,
-        // and the getter resolves the line from it at any later point —
-        // readers (e.g. `write_traceback_chain` in `error.rs`) MUST go
-        // through `w_code` rather than dereferencing the `frame` pointer.
-        let frame =
-            pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
-        let w_code = (*frame).pycode as PyObjectRef;
-        let code_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_code);
         // `tb = operror.get_traceback()` — the read that grows the chain
         // marks the previous head's frame, matching `get_traceback`.
         let w_exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(w_exc_object);
         mark_traceback_escaped(prev_tb);
-        // `last_instruction` counts instructions; the slot holds bytes.
-        // The constructor sees the forwarded frame, code, and previous node
-        // rather than the locals.
         let frame =
             pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut crate::pyframe::PyFrame;
         let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
         );
-        let w_code = pyre_object::gc_roots::shadow_stack_get(code_slot);
-        let new_tb = w_pytraceback_new(
-            frame,
-            last_instruction * 2,
-            prev_tb,
-            LINENO_NOT_COMPUTED,
-            w_code,
-        );
+        let new_tb = w_pytraceback_for_frame(frame, last_instruction, prev_tb);
         let w_exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         pyre_object::interp_exceptions::w_exception_set_traceback(w_exc_object, new_tb);
         crate::eval::set_in_flight_exception(w_exc_object);
@@ -670,6 +691,24 @@ mod tests {
         unsafe {
             assert!(w_pytraceback_set_w_next(outer, inner).is_ok());
             assert_eq!(w_pytraceback_get_w_next(outer), inner);
+        }
+    }
+
+    /// `PyTraceback.__init__` stores the frame's `last_instr == -1` sentinel
+    /// unchanged; converting instruction units to bytes must not turn it into
+    /// `-2`.
+    #[test]
+    fn last_instr_sentinel_stays_minus_one() {
+        let code = crate::compile_exec("pass\n").expect("compile");
+        let w_code = crate::pycode::box_code_constant(&code);
+        let globals = pyre_object::w_dict_new();
+        let mut frame =
+            crate::pyframe::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
+                .expect("frame");
+        assert_eq!(frame.last_instr, -1);
+        unsafe {
+            let tb = w_pytraceback_for_frame(frame.as_mut_ptr(), -1, PY_NULL);
+            assert_eq!(w_pytraceback_get_lasti(tb), -1);
         }
     }
 }

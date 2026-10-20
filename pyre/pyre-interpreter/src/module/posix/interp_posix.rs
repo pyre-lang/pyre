@@ -5209,27 +5209,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     }
 
     /// The names a directory descriptor holds, `.` and `..` left out.
+    /// `interp_posix.listdir` dups first (`rposix.dup(..., inheritable=False)`),
+    /// then `rposix.fdlistdir` takes the duplicate.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     fn fdlistdir(fd: i32) -> Result<Vec<Vec<u8>>, i32> {
-        let mut names = Vec::new();
-        fd_readdir(fd, |name, _ino, _d_type| names.push(name.to_vec()))?;
-        Ok(names)
-    }
-
-    /// `rposix.listdir`: `c_opendir` then `_listdir` with `rewind=False`.
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    fn path_listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
-        let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
-        let dirp = unsafe { majit_rlib::rposix::c_opendir(c_path.as_ptr()) };
-        if dirp.is_null() {
+        let dup = unsafe { majit_rlib::rposix::c_dup_noninheritable(fd) };
+        if dup < 0 {
             return Err(majit_rlib::rposix::get_saved_errno());
         }
-        let mut names = Vec::new();
-        let errno = readdir_collect(dirp, |name, _ino, _d_type| names.push(name.to_vec()));
-        unsafe {
-            let _ = majit_rlib::rposix::c_closedir(dirp);
-        }
-        if errno != 0 { Err(errno) } else { Ok(names) }
+        majit_rlib::rposix::fdlistdir(dup)
+    }
+
+    /// `rposix.listdir`.
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    fn path_listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
+        majit_rlib::rposix::listdir(path)
     }
 
     // ── posix.listdir(path=".") → list of str ──
@@ -5892,54 +5886,68 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
     }
 
-    /// `rposix_stat.build_stat_result` reads the same fields off the raw
-    /// `struct stat` the `*at` calls fill in.
+    /// `rposix_stat.build_stat_result` fields, already in `STAT_FIELDS` order.
     #[cfg(all(unix, not(feature = "sandbox")))]
-    fn stat_fields_from_libc(st: &libc::stat) -> StatFields {
+    fn stat_fields_from_libc(st: &majit_rlib::rposix_stat::StatResult) -> StatFields {
         StatFields {
-            mode: st.st_mode as i64,
-            ino: st.st_ino as u128,
-            dev: st.st_dev as i64,
-            nlink: st.st_nlink as i64,
-            uid: st.st_uid as i64,
-            gid: st.st_gid as i64,
+            mode: st.st_mode,
+            // `st_ino` is unsigned in `struct stat`; the `Signed` field holds
+            // its bits.
+            ino: st.st_ino as u64 as u128,
+            dev: st.st_dev,
+            nlink: st.st_nlink,
+            uid: st.st_uid,
+            gid: st.st_gid,
             size: st.st_size,
             atime: st.st_atime,
             mtime: st.st_mtime,
             ctime: st.st_ctime,
-            atime_ns: whole_ns(st.st_atime, st.st_atime_nsec),
-            mtime_ns: whole_ns(st.st_mtime, st.st_mtime_nsec),
-            ctime_ns: whole_ns(st.st_ctime, st.st_ctime_nsec),
-            blksize: st.st_blksize as i64,
+            atime_ns: whole_ns(st.st_atime, st.nsec_atime),
+            mtime_ns: whole_ns(st.st_mtime, st.nsec_mtime),
+            ctime_ns: whole_ns(st.st_ctime, st.nsec_ctime),
+            blksize: st.st_blksize,
             blocks: st.st_blocks,
-            rdev: st.st_rdev as i64,
+            rdev: st.st_rdev,
         }
     }
 
     /// `rposix_stat.build_stat_result` over a filled `STAT_STRUCT`.
     #[cfg(all(unix, not(feature = "sandbox")))]
-    fn stat_result_from_libc_stat(st: &libc::stat) -> pyre_object::PyObjectRef {
-        #[cfg(target_os = "macos")]
-        let st_flags = st.st_flags;
-        #[cfg(not(target_os = "macos"))]
+    fn stat_result_from_libc_stat(
+        st: &majit_rlib::rposix_stat::StatResult,
+    ) -> pyre_object::PyObjectRef {
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        let st_flags = st.st_flags as u32;
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        )))]
         let st_flags = 0u32;
         stat_result_from_fields(&stat_fields_from_libc(st), st_flags)
     }
 
-    /// `rposix_stat.stat` / `lstat`: `c_stat` / `c_lstat` into a `STAT_STRUCT`.
+    /// `rposix_stat.stat` / `lstat`.
     #[cfg(all(unix, not(feature = "sandbox")))]
-    fn libc_stat_path(path: &[u8], follow: bool) -> Result<libc::stat, i32> {
-        let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
-        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let ret = if follow {
-            unsafe { majit_rlib::rposix::c_stat(c_path.as_ptr(), st.as_mut_ptr()) }
+    fn libc_stat_path(
+        path: &[u8],
+        follow: bool,
+    ) -> Result<majit_rlib::rposix_stat::StatResult, i32> {
+        if follow {
+            majit_rlib::rposix_stat::stat(path)
         } else {
-            unsafe { majit_rlib::rposix::c_lstat(c_path.as_ptr(), st.as_mut_ptr()) }
-        };
-        if ret != 0 {
-            return Err(majit_rlib::rposix::get_saved_errno());
+            majit_rlib::rposix_stat::lstat(path)
         }
-        Ok(unsafe { st.assume_init() })
     }
 
     /// The Windows counterpart of `stat_fields_from_libc`.  `win32_xstat` and
@@ -6289,7 +6297,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 return Err(errno_err_with_filename(errno, path.w_path()));
             }
             let st = unsafe { st.assume_init() };
-            return Ok(stat_result_from_libc_stat(&st));
+            return Ok(stat_result_from_libc_stat(
+                &majit_rlib::rposix_stat::build_stat_result(&st),
+            ));
         }
         // Unreachable in practice — `stat_entry` turns a `dir_fd` away at
         // unwrap time wherever `HAVE_FSTATAT` is false — but the arm has to
@@ -6393,7 +6403,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         name: &[u8],
         dir_fd: i32,
         follow_symlinks: bool,
-    ) -> Result<libc::stat, i32> {
+    ) -> Result<majit_rlib::rposix_stat::StatResult, i32> {
         let c_name = std::ffi::CString::new(name).map_err(|_| libc::EINVAL)?;
         let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
         let flags = if follow_symlinks {
@@ -6409,7 +6419,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             let errno = majit_rlib::rposix::get_saved_errno();
             return Err(if errno == 0 { libc::EBADF } else { errno });
         }
-        Ok(unsafe { st.assume_init() })
+        Ok(majit_rlib::rposix_stat::build_stat_result(&unsafe {
+            st.assume_init()
+        }))
     }
     fn dir_entry_follow(args: &[PyObjectRef]) -> Result<bool, crate::PyError> {
         match args.get(1).copied().filter(|value| !value.is_null()) {
@@ -7465,7 +7477,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
                 let ret = unsafe { majit_rlib::rposix::c_fstat(fd, st.as_mut_ptr()) };
                 if ret == 0 {
-                    return Ok(stat_result_from_libc_stat(&unsafe { st.assume_init() }));
+                    return Ok(stat_result_from_libc_stat(
+                        &majit_rlib::rposix_stat::build_stat_result(&unsafe { st.assume_init() }),
+                    ));
                 }
                 let errno = majit_rlib::rposix::get_saved_errno();
                 crate::builtins::eintr_retry_with(std::io::Error::from_raw_os_error(errno), |e| {

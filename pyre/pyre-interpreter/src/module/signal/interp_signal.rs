@@ -109,42 +109,14 @@ fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
     }
 }
 
-/// error.py `exception_from_saved_errno(space, w_type)` — build an instance
-/// of `class_name` (an `OSError` or subclass) carrying the errno and its
-/// strerror, so `.errno` / `str()` behave like any `OSError`.  Falls back
-/// to `OSError` if `class_name` is not registered.
+/// `space.w_OSError` / `get_itimer_error(space)` for
+/// `error.py exception_from_saved_errno` / `exception_from_errno`.
+/// Falls back to `OSError` if `class_name` is not registered.
 #[cfg(all(feature = "host_env", unix))]
-fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
-    let strerror = {
-        #[cfg(not(feature = "sandbox"))]
-        {
-            match majit_rlib::rposix::strerror(errno) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(()) => format!("error {errno}"),
-            }
-        }
-        #[cfg(feature = "sandbox")]
-        unsafe {
-            std::ffi::CStr::from_ptr(libc::strerror(errno))
-                .to_string_lossy()
-                .into_owned()
-        }
-    };
-    let cls = crate::builtins::lookup_exc_class(class_name)
+fn errno_w_type(class_name: &str) -> PyObjectRef {
+    crate::builtins::lookup_exc_class(class_name)
         .or_else(|| crate::builtins::lookup_exc_class("OSError"))
-        .expect("OSError must be installed");
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(cls);
-    let errno_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
-    let msg_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&strerror));
-    let w_value = pyre_object::w_tuple_new(vec![
-        pyre_object::gc_roots::shadow_stack_get(errno_slot),
-        pyre_object::gc_roots::shadow_stack_get(msg_slot),
-    ]);
-    crate::PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
+        .expect("OSError must be installed")
 }
 
 /// interp_signal.py `timeval_from_double`.
@@ -587,7 +559,7 @@ impl CheckSignalAction {
         // async handler stashed, before polling pending signals.
         let werr = signalstate::get_wakeup_fd_write_errno();
         if werr != 0 {
-            report_wakeup_fd_error(werr);
+            report_wakeup_fd_error(ec, werr);
         }
         let mut n = self.pending_signal;
         if n < 0 {
@@ -706,35 +678,48 @@ fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError
 }
 
 /// interp_signal.py `_report_wakeup_fd_error` — surface the errno
-/// of a failed wakeup-fd write.  PyPy reports it through
-/// `write_unraisable_default`; pyre has no unraisable hook, so it writes
-/// the equivalent `OSError` line to stderr directly.
-fn report_wakeup_fd_error(errno_val: i32) {
-    #[cfg(unix)]
-    let msg = {
-        #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-        {
-            match majit_rlib::rposix::strerror(errno_val) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(()) => format!("error {errno_val}"),
-            }
-        }
-        #[cfg(not(all(feature = "host_env", not(feature = "sandbox"))))]
-        unsafe {
-            let p = libc::strerror(errno_val);
-            if p.is_null() {
-                format!("error {errno_val}")
-            } else {
-                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-            }
-        }
+/// of a failed wakeup-fd write through `write_unraisable_default`.
+fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
+    let Some(w_type) = crate::builtins::lookup_exc_class("OSError") else {
+        return;
     };
-    #[cfg(not(unix))]
-    let msg = format!("error {errno_val}");
-    crate::host_seam::emit_stderr(
-        b"Exception ignored when trying to write to the signal wakeup fd:\n",
+    let msg = match crate::error::strerror(errno_val) {
+        Ok(msg) => msg,
+        Err(()) => rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno_val}")),
+    };
+    let mut err = crate::PyError::os_error_errno_strerror(errno_val, msg);
+    let w_exc = err.to_exc_object();
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_type);
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_exc);
+    let frame = ec.gettopframe_nohidden();
+    let w_tb = if !frame.is_null() {
+        unsafe { (*frame).mark_as_escaped() };
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        crate::executioncontext::force_frame(frame);
+        let frame = anchor.live();
+        let last_instr = unsafe { (*frame).last_instr as i64 };
+        unsafe {
+            crate::pytraceback::w_pytraceback_for_frame(frame, last_instr, pyre_object::PY_NULL)
+        }
+    } else {
+        pyre_object::w_none()
+    };
+    let tb_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_tb);
+    crate::PyError::write_unraisable_default(
+        pyre_object::w_none(),
+        roots.get(type_slot),
+        roots.get(exc_slot),
+        roots.get(tb_slot),
+        rustpython_wtf8::Wtf8::new(
+            "Exception ignored when trying to write to the signal wakeup fd",
+        ),
+        pyre_object::w_none(),
+        "",
     );
-    crate::host_seam::emit_stderr(format!("OSError: [Errno {errno_val}] {msg}\n").as_bytes());
 }
 
 impl AsyncActionOps for CheckSignalAction {
@@ -1191,16 +1176,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
                         let ret = unsafe { majit_rlib::rsignal::c_sigemptyset(&mut mask) };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::_get_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         let ret = unsafe { majit_rlib::rsignal::c_sigfillset(&mut mask) };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::_get_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         Ok(sigset_to_signals(&mut mask))
@@ -1347,9 +1332,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         majit_rlib::rsignal::c_setitimer(which, &mut new_value, &mut old)
                     });
                     if ret != 0 {
-                        return Err(errno_exception(
-                            "signal.ItimerError",
-                            majit_rlib::rposix::get_saved_errno(),
+                        return Err(crate::error::exception_from_saved_errno(
+                            pyre_object::PY_NULL,
+                            errno_w_type("signal.ItimerError"),
                         ));
                     }
                     Ok(itimer_retval(&old))
@@ -1486,7 +1471,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             majit_rlib::rsignal::c_sigwait(&mut set, &mut signum)
                         });
                         if ret != 0 {
-                            return Err(errno_exception("OSError", ret));
+                            // interp_signal.py `sigwait` raises
+                            // `exception_from_saved_errno`; `rsignal.c_sigwait`
+                            // returns the error number, so `ret` is passed.
+                            return Err(crate::error::exception_from_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
+                                ret,
+                            ));
                         }
                         Ok(pyre_object::w_int_new(signum as i64))
                     }
@@ -1513,9 +1505,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
                         let ret = unsafe { majit_rlib::rsignal::c_sigpending(&mut mask) };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::get_saved_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         Ok(sigset_to_signals(&mut mask))
@@ -1549,9 +1541,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         }
                         let tid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u64;
                         let signum = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-                        let ret = unsafe { libc::pthread_kill(tid as libc::pthread_t, signum) };
+                        let ret =
+                            unsafe { majit_rlib::rthread::c_pthread_kill(tid as i64, signum) };
                         if ret != 0 {
-                            return Err(errno_exception("OSError", ret));
+                            // interp_signal.py `pthread_kill` raises
+                            // `exception_from_saved_errno`; `RPyThread_kill`
+                            // returns the error number, so `ret` is passed.
+                            return Err(crate::error::exception_from_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
+                                ret,
+                            ));
                         }
                         // interp_signal.py — the signal may have been
                         // sent to the current thread.
@@ -1595,9 +1595,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             majit_rlib::rsignal::c_pthread_sigmask(how, &mut set, &mut previous)
                         };
                         if ret != 0 {
-                            return Err(errno_exception(
-                                "OSError",
-                                majit_rlib::rposix::get_saved_errno(),
+                            return Err(crate::error::exception_from_saved_errno(
+                                pyre_object::PY_NULL,
+                                errno_w_type("OSError"),
                             ));
                         }
                         // interp_signal.py:546-547 — if signals were

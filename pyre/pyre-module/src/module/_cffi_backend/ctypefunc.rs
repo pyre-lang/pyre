@@ -399,7 +399,6 @@ pub(crate) mod cif {
     use super::{PyError, PyObjectRef, W_CType, ctypeobj};
     use majit_rlib::clibffi::{self, FFI_OK, FFI_TYPE_P, FFI_TYPE_STRUCT, ffi_type};
     use majit_rlib::jit_libffi::{CifDescription, SIZE_OF_FFI_ARG, exchange_args, header};
-    use majit_rlib::rffi::{INT, UINT};
 
     /// `CifDescrBuilder` — the two-pass bump allocator that measures the block
     /// and then fills it.
@@ -673,6 +672,7 @@ pub(crate) mod cif {
     /// `CifDescrBuilder.rawallocate` — measure, allocate, fill, prepare.
     /// `nfixedargs` is the count of declared arguments a variadic call passes
     /// before its `...`, and `None` says the function is not variadic.
+    #[majit_macros::dont_look_inside]
     pub fn build_cif_descr(
         fargs: &[PyObjectRef],
         w_fresult: PyObjectRef,
@@ -718,7 +718,7 @@ pub(crate) mod cif {
             offset += unsafe { (*atype).size };
         }
 
-        // `CifDescrBuilder.fb_extra_fields`, then `jit_ffi_prep_cif`.
+        // `CifDescrBuilder.fb_extra_fields`.
         let descr = unsafe { header(rawmem as usize) };
         descr.abi = abi as clibffi::FFI_ABI;
         descr.nargs = nargs;
@@ -726,19 +726,16 @@ pub(crate) mod cif {
         descr.atypes = builder.atypes;
         descr.exchange_result = exchange_result;
         descr.exchange_size = align_arg(offset);
-        let (abi, rtype, atypes) = (descr.abi, descr.rtype, descr.atypes);
-        // A target whose variadic arguments do not travel the way its fixed
-        // ones do -- aarch64 Darwin passes them on the stack -- needs the
-        // fixed count, which is what `clibffi.py AbstractFuncPtr.__init__`
-        // hands `c_ffi_prep_cif_var` whenever `variadic_args > 0`.
+        // `CifDescrBuilder.rawallocate`: `jit_ffi_prep_cif_var(rawmem,
+        // nargs_declared)` for a variadic function, `jit_ffi_prep_cif(rawmem)`
+        // otherwise.
         let res = match nfixedargs {
             Some(nfixed) => unsafe {
-                let cif = &raw mut descr.cif;
-                clibffi::c_ffi_prep_cif_var(cif, abi, nfixed as UINT, nargs as UINT, rtype, atypes)
+                majit_rlib::jit_libffi::jit_ffi_prep_cif_var(rawmem as usize, nfixed)
             },
-            None => unsafe { majit_rlib::jit_libffi::jit_ffi_prep_cif(rawmem as usize) as INT },
+            None => unsafe { majit_rlib::jit_libffi::jit_ffi_prep_cif(rawmem as usize) },
         };
-        if res != FFI_OK {
+        if res != FFI_OK as i64 {
             super::cdataobj::raw_free(rawmem);
             return Err(PyError::system_error(
                 "libffi failed to build this function type",
@@ -761,6 +758,7 @@ pub(crate) mod cif {
     use super::{PyError, PyObjectRef};
 
     /// No libffi on this target, so no foreign call can be described.
+    #[majit_macros::dont_look_inside]
     pub fn build_cif_descr(
         _fargs: &[PyObjectRef],
         _w_fresult: PyObjectRef,

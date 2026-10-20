@@ -140,9 +140,9 @@ mod imp {
         unsafe { header(cif).abi as i64 }
     }
 
-    /// `jit_libffi.py jit_ffi_prep_cif` — fill `cif` after the rest of the
-    /// block is initialized.  There is no variadic form; `c_ffi_prep_cif_var`
-    /// stays on `clibffi.py AbstractFuncPtr.__init__`.
+    /// `jit_libffi.py jit_ffi_prep_cif` — minimal wrapper around
+    /// `ffi_prep_cif()`.  Call this after `cif_description` is initialized,
+    /// in order to fill the last field: `cif`.
     ///
     /// # Safety
     /// As [`header`].
@@ -152,6 +152,30 @@ mod imp {
             clibffi::c_ffi_prep_cif(
                 &raw mut descr.cif,
                 descr.abi,
+                descr.nargs as UINT,
+                descr.rtype,
+                descr.atypes,
+            )
+        };
+        res as i64
+    }
+
+    /// `jit_libffi.py jit_ffi_prep_cif_var` — same as [`jit_ffi_prep_cif`],
+    /// but for a call to a variadic function.  `nfixedargs` is the number of
+    /// arguments declared before the `...` in the C signature.  Some ABIs
+    /// (notably arm64 on macOS/iOS) pass the variadic arguments differently
+    /// from the fixed ones, so libffi must be told where the variadic part
+    /// starts.
+    ///
+    /// # Safety
+    /// As [`header`].
+    pub unsafe fn jit_ffi_prep_cif_var(cif_description: usize, nfixedargs: usize) -> i64 {
+        let descr = unsafe { header(cif_description) };
+        let res = unsafe {
+            clibffi::c_ffi_prep_cif_var(
+                &raw mut descr.cif,
+                descr.abi,
+                nfixedargs as UINT,
                 descr.nargs as UINT,
                 descr.rtype,
                 descr.atypes,
@@ -499,7 +523,6 @@ mod imp {
     ///
     /// # Safety
     /// As [`jit_ffi_call`].
-    #[majit_macros::dont_look_inside_cannot_raise]
     pub unsafe fn jit_ffi_call_impl_any(
         cif_description: usize,
         func_addr: usize,

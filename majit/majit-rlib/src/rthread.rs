@@ -115,6 +115,24 @@ pub fn get_ident() -> i64 {
     unsafe { *threadlocalref_addr().byte_add(TLFIELD_THREAD_IDENT_OFS) }
 }
 
+/// `RPyThread_kill` (`thread_pthread.c`).
+#[cfg(unix)]
+unsafe fn rpythread_kill(id: i64, signal: crate::rffi::INT) -> crate::rffi::INT {
+    unsafe { libc::pthread_kill(id as libc::pthread_t, signal) }
+}
+
+// `rthread.c_pthread_kill`. `rthread.llexternal` defaults to
+// `sandboxsafe=True`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_pthread_kill = "RPyThread_kill",
+    [i64, crate::rffi::INT],
+    crate::rffi::INT,
+    sandboxsafe = true,
+    save_err = crate::rffi::RFFI_SAVE_ERRNO,
+    macro = rpythread_kill
+);
+
 /// `ThreadLocalField.getraw()` for an `rffi.INT` field.
 pub fn tlfield_getraw_int(ofs: usize) -> i32 {
     unsafe { *threadlocalref_addr().byte_add(ofs).cast::<i32>() }

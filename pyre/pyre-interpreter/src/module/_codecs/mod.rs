@@ -5,6 +5,8 @@
 //! text path. The codec registry (`register` / `lookup`) and error
 //! handlers remain stubs; binary transform codecs are not modelled.
 
+pub mod locale;
+
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pyre_object::*;
