@@ -3570,6 +3570,7 @@ mod tests {
         assert!(is_registered("int"));
         assert!(is_registered("float"));
         assert!(is_registered("chr"));
+        assert!(is_registered("unichr"));
         assert!(is_registered("tuple"));
         assert!(is_registered("list"));
         assert!(is_registered("zip"));

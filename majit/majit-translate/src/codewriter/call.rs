@@ -5264,25 +5264,23 @@ impl CallControl {
         // while the harvest key and the module-qualified alias are
         // crate-stripped (`module::…`). A graph registered under the full
         // path with an empty `func.oopspec` must not hide that alias.
-        // Only `crate` and registered local crate roots use that harvest
-        // spelling; a missing direct record on a foreign crate is not
-        // an alias of `module::f`.
-        if path.segments.len() > 1 {
-            let root = path.segments[0].as_str();
-            if root == "crate" || crate::local_crates::is_local_crate_root(root) {
-                let stripped =
-                    CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
-                if let Some(alt) = self.func_effects(&stripped)
-                    && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
-                {
-                    return Some(alt);
-                }
-                if let Some(user) = user_path_behind_majit_call_target(&stripped)
-                    && let Some(alt) = self.func_effects_with_crate_alias(&user)
-                    && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
-                {
-                    return Some(alt);
-                }
+        // `crate`, registered local crate roots, and harvested
+        // foreign-body crate roots use that harvest spelling
+        // (`bookkeeper.py` `Bookkeeper.getdesc`); an Opaque FunDecl
+        // (`extfunc.py`) is not harvested, so a missing direct record
+        // on an unharvested foreign crate is not an alias of `module::f`.
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+            let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
+            if let Some(alt) = self.func_effects(&stripped)
+                && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
+            {
+                return Some(alt);
+            }
+            if let Some(user) = user_path_behind_majit_call_target(&stripped)
+                && let Some(alt) = self.func_effects_with_crate_alias(&user)
+                && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
+            {
+                return Some(alt);
             }
         }
         direct
@@ -8094,14 +8092,10 @@ impl CallControl {
         if self.has_callable_graph(path) {
             return Some(path.clone());
         }
-        if path.segments.len() > 1 {
-            let root = path.segments[0].as_str();
-            if root == "crate" || crate::local_crates::is_local_crate_root(root) {
-                let stripped =
-                    CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
-                if self.has_callable_graph(&stripped) {
-                    return Some(stripped);
-                }
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+            let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
+            if self.has_callable_graph(&stripped) {
+                return Some(stripped);
             }
         }
         None
@@ -20329,6 +20323,45 @@ mod tests {
             assert!(
                 cc.is_candidate(&registered),
                 "BFS must follow the crate-stripped funcobj, not skip the qualified call"
+            );
+
+            let portal_graph = cc
+                .function_graphs
+                .get(&portal)
+                .expect("portal graph")
+                .clone();
+            let op = &portal_graph.block(portal_graph.startblock).operations[0];
+            assert_eq!(
+                cc.graphs_from(op),
+                Some(vec![registered.clone()]),
+                "emit must use the registered stripped path BFS followed"
+            );
+            assert_eq!(cc.guess_call_kind(op), CallKind::Regular);
+            assert!(cc.direct_graph_for(&spelled).is_some());
+        });
+    }
+
+    /// A FunDecl with a body from a foreign crate (`CHARON_CORE_INCLUDE`)
+    /// registers crate-stripped (`num::<Impl>::div_ceil`); Charon
+    /// `name_path()` keeps the defining crate (`core::…`). BFS /
+    /// `graphs_from` must hit that funcobj the same way they hit a
+    /// local-crate alias (`bookkeeper.py` `Bookkeeper.getdesc`).
+    #[test]
+    fn graphs_from_and_bfs_agree_on_foreign_body_crate_qualified_function_path() {
+        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
+            let mut cc = CallControl::new();
+            let registered = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
+            let portal = CallPath::from_segments(["portal"]);
+            let spelled = CallTarget::function_path(["core", "num", "<Impl>", "div_ceil"]);
+            cc.register_function_graph(portal.clone(), graph_calling("portal", spelled.clone()));
+            cc.register_function_graph(registered.clone(), FunctionGraph::new("div_ceil"));
+            cc.mark_portal(portal.clone());
+
+            let mut policy = crate::policy::DefaultJitPolicy::new();
+            cc.find_all_graphs(&mut policy);
+            assert!(
+                cc.is_candidate(&registered),
+                "BFS must follow the crate-stripped funcobj of a FunDecl with a body"
             );
 
             let portal_graph = cc

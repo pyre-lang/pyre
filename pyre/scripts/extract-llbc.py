@@ -47,7 +47,61 @@ CHARON_BODY_SHAPE_ARGS = ["--reconstruct-panic-calls", "--inline-anon-consts"]
 # `--include libc::_` translates the libc items an extracted crate reaches,
 # including const initializers. A foreign NamedConst otherwise stays
 # Opaque, so the named-const harvest has no literal.
-CHARON_ARGS = ["--hide-marker-traits", *CHARON_BODY_SHAPE_ARGS, "--include", "libc::_"]
+# Charon name-matcher `--include` of `core` methods whose bodies would
+# otherwise stay `opacity: Foreign` / `body: "Opaque"`. Pattern shape
+# matches `libc::_`: `item::_` is subitems only. Inherent-impl methods
+# live under an Impl segment, so `core::num::_::div_ceil` matches
+# `{uN,usize}::div_ceil`. `--extract-opaque-bodies` translates every
+# reached foreign body; keep the narrow list.
+CHARON_CORE_INCLUDE = [
+    "--include",
+    "core::num::_::div_ceil",
+    "--include",
+    "core::num::_::saturating_add",
+    "--include",
+    "core::num::_::saturating_sub",
+    "--include",
+    "core::num::_::is_ascii_whitespace",
+    "--include",
+    "core::num::_::wrapping_sub",
+    "--include",
+    "core::char::methods::_::from_u32",
+    "--include",
+    "core::char::methods::_::len_utf8",
+    "--include",
+    "core::char::convert::from_u32",
+    "--include",
+    "core::char::convert::char_try_from_u32",
+    "--include",
+    "core::char::methods::len_utf8",
+    "--include",
+    "core::ops::range::_::contains",
+    "--include",
+    "core::ops::range::_::new",
+    "--include",
+    "core::ops::range::_::start_bound",
+    "--include",
+    "core::ops::range::_::end_bound",
+    "--include",
+    "core::ops::range::RangeBounds::contains",
+    # `RangeInclusive` is a foreign struct whose fields (`start`/`end`)
+    # stay `kind: Opaque` unless the type itself is included; start_bound
+    # then reads those fields as `Adt` and Bound::Included unions
+    # `Instance(Adt) ∪ Integer`.
+    "--include",
+    "core::ops::range::RangeInclusive",
+    "--include",
+    "core::cmp::impls::_::le",
+    "--include",
+    "core::cmp::impls::_::lt",
+]
+CHARON_ARGS = [
+    "--hide-marker-traits",
+    *CHARON_BODY_SHAPE_ARGS,
+    "--include",
+    "libc::_",
+    *CHARON_CORE_INCLUDE,
+]
 
 # `pyre-native` is the stable native/backend boundary.  Charon follows local
 # workspace dependencies by default, so merely moving an implementation into

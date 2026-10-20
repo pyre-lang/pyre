@@ -459,7 +459,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
     // `i < len(slice)`, branch on it.  `__len` on the `SomeList`-modelled slice
     // routes through the rtyper `len` op → `AbstractBaseListRepr.rtype_len` →
     // `arraylen_gc`.  The compare's result is a Bool, so it declares `Int` (as
-    // `range_contains` and `slice_first` do) and never the `Unsigned` that
+    // `slice_first` does) and never the `Unsigned` that
     // would wrap the flag in `r_uint`; the annotator derives the `lt` llop from
     // the OPERAND annotations, where the `usize` index and the non-negative
     // `arraylen_gc` both admit the unsigned compare.  `set_branch` appends the

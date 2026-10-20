@@ -2544,7 +2544,7 @@ fn block_reachable_from_start(graph: &FunctionGraph, block: usize) -> bool {
 
 /// A `From::from` call spliced in front of a foreign `from_residual`.
 ///
-/// `segments` is the path [`crate::parse::CallPath::for_trait_impl_method`]
+/// `segments` is the path [`crate::front::mir::trait_impl_identity_path`]
 /// registers. `pass_payload` is false when that impl's parameter is a
 /// void zero-sized type (`()`, `PhantomData`, `Arg<T>`): `FUNC.ARGS`
 /// then has no slot, so the call must not pass the field read
@@ -2734,7 +2734,9 @@ fn is_from_impl_call(kind: &OpKind) -> bool {
         return false;
     };
     segments.last().map(String::as_str) == Some("from")
-        && segments.iter().any(|seg| seg.starts_with("<Impl#"))
+        && segments
+            .iter()
+            .any(|seg| seg.starts_with("<impl ") && seg.ends_with('>'))
 }
 
 /// The value `Result::from_residual` is called with on a live `?` tail.
@@ -13633,10 +13635,16 @@ mod from_residual_conversion_tests {
     }
 
     fn from_segments() -> Vec<String> {
-        ["pyre_interpreter", "error", "PyError", "<Impl#7>", "from"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "pyre_interpreter",
+            "error",
+            "PyError",
+            "<impl core::convert::From<E>>",
+            "from",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     }
 
     fn from_residual_tail(owner: &str) -> (FunctionGraph, Variable) {
@@ -14280,7 +14288,7 @@ mod break_arm_copy_tests {
                         "pyre_interpreter",
                         "error",
                         "PyError",
-                        "<Impl#7>",
+                        "<impl core::convert::From<E>>",
                         "from",
                     ]),
                     args: crate::model::call_args(vec![operand]),

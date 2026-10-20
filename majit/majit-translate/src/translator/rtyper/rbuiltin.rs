@@ -5541,15 +5541,14 @@ mod tests {
     fn install_default_typers_registers_baseline_builtins_from_host_env() {
         // rbuiltin.py + 709-715 — `@typer_for(<builtin>)` entries
         // that reach the registry via the bare `lookup_builtin` path
-        // (HOST_ENV `builtins` table).  `unichr` is Python 2-only and
-        // absent from pyre's HOST_ENV bootstrap, so the silent-skip on
-        // missing entries leaves it out of BUILTIN_TYPER — excluded
-        // from this assertion deliberately.
+        // (HOST_ENV `builtins` table).  `unichr` is `builtin_unichr`
+        // (`SomeUnicodeCodePoint`).
         for name in [
             "bool",
             "int",
             "float",
             "chr",
+            "unichr",
             "unicode",
             "bytearray",
             "list",

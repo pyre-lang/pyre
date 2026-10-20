@@ -1738,6 +1738,7 @@ impl HostEnv {
             "divmod",
             "pow",
             "chr",
+            "unichr",
             "ord",
             "hex",
             "oct",
@@ -2727,18 +2728,65 @@ pub static HOST_ENV: LazyLock<HostEnv> = LazyLock::new(HostEnv::bootstrap);
 /// `lookup_builtin(leaf)`, and two or more are
 /// `import_module(prefix).module_get(leaf)`. `translate_op` and
 /// `Lowering::callee_is_host_builtin` both call this.
+///
+/// A specialized / residual-inst / generic-args leaf is the same
+/// HOST_ENV object as the declaration (`template_callable_leaf`):
+/// Layer-3b must still hit `ConditionalCallEntry` when a Charon
+/// instance spelled the residual that way.
 pub(crate) fn host_env_callable(segments: &[String]) -> Option<HostObject> {
     if let [leaf] = segments {
-        HOST_ENV.lookup_builtin(leaf)
+        HOST_ENV
+            .lookup_builtin(leaf)
+            .or_else(|| HOST_ENV.lookup_builtin(host_env_template_leaf(leaf)))
     } else if segments.len() >= 2 {
         let module = segments[..segments.len() - 1].join(".");
         let leaf = &segments[segments.len() - 1];
-        HOST_ENV
-            .import_module(&module)
-            .and_then(|module| module.module_get(leaf))
+        let imported = HOST_ENV.import_module(&module)?;
+        imported
+            .module_get(leaf)
+            .or_else(|| imported.module_get(host_env_template_leaf(leaf)))
     } else {
         None
     }
+}
+
+fn host_env_template_leaf(leaf: &str) -> &str {
+    crate::front::clause_spec::template_callable_leaf(leaf)
+}
+
+/// Residual `majit_rlib::jit::conditional_call0..4` /
+/// `conditional_call_elidable1` leaf. `rlib/jit.py` `ConditionalCallEntry`
+/// (`_about_ = _jit_conditional_call, _jit_conditional_call_value`) is one
+/// ExtRegistry object; a harvested body of that leaf is not a
+/// `FunctionDesc`. `__spec_` / `__inst_` / `<…>` spellings of the same
+/// leaf are still that object (`template_callable_leaf`).
+pub(crate) fn is_host_env_conditional_call_leaf(leaf: &str) -> bool {
+    let leaf = crate::front::clause_spec::template_callable_leaf(leaf);
+    let leaf = leaf.rsplit("::").next().unwrap_or(leaf);
+    matches!(
+        leaf,
+        "conditional_call0"
+            | "conditional_call1"
+            | "conditional_call2"
+            | "conditional_call3"
+            | "conditional_call4"
+            | "conditional_call_elidable1"
+    )
+}
+
+/// ExtRegistry `rlib/jit.py` `ConditionalCallEntry` named by the
+/// callable's real path: `majit_rlib::jit::<leaf>`, or the
+/// local-crate-stripped `jit::<leaf>`. A bare leaf is some other
+/// function of that name.
+pub(crate) fn is_jit_conditional_call_path(segs: &[String]) -> bool {
+    let leaf = match segs {
+        [crate_name, module, leaf] if crate_name == "majit_rlib" && module == "jit" => {
+            leaf.as_str()
+        }
+        [module, leaf] if module == "jit" => leaf.as_str(),
+        _ => return false,
+    };
+    is_host_env_conditional_call_leaf(leaf)
 }
 
 /// Flow-space carrier for Python objects referenced directly by the

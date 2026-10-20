@@ -177,6 +177,33 @@ pub(crate) fn unspecialized_leaf(leaf: &str) -> &str {
     }
 }
 
+/// Template ident of a specialized, residual-inst, or generic-args leaf.
+///
+/// `FunctionDesc.cachedgraph` names copies `leaf__spec_<hash>`;
+/// `residual_generic_fun_segments` names them `leaf__inst_<types>`;
+/// Charon may leave `leaf::<A, B>` / `leaf<A, B>` on the ident. HOST_ENV
+/// and `registration_decline` key the declaration, so a pass that
+/// recognizes a residual by its leaf sees through those spellings.
+pub(crate) fn template_callable_leaf(leaf: &str) -> &str {
+    let leaf = unspecialized_leaf(leaf);
+    let leaf = match leaf.split_once("__inst_") {
+        Some((stem, rest)) if !stem.is_empty() && !rest.is_empty() => stem,
+        _ => leaf,
+    };
+    strip_generic_ident(leaf)
+}
+
+fn strip_generic_ident(leaf: &str) -> &str {
+    let at = match leaf.find("::<") {
+        Some(at) => at,
+        None => match leaf.find('<') {
+            Some(at) => at,
+            None => return leaf,
+        },
+    };
+    &leaf[..at]
+}
+
 /// Type and const-generic names of a concrete residual instantiation.
 ///
 /// `annlowlevel.specialize` keys each specialized graph on the argument
@@ -295,7 +322,7 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
 /// The impl's own body for the trait's `method_idx`-th method. Each impl
 /// method is tagged `{"TraitMethod": [trait_id, method_idx]}`; a method the
 /// impl does not override is absent and answers `None`.
-fn impl_method_fn_id(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u64> {
+pub(crate) fn impl_method_fn_id(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u64> {
     llbc.trait_impls_raw()
         .get(impl_id as usize)?
         .get("methods")?
@@ -922,7 +949,7 @@ fn spec_fn_name(meta: &majit_charon_reader::ullbc::ItemMeta, llbc: &Llbc) -> Str
     segs.join("::")
 }
 
-fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
+pub(crate) fn render_trait_impl(llbc: &Llbc, impl_id: u64) -> Option<String> {
     let row = llbc.trait_impls_raw().get(impl_id as usize)?;
     let impl_trait = row.get("impl_trait")?;
     let trait_id = impl_trait.get("id")?.as_u64()?;
@@ -1368,6 +1395,26 @@ mod tests {
         assert_eq!(unspecialized_leaf(&leaf), "zero_division");
         assert_eq!(unspecialized_leaf("zero_division"), "zero_division");
         assert_eq!(unspecialized_leaf("a__sb_c"), "a__sb_c");
+        assert_eq!(
+            template_callable_leaf("conditional_call3__spec_deadbeefdeadbeef"),
+            "conditional_call3"
+        );
+        assert_eq!(
+            template_callable_leaf("conditional_call3__inst_PyObjectRef_i64_bool"),
+            "conditional_call3"
+        );
+        assert_eq!(
+            template_callable_leaf("conditional_call3::<A, B, C>"),
+            "conditional_call3"
+        );
+        assert_eq!(
+            template_callable_leaf("conditional_call3<A, B, C>"),
+            "conditional_call3"
+        );
+        assert_eq!(
+            template_callable_leaf("conditional_call3"),
+            "conditional_call3"
+        );
     }
 
     /// The same instantiation through a `Deduplicated` id and inline is one leaf.

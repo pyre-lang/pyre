@@ -824,11 +824,11 @@ impl CallRegistry {
             return Some(entry);
         }
         // `populate_call_registry_from_call_graphs` dedupes by
-        // `canonical_dedup_key`, stripping a leading `crate` / local
-        // crate root. A callsite that still spells the crate-qualified
-        // path must hit the same FunctionDesc (`bookkeeper.getdesc`
-        // identity on the callable).
-        if let Some(stripped) = strip_local_crate_prefix(key.segments()) {
+        // `canonical_dedup_key`, stripping a leading `crate` / local /
+        // harvested foreign-body crate root. A callsite that still
+        // spells the crate-qualified path must hit the same
+        // FunctionDesc (`bookkeeper.getdesc` identity on the callable).
+        if let Some(stripped) = crate::local_crates::strip_alias_crate_prefix(key.segments()) {
             let stripped_key = FunctionPathKey::from_segments(stripped);
             if let Some(entry) = self.lookup_registered(&stripped_key) {
                 return Some(entry);
@@ -1329,17 +1329,6 @@ impl CallRegistry {
     // function_desc.cache`.
 }
 
-/// Strip a leading `crate` / local crate root the way
-/// `populate_call_registry_from_call_graphs` dedupes. `None` when the
-/// path has no such prefix.
-fn strip_local_crate_prefix(segments: &[String]) -> Option<Vec<String>> {
-    let first = segments.first()?;
-    if first != "crate" && !crate::local_crates::is_local_crate_root(first) {
-        return None;
-    }
-    Some(segments[1..].to_vec())
-}
-
 /// Stem of a leaf produced by `residual_inst_suffix` (`helper_fnaddr.rs`).
 ///
 /// `ll_dict_grow_trampoline__inst_K_V_S` → `Some("ll_dict_grow_trampoline")`.
@@ -1525,6 +1514,53 @@ mod tests {
                     ]))
                     .is_none(),
                 "a residual inst with no template stub stays unregistered"
+            );
+        });
+    }
+
+    #[test]
+    fn lookup_hits_a_stripped_foreign_body_crate_prefix() {
+        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
+            let bk = Rc::new(Bookkeeper::new());
+            let registry = CallRegistry::new(bk);
+            let registered = registry.get_or_register(
+                FunctionPathKey::from_segments(["num", "<Impl>", "div_ceil"]),
+                signature(&["self", "rhs"]),
+            );
+            let crate_hit = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "core", "num", "<Impl>", "div_ceil",
+                ]))
+                .expect("harvested foreign callable must share the stripped FunctionDesc");
+            assert!(
+                Rc::ptr_eq(&registered, &crate_hit),
+                "stripped lookup must return the same FunctionEntry"
+            );
+        });
+    }
+
+    #[test]
+    fn lookup_does_not_strip_unharvested_foreign_crate() {
+        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
+            let bk = Rc::new(Bookkeeper::new());
+            let registry = CallRegistry::new(bk);
+            let _div_ceil = registry.get_or_register(
+                FunctionPathKey::from_segments(["num", "<Impl>", "div_ceil"]),
+                signature(&["self", "rhs"]),
+            );
+            let _transmute = registry.get_or_register(
+                FunctionPathKey::from_segments(["mem", "transmute"]),
+                signature(&["src"]),
+            );
+            assert!(
+                registry
+                    .lookup(&FunctionPathKey::from_segments([
+                        "core",
+                        "mem",
+                        "transmute",
+                    ]))
+                    .is_none(),
+                "an Opaque foreign FunDecl must not strip its crate prefix even when another core body is harvested"
             );
         });
     }
