@@ -1978,7 +1978,8 @@ mod tests {
             majit_ir::ArrayFlag::Pointer,
             "pycode".to_string(),
             "pycode",
-        );
+        )
+        .with_index_in_parent(0);
         let token = majit_ir::SimpleFieldDescr::new_with_name(
             1,
             token_offset,
@@ -1988,7 +1989,8 @@ mod tests {
             majit_ir::ArrayFlag::Pointer,
             "vable_token".to_string(),
             "vable_token",
-        );
+        )
+        .with_index_in_parent(1);
         let sd = majit_ir::descr::SimpleSizeDescr::new(0, 72, 0).with_all_fielddescrs(vec![
             std::sync::Arc::new(decoy) as std::sync::Arc<dyn FieldDescr>,
             std::sync::Arc::new(token) as std::sync::Arc<dyn FieldDescr>,

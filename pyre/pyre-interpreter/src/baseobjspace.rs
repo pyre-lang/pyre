@@ -26450,7 +26450,7 @@ mod tests {
         crate::typedef::init_typeobjects();
         use pyre_object::objectobject::w_instance_new;
         let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(cls, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(cls, true) };
         w_instance_new(cls)
     }
 

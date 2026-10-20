@@ -135,6 +135,16 @@ mod typedef_identity_tests {
                 ));
                 crate::call::create_all_slots(child, gc_roots::shadow_stack_get(bases_slot))
                     .unwrap();
+                assert!(
+                    !w_type_get_terminator(child).is_null(),
+                    "typeobject.py W_TypeObject.__init__ installs terminator after layout"
+                );
+                let inst = w_instance_new(child);
+                assert_ne!(
+                    (*(inst as *const pyre_object::objectobject::W_ObjectObject)).map,
+                    0,
+                    "alloc_instance_object copies w_subtype.terminator"
+                );
                 let parent_layout = w_type_get_layout_ptr(base);
                 let child_layout = w_type_get_layout_ptr(child);
                 assert_eq!((*child_layout).typedef, (*parent_layout).typedef);
@@ -146,6 +156,99 @@ mod typedef_identity_tests {
                 if !slot_names.is_empty() {
                     assert_eq!((*child_layout).base_layout, parent_layout);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn object_and_module_own_nodict_terminators_after_bootstrap() {
+        use crate::objspace::std::mapdict::{MapRef, TerminatorKind};
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        unsafe {
+            let object = super::w_object();
+            let object_term = w_type_get_terminator(object) as MapRef;
+            assert!(
+                !object_term.is_null(),
+                "typeobject.py W_TypeObject.__init__ stores terminator after layout"
+            );
+            assert!(!w_type_get_hasdict(object));
+            assert_eq!((*object_term).as_terminator().kind, TerminatorKind::NoDict);
+
+            let module = super::gettypeobject(&MODULE_TYPE);
+            let module_term = w_type_get_terminator(module) as MapRef;
+            assert!(!module_term.is_null());
+            assert!(w_type_get_hasdict(module));
+            assert!(
+                w_type_get_typedef_hasdict(module),
+                "module.py Module.typedef owns w_dict"
+            );
+            assert_eq!((*module_term).as_terminator().kind, TerminatorKind::NoDict);
+        }
+    }
+
+    #[test]
+    fn module_terminator_kind_needs_layout_before_hasdict() {
+        // rv5g encodings BOOTSTRAP: installing when hasdict is already true
+        // but layout is still null makes `w_type_get_typedef_hasdict` read
+        // false, so `new_instance_terminator` builds a DictTerminator.
+        // Module attribute writes then go to mapdict instead of `w_dict`.
+        use crate::objspace::std::mapdict::{TerminatorKind, new_instance_terminator};
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        unsafe {
+            let module = super::gettypeobject(&MODULE_TYPE);
+            let hasdict = w_type_get_hasdict(module);
+            let typedef_hasdict = w_type_get_typedef_hasdict(module);
+            assert!(hasdict && typedef_hasdict);
+
+            let premature = new_instance_terminator(module, true, false);
+            assert_eq!((*premature).as_terminator().kind, TerminatorKind::Dict);
+
+            let final_term = new_instance_terminator(module, hasdict, typedef_hasdict);
+            assert_eq!((*final_term).as_terminator().kind, TerminatorKind::NoDict);
+
+            let live = w_type_get_terminator(module);
+            assert_eq!(
+                (*(live as crate::objspace::std::mapdict::MapRef))
+                    .as_terminator()
+                    .kind,
+                TerminatorKind::NoDict
+            );
+        }
+    }
+
+    #[test]
+    fn registry_type_terminators_match_hasdict_and_not_typedef_hasdict() {
+        use crate::objspace::std::mapdict::{MapRef, TerminatorKind};
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        unsafe {
+            for &addr in super::TYPEOBJECT_CACHE.get().unwrap().values() {
+                let tp = addr as PyObjectRef;
+                if !is_type(tp) {
+                    continue;
+                }
+                let term = w_type_get_terminator(tp) as MapRef;
+                assert!(
+                    !term.is_null(),
+                    "{} missing terminator",
+                    w_type_get_name(tp)
+                );
+                let want_dict = w_type_get_hasdict(tp) && !w_type_get_typedef_hasdict(tp);
+                let expected = match want_dict {
+                    true => TerminatorKind::Dict,
+                    false => TerminatorKind::NoDict,
+                };
+                assert_eq!(
+                    (*term).as_terminator().kind,
+                    expected,
+                    "{}",
+                    w_type_get_name(tp)
+                );
             }
         }
     }
@@ -644,7 +747,7 @@ pub fn init_typeobjects() {
         ));
         unsafe {
             // module.py Module.getdict plus Module.typedef.__weakref__.
-            pyre_object::w_type_set_hasdict(module_type, true);
+            crate::objspace::std::mapdict::set_type_hasdict(module_type, true);
             pyre_object::w_type_set_weakrefable(module_type, true);
         }
         reg.insert(
@@ -733,7 +836,7 @@ pub fn init_typeobjects() {
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(function_type, false) };
         // typedef.py:735/740 — Function exposes __dict__ and __weakref__.
         unsafe {
-            pyre_object::w_type_set_hasdict(function_type, true);
+            crate::objspace::std::mapdict::set_type_hasdict(function_type, true);
             pyre_object::w_type_set_weakrefable(function_type, true);
         }
         reg.insert(
@@ -755,7 +858,7 @@ pub fn init_typeobjects() {
         unsafe {
             // CPython 3.14 PyCFunction objects are weakrefable but have no
             // instance dict. PyPy's copied Function rawdict differs here.
-            pyre_object::w_type_set_hasdict(builtin_function_type, false);
+            crate::objspace::std::mapdict::set_type_hasdict(builtin_function_type, false);
             pyre_object::w_type_set_weakrefable(builtin_function_type, true);
         }
         reg.insert(
@@ -807,7 +910,7 @@ pub fn init_typeobjects() {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(method_wrapper_type, false);
             pyre_object::w_type_set_disallow_instantiation(method_wrapper_type);
-            pyre_object::w_type_set_hasdict(method_wrapper_type, false);
+            crate::objspace::std::mapdict::set_type_hasdict(method_wrapper_type, false);
             pyre_object::w_type_set_weakrefable(method_wrapper_type, false);
         }
         reg.insert(
@@ -828,7 +931,7 @@ pub fn init_typeobjects() {
             pyre_object::w_type_set_disallow_instantiation(classmethod_descriptor_type);
             // `PyClassMethodDescr_Type` carries no `Py_TPFLAGS_METHOD_DESCRIPTOR`:
             // it binds to the class, not to the instance the caller pushed.
-            pyre_object::w_type_set_hasdict(classmethod_descriptor_type, false);
+            crate::objspace::std::mapdict::set_type_hasdict(classmethod_descriptor_type, false);
             pyre_object::w_type_set_weakrefable(classmethod_descriptor_type, false);
             pyre_object::set_instantiate(
                 &crate::function::CLASSMETHOD_DESCRIPTOR_TYPE,
@@ -2927,6 +3030,7 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
         // object: hasdict=False, weakrefable=False (bare object() has no __dict__)
         pyre_object::w_type_set_hasdict(type_obj, false);
         pyre_object::w_type_set_weakrefable(type_obj, false);
+        crate::objspace::std::mapdict::install_type_terminator(type_obj);
     }
     unsafe { w_type_set_mro(type_obj, vec![type_obj]) };
     let type_obj = pyre_object::gc_roots::shadow_stack_get(type_slot);
@@ -3512,6 +3616,10 @@ fn new_typeobject_with_metatype_and_layout(
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             has_weakref || base_weakrefable,
         );
+        // typeobject.py `W_TypeObject.__init__`: layout → hasdict → terminator.
+        crate::objspace::std::mapdict::install_type_terminator(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+        );
     }
 
     // MRO = [self] + base_mro
@@ -3639,6 +3747,7 @@ pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
         }
         pyre_object::w_type_set_hasdict(type_obj, hasdict);
         pyre_object::w_type_set_weakrefable(type_obj, weakrefable);
+        crate::objspace::std::mapdict::install_type_terminator(type_obj);
     }
 
     // MRO = C3 linearization over the recorded `__bases__`.
@@ -24862,6 +24971,9 @@ fn object_descr_new_from(
         }
         check_user_subclass(w_object, cls)
     })?;
+    // `allocate_instance` → `user_setup` → `_mapdict_init_empty(w_subtype.terminator)`
+    // (`mapdict.py`). The type already owns its terminator from
+    // `W_TypeObject.__init__`.
     Ok(w_instance_new(cls))
 }
 

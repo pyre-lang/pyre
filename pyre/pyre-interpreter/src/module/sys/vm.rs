@@ -215,7 +215,7 @@ fn sys_namespace_type() -> PyObjectRef {
         // (typedef.py:40) and suppress the mapdict one
         // (typeobject.py:253-257), so flip `hasdict` directly — the
         // `create_dict_slot` flag flip (typeobject.py).
-        unsafe { w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         tp
     })
 }
@@ -706,7 +706,7 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
             object_typedef,
         );
         unsafe {
-            w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
             pyre_object::w_type_set_text_signature(tp, "(mapping_or_iterable=(), /, **kwargs)");
         }
         tp

@@ -46,7 +46,7 @@ pub(crate) fn capsule_type() -> PyObjectRef {
             );
         });
         unsafe {
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
             pyre_object::w_type_set_disallow_instantiation(tp);
             // No `Py_TPFLAGS_BASETYPE` either -- a subclass would carry the name
             // without the payload `is_capsule` reads.

@@ -11758,11 +11758,13 @@ fn walker_guard_class<Sym: WalkSym>(
 }
 
 /// Guard the fixed-layout mapdict-carrier representation, the receiver type's
-/// live Python class, live version tag, and the exact map shape used by the
-/// mapdict attribute folds.  The layout guard proves that a later receiver
-/// still has the wide user layout before either mapdict field is read, and
-/// the Python class guard which subclass it is. The promoted map identity then
-/// pins its storage coordinates (mapdict.py).
+/// live version tag, and the exact map shape used by the mapdict attribute
+/// folds.  The layout guard proves that a later receiver still has the wide
+/// user layout before either mapdict field is read. The promoted map identity
+/// (`mapdict.py MapdictStorageMixin._get_mapdict_map`) pins both the storage
+/// coordinates and the Python class (`BaseUserClassMapdict.getclass` /
+/// `terminator.w_cls`). Same promote `walker_pin_stamped_instance_class`
+/// emits for a user instance; a later GETFIELD of this descr is a ConstInt.
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -11797,10 +11799,15 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
 
     // `typedef.py _getusercls` gives a builtin user subclass a generated payload
     // containing MapdictStorageMixin, and the GuardClass above already
-    // separates it from the shorter builtin payload. Every Python subclass of
-    // one builtin shares that generated class, so pin `w_class` before loading
-    // `map`; a different subclass exits first.
-    walker_guard_exact_w_class(ctx, op_pc, obj, w_type)?;
+    // separates it from the shorter builtin payload. Python subclasses of one
+    // builtin share that generated class. PyPy's class identity for a user
+    // instance is `map.terminator.w_cls` (`mapdict.py
+    // BaseUserClassMapdict.getclass` / `setclass`); the only promotion is
+    // `jit.promote(self.map)` (`MapdictStorageMixin._get_mapdict_map`). A
+    // different subclass is a different terminator, hence a different map, so
+    // the map GUARD_VALUE below is the whole class-identity proof. Do not also
+    // pin `w_class` here: pyre's extra header word is not an extra promotion
+    // in PyPy.
 
     // The instance map pins the storage layout, but class mutation can change
     // lookup precedence without changing that map. Pin the receiver type's
@@ -11825,7 +11832,7 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
-    // GuardClass, the `w_class` pin and the version-tag pin can minor-collect.
+    // GuardClass and the version-tag pin can minor-collect.
     // `concrete_obj` is a copy; the receiver box is `obj`
     // (`RefFrontendOp` / `getref_base`).
     let concrete_obj = walker_concrete_ref_object(ctx, obj).unwrap_or(concrete_obj);

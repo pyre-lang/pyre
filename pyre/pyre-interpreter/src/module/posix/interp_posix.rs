@@ -1430,7 +1430,7 @@ mod win_nt {
         CELL.get_or_init(|| {
             let tp = crate::typedef::make_builtin_type("nt.DLLDirectoryCookie", |_ns| {});
             unsafe {
-                pyre_object::typeobject::w_type_set_hasdict(tp, true);
+                crate::objspace::std::mapdict::set_type_hasdict(tp, true);
                 pyre_object::typeobject::w_type_set_disallow_instantiation(tp);
                 pyre_object::typeobject::w_type_set_acceptable_as_base_class(tp, false);
             }

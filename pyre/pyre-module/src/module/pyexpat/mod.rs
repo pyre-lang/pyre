@@ -2269,7 +2269,7 @@ const ERROR_NAMES: &[&str] = &[
 /// submodules; constants are written as instance attributes.
 fn make_namespace(name: &'static str) -> PyObjectRef {
     let tp = pyre_interpreter::typedef::make_builtin_type(name, |_| {});
-    unsafe { typeobject::w_type_set_hasdict(tp, true) };
+    unsafe { pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true) };
     // The fresh instance is named only by this local while the name store below
     // builds its string and installs the instance's attribute storage, so it
     // takes one liveness pin; an instance does not move, so the local stays

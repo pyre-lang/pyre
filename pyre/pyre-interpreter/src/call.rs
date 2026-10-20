@@ -8001,6 +8001,12 @@ pub unsafe fn create_all_slots(
             })
         };
         pyre_object::w_type_set_layout(w_type, layout);
+        // typeobject.py `W_TypeObject.__init__` after `setup_user_defined_type`
+        // returns the layout: hasdict is already final (`create_dict_slot` /
+        // `copy_flags_from_bases`), then `self.terminator`.
+        // `alloc_instance_object` copies that word (`mapdict.py user_setup` /
+        // `_mapdict_init_empty(w_subtype.terminator)`).
+        crate::objspace::std::mapdict::install_type_terminator(w_type);
         Ok(())
     }
 }

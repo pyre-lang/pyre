@@ -80,7 +80,7 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
             cdata::cdata_type(),
         );
         unsafe {
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
             // PyPy `function.py:CFuncPtr.__metaclass__ = CFuncPtrType`.
             pyre_object::typeobject::w_type_set_w_class(

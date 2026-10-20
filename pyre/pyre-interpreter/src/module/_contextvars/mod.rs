@@ -106,7 +106,7 @@ pub(crate) fn context_var_type() -> PyObjectRef {
                 );
             }
         });
-        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
         tp
     })
@@ -473,7 +473,7 @@ fn token_type() -> PyObjectRef {
                 );
             }
         });
-        unsafe { typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
         tp
     })

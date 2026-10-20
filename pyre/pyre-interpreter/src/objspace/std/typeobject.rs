@@ -188,6 +188,15 @@ impl TypeCache {
                 })
             };
             w_type_set_layout(gc_roots::shadow_stack_get(w_type_slot), layout);
+            // typeobject.py `W_TypeObject.__init__`: layout → typedef facts →
+            // terminator. `hasdict` was stored from `override_def.hasdict`
+            // before this layout write so `w_type_get_typedef_hasdict` is
+            // readable here. Installing before layout makes that getter
+            // return false and a `hasdict` TypeDef (module) gets a
+            // `DictTerminator`.
+            crate::objspace::std::mapdict::install_type_terminator(gc_roots::shadow_stack_get(
+                w_type_slot,
+            ));
             if std::ptr::eq(definition as *const TypeDef, overridetypedef) {
                 // TypeCache.build's else arm: qualify member functions.
                 crate::typedef::stamp_new_descr_self(

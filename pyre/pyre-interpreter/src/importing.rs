@@ -9127,7 +9127,7 @@ mod tests {
         crate::typedef::init_typeobjects();
         let module = pyre_object::module::w_module_new("import_cache_probe_mod");
         let spec_cls = crate::typedef::make_builtin_type("ImportCacheProbeSpec", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(spec_cls, true) };
         let spec = pyre_object::objectobject::w_instance_new(spec_cls);
         let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
         unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };
@@ -9150,7 +9150,7 @@ mod tests {
         crate::typedef::init_typeobjects();
         let module = pyre_object::module::w_module_new("import_cache_nondescript_mod");
         let spec_cls = crate::typedef::make_builtin_type("ImportCacheNonDataSpec", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(spec_cls, true) };
         let descr = crate::gateway::make_builtin_function("_initializing", |_| {
             Ok(pyre_object::w_bool_from(true))
         });
@@ -9224,7 +9224,7 @@ mod tests {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
         let spec_cls = crate::typedef::make_builtin_type("CustomFileOriginSpec", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(spec_cls, true) };
         let spec = pyre_object::objectobject::w_instance_new(spec_cls);
         crate::baseobjspace::setattr_str(spec, "has_location", pyre_object::w_bool_from(true))
             .unwrap();
@@ -9242,7 +9242,7 @@ mod tests {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
         let spec_cls = crate::typedef::make_builtin_type("CustomSetFileattrSpec", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(spec_cls, true) };
         let spec = pyre_object::objectobject::w_instance_new(spec_cls);
         crate::baseobjspace::setattr_str(spec, "_set_fileattr", pyre_object::w_bool_from(true))
             .unwrap();

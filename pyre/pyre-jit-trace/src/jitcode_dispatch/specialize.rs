@@ -2469,7 +2469,10 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     {
         let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
-        walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
+        let Some(_) = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?
+        else {
+            return Ok(None);
+        };
 
         let dict_op = walker_record_getfield_gc_r_uncached(
             ctx,
@@ -2943,6 +2946,47 @@ unsafe fn walker_classify_shadow_guard(
     }
 }
 
+/// `jit.promote(self.map)` (`mapdict.py MapdictStorageMixin._get_mapdict_map`).
+///
+/// A user instance's Python class is `map.terminator.w_cls` (`mapdict.py
+/// BaseUserClassMapdict.getclass` / `setclass`); promoting the map is the
+/// class-identity proof, devolved maps included
+/// (`DevolvedDictTerminator.set_terminator`). A second promote on a box
+/// already replaced with a `ConstInt` is a no-op (`pyjitpl.py
+/// implement_guard_value`).
+fn walker_promote_instance_map<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    map: usize,
+) -> Result<(), DispatchError> {
+    // GuardClass (and the version-tag pin) can minor-collect. `concrete_obj`
+    // is a copy; the receiver box is `obj` (`RefFrontendOp` / `getref_base`).
+    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+    let descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
+    if let Some(cached) = ctx.trace_ctx.heapcache_getfield_cached(obj, descr.index())
+        && cached.is_constant()
+    {
+        return Ok(());
+    }
+    // Map nodes are interned immortal `malloc_raw` `MapNode`s (`intern_node`
+    // / `new_terminator`, `lltype.malloc(..., flavor='raw')`). The pointer
+    // is a stable identity, not a GC object, so it needs no ConstPtr box;
+    // GuardValue compares it as an Int word (`object_map_descr`).
+    let slot_op = walker_record_getfield_gc_i_uncached(ctx, obj, descr.clone());
+    let slot_const = ctx.trace_ctx.const_int(map as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[slot_op, slot_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(slot_op, slot_const);
+    // So a later promote of the same descr sees a ConstInt and skips, matching
+    // `implement_guard_value` returning early on a Const.
+    ctx.trace_ctx
+        .heapcache_getfield_now_known(obj, descr.index(), slot_const);
+    Ok(())
+}
+
 /// Re-prove the shadowing precondition: growing an instance attribute named
 /// like the method must side-exit before the constant descriptor is reused.
 /// mapdict.py LOAD_ATTR caching does this by pinning the map; an exception
@@ -2957,13 +3001,11 @@ fn walker_emit_shadow_guard<Sym: WalkSym>(
     // The caller's guards can minor-collect; `concrete_obj` is a copy of `obj`.
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
     let (slot_op, slot_const, shadow_guard) = match shadow {
-        ShadowGuard::InstanceMap(map) => (
-            walker_record_getfield_gc_i_uncached(ctx, obj, unsafe {
-                crate::descr::mapdict_map_descr(concrete_obj)
-            }),
-            ctx.trace_ctx.const_int(map as i64),
-            OpCode::GuardValue,
-        ),
+        // `map` is the immortal `malloc_raw` node captured in
+        // `walker_classify_shadow_guard`; it does not move.
+        ShadowGuard::InstanceMap(map) => {
+            return walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map as usize);
+        }
         // Pinning `w_dict` at null is a nullity test, and `pyjitpl.py
         // _establish_nullity` proves one with GUARD_ISNULL.  As a GUARD_VALUE
         // the guard's jitcounter keys on the *failing* value
@@ -2989,13 +3031,10 @@ fn walker_emit_shadow_guard<Sym: WalkSym>(
     // the box is replaced with, the way `_establish_nullity` does it.  The
     // concrete is stamped here because `stamp_guard_value_concrete` reads it
     // off a GUARD_VALUE's expected operand, which GUARD_ISNULL does not carry.
-    if shadow_guard == OpCode::GuardIsnull {
-        ctx.trace_ctx
-            .set_opref_concrete(slot_op, majit_ir::Value::Ref(majit_ir::GcRef(0)));
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, shadow_guard, &[slot_op])?;
-    } else {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, shadow_guard, &[slot_op, slot_const])?;
-    }
+    // InstanceMap returns above through `walker_promote_instance_map`.
+    ctx.trace_ctx
+        .set_opref_concrete(slot_op, majit_ir::Value::Ref(majit_ir::GcRef(0)));
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, shadow_guard, &[slot_op])?;
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(slot_op, slot_const);
@@ -3039,8 +3078,9 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
         return Ok(None);
     }
     // `space.type` reaches an exception's class through the kind registry when
-    // the generic stub is still installed, and the `w_class` guard below can
-    // only pin a class the slot actually holds.
+    // the generic stub is still installed; the header `w_class` still has to
+    // match the type `load_method_fast_path` answered, even though the pin
+    // below promotes the map rather than that slot.
     if !std::ptr::eq(unsafe { (*concrete_obj).w_class }, w_type) {
         return Ok(None);
     }
@@ -3051,16 +3091,20 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // guard_class(obj, ob_type): pins the payload layout, so the `w_class` and
-    // shadowing-slot reads below name the fields they were recorded against.
-    // Pin the Python-level receiver class (`w_class`) exactly.  This is the
-    // per-frame method namespace anchor: a subclass with the same instance
-    // payload vtable side-exits instead of reusing the caller's method.
+    // guard_class(obj, ob_type): pins the payload layout, so the shadowing-slot
+    // reads below name the fields they were recorded against. A user-instance
+    // Python class is `map.terminator.w_cls` (`mapdict.py
+    // BaseUserClassMapdict.getclass`); `walker_pin_stamped_instance_class`
+    // promotes the map (`MapdictStorageMixin._get_mapdict_map`). The
+    // shadow-guard map GUARD_VALUE that follows is the same promote and is
+    // elided once the box is a ConstInt (`pyjitpl.py implement_guard_value`).
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
     // The guards can minor-collect: box `w_descr` before them.
     let method_const = ctx.trace_ctx.const_ref(w_descr as i64);
-    walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
+    let Some(_) = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)? else {
+        return Ok(None);
+    };
 
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
 
@@ -3094,7 +3138,9 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     };
     // The guards can minor-collect: box the cell before them.
     let cell_const = ctx.trace_ctx.const_ref(cell as i64);
-    walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
+    let Some(_) = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)? else {
+        return Ok(None);
+    };
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
     // `w_value` holds, not the function that was there at record time.
@@ -3528,9 +3574,10 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
 /// through every iteration. This fold reproduces PyPy's shape directly:
 ///
 ///   guard_class(obj, ob_type)
-///   guard_value(getfield(obj, w_class), the type)
 ///   guard_value(getfield(the type, version_tag), the tag)
-///   guard_value(getfield(obj, map), the map)   — a dict-bearing receiver only
+///   guard_value(getfield(obj, map), the map)   — user-instance layout
+///     (`mapdict.py BaseUserClassMapdict.getclass` /
+///     `MapdictStorageMixin._get_mapdict_map`); exact `object()` skips
 ///   new_with_vtable(Method) + setfield(w_function/w_self/w_class/header)
 ///
 /// The guards make `lookup_in_type` constant exactly as the version-tag promote
@@ -3601,8 +3648,7 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
         dst,
         dst_bank,
         None,
-    )?;
-    Ok(Some(()))
+    )
 }
 
 /// LOAD_SPECIAL's `__enter__` / `__exit__` lookup, folded to the shape PyPy's
@@ -3614,9 +3660,11 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
 /// `GUARD_NO_EXCEPTION` through every `with`, and materialises the context
 /// manager because it escapes into the call.
 ///
-/// The lookup reads the type only, so the guards are just the receiver's class
-/// and the type's version tag — no instance-dict shadowing guard, which is what
-/// [`try_walker_specialize_load_bound_method_attr`] additionally needs.
+/// The lookup reads the type only, so the guards are the receiver's payload
+/// layout, the user-instance map promote (`mapdict.py
+/// BaseUserClassMapdict.getclass` / `MapdictStorageMixin._get_mapdict_map`),
+/// and the type's version tag — no instance-dict shadowing guard, which is
+/// what [`try_walker_specialize_load_bound_method_attr`] additionally needs.
 ///
 /// Returns `None` (fall through to the residual, SAFE) for every shape
 /// [`pyre_interpreter::baseobjspace::load_special_fast_path`] declines,
@@ -3674,23 +3722,24 @@ pub(crate) fn try_walker_specialize_load_special_method<Sym: WalkSym>(
         dst,
         dst_bank,
         cell_guard,
-    )?;
-    Ok(Some(()))
+    )
 }
 
 /// Emit the guards and the inline `Method` a constant-descriptor bind reduces
 /// to, given a `w_descr` some caller has already proven binds through
 /// `w_method_new(w_descr, obj, w_type)`, with the descriptor's header stamp.
 ///
-/// Three guards make that reduction reproducible: `guard_class` on the physical
-/// layout the `w_class` read needs, `guard_value` on the Python-level class so
-/// a subclass reaching the same layout side-exits, and the type version tag
-/// (`typeobject.py promote(self.version_tag())`) so rebinding the name on the
-/// type retires the trace.  An optional instance-dict shadowing guard is the
-/// fourth when the caller looked the name up through `LOAD_ATTR`;
-/// `LOAD_SPECIAL` is type-only (`baseobjspace.py lookup`) and passes `None`.
-/// The `Method` is then built inline rather than called for, which is what
-/// lets the consuming `CALL` virtualize it away.
+/// Three guards make that reduction reproducible: `guard_class` on the
+/// physical layout, `jit.promote(self.map)` on a user instance (`mapdict.py
+/// MapdictStorageMixin._get_mapdict_map` / `BaseUserClassMapdict.getclass`)
+/// so a subclass sharing the payload vtable side-exits, and the type version
+/// tag (`typeobject.py promote(self.version_tag())`) so rebinding the name
+/// on the type retires the trace. Exact `object()` has no mapdict
+/// (`W_ObjectObject`); GuardClass alone proves it. An optional instance-dict
+/// shadowing guard is the fourth when the caller looked the name up through
+/// `LOAD_ATTR`; `LOAD_SPECIAL` is type-only (`baseobjspace.py lookup`) and
+/// passes `None`. The `Method` is then built inline rather than called for,
+/// which is what lets the consuming `CALL` virtualize it away.
 ///
 /// Shared by `LOAD_ATTR`, builtin `getattr`, and `LOAD_SPECIAL`'s type-only
 /// `__enter__` / `__exit__` lookup, each with its own lookup preconditions.
@@ -3707,11 +3756,27 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
     attr_cell: Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
-) -> Result<(), DispatchError> {
-    let w_type_const = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
+) -> Result<Option<()>, DispatchError> {
+    // The pin, cell promote, and shadow guards can minor-collect: box the
+    // descriptor, header class, and attr-cell words before the first record.
+    let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
+    let header_class_const = ctx.trace_ctx.const_ref(header.1 as i64);
+    let attr_cell_boxed = attr_cell.map(|(cell, expected)| {
+        (
+            ctx.trace_ctx.const_ref(cell as i64),
+            ctx.trace_ctx.const_ref(expected as i64),
+        )
+    });
+    let Some(w_type_const) =
+        walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?
+    else {
+        return Ok(None);
+    };
     // The version-tag pin does not cover an in-place cell write.  Same
     // getfield and `guard_value` as `ExceptionInlineReceiverGuard`'s attr_cell.
-    if let Some((cell, expected)) = attr_cell {
+    if let Some((cell_const, expected_const)) = attr_cell_boxed {
+        let cell = walker_const_ref_object(ctx, cell_const);
+        let expected = walker_const_ref_object(ctx, expected_const);
         super::walker_promote_object_mutable_cell(ctx, op_pc, cell, expected)?;
     }
 
@@ -3719,6 +3784,12 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
         walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     }
 
+    // The pin, cell promote, and shadow guard can minor-collect. Re-read
+    // each copy from its box before the bind uses it.
+    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+    let w_type = walker_const_ref_object(ctx, w_type_const);
+    let w_descr = walker_const_ref_object(ctx, descr_const);
+    let header = (header.0, walker_const_ref_object(ctx, header_class_const));
     // `baseobjspace::get` binds method descriptors through
     // `builtin_bound_method_new`, including its w_class / w_module stores.
     // Share the descriptor binding body with super; only lookup differs.
@@ -3737,7 +3808,8 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
             slot_pin: None,
         },
     )?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)?;
+    Ok(Some(()))
 }
 
 /// Fold `bh_load_method_self_fn(obj, attr, code, name_idx)` once both the
@@ -9037,8 +9109,7 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     } {
         return Ok(None);
     }
-    let terminator =
-        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(cls) };
+    let terminator = unsafe { pyre_object::typeobject::w_type_get_terminator(cls) };
     if terminator.is_null() {
         return Ok(None);
     }
@@ -9413,8 +9484,7 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     } {
         return Ok(None);
     }
-    let terminator =
-        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(cls) };
+    let terminator = unsafe { pyre_object::typeobject::w_type_get_terminator(cls) };
     if terminator.is_null() {
         return Ok(None);
     }
@@ -11393,7 +11463,7 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     walker_guard_stamped_ref_pin(ctx, op.pc, name_ref, concrete_name)?;
 
     if let Some((w_type, _version_tag, w_descr, shadow, header)) = bound_method {
-        walker_emit_constant_descr_bound_method(
+        match walker_emit_constant_descr_bound_method(
             ctx,
             op.pc,
             r_args[2],
@@ -11405,8 +11475,14 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
             dst,
             'r',
             None,
-        )?;
-        return Ok(Some(()));
+        )? {
+            Some(()) => return Ok(Some(())),
+            None => {
+                ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+                ctx.trace_ctx.heap_cache_mut().reset();
+                return Ok(None);
+            }
+        }
     }
 
     let Ok(name) = name.as_str() else {
@@ -14804,24 +14880,56 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
     Ok(expected)
 }
 
-/// Pin payload layout, uncached `w_class`, and `version_tag`.
+/// Pin payload layout and `version_tag`. A user instance's Python class is
+/// `map.terminator.w_cls` (`mapdict.py BaseUserClassMapdict.getclass` /
+/// `setclass`); reading it is `jit.promote(self.map)`
+/// (`MapdictStorageMixin._get_mapdict_map`). Exact `object()` is
+/// `W_ObjectObject` with no mapdict; GuardClass alone proves the class.
+/// A user instance with `map == 0` declines (the terminator has not been
+/// installed). Do not also GETFIELD/GUARD_VALUE `w_class` on that layout:
+/// pyre's extra header word is not an extra promotion in PyPy.
 fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     obj: OpRef,
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
-) -> Result<OpRef, DispatchError> {
+) -> Result<Option<OpRef>, DispatchError> {
+    // Decline before emitting: a user instance with no terminator cannot
+    // prove `getclass` (`mapdict.py BaseUserClassMapdict.getclass`).
+    if unsafe { pyre_object::is_user_instance(concrete_obj) } {
+        let map = unsafe { (*(concrete_obj as *const pyre_object::W_ObjectObject)).map };
+        if map == 0 {
+            return Ok(None);
+        }
+    }
     let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-    // `GuardClass` records into `opencoder.py Trace._ops` (and its
-    // snapshot into `_snapshot_data`). `w_type` is a Copy, not
-    // `history.py *FrontendOp.value`; pin it across that append so
-    // the later `GuardValue` intern sees the live word.
-    let w_type_pin = residual_call::owner_root_if_gc(w_type as usize);
+    // Every record below appends to `opencoder.py Trace._ops` and can
+    // minor-collect. Box `w_type` before the first one; `w_type` is a copy.
+    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
     walker_guard_stamped_class(ctx, pc, obj, phys_type)?;
+    let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
+    if unsafe { pyre_object::is_user_instance(concrete_obj) } {
+        let map = unsafe { (*(concrete_obj as *const pyre_object::W_ObjectObject)).map };
+        if map == 0 {
+            return Ok(None);
+        }
+        walker_promote_instance_map(ctx, pc, obj, concrete_obj, map)?;
+        walker_pin_type_version_tag(ctx, pc, w_type_const)?;
+        return Ok(Some(w_type_const));
+    }
+    if unsafe { pyre_object::is_instance(concrete_obj) } {
+        // Exact `object()`: GuardClass already proved `INSTANCE_TYPE`.
+        // PyPy `W_ObjectObject` has no mapdict.
+        walker_pin_type_version_tag(ctx, pc, w_type_const)?;
+        return Ok(Some(w_type_const));
+    }
     let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type = pinned_obj(&w_type_pin, w_type);
-    walker_guard_stamped_type_version(ctx, pc, w_class, w_type)
+    // The getfield can minor-collect; read `w_type` through its box.
+    let w_type = walker_const_ref_object(ctx, w_type_const);
+    Ok(Some(walker_guard_stamped_type_version(
+        ctx, pc, w_class, w_type,
+    )?))
 }
 
 /// `allocate_instance` stamps the realbase vtable when `w_class` is that

@@ -613,12 +613,13 @@ pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
 /// RPython: this corresponds to reading typeptr + gettypefor (fused into one field).
 pub const W_CLASS_OFFSET: usize = std::mem::offset_of!(PyObject, w_class);
 
-/// Hidden `mutate_w_class` for the header field spelled `w_class?`.
+/// Watcher set for `__class__` assignment (`notify_w_class_mutated`).
 ///
-/// `__class__` assignment is rare and shared across every instance, so one
-/// process-global [`QuasiImmutField`] serves every object — the rtyper would
-/// synthesise a per-object slot, but a write already has to revoke every
-/// loop that folded any instance's class.
+/// Instance `w_class` is an ordinary mutable field (`mapdict.py`
+/// `BaseUserClassMapdict.setclass`); the JIT descr is not `?`.
+/// `walker_pin_type_attr_binding` still registers on this watcher:
+/// `TypeAttrBinding::UnboundHeap` records `record_quasiimmut_field`
+/// against `w_class_descr()`, which installs via `w_class_current_qmut`.
 /// Process-wide layout owner for header quasi-immuts. One space, one
 /// watcher set — a field of this prebuilt, not a naked module static.
 struct ObjectLayout {
@@ -643,7 +644,7 @@ pub fn notify_w_class_mutated() {
     }
 }
 
-/// Unlink the `w_class?` watcher and publish `store` under the same lock
+/// Unlink the `w_class` watcher and publish `store` under the same lock
 /// so a tracer cannot fold the old class onto a freshly installed watcher.
 #[inline]
 pub fn notify_w_class_mutated_then(store: impl FnOnce()) {

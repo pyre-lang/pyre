@@ -1,8 +1,9 @@
 # pyre-check: max-pypy-ratio=8.8
 # dynasm 3.8-4.4x (darwin-arm64); the ceiling is twice the slower reading.
-# wasm has its own baseline: it reads guard_failures 12664 against 12635 on
-# dynasm, with the same loops and bridges. The cause of the extra exits is
-# not identified.
+# wasm once read guard_failures 12664 against 12635 on dynasm. A user
+# instance now promotes its map (mapdict.py MapdictStorageMixin._get_mapdict_map
+# = jit.promote(self.map); class identity is terminator.w_cls). Map nodes are
+# interned + immortal, so that GUARD_VALUE is a stable word; wasm agrees.
 # A guard-failure bridge resumes `pickle._Unpickler.load` in the middle of its
 # `while True` loop, inlines the dispatched opcode handler and reaches the loop
 # header again.  It finishes that frame there and runs the rest of the loop with

@@ -562,7 +562,7 @@ macro_rules! py_module {
 ///                 crate::make_builtin_function_with_arity("__init__", __init__, 2));
 ///             // ... more methods
 ///         });
-///         unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+///         unsafe { $crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
 ///         tp as usize
 ///     }) as ::pyre_object::PyObjectRef
 /// }
@@ -635,7 +635,7 @@ macro_rules! py_class {
                         }
                     )*)?
                 });
-                unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+                unsafe { $crate::objspace::std::mapdict::set_type_hasdict(tp, true) };
                 tp
             })
         }

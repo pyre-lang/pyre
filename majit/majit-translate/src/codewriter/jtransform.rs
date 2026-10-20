@@ -6989,54 +6989,6 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
-    /// Whether `var` is a `new_with_vtable` result
-    /// (`jtransform.py rewrite_op_malloc` → `heaptracker.get_vtable_for_gcstruct`).
-    /// Walk through `__cast_instance_intrinsic`. A plain `new` does not stamp
-    /// the typeptr (that op is the no-vtable arm); a residual nursery bump
-    /// does not either, so the matching setfield must stay. The matching
-    /// getfield is `handle_getfield_typeptr` and is unconditional.
-    fn allocation_stamps_typeptr(
-        graph: &FunctionGraph,
-        var: &crate::flowspace::model::Variable,
-    ) -> bool {
-        let mut cur = var.clone();
-        for _ in 0..8 {
-            let Some(producer) = graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .find(|candidate| candidate.result.as_ref() == Some(&cur))
-            else {
-                return false;
-            };
-            match &producer.kind {
-                OpKind::NewWithVtable { .. } => return true,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } if segments.first().map(String::as_str)
-                    == Some(crate::runtime_names::shims::CAST_INSTANCE) =>
-                {
-                    let Some(inner) = args.first().and_then(LinkArg::as_variable) else {
-                        return false;
-                    };
-                    cur = inner.clone();
-                }
-                _ => return false,
-            }
-        }
-        false
-    }
-
-    /// Whether `op`'s FieldWrite base is a `new_with_vtable` result.
-    fn field_write_base_stamps_typeptr(graph: &FunctionGraph, op: &SpaceOperation) -> bool {
-        let OpKind::FieldWrite { base, .. } = &op.kind else {
-            return false;
-        };
-        Self::allocation_stamps_typeptr(graph, base)
-    }
-
     /// RPython: rewrite_op_setfield
     fn rewrite_op_setfield(
         &mut self,
@@ -7049,42 +7001,14 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         // `jtransform.py rewrite_op_setfield`: `if self.is_typeptr_getset(op):
         // # ignore the operation completely -- instead, it's done by 'new';
-        // return` — checked before anything else, as on the read side.  The
-        // class word is stamped by the allocation, so a write to it emits no
-        // op at all.  Dropping it is sound only after `rewrite_op_malloc`
-        // turned the allocation into `new_with_vtable`
-        // (`heaptracker.get_vtable_for_gcstruct`).
-        //
-        // `alloc_instance_object` does not become that op. Three stacked
-        // gaps, each required:
-        // 1. `fuse_boxing_alloc` `gc_malloc_flavor` matches only
-        //    `lltype::{malloc,malloc_typed,malloc_typed_managed,malloc_typed_stable}`.
-        //    The body calls `try_gc_alloc_nursery_raw(tid, size)`;
-        //    `lower_struct_ptr_writes` then turns `ptr::write` into
-        //    FieldWrites, so the residual is nursery Call + `ob_type` store.
-        // 2. `instance_typeptr_for` chooses `INSTANCE_TYPE` vs
-        //    `INSTANCE_USER_TYPE` at runtime. `resolve_header_plan` refuses a
-        //    non-constant `ob_type` (`ob_type-not-a-constant-address`) rather
-        //    than emitting plain `new`.
-        // 3. One Rust STRUCT (`W_ObjectObject`) carries two vtables: tid 53 /
-        //    `INSTANCE_TYPE` for exact `object()`, tid 217 /
-        //    `INSTANCE_USER_TYPE` for `_getusercls`. Upstream
-        //    `get_vtable_for_gcstruct` answers one vtable per STRUCT.
-        //    `NewWithVtable { owner: "W_ObjectObject", vtable: 0 }` would
-        //    stamp the published exact-object group, the wrong tid/typeptr
-        //    for user carriers. The user size descr already lives under
-        //    `objectobject::W_ObjectObjectUser`
-        //    (`W_OBJECT_OBJECT_USER_SIZE_DESCR`); there is no Rust STRUCT of
-        //    that name for `rclass.new_instance` to malloc.
-        // Convergence is `typedef.py _getusercls` as its own interp class
-        // (`W_ObjectObjectUserDictWeakrefable`), two specialized
-        // `new_instance` graphs with constant vtables, then this drop is
-        // unconditional. Teaching fuse the nursery spelling, or splitting
-        // only the typeptr without that STRUCT, still stamps the wrong GC
-        // tid on user instances. The store stays until that landing.
+        // return` — checked before anything else, as on the read side.
+        // A vtable-bearing STRUCT is `new_with_vtable`
+        // (`rewrite_op_malloc` / `heaptracker.get_vtable_for_gcstruct`);
+        // a plain `new` has no typeptr field. Exact `object()` and
+        // `_getusercls` each malloc their own STRUCT
+        // (`alloc_exact_object_instance` / `alloc_user_object_instance`).
         if matches!(&op.kind, OpKind::FieldWrite { .. })
             && crate::codewriter::heaptracker::is_typeptr_field(field)
-            && Self::field_write_base_stamps_typeptr(graph, op)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -27865,13 +27789,10 @@ mod tests {
         }));
     }
 
-    /// `jtransform.py rewrite_op_setfield` drops typeptr only because
-    /// `rewrite_op_malloc` already emitted `new_with_vtable`. A residual
-    /// `try_gc_alloc_nursery_raw` is not that op (`gc_malloc_flavor` does
-    /// not match it; see `rewrite_op_setfield`), so the store stays even
-    /// after `__cast_instance_intrinsic`.
+    /// `jtransform.py rewrite_op_setfield` / `is_typeptr_getset` drops
+    /// typeptr unconditionally ("instead, it's done by 'new'").
     #[test]
-    fn rewrite_op_setfield_keeps_typeptr_on_residual_nursery_alloc() {
+    fn rewrite_op_setfield_drops_typeptr_on_residual_nursery_alloc() {
         let mut graph = FunctionGraph::new("alloc_instance_object");
         let bb = graph.startblock;
         let tid = graph.push_op_var(bb, OpKind::ConstInt(217), true).unwrap();
@@ -27917,15 +27838,15 @@ mod tests {
         graph.set_return(bb, Some(raw));
         let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
         assert!(
-            transformed.graph.blocks.iter().any(|block| {
-                block.operations.iter().any(|op| {
-                    matches!(
+            transformed.graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(
                         &op.kind,
                         OpKind::FieldWrite { field, .. } if field.name == "ob_type"
                     )
                 })
             }),
-            "typeptr store on a residual nursery bump must stay"
+            "typeptr store on a residual nursery bump must drop"
         );
     }
 
@@ -27973,10 +27894,10 @@ mod tests {
         );
     }
 
-    /// Plain `new` is the no-vtable arm of `rewrite_op_malloc`. It does not
-    /// stamp the typeptr, so the store stays.
+    /// `jtransform.py rewrite_op_setfield` / `is_typeptr_getset` drops
+    /// typeptr unconditionally. A plain `new` has no typeptr field.
     #[test]
-    fn rewrite_op_setfield_keeps_typeptr_on_plain_new() {
+    fn rewrite_op_setfield_drops_typeptr_on_plain_new() {
         let mut graph = FunctionGraph::new("stack_pyobject");
         let bb = graph.startblock;
         let obj = graph
@@ -28004,15 +27925,15 @@ mod tests {
         graph.set_return(bb, Some(obj));
         let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
         assert!(
-            transformed.graph.blocks.iter().any(|block| {
-                block.operations.iter().any(|op| {
-                    matches!(
+            transformed.graph.blocks.iter().all(|block| {
+                block.operations.iter().all(|op| {
+                    !matches!(
                         &op.kind,
                         OpKind::FieldWrite { field, .. } if field.name == "ob_type"
                     )
                 })
             }),
-            "typeptr store on plain new must stay"
+            "typeptr store on plain new must drop"
         );
     }
 

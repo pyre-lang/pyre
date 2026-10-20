@@ -1,13 +1,10 @@
-//! Production-graph census for `alloc_instance_object`.
+//! Production-graph census for the two `rclass.new_instance` graphs.
 //!
-//! `try_gc_alloc_nursery_raw` + `ptr::write` is `lltype.malloc(STRUCT)`.
-//! `jtransform.py rewrite_op_malloc` turns that into `new_with_vtable` when
-//! the STRUCT has one vtable. This graph does not: `W_ObjectObject` is one
-//! STRUCT with two vtables (`INSTANCE_TYPE` tid 53 vs `INSTANCE_USER_TYPE`
-//! tid 217), `fuse_boxing_alloc` does not match `try_gc_alloc_nursery_raw`,
-//! and `instance_typeptr_for` is not a constant. Until `_getusercls` is its
-//! own interp class (`W_ObjectObjectUserDictWeakrefable`), the residual bump
-//! must keep the typeptr store.
+//! Exact `object()` mallocs `W_ObjectObject` with constant `INSTANCE_TYPE`;
+//! `_getusercls` mallocs `W_ObjectObjectUser` with constant
+//! `INSTANCE_USER_TYPE`. `fuse_boxing_alloc` turns each `malloc_typed_managed`
+//! cluster into `new_with_vtable`, and `jtransform.py rewrite_op_setfield`
+//! / `is_typeptr_getset` drops the typeptr store.
 
 mod common;
 
@@ -172,8 +169,7 @@ fn has_ptr_write(graph: &FunctionGraph) -> bool {
     })
 }
 
-#[test]
-fn alloc_instance_object_stamps_typeptr_after_jtransform() {
+fn transform_named(leaf: &str) -> (FunctionGraph, FunctionGraph) {
     let llbc = load_llbc(OBJECT_LLBC);
     let pytypes = [
         ("pyobject::INSTANCE_TYPE", 0x1000_0000i64),
@@ -181,59 +177,48 @@ fn alloc_instance_object_stamps_typeptr_after_jtransform() {
     ];
     let graph = lower_named_with_static_addrs(
         llbc,
-        "alloc_instance_object",
+        leaf,
         HostStaticAddrs {
             pytypes: &pytypes,
             ..Default::default()
         },
     )
-    .expect("lower alloc_instance_object");
-    eprintln!("{}", summarize("lowered", &graph));
+    .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"));
     let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
-    eprintln!("{}", summarize("jtransform", &transformed.graph));
+    (graph, transformed.graph)
+}
 
-    let fused = has_new_with_vtable(&transformed.graph);
-    let residual = has_nursery_raw(&transformed.graph);
-    let write = has_ptr_write(&transformed.graph);
+fn assert_new_with_vtable_and_no_typeptr_store(leaf: &str) {
+    let (lowered, transformed) = transform_named(leaf);
     let dump = format!(
         "{}\n{}",
-        summarize("lowered", &graph),
-        summarize("jtransform", &transformed.graph)
+        summarize("lowered", &lowered),
+        summarize("jtransform", &transformed)
     );
     assert!(
-        !write,
+        !has_ptr_write(&transformed),
         "generic core::ptr::write must not survive as a shared callee\n{dump}"
     );
+    assert!(
+        has_new_with_vtable(&transformed),
+        "{leaf} must lower to NewWithVtable\n{dump}"
+    );
+    assert!(
+        !has_ob_type_store(&transformed),
+        "jtransform.py rewrite_op_setfield drops typeptr on {leaf}\n{dump}"
+    );
+    assert!(
+        !has_nursery_raw(&transformed),
+        "{leaf} must not residualise try_gc_alloc_nursery_raw\n{dump}"
+    );
+}
 
-    let plain_new_header_keeps_typeptr = transformed.graph.blocks.iter().any(|block| {
-        let news: Vec<_> = block
-            .operations
-            .iter()
-            .filter_map(|op| match (&op.result, &op.kind) {
-                (Some(r), OpKind::New { owner }) if owner.ends_with("PyObject") => Some(r),
-                _ => None,
-            })
-            .collect();
-        news.iter().any(|base| {
-            block.operations.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldWrite { base: b, field, .. }
-                        if b == *base && field.name == "ob_type"
-                )
-            })
-        })
-    });
-    let any_ob_type = has_ob_type_store(&transformed.graph);
-    assert!(
-        fused || (residual && any_ob_type),
-        "alloc_instance_object must stamp the typeptr: NewWithVtable, or a \
-         residual nursery bump that keeps the ob_type store. fused={fused} \
-         residual={residual} any_ob_type={any_ob_type} \
-         plain_new_header_keeps={plain_new_header_keeps_typeptr}\n{dump}"
-    );
-    assert!(
-        fused || plain_new_header_keeps_typeptr || !residual,
-        "plain New PyObject must keep its ob_type store\n{dump}"
-    );
+#[test]
+fn alloc_exact_object_instance_is_new_with_vtable() {
+    assert_new_with_vtable_and_no_typeptr_store("alloc_exact_object_instance");
+}
+
+#[test]
+fn alloc_user_object_instance_is_new_with_vtable() {
+    assert_new_with_vtable_and_no_typeptr_store("alloc_user_object_instance");
 }

@@ -263,22 +263,12 @@ impl CachedField {
         // time, so no cache can reach them: upstream gets one box per loop from
         // `ThreadLocalReference(ExecutionContext, loop_invariant=True)`.
         //
-        // The instance class word is the analog of mapdict `inst_map`
-        // (`BaseUserClassMapdict.setclass`), which is not always_pure and
-        // which `setfield_gc` writes. pyre also tags it `?` so a *constant*
-        // object's class load can register `quasi_immutable_deps`
-        // (`notify_w_class_mutated`). On a red instance
-        // `optimize_QUASIIMMUT_FIELD` ignores the marker (`structvalue` is
-        // not constant, heap.py), so GNI does not protect the GETFIELD cache.
-        // A residual `CallMayForce` (`store_attr_fn`, `CallFlavor::MayForce`
-        // → `EffectInfo::MOST_GENERAL`) must drop it the way
-        // `heap.py clean_caches` drops `inst_map`. Leaving the promotion in
-        // the cache lets `serialize_optheap` export class B into a bridge
-        // whose `GUARD_VALUE` wants A (`class_reassign_hot`).
-        if descr.is_always_pure()
-            || (descr.is_quasi_immutable()
-                && !descr.as_field_descr().is_some_and(|f| f.is_w_class()))
-        {
+        // Instance `w_class` is an ordinary mutable field, the analog of
+        // mapdict `inst_map` (`BaseUserClassMapdict.setclass`). Type objects
+        // keep their own quasi-immutable fields. A residual
+        // `CallMayForce` therefore drops the instance class the way
+        // `heap.py clean_caches` drops `inst_map`.
+        if descr.is_always_pure() || descr.is_quasi_immutable() {
             return;
         }
         let descr_idx = field_idx;
@@ -4668,16 +4658,19 @@ mod tests {
             )
             .with_index_in_parent(1),
         );
-        let header: Arc<SimpleFieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
-            0,
-            0,
-            8,
-            Type::Ref,
-            false,
-            ArrayFlag::Pointer,
-            "PyObject.w_class".to_string(),
-            "w_class",
-        ));
+        let header: Arc<SimpleFieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                0,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class",
+            )
+            .with_index_in_parent(0),
+        );
         let size: DescrRef = Arc::new(
             SimpleSizeDescr::new(0x3000_0068, 104, 37).with_all_fielddescrs(vec![
                 header.clone() as Arc<dyn FieldDescr>,
@@ -4722,18 +4715,22 @@ mod tests {
                 "PyObject.w_class".to_string(),
                 "w_class",
             )
-            .with_class_word(true),
+            .with_class_word(true)
+            .with_index_in_parent(0),
         );
-        let map: Arc<SimpleFieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
-            1,
-            16,
-            8,
-            Type::Int,
-            false,
-            ArrayFlag::Signed,
-            "W_ObjectObject.map".to_string(),
-            "map",
-        ));
+        let map: Arc<SimpleFieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                1,
+                16,
+                8,
+                Type::Int,
+                false,
+                ArrayFlag::Signed,
+                "W_ObjectObject.map".to_string(),
+                "map",
+            )
+            .with_index_in_parent(1),
+        );
         let size: DescrRef = Arc::new(
             SimpleSizeDescr::new(0x3000_0069, 32, 53).with_all_fielddescrs(vec![
                 w_class.clone() as Arc<dyn FieldDescr>,
@@ -4791,19 +4788,22 @@ mod tests {
                 "w_class",
             )
             .with_class_word(true)
-            .with_quasi_immutable(true),
+            .with_index_in_parent(0),
         );
         w_class.set_descr_index(99);
-        let map: Arc<SimpleFieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
-            1,
-            16,
-            8,
-            Type::Int,
-            false,
-            ArrayFlag::Signed,
-            "W_ObjectObject.map".to_string(),
-            "map",
-        ));
+        let map: Arc<SimpleFieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                1,
+                16,
+                8,
+                Type::Int,
+                false,
+                ArrayFlag::Signed,
+                "W_ObjectObject.map".to_string(),
+                "map",
+            )
+            .with_index_in_parent(1),
+        );
         map.set_descr_index(100);
         let size: DescrRef = Arc::new(
             SimpleSizeDescr::with_vtable(0x3000_006a, 32, 53, 0x1000).with_all_fielddescrs(vec![
@@ -4855,9 +4855,10 @@ mod tests {
 
     /// `CachedField.invalidate` keeps a `?` field across `clean_caches`
     /// (pyre spelling of upstream `is_always_pure` covering
-    /// `IR_QUASIIMMUTABLE`). The instance class word is the analog of
-    /// mapdict `inst_map`, which is not always_pure, so a MOST_GENERAL
-    /// residual setattr drops it. `ExecutionContext.w_tracefunc` stays.
+    /// `IR_QUASIIMMUTABLE`). Instance `w_class` is ordinary mutable
+    /// (`mapdict.py BaseUserClassMapdict.setclass` / `inst_map`), so a
+    /// MOST_GENERAL residual setattr drops it. `ExecutionContext.w_tracefunc`
+    /// stays.
     #[test]
     fn clean_caches_drops_listed_w_class_keeps_other_quasiimmut() {
         use majit_ir::GcRef;
@@ -4875,7 +4876,7 @@ mod tests {
                 "w_class",
             )
             .with_class_word(true)
-            .with_quasi_immutable(true),
+            .with_index_in_parent(0),
         );
         w_class.set_descr_index(99);
         let tracefunc: Arc<SimpleFieldDescr> = Arc::new(
@@ -4889,7 +4890,8 @@ mod tests {
                 "ExecutionContext.w_tracefunc".to_string(),
                 "w_tracefunc",
             )
-            .with_quasi_immutable(true),
+            .with_quasi_immutable(true)
+            .with_index_in_parent(1),
         );
         tracefunc.set_descr_index(100);
         let size: DescrRef = Arc::new(
@@ -8218,6 +8220,10 @@ mod tests {
 
     #[test]
     fn call_may_force_most_general_drops_w_class_getfield_cache() {
+        // Instance `w_class` is ordinary mutable (`mapdict.py
+        // BaseUserClassMapdict.setclass` / `inst_map`), so a MOST_GENERAL
+        // residual drops the cached GETFIELD the way `heap.py clean_caches`
+        // drops a mutable field. Type objects keep their own `?` fields.
         use majit_ir::descr::{ArrayFlag, SimpleFieldDescr};
 
         let w_class: DescrRef = Arc::new(
@@ -8231,8 +8237,7 @@ mod tests {
                 "PyObject.w_class".to_string(),
                 "w_class",
             )
-            .with_class_word(true)
-            .with_quasi_immutable(true),
+            .with_class_word(true),
         );
         w_class.set_descr_index(99);
         let call_d = call_descr(80, EffectInfo::MOST_GENERAL);

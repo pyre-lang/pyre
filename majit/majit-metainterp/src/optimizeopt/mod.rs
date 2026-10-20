@@ -322,6 +322,63 @@ fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
         visitor(&mut gcref);
         op.set_value(Value::Ref(gcref));
     }
+    // recorder.rs `walk_const_ptr_refs` walks each slot's QuasiImmutDescr
+    // (`quasiimmut.py self.struct` / `constantfieldbox`). After
+    // `compile_tracing` is taken, this published-op walk is that holder.
+    // `heap.py is_still_valid_for` compares those words to the optimizer's
+    // ConstPtr; a compile-time minor that forwarded the ConstPtr but not
+    // the descr raises `InvalidLoop('quasi immutable field changed during
+    // tracing')` on a field that did not change.
+    if let Some(descr) = op.getdescr()
+        && let Some(qd) = descr.as_quasi_immut_descr()
+    {
+        qd.walk_const_ptr_refs(visitor);
+    }
+}
+
+#[cfg(test)]
+mod walk_live_op_quasiimmut_tests {
+    use super::*;
+    use majit_ir::QuasiImmutHandle;
+
+    #[derive(Debug)]
+    struct Handle;
+    impl QuasiImmutHandle for Handle {
+        fn is_current(&self) -> bool {
+            true
+        }
+        fn register_loop_token(&self, _token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>) {}
+        fn instance_identity(&self) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn walk_live_op_forwards_quasiimmut_struct_ptr() {
+        let field = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(0, 8, 8, Type::Ref, false))
+            as DescrRef;
+        let descr = std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+            field,
+            0x4100,
+            std::sync::Arc::new(Handle),
+            None,
+        )) as DescrRef;
+        let obj = Operand::bound_from_opref(OpRef::input_arg_typed(0, Type::Ref));
+        let op = OpRc::new(Op::with_descr(
+            OpCode::QuasiimmutField,
+            &[obj],
+            descr.clone(),
+        ));
+        let ops = vec![op];
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_vec(&ops);
+        roots.walk(&mut |slot| {
+            if slot.0 == 0x4100 {
+                slot.0 = 0x5100;
+            }
+        });
+        assert_eq!(descr.as_quasi_immut_descr().unwrap().struct_ptr(), 0x5100);
+    }
 }
 
 /// Compile-time snapshot box list. RPython keeps the live boxes themselves;

@@ -2885,7 +2885,7 @@ fn socket_type() -> pyre_object::PyObjectRef {
         // exposes the same immutable public type while constructing it from a
         // module heap spec, so retain HEAPTYPE and set IMMUTABLETYPE as well.
         pyre_interpreter::typedef::mark_cpython_heap_type(tp, true);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true) };
         unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
         tp
     })

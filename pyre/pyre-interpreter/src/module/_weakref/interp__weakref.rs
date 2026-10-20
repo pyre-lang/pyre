@@ -422,7 +422,7 @@ pub fn proxy_type() -> PyObjectRef {
             &pyre_object::weakref::WEAKREF_LAYOUT_TYPE as *const PyType,
         );
         unsafe {
-            pyre_object::w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
             // `proxy_typedef_dict` `__getattribute__` (`proxy_getattribute`).
             pyre_object::w_type_set_dispatch_own_getattribute(tp);
@@ -496,7 +496,7 @@ pub fn callable_proxy_type() -> PyObjectRef {
             &pyre_object::weakref::WEAKREF_LAYOUT_TYPE as *const PyType,
         );
         unsafe {
-            pyre_object::w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
             // `callable_proxy_typedef_dict` shares `proxy_getattribute`.
             pyre_object::w_type_set_dispatch_own_getattribute(tp);
@@ -2746,7 +2746,7 @@ mod tests {
         // Use a hasdict instance so the underlying object stores
         // attributes in its mapdict.
         let user_type = crate::typedef::make_builtin_type("ProxyTarget", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(user_type, true) };
         let referent = pyre_object::objectobject::w_instance_new(user_type);
         crate::baseobjspace::setattr_str(referent, "x", pyre_object::w_int_new(7)).unwrap();
 
@@ -2761,7 +2761,7 @@ mod tests {
         let _g = super::lock_proxy_tests();
         crate::typedef::init_typeobjects();
         let user_type = crate::typedef::make_builtin_type("ProxyTarget2", |_| {});
-        unsafe { pyre_object::w_type_set_hasdict(user_type, true) };
+        unsafe { crate::objspace::std::mapdict::set_type_hasdict(user_type, true) };
         let referent = pyre_object::objectobject::w_instance_new(user_type);
 
         let proxy = W_Proxy_new(referent, PY_NULL);

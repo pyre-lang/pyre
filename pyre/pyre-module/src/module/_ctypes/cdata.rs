@@ -146,7 +146,7 @@ static SIMPLECDATA_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
 pub(super) fn cdata_type() -> PyObjectRef {
     CDATA_TYPE_OBJ.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("_CData", init_cdata_type);
-        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        unsafe { pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true) };
         super::finish_cpython_type(tp, "_ctypes", true)
     })
 }
@@ -596,7 +596,7 @@ pub(super) fn simplecdata_type() -> PyObjectRef {
             cdata_type(),
         );
         unsafe {
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            pyre_interpreter::objspace::std::mapdict::set_type_hasdict(tp, true);
             // PyPy `primitive.py:SimpleType(_CDataMeta)` / CPython 3.14
             // `CREATE_TYPE(... PyCSimpleType_Type ...)`.
             pyre_object::typeobject::w_type_set_w_class(tp, super::metaclass::pycsimpletype_type());

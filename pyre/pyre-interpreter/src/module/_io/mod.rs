@@ -1629,7 +1629,7 @@ pub fn io_base_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
         }
         tp
     })
@@ -1654,7 +1654,7 @@ pub(super) fn raw_iobase_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
         }
         tp
     })
@@ -1731,7 +1731,7 @@ pub(super) fn buffered_iobase_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
         }
         tp
     })
@@ -1750,7 +1750,7 @@ fn text_iobase_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, true);
             pyre_object::w_type_set_weakrefable(tp, true);
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
+            crate::objspace::std::mapdict::set_type_hasdict(tp, true);
         }
         tp
     })
@@ -1895,7 +1895,7 @@ crate::py_module! {
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(typ, true);
                 pyre_object::w_type_set_weakrefable(typ, true);
-                pyre_object::typeobject::w_type_set_hasdict(typ, true);
+                crate::objspace::std::mapdict::set_type_hasdict(typ, true);
             };
             crate::__pyre_store!(ns, name, typ);
         }
@@ -1933,7 +1933,7 @@ crate::py_module! {
             let mut t = pyre_object::gc_roots::shadow_stack_get(slot);
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(t, true);
-                pyre_object::typeobject::w_type_set_hasdict(t, true);
+                crate::objspace::std::mapdict::set_type_hasdict(t, true);
             }
             crate::__pyre_store!(ns, name, t);
         }
@@ -1950,7 +1950,7 @@ crate::py_module! {
             let mut console_io = pyre_object::gc_roots::shadow_stack_get(console_io_slot);
             unsafe {
                 pyre_object::w_type_set_acceptable_as_base_class(console_io, true);
-                pyre_object::typeobject::w_type_set_hasdict(console_io, true);
+                crate::objspace::std::mapdict::set_type_hasdict(console_io, true);
             }
             crate::__pyre_store!(ns, "_WindowsConsoleIO", console_io);
         }

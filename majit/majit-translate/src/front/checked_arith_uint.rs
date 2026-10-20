@@ -133,6 +133,13 @@ pub(crate) fn is_word_sized_uint_atom_for(atom: &str, word_bytes: usize) -> bool
     }
 }
 
+/// Width of the JIT int box (`Value::Int(i64)`), on every backend.
+///
+/// Wrapping ops compare the destination word against this, not against
+/// `target_word_size`: a 4-byte word on wasm32 is narrower than the box
+/// (`jtransform.py` `_int_to_int_cast` when `size2 < sizeof(Signed)`).
+pub(crate) const JIT_BANK_BITS: u32 = 64;
+
 /// `I64` / `U64` are the 8-byte JIT int bank. `Isize` / `Usize` are that
 /// bank only when the target word is 8 bytes; a 4-byte word wraps like
 /// `i32` / `u32` and must not be lowered to an unmasked `int_*` op.
@@ -142,6 +149,126 @@ pub(crate) fn is_jit_bank_int_atom(atom: &str, word_bytes: usize) -> bool {
         "Isize" | "Usize" => word_bytes == 8,
         _ => false,
     }
+}
+
+/// Bit width of a Charon integer atom.
+///
+/// `Isize` / `Usize` are the target word (`lltype.Signed` /
+/// `lltype.Unsigned`), not [`JIT_BANK_BITS`]. A 4-byte word is 32 bits
+/// so casts and wrapping ops truncate (`jtransform.py` `_int_to_int_cast`).
+pub(crate) fn literal_int_atom_bits(atom: &str, word_bytes: usize) -> Option<u32> {
+    match atom {
+        "I8" | "U8" => Some(8),
+        "I16" | "U16" => Some(16),
+        "I32" | "U32" => Some(32),
+        "I64" | "U64" => Some(64),
+        "Isize" | "Usize" => Some((word_bytes * 8) as u32),
+        "I128" | "U128" => Some(128),
+        _ => None,
+    }
+}
+
+/// Truncation after a box-wide wrapping op (`jtransform.py`
+/// `_int_to_int_cast`: `int_and` unsigned, `int_signext` signed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WrappingTruncation {
+    None,
+    /// `int_and` with `(1 << bits) - 1`.
+    Mask(u32),
+    /// `int_signext` by this many bytes (`size2` in `_int_to_int_cast`).
+    SignExt(u32),
+}
+
+/// How a `core::num::<Impl>::wrapping_*` leaf lowers for `atom` at
+/// `word_bytes`. `Call` stays residual; `None` is not a wrapping leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WrappingPlan {
+    Call,
+    Inline {
+        op: &'static str,
+        unsigned_receiver: bool,
+        /// `bits - 1` of the receiver, for `wrapping_shl` / `wrapping_shr`.
+        shift_count_mask: Option<u32>,
+        truncation: WrappingTruncation,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WrapKind {
+    Arith,
+    DivRem,
+    Shift,
+    Neg,
+}
+
+/// Width decision for wrapping lowering. Pure in `atom`, `leaf`, and
+/// `word_bytes` — the lowering passes [`crate::layout::target_word_size`].
+///
+/// A receiver narrower than [`JIT_BANK_BITS`] takes the box op, then
+/// truncation (`rint.py` `cast_primitive`). Compare against the box, not
+/// the word: a 4-byte word on wasm32 is still narrower than the box, so
+/// it matches `u32` / `i32`. `wrapping_shr` inlines without truncation:
+/// the receiver is already canonical. `wrapping_div` / `wrapping_rem`
+/// stay a `Call` unless the receiver is the signed bank (`I64` / 8-byte
+/// `Isize`): `uint_floordiv` / `uint_mod` are different insns.
+pub(crate) fn wrapping_plan(atom: &str, leaf: &str, word_bytes: usize) -> Option<WrappingPlan> {
+    let (op, signed_only, kind) = match leaf {
+        "wrapping_add" => ("add", false, WrapKind::Arith),
+        "wrapping_sub" => ("sub", false, WrapKind::Arith),
+        "wrapping_mul" => ("mul", false, WrapKind::Arith),
+        "wrapping_div" => ("floordiv", true, WrapKind::DivRem),
+        "wrapping_rem" => ("mod", true, WrapKind::DivRem),
+        "wrapping_shl" => ("lshift", false, WrapKind::Shift),
+        "wrapping_shr" => ("rshift", false, WrapKind::Shift),
+        "wrapping_neg" => ("neg", false, WrapKind::Neg),
+        _ => return None,
+    };
+    let bits = literal_int_atom_bits(atom, word_bytes)?;
+    if bits > JIT_BANK_BITS {
+        return Some(WrappingPlan::Call);
+    }
+    let unsigned_receiver = matches!(atom, "U8" | "U16" | "U32" | "U64" | "Usize" | "U128");
+    let bank = is_jit_bank_int_atom(atom, word_bytes);
+    let signed_word = !unsigned_receiver && bank;
+    let unsigned_word = unsigned_receiver && bank;
+    let narrower_than_box = bits < JIT_BANK_BITS;
+    let inlines_narrow = match kind {
+        WrapKind::Arith | WrapKind::Shift | WrapKind::Neg => narrower_than_box,
+        WrapKind::DivRem => false,
+    };
+    if !signed_word && !unsigned_word && !inlines_narrow {
+        return Some(WrappingPlan::Call);
+    }
+    if signed_only && !signed_word {
+        return Some(WrappingPlan::Call);
+    }
+    if kind == WrapKind::Shift && bits <= 1 {
+        return Some(WrappingPlan::Call);
+    }
+    let truncates = match kind {
+        WrapKind::Arith | WrapKind::Neg => narrower_than_box,
+        WrapKind::Shift => narrower_than_box && leaf == "wrapping_shl",
+        WrapKind::DivRem => false,
+    };
+    let truncation = if truncates {
+        if unsigned_receiver {
+            WrappingTruncation::Mask(bits)
+        } else {
+            WrappingTruncation::SignExt(bits / 8)
+        }
+    } else {
+        WrappingTruncation::None
+    };
+    let shift_count_mask = match kind {
+        WrapKind::Shift => Some(bits - 1),
+        _ => None,
+    };
+    Some(WrappingPlan::Inline {
+        op,
+        unsigned_receiver,
+        shift_count_mask,
+        truncation,
+    })
 }
 
 /// `Signed` max for a `word_bytes`-wide machine word (`sys.maxint`).
@@ -433,7 +560,7 @@ mod tests {
     fn four_byte_usize_wrapping_shl_is_not_a_jit_bank_op() {
         assert!(
             !is_jit_bank_int_atom("Usize", 4),
-            "usize::wrapping_shl on a 4-byte word must stay a residual call"
+            "a 4-byte usize is not the i64 bank; wrapping_* use the narrow path"
         );
         assert!(!is_jit_bank_int_atom("Isize", 4));
         assert!(is_jit_bank_int_atom("Usize", 8));
@@ -442,6 +569,275 @@ mod tests {
         assert!(is_jit_bank_int_atom("I64", 4));
         assert!(!is_jit_bank_int_atom("U32", 8));
         assert!(!is_jit_bank_int_atom("I32", 8));
+    }
+
+    #[test]
+    fn literal_int_atom_bits_follows_target_word() {
+        assert_eq!(literal_int_atom_bits("Usize", 4), Some(32));
+        assert_eq!(literal_int_atom_bits("Isize", 4), Some(32));
+        assert_eq!(literal_int_atom_bits("Usize", 8), Some(64));
+        assert_eq!(literal_int_atom_bits("Isize", 8), Some(64));
+        assert_eq!(literal_int_atom_bits("U32", 4), Some(32));
+        assert_eq!(literal_int_atom_bits("U32", 8), Some(32));
+        assert_eq!(literal_int_atom_bits("U64", 4), Some(64));
+        assert_eq!(literal_int_atom_bits("I64", 8), Some(64));
+        assert_eq!(literal_int_atom_bits("U128", 8), Some(128));
+    }
+
+    fn plan_inline(
+        op: &'static str,
+        unsigned: bool,
+        shift: Option<u32>,
+        truncation: WrappingTruncation,
+    ) -> Option<WrappingPlan> {
+        Some(WrappingPlan::Inline {
+            op,
+            unsigned_receiver: unsigned,
+            shift_count_mask: shift,
+            truncation,
+        })
+    }
+
+    /// Every row of the pw2 wrapping leaf table, at both word sizes.
+    #[test]
+    fn wrapping_plan_leaf_table_both_words() {
+        use WrappingTruncation::{Mask, SignExt};
+        let call = Some(WrappingPlan::Call);
+        let mask32 = Mask(32);
+        let sext4 = SignExt(4);
+        let none = WrappingTruncation::None;
+
+        for word in [4usize, 8] {
+            assert_eq!(
+                wrapping_plan("U32", "wrapping_add", word),
+                plan_inline("add", true, None, mask32)
+            );
+            assert_eq!(
+                wrapping_plan("I32", "wrapping_add", word),
+                plan_inline("add", false, None, sext4)
+            );
+            assert_eq!(
+                wrapping_plan("U32", "wrapping_sub", word),
+                plan_inline("sub", true, None, mask32)
+            );
+            assert_eq!(
+                wrapping_plan("I32", "wrapping_sub", word),
+                plan_inline("sub", false, None, sext4)
+            );
+            assert_eq!(
+                wrapping_plan("U32", "wrapping_mul", word),
+                plan_inline("mul", true, None, mask32)
+            );
+            assert_eq!(
+                wrapping_plan("I32", "wrapping_mul", word),
+                plan_inline("mul", false, None, sext4)
+            );
+            assert_eq!(
+                wrapping_plan("U32", "wrapping_neg", word),
+                plan_inline("neg", true, None, mask32)
+            );
+            assert_eq!(
+                wrapping_plan("I32", "wrapping_neg", word),
+                plan_inline("neg", false, None, sext4)
+            );
+            assert_eq!(
+                wrapping_plan("U32", "wrapping_shl", word),
+                plan_inline("lshift", true, Some(31), mask32)
+            );
+            assert_eq!(
+                wrapping_plan("I32", "wrapping_shl", word),
+                plan_inline("lshift", false, Some(31), sext4)
+            );
+            assert_eq!(
+                wrapping_plan("U32", "wrapping_shr", word),
+                plan_inline("rshift", true, Some(31), none)
+            );
+            assert_eq!(
+                wrapping_plan("I32", "wrapping_shr", word),
+                plan_inline("rshift", false, Some(31), none)
+            );
+            assert_eq!(wrapping_plan("U32", "wrapping_div", word), call);
+            assert_eq!(wrapping_plan("I32", "wrapping_div", word), call);
+            assert_eq!(wrapping_plan("U32", "wrapping_rem", word), call);
+            assert_eq!(wrapping_plan("I32", "wrapping_rem", word), call);
+
+            assert_eq!(
+                wrapping_plan("U64", "wrapping_add", word),
+                plan_inline("add", true, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_add", word),
+                plan_inline("add", false, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("U64", "wrapping_sub", word),
+                plan_inline("sub", true, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_sub", word),
+                plan_inline("sub", false, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("U64", "wrapping_mul", word),
+                plan_inline("mul", true, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_mul", word),
+                plan_inline("mul", false, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("U64", "wrapping_neg", word),
+                plan_inline("neg", true, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_neg", word),
+                plan_inline("neg", false, None, none)
+            );
+            assert_eq!(
+                wrapping_plan("U64", "wrapping_shl", word),
+                plan_inline("lshift", true, Some(63), none)
+            );
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_shl", word),
+                plan_inline("lshift", false, Some(63), none)
+            );
+            assert_eq!(
+                wrapping_plan("U64", "wrapping_shr", word),
+                plan_inline("rshift", true, Some(63), none)
+            );
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_shr", word),
+                plan_inline("rshift", false, Some(63), none)
+            );
+            assert_eq!(wrapping_plan("U64", "wrapping_div", word), call);
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_div", word),
+                plan_inline("floordiv", false, None, none)
+            );
+            assert_eq!(wrapping_plan("U64", "wrapping_rem", word), call);
+            assert_eq!(
+                wrapping_plan("I64", "wrapping_rem", word),
+                plan_inline("mod", false, None, none)
+            );
+            assert_eq!(wrapping_plan("U128", "wrapping_add", word), call);
+            assert_eq!(wrapping_plan("I128", "wrapping_neg", word), call);
+        }
+
+        // 4-byte word: Usize/Isize match u32/i32.
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_add", 4),
+            plan_inline("add", true, None, mask32)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_add", 4),
+            plan_inline("add", false, None, sext4)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_sub", 4),
+            plan_inline("sub", true, None, mask32)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_sub", 4),
+            plan_inline("sub", false, None, sext4)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_mul", 4),
+            plan_inline("mul", true, None, mask32)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_mul", 4),
+            plan_inline("mul", false, None, sext4)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_neg", 4),
+            plan_inline("neg", true, None, mask32)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_neg", 4),
+            plan_inline("neg", false, None, sext4)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_shl", 4),
+            plan_inline("lshift", true, Some(31), mask32)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_shl", 4),
+            plan_inline("lshift", false, Some(31), sext4)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_shr", 4),
+            plan_inline("rshift", true, Some(31), none)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_shr", 4),
+            plan_inline("rshift", false, Some(31), none)
+        );
+        assert_eq!(wrapping_plan("Usize", "wrapping_div", 4), call);
+        assert_eq!(wrapping_plan("Isize", "wrapping_div", 4), call);
+        assert_eq!(wrapping_plan("Usize", "wrapping_rem", 4), call);
+        assert_eq!(wrapping_plan("Isize", "wrapping_rem", 4), call);
+
+        // 8-byte word: Usize/Isize match u64/i64.
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_add", 8),
+            plan_inline("add", true, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_add", 8),
+            plan_inline("add", false, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_sub", 8),
+            plan_inline("sub", true, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_sub", 8),
+            plan_inline("sub", false, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_mul", 8),
+            plan_inline("mul", true, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_mul", 8),
+            plan_inline("mul", false, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_neg", 8),
+            plan_inline("neg", true, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_neg", 8),
+            plan_inline("neg", false, None, none)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_shl", 8),
+            plan_inline("lshift", true, Some(63), none)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_shl", 8),
+            plan_inline("lshift", false, Some(63), none)
+        );
+        assert_eq!(
+            wrapping_plan("Usize", "wrapping_shr", 8),
+            plan_inline("rshift", true, Some(63), none)
+        );
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_shr", 8),
+            plan_inline("rshift", false, Some(63), none)
+        );
+        assert_eq!(wrapping_plan("Usize", "wrapping_div", 8), call);
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_div", 8),
+            plan_inline("floordiv", false, None, none)
+        );
+        assert_eq!(wrapping_plan("Usize", "wrapping_rem", 8), call);
+        assert_eq!(
+            wrapping_plan("Isize", "wrapping_rem", 8),
+            plan_inline("mod", false, None, none)
+        );
+
+        assert_eq!(wrapping_plan("U32", "checked_add", 8), None);
     }
 
     #[test]

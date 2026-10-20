@@ -117,7 +117,7 @@ pub(crate) fn lock_instance_stripes(first: PyObjectRef, second: PyObjectRef) -> 
 fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
     // A nursery instance moves while this guard is held. Stripe on its class,
     // as `w_list_lock_acquire` does, so a collection inside
-    // `type_terminator_or_create` does not put later accessors on another stripe.
+    // `ensure_mapdict_initialized` does not put later accessors on another stripe.
     // `__class__` assignment changes that stripe. After the acquire, re-read
     // `w_class`; a mismatch means the transition published a new class while
     // this thread waited, so drop and take the new stripe.
@@ -532,8 +532,8 @@ pub fn new_dict_terminator(w_cls: PyObjectRef) -> MapRef {
     t
 }
 
-/// Build the per-type map terminator (typeobject.py:251-260 +
-/// mapdict.py): a `DictTerminator` when the type has `__dict__`, else
+/// Build the per-type map terminator (`typeobject.py W_TypeObject.__init__` +
+/// `mapdict.py`): a `DictTerminator` when the type has `__dict__`, else
 /// a `NoDictTerminator`. `allow_unboxing` keeps its `mapdict.py` default of
 /// `True`; type instability later freezes it off per-class through the reactive
 /// paths (`plain_direct_write` type change / `holder_pick_attr` mismatch), and
@@ -561,17 +561,59 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
     }
 }
 
-/// `_mapdict_init_empty` deferred to first attribute access (mapdict.py
-/// `user_setup` calls it at construction with `w_subtype.terminator`; pyre
-/// defers to first access). If the instance's `map` is null, fetch the owning
-/// type's terminator — lazily creating and storing it on the type if absent,
-/// covering types built before the eager install site — then set it as the
-/// instance map. Must run before any `node_read`/`node_write`/`node_delete`.
+/// Store `w_type.terminator` after layout and hasdict/typedef facts are final
+/// (`typeobject.py W_TypeObject.__init__`).
 ///
-/// Returns `obj`. [`new_terminator`] leaks a `Box`, so
-/// [`type_terminator_or_create`] does not collect and the instance does not
-/// move here. Callers that collect after this returns pin the pointer
-/// themselves (`instance_setclass`).
+/// Construction sites run once; `debug_assert!` the slot was null. The only
+/// legitimate second run is a post-constructor `hasdict` flip
+/// (`py_class!`, `init_typeobjects` function/module, cpyext `tp_dictoffset`):
+/// [`set_type_hasdict`] re-invokes this so the kind matches
+/// `hasdict and not typedef.hasdict`.
+///
+/// # Safety
+/// `w_type` must be a live `W_TypeObject`.
+pub unsafe fn install_type_terminator(w_type: PyObjectRef) {
+    debug_assert!(!w_type.is_null());
+    let existing = unsafe { pyre_object::w_type_get_terminator(w_type) };
+    let hasdict = unsafe { pyre_object::w_type_get_hasdict(w_type) };
+    let typedef_hasdict = unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) };
+    let term = new_instance_terminator(w_type, hasdict, typedef_hasdict) as *const u8;
+    if existing.is_null() {
+        unsafe { pyre_object::w_type_set_terminator(w_type, term) };
+        return;
+    }
+    // Second install: `set_type_hasdict` after the constructor. Instances
+    // must not have copied the old word yet (`_getusercls` stamps `map: 0`
+    // until [`ensure_mapdict_initialized`]; `alloc_instance_object` copies
+    // at alloc, after this flip).
+    unsafe { pyre_object::w_type_set_terminator(w_type, term) };
+}
+
+/// `w_type_set_hasdict` that rebuilds the terminator when `hasdict` changes
+/// after [`install_type_terminator`]. Construction-time sets (layout still
+/// empty, terminator still null) only store the flag.
+///
+/// # Safety
+/// `w_type` must be a live `W_TypeObject`.
+pub unsafe fn set_type_hasdict(w_type: PyObjectRef, v: bool) {
+    let old = unsafe { pyre_object::w_type_get_hasdict(w_type) };
+    unsafe { pyre_object::w_type_set_hasdict(w_type, v) };
+    if old == v || unsafe { pyre_object::w_type_get_terminator(w_type) }.is_null() {
+        return;
+    }
+    unsafe { install_type_terminator(w_type) };
+}
+
+/// `_mapdict_init_empty` for a carrier whose `map` is still null
+/// (`mapdict.py user_setup` copies `w_subtype.terminator` at construction;
+/// `typeobject.py W_TypeObject.__init__` stores that terminator after layout).
+/// `_getusercls` allocators stamp `map: 0` (`pyre-object` cannot call this
+/// layer), so the null-map check stays: copy the type's terminator into the
+/// instance before any `node_read`/`node_write`/`node_delete`.
+///
+/// Returns `obj`. The terminator is an immortal `malloc_raw` node, so this
+/// does not collect and the instance does not move here. Callers that collect
+/// after this returns pin the pointer themselves (`instance_setclass`).
 ///
 /// # Safety
 /// `obj` must be a live mapdict carrier. User-layout instances
@@ -590,15 +632,19 @@ pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) -> PyObjectRef {
     obj
 }
 
-/// [`type_terminator_or_create`] for callers outside the mapdict layer — the
-/// JIT's instantiation emit bakes the terminator into the trace as the fresh
-/// instance's `map`, so it needs the same one the interpreter would install
-/// rather than the null a not-yet-touched type still carries.
+/// Read `w_type.terminator` (`typeobject.py W_TypeObject.__init__` stores it
+/// after layout). Kept for callers that only need the word; construction
+/// uses [`install_type_terminator`].
 ///
 /// # Safety
 /// `w_type` must be a live `W_TypeObject`.
 pub unsafe fn ensure_type_terminator(w_type: PyObjectRef) -> *const u8 {
-    unsafe { type_terminator_or_create(w_type) as *const u8 }
+    let term = unsafe { pyre_object::w_type_get_terminator(w_type) };
+    debug_assert!(
+        !term.is_null(),
+        "typeobject.py W_TypeObject.__init__ stores terminator after layout"
+    );
+    term
 }
 
 /// Whether `obj`'s storage class is a `_getusercls` class
@@ -672,7 +718,7 @@ pub unsafe fn has_mapdict_storage(obj: PyObjectRef) -> bool {
 /// Whether `obj`'s class typedef owns the instance dictionary.
 ///
 /// `typedef.py` `_getusercls` mixes `MapdictDictSupport` in only when
-/// `not typedef.hasdict`. `type_terminator_or_create` reads that fact
+/// `not typedef.hasdict`. `install_type_terminator` reads that fact
 /// with `w_type_get_typedef_hasdict` on the class from
 /// `w_instance_get_type`. Ordinary attributes then go through the class's
 /// own `getdict`; the map is not that dictionary.
@@ -693,19 +739,27 @@ pub unsafe fn typedef_owns_dict(obj: PyObjectRef) -> bool {
         && unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) }
 }
 
-/// Fetch `w_type`'s instance terminator, lazily creating and storing it on the
-/// type if absent (covering types built before the eager install site).
+/// Read `w_type.terminator` (`typeobject.py W_TypeObject.__init__` /
+/// [`install_type_terminator`]). Types built after bootstrap always have
+/// one. A null slot on a type that already has a layout is a missed
+/// construction site. Incomplete types (`w_type_new` in unit tests, layout
+/// still null) still need a terminator when `_getusercls` stamped `map: 0`.
 ///
 /// # Safety
 /// `w_type` must be a live `W_TypeObject`.
 unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
-    let mut term = pyre_object::w_type_get_terminator(w_type);
-    if term.is_null() {
-        let hasdict = pyre_object::w_type_get_hasdict(w_type);
-        let typedef_hasdict = pyre_object::w_type_get_typedef_hasdict(w_type);
-        term = new_instance_terminator(w_type, hasdict, typedef_hasdict) as *const u8;
-        unsafe { pyre_object::w_type_set_terminator(w_type, term) };
+    let term = unsafe { pyre_object::w_type_get_terminator(w_type) };
+    if !term.is_null() {
+        return term as MapRef;
     }
+    debug_assert!(
+        unsafe { pyre_object::w_type_get_layout_ptr(w_type) }.is_null(),
+        "typeobject.py W_TypeObject.__init__ stores terminator after layout"
+    );
+    let hasdict = unsafe { pyre_object::w_type_get_hasdict(w_type) };
+    let typedef_hasdict = unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) };
+    let term = new_instance_terminator(w_type, hasdict, typedef_hasdict) as *const u8;
+    unsafe { pyre_object::w_type_set_terminator(w_type, term) };
     term as MapRef
 }
 
