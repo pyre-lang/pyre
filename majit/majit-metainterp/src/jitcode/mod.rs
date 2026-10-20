@@ -923,6 +923,37 @@ fn is_inline_call(opcode: u8) -> bool {
 }
 
 pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolicResiduals {
+    fn is_conditional_call(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            insns::BC_CONDITIONAL_CALL_IR_V
+                | insns::BC_CONDITIONAL_CALL_VALUE_IR_I
+                | insns::BC_CONDITIONAL_CALL_VALUE_IR_R
+        )
+    }
+
+    fn collect_constant_funcptr_target(
+        jitcode: &JitCode,
+        funcptr_byte: usize,
+        targets: &mut std::collections::BTreeSet<i64>,
+    ) {
+        let Some(&funcptr_reg) = jitcode.code.get(funcptr_byte) else {
+            return;
+        };
+        let funcptr_reg = funcptr_reg as usize;
+        if funcptr_reg < jitcode.num_regs_i() {
+            return;
+        }
+        let Some(&target) = jitcode.constants_i.get(funcptr_reg - jitcode.num_regs_i()) else {
+            return;
+        };
+        if crate::pyjitpl::resolve_symbolic_fnaddr_path(target).is_some()
+            || majit_jitcode::codewriter::call::is_symbolic_fnaddr(target)
+        {
+            targets.insert(target);
+        }
+    }
+
     fn visit(
         jitcode: &JitCode,
         visited: &mut std::collections::BTreeSet<usize>,
@@ -943,22 +974,12 @@ pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolic
                 continue;
             };
             if is_residual_call(opcode) {
-                let Some(&funcptr_reg) = jitcode.code.get(pc + 1) else {
-                    continue;
-                };
-                let funcptr_reg = funcptr_reg as usize;
-                if funcptr_reg < jitcode.num_regs_i() {
-                    continue;
-                }
-                let Some(&target) = jitcode.constants_i.get(funcptr_reg - jitcode.num_regs_i())
-                else {
-                    continue;
-                };
-                if crate::pyjitpl::resolve_symbolic_fnaddr_path(target).is_some()
-                    || majit_jitcode::codewriter::call::is_symbolic_fnaddr(target)
-                {
-                    targets.insert(target);
-                }
+                collect_constant_funcptr_target(jitcode, pc + 1, targets);
+                continue;
+            }
+            if is_conditional_call(opcode) {
+                // `iiIRd` / `riIRd`: lead (cond/value) at pc+1, funcptr at pc+2.
+                collect_constant_funcptr_target(jitcode, pc + 2, targets);
                 continue;
             }
             if !is_inline_call(opcode) {

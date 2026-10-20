@@ -2679,7 +2679,6 @@ fn ordinary_raw_adt_pointer_stamps_raw_owner_func_result() {
             spec,
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
-            None,
         )
         .as_deref(),
         Some("raw:Owner"),
@@ -2701,7 +2700,6 @@ fn ordinary_raw_adt_pointer_stamps_raw_owner_func_result() {
             spec,
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
-            None,
         )
         .as_deref(),
         Some("i64")

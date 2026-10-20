@@ -14,7 +14,7 @@ use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
     front::llbc_hints::harvest_hints_from_llbcs,
-    model::{CallTarget, ConcreteType, FunctionGraph, OpKind, ValueType},
+    model::{CallTarget, ConcreteType, FunctionGraph, LinkArg, OpKind, ValueType},
 };
 
 #[test]
@@ -754,6 +754,65 @@ fn byteskey_as_bytes_is_str_identity_not_window_strlen() {
     );
 }
 
+/// `RDict::get<Q>` specialized at `V = PyObjectRef` (`*mut PyObject`).
+///
+/// `_orig_w_dict_lookup_int_strategy` is the `look_inside_iff` body
+/// (`entries.get(&k).copied()`). The public name is the dispatch wrapper
+/// (`rlib/jit.py look_inside_iff`); a function-name filter on that wrapper
+/// never queues the generic `get`. The spec copy's `lookup()?` break arm
+/// returns the enclosing `Option<&V>` None. After substitution that Option
+/// is a one-word nullable pointer, so the None arm is a null Ref
+/// (`null_mut`), not a tagged `Option` New. `aggregate_shape` already
+/// identity-returns `Some` as the payload; the `?` rewrite must classify
+/// the same specialized type.
+#[test]
+fn rdict_get_pyobject_spec_none_is_null_ref_not_option_new() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(&llbc),
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict"],
+        &["_orig_w_dict_lookup_int_strategy"],
+    )
+    .expect("lower _orig_w_dict_lookup_int_strategy");
+    let gets: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| f.name.starts_with("get__spec_") && f.name.contains("PyObject"))
+        .collect();
+    assert!(
+        !gets.is_empty(),
+        "no RDict::get spec at PyObject, names {:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|n| n.contains("get__spec_"))
+            .collect::<Vec<_>>()
+    );
+    for f in &gets {
+        let graph = f.graph();
+        assert!(
+            !graph_has_option_none_ctor(&graph),
+            "{} None arm must not construct Option::None, ops {:?}",
+            f.name,
+            op_kinds(&graph)
+        );
+        assert!(
+            !graph_has_option_new(&graph),
+            "{} None arm must not New an Option SizeDescr, ops {:?}",
+            f.name,
+            op_kinds(&graph)
+        );
+        assert!(
+            graph_returns_null_ref(&graph),
+            "{} None arm must return a null Ref, ops {:?}",
+            f.name,
+            op_kinds(&graph)
+        );
+    }
+}
+
 /// `fn f(s: &mut S) { replace(&mut s.u, ()) }` where `S.u` is `()`.
 /// The borrow aliases a Void field read: no `getfield` of `u`.
 #[test]
@@ -903,6 +962,83 @@ fn producer_value_type<'a>(
                 | OpKind::FieldRead { ty, .. } => Some(ty),
                 _ => None,
             }
+        })
+    })
+}
+
+fn graph_has_option_none_ctor(graph: &FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, owner_path, .. },
+                    ..
+                } if name == "None" && owner_path.iter().any(|part| part.contains("Option"))
+            )
+        })
+}
+
+fn graph_has_option_new(graph: &FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::New { owner } => owner.contains("option::Option") || owner.contains("Option<"),
+            _ => false,
+        })
+}
+
+fn graph_returns_null_ref(graph: &FunctionGraph) -> bool {
+    let nulls: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments
+                == &[
+                    "core".to_string(),
+                    "ptr".to_string(),
+                    "null_mut".to_string(),
+                ] =>
+            {
+                op.result.clone()
+            }
+            _ => None,
+        })
+        .collect();
+    if nulls.is_empty() {
+        return false;
+    }
+    let mut returned = nulls.clone();
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call { args, .. } = &op.kind else {
+            continue;
+        };
+        if args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .is_some_and(|v| nulls.contains(v))
+        {
+            if let Some(res) = op.result.clone() {
+                returned.push(res);
+            }
+        }
+    }
+    graph.blocks.iter().any(|block| {
+        block.exits.iter().any(|link| {
+            link.target == graph.returnblock
+                && link
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(v) if returned.contains(v)))
         })
     })
 }
