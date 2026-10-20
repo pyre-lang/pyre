@@ -8677,21 +8677,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // raises after `finishframe`.  Distinct raising depth is 3; recursive
     // / duplicate raising is unbounded here (`max_unroll_recursion` is the
     // sole remaining bound).  `perform_call` has no such cap; see
-    // `fbw_effective_multiframe_depth`.  A value-returning chain (no raise)
-    // inlines to the full depth either way.
-    // Value-returning recursion still keys only on this callee's own
-    // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
-    // only a raising-chain safety valve: it must not promote an unrelated
-    // value-returning callee to the unbounded recursive cap.
-    let effective_multiframe_depth = fbw_effective_multiframe_depth(
-        contains_raise,
-        if contains_raise {
-            recursive_portal_present
-                || framestack_has_duplicate_w_code(&ctx.session.borrow().framestack)
-        } else {
-            recursive_portal_present
-        },
-    );
+    // `fbw_effective_multiframe_depth`.
+    //
+    // `_opimpl_recursive_call` (`pyjitpl.py`) inlines a *different* callable
+    // through `perform_call` with no total-framestack depth gate: only the
+    // same-greenkey count is compared to `max_unroll_recursion`.  The generic
+    // cap is a cost valve for a distinct non-recursive chain.  An ambient
+    // recursive unroll already has duplicate `w_code` on the framestack
+    // (the `rec`/`step` chain); a new leaf at that depth is `perform_call`,
+    // not another unroll of the portal.  Raising chains already used this
+    // bit so a middle `SubRaise` could `finishframe_exception` through the
+    // remaining frames; value-returning uses it for the same `perform_call`
+    // reason.
+    let recursive_or_duplicate = recursive_portal_present
+        || framestack_has_duplicate_w_code(&ctx.session.borrow().framestack);
+    let effective_multiframe_depth =
+        fbw_effective_multiframe_depth(contains_raise, recursive_or_duplicate);
     // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so an unseeded caller-boundary resume is not part of that
