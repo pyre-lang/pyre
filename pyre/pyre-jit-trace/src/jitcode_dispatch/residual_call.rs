@@ -6852,15 +6852,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // every static, then every array item). pyre traces a
     // `snapshot_for_tracing` copy and `synchronize_virtualizable` writes
     // that copy (`virtualizable_heap_ptr`), so a residual that runs Python
-    // — and, with nested tracing, `bound_reached` / `compile_and_run_once`
-    // for another green key — would `extract_live` from the interpreter
-    // frame and see pre-walk statics (`last_instr`, `valuestackdepth`) and
-    // any array slot the walk had not already mirrored. Write the boxes
-    // onto the live frame at the same moment
-    // `vable_and_vrefs_before_residual_call` arms the token. An unreadable
-    // slot declines the residual (`ResidualDecline::ValueUnavailable`)
-    // before the token is armed, so a declined residual never strands
-    // TOKEN_TRACING_RESCALL.
+    // would `extract_live` from the interpreter frame and see pre-walk
+    // statics (`last_instr`, `valuestackdepth`) and any array slot the walk
+    // had not already mirrored. Write the boxes onto the live frame at the
+    // same moment `vable_and_vrefs_before_residual_call` arms the token.
+    // Nested `bound_reached` during that residual parks without a second
+    // write: `force_now` only clears the token, and `vable_after_residual_call`
+    // reloads `load_fields_from_virtualizable`. An unreadable slot declines
+    // the residual (`ResidualDecline::ValueUnavailable`) before the token
+    // is armed, so a declined residual never strands TOKEN_TRACING_RESCALL.
     if !flush_live_virtualizable_before_residual_call(ctx, live_frame_root.current(live_frame)) {
         return Ok(ResidualExecOutcome::Declined(
             ResidualDecline::ValueUnavailable,
@@ -8292,7 +8292,7 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
 }
 
 /// Write tracing boxes onto the live virtualizable before a residual that
-/// may run Python, or before a nested `compile_and_run_once`.
+/// may run Python.
 ///
 /// `virtualizable.py force_now` on `TOKEN_TRACING_RESCALL` assumes the
 /// real object already holds the boxes (`synchronize_virtualizable` /
@@ -8311,15 +8311,7 @@ pub(crate) fn walker_do_jit_force_virtual<Sym: WalkSym>(
 ///
 /// Returns `false` when a declared slot is unreadable (`Void` /
 /// `NO_CONCRETE` / missing). Nothing was written; the caller declines
-/// the residual (`ResidualDecline::ValueUnavailable`) or the nested
-/// attempt.
-pub fn flush_live_virtualizable_before_nested_trace(ctx: &TraceCtx) -> bool {
-    let Some(frame) = ctx.standard_virtualizable_ptr() else {
-        return true;
-    };
-    flush_live_virtualizable_to_frame(ctx, frame)
-}
-
+/// the residual (`ResidualDecline::ValueUnavailable`).
 fn flush_live_virtualizable_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
     if frame == 0 {
         return true;
