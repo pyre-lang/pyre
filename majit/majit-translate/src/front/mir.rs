@@ -5949,8 +5949,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.saturating_sub_sites,
             )
         };
-        // The `Option::unwrap_or` value-select rewrite
-        // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
+        // The `Option::unwrap_or` / `unwrap_or_default` value-select rewrite
+        // (`front::option_unwrap_or`) splits the residual combinator call
         // block into a `__discriminant` diamond, same post-lowering shape and
         // fail-safe contract as `bool::then`; gate the reachability sweep on
         // an actual rewrite.
@@ -9224,10 +9224,11 @@ struct Lowering<'a> {
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
     slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `Option::unwrap_or(opt, default)` call sites recorded for the
-    /// discriminant value-select the `front::option_unwrap_or` post-pass
-    /// synthesizes after the body lowering completes.  Each carries the
-    /// resolved `Option` owners the arms' field reads need (see
+    /// `Option::unwrap_or(opt, default)` / `unwrap_or_default` call sites
+    /// recorded for the discriminant value-select the
+    /// `front::option_unwrap_or` post-pass synthesizes after the body
+    /// lowering completes.  Each carries the resolved `Option` owners the
+    /// arms' field reads need (see
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
     unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
     /// Plain-error `Result::ok(res)` call sites recorded for the
@@ -24619,6 +24620,19 @@ impl<'a> Lowering<'a> {
             (&class, &call.func),
             (CallClass::Dynamic, CallFunc::Dynamic(_))
         );
+        // `unwrap_or_default` needs this RegularCall's Default trait_refs at
+        // the residual-call capture (`default_call_for_take`).  `call.func`
+        // moves into the match below; keep a clone of this one combinator.
+        let unwrap_or_default_reg = match &call.func {
+            CallFunc::Regular(reg)
+                if regular_call_name_path(reg, self.llbc)
+                    .as_deref()
+                    .is_some_and(|p| p.rsplit("::").next() == Some("unwrap_or_default")) =>
+            {
+                Some(reg.clone())
+            }
+            _ => None,
+        };
         let op_kind = match (class, call.func) {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>
@@ -31536,36 +31550,60 @@ impl<'a> Lowering<'a> {
             self.slice_first_sites.push(site);
         }
         // Capture `Option::unwrap_or(opt, default)` /
-        // `Result::unwrap_or(res, default)` sites for the discriminant
-        // value-select `front::option_unwrap_or` synthesizes.  `unwrap_or`'s
-        // body is Opaque (foreign `core`), but its receiver is the enum ADT, so
-        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
-        // `args[0]`, default in `args[1]`), NOT a raw FunctionPath.  Resolving
-        // the enum field owners needs the receiver's type (`first_arg_ty`), in
-        // hand here; `recognize_unwrap_or_site` classifies `Option` vs `Result`
-        // (their `Some`=1 / `Ok`=0 payload tags differ) and records the
-        // polarity.  The exception-carrier Result is recorded as a
-        // `ResultUnwrapOrSite` instead — `front::result_exc` fuses that
-        // combinator onto `LastException` (`except OperationError`) rather
-        // than a value-select.  A resolution miss leaves the residual call —
-        // an unregistered callee the rtyper census Skips, so no graph
-        // regresses.
+        // `Result::unwrap_or(res, default)` / `unwrap_or_default` sites for
+        // the discriminant value-select `front::option_unwrap_or` synthesizes.
+        // `unwrap_or`'s body is Opaque (foreign `core`), but its receiver is
+        // the enum ADT, so `first_is_self` routes it to a `CallTarget::Method`
+        // (receiver in `args[0]`, default in `args[1]`), NOT a raw
+        // FunctionPath.  Resolving the enum field owners needs the receiver's
+        // type (`first_arg_ty`), in hand here; `recognize_unwrap_or_site`
+        // classifies `Option` vs `Result` (their `Some`=1 / `Ok`=0 payload
+        // tags differ) and records the polarity.  The exception-carrier
+        // Result is recorded as a `ResultUnwrapOrSite` instead —
+        // `front::result_exc` fuses that combinator onto `LastException`
+        // (`except OperationError`) rather than a value-select.  A resolution
+        // miss leaves the residual call — an unregistered callee the rtyper
+        // census Skips, so no graph regresses.
+        //
+        // core `Option::unwrap_or_default` is `unwrap_or(Default::default())`;
+        // the None arm is `if w is None: w = ""` for `Option<String>`.  The
+        // unary Method records the same site, then fills `default_call` from
+        // `default_call_for_take` of the payload `T`.  A carrier Result
+        // `unwrap_or_default` is left residual (none exists in the census).
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
             ..
         } = &op_kind
-            && args.len() == 2
-            && name == "unwrap_or"
         {
-            if let Some(site) =
-                self.recognize_result_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
-            {
-                self.result_unwrap_or_sites.push(site);
-            } else if let Some(site) =
-                self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
-            {
-                self.unwrap_or_sites.push(site);
+            if args.len() == 2 && name == "unwrap_or" {
+                if let Some(site) =
+                    self.recognize_result_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
+                {
+                    self.result_unwrap_or_sites.push(site);
+                } else if let Some(site) =
+                    self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
+                {
+                    self.unwrap_or_sites.push(site);
+                }
+            } else if args.len() == 1 && name == "unwrap_or_default" {
+                if let Some(mut site) =
+                    self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
+                    && let Some(reg) = unwrap_or_default_reg.as_ref()
+                {
+                    let payload_ty = first_arg_ty.as_ref().and_then(|recv| {
+                        let peeled = self.peel_to_option_or_result(recv);
+                        let recv = peeled.as_ref().unwrap_or(recv);
+                        crate::front::result_exc::tyref_option_payload(recv, self.llbc)
+                            .or_else(|| crate::front::result_exc::tyref_result_ok(recv, self.llbc))
+                    });
+                    if let Some(payload_ty) = payload_ty
+                        && let Some(default_call) = self.default_call_for_take(reg, &payload_ty)
+                    {
+                        site.default_call = Some(default_call);
+                        self.unwrap_or_sites.push(site);
+                    }
+                }
             }
         }
         // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
@@ -31691,7 +31729,8 @@ impl<'a> Lowering<'a> {
         }
         // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, callable)` sites
         // for the discriminant closure-select `front::option_closure_select`
-        // synthesizes.  All five combinators are Opaque (foreign `core`) with
+        // synthesizes.  All six combinators (`map`/`and_then`/`unwrap_or_else`/
+        // `or_else`/`is_some_and`/`is_none_or`) are Opaque (foreign `core`) with
         // the `Option` ADT receiver, so `first_is_self` routes them to a
         // two-arg `CallTarget::Method` (receiver `args[0]`, callable
         // `args[1]`).  The callable is a closure ADT (`second_arg_ty` →
@@ -31717,6 +31756,9 @@ impl<'a> Lowering<'a> {
                 "is_some_and" => {
                     Some(crate::front::option_closure_select::ClosureCombinator::IsSomeAnd)
                 }
+                "is_none_or" => {
+                    Some(crate::front::option_closure_select::ClosureCombinator::IsNoneOr)
+                }
                 _ => None,
             }
             && let Some(site) = self.recognize_closure_select_site(
@@ -31734,9 +31776,9 @@ impl<'a> Lowering<'a> {
         // Discriminant-switch combinators whose opaque core body is an
         // if/else on the receiver tag (plus `call_once` of a closure
         // argument when there is one).  Option `map`/`and_then`/
-        // `unwrap_or_else`/`or_else`/`is_some_and` already have their own
-        // capture above; this records the remaining Option/Result methods
-        // whose semantics are the same shape.
+        // `unwrap_or_else`/`or_else`/`is_some_and`/`is_none_or` already have
+        // their own capture above; this records the remaining Option/Result
+        // methods whose semantics are the same shape.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -38311,6 +38353,7 @@ impl<'a> Lowering<'a> {
             int_null: self.option_niche_int_null(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
+            default_call: None,
         })
     }
 
@@ -39938,8 +39981,8 @@ impl<'a> Lowering<'a> {
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
         // is `Option<T>` and its closure returns that same `Option<T>`;
-        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`'s closure and
-        // dest are both `bool`.
+        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`/`is_none_or`
+        // closures and dests are both `bool`.
         let call_result_tyref = match kind {
             ClosureCombinator::Map => {
                 crate::front::result_exc::tyref_option_payload(dest_ty, self.llbc)?
@@ -39947,7 +39990,8 @@ impl<'a> Lowering<'a> {
             ClosureCombinator::AndThen
             | ClosureCombinator::OrElse
             | ClosureCombinator::UnwrapOrElse
-            | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
+            | ClosureCombinator::IsSomeAnd
+            | ClosureCombinator::IsNoneOr => clone_tyref(dest_ty),
         };
         let mut call_result_ty = tyref_to_value_type_with(
             &call_result_tyref,
