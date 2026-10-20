@@ -269,7 +269,11 @@ pub(crate) fn jit_clear_published_exception() {
 /// a side-channel TLS slot — that path is drained before the guard
 /// machinery runs and would bypass try/except. The call helpers return
 /// garbage on Err; resume data hands control to the except block.
+///
+/// `JIT_EXC_RAISER` is a OnceLock with no static-address lane, same as
+/// `optional_module_hooks`. The residual runs `OnceLock::get`.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub(crate) fn jit_publish_exception(exc_obj: PyObjectRef) {
     if exc_obj != PY_NULL
         && let Some(raiser) = JIT_EXC_RAISER.get()
@@ -280,7 +284,11 @@ pub(crate) fn jit_publish_exception(exc_obj: PyObjectRef) {
 
 /// Publish a residual-call error through both exception channels and return
 /// the one-word sentinel required by the residual-call ABI.
+///
+/// Residual ABI also writes `BH_LAST_EXC_VALUE` (`rthread.py` tlref). The
+/// residual runs that TLS store.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn jit_publish_residual_error(mut error: PyError) -> i64 {
     let exc_obj = error.to_exc_object();
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(exc_obj as i64));

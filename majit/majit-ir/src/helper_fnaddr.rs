@@ -179,6 +179,26 @@ pub fn set_rstr_payload_reader(f: RstrPayloadFn) {
     let _ = RSTR_PAYLOAD.set(f);
 }
 
+/// Rebuild a shared object-pointer slice from one residual `Ref` word.
+///
+/// The word is the address of a length-prefixed `GcArray` (`lltype.py
+/// GcArray`): a `usize` length header at offset 0, then the items. That is
+/// the same shape as `majit_rlib` `TypedItemsBlock` and pyre-object
+/// `ItemsBlock`. A zero word is the empty slice.
+///
+/// # Safety
+/// `word` is 0, or a pointer to that layout whose items of type `T` are live
+/// for `'a`.
+pub unsafe fn object_gcarray_slice<'a, T>(word: i64) -> &'a [T] {
+    if word == 0 {
+        return &[];
+    }
+    let header = word as usize as *const usize;
+    let len = unsafe { *header };
+    let items = (word as usize + std::mem::size_of::<usize>()) as *const T;
+    unsafe { std::slice::from_raw_parts(items, len) }
+}
+
 /// Bytes of the rstr `STR` word `word`, via the reader installed by
 /// [`set_rstr_payload_reader`].
 ///
@@ -331,6 +351,23 @@ pub fn for_each_prebuilt_class_static(mut visit: impl FnMut(&PrebuiltStaticAddr)
         for desc in guard.iter() {
             visit(desc);
         }
+    }
+}
+
+#[cfg(test)]
+mod object_gcarray_slice_tests {
+    use super::object_gcarray_slice;
+
+    #[test]
+    fn reads_length_prefixed_block_and_zero_word() {
+        let a = 0xAAusize;
+        let b = 0xBBusize;
+        let c = 0xCCusize;
+        let block: [usize; 4] = [3, a, b, c];
+        let slice = unsafe { object_gcarray_slice::<usize>(block.as_ptr() as i64) };
+        assert_eq!(slice, &[a, b, c]);
+        let empty = unsafe { object_gcarray_slice::<usize>(0) };
+        assert!(empty.is_empty());
     }
 }
 

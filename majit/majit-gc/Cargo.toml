@@ -44,7 +44,13 @@ indexmap = { workspace = true }
 rustc-hash = { workspace = true }
 libc = { workspace = true }
 majit-ir = { workspace = true }
+majit-macros = { workspace = true }
 parking_lot = { workspace = true }
+
+# `#[dont_look_inside]` emits a wasm32 constructor that registers the residual
+# trampoline (`emit_helper_fnaddr_ctor`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ctor = { workspace = true }
 
 # `llarena.arena_protect` is posix `mprotect` and nt `VirtualProtect`;
 # `llarena.has_protect` is false everywhere else, which is why this is not a

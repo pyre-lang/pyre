@@ -352,20 +352,27 @@ pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
 /// `{hash, len, chars}` readers stay unchanged. A payload holds no GC pointer,
 /// so it is a true leaf (`GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`).
 /// Returns null on overflow or allocation failure.
+///
+/// `malloc_varsize` + `init_gc_object_immortal`. Opaque to the tracer so the
+/// dispatcher does not look inside.
+#[majit_macros::dont_look_inside]
 pub fn alloc_varsize_with_gc_header_immortal(payload_size: usize, type_id: u32) -> *mut u8 {
     alloc_varsize_with_gc_header_immortal_zeroed_flag(payload_size, type_id, false)
 }
 
 /// [`alloc_varsize_with_gc_header_immortal`] with the payload bytes cleared.
+#[majit_macros::dont_look_inside]
 pub fn alloc_varsize_with_gc_header_immortal_zeroed(payload_size: usize, type_id: u32) -> *mut u8 {
     alloc_varsize_with_gc_header_immortal_zeroed_flag(payload_size, type_id, true)
 }
 
+#[majit_macros::dont_look_inside]
 fn varsize_immortal_layout(payload_size: usize) -> Option<std::alloc::Layout> {
     let total = GcHeader::SIZE.checked_add(payload_size)?;
     std::alloc::Layout::from_size_align(total, GcHeader::SIZE).ok()
 }
 
+#[majit_macros::dont_look_inside]
 fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
     payload_size: usize,
     type_id: u32,
@@ -396,6 +403,7 @@ fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
 /// # Safety
 /// `payload` must be a live pointer from that allocator, and `payload_size`
 /// must be the size passed at allocation.
+#[majit_macros::dont_look_inside]
 pub unsafe fn dealloc_varsize_with_gc_header(payload: *mut u8, payload_size: usize) {
     if payload.is_null() {
         return;

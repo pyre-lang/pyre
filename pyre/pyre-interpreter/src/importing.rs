@@ -762,6 +762,9 @@ pub fn set_optional_module_hooks(hooks: OptionalModuleHooks) {
     let _ = OPTIONAL_MODULE_HOOKS.set(hooks);
 }
 
+/// `OPTIONAL_MODULE_HOOKS` has no static-address lane, so the body emits that
+/// static as a nullary call. The residual runs `OnceLock::get`.
+#[majit_macros::dont_look_inside]
 pub fn optional_module_hooks() -> Option<&'static OptionalModuleHooks> {
     OPTIONAL_MODULE_HOOKS.get()
 }

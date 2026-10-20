@@ -27837,6 +27837,10 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// bytes / bytearray methods accept any buffer argument the way
 /// `space.buffer_w(w_obj, space.BUF_SIMPLE)` does upstream, without treating a
 /// memoryview as bytes-like elsewhere.
+///
+/// `external_buffer_view` is an Acquire load of a multi-word aggregate. This
+/// caller returns one exception-bridge word.
+#[majit_macros::dont_look_inside]
 pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
         return buffer_as_bytes_like(target?);
