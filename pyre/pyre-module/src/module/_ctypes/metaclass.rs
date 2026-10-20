@@ -1315,15 +1315,112 @@ fn meta_mul(args: &[PyObjectRef]) -> PyResult {
     array_type_from_ctype(cls, n as usize)
 }
 
+/// `from_param` of every metaclass but `PyCSimpleType`, whose own sits on
+/// `_SimpleCData`: `PyCPointerType` has `PyCPointerType_from_param`, and
+/// `PyCStructType`, `UnionType`, `PyCArrayType` and `PyCFuncPtrType` take
+/// `CDataType_from_param` from `CDataType_methods`.
 fn meta_from_param(args: &[PyObjectRef]) -> PyResult {
-    if args
-        .first()
-        .copied()
-        .is_some_and(cdata::is_simplecdata_type)
-    {
-        return cdata::simple_from_param(args);
+    let (Some(&(mut cls)), Some(&(mut value))) = (args.first(), args.get(1)) else {
+        return Err(pyre_interpreter::PyError::type_error(
+            "from_param() missing value",
+        ));
+    };
+    if pyre_object::with_roots!(cls, value => cdata::is_simplecdata_type(cls)) {
+        return cdata::simple_from_param(&[cls, value]);
     }
-    Ok(args.get(1).copied().unwrap_or_else(pyre_object::w_none))
+    if unsafe { pyre_interpreter::baseobjspace::isinstance_w(cls, pycpointertype_type()) } {
+        return pointer_type_from_param(cls, value);
+    }
+    cdata_type_from_param(cls, value)
+}
+
+/// `CDataType_from_param`: an instance of the type itself, a `byref()`
+/// carrier of the type's `proto`, or whatever the value's `_as_parameter_`
+/// converts to.
+fn cdata_type_from_param(cls: PyObjectRef, value: PyObjectRef) -> PyResult {
+    cdata_type_from_param_at(cls, value, 0)
+}
+
+fn cdata_type_from_param_at(mut cls: PyObjectRef, mut value: PyObjectRef, depth: i64) -> PyResult {
+    if unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, cls) } {
+        return Ok(value);
+    }
+    if super::interp_ctypes::is_carg(value) {
+        let d = pyre_object::with_roots!(cls, value =>
+            pyre_interpreter::baseobjspace::getdict_native(value));
+        let ob = if d.is_null() {
+            None
+        } else {
+            unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
+                .filter(|ob| !unsafe { pyre_object::is_none(*ob) })
+        };
+        // If we got a PyCArgObject, we must check if the object packed in it
+        // is an instance of the type's info->proto.
+        if let Some(ob) = ob
+            && let Some(proto) = stginfo::stginfo_of(cls).and_then(stginfo::stginfo_proto)
+            && unsafe { pyre_interpreter::baseobjspace::isinstance_w(ob, proto) }
+        {
+            return Ok(value);
+        }
+        let ob_name = ob.map_or_else(|| "???".to_string(), cdata::value_type_name);
+        let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "expected {name} instance instead of pointer to {ob_name}"
+        )));
+    }
+    let as_parameter = pyre_object::with_roots!(cls, value =>
+        pyre_interpreter::baseobjspace::findattr(value, "_as_parameter_"))?;
+    if let Some(as_parameter) = as_parameter {
+        // `_Py_EnterRecursiveCall(" while processing _as_parameter_")`. The
+        // call below is a tail call, which grows no stack for `stack_check`
+        // to see, so the depth is counted against the recursion limit.
+        if depth >= pyre_interpreter::stack_check::get_recursion_limit() as i64 {
+            return Err(pyre_interpreter::PyError::recursion_error(
+                "maximum recursion depth exceeded while processing _as_parameter_",
+            ));
+        }
+        return cdata_type_from_param_at(cls, as_parameter, depth + 1);
+    }
+    let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
+    Err(pyre_interpreter::PyError::type_error(format!(
+        "expected {name} instance instead of {}",
+        cdata::value_type_name(value)
+    )))
+}
+
+/// `PyCPointerType_from_param`: `None` (a NULL pointer later), an instance
+/// of the pointee through `byref`, a pointer or array whose item type is the
+/// pointee or a subclass of it, then `CDataType_from_param`.
+fn pointer_type_from_param(mut cls: PyObjectRef, mut value: PyObjectRef) -> PyResult {
+    if unsafe { pyre_object::is_none(value) } {
+        // ConvParam will convert to a NULL pointer later.
+        return Ok(value);
+    }
+    let Some(typeinfo) = stginfo::stginfo_of(cls) else {
+        return Err(pyre_interpreter::PyError::type_error("abstract class"));
+    };
+    let proto = pyre_object::with_roots!(cls, value => stginfo::stginfo_proto(typeinfo));
+    if let Some(mut proto) = proto {
+        // If we expect POINTER(<type>), but receive a <type> instance, accept
+        // it by calling byref(<type>).
+        if unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, proto) } {
+            return super::interp_ctypes::ctypes_byref(&[value]);
+        }
+        if is_pointer_instance(value) || is_array_instance(value) {
+            // Array instances are also pointers when the item types are the
+            // same.
+            let v_proto = pyre_interpreter::typedef::r#type(value)
+                .and_then(|tp| stginfo::stginfo_of(tp.as_ptr()))
+                .and_then(stginfo::stginfo_proto);
+            if let Some(v_proto) = v_proto
+                && pyre_object::with_roots!(cls, value, proto =>
+                    pyre_interpreter::baseobjspace::issubclass(v_proto, proto))?
+            {
+                return Ok(value);
+            }
+        }
+    }
+    cdata_type_from_param(cls, value)
 }
 
 /// `%R must have storage info`: `ctype_get_pointer_type` and

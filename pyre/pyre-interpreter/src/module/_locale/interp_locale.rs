@@ -294,46 +294,40 @@ fn c_locale_conv() -> LocaleConvData {
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let mut ns = pyre_object::gc_roots::pin_root(ns);
-    // Locale category constants sourced from libc so the values match
-    // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
-    // Windows has a C runtime too, and its numbering is a third one again
-    // (LC_ALL=0, LC_COLLATE=1, LC_CTYPE=2); a POSIX value passed to it names
-    // a different category, so it must come from libc there as well.
+    // `moduledef.py`: `for constant, value in rlocale.constants.iteritems()`.
+    // The values are the host C runtime's own numbering.
     #[cfg(any(unix, windows))]
     {
-        #[cfg(not(all(windows, feature = "host_env")))]
-        use libc as host_locale;
-        #[cfg(all(windows, feature = "host_env"))]
-        use rustpython_host_env::locale as host_locale;
+        use majit_rlib::rlocale;
         crate::__pyre_store!(
             ns,
             "LC_CTYPE",
-            pyre_object::w_int_new(host_locale::LC_CTYPE as i64)
+            pyre_object::w_int_new(rlocale::LC_CTYPE as i64)
         );
         crate::__pyre_store!(
             ns,
             "LC_NUMERIC",
-            pyre_object::w_int_new(host_locale::LC_NUMERIC as i64)
+            pyre_object::w_int_new(rlocale::LC_NUMERIC as i64)
         );
         crate::__pyre_store!(
             ns,
             "LC_TIME",
-            pyre_object::w_int_new(host_locale::LC_TIME as i64)
+            pyre_object::w_int_new(rlocale::LC_TIME as i64)
         );
         crate::__pyre_store!(
             ns,
             "LC_COLLATE",
-            pyre_object::w_int_new(host_locale::LC_COLLATE as i64)
+            pyre_object::w_int_new(rlocale::LC_COLLATE as i64)
         );
         crate::__pyre_store!(
             ns,
             "LC_MONETARY",
-            pyre_object::w_int_new(host_locale::LC_MONETARY as i64)
+            pyre_object::w_int_new(rlocale::LC_MONETARY as i64)
         );
         crate::__pyre_store!(
             ns,
             "LC_ALL",
-            pyre_object::w_int_new(host_locale::LC_ALL as i64)
+            pyre_object::w_int_new(rlocale::LC_ALL as i64)
         );
     }
     // `LC_MESSAGES` is a POSIX category the MSVC CRT has no counterpart for.
@@ -344,7 +338,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_store!(
         ns,
         "LC_MESSAGES",
-        pyre_object::w_int_new(libc::LC_MESSAGES as i64)
+        pyre_object::w_int_new(majit_rlib::rlocale::LC_MESSAGES as i64)
     );
     #[cfg(not(any(unix, windows)))]
     {

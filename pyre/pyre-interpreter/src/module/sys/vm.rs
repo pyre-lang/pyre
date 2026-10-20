@@ -2294,9 +2294,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "getdefaultencoding",
         make_builtin_function_with_arity("getdefaultencoding", |_| Ok(w_str_new("utf-8")), 0),
     );
-    // sys.getwindowsversion — a five-field sequence over `OSVERSIONINFOEXW`
-    // with five named-only fields beyond it, the same shape `os.stat_result`
-    // carries its `st_*_ns` extras in. `test.support.os_helper` reads
+    // sys.getwindowsversion — `vm.py windows_version_info`: a five-field
+    // sequence over `OSVERSIONINFOEXW` with five named-only fields at
+    // `structseqfield(10..=14)`. `test.support.os_helper` reads
     // `.platform` at import, so every `test.support` consumer needs it.
     //
     // `major`/`minor`/`build` are `GetVersionEx`'s answer, which is the running
@@ -2337,15 +2337,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     pyre_object::gc_roots::RootedOnceRef::new();
                 let cls = SEQ_TYPE.get_or_init(|| {
                     crate::_structseq::disallow_instantiation(
-                        crate::_structseq::make_struct_seq_with_extra(
+                        crate::_structseq::make_struct_seq_with_indexed_extra(
                             "sys.getwindowsversion",
                             &["major", "minor", "build", "platform", "service_pack"],
                             &[
-                                "service_pack_major",
-                                "service_pack_minor",
-                                "suite_mask",
-                                "product_type",
-                                "platform_version",
+                                (10, "service_pack_major"),
+                                (11, "service_pack_minor"),
+                                (12, "suite_mask"),
+                                (13, "product_type"),
+                                (14, "platform_version"),
                             ],
                         ),
                     )

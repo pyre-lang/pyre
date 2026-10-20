@@ -919,7 +919,13 @@ impl<'a> RegAlloc<'a> {
         asm: &mut dyn RegAllocAssembler,
     ) {
         let a0 = args[0];
-        let base_loc = self.make_sure_var_in_reg(a0, Type::Int, args, None, false);
+        // The counter address is a ConstInt, which
+        // `ARMRegisterManager.return_constant` loads into a register.
+        let base_loc = if a0.is_constant() {
+            self.const_int_in_reg(a0, args)
+        } else {
+            self.make_sure_var_in_reg(a0, Type::Int, args, None, false)
+        };
         // `get_scratch_reg(INT, boxes)`.
         let tmp = self.fresh_temp_var();
         self.longevity
@@ -935,6 +941,8 @@ impl<'a> RegAlloc<'a> {
         self.rm
             .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
         self.perform_discard(i, vec![base_loc, value_loc], asm);
+        // `self.free_temp_vars()`.
+        self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
     }
 
     /// aarch64/regalloc.py `notimplemented`, the `operations` default.
@@ -1003,6 +1011,24 @@ impl<'a> RegAlloc<'a> {
         // then `_guard_impl`'s one walk of `getfailargs()`.
         let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
         self.perform_guard(op, i, [loc], None, asm);
+    }
+
+    /// The ConstInt arm of aarch64/regalloc.py
+    /// `ARMRegisterManager.return_constant`: `get_scratch_reg(INT,
+    /// forbidden_vars)` loaded with `convert_to_imm(v)`. The shared
+    /// `return_constant` hands the bare immediate back, which the AArch64
+    /// emitters that `assert loc.is_core_reg()` cannot take. The temp is
+    /// freed by `rm.free_temp_vars`.
+    pub(crate) fn const_int_in_reg(&mut self, v: OpRef, forbidden: &[OpRef]) -> Loc {
+        debug_assert!(v.is_constant() && self.tp(v) != Type::Float);
+        let tmp = self.fresh_temp_var();
+        self.longevity
+            .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        let reg = self.force_allocate_reg(tmp, Type::Int, forbidden, None, false);
+        let imm = self.rm.convert_to_imm(v, &self.constants);
+        self.rm.spill_moves.push((imm, Loc::Reg(reg)));
+        self.rm.temp_boxes.push(tmp);
+        Loc::Reg(reg)
     }
 
     /// aarch64/regalloc.py `prepare_op_guard_value`: arg in a register.
@@ -2289,11 +2315,20 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         asm: &mut dyn RegAllocAssembler,
     ) {
+        // aarch64/regalloc.py `prepare_op_cond_call_gc_wb`: every argument
+        // in a register, a ConstInt card index included.
         let mut arglocs = Vec::new();
         for (idx, &arg) in args.iter().enumerate() {
-            let tp = if idx == 0 { Type::Ref } else { Type::Int };
-            arglocs.push(self.make_sure_var_in_reg(arg, tp, args, None, false));
+            let loc = if idx == 0 {
+                self.make_sure_var_in_reg(arg, Type::Ref, args, None, false)
+            } else if arg.is_constant() {
+                self.const_int_in_reg(arg, args)
+            } else {
+                self.make_sure_var_in_reg(arg, Type::Int, args, None, false)
+            };
+            arglocs.push(loc);
         }
         self.perform_discard(i, arglocs, asm);
+        self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
     }
 }

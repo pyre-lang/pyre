@@ -576,7 +576,7 @@ impl From<pyre_interpreter::PyError> for Py2RegError {
 }
 
 /// `Py2Reg` — a Python value + type → registry bytes.
-fn py2reg(value: PyObjectRef, typ: u32) -> Result<Vec<u8>, Py2RegError> {
+fn py2reg(mut value: PyObjectRef, typ: u32) -> Result<Vec<u8>, Py2RegError> {
     match typ {
         host_reg::REG_DWORD => {
             if unsafe { is_none(value) } {
@@ -649,8 +649,11 @@ fn py2reg(value: PyObjectRef, typ: u32) -> Result<Vec<u8>, Py2RegError> {
             // `w_value.buffer_w(space, space.BUF_SIMPLE)`; any exporter of a
             // simple buffer qualifies, `BufferInterfaceNotFound` is the
             // TypeError.
-            match pyre_interpreter::baseobjspace::simple_buffer_bytes(value)
-                .map_err(Py2RegError::Raised)?
+            // `value` names its type in the refusal below, after a call that
+            // can run Python (`memoryview.release`).
+            match pyre_object::with_roots!(value =>
+                pyre_interpreter::baseobjspace::simple_buffer_bytes(value))
+            .map_err(Py2RegError::Raised)?
             {
                 Some(view) => Ok(view.into_bytes()),
                 None => Err(Py2RegError::Raised(pyre_interpreter::PyError::type_error(

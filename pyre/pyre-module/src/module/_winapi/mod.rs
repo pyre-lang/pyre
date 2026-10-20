@@ -348,6 +348,11 @@ mod process {
                 "environment must be dictionary or None",
             ));
         }
+        // `keys()`, the drain of what it returns and `getitem` all run Python,
+        // so the mapping and every key are published and read back rather
+        // than kept in plain locals.
+        let _env_roots = pyre_object::gc_roots::push_roots();
+        let env_slot = pyre_object::gc_roots::pin_roots(&[w_env]);
         let w_keys = pyre_interpreter::baseobjspace::call_method(w_env, "keys", &[]);
         if w_keys.is_null() {
             return Err(
@@ -357,11 +362,6 @@ mod process {
             );
         }
         let keys = pyre_interpreter::baseobjspace::unpackiterable(w_keys, -1)?;
-        // `getitem` runs the mapping's own `__getitem__`, which allocates, so
-        // the mapping and every key are published and read back per iteration
-        // rather than kept in plain locals.
-        let _env_roots = pyre_object::gc_roots::push_roots();
-        let env_slot = pyre_object::gc_roots::pin_roots(&[w_env]);
         let keys_base = pyre_object::gc_roots::pin_roots(&keys);
 
         // Each name with its sort key and the slot its key object sits in.

@@ -858,18 +858,27 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
                 )?;
             }
         } else if pyre_object::is_list(set) {
-            if pyre_object::is_list(iterable) {
-                let items = pyre_object::w_list_items_copy_as_vec_mode(
+            let items = if pyre_object::is_list(iterable) {
+                pyre_object::w_list_items_copy_as_vec_mode(
                     iterable,
                     majit_metainterp::jit::we_are_jitted(),
-                );
-                for item in items {
-                    pyre_object::w_list_append(set, item);
-                }
+                )
             } else if pyre_object::is_tuple(iterable) {
-                for item in pyre_object::w_tuple_items_copy_as_vec(iterable) {
-                    pyre_object::w_list_append(set, item);
-                }
+                pyre_object::w_tuple_items_copy_as_vec(iterable)
+            } else {
+                return Ok(());
+            };
+            // `w_list_append` can grow the items block through a nursery
+            // malloc that collects, so the list and the copied items are
+            // read back from the shadow stack on every append.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let sp = _roots.pin_roots(&[set]);
+            let item_base = pyre_object::gc_roots::pin_roots(&items);
+            for i in 0..items.len() {
+                pyre_object::w_list_append(
+                    pyre_object::gc_roots::shadow_stack_get(sp),
+                    pyre_object::gc_roots::shadow_stack_get(item_base + i),
+                );
             }
         }
     }

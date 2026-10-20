@@ -72,6 +72,14 @@ mod imp {
         (cif + std::mem::size_of::<CifDescription>()) as *mut usize
     }
 
+    /// `cif_description.cif`, the inlined `FFI_CIFP` record.
+    ///
+    /// # Safety
+    /// As [`header`].
+    pub unsafe fn cif(cif_description: usize) -> *mut ffi_cif {
+        (cif_description + std::mem::offset_of!(CifDescription, cif)) as *mut ffi_cif
+    }
+
     // The block carries `hints={'immutable': True}`: every field is filled in
     // before the first call through it and read-only afterwards.  Each reader
     // below is one elidable leaf, so a call through a promoted function type
@@ -537,13 +545,12 @@ mod imp {
         let resultdata =
             llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) })
                 as *mut std::ffi::c_void;
-        let descr = unsafe { header(cif_description) };
         // `clibffi.py c_ffi_call` (`save_err=RFFI_ERR_ALL | RFFI_ALT_ERRNO`).
         // A trace records `CALL_RELEASE_GIL` with the same flags
         // (`pyjitpl.py direct_libffi_call`) and the backend does the swap.
         unsafe {
             clibffi::c_ffi_call(
-                &raw mut descr.cif,
+                cif(cif_description),
                 func_addr as VOIDP,
                 resultdata,
                 buffer_array,

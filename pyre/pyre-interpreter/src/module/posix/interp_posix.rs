@@ -1107,6 +1107,16 @@ mod win_nt {
         io_err_with_filename(error, filename)
     }
 
+    /// `wrap_oserror` of an `rwin32` `WindowsError`: the code is a Win32
+    /// error and lands in `.winerror`.
+    pub(super) fn windows_err(error: majit_rlib::rwin32::WindowsError) -> crate::PyError {
+        crate::PyError::os_error_win32_syscall2(
+            error.winerror as i32,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        )
+    }
+
     fn io_err_with_filename(error: &std::io::Error, filename: PyObjectRef) -> crate::PyError {
         match error.raw_os_error() {
             Some(winerror) => {
@@ -1375,10 +1385,10 @@ mod win_nt {
                 "get_handle_inheritable() missing required argument 'handle'",
             ));
         };
-        let handle = crate::baseobjspace::c_int_w(arg)? as libc::intptr_t;
-        match host_nt::get_handle_inheritable(handle) {
+        let handle = crate::baseobjspace::c_int_w(arg)? as majit_rlib::rwin32::HANDLE;
+        match majit_rlib::rwin32::get_handle_inheritable(handle) {
             Ok(value) => Ok(pyre_object::w_bool_from(value)),
-            Err(error) => Err(io_err(&error, "")),
+            Err(error) => Err(windows_err(error)),
         }
     }
 
@@ -1389,11 +1399,11 @@ mod win_nt {
                 "set_handle_inheritable() takes 2 arguments",
             ));
         }
-        let handle = crate::baseobjspace::c_int_w(args[0])? as libc::intptr_t;
+        let handle = crate::baseobjspace::c_int_w(args[0])? as majit_rlib::rwin32::HANDLE;
         let inheritable = crate::baseobjspace::is_true(args[1])?;
-        match host_nt::set_handle_inheritable(handle, inheritable) {
+        match majit_rlib::rwin32::set_handle_inheritable(handle, inheritable) {
             Ok(()) => Ok(pyre_object::w_none()),
-            Err(error) => Err(io_err(&error, "")),
+            Err(error) => Err(windows_err(error)),
         }
     }
 
@@ -15608,9 +15618,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let handle = fd_handle(fd).ok_or_else(|| errno_err(libc::EBADF, ""))?;
-                    match host_nt::get_handle_inheritable(handle as _) {
+                    match majit_rlib::rwin32::get_handle_inheritable(handle as _) {
                         Ok(inheritable) => Ok(pyre_object::w_bool_from(inheritable)),
-                        Err(e) => Err(handle_err(&e)),
+                        Err(e) => Err(win_nt::windows_err(e)),
                     }
                 },
                 1,
@@ -15630,9 +15640,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
                     let inherit = crate::baseobjspace::is_true(args[1])?;
                     let handle = fd_handle(fd).ok_or_else(|| errno_err(libc::EBADF, ""))?;
-                    match host_nt::set_handle_inheritable(handle as _, inherit) {
+                    match majit_rlib::rwin32::set_handle_inheritable(handle as _, inherit) {
                         Ok(()) => Ok(pyre_object::w_none()),
-                        Err(e) => Err(handle_err(&e)),
+                        Err(e) => Err(win_nt::windows_err(e)),
                     }
                 },
                 2,

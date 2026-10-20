@@ -2,9 +2,11 @@
 //! writes around itself (`llexternal(..., save_err=...)`).
 
 use crate::rthread;
+#[cfg(unix)]
+use majit_jitcode::rffi::RFFI_FULL_ERRNO_ZERO;
 use majit_jitcode::rffi::{
-    RFFI_ALT_ERRNO, RFFI_FULL_ERRNO_ZERO, RFFI_READSAVED_ERRNO, RFFI_READSAVED_LASTERROR,
-    RFFI_SAVE_ERRNO, RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR, RFFI_ZERO_ERRNO_BEFORE,
+    RFFI_ALT_ERRNO, RFFI_READSAVED_ERRNO, RFFI_READSAVED_LASTERROR, RFFI_SAVE_ERRNO,
+    RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR, RFFI_ZERO_ERRNO_BEFORE,
 };
 
 #[cfg(target_os = "windows")]

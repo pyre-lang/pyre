@@ -6878,29 +6878,7 @@ impl<'a> AssemblerARM64<'a> {
                         ; strb w16, [X(loc_base.value), x30]
                     );
                 }
-                // x86/assembler.py `elif isinstance(loc_index, ImmedLoc)`:
-                // byte offset and bit mask are both assembly-time constants, so
-                // the sequence collapses to one load/or/store at a fixed
-                // displacement. A64 has no or-to-memory form, so the OR8 there
-                // becomes ldrb/orr/strb here. `byte_ofs` carries the same
-                // `- GcHeader::SIZE` bias the register form applies with
-                // `sub x30, x30, ...`: the base addresses the payload while the
-                // card bytes sit before the header.
-                Some(Loc::Immed(loc_index) | Loc::ImmedFloat(loc_index)) => {
-                    let byte_index = loc_index.value >> wb.jit_wb_card_page_shift;
-                    let byte_ofs = !(byte_index >> 3) - majit_gc::header::GcHeader::SIZE as i64;
-                    let byte_val = (1_i64 << (byte_index & 7)) as u32;
-                    self.emit_mov_imm64(30, byte_ofs);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; mov w17, byte_val
-                        ; ldrb w16, [X(loc_base.value), x30]
-                        ; orr w16, w16, w17
-                        ; strb w16, [X(loc_base.value), x30]
-                    );
-                }
-                // x86/assembler.py `_write_barrier_fastpath`
-                // `raise AssertionError("index is neither RegLoc nor ImmedLoc")`
-                _ => panic!("index is neither RegLoc nor ImmedLoc"),
+                _ => panic!("card index {loc_index:?} is not a core register"),
             }
         }
 
@@ -8712,16 +8690,5 @@ impl RegAllocAssembler for AssemblerARM64<'_> {
             frame_depth,
         );
         self.fail_index += 1;
-    }
-
-    fn regalloc_lea_scaled_addr(
-        &mut self,
-        _dst: Loc,
-        _index_loc: &Loc,
-        _itemsize: i64,
-        _base_loc: &Loc,
-        _ofs: i64,
-    ) {
-        unreachable!("the LEA of x86 `consider_zero_array`; aarch64 has no such step")
     }
 }

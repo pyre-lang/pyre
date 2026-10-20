@@ -1,5 +1,4 @@
 use indexmap::IndexMap;
-use std::cell::RefCell;
 use std::sync::Arc;
 /// runner.py: AbstractX86CPU — the Backend trait implementation.
 ///
@@ -37,75 +36,23 @@ use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 #[cfg(target_arch = "x86_64")]
 use crate::x86::cpu_ext::X86CpuExt as ArchCpuExt;
 
-/// Global CALL_ASSEMBLER target registry.
-///
-/// RPython stores `descr._ll_function_addr` on the target token
-/// (x86/assembler.py:599) so `CALL_ASSEMBLER` can resolve the callee
-/// address directly from the descriptor. pyre identifies callee tokens
-/// by `JitCellToken` object identity (`identity_key`), so a per-thread
-/// `identity_key -> DynasmCaTarget` index is required.
-///
-/// Each entry retains a `Weak` to the callee's `CompiledLoopToken` so
-/// `handle_call_assembler` (rewrite.py) can sample
-/// `_ll_initial_locs` and `frame_info`. The strong owner is
-/// `JitCellToken.compiled_loop_token` / `alive_loops`; a strong Arc
-/// here would keep the CLT past `CompiledLoopToken.__del__`.
-struct DynasmCaTarget {
-    /// `_ll_function_addr` per `x86/assembler.py:599`, retained for
-    /// redirect bookkeeping and diagnostics. Dynasm address resolution now
-    /// reads the descr-carried token directly.
-    code_addr: usize,
-    /// `model.py` `CompiledLoopToken` — Weak to the owning
-    /// `JitCellToken.compiled_loop_token`.
-    compiled_loop_token: std::sync::Weak<majit_backend::CompiledLoopToken>,
-    /// `pyjitpl.py:3629` `outermost_jitdriver_sd.index_of_virtualizable`.
-    /// Captured from `JitCellToken.virtualizable_arg_index` when the compiled
-    /// target registers.
-    index_of_virtualizable: i32,
-}
-
-thread_local! {
-    /// CALL_ASSEMBLER callee dispatch table.  RPython keeps the equivalent
-    /// state on `cpu.assembler` (per-CPU); majit's JIT compiles and executes
-    /// on a single thread, so a thread-local mirrors that per-context scope
-    /// while keeping concurrent backend test binaries (each test runs on its
-    /// own thread) from sharing a global map keyed by reused token numbers —
-    /// a colliding token would otherwise let one thread bake another thread's
-    /// compiled `code_addr` into a CALL_ASSEMBLER site.  The map is read only
-    /// at compile time (the resolved address is baked into the code), so
-    /// thread-local scope never narrows what production (single-threaded) can
-    /// reach.
-    static CALL_ASSEMBLER_TARGETS: RefCell<IndexMap<usize, DynasmCaTarget, rustc_hash::FxBuildHasher>> =
-        const { RefCell::new(IndexMap::with_hasher(rustc_hash::FxBuildHasher)) };
-}
-
-fn unregister_dynasm_ca_target(token_key: usize) {
-    let _ = CALL_ASSEMBLER_TARGETS.try_with(|cell| {
-        cell.borrow_mut().swap_remove(&token_key);
-    });
-}
-
-/// `rewrite.py` `handle_call_assembler` per-callee metadata
-/// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
-/// Mirrors `majit-backend-cranelift::compiler.rs`.
+/// `rewrite.py` `handle_call_assembler`: the callee metadata is read off
+/// the CALL_ASSEMBLER descr itself, `loop_token.compiled_loop_token`
+/// (`_ll_initial_locs`, `frame_info`) and the token's virtualizable index.
 pub(crate) fn lookup_call_assembler_callee_locs(
-    token_key: usize,
+    token: &JitCellToken,
 ) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
-    CALL_ASSEMBLER_TARGETS.with(|cell| {
-        let guard = cell.borrow();
-        let target = guard.get(&token_key)?;
-        let clt = target.compiled_loop_token.upgrade()?;
-        // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
-        // pinned, matching cranelift's `compiler.rs` pattern.
-        let frame_info_ptr = clt.frame_info.data_ptr() as usize;
-        let frame_depth = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
-        let ll_initial_locs = clt._ll_initial_locs.lock().clone();
-        Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
-            _ll_initial_locs: ll_initial_locs,
-            frame_depth,
-            frame_info_ptr,
-            index_of_virtualizable: target.index_of_virtualizable,
-        })
+    let clt = token.compiled_loop_token()?;
+    // `JitFrameInfo` is `#[repr(C)]` and the token's Arc keeps the
+    // allocation pinned.
+    let frame_info_ptr = clt.frame_info.data_ptr() as usize;
+    let frame_depth = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
+    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
+    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
+        _ll_initial_locs: ll_initial_locs,
+        frame_depth,
+        frame_info_ptr,
+        index_of_virtualizable: token.virtualizable_arg_index().map_or(-1_i32, |i| i as i32),
     })
 }
 
@@ -424,7 +371,6 @@ struct RanFrame {
     head: *mut JitFrame,
     tip: *mut JitFrame,
     gc_object: bool,
-    num_slots: usize,
 }
 
 /// Frame allocated the same way [`alloc_entry_jitframe`] allocates the
@@ -2438,12 +2384,11 @@ impl DynasmBackend {
             wb_descr,
             jitframe_info: crate::jitframe_layout().and_then(|info| info.jitframe_descrs),
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs +
-            // ptr2int(compiled_loop_token.frame_info), both sourced from the
-            // CLT Arc on the registered DynasmCaTarget (model.py:292-338).
+            // ptr2int(compiled_loop_token.frame_info) off the descr's token.
             call_assembler_callee_locs: Some(Box::new(|ltd| {
                 ltd.token_handle_any()
                     .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
-                    .and_then(|token| lookup_call_assembler_callee_locs(token.identity_key()))
+                    .and_then(|token| lookup_call_assembler_callee_locs(token))
             })),
             // x86/runner.py:31 `load_supported_factors = (1, 2, 4, 8)`
             // vs llmodel.py:39 default `(1,)` used by the aarch64
@@ -2566,6 +2511,11 @@ impl DynasmBackend {
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
         gc.freeze_types();
         self.jitframe_facts = install_gc_box(gc);
+        // `setup_once` reads the barrier descr off `gc_ll_descr`. A collector
+        // installed after it can be the first whose descr has card marking,
+        // so the `withcards` helpers are built here.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        self.arch_cpu_ext.build_wb_slowpaths();
     }
 
     /// No-op, as on cranelift and wasm: the GC rewriter lowers every
@@ -2722,55 +2672,6 @@ impl DynasmBackend {
             "find_descr_by_ptr: jf_descr was not written; refusing to recover a null FailDescrCell"
         );
         unsafe { majit_backend::deadframe::ExitDescr::from_cell(ptr) }
-    }
-
-    /// `rpython/jit/backend/x86/assembler.py:599` parity: store
-    /// `_ll_function_addr` after the loop is fully assembled and retain the
-    /// compiled-loop metadata for GC rewrite callbacks.
-    fn register_call_assembler_target(token: &JitCellToken, code_addr: usize) {
-        let token_key = token.identity_key();
-        let index_of_virtualizable = token.virtualizable_arg_index().map_or(-1_i32, |i| i as i32);
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[dynasm][ca-target] register token={} addr=0x{:x}",
-                token.number(),
-                code_addr
-            );
-        }
-        CALL_ASSEMBLER_TARGETS.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            match guard.get_mut(&token_key) {
-                Some(existing) => {
-                    existing.code_addr = code_addr;
-                }
-                None => {
-                    let clt = token.compiled_loop_token_expect();
-                    clt.set_ca_unregister(token_key, unregister_dynasm_ca_target);
-                    guard.insert(
-                        token_key,
-                        DynasmCaTarget {
-                            code_addr,
-                            compiled_loop_token: Arc::downgrade(&clt),
-                            index_of_virtualizable,
-                        },
-                    );
-                }
-            }
-        });
-    }
-
-    fn redirect_call_assembler_target(old_key: usize, new_addr: usize) {
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[dynasm][ca-target] redirect token_key={} addr=0x{:x}",
-                old_key, new_addr
-            );
-        }
-        CALL_ASSEMBLER_TARGETS.with(|cell| {
-            if let Some(existing) = cell.borrow_mut().get_mut(&old_key) {
-                existing.code_addr = new_addr;
-            }
-        });
     }
 
     /// `rpython/jit/backend/llsupport/llmodel.py get_baseofs_of_frame_field`
@@ -3011,7 +2912,6 @@ impl DynasmBackend {
             head: jf_ptr,
             tip: result_jf,
             gc_object,
-            num_slots,
         }
     }
 
@@ -3041,8 +2941,12 @@ impl DynasmBackend {
                 None,
             ))
         } else {
+            // The bound is the returned frame's own `jf_frame` length:
+            // `_check_frame_depth` may have reallocated a deeper tip than the
+            // `num_slots` the entry frame was built with.
+            let num_slots = unsafe { JitFrame::frame_length(ran.tip) } as usize;
             DeadFrame::LibcJitFrame(unsafe {
-                LibcJitFrameDeadFrame::owning(ran.head, ran.tip, ran.num_slots, descr, None)
+                LibcJitFrameDeadFrame::owning(ran.head, ran.tip, num_slots, descr, None)
             })
         }
     }
@@ -3135,13 +3039,11 @@ impl DynasmBackend {
         token: &JitCellToken,
         head: *mut JitFrame,
         tip: *mut JitFrame,
-        num_slots: usize,
     ) -> DeadFrame {
         let ran = RanFrame {
             head,
             tip,
             gc_object: self.jitframe_facts.is_gc_object,
-            num_slots,
         };
         self.deadframe_from_run(token, ran)
     }
@@ -3218,7 +3120,7 @@ impl DynasmBackend {
     }
 
     /// Raw finish entry. Allocate, store `args`, call the token, and return
-    /// `(head, tip, num_slots, jf_descr)`.
+    /// `(head, tip, jf_descr)`.
     ///
     /// `llmodel.py` `AbstractLLCPU.make_execute_token`. Both raw finish paths
     /// read slot 0 of `tip` afterwards. Allocation and the slot stores are
@@ -3229,7 +3131,7 @@ impl DynasmBackend {
         &self,
         token: &JitCellToken,
         args: &[i64],
-    ) -> (*mut JitFrame, *mut JitFrame, usize, usize) {
+    ) -> (*mut JitFrame, *mut JitFrame, usize) {
         let entry = token.ll_function_addr() as *const u8;
         let clt = unsafe { &*token.compiled_loop_token_ptr() };
         let num_slots = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
@@ -3252,7 +3154,7 @@ impl DynasmBackend {
             returned
         };
         let descr_raw = unsafe { crate::llmodel::get_latest_descr(tip) };
-        (jf_ptr, tip, num_slots, descr_raw)
+        (jf_ptr, tip, descr_raw)
     }
 
     /// Cell address published by `set_done_with_this_frame_descr_int`.
@@ -3370,7 +3272,7 @@ impl Backend for DynasmBackend {
             .arch_cpu_ext
             .ensure_malloc_slowpath_unicode(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
+        let wb_slowpath = self.arch_cpu_ext.wb_slowpath();
         // `setup_once`: `propagate_exception_path`, `_frame_realloc_slowpath`,
         // `stack_check_slowpath`. Passed in like `wb_slowpath`. The stack
         // check stays 0 until `insert_stack_check` is registered; the next
@@ -3450,7 +3352,6 @@ impl Backend for DynasmBackend {
         let gc_table =
             (!gcrefs.is_empty()).then(|| unsafe { majit_gc::GcTable::in_code(rawstart, &gcrefs) });
         let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
-        Self::register_call_assembler_target(token, code_addr);
         self.register_fail_descrs(token, &compiled.fail_descrs);
         if let Some(table) = gc_table {
             self.register_gc_table(token, table);
@@ -3690,7 +3591,7 @@ impl Backend for DynasmBackend {
             .arch_cpu_ext
             .ensure_malloc_slowpath_unicode(&self.descr_attachments);
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        let wb_slowpath = self.arch_cpu_ext.ensure_wb_slowpath();
+        let wb_slowpath = self.arch_cpu_ext.wb_slowpath();
         // Same once-per-CPU helpers as `compile_loop`.
         #[cfg(target_arch = "x86_64")]
         let propagate_exception_path = self
@@ -3917,7 +3818,7 @@ impl Backend for DynasmBackend {
         if raw_done_entry_use_general(exec_diag_enabled()) {
             return self.execute_token_done_int_raw_general(token, args);
         }
-        let (jf_ptr, tip, num_slots, descr_raw) = self.run_done_raw_entry(token, args);
+        let (jf_ptr, tip, descr_raw) = self.run_done_raw_entry(token, args);
         if self.finish_is_done_int(descr_raw) {
             // A GC frame was already resolved in `run_done_raw_entry`.
             // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
@@ -3930,7 +3831,7 @@ impl Backend for DynasmBackend {
             park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
             return Ok(value);
         }
-        Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
+        Err(self.raw_entry_deadframe(token, jf_ptr, tip))
     }
 
     /// `warmstate.py execute_assembler` ref fast path. `done_ref_from_ran`
@@ -3956,7 +3857,7 @@ impl Backend for DynasmBackend {
         if raw_done_entry_use_general(exec_diag_enabled()) {
             return self.execute_token_done_ref_raw_general(token, args);
         }
-        let (jf_ptr, tip, num_slots, descr_raw) = self.run_done_raw_entry(token, args);
+        let (jf_ptr, tip, descr_raw) = self.run_done_raw_entry(token, args);
         if self.finish_is_done_ref(descr_raw) {
             // A GC frame was already resolved in `run_done_raw_entry`.
             // Host frames walk `jf_forward` (`jitframe.py` `jitframe_resolve`).
@@ -3969,7 +3870,7 @@ impl Backend for DynasmBackend {
             park_or_free_done_entry_frame(token, jf_ptr, tip, self.jitframe_facts.is_gc_object);
             return Ok(value);
         }
-        Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
+        Err(self.raw_entry_deadframe(token, jf_ptr, tip))
     }
 
     /// Override execute_token_ints_raw to return the FULL jitframe
@@ -4199,22 +4100,6 @@ impl Backend for DynasmBackend {
         crate::jit_exc_clear();
     }
 
-    /// `llmodel.py free_loop_and_bridges` parity.  When the CLT
-    /// drops, `asmmemmgr_gcreftracers` releases its strong refs to the
-    /// baked `FailDescrCell` Arcs; subsequent recovery from a stale
-    /// address would be UB, but the JIT-emitted code holding the address
-    /// is also retired when its CLT drops, so no live caller can reach a
-    /// stale `descr_addr`.
-    ///
-    /// `compile_loop` inserts the token into `CALL_ASSEMBLER_TARGETS`
-    /// (`runner.rs`) and that map stores a strong
-    /// `Arc<CompiledLoopToken>`; without removal here the CLT — and the
-    /// fail-descr cells it pins — would live for the entire process
-    /// lifetime.  Drop the entry so the Arc chain unwinds.
-    fn free_loop(&mut self, token: &JitCellToken) {
-        unregister_dynasm_ca_target(token.identity_key());
-    }
-
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
         // `history.py AbstractDescr.show(cpu, descr_gcref) =
         // cast_gcref_to_instance(...)` parity.  `descr_addr` is the thin
@@ -4310,7 +4195,6 @@ impl Backend for DynasmBackend {
         let old_addr = old_compiled.entry_ptr();
         let new_addr = new_compiled.entry_ptr();
         Asm::redirect_call_assembler(old, new, old_addr, new_addr);
-        Self::redirect_call_assembler_target(old.identity_key(), new_addr as usize);
         Ok(())
     }
 
@@ -4946,10 +4830,10 @@ impl Backend for DynasmBackend {
                 .ensure_malloc_slowpath_str(&self.descr_attachments);
             self.arch_cpu_ext
                 .ensure_malloc_slowpath_unicode(&self.descr_attachments);
-            self.arch_cpu_ext.ensure_wb_slowpath();
+            self.arch_cpu_ext.build_wb_slowpaths();
         }
         #[cfg(target_arch = "aarch64")]
-        self.arch_cpu_ext.ensure_wb_slowpath();
+        self.arch_cpu_ext.build_wb_slowpaths();
     }
 
     /// `backend/<arch>/__init__.py` parity — pyre's dynasm backend

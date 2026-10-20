@@ -107,6 +107,26 @@ pub struct lconv {
     pub _W_negative_sign: crate::rffi::CWCHARP,
 }
 
+// `rlocale.constant_names`: the categories `locale.h` defines, which
+// `pypy/module/_locale/moduledef.py` publishes from `rlocale.constants`.
+// Each C runtime numbers them for itself (glibc LC_CTYPE=0, macOS LC_ALL=0,
+// MSVC LC_ALL=0 / LC_COLLATE=1 / LC_CTYPE=2).
+#[cfg(any(unix, windows))]
+pub const LC_CTYPE: crate::rffi::INT = libc::LC_CTYPE;
+#[cfg(any(unix, windows))]
+pub const LC_NUMERIC: crate::rffi::INT = libc::LC_NUMERIC;
+#[cfg(any(unix, windows))]
+pub const LC_TIME: crate::rffi::INT = libc::LC_TIME;
+#[cfg(any(unix, windows))]
+pub const LC_COLLATE: crate::rffi::INT = libc::LC_COLLATE;
+#[cfg(any(unix, windows))]
+pub const LC_MONETARY: crate::rffi::INT = libc::LC_MONETARY;
+/// The MSVC `locale.h` has no `LC_MESSAGES`.
+#[cfg(unix)]
+pub const LC_MESSAGES: crate::rffi::INT = libc::LC_MESSAGES;
+#[cfg(any(unix, windows))]
+pub const LC_ALL: crate::rffi::INT = libc::LC_ALL;
+
 /// `cConfig.LC_MIN` / `cConfig.LC_MAX`. Only the MSVC `locale.h` defines
 /// them (`LC_ALL` / `LC_TIME`); elsewhere they are `None`.
 #[cfg(windows)]

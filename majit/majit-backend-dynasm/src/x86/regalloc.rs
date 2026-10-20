@@ -11,7 +11,6 @@ use crate::regalloc::{
     FrameManager, Lifetime, RegAlloc, RegAllocAssembler, SAVE_ALL_REGS, SAVE_DEFAULT_REGS,
     SAVE_GCREF_REGS, compute_vars_longevity, fits_in_32bits, is_math_sqrt_call,
 };
-use crate::regloc::X86_64_SCRATCH_REG;
 use crate::regloc::{
     EAX, EBP, EBX, ECX, EDI, EDX, ESI, R8, R9, R10, R12, R13, R14, R15, RegLoc, XMM0, XMM1, XMM2,
     XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14,
@@ -1723,18 +1722,6 @@ impl<'a> RegAlloc<'a> {
             .unwrap_or(8)
     }
 
-    pub(crate) fn gc_offset_loc(&mut self, ofs: i64) -> Loc {
-        // x86 `AddressLoc` keeps any displacement that `fits_in_32bits`,
-        // including negatives.
-        if fits_in_32bits(ofs) {
-            Loc::immed(ofs)
-        } else {
-            self.pending_moves
-                .push((Loc::immed(ofs), Loc::Reg(X86_64_SCRATCH_REG)));
-            Loc::Reg(X86_64_SCRATCH_REG)
-        }
-    }
-
     pub(crate) fn _consider_gc_load(
         &mut self,
         dst: OpRef,
@@ -1747,7 +1734,9 @@ impl<'a> RegAlloc<'a> {
     ) {
         let args = [base, offset];
         let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
-        let ofs_loc = self.gc_offset_loc(self.const_value(offset));
+        // A ConstInt offset comes back as an immediate; `addr_add` and the
+        // location builder encode one that does not fit 32 bits.
+        let ofs_loc = self.make_sure_var_in_reg(offset, Type::Int, &args, None, false);
         let nsize = self.gc_load_nsize(op, size);
         let tp = op.opcode.result_type();
         let res_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
@@ -1842,19 +1831,12 @@ impl<'a> RegAlloc<'a> {
     ) {
         let args = [base, offset, value];
         let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
-        let tp_val = self.tp(value);
-        let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
         let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
-        let ofs = self.const_value(offset);
-        // pyre's GC header sits at `obj - HDR_SIZE`, so `gen_initialize_tid`
-        // stores at a small negative offset, an immediate disp8. Wider
-        // displacements, including other negatives and offsets >= 4096, stay
-        // immediate via `gc_offset_loc` when `fits_in_32bits` (`AddressLoc`).
-        let ofs_loc = if (-256..0).contains(&ofs) {
-            Loc::immed(ofs)
-        } else {
-            self.gc_offset_loc(ofs)
-        };
+        assert!(size >= 1);
+        let need_lower_byte = size == 1;
+        let tp_val = self.tp(value);
+        let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, need_lower_byte);
+        let ofs_loc = self.make_sure_var_in_reg(offset, Type::Int, &args, None, false);
         self.perform_discard_gc_store(i, value_loc, base_loc, ofs_loc, size, asm);
     }
 

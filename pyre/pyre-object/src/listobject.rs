@@ -9,10 +9,11 @@
 #![allow(dead_code)]
 
 use crate::object_array::{
-    ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
-    alloc_typed_items_block_nursery, dealloc_list_items_block, gc_int_array_gc_type_id,
-    grow_float_items_block, grow_int_items_block, grow_list_items_block_gc, items_block_capacity,
-    items_block_items_base, items_block_set_ref, jit_ll_arraycopy, typed_items_block_items_base,
+    FloatItemsBlock, ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc,
+    alloc_typed_items_block, alloc_typed_items_block_nursery, dealloc_list_items_block,
+    gc_float_array_gc_type_id, gc_int_array_gc_type_id, grow_list_items_block_gc,
+    items_block_capacity, items_block_items_base, items_block_set_ref, jit_ll_arraycopy,
+    typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -3238,10 +3239,24 @@ pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: i64, ove
     } else {
         newsize as usize
     };
-    let newitems = grow_int_items_block(ll_list_int_items(list), new_allocated as usize, p);
+    // `newitems = malloc(LIST.items.TO, new_allocated)`: a nursery malloc
+    // that may collect, so `l` is reloaded after it. Nothing between the
+    // malloc and `l.items = newitems` collects, so `newitems` needs no root.
+    let newitems = int_ll_newlist(new_allocated);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
+    let old = ll_list_int_items(list);
+    // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+    crate::object_array::ll_arraycopy_int_items_block(old, newitems, 0, 0, p as i64);
+    // The barrier gctransform puts before `l.items = newitems`: an old list
+    // now names a young block.
+    list_write_barrier(obj);
     ll_list_int_set_items(list, newitems);
+    // A block outside the collector's heap (no GC installed) has no other
+    // owner to free it; a collector-owned one is left to the collector.
+    if !majit_rlib::jit::we_are_jitted() {
+        crate::object_array::dealloc_typed_items_block(old);
+    }
 }
 
 /// `rlist.py _ll_list_resize_ge` for Integer storage.
@@ -3377,10 +3392,30 @@ pub unsafe fn ll_list_float_resize_hint_really(obj: PyObjectRef, newsize: i64, o
     } else {
         newsize as usize
     };
-    let newitems = grow_float_items_block(ll_list_float_items(list), new_allocated as usize, p);
+    // `newitems = malloc(LIST.items.TO, new_allocated)`: a nursery malloc
+    // that may collect, so `l` is reloaded after it. Nothing between the
+    // malloc and `l.items = newitems` collects, so `newitems` needs no root.
+    let newitems = float_ll_newlist(new_allocated);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let list = &mut *(obj as *mut W_ListObject);
+    let old = ll_list_float_items(list);
+    // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+    crate::object_array::ll_arraycopy_float_items_block(
+        old as *mut FloatItemsBlock,
+        newitems as *mut FloatItemsBlock,
+        0,
+        0,
+        p as i64,
+    );
+    // The barrier gctransform puts before `l.items = newitems`: an old list
+    // now names a young block.
+    list_write_barrier(obj);
     ll_list_float_set_items(list, newitems);
+    // A block outside the collector's heap (no GC installed) has no other
+    // owner to free it; a collector-owned one is left to the collector.
+    if !majit_rlib::jit::we_are_jitted() {
+        crate::object_array::dealloc_typed_items_block(old);
+    }
 }
 
 /// `rlist.py _ll_list_resize_ge` for Float storage.
@@ -3914,7 +3949,34 @@ unsafe fn int_ll_newlist(count: i64) -> *mut TypedItemsBlock {
     if count == 0 {
         return std::ptr::null_mut();
     }
-    alloc_typed_items_block_nursery(count, gc_int_array_gc_type_id())
+    typed_ll_newlist(count, gc_int_array_gc_type_id())
+}
+
+/// The body shared by [`int_ll_newlist`] and [`float_ll_newlist`].
+///
+/// With no collector installed, `alloc_typed_items_block_nursery` hands back
+/// a header-less `std::alloc` block, while every free of a typed block here
+/// (`dealloc_typed_items_block`) expects the header-prefixed block
+/// `alloc_typed_items_block` makes; such a block would reach `dealloc` at the
+/// wrong address. So the no-collector case takes the latter.
+#[inline]
+unsafe fn typed_ll_newlist(count: usize, tid: u32) -> *mut TypedItemsBlock {
+    if crate::object_array::itemsblock_gc_enabled() && majit_gc::gc_allocator_installed() {
+        alloc_typed_items_block_nursery(count, tid)
+    } else {
+        alloc_typed_items_block(count, tid)
+    }
+}
+
+/// [`int_ll_newlist`] for FloatListStrategy storage (`GcArray(Float)`).
+#[inline(never)]
+#[majit_macros::oopspec("newlist(length)")]
+unsafe fn float_ll_newlist(count: i64) -> *mut TypedItemsBlock {
+    let count = count as usize;
+    if count == 0 {
+        return std::ptr::null_mut();
+    }
+    typed_ll_newlist(count, gc_float_array_gc_type_id())
 }
 
 /// `W_ListObject.from_storage_and_strategy` for IntegerListStrategy: the

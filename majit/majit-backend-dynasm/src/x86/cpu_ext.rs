@@ -161,7 +161,8 @@ impl X86CpuExt {
     /// `llsupport/assembler.py setup_once` parity: build every
     /// `_build_wb_slowpath` variant not built yet and memoise the entries, which
     /// `_write_barrier_fastpath` then `CALL`s as `wb_slowpath[helper_num]`.
-    pub(crate) fn ensure_wb_slowpath(&mut self) -> [usize; 5] {
+    /// Runs from `setup_once` and from `set_gc_allocator`, not per compile.
+    pub(crate) fn build_wb_slowpaths(&mut self) {
         // `_build_wb_slowpath(False)`, `(True)`, `(False, for_frame=True)`,
         // then the `withfloats=True` pair.
         for (withcards, withfloats, for_frame) in [
@@ -176,10 +177,9 @@ impl X86CpuExt {
             } else {
                 usize::from(withcards) + 2 * usize::from(withfloats)
             };
-            // `_write_barrier_fastpath`: `if self.wb_slowpath[helper_num] ==
-            // 0` builds it there. A collector installed after the first
-            // build (`set_gc_allocator`) can be the first with a write
-            // barrier, so an entry left at 0 is retried, never cached.
+            // An entry built by an earlier call is kept; one left at 0 (no
+            // `withcards` helper for the descr seen then) is built when
+            // `set_gc_allocator` installs a collector whose descr has one.
             if self.wb_slowpath[helper_num] != 0 {
                 continue;
             }
@@ -194,17 +194,23 @@ impl X86CpuExt {
             self.wb_slowpath[helper_num] = addr;
             self._wb_slowpath_buffers.push(buffer);
         }
+    }
+
+    /// The entries [`Self::build_wb_slowpaths`] built, which every compile
+    /// hands to its assembler.
+    pub(crate) fn wb_slowpath(&self) -> [usize; 5] {
         self.wb_slowpath
     }
 
     /// `_build_cond_call_slowpath` for all four `(supports_floats, callee_only)`
-    /// pairs, memoised once per CPU. `ensure_wb_slowpath` runs first:
+    /// pairs, memoised once per CPU. `build_wb_slowpaths` runs first:
     /// `reload_frame_if_necessary` inside the helper calls `wb_slowpath[4]`.
     pub(crate) fn ensure_cond_call_slowpath(&mut self) -> [usize; 4] {
         if self.cond_call_slowpath[0] != 0 {
             return self.cond_call_slowpath;
         }
-        let wb_slowpath = self.ensure_wb_slowpath();
+        self.build_wb_slowpaths();
+        let wb_slowpath = self.wb_slowpath;
         let (buffers, addrs) =
             super::assembler::build_cond_call_slowpaths(wb_slowpath, &self.asm_memory_manager);
         assert!(

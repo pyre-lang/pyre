@@ -6089,3 +6089,55 @@ fn removed_operation_reaching_the_backend_is_not_implemented() {
         "panic message: {msg}"
     );
 }
+
+/// x86/regalloc.py `_consider_gc_load` / `consider_gc_store` take the offset
+/// through `rm.make_sure_var_in_reg`: a variable offset sits in a register,
+/// and a constant one that does not fit 32 bits is left to the location
+/// builder (`_fix_static_offset_64_m`), also when the stored value is a
+/// 64-bit immediate.
+#[test]
+fn gc_load_store_take_register_and_wide_offsets() {
+    const WIDE: i64 = 1 << 33;
+    const BIG: i64 = 0x1234_5678_9abc_def0;
+    let mut buf = [0i64; 4];
+    let base = buf.as_mut_ptr() as usize;
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Int, 2),
+        InputArg::from_type_rc(Type::Int, 3),
+    ];
+    let obj = inputargs[0].opref();
+    let shifted = inputargs[1].opref();
+    let ofs = inputargs[2].opref();
+    let value = inputargs[3].opref();
+    let loaded = OpRef::int_op(5);
+    let ops = vec![
+        op_at(
+            OpCode::GcStore,
+            &[obj, ofs, value, OpRef::const_int(8)],
+            OpRef::void_op(4),
+        ),
+        op_at(
+            OpCode::GcLoadI,
+            &[shifted, OpRef::const_int(WIDE + 8), OpRef::const_int(8)],
+            loaded,
+        ),
+        gc_store(shifted, WIDE + 16, OpRef::const_int(BIG), 8, 6),
+        finish_int(loaded, 7),
+    ];
+    let token = compile_ops(&mut backend, &inputargs, ops);
+    let frame = backend.execute_token(
+        &token,
+        &[
+            Value::Ref(GcRef(base)),
+            Value::Ref(GcRef(base.wrapping_sub(WIDE as usize))),
+            Value::Int(8),
+            Value::Int(77),
+        ],
+    );
+    assert_eq!(backend.get_int_value(&frame, 0), 77);
+    assert_eq!(buf, [0, 77, BIG, 0]);
+}

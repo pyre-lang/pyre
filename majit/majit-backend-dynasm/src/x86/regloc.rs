@@ -470,19 +470,12 @@ impl LocationCodeBuilder {
             Operand::M(_, ofs) | Operand::A(_, _, _, ofs) => ofs,
             _ => 0,
         };
-        // The regalloc stages an out-of-range offset into the scratch
-        // register (`gc_offset_loc`), so an address can already hold it.
         let scratch = X86_64_SCRATCH_REG.value;
-        let address_holds_scratch = match loc1 {
-            Operand::M(base, _) => base == scratch,
-            Operand::A(base, index, _, _) => base == i16::from(scratch) || index == scratch,
-            _ => false,
-        };
         // A `'j'` with no `NAME_j<code2>` form is reached through
         // `_addr_as_reg_offset`, which needs the scratch register too.
         let j_needs_scratch =
             matches!(loc1, Operand::J(_)) && !has_j_form(name, loc1, Operand::R(scratch));
-        if !rx86::fits_in_32bits(checkvalue) || address_holds_scratch || j_needs_scratch {
+        if !rx86::fits_in_32bits(checkvalue) || j_needs_scratch {
             // Both operands are 64-bit: the scratch register is taken by the
             // address, so the immediate goes through a pushed free register.
             let freereg = loc1.find_unused_reg();

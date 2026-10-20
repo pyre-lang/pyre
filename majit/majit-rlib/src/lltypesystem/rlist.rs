@@ -26,7 +26,12 @@ use std::alloc::{Layout, alloc, alloc_zeroed};
 /// read "unset" and "the first registered type" the same way, which is the
 /// very confusion these ids exist to prevent. `TypeRegistry::register`
 /// reserves this value by rejecting an index that cannot fit below it.
-pub const UNSET_GC_TYPE_ID: u32 = majit_ir::descr::UNSET_GC_TYPE_ID;
+///
+/// Spelled as a literal: an initializer naming the `majit_ir` const reads
+/// as a call to a global outside the extracted LLBC corpus, which the
+/// prepass cannot lift.
+pub const UNSET_GC_TYPE_ID: u32 = 0xFFFF_FFFF;
+const _: () = assert!(UNSET_GC_TYPE_ID == majit_ir::descr::UNSET_GC_TYPE_ID);
 
 /// GC type id for `Ptr(GcArray(Signed))`. This is a distinct ARRAY identity
 /// from `GcArray(Float)` even though the collector trace shape is the same —

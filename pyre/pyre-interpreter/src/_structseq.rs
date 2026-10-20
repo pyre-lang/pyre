@@ -481,7 +481,7 @@ pub fn new_instance_with_extra(
 /// The returned type is the value module callers stash so future
 /// allocations route through [`new_instance`].
 pub fn make_struct_seq(name: &'static str, field_names: &[&'static str]) -> PyObjectRef {
-    make_struct_seq_impl(name, field_names, &[])
+    make_struct_seq_impl(name, field_names, std::iter::empty())
 }
 
 /// Like [`make_struct_seq`] but adds named-only fields beyond the tuple
@@ -494,7 +494,35 @@ pub fn make_struct_seq_with_extra(
     field_names: &[&'static str],
     extra_field_names: &[&'static str],
 ) -> PyObjectRef {
-    make_struct_seq_impl(name, field_names, extra_field_names)
+    // `app_posix.py stat_result` numbers the named-only fields past a gap in
+    // the indices, which is what makes `structseqtype.__new__` classify them
+    // as extra fields rather than positional ones.
+    let first_extra = field_names.len() + 1;
+    make_struct_seq_impl(
+        name,
+        field_names,
+        extra_field_names
+            .iter()
+            .enumerate()
+            .map(|(i, field)| (first_extra + i, *field)),
+    )
+}
+
+/// Like [`make_struct_seq_with_extra`], with each named-only field at the
+/// `structseqfield(index)` its app-level class gives it
+/// (`vm.py windows_version_info` puts its extras at 10..=14).
+pub fn make_struct_seq_with_indexed_extra(
+    name: &'static str,
+    field_names: &[&'static str],
+    extra_fields: &[(usize, &'static str)],
+) -> PyObjectRef {
+    assert!(
+        extra_fields
+            .first()
+            .is_none_or(|(index, _)| *index > field_names.len()),
+        "{name}: named-only fields must follow a gap after the sequence fields"
+    );
+    make_struct_seq_impl(name, field_names, extra_fields.iter().copied())
 }
 
 /// Mark a structseq type `Py_TPFLAGS_DISALLOW_INSTANTIATION`, which is how
@@ -510,7 +538,7 @@ pub fn disallow_instantiation(cls: PyObjectRef) -> PyObjectRef {
 fn make_struct_seq_impl(
     name: &'static str,
     field_names: &[&'static str],
-    extra_field_names: &[&'static str],
+    extra_fields: impl Iterator<Item = (usize, &'static str)> + Clone,
 ) -> PyObjectRef {
     let (module, short_name) = name
         .rsplit_once('.')
@@ -524,16 +552,11 @@ fn make_struct_seq_impl(
         unsafe { pyre_object::w_dict_setitem_str(roots.get(ns_slot), key, roots.get(value_slot)) };
     };
 
-    // `app_posix.py stat_result` numbers the named-only fields past a gap in
-    // the indices, which is what makes `structseqtype.__new__` classify them
-    // as extra fields rather than positional ones.
-    let n_sequence_fields = field_names.len();
-    let indexed = field_names.iter().enumerate().chain(
-        extra_field_names
-            .iter()
-            .enumerate()
-            .map(|(i, field)| (n_sequence_fields + 1 + i, field)),
-    );
+    let indexed = field_names
+        .iter()
+        .copied()
+        .enumerate()
+        .chain(extra_fields.clone());
     for (index, field) in indexed {
         let w_field = crate::call::call_function_impl_result(
             roots.get(field_type_slot),
@@ -550,8 +573,9 @@ fn make_struct_seq_impl(
     // name goes.  Such a type gets `_name` stored after creation instead.
     let name_is_field = field_names
         .iter()
-        .chain(extra_field_names)
-        .any(|field| *field == "name");
+        .copied()
+        .chain(extra_fields.map(|(_, field)| field))
+        .any(|field| field == "name");
     if !name_is_field {
         store("name", pyre_object::w_str_new(name));
     }

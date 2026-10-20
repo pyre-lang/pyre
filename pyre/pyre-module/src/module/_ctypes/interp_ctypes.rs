@@ -11,7 +11,8 @@
 //! the buffer-view machinery aliases nested/pointed-to memory.
 //!
 //! Dynamic loading on posix is `rdynload` (`dlopen`/`dlsym`/`dlclose`).
-//! Windows `LoadLibrary` is `LoadLibraryExW`.
+//! Windows `LoadLibrary` is `LoadLibraryExW`; symbol lookup and
+//! `FreeLibrary` are `rdynload.dlsym` and `rdynload.dlclose`.
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     register_host_ctypes(ns);
@@ -524,17 +525,19 @@ pub(super) fn lookup_symbol(handle: usize, symbol: &[u8]) -> Result<usize, Looku
     }
     // `GetProcAddress` names the export in the module's own narrow spelling,
     // and an embedded NUL would silently truncate the name it looks for.
-    let Ok(name) = std::ffi::CString::new(symbol) else {
+    if symbol.contains(&0) {
         return Err(LookupSymbolError::Load(
             "symbol name contains a null byte".to_string(),
         ));
-    };
-    rustpython_host_env::ctypes::get_proc_address(handle as _, &name).ok_or_else(|| {
-        LookupSymbolError::Load(format!(
-            "symbol '{}' not found",
-            String::from_utf8_lossy(symbol)
-        ))
-    })
+    }
+    majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol)
+        .map(|address| address as usize)
+        .map_err(|name| {
+            LookupSymbolError::Load(format!(
+                "symbol '{}' not found",
+                String::from_utf8_lossy(&name)
+            ))
+        })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -597,7 +600,10 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
     // library cache: that cache's Windows door is `Library::new`, which has no
     // flags parameter, and its raw-handle door is unix-only.  Keeping the
     // module handle is also what `_ctypes.c` stores, so `FreeLibrary` and the
-    // symbol lookup in [`lookup_symbol`] are the plain Win32 calls on it.
+    // symbol lookup in [`lookup_symbol`] are `rdynload.dlclose` and
+    // `rdynload.dlsym` on it. The load itself is not `rdynload.dlopenex`:
+    // that widens the name with `utf82wcharp`, one unit per code point, so
+    // a path outside the BMP would not reach `LoadLibraryExW` intact.
     pyre_interpreter::__pyre_store!(
         ns,
         "LoadLibrary",
@@ -666,7 +672,13 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
                     ));
                 };
                 let module = pyre_interpreter::baseobjspace::int_w(handle)? as isize;
-                host_ctypes::free_library(module as _).map_err(|_| last_win32_error())?;
+                // `rdynload.dlclose`: `FreeLibrary`, -1 on failure.
+                let rc = unsafe {
+                    majit_rlib::rdynload::dlclose(module as majit_rlib::rdynload::DLLHANDLE)
+                };
+                if rc != 0 {
+                    return Err(last_win32_error());
+                }
                 Ok(pyre_object::w_none())
             },
             1,
@@ -950,7 +962,7 @@ fn ctypes_addressof(
 }
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn ctypes_byref(
+pub(super) fn ctypes_byref(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     use super::{cdata, cfield};

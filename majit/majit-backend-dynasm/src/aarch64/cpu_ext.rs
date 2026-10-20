@@ -62,8 +62,9 @@ impl Aarch64CpuExt {
     }
 
     /// `aarch64/assembler.py setup_once`: `_build_wb_slowpath` for every
-    /// `withcards`/`withfloats` pair and the `for_frame` helper.
-    pub(crate) fn ensure_wb_slowpath(&mut self) -> [usize; 5] {
+    /// `withcards`/`withfloats` pair and the `for_frame` helper. Runs from
+    /// `setup_once` and from `set_gc_allocator`, not per compile.
+    pub(crate) fn build_wb_slowpaths(&mut self) {
         // `_build_wb_slowpath(False)`, `(True)`, `(False, for_frame=True)`,
         // then the `withfloats=True` pair.
         for (withcards, withfloats, for_frame) in [
@@ -78,10 +79,9 @@ impl Aarch64CpuExt {
             } else {
                 usize::from(withcards) + 2 * usize::from(withfloats)
             };
-            // `_write_barrier_fastpath`: `if self.wb_slowpath[helper_num] ==
-            // 0` builds it there. A collector installed after the first
-            // build (`set_gc_allocator`) can be the first with a write
-            // barrier, so an entry left at 0 is retried, never cached.
+            // An entry built by an earlier call is kept; one left at 0 (no
+            // `withcards` helper for the descr seen then) is built when
+            // `set_gc_allocator` installs a collector whose descr has one.
             if self.wb_slowpath[helper_num] != 0 {
                 continue;
             }
@@ -96,6 +96,11 @@ impl Aarch64CpuExt {
             self.wb_slowpath[helper_num] = addr;
             self._wb_slowpath_buffers.push(buffer);
         }
+    }
+
+    /// The entries [`Self::build_wb_slowpaths`] built, which every compile
+    /// hands to its assembler.
+    pub(crate) fn wb_slowpath(&self) -> [usize; 5] {
         self.wb_slowpath
     }
 

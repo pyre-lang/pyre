@@ -26936,6 +26936,9 @@ mod metainterp_static_data_tests {
         driver.portal_runner_adr = portal_runner_helper as *const () as i64;
         let idx = meta.register_jitdriver_sd(driver);
         meta.finish_setup_descrs_for_jitdrivers();
+        // `compile_and_run_once` runs `_setup_once` before any compile;
+        // the CALL_ASSEMBLER below needs the WB slowpaths it builds.
+        meta.staticdata._setup_once(&mut meta.backend);
         let jd = meta.staticdata.jitdrivers_sd[idx].clone();
         let red_arg_types: Vec<majit_ir::Type> = Vec::new();
         assert_eq!(
@@ -27024,6 +27027,9 @@ mod metainterp_static_data_tests {
         assert_eq!(idx0, 0);
         assert_eq!(idx1, 1);
         meta.finish_setup_descrs_for_jitdrivers();
+        // `compile_and_run_once` runs `_setup_once` before any compile;
+        // the temporary callback's CALL_ASSEMBLER needs its WB slowpaths.
+        meta.staticdata._setup_once(&mut meta.backend);
 
         let key = 0x5eC0_u64;
         let planted = std::sync::Arc::new(majit_backend::JitCellToken::new(11));
