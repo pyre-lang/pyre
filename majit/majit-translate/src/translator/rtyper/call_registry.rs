@@ -65,7 +65,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
-use crate::annotator::description::{AnnSignature, FunctionDesc, GraphCacheKey};
+use crate::annotator::description::{
+    AnnSignature, FunctionDesc, GraphCacheKey, clone_lifted_graph,
+};
 use crate::annotator::model::{SomeInstance, SomeValue};
 use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
@@ -859,6 +861,12 @@ impl CallRegistry {
     /// residual signature and annotator stub graph onto this path so
     /// the caller can annotate, while the instantiation keeps a
     /// distinct callable identity.
+    ///
+    /// `func_with_new_name` copies `_annspecialcase_`. `newfuncdesc`
+    /// then `FunctionDesc.specialize` / `pycall` still run
+    /// `specialize_argtype` before the codewriter residualizes
+    /// (`policy.py look_inside_graph`). Sharing the template stub
+    /// `Rc` would `mergeinputargs` Instance ∪ Tuple on one startblock.
     fn materialize_residual_inst(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         let template_segs = residual_inst_template_segments(key.segments())?;
         let template = self.lookup_residual_template(&template_segs)?;
@@ -875,13 +883,13 @@ impl CallRegistry {
             .cloned();
         let declared = template.declared_funcptr_type.borrow().clone();
         let annsignature = template.function_desc.borrow().annsignature.clone();
-        let graph_func = GraphFunc::new(
-            key.name().to_string(),
-            Constant::new(ConstValue::Dict(HashMap::new())),
-        );
+        let graph_func = template
+            .host_object
+            .user_function()?
+            .with_new_name(key.name());
         let entry = self.get_or_register_with_func(key.clone(), signature, graph_func);
         if let Some(pygraph) = pygraph {
-            entry.prefill_default_cache(pygraph);
+            entry.prefill_default_cache(clone_lifted_graph(&pygraph, Some(key.name())));
         }
         *entry.declared_funcptr_type.borrow_mut() = declared;
         entry.function_desc.borrow_mut().annsignature = annsignature;
@@ -1566,6 +1574,141 @@ mod tests {
     }
 
     #[test]
+    fn residual_inst_argtype_dont_look_inside_splits_instance_and_tuple() {
+        // `func_with_new_name` copies `_annspecialcase_`, so each
+        // `leaf__inst_*` FunctionDesc still `specialize_argtype`s
+        // (`description.py FunctionDesc.specialize` / `annrpython.py
+        // pycall`) before `policy.py look_inside_graph` residualizes.
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            use crate::annotator::argument::ArgumentsForTranslation;
+            use crate::annotator::classdesc::ClassDef;
+            use crate::annotator::model::{SomeInteger, SomeTuple};
+            use crate::annotator::policy::Specializer;
+
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let registry = CallRegistry::new(ann.bookkeeper.clone());
+            let mut func = GraphFunc::new(
+                "gc_alloc_young_storage_box",
+                Constant::new(ConstValue::Dict(HashMap::new())),
+            );
+            func.annspecialcase = Some("specialize:argtype(0)".into());
+            func._jit_look_inside_ = Some(false);
+            let sig = signature(&["value", "tid"]);
+            let template = registry.get_or_register_with_func(
+                FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "gc_storage",
+                    "gc_alloc_young_storage_box",
+                ]),
+                sig.clone(),
+                func,
+            );
+            template.prefill_default_cache(stub_pygraph_with_formals(
+                "pyre_object::gc_storage::gc_alloc_young_storage_box",
+                sig.clone(),
+            ));
+
+            let inst_entry = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "gc_storage",
+                    "gc_alloc_young_storage_box__inst_RDict_u32",
+                ]))
+                .expect("RDict residual inst");
+            let tuple_entry = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "gc_storage",
+                    "gc_alloc_young_storage_box__inst_tuple_u32",
+                ]))
+                .expect("tuple residual inst");
+            assert!(
+                matches!(
+                    inst_entry.function_desc.borrow().specializer.as_ref(),
+                    Some(Specializer::Argtype { parms }) if parms == &["0".to_string()]
+                ),
+                "materialize_residual_inst must copy specialize:argtype"
+            );
+            let inst_none = inst_entry
+                .function_desc
+                .borrow()
+                .cache
+                .borrow()
+                .get(&GraphCacheKey::None)
+                .cloned()
+                .expect("inst stub");
+            let tuple_none = tuple_entry
+                .function_desc
+                .borrow()
+                .cache
+                .borrow()
+                .get(&GraphCacheKey::None)
+                .cloned()
+                .expect("tuple stub");
+            assert!(
+                !Rc::ptr_eq(&inst_none, &tuple_none),
+                "instantiations must not share the template stub Rc"
+            );
+
+            let inst = SomeValue::Instance(SomeInstance::new(
+                Some(ClassDef::new_standalone("rordereddict::RDict", None)),
+                false,
+                std::collections::BTreeMap::new(),
+            ));
+            let tuple = SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
+                SomeInteger::default(),
+            )]));
+            let tid = SomeValue::Integer(SomeInteger::default());
+            inst_entry
+                .function_desc
+                .borrow()
+                .pycall(
+                    None,
+                    &ArgumentsForTranslation::new(
+                        vec![Some(inst.clone()), Some(tid.clone())],
+                        None,
+                        None,
+                    ),
+                    &SomeValue::Impossible,
+                    None,
+                )
+                .expect("instance pycall");
+            inst_entry
+                .function_desc
+                .borrow()
+                .pycall(
+                    None,
+                    &ArgumentsForTranslation::new(vec![Some(tuple.clone()), Some(tid)], None, None),
+                    &SomeValue::Impossible,
+                    None,
+                )
+                .expect("tuple pycall");
+            let g_inst = inst_entry
+                .function_desc
+                .borrow()
+                .specialize(
+                    &mut vec![Some(inst), Some(SomeValue::Integer(SomeInteger::default()))],
+                    None,
+                )
+                .expect("instance specialize")
+                .expect_graph()
+                .unwrap();
+            let g_tuple = inst_entry
+                .function_desc
+                .borrow()
+                .specialize(
+                    &mut vec![
+                        Some(tuple),
+                        Some(SomeValue::Integer(SomeInteger::default())),
+                    ],
+                    None,
+                )
+                .expect("tuple specialize")
+                .expect_graph()
+                .unwrap();
+            assert!(!Rc::ptr_eq(&g_inst, &g_tuple));
+        });
+    }
+
+    #[test]
     fn source_callable_keeps_memo_policy_evaluator_and_alias_identity() {
         use crate::annotator::description::SpecializeResult;
         use crate::annotator::model::SomeBool;
@@ -1957,6 +2100,38 @@ mod tests {
         let startblock = crate::flowspace::model::Block::shared(vec![]);
         Rc::new(PyGraph {
             graph: Rc::new(RefCell::new(FunctionGraph::new(name, startblock))),
+            func,
+            signature: RefCell::new(sig),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Signature-only residual stub whose startblock inputargs match
+    /// the formals, so `recursivecall` / `mergeinputargs` can run.
+    fn stub_pygraph_with_formals(name: &str, sig: Signature) -> Rc<PyGraph> {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, FunctionGraph, Hlvalue, Link, Variable,
+        };
+        let inputargs: Vec<Hlvalue> = sig
+            .argnames
+            .iter()
+            .map(|n| Hlvalue::Variable(Variable::named(n)))
+            .collect();
+        let startblock = Block::shared(inputargs);
+        let func = GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        let mut graph_inner = FunctionGraph::new(name, startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let return_var = Variable::named("result");
+        *return_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Impossible));
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        Rc::new(PyGraph {
+            graph: graph_inner.into_ref(),
             func,
             signature: RefCell::new(sig),
             defaults: RefCell::new(Some(Vec::new())),

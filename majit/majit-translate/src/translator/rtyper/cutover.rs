@@ -2558,7 +2558,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // verbatim single-key stub cannot collide.  `register_unsafe_fn_stubs`
     // is non-overwriting (skips keys the `function_graphs` pass already
     // registered) and idempotent.
-    register_unsafe_fn_stubs(registry, unsafe_fn_stubs);
+    register_unsafe_fn_stubs(registry, unsafe_fn_stubs, Some(function_graphs));
     // `__deref_write(ptr, value)` is the MIR front end's opaque store
     // marker.  Give the annotator the same declared-external carrier as the
     // Rust-stdlib leaves below so one unfollowable store does not stop the
@@ -3277,9 +3277,15 @@ fn declared_funcptr_type_from_legacy(
 /// there: this function takes only `&CallRegistry`, its caller holds
 /// `function_graphs` by shared reference, and `GraphStore::insert` needs
 /// `&mut self`.
+///
+/// A declared funcobj's `_annspecialcase_` is installed through
+/// `source_graph_func` so `Bookkeeper.newfuncdesc` /
+/// `FunctionDesc.specialize` still see `specialize:argtype` when this
+/// residual is seeded before `set_getdesc`.
 pub(crate) fn register_unsafe_fn_stubs(
     registry: &CallRegistry,
     specs: &[(Vec<String>, Signature, Option<String>)],
+    function_graphs: Option<&crate::codewriter::call::GraphStore>,
 ) {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     for (segments, signature, return_token) in specs {
@@ -3315,8 +3321,54 @@ pub(crate) fn register_unsafe_fn_stubs(
             // safe fn with the same path).  Don't overwrite.
             continue;
         }
-        registry.register_callee(key, signature.clone(), stub_pygraph);
+        let graph_func =
+            declared_source_graph_func(function_graphs, segments).unwrap_or_else(|| {
+                GraphFunc::new(
+                    segments.last().cloned().unwrap_or_default(),
+                    Constant::new(ConstValue::Dict(HashMap::new())),
+                )
+            });
+        let entry = registry.get_or_register_with_func(key, signature.clone(), graph_func);
+        entry.prefill_default_cache(stub_pygraph);
     }
+}
+
+/// `_annspecialcase_` of a funcobj the front end declared, for
+/// `Bookkeeper.newfuncdesc` (`description.py FunctionDesc.specialize`).
+fn declared_source_graph_func(
+    function_graphs: Option<&crate::codewriter::call::GraphStore>,
+    segments: &[String],
+) -> Option<GraphFunc> {
+    let store = function_graphs?;
+    let try_segs = |segs: &[String]| {
+        let path = crate::parse::CallPath::from_segments(segs.iter().cloned());
+        store
+            .declared_funcobj(&path)
+            .map(|graph| source_graph_func(&graph))
+    };
+    if let Some(func) = try_segs(segments) {
+        return Some(func);
+    }
+    let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
+    let stripped = canonical_dedup_key(&path);
+    if stripped.as_slice() != segments
+        && let Some(func) = try_segs(&stripped)
+    {
+        return Some(func);
+    }
+    let mut roots = crate::local_crates::local_crate_roots();
+    if !roots.iter().any(|root| root == "crate") {
+        roots.push("crate".to_string());
+    }
+    for root in roots {
+        let mut segs = Vec::with_capacity(segments.len() + 1);
+        segs.push(root);
+        segs.extend(segments.iter().cloned());
+        if let Some(func) = try_segs(&segs) {
+            return Some(func);
+        }
+    }
+    None
 }
 
 /// Foreign Rust-stdlib helper paths the interpreter source calls inline
@@ -5717,7 +5769,7 @@ mod tests {
                 Some("ref".to_string()),
             ));
         }
-        register_unsafe_fn_stubs(&stub_registry, &specs);
+        register_unsafe_fn_stubs(&stub_registry, &specs, None);
         assert_eq!(
             stub_registry.len(),
             1,
@@ -5819,7 +5871,7 @@ mod tests {
                 None,
             ));
         }
-        register_unsafe_fn_stubs(&stub_registry, &specs);
+        register_unsafe_fn_stubs(&stub_registry, &specs, None);
         assert_eq!(
             stub_registry.len(),
             1,
@@ -10267,7 +10319,7 @@ mod tests {
                 Some("i128".to_string()),
             ),
         ];
-        register_unsafe_fn_stubs(&registry, &specs);
+        register_unsafe_fn_stubs(&registry, &specs, None);
         assert_eq!(
             registry.len(),
             3,
@@ -10336,7 +10388,7 @@ mod tests {
                 None,
             ));
         }
-        register_unsafe_fn_stubs(&registry, &specs);
+        register_unsafe_fn_stubs(&registry, &specs, None);
         assert_eq!(
             registry.len(),
             3,
@@ -10767,7 +10819,7 @@ mod tests {
         )];
         let bk = std::rc::Rc::new(Bookkeeper::new());
         let registry = CallRegistry::new(bk);
-        register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs);
+        register_unsafe_fn_stubs(&registry, &callcontrol.unsafe_fn_stubs, None);
         // Registry side: the stub is present for `cachedgraph` lookups.
         let key = FunctionPathKey::from_segments(["pyobject".to_string(), "is_none".to_string()]);
         assert!(
@@ -10806,7 +10858,7 @@ mod tests {
             signature,
             Some("bool".to_string()),
         )];
-        register_unsafe_fn_stubs(&registry, &specs);
+        register_unsafe_fn_stubs(&registry, &specs, None);
         assert_eq!(registry.len(), 1, "no new entry expected");
         let after = registry.lookup(&key).expect("entry still present");
         assert_eq!(
