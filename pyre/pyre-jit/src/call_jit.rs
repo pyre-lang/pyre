@@ -4249,7 +4249,7 @@ struct BridgeNestedTraceGuard {
 impl BridgeNestedTraceGuard {
     fn enter() -> Self {
         let (driver, _) = crate::eval::driver_pair();
-        let (parked, _) = crate::eval::park_nested_trace_if_tracing(driver);
+        let parked = crate::eval::park_nested_trace_if_tracing(driver);
         Self { parked }
     }
 }
@@ -4331,7 +4331,12 @@ pub fn trace_and_compile_from_bridge(
     guard_exc: i64,
     allow_finish_direct_return: bool,
 ) -> BridgeResolution {
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
+    // The park is this outer `BridgeNestedTraceGuard` (`compile.py`
+    // `_trace_and_compile_from_bridge` constructs a fresh MetaInterp).
+    let mut incoming_frame_root = frame.map(FrameRoot::new);
     let _nested = BridgeNestedTraceGuard::enter();
+    let frame = incoming_frame_root.as_mut().map(|r| r.frame());
     let resolution = trace_and_compile_from_bridge_body(
         descr_arc,
         frame,
@@ -4434,13 +4439,6 @@ fn trace_and_compile_from_bridge_body(
     // `prepare_resume_from_failure` all allocate, so the root is taken
     // before those calls and every later read goes through `FrameRoot::frame`.
     let mut bridge_frame_root = frame.map(FrameRoot::new);
-    // compile.py `_trace_and_compile_from_bridge` constructs a new
-    // `MetaInterp(metainterp_sd, jitdriver_sd)`. The reused driver parks
-    // the outer attempt for this whole function so `start_bridge_tracing`
-    // and the `is_tracing()` checks below see only the bridge walk.
-    // gct_direct_call: incoming GC refs are rooted before a collecting park.
-    let _nested = crate::eval::NestedTracePark::enter();
-
     let Some(green_key) = bridge_compile_preflight(descr_arc) else {
         return BridgeResolution::ResumeBlackhole;
     };
@@ -5933,13 +5931,6 @@ fn jit_ca_handle_guard_failure(
             };
         };
     }
-    // `compile.py _trace_and_compile_from_bridge` constructs a fresh
-    // MetaInterp. pyre's CALL_ASSEMBLER guard callback runs synchronously
-    // from the backend trampoline, so an outer attempt can still occupy
-    // this reused object. Park it (`warmstate.py bound_reached`) so
-    // `start_retrace_from_guard` can open its own profiler TRACING.
-    let _nested = crate::eval::NestedTracePark::enter();
-
     // compile.py _trace_and_compile_from_bridge.  Native CA code
     // crosses the backend boundary with only the raw descr pointer; recover
     // the backend FailDescr Arc before any guard-failure routing so identity
