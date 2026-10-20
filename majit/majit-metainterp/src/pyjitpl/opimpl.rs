@@ -4099,12 +4099,13 @@ where
         }
         // pyjitpl.py MIFrame.opimpl_jit_merge_point: `redboxes` reach
         // `reached_loop_header` / `put_back_list_of_boxes3` only under
-        // `if not self.metainterp.portal_call_depth`. This walker uses
-        // `inline_depth()` for that root-portal test (same predicate as
-        // the recursive-cut else-branch and `last_mp_green_pc` below).
+        // `if not self.metainterp.portal_call_depth`. Sampled through
+        // `portal_call_depth_fn` (same predicate as the recursive-cut
+        // else-branch and `last_mp_green_pc` below).
         // Snapshot helpers re-read these register numbers from
         // `frames.first()` (the root portal frame).
-        if ctx.inline_depth() == 0 {
+        let portal_call_depth = ctx.portal_call_depth();
+        if portal_call_depth == 0 {
             self.last_mp_green_i = green_i_regs;
             self.last_mp_green_r = green_r_regs;
             self.last_mp_green_f = green_f_regs;
@@ -4161,10 +4162,10 @@ where
         // return `Continue` still passed through a real opcode
         // boundary, and that boundary is what the correction needs.
         //
-        // Restricted to `inline_depth() == 0`: the position it competes
-        // with is the ROOT frame's i0, so an inlined callee's own pc
+        // Restricted to `portal_call_depth == 0`: the position it competes
+        // with is the ROOT frame's i0, so an inlined portal's own pc
         // would name a position in the wrong code.
-        if ctx.inline_depth() == 0
+        if portal_call_depth == 0
             && let Some(u) = mp_green_pc.and_then(|v| usize::try_from(v).ok())
         {
             ctx.last_mp_green_pc = Some(u);
@@ -4192,7 +4193,7 @@ where
         {
             self.seen_loop_header_for_jdindex = jdindex as i32;
         }
-        if ctx.inline_depth() > 0 && self.seen_loop_header_for_jdindex < 0 && !no_loop_header {
+        if portal_call_depth > 0 && self.seen_loop_header_for_jdindex < 0 && !no_loop_header {
             return TraceAction::Continue;
         }
         // pyjitpl.py: `reached_loop_header` is called with
@@ -4263,11 +4264,7 @@ where
                 // installed at every trace-start path; missing
                 // installs would be a structural bug, so default
                 // to "don't stamp" rather than over-stamping.
-                let depth_zero = ctx
-                    .portal_call_depth_fn
-                    .as_ref()
-                    .map(|f| f() == 0)
-                    .unwrap_or(false);
+                let depth_zero = portal_call_depth == 0;
                 // pyjitpl.py MIFrame.opimpl_jit_merge_point keys `ptoken` on `greenboxes`
                 // — the greens of the merge point being visited RIGHT
                 // NOW, not the trace's own header. Keyed on the fixed
@@ -4338,7 +4335,7 @@ where
                 self.seen_loop_header_for_jdindex,
             );
             self.seen_loop_header_for_jdindex = -1;
-            if ctx.inline_depth() > 0 {
+            if portal_call_depth > 0 {
                 // pyjitpl.py MIFrame.opimpl_jit_merge_point else-branch: a recursive-portal
                 // merge point reached at portal_call_depth > 0 is NOT
                 // the traced loop's own header. Instead of a close it
@@ -4375,6 +4372,11 @@ where
                 let mut popped = self.frames.pop().expect("recursive-cut: framestack < 2");
                 if popped.inline_frame {
                     ctx.pop_inline_frame();
+                }
+                // pyjitpl.py `popframe(leave_portal_frame=False)` still
+                // decrements `portal_call_depth` when `jitcode.jitdriver_sd`.
+                if popped.portal_entered {
+                    ctx.adjust_portal_call_depth(-1);
                 }
                 // popframe still appends the log close when greenkey
                 // is set, even with leave_portal_frame=False.
@@ -4433,7 +4435,7 @@ where
             // re-emit those guards, which is what keeps the ops after the
             // merge point self-sufficient.
             //
-            // Placed after the `inline_depth() > 0` recursive-cut branch
+            // Placed after the `portal_call_depth > 0` recursive-cut branch
             // above because that branch is upstream's `else` at
             // pyjitpl.py — it returns instead of calling
             // `reached_loop_header`, so the reset must not run on it.

@@ -6689,6 +6689,7 @@ impl<M: Clone> MetaInterp<M> {
                 // entry installs both fns unconditionally.
                 let self_ptr = self as *const Self as *const ();
                 let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
+                let depth_ptr = std::ptr::addr_of_mut!(self.portal_call_depth);
                 if let Some(ref mut ctx) = self.tracing {
                     ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
                         let meta = unsafe { &*(self_ptr as *const Self) };
@@ -6703,6 +6704,13 @@ impl<M: Clone> MetaInterp<M> {
                     ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                         let meta = unsafe { &*(self_ptr as *const Self) };
                         meta.portal_call_depth
+                    }));
+                    ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta: i32| unsafe {
+                        *depth_ptr += delta;
+                    }));
+                    ctx.unique_id_for_greenkey_fn = Some(Box::new(move |jd_no, greenkey| {
+                        let meta = unsafe { &*(self_ptr as *const Self) };
+                        meta.unique_id_for_greenkey(jd_no, greenkey)
                     }));
                     ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
                         let meta = unsafe { &*(self_ptr as *const Self) };
@@ -7161,6 +7169,7 @@ impl<M: Clone> MetaInterp<M> {
         // that distinction explicitly.
         let self_ptr = self as *const Self as *const ();
         let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
+        let depth_ptr = std::ptr::addr_of_mut!(self.portal_call_depth);
         if let Some(ref mut ctx) = self.tracing {
             ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
                 let meta = unsafe { &*(self_ptr as *const Self) };
@@ -7175,6 +7184,13 @@ impl<M: Clone> MetaInterp<M> {
             ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.portal_call_depth
+            }));
+            ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta: i32| unsafe {
+                *depth_ptr += delta;
+            }));
+            ctx.unique_id_for_greenkey_fn = Some(Box::new(move |jd_no, greenkey| {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.unique_id_for_greenkey(jd_no, greenkey)
             }));
             ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
@@ -17881,6 +17897,7 @@ impl<M: Clone> MetaInterp<M> {
         self.arm_portal_trace_positions();
         let self_ptr = self as *const Self as *const ();
         let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
+        let depth_ptr = std::ptr::addr_of_mut!(self.portal_call_depth);
         if let Some(ref mut ctx) = self.tracing {
             // After the ctx is in `self.tracing`, matching
             // `publish_trace_start`. Extra-area pointers name Trace
@@ -17890,6 +17907,13 @@ impl<M: Clone> MetaInterp<M> {
             ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.portal_call_depth
+            }));
+            ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta: i32| unsafe {
+                *depth_ptr += delta;
+            }));
+            ctx.unique_id_for_greenkey_fn = Some(Box::new(move |jd_no, greenkey| {
+                let meta = unsafe { &*(self_ptr as *const Self) };
+                meta.unique_id_for_greenkey(jd_no, greenkey)
             }));
             ctx.current_call_id_fn = Some(Box::new(move || -> u64 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
@@ -19847,11 +19871,11 @@ impl<M: Clone> MetaInterp<M> {
 
     /// `resume.py` `rebuild_from_resumedata` for a bridge that already
     /// decoded its sections. `newframe(jitcodes[jitcode_pos])` per section,
-    /// then `consume_boxes` into that frame's registers.
+    /// then `consume_boxes` into that frame's registers. An empty stream
+    /// creates no frame.
     #[allow(clippy::too_many_arguments)]
     pub fn rebuild_portal_framestack_from_resumedata(
         &mut self,
-        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
         fail_types: &[majit_ir::Type],
@@ -19862,56 +19886,50 @@ impl<M: Clone> MetaInterp<M> {
     ) -> bool {
         // `rebuild_from_resumedata`: `jitcode = staticdata.jitcodes[jitcode_pos]`,
         // then `newframe(jitcode)` and `setup_resume_at_op(pc)`. Each section
-        // carries its own jitcode; the portal jitcode is only the empty-stack
-        // stand-in `initialize_state_from_start` uses.
+        // carries its own jitcode.
         self.portal_call_depth = -1;
         self.framestack = crate::pyjitpl::MIFrameStack::empty();
         self.call_ids.clear();
         self.current_call_id = 0;
         let jitcodes = std::sync::Arc::clone(&self.staticdata);
-        if frames.is_empty() {
-            let _ = self.newframe(mainjitcode, None);
-        } else {
-            for (section_i, section) in frames.iter().enumerate() {
-                // resume.py `rebuild_from_resumedata`:
-                // `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
-                // The caller's materialized body for this section is that
-                // jitcode (`frame_value_count_at` counts boxes on it; a
-                // skeleton at the same index decodes no `-live-`). Without
-                // one, a missing index is an indexing error; do not
-                // substitute `mainjitcode`.
-                let jitcode = match materialized.get(section_i).and_then(|slot| slot.clone()) {
-                    Some(jitcode) => jitcode,
-                    None => {
-                        let pos = usize::try_from(section.jitcode_index).unwrap_or_else(|_| {
-                            panic!(
-                                "rebuild_from_resumedata: jitcodes[{}] index error",
-                                section.jitcode_index
-                            )
-                        });
-                        jitcodes.jitcodes.get(pos).cloned().unwrap_or_else(|| {
-                            panic!(
-                                "rebuild_from_resumedata: jitcodes[{pos}] index error (len {})",
-                                jitcodes.jitcodes.len()
-                            )
-                        })
-                    }
-                };
-                // resume.py `read_jitcode_pos_pc` stores `frame.pc`.
-                // `capture_resumedata` leaves that pc alone when `resumepc < 0`,
-                // so the stored word is never negative. Pyre can still put
-                // `NO_JITCODE_PC` (-1) here. That is not a jitcode position:
-                // `resolve_jitcode` declines `pc < 0`, and this rebuild reports
-                // the same failure (`false` → caller aborts to blackhole)
-                // instead of seating a pc-0 frame and returning success.
-                let Ok(pc) = usize::try_from(section.pc) else {
-                    return false;
-                };
-                let frame_index = self.newframe(jitcode, None);
-                if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
-                    // resume.py `MIFrame.setup_resume_at_op`.
-                    frame.setup_resume_at_op(pc);
+        for (section_i, section) in frames.iter().enumerate() {
+            // resume.py `rebuild_from_resumedata`:
+            // `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
+            // The caller's materialized body for this section is that
+            // jitcode (`frame_value_count_at` counts boxes on it; a
+            // skeleton at the same index decodes no `-live-`). Without
+            // one, a missing index is an indexing error.
+            let jitcode = match materialized.get(section_i).and_then(|slot| slot.clone()) {
+                Some(jitcode) => jitcode,
+                None => {
+                    let pos = usize::try_from(section.jitcode_index).unwrap_or_else(|_| {
+                        panic!(
+                            "rebuild_from_resumedata: jitcodes[{}] index error",
+                            section.jitcode_index
+                        )
+                    });
+                    jitcodes.jitcodes.get(pos).cloned().unwrap_or_else(|| {
+                        panic!(
+                            "rebuild_from_resumedata: jitcodes[{pos}] index error (len {})",
+                            jitcodes.jitcodes.len()
+                        )
+                    })
                 }
+            };
+            // resume.py `read_jitcode_pos_pc` stores `frame.pc`.
+            // `capture_resumedata` leaves that pc alone when `resumepc < 0`,
+            // so the stored word is never negative. Pyre can still put
+            // `NO_JITCODE_PC` (-1) here. That is not a jitcode position:
+            // `resolve_jitcode` declines `pc < 0`, and this rebuild reports
+            // the same failure (`false` → caller aborts to blackhole)
+            // instead of seating a pc-0 frame and returning success.
+            let Ok(pc) = usize::try_from(section.pc) else {
+                return false;
+            };
+            let frame_index = self.newframe(jitcode, None);
+            if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
+                // resume.py `MIFrame.setup_resume_at_op`.
+                frame.setup_resume_at_op(pc);
             }
         }
         // resume.py `rebuild_from_resumedata`: `newframe` +
@@ -24513,7 +24531,6 @@ mod portal_resume_rebuild_tests {
         install(&mut meta, jitcode.clone());
         let frames = [section(majit_ir::resumedata::NO_JITCODE_PC, vec![])];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24531,14 +24548,12 @@ mod portal_resume_rebuild_tests {
     fn missing_jitcode_index_panics() {
         let _lock = lock_rebuild();
         let mut meta = MetaInterp::<()>::new(0);
-        let jitcode = rvmprof_jitcode();
         let frames = [RebuiltFrame {
             jitcode_index: 5,
             pc: 0,
             values: vec![],
         }];
         let _ = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24577,7 +24592,6 @@ mod portal_resume_rebuild_tests {
             ],
         )];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24618,7 +24632,6 @@ mod portal_resume_rebuild_tests {
             ],
         )];
         assert!(meta.rebuild_portal_framestack_from_resumedata(
-            jitcode.clone(),
             &frames,
             &[],
             &[],
@@ -24630,7 +24643,6 @@ mod portal_resume_rebuild_tests {
         assert_eq!(meta.framestack.frames[0].pc, 0);
         meta.framestack.frames[0].pc = 99;
         assert!(meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24655,7 +24667,6 @@ mod portal_resume_rebuild_tests {
         ];
         let frames = [section(0, two.clone()), section(3, two)];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24709,7 +24720,6 @@ mod portal_resume_rebuild_tests {
             ),
         ];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24761,7 +24771,6 @@ mod portal_resume_rebuild_tests {
 
         let frames = [section(0, vec![RebuiltValue::Virtual(0)])];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24864,7 +24873,6 @@ mod portal_resume_rebuild_tests {
         ];
         let materialized = vec![Some(rvmprof.clone()), Some(refs.clone())];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
-            rvmprof,
             &frames,
             &[],
             &[],
@@ -24952,7 +24960,6 @@ mod portal_resume_rebuild_tests {
         meta.tracing = Some(tracing);
         let frames = [section(0, vec![RebuiltValue::Virtual(0)])];
         let ok = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -24983,7 +24990,6 @@ mod portal_resume_rebuild_tests {
             ],
         )];
         let _ = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],
@@ -25017,7 +25023,6 @@ mod portal_resume_rebuild_tests {
             vec![RebuiltValue::Const(majit_ir::Const::Int(1))],
         )];
         let _ = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
             &frames,
             &[],
             &[],

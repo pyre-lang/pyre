@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use majit_ir::{OpCode, OpRef, Type, Value};
+use majit_ir::{GreenKey, OpCode, OpRef, Type, Value};
 use smallvec::SmallVec;
 
 use super::{MIFrame, MIFrameStack};
@@ -3021,6 +3021,9 @@ where
             // ENTER_PORTAL_FRAME unwinds through here, so record the matching
             // LEAVE_PORTAL_FRAME just as the normal-return pop does.
             if frame.portal_entered {
+                // pyjitpl.py `popframe`: `portal_call_depth -= 1` then
+                // `leave_portal_frame` when `jitcode.jitdriver_sd`.
+                ctx.adjust_portal_call_depth(-1);
                 let jd_box = ctx.const_int(frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
                 if frame.portal_trace_logged {
@@ -3695,10 +3698,15 @@ where
             let mut portal_frame = self.frames.take_frame(portal, green_pc, None, Some(ctx));
             portal_frame.code_cursor = green_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
-            // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id).
-            // rvmprof.get_unique_id is 0 when the code class is unregistered.
+            // pyjitpl.py `MetaInterp.newframe`: `portal_call_depth += 1`, then
+            // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
+            // and `enter_portal_frame(jd_no, unique_id)`.
+            ctx.adjust_portal_call_depth(1);
+            let greenkey: crate::pyjitpl::PortalGreenKey =
+                (green_pc as u64, Some(GreenKey::new(green_values.clone())));
+            let unique_id = ctx.unique_id_for_greenkey(jd_index, &greenkey);
             let jd_box = ctx.const_int(jd_index as i64);
-            let uid_box = ctx.const_int(0);
+            let uid_box = ctx.const_int(unique_id as i64);
             ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
             // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME and the
             // `portal_trace_positions` append sit on adjacent lines.
@@ -4222,6 +4230,9 @@ where
             // BC_INLINE_CALL frames (inline_frame=true, portal_entered=false)
             // recorded no ENTER and record no LEAVE.
             if finished_frame.portal_entered {
+                // pyjitpl.py `popframe`: `portal_call_depth -= 1` then
+                // `leave_portal_frame` when `jitcode.jitdriver_sd`.
+                ctx.adjust_portal_call_depth(-1);
                 let jd_box = ctx.const_int(finished_frame.portal_jd as i64);
                 ctx.record_op(OpCode::LeavePortalFrame, &[jd_box]);
                 if finished_frame.portal_trace_logged {
@@ -6809,10 +6820,9 @@ mod tests {
     }
 
     /// pyjitpl.py `MIFrame.opimpl_jit_merge_point`: `redboxes` become the
-    /// loop-header live state only at `portal_call_depth == 0`. This walker
-    /// uses `inline_depth()` for that test. A merge point reached inside an
-    /// inlined portal must leave `last_mp_red_*` / `portal_red_regs_*` as
-    /// the root merge point set them.
+    /// loop-header live state only at `portal_call_depth == 0`. A merge point
+    /// reached inside an inlined portal must leave `last_mp_red_*` /
+    /// `portal_red_regs_*` as the root merge point set them.
     #[test]
     fn merge_point_at_inline_depth_leaves_root_last_mp_reds() {
         let mut staticdata = crate::MetaInterpStaticData::new();
@@ -6835,6 +6845,9 @@ mod tests {
             0,
             std::sync::Arc::new(staticdata),
         );
+        let portal_depth = std::rc::Rc::new(std::cell::Cell::new(0i32));
+        let portal_depth_fn = portal_depth.clone();
+        ctx.portal_call_depth_fn = Some(Box::new(move || portal_depth_fn.get()));
         let mut stack = MIFrameStack::empty();
         stack.frames.push(MIFrame::new(root, 0));
         let mut machine = portal_red_snapshot_machine(&mut stack);
@@ -6856,7 +6869,8 @@ mod tests {
         assert!(machine.last_mp_red_f.is_empty());
 
         assert!(ctx.push_inline_frame((0, 0), u32::MAX));
-        assert!(ctx.inline_depth() > 0);
+        portal_depth.set(1);
+        assert!(ctx.portal_call_depth() > 0);
         machine.frames.frames.push(MIFrame::new(callee, 0));
         assert!(matches!(
             machine.execute_one_instruction(&mut ctx, &mut sym, &runtime),
@@ -7819,7 +7833,7 @@ mod tests {
     /// then a deferred leave_portal_frame, then ChangeFrame resumes the caller.
     ///
     /// The fixture merges the two existing recursive-portal fixtures: it BOTH
-    /// inlines the portal (so `inline_depth() > 0` and the callee reaches a
+    /// inlines the portal (so `portal_call_depth > 0` and the callee reaches a
     /// merge point at depth > 0) AND resolves a CALL_ASSEMBLER target so the
     /// cut can record the recursion.  The recorded op stream must be
     /// `[ENTER_PORTAL_FRAME … CALL_ASSEMBLER, GUARD_NOT_FORCED,
@@ -7914,6 +7928,14 @@ mod tests {
 
         let recorder = crate::recorder::Trace::new();
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
+        let portal_depth = std::rc::Rc::new(std::cell::Cell::new(0i32));
+        {
+            let portal_depth = portal_depth.clone();
+            ctx.portal_call_depth_fn = Some(Box::new(move || portal_depth.get()));
+        }
+        ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta| {
+            portal_depth.set(portal_depth.get() + delta);
+        }));
         let mut sym = RecursiveFreshSym;
         let runtime = RecursivePortalMergePointRuntime {
             portal: portal.clone(),

@@ -4952,7 +4952,6 @@ fn trace_bridge_via_interpret(
         let liveness = meta.staticdata.liveness_info.snapshot_arc();
         let op_live = meta.staticdata.op_live as u8;
         meta.rebuild_portal_framestack_from_resumedata(
-            mainjitcode.clone(),
             &resume_result.frames,
             raw_values,
             &retrace.fail_types,
