@@ -36,7 +36,7 @@ packaging, which the os gates make irrelevant to the default).
 
 ## The header
 
-`include/pyre3.14t/` is what an extension compiles against.
+`include/pyre3.15t/` is what an extension compiles against.
 An extension includes `Python.h`; that file is only the include list, and the
 content is split by topic the way `pypy/module/cpyext/include` and CPython's
 own `Include` are -- `object.h`, `longobject.h`, `modsupport.h`, and so on, one
@@ -205,7 +205,7 @@ header declaring it wrongly.
   fifth argument, the fourth being the Windows code that is 0 here. The
   `const char *` filename spelling reads the code before decoding the path,
   the decode being a call that can overwrite it;
-- the audit events (`cpyext/sysmodule.rs`, `include/pyre3.14t/audit.h`):
+- the audit events (`cpyext/sysmodule.rs`, `include/pyre3.15t/audit.h`):
   `PySys_AuditTuple` and the variadic `PySys_Audit` over it, which reach the
   same hooks `sys.addaudithook` installs. A hook is Python code, so a raise
   is what the `-1` reports;
@@ -213,7 +213,7 @@ header declaring it wrongly.
   (`cpyext/import_.rs`), the import-then-`getattr` pair a C caller reaching
   into Python uses;
 - the locks an extension holds while it works (`cpyext/lock.rs`,
-  `include/pyre3.14t/lock.h`, `include/pyre3.14t/pythread.h`): the one-byte
+  `include/pyre3.15t/lock.h`, `include/pyre3.15t/pythread.h`): the one-byte
   `PyMutex` the caller embeds, whose uncontended take and release are the
   header's own compare-exchange and whose contended halves are exported; and
   the allocated `PyThread_type_lock` with `PyThread_acquire_lock` /
@@ -664,7 +664,7 @@ CPython-backed strategy for exactly this (`cpyext/listobject.py`
 `get_list_storage`); pyre has no such strategy, so there is no array to point
 at.
 
-The public suffix uses `pyre314`, not `cpython-314`: accepting a CPython-tagged
+The public suffix uses `pyre315`, not `cpython-315`: accepting a CPython-tagged
 binary would falsely claim that CPython's private object layouts and symbols
 are ABI-compatible with pyre.
 

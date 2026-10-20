@@ -1582,7 +1582,7 @@ pub(super) fn ensure_linked() {
 #[cfg(test)]
 mod tests {
     /// A request word is one thing two places spell: an extension compiled
-    /// against `include/pyre3.14t/object.h` builds it, and this file reads it.
+    /// against `include/pyre3.15t/object.h` builds it, and this file reads it.
     /// Nothing tied the two together -- upstream has no such pair, because
     /// `api.py` reads each value out of the real header with
     /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
@@ -1595,7 +1595,7 @@ mod tests {
     fn every_buffer_flag_is_the_bit_the_header_gives_it() {
         use bitflags::Flags as _;
 
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/object.h");
 
         let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
         let lookup = |known: &Vec<(&str, std::ffi::c_int)>, name: &str| {

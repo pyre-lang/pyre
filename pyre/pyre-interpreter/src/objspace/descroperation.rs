@@ -6723,6 +6723,7 @@ pub(crate) fn unionable(obj: PyObjectRef) -> bool {
             || is_type(obj)
             || pyre_object::is_union(obj)
             || pyre_object::is_generic_alias(obj)
+            || pyre_object::is_sentinel(obj)
     }
 }
 
@@ -7200,8 +7201,8 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
         // restrict to those ops; other ops fall through to the dunder
         // dispatch which currently raises TypeError, matching the
         // unimplemented `__lt__` etc. on plain dict.
-        if is_exact_type(a, &pyre_object::DICT_TYPE)
-            && is_exact_type(b, &pyre_object::DICT_TYPE)
+        if is_exact_any_dict(a)
+            && is_exact_any_dict(b)
             && matches!(op, CompareOp::Eq | CompareOp::Ne)
         {
             // `w_dict_lookup_checked` hashes `k` through its `__hash__` and

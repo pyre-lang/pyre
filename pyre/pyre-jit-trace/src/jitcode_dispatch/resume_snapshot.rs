@@ -1636,7 +1636,8 @@ fn caller_operand_slots<Sym: WalkSym>(
         // `stack_effects`), not an input. Counting it named the local below
         // the owner, and `collect_call_stack_overrides` declined
         // (`CallStack::ProofSlotUnresolved`) on `Attrs.cm(i)`.
-        pyre_interpreter::Instruction::GetIter | pyre_interpreter::Instruction::ForIter { .. } => 1,
+        pyre_interpreter::Instruction::GetIter { .. } => 1,
+        pyre_interpreter::Instruction::ForIter { .. } => 2,
         pyre_interpreter::Instruction::LoadAttr { .. } => 1,
         // `[value]`. `opcode_pop_jump_if` pops that one value and then calls
         // `truth_value`. `stack_end` is the depth on entry, so the value is

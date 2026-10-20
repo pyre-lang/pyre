@@ -4817,6 +4817,21 @@ impl TraceCtx {
         Some(prev)
     }
 
+    /// Mark flat slot `index` as holding a live NULL Ref rather than an
+    /// unwritten word. A bridge rebuilds its shadow from resume data, where
+    /// `resume.py` `decode_box` turns a `NULLREF` tagged slot into
+    /// `CONST_NULL`: a real box of the restored frame, the same as a NULL the
+    /// trace itself stored.
+    pub fn mark_virtualizable_slot_live_null(&mut self, index: usize) {
+        if let Some(slot) = self
+            .virtualizable_live_null_slots
+            .as_mut()
+            .and_then(|slots| slots.get_mut(index))
+        {
+            *slot = true;
+        }
+    }
+
     /// Whether the last executed store into flat slot `index` wrote a live NULL Ref.
     pub fn virtualizable_slot_stored_live_null(&self, index: usize) -> bool {
         self.virtualizable_live_null_slots

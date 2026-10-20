@@ -39,12 +39,22 @@ impl DeferredPercentError {
             }
             Self::IncompleteMappingKey(error) => error,
         };
-        Err(PyError::value_error(error.to_string()))
+        Err(PyError::value_error(percent_error_message(error)))
     }
 }
 
 fn is_format_char(codepoint: CodePoint, expected: char) -> bool {
     codepoint.to_u32() == expected as u32
+}
+
+/// rustpython-common renamed `IncompleteFormat` to `StrayModulo` and its
+/// Display to `stray % at position N`.  The 3.14 message is still
+/// `incomplete format` (`formatting.py`).
+fn percent_error_message(error: CFormatError) -> String {
+    match error.typ {
+        CFormatErrorType::StrayModulo => "incomplete format".to_string(),
+        _ => error.to_string(),
+    }
 }
 
 fn wtf8_prefix(fmt: &Wtf8, codepoints: usize) -> Wtf8Buf {
@@ -62,6 +72,8 @@ fn wtf8_acquisition_prefix(
     include_precision_star: bool,
 ) -> Wtf8Buf {
     let codepoints: Vec<_> = fmt.code_points().collect();
+    // rustpython-common reports `StrayModulo` at the `%` itself
+    // (`CFormatStrOrBytes::parse` remaps that type onto the `%` index).
     let spec_start = (0..search_end)
         .filter(|&index| is_format_char(codepoints[index], '%'))
         .rfind(|&index| {
@@ -69,9 +81,9 @@ fn wtf8_acquisition_prefix(
             matches!(
                 CFormatWtf8::parse_from_wtf8(&prefix),
                 Err(CFormatError {
-                    typ: CFormatErrorType::IncompleteFormat,
+                    typ: CFormatErrorType::StrayModulo,
                     index: error_index,
-                }) if error_index == index + 1
+                }) if error_index == index
             )
         })
         .expect("a width or precision error belongs to a conversion spec");
@@ -146,9 +158,9 @@ fn bytes_acquisition_prefix(
             matches!(
                 CFormatBytes::parse_from_bytes(&fmt[..=index]),
                 Err(CFormatError {
-                    typ: CFormatErrorType::IncompleteFormat,
+                    typ: CFormatErrorType::StrayModulo,
                     index: error_index,
-                }) if error_index == index + 1
+                }) if error_index == index
             )
         })
         .expect("a width or precision error belongs to a conversion spec");
@@ -223,7 +235,7 @@ fn parse_wtf8_incremental(
                 .expect("the acquisition prefix of a deferred quantity error must parse");
                 return Ok((recovered, Some(DeferredPercentError::Quantity(error))));
             }
-            if matches!(error.typ, CFormatErrorType::IncompleteFormat) {
+            if matches!(error.typ, CFormatErrorType::StrayModulo) {
                 let recovered = CFormatWtf8::parse_from_wtf8(&wtf8_acquisition_prefix(
                     fmt,
                     error,
@@ -234,7 +246,7 @@ fn parse_wtf8_incremental(
                 return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
             if !matches!(error.typ, CFormatErrorType::UnmatchedKeyParentheses) {
-                return Err(PyError::value_error(error.to_string()));
+                return Err(PyError::value_error(percent_error_message(error)));
             }
             let prefix_len = error
                 .index
@@ -270,7 +282,7 @@ fn parse_bytes_incremental(
                 .expect("the acquisition prefix of a deferred quantity error must parse");
                 return Ok((recovered, Some(DeferredPercentError::Quantity(error))));
             }
-            if matches!(error.typ, CFormatErrorType::IncompleteFormat) {
+            if matches!(error.typ, CFormatErrorType::StrayModulo) {
                 let recovered = CFormatBytes::parse_from_bytes(&bytes_acquisition_prefix(
                     fmt,
                     error,
@@ -281,7 +293,7 @@ fn parse_bytes_incremental(
                 return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
             if !matches!(error.typ, CFormatErrorType::UnmatchedKeyParentheses) {
-                return Err(PyError::value_error(error.to_string()));
+                return Err(PyError::value_error(percent_error_message(error)));
             }
             let prefix_len = error
                 .index
@@ -385,7 +397,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     if let Some(error) =
                         current_deferred.and_then(DeferredPercentError::before_conversion)
                     {
-                        return Err(PyError::value_error(error.to_string()));
+                        return Err(PyError::value_error(percent_error_message(error)));
                     }
                     pyre_object::gc_roots::shadow_stack_get(value_slot)
                 } else {
@@ -398,7 +410,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     if let Some(error) =
                         current_deferred.and_then(DeferredPercentError::before_conversion)
                     {
-                        return Err(PyError::value_error(error.to_string()));
+                        return Err(PyError::value_error(percent_error_message(error)));
                     }
                     let Some(v) = pos.next() else {
                         return Err(PyError::type_error(
@@ -547,7 +559,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                     if let Some(error) =
                         current_deferred.and_then(DeferredPercentError::before_conversion)
                     {
-                        return Err(PyError::value_error(error.to_string()));
+                        return Err(PyError::value_error(percent_error_message(error)));
                     }
                     result.extend(spec_format_bytes(
                         &spec,
@@ -589,7 +601,7 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                 if let Some(error) =
                     current_deferred.and_then(DeferredPercentError::before_conversion)
                 {
-                    return Err(PyError::value_error(error.to_string()));
+                    return Err(PyError::value_error(percent_error_message(error)));
                 }
                 let Some(value) = pos.next() else {
                     return Err(PyError::type_error(

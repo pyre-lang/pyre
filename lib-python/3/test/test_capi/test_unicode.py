@@ -842,15 +842,17 @@ class CAPITest(unittest.TestCase):
         if SIZEOF_WCHAR_T == 2:
             self.assertEqual(fromwidechar('a\U0001f600'.encode(encoding), 2), 'a\ud83d')
 
-        self.assertRaises(MemoryError, fromwidechar, b'', PY_SSIZE_T_MAX)
         self.assertRaises(SystemError, fromwidechar, b'\0'*SIZEOF_WCHAR_T, -2)
-        self.assertRaises(SystemError, fromwidechar, b'\0'*SIZEOF_WCHAR_T, PY_SSIZE_T_MIN)
         self.assertEqual(fromwidechar(NULL, 0), '')
         self.assertRaises(SystemError, fromwidechar, NULL, 1)
         self.assertRaises(SystemError, fromwidechar, NULL, PY_SSIZE_T_MAX)
         self.assertRaises(SystemError, fromwidechar, NULL, -1)
         self.assertRaises(SystemError, fromwidechar, NULL, -2)
         self.assertRaises(SystemError, fromwidechar, NULL, PY_SSIZE_T_MIN)
+
+        # The following tests are skipped since they rely on undefined behavior
+        #self.assertRaises(MemoryError, fromwidechar, b'', PY_SSIZE_T_MAX)
+        #self.assertRaises(SystemError, fromwidechar, b'\0'*SIZEOF_WCHAR_T, PY_SSIZE_T_MIN)
 
     @support.cpython_only
     @unittest.skipIf(_testlimitedcapi is None, 'need _testlimitedcapi module')
@@ -1738,6 +1740,20 @@ class CAPITest(unittest.TestCase):
                 self.assertEqual(getargs_s_hash(s), chr(k).encode() * (i + 1))
                 # Check that the second call returns the same result
                 self.assertEqual(getargs_s_hash(s), chr(k).encode() * (i + 1))
+
+    @support.cpython_only
+    @unittest.skipIf(_testcapi is None, 'need _testcapi module')
+    def test_GET_CACHED_HASH(self):
+        from _testcapi import unicode_GET_CACHED_HASH
+        content_bytes = b'some new string'
+        # avoid parser interning & constant folding
+        obj = str(content_bytes, 'ascii')
+        # impl detail: fresh strings do not have cached hash
+        self.assertEqual(unicode_GET_CACHED_HASH(obj), -1)
+        # impl detail: adding string to a dict caches its hash
+        {obj: obj}
+        # impl detail: ASCII string hashes are equal to bytes ones
+        self.assertEqual(unicode_GET_CACHED_HASH(obj), hash(content_bytes))
 
 
 class PyUnicodeWriterTest(unittest.TestCase):

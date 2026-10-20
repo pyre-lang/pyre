@@ -790,20 +790,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     pyre_interpreter::__pyre_put_new!(ns_slot, "VSUSP", pyre_object::w_int_new(libc::VSUSP as i64));
     pyre_interpreter::__pyre_put_new!(ns_slot, "VTIME", pyre_object::w_int_new(libc::VTIME as i64));
 
+    macro_rules! tc {
+        ($name:literal, $val:expr) => {
+            pyre_interpreter::__pyre_put_new!(ns_slot, $name, pyre_object::w_int_new($val as i64));
+        };
+    }
+
     // Darwin names these beside the portable set. Most are `libc`
     // constants; the rest are the values `<sys/termios.h>`,
     // `<sys/ttydefaults.h>`, and `<sys/ttycom.h>` give.
     #[cfg(target_vendor = "apple")]
     {
-        macro_rules! tc {
-            ($name:literal, $val:expr) => {
-                pyre_interpreter::__pyre_put_new!(
-                    ns_slot,
-                    $name,
-                    pyre_object::w_int_new($val as i64)
-                );
-            };
-        }
         // `c_iflag` bits.
         tc!("IMAXBEL", libc::IMAXBEL);
         tc!("IUTF8", libc::IUTF8);
@@ -957,6 +954,151 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // `0xff` on the BSDs and `'\0'` on linux, so it is answered here
         // rather than beside the `V*` indices above.
         tc!("_POSIX_VDISABLE", libc::_POSIX_VDISABLE);
+    }
+
+    // Linux names from `rtermios.CONSTANT_NAMES` that the portable set
+    // above does not already store.  Only `libc` symbols defined for
+    // glibc on both x86_64 and aarch64 are registered.
+    #[cfg(target_os = "linux")]
+    {
+        // Baud rates.
+        tc!("B460800", libc::B460800);
+        tc!("CBAUDEX", libc::CBAUDEX);
+        tc!("EXTA", libc::EXTA);
+        tc!("EXTB", libc::EXTB);
+
+        // `c_iflag` bits.
+        tc!("IUCLC", libc::IUCLC);
+        tc!("IMAXBEL", libc::IMAXBEL);
+
+        // `c_oflag` bits and the delay masks they select with.
+        tc!("OLCUC", libc::OLCUC);
+        tc!("OFILL", libc::OFILL);
+        tc!("OFDEL", libc::OFDEL);
+        tc!("NLDLY", libc::NLDLY);
+        tc!("CRDLY", libc::CRDLY);
+        tc!("TABDLY", libc::TABDLY);
+        tc!("BSDLY", libc::BSDLY);
+        tc!("VTDLY", libc::VTDLY);
+        tc!("FFDLY", libc::FFDLY);
+
+        // Delay values.
+        tc!("NL0", libc::NL0);
+        tc!("NL1", libc::NL1);
+        tc!("CR0", libc::CR0);
+        tc!("CR1", libc::CR1);
+        tc!("CR2", libc::CR2);
+        tc!("CR3", libc::CR3);
+        tc!("TAB0", libc::TAB0);
+        tc!("TAB1", libc::TAB1);
+        tc!("TAB2", libc::TAB2);
+        tc!("TAB3", libc::TAB3);
+        tc!("XTABS", libc::XTABS);
+        tc!("BS0", libc::BS0);
+        tc!("BS1", libc::BS1);
+        tc!("VT0", libc::VT0);
+        tc!("VT1", libc::VT1);
+        tc!("FF0", libc::FF0);
+        tc!("FF1", libc::FF1);
+
+        // `c_cflag` bits.
+        tc!("CIBAUD", libc::CIBAUD);
+        tc!("CRTSCTS", libc::CRTSCTS);
+        tc!("CBAUD", libc::CBAUD);
+        tc!("IBSHIFT", libc::IBSHIFT);
+
+        // `c_lflag` bits.
+        tc!("XCASE", libc::XCASE);
+        tc!("ECHOCTL", libc::ECHOCTL);
+        tc!("ECHOPRT", libc::ECHOPRT);
+        tc!("ECHOKE", libc::ECHOKE);
+        tc!("FLUSHO", libc::FLUSHO);
+        tc!("PENDIN", libc::PENDIN);
+
+        // `c_cc` length and the indices beyond the portable set.
+        // `rtermios` copies `VSWTC` onto `VSWTCH` (and vice versa) when
+        // the platform defines only one of them.
+        tc!("NCCS", libc::NCCS);
+        tc!("VSWTC", libc::VSWTC);
+        tc!("VSWTCH", libc::VSWTC);
+        tc!("VREPRINT", libc::VREPRINT);
+        tc!("VDISCARD", libc::VDISCARD);
+        tc!("VWERASE", libc::VWERASE);
+        tc!("VLNEXT", libc::VLNEXT);
+        tc!("VEOL2", libc::VEOL2);
+
+        // File ioctls published beside the terminal ones.
+        tc!("FIOASYNC", libc::FIOASYNC);
+        tc!("FIOCLEX", libc::FIOCLEX);
+        tc!("FIONBIO", libc::FIONBIO);
+        tc!("FIONCLEX", libc::FIONCLEX);
+        tc!("FIONREAD", libc::FIONREAD);
+
+        // termios ioctls.
+        tc!("TCFLSH", libc::TCFLSH);
+        tc!("TCGETA", libc::TCGETA);
+        tc!("TCGETS", libc::TCGETS);
+        tc!("TCSBRK", libc::TCSBRK);
+        tc!("TCSBRKP", libc::TCSBRKP);
+        tc!("TCSETA", libc::TCSETA);
+        tc!("TCSETAF", libc::TCSETAF);
+        tc!("TCSETAW", libc::TCSETAW);
+        tc!("TCSETS", libc::TCSETS);
+        tc!("TCSETSF", libc::TCSETSF);
+        tc!("TCSETSW", libc::TCSETSW);
+        tc!("TCXONC", libc::TCXONC);
+
+        // Terminal ioctls.
+        tc!("TIOCCONS", libc::TIOCCONS);
+        tc!("TIOCEXCL", libc::TIOCEXCL);
+        tc!("TIOCGETD", libc::TIOCGETD);
+        tc!("TIOCGICOUNT", libc::TIOCGICOUNT);
+        tc!("TIOCGLCKTRMIOS", libc::TIOCGLCKTRMIOS);
+        tc!("TIOCGPGRP", libc::TIOCGPGRP);
+        tc!("TIOCGSERIAL", libc::TIOCGSERIAL);
+        tc!("TIOCGSOFTCAR", libc::TIOCGSOFTCAR);
+        tc!("TIOCGWINSZ", libc::TIOCGWINSZ);
+        tc!("TIOCINQ", libc::TIOCINQ);
+        tc!("TIOCLINUX", libc::TIOCLINUX);
+        tc!("TIOCMBIC", libc::TIOCMBIC);
+        tc!("TIOCMBIS", libc::TIOCMBIS);
+        tc!("TIOCMGET", libc::TIOCMGET);
+        tc!("TIOCMIWAIT", libc::TIOCMIWAIT);
+        tc!("TIOCMSET", libc::TIOCMSET);
+        tc!("TIOCNOTTY", libc::TIOCNOTTY);
+        tc!("TIOCNXCL", libc::TIOCNXCL);
+        tc!("TIOCOUTQ", libc::TIOCOUTQ);
+        tc!("TIOCPKT", libc::TIOCPKT);
+        tc!("TIOCSCTTY", libc::TIOCSCTTY);
+        tc!("TIOCSETD", libc::TIOCSETD);
+        tc!("TIOCSLCKTRMIOS", libc::TIOCSLCKTRMIOS);
+        tc!("TIOCSPGRP", libc::TIOCSPGRP);
+        tc!("TIOCSTI", libc::TIOCSTI);
+        tc!("TIOCSWINSZ", libc::TIOCSWINSZ);
+
+        // Modem-line bits for `TIOCMGET` / `TIOCMSET`.
+        tc!("TIOCM_LE", libc::TIOCM_LE);
+        tc!("TIOCM_DTR", libc::TIOCM_DTR);
+        tc!("TIOCM_RTS", libc::TIOCM_RTS);
+        tc!("TIOCM_ST", libc::TIOCM_ST);
+        tc!("TIOCM_SR", libc::TIOCM_SR);
+        tc!("TIOCM_CTS", libc::TIOCM_CTS);
+        tc!("TIOCM_CAR", libc::TIOCM_CAR);
+        tc!("TIOCM_CD", libc::TIOCM_CD);
+        tc!("TIOCM_RNG", libc::TIOCM_RNG);
+        tc!("TIOCM_RI", libc::TIOCM_RI);
+        tc!("TIOCM_DSR", libc::TIOCM_DSR);
+
+        // Serial ioctls.
+        tc!("TIOCSERCONFIG", libc::TIOCSERCONFIG);
+        tc!("TIOCSERGETLSR", libc::TIOCSERGETLSR);
+        tc!("TIOCSERGETMULTI", libc::TIOCSERGETMULTI);
+        tc!("TIOCSERGSTRUCT", libc::TIOCSERGSTRUCT);
+        tc!("TIOCSERGWILD", libc::TIOCSERGWILD);
+        tc!("TIOCSERSETMULTI", libc::TIOCSERSETMULTI);
+        tc!("TIOCSERSWILD", libc::TIOCSERSWILD);
+        tc!("TIOCSSERIAL", libc::TIOCSSERIAL);
+        tc!("TIOCSSOFTCAR", libc::TIOCSSOFTCAR);
     }
 
     // `interp_termios.py Cache.__init__`:

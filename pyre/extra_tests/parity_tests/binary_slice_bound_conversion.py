@@ -1,3 +1,4 @@
+# pyre-check: pypy-diverges: 3.15 `_PyEval_SliceIndex` dropped "or None"; pypy 3.11 still emits it
 # CPython-suite gap: bound conversion (int subclass, bigint clamp, rewritten
 # TypeError) and lock-free conversion vs the copy stripe are not in the suite.
 # parity-tests reason: `_eval_slice_index` is `space.getindex_w`; the list copy
@@ -39,7 +40,7 @@ def expect_typeerror(fn):
         fn()
     except TypeError as exc:
         assert str(exc) == (
-            "slice indices must be integers or None or have an __index__ method"
+            "slice indices must be integers or have an __index__ method"
         )
         return
     raise AssertionError("expected TypeError")

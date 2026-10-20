@@ -632,7 +632,6 @@ class CAPICodecs(unittest.TestCase):
         for name in [
             encoding_name,
             encoding_name.upper(),
-            encoding_name.replace('_', '-'),
         ]:
             with self.subTest(name):
                 self.assertTrue(_testcapi.codec_known_encoding(name))

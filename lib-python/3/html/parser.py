@@ -157,9 +157,6 @@ class HTMLParser(_markupbase.ParserBase):
         self.cdata_elem = None
         self._support_cdata = True
         self._escapable = True
-        # HTMLParser.feed: join pending chunks only once the unparsed
-        # buffer has doubled, so an unterminated construct is not
-        # concatenated and rescanned on every call.
         self._pending = []
         self._pending_len = 0
         self._parse_threshold = 1

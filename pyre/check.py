@@ -26,19 +26,19 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 EXE = ".exe" if sys.platform == "win32" else ""
-# pyre's compat target is CPython 3.14; its native modules (`_sre.MAGIC`) and the
+# pyre's compat target is CPython 3.15; its native modules (`_sre.MAGIC`) and the
 # vendored `lib-python/3` are coupled to that version. Take a version-matched
 # oracle or none at all: a stale `python3` on PATH (an older system CPython)
 # diverges from pypy on version-sensitive error text and trips a spurious
 # cpython-vs-pypy baseline mismatch, and its timings gate the ratios.
-CPYTHON_TARGET = (3, 14)
+CPYTHON_TARGET = (3, 15)
 
 
 def _probe_interpreter(command):
     """What the interpreter reports as its version and its own path.
 
     `None` when the command did not run at all, which on Windows is what a
-    `python3.14` naming an extensionless shim rather than an executable does —
+    `python3.15` naming an extensionless shim rather than an executable does —
     `shutil.which` finds it and `CreateProcess` cannot start it.
     """
     probe = "import sys; print(sys.version_info[0], sys.version_info[1]); print(sys.executable)"
@@ -67,7 +67,7 @@ def _resolve_python3():
     spawns it, and the timed runs hand the child a curated one.
     """
     named = os.environ.get("PYRE_CHECK_PYTHON3")
-    candidates = [named] if named else ["python3.14", "python3", "python"]
+    candidates = [named] if named else ["python3.15", "python3", "python"]
     rejected = []
     for candidate in candidates:
         if named is None and shutil.which(candidate) is None:
@@ -96,7 +96,7 @@ def python3():
     """The oracle interpreter, resolved once and remembered.
 
     Resolved on first use rather than at import, because `_resolve_python3`
-    exits the process when no CPython 3.14 is on PATH -- and `--check-headers`
+    exits the process when no CPython 3.15 is on PATH -- and `--check-headers`
     reads fixture files, never runs an oracle, and runs on a job that has no
     reason to carry one.
     """
@@ -1019,7 +1019,7 @@ def pyre_env():
     # earlier runs left on disk. Importing a module the cache already holds
     # unmarshals where importing it cold compiles, and that difference reaches
     # jit-stats the same way the ambient import loop above does: `import json,
-    # base64, textwrap` alone drops 30 `__pycache__/*.pyre314.pyc` files into
+    # base64, textwrap` alone drops 30 `__pycache__/*.pyre315.pyc` files into
     # the pinned stdlib, so the first run of a fresh checkout and every run
     # after it measure different work.
     #

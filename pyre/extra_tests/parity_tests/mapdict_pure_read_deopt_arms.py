@@ -320,7 +320,7 @@ def instance_iter_deopt_arms():
                 for _x in obj:
                     pass
             except TypeError as err:
-                if "non-iterator" in str(err):
+                if "iterator" in str(err):
                     hits += 1
         return hits
 

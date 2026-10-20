@@ -3115,7 +3115,7 @@ impl NamespaceOpcodeHandler for PyFrame {
     /// `space.getitem(w_locals, name)` directly per PyPy
     /// `pyopcode.py:LOAD_NAME` `space.finditem_str(w_locals, name)`.
     fn load_name_value(&mut self, name: &str, nameindex: usize) -> Result<Self::Value, PyError> {
-        let w_locals = self.get_w_locals();
+        let mut w_locals = self.get_w_locals();
         if !w_locals.is_null() {
             // At module scope `initialize_frame_scopes` binds `w_locals` to the
             // very same object as `w_globals`, so the locals probe here is a
@@ -3142,13 +3142,15 @@ impl NamespaceOpcodeHandler for PyFrame {
                 // namespace that cannot use the borrowed-key shortcut — a
                 // `dict` subclass, a non-dict mapping — wraps no key of its own
                 // per execution either.
-                if let Some(value) = crate::baseobjspace::finditem_str_named(
-                    w_locals,
-                    name,
-                    self.pycode as PyObjectRef,
-                    nameindex,
+                if let Some(value) = pyre_object::with_roots!(w_locals =>
+                    crate::baseobjspace::finditem_str_named(
+                        w_locals,
+                        name,
+                        self.pycode as PyObjectRef,
+                        nameindex,
+                    )
                 )? {
-                    return Ok(value);
+                    return crate::lazyimport::maybe_reify_str(value, name, w_locals);
                 }
                 // pyopcode.py:972 — a missing locals entry falls through to
                 // `LOAD_GLOBAL_cached`.
@@ -3274,7 +3276,7 @@ impl NamespaceOpcodeHandler for PyFrame {
             && let Some(value) =
                 unsafe { load_global_cache_hit(self.pycode as PyObjectRef, nameindex) }
         {
-            return Ok(value);
+            return crate::lazyimport::maybe_reify_str(value, name, w_globals);
         }
         let mut w_builtin = self.get_builtin();
         if use_cache {
@@ -3288,7 +3290,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                 ))
             }?;
             if let Some(value) = cache_hit {
-                return Ok(value);
+                return crate::lazyimport::maybe_reify_str(value, name, w_globals);
             }
         }
         // `_load_global_fallback` → `_load_global` (`pyopcode.py`):
@@ -3299,7 +3301,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // instead of being swallowed as a miss.  A cached miss lands here too
         // and finds nothing again before the `NameError`.
         if !w_globals.is_null()
-            && let Some(value) = pyre_object::with_roots!(w_builtin =>
+            && let Some(value) = pyre_object::with_roots!(w_builtin, w_globals =>
                 crate::baseobjspace::finditem_str_named(
                     w_globals,
                     name,
@@ -3308,15 +3310,17 @@ impl NamespaceOpcodeHandler for PyFrame {
                 )
             )?
         {
-            return Ok(value);
+            return crate::lazyimport::maybe_reify_str(value, name, w_globals);
         }
         // `self.get_builtin().getdictvalue(space, varname)`.
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
-            let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+            let mut w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
             if !w_dict.is_null()
-                && let Some(value) = crate::baseobjspace::finditem_str(w_dict, name)?
+                && let Some(value) = pyre_object::with_roots!(w_dict =>
+                    crate::baseobjspace::finditem_str(w_dict, name)
+                )?
             {
-                return Ok(value);
+                return crate::lazyimport::maybe_reify_str(value, name, w_dict);
             }
         }
         // `pyopcode.py _load_global_failed`: NameError.
@@ -4625,6 +4629,7 @@ impl OpcodeStepExecutor for PyFrame {
 
         self.pop_value()?;
         self.pop_value()?;
+        self.pop_value()?;
         let value =
             if !err.exc_object.is_null() && unsafe { pyre_object::is_exception(err.exc_object) } {
                 crate::baseobjspace::getattr_str(err.exc_object, "value")
@@ -4632,9 +4637,10 @@ impl OpcodeStepExecutor for PyFrame {
             } else {
                 pyre_object::w_none()
             };
-        // `(sub_iter, last_sent_val, exc_value -- none, value)`: the `END_SEND`
-        // this jumps back to pops the pair, as it does SEND's `receiver, value`.
+        // `(sub_iter, null_in, last_sent_val, exc -- none, null_out, value)`:
+        // END_SEND pops the result, the index-or-NULL slot, and the receiver.
         self.push(pyre_object::w_none());
+        self.push(pyre_object::PY_NULL);
         self.push(value);
         Ok(())
     }
@@ -5001,7 +5007,7 @@ impl OpcodeStepExecutor for PyFrame {
         self.call_module_helper("_typing", helper, &[arg1, arg2])
     }
 
-    fn import_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
+    fn import_name(&mut self, name: &str, nameindex: usize, flags: u32) -> Result<(), PyError> {
         // `pyopcode.py IMPORT_NAME`: the popped fromlist / level stay
         // livevars across `getname_w` and `__import__`.  `intern_str_value`
         // (the no-table fallback of `w_code_getname_w_or_new`) and the
@@ -5018,12 +5024,22 @@ impl OpcodeStepExecutor for PyFrame {
         };
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_modulename);
-        let w_obj = crate::importing::import_name(
-            self,
-            pyre_object::gc_roots::shadow_stack_get(name_slot),
-            pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
-            pyre_object::gc_roots::shadow_stack_get(flag_slot),
-        )?;
+        let w_obj = if flags & 2 == 0 {
+            crate::lazyimport::eval_lazy_import_name(
+                self,
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
+                pyre_object::gc_roots::shadow_stack_get(flag_slot),
+                flags & 1 != 0,
+            )?
+        } else {
+            crate::importing::import_name(
+                self,
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
+                pyre_object::gc_roots::shadow_stack_get(flag_slot),
+            )?
+        };
         Self::push_anchored(&anchor, w_obj)
     }
 
@@ -5032,7 +5048,11 @@ impl OpcodeStepExecutor for PyFrame {
     fn import_from(&mut self, name: &str) -> Result<(), PyError> {
         let module = self.peek();
         let anchor = FrameAnchor::new(self);
-        let attr = crate::importing::import_from(module, name)?;
+        let attr = if unsafe { is_lazy_import(module) } {
+            crate::lazyimport::lazy_import_from(module, name)?
+        } else {
+            crate::importing::import_from(module, name)?
+        };
         Self::push_anchored(&anchor, attr)
     }
 
@@ -5838,7 +5858,8 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn send_value(&mut self, target: usize) -> Result<(), PyError> {
         let value = self.pop();
-        let iter = self.peek();
+        // Iterator sits under the index-or-NULL slot GET_ITER pushed.
+        let iter = PyFrame::peek_at(self, 1);
         let anchor = FrameAnchor::new(self);
         // `next_yield_from` keeps the awaitable live across `send_ex` /
         // `space.next`; both run Python and relocate a nursery-born
@@ -5936,6 +5957,7 @@ impl OpcodeStepExecutor for PyFrame {
 
     fn end_send(&mut self) -> Result<(), PyError> {
         let result = self.pop();
+        let _null = self.pop();
         let _iter = self.pop();
         self.push(result);
         Ok(())
@@ -6771,9 +6793,12 @@ mod tests {
     #[test]
     fn test_eval_loop_raises_on_malformed_extended_arg_chain() {
         let code = compile_exec("x = 1").expect("compile failed");
+        // The malformed-chain guard is `instruction_discriminant < 44`.
+        // GET_ITER is opcode 70 and takes an arg, so ExtendedArg+GetIter
+        // is a valid decode. END_FOR is opcode 9 and still trips the guard.
         unsafe {
             code.instructions.replace_op(0, Instruction::ExtendedArg);
-            code.instructions.replace_op(1, Instruction::GetIter);
+            code.instructions.replace_op(1, Instruction::EndFor);
         }
         let mut frame = PyFrame::new(code);
         let err = frame

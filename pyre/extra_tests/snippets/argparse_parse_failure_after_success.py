@@ -34,9 +34,11 @@ class Theme:
     label = ""
 
 
-def _set_color(self, color):
-    self._theme = Theme()
-    self._decolor = lambda x: x
+def _set_color(self, color, *, file=None):
+    self._theme_color = color
+    self._theme_file = file
+    self._cached_theme = Theme()
+    self._cached_decolor = lambda x: x
 
 
 argparse.HelpFormatter._set_color = _set_color

@@ -3,7 +3,7 @@
 //! The rustpython compiler re-exports stay on `pyre_interpreter::compile`.
 
 use rustpython_compiler::compile as rp_compile;
-use rustpython_compiler::{CompileError, CompileOpts, Mode};
+use rustpython_compiler::{CompileError, CompileOpts, Mode, parser};
 use rustpython_compiler_core::bytecode::CodeObject;
 
 /// Rewrite every `\r\n` and every lone `\r` in a source as `\n`.
@@ -124,15 +124,39 @@ pub fn compile_source_with_opts(
         ..opts
     };
     let source = universal_newline(source);
+    let flags = crate::lazyimport::collect_lazy_import_flags(&source, filename, mode)?;
     match rp_compile(&source, mode, filename, opts.clone()) {
-        Ok(code) => Ok(code),
+        Ok(mut code) => {
+            crate::pycode::fixup_code_get_iter(&mut code);
+            crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
+            Ok(code)
+        }
         Err(error) => retry_named_escape_parse(&source, error, |rewritten| {
-            rp_compile(rewritten, mode, filename, opts)
+            rp_compile(rewritten, mode, filename, opts).map(|mut code| {
+                crate::pycode::fixup_code_get_iter(&mut code);
+                crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
+                code
+            })
         }),
     }
 }
 
 fn compile_error_is_unexpected_unicode(error: &CompileError) -> bool {
+    // ruff 0.16.10 reports an unresolved `\N{...}` as
+    // `UnicodeEscapeErrorKind::UnknownName` ("unknown Unicode character name").
+    // Older parsers spelled that "Got unexpected unicode"; keep both so the
+    // rewrite retry still fires for names rustpython-unicode can resolve.
+    if let CompileError::Parse(parse_err) = error
+        && matches!(
+            &parse_err.error,
+            parser::ParseErrorType::Lexical(parser::LexicalErrorType::UnicodeEscapeError {
+                kind: parser::UnicodeEscapeErrorKind::UnknownName,
+                ..
+            })
+        )
+    {
+        return true;
+    }
     error
         .to_string()
         .to_ascii_lowercase()

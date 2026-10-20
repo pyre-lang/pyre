@@ -1038,11 +1038,25 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     Ok(libc_tm_to_c_tm(unsafe { &*p }))
 }
 
+/// `_PyTime_windows_filetime` raises OverflowError for a timestamp before
+/// the FILETIME epoch; `gmtime_s` / `localtime_s` failures raise OSError.
+#[cfg(all(windows, feature = "host_env"))]
+fn timestamp_error(err: host_time::TimestampError) -> crate::PyError {
+    match err {
+        host_time::TimestampError::FiletimeOutOfRange => {
+            crate::PyError::overflow_error("timestamp out of range for Windows FILETIME")
+        }
+        host_time::TimestampError::Os(err) => {
+            crate::PyError::os_error_with_errno(err.raw_os_error().unwrap_or(0), "")
+        }
+    }
+}
+
 #[cfg(all(windows, feature = "host_env"))]
 fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::gmtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
-        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
+        .map_err(timestamp_error)
 }
 
 /// The calendar a target with no libc has to compute for itself.
@@ -1397,7 +1411,7 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
 fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
     host_time::localtime_from_timestamp(seconds as host_time::TimeT)
         .map(|tm| libc_tm_to_c_tm(&tm))
-        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
+        .map_err(timestamp_error)
 }
 
 #[cfg(target_arch = "wasm32")]

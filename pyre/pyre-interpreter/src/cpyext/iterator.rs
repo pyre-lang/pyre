@@ -236,12 +236,12 @@ pub(super) fn ensure_linked() {
 #[cfg(test)]
 mod tests {
     /// `PyIter_Send` answers the number an extension compiled against
-    /// `include/pyre3.14t/object.h` switches on, so the values are one
+    /// `include/pyre3.15t/object.h` switches on, so the values are one
     /// enumeration in two places.  This walks the header and rejects any value
     /// the Rust side numbers differently, or does not spell at all.
     #[test]
     fn every_send_result_is_the_number_the_header_gives_it() {
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/object.h");
 
         // The three sit between `typedef enum {` and `} PySendResult;`, one to
         // a line, and nothing else in the header is named `PYGEN_`.

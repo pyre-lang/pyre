@@ -656,9 +656,9 @@ pub(crate) fn timestamp_pyc_path(source: &std::path::Path) -> Option<std::path::
     let stem = name.strip_suffix(".py").unwrap_or(name);
     let opt = crate::importing::optimize_flag();
     let file = if opt == 0 {
-        format!("{stem}.pyre314.pyc")
+        format!("{stem}.pyre315.pyc")
     } else {
-        format!("{stem}.pyre314.opt-{opt}.pyc")
+        format!("{stem}.pyre315.opt-{opt}.pyc")
     };
     // `_bootstrap_external.cache_from_source`: `sys.pycache_prefix` is a
     // parallel tree of the absolute source parent; otherwise adjacent
@@ -743,10 +743,13 @@ pub(crate) fn try_load_timestamp_pyc(
 }
 
 /// Bytecode/marshal version token stamped into the frozen cache header and
-/// exposed as `_imp.pyc_magic_number_token`: the low half is the 3.14 magic
-/// 3627, the high half the `\r\n` marker so the number breaks when read as
-/// text.  A cache written by an interpreter with a different token is rejected.
-pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 = 0x0A0D_0E2B;
+/// exposed as `_imp.pyc_magic_number_token`: the low half is
+/// `pycore_magic_number.h` `PYC_MAGIC_NUMBER` 3666 for 3.15.0, the high half
+/// the `\r\n` marker so the number breaks when read as text
+/// (`3666 | ('\r' << 16) | ('\n' << 24)`).  The same token is rustpython
+/// `crates/vm/src/version.rs`.  A cache written by an interpreter with a
+/// different token is rejected.
+pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 = 0x0A0D_0E52;
 
 /// `app_main.py:execfile` — validate a `.pyc` script header and unmarshal its
 /// code object.  Script execution deliberately shares the same magic token and
@@ -1493,7 +1496,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // this identical to sys.implementation.cache_tag.
         crate::make_builtin_function_with_arity(
             "get_tag",
-            |_| Ok(pyre_object::w_str_new("pyre314")),
+            |_| Ok(pyre_object::w_str_new("pyre315")),
             0,
         ));
     crate::__pyre_store!(ns, "source_hash", crate::make_builtin_function_with_arity(
@@ -1504,7 +1507,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // (k0=magic, k1=0) and serialized low-byte-first — the 8-byte
                 // hash field of hash-based pycs (`_code_to_hash_pyc` asserts
                 // `len(source_hash) == 8`).  The pyc header this fills already
-                // carries the 3.14 magic number, so the digest has to agree
+                // carries the 3.15 magic number, so the digest has to agree
                 // with the one that format specifies.
                 use std::hash::Hasher;
                 // `args` is the gateway's native copy; `int_w` can collect.
@@ -1525,6 +1528,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(
                     &hasher.finish().to_le_bytes(),
                 ))
+            },
+            2,
+        ));
+    crate::__pyre_store!(ns, "_set_lazy_attributes", crate::make_builtin_function_with_arity(
+            "_set_lazy_attributes",
+            |args| {
+                if !unsafe { pyre_object::is_str(args[1]) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "_set_lazy_attributes() argument 2 must be str, not {}",
+                        crate::type_methods::clinic_arg_type_name(args[1])
+                    )));
+                }
+                crate::lazyimport::set_lazy_attributes(args[0], args[1])?;
+                Ok(pyre_object::w_none())
             },
             2,
         ));

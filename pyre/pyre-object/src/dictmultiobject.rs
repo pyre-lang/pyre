@@ -1370,7 +1370,7 @@ pub(crate) fn dict_write_barrier(obj: PyObjectRef) {
     if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
         crate::gc_hook::try_gc_write_barrier_managed(obj as crate::gc_hook::GCREF);
     }
-    if unsafe { is_dict(obj) } {
+    if unsafe { is_any_dict(obj) } {
         let dict = unsafe { &*(obj as *const W_DictObject) };
         let kind = dict.dstrategy.kind;
         if kind != StrategyKind::Map && kind != StrategyKind::Class && !dict.dstorage.is_null() {
@@ -1592,6 +1592,52 @@ pub fn newdict_empty() -> PyObjectRef {
 #[inline(never)]
 pub fn w_dict_new() -> PyObjectRef {
     newdict_empty()
+}
+
+/// Empty `frozendict` — same `W_DictObject` payload as [`newdict_empty`],
+/// allocated with [`crate::pyobject::FROZENDICT_TYPE`] the way
+/// [`crate::setobject::w_frozenset_new`] allocates `W_SetObject` under
+/// `FROZENSET_TYPE`.
+#[inline(never)]
+pub fn w_frozendict_new() -> PyObjectRef {
+    crate::lltype::malloc_typed_managed(W_DictObject {
+        ob_header: PyObject {
+            ob_type: &crate::pyobject::FROZENDICT_TYPE as *const PyType,
+            w_class: get_instantiate(&crate::pyobject::FROZENDICT_TYPE),
+        },
+        dstorage: std::ptr::null_mut(),
+        dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
+        keys_version: 0,
+        clear_gen: 0,
+    }) as PyObjectRef
+}
+
+/// Clone `obj`'s strategy + storage into a newly allocated exact `frozendict`.
+///
+/// `W_FrozensetObject.descr_new2` / `W_BaseSetObject.from_storage_and_strategy`
+/// allocate a frozen instance then install the source's strategy and a copy
+/// of its storage. Strategy `copy()` still mints a `dict`; adopt that
+/// strategy/storage onto the new frozendict (`w_dict_adopt_regular_copy_for_empty_update`).
+///
+/// # Safety
+/// `obj` must be a live `W_DictObject` (dict or frozendict storage).
+pub unsafe fn w_frozendict_copy_from(obj: PyObjectRef) -> PyObjectRef {
+    if obj.is_null() {
+        return w_frozendict_new();
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let src_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_frozendict_new());
+    let copied = w_dict_copy(crate::gc_roots::shadow_stack_get(src_slot));
+    let copied_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(copied);
+    w_dict_adopt_regular_copy_for_empty_update(
+        crate::gc_roots::shadow_stack_get(dst_slot),
+        crate::gc_roots::shadow_stack_get(copied_slot),
+    );
+    crate::gc_roots::shadow_stack_get(dst_slot)
 }
 
 /// Type-namespace twin of [`w_dict_new`].

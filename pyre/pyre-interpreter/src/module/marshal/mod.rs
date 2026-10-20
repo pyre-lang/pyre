@@ -811,11 +811,18 @@ struct PyreMarshalBag {
     /// code object (`co_names`, localsplus names, filename, `co_name`,
     /// `co_qualname`). Nested code objects pop their own run first.
     names: *mut Vec<usize>,
+    /// Public `co_code` bytes retained when `code_units_from_bytes` has to
+    /// substitute `Reserved` for an opcode the `Instruction` enum cannot spell.
+    raw_code: *mut Option<Vec<u8>>,
 }
 
 impl PyreMarshalBag {
-    fn new(errors: ErrorSink, names: &mut Vec<usize>) -> Self {
-        Self { errors, names }
+    fn new(errors: ErrorSink, names: &mut Vec<usize>, raw_code: &mut Option<Vec<u8>>) -> Self {
+        Self {
+            errors,
+            names,
+            raw_code,
+        }
     }
 
     fn remember_python_error(&self, error: PyError) -> wire::MarshalError {
@@ -971,10 +978,16 @@ impl wire::MarshalBag for PyreMarshalBag {
             .ok_or(wire::MarshalError::BadType)
     }
 
-    fn make_code(&self, code: CodeObject<ConstantData>) -> Result<Rooted, wire::MarshalError> {
-        // Owned here and used nowhere else — hand it over rather than copying
-        // the recursive constants graph, as in `make_runtime_code`.
-        Ok(Rooted::new(crate::pycode::box_code_object(code)))
+    fn make_code(
+        &self,
+        code: CodeObject<ConstantData>,
+        fields: wire::CodeFields<Rooted>,
+    ) -> Result<Rooted, wire::MarshalError> {
+        let constants = self
+            .tuple_elements_from_value(&fields.consts)
+            .ok_or(wire::MarshalError::BadType)?;
+        let raw_code_bytes = unsafe { (*self.raw_code).take() };
+        self.make_runtime_code(code, constants, raw_code_bytes)
     }
 
     fn make_stop_iter(&self) -> Result<Rooted, wire::MarshalError> {
@@ -1105,8 +1118,8 @@ impl wire::MarshalBag for PyreMarshalBag {
 
     /// A `co_consts` entry the compiler enum cannot describe — a list, a dict,
     /// a set — is legal in a code object and marshals fine; it takes a shape
-    /// placeholder here and reaches its slot through
-    /// `make_code_with_constants`, which is what `read_code_consts` does for
+    /// placeholder here and reaches its slot through `make_code`'s
+    /// `CodeFields.consts`, which is what `read_code_consts` does for
     /// `code.replace(co_consts=...)`.
     fn code_constant_from_value(&self, value: &Rooted) -> Result<ConstantData, wire::MarshalError> {
         // `unmarshal_pycode` hands its decoded constants straight to
@@ -1122,39 +1135,21 @@ impl wire::MarshalBag for PyreMarshalBag {
             .unwrap_or(ConstantData::None))
     }
 
-    fn make_code_with_constants(
-        &self,
-        code: CodeObject<ConstantData>,
-        constants: Vec<Rooted>,
-    ) -> Result<Rooted, wire::MarshalError> {
-        self.make_runtime_code(code, constants, None)
-    }
-
     fn code_units_from_bytes(
         &self,
         code_bytes: &[u8],
     ) -> Result<crate::bytecode::CodeUnits, wire::MarshalError> {
         crate::pycode::decode_code_units(code_bytes)
-            .map(|(instructions, _)| instructions)
+            .map(|(instructions, _)| {
+                if instructions
+                    .iter()
+                    .any(|unit| matches!(unit.op, crate::bytecode::Instruction::Reserved))
+                {
+                    unsafe { *self.raw_code = Some(code_bytes.to_vec()) };
+                }
+                instructions
+            })
             .map_err(|()| wire::MarshalError::InvalidBytecode)
-    }
-
-    fn make_code_with_constants_and_bytes(
-        &self,
-        code: CodeObject<ConstantData>,
-        constants: Vec<Rooted>,
-        code_bytes: Vec<u8>,
-    ) -> Result<Rooted, wire::MarshalError> {
-        // `code_units_from_bytes` already substituted the `Reserved`
-        // placeholder for every opcode byte `CodeUnit` cannot spell, so the
-        // decoded stream itself says whether the exact public bytes still have
-        // to be carried; decoding them a second time would only rediscover it.
-        let raw_code_bytes = code
-            .instructions
-            .iter()
-            .any(|unit| matches!(unit.op, crate::bytecode::Instruction::Reserved))
-            .then_some(code_bytes);
-        self.make_runtime_code(code, constants, raw_code_bytes)
     }
 
     // `deserialize_code_value_inner` reads a code object's fields as bag
@@ -1246,7 +1241,8 @@ fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
     let mut pending_error = None;
     let mut name_slots = Vec::with_capacity(64);
     let errors = ErrorSink::park(&roots, &mut pending_error);
-    let bag = PyreMarshalBag::new(errors, &mut name_slots);
+    let mut raw_code = None;
+    let bag = PyreMarshalBag::new(errors, &mut name_slots, &mut raw_code);
     let mut reader = BytesReader {
         data,
         errors: bag.errors,
@@ -1469,7 +1465,8 @@ crate::py_module! {
             let mut pending_error = None;
             let mut name_slots = Vec::with_capacity(64);
             let errors = ErrorSink::park(&roots, &mut pending_error);
-            let bag = PyreMarshalBag::new(errors, &mut name_slots);
+            let mut raw_code = None;
+            let bag = PyreMarshalBag::new(errors, &mut name_slots, &mut raw_code);
             let mut reader = FileReader::from_probed(rooted_file, has_readinto, bag.errors);
             let result = match wire::deserialize_value(&mut reader, bag) {
                 Ok(result) => result,
@@ -1514,7 +1511,12 @@ mod tests {
         let roots = pyre_object::gc_roots::push_roots();
         let mut pending_error = None;
         let mut name_slots = Vec::new();
-        let bag = PyreMarshalBag::new(ErrorSink::park(&roots, &mut pending_error), &mut name_slots);
+        let mut raw_code = None;
+        let bag = PyreMarshalBag::new(
+            ErrorSink::park(&roots, &mut pending_error),
+            &mut name_slots,
+            &mut raw_code,
+        );
         let text = rustpython_wtf8::Wtf8Buf::from("stat_result");
         let rooted = wire::MarshalBag::make_str(&bag, &text);
         unsafe {
@@ -1544,7 +1546,12 @@ mod tests {
         let roots = pyre_object::gc_roots::push_roots();
         let mut pending_error = None;
         let mut name_slots = Vec::new();
-        let bag = PyreMarshalBag::new(ErrorSink::park(&roots, &mut pending_error), &mut name_slots);
+        let mut raw_code = None;
+        let bag = PyreMarshalBag::new(
+            ErrorSink::park(&roots, &mut pending_error),
+            &mut name_slots,
+            &mut raw_code,
+        );
 
         let placeholder = wire::MarshalBag::code_constant_from_value(&bag, &rooted)
             .expect("PyCode constant must be accepted");

@@ -739,6 +739,8 @@ pub struct ExecutionContext {
     /// Upstream keeps this on the execution context (`objspace.py
     /// get_objects_in_repr` / `cpyext Py_ReprEnter`), not a thread-local.
     pub repr_active: RefCell<Vec<PyObjectRef>>,
+    /// Placeholders currently being resolved (`_PyThreadStateImpl.lazy_imports`).
+    pub lazy_imports_resolving: RefCell<Vec<PyObjectRef>>,
     /// Frame-close census for `__del__` before the next opcode. Owned by
     /// the execution context that is finishing the generator, not TLS.
     pub pending_close_finalizer: Cell<bool>,
@@ -924,6 +926,7 @@ impl ExecutionContext {
             contextvar_context: pyre_object::PY_NULL,
             py_repr: pyre_object::PY_NULL,
             repr_active: RefCell::new(Vec::new()),
+            lazy_imports_resolving: RefCell::new(Vec::new()),
             pending_close_finalizer: Cell::new(false),
             py_recursion_depth: 0,
             accounted_activation: 0,
@@ -981,6 +984,7 @@ impl ExecutionContext {
         ec.contextvar_context = pyre_object::PY_NULL;
         ec.py_repr = pyre_object::PY_NULL;
         ec.repr_active = RefCell::new(Vec::new());
+        ec.lazy_imports_resolving = RefCell::new(Vec::new());
         ec.pending_close_finalizer = Cell::new(false);
         ec
     }
@@ -1009,6 +1013,9 @@ impl ExecutionContext {
         });
         visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
         for entry in self.repr_active.get_mut().iter_mut() {
+            visitor(unsafe { &mut *(entry as *mut PyObjectRef as *mut majit_ir::GcRef) });
+        }
+        for entry in self.lazy_imports_resolving.get_mut().iter_mut() {
             visitor(unsafe { &mut *(entry as *mut PyObjectRef as *mut majit_ir::GcRef) });
         }
         if let Some(pending) = self.pending_loop_exit.as_mut() {

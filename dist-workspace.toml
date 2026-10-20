@@ -29,7 +29,7 @@ install-updater = false
 # and it is included beside the executable in every archive and installer.
 # `include` keeps each item's own name and has no per-target form, so the one
 # entry names the stdlib directory on every platform: `lib` holding
-# `pyre3.14t`, except on Windows where the stdlib is `Lib` itself and the two
+# `pyre3.15t`, except on Windows where the stdlib is `Lib` itself and the two
 # spellings are the same path.
 include = ["dist-assets/lib"]
 github-build-setup = "../pyre-dist-build-setup.yml"

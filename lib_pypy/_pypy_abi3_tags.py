@@ -22,7 +22,7 @@ CPython), and it is reached by both `sys_tags()` and pip's own
 `get_supported()`, which bypasses `sys_tags()`.
 
 pyre uses the same hook.  Its packaging interpreter names are
-`pyre3`/`pyre314` rather than `pp3`/`pp314`, so those are advertised
+`pyre3`/`pyre315` rather than `pp3`/`pp314`, so those are advertised
 alongside the PyPy names when running under pyre.
 """
 import sys

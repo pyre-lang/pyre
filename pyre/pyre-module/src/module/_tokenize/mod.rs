@@ -354,7 +354,7 @@ fn emit_next_token(self_obj: PyObjectRef) -> Result<PyObjectRef, pyre_interprete
             };
             if next_start == end
                 && (is_number_kind(next.kind())
-                    || (next.kind() == TokenKind::Name
+                    || (next.kind() == TokenKind::Identifier
                         && (!this.extra_tokens
                             || next_text.starts_with('_')
                             || next_text.eq_ignore_ascii_case("e"))))
@@ -636,6 +636,16 @@ const fn is_number_kind(kind: TokenKind) -> bool {
 fn tolerated_extra_lexical_error(extra_tokens: bool, error: &ParseError, tokens: &[Token]) -> bool {
     if !extra_tokens {
         return false;
+    }
+    // `tok_get_normal_mode` reports an unmatched or mismatched closing
+    // bracket only when `tok_extra_tokens` is off.
+    if matches!(
+        error.error,
+        ParseErrorType::Lexical(
+            LexicalErrorType::UnmatchedBracket { .. } | LexicalErrorType::MismatchedBracket { .. }
+        )
+    ) {
+        return true;
     }
     tokens.iter().any(|token| {
         if token.kind() != TokenKind::Unknown {
@@ -927,7 +937,7 @@ fn make_token_tuple(
 const fn token_kind_value(kind: TokenKind) -> u8 {
     match kind {
         TokenKind::EndOfFile => 0,
-        TokenKind::Name
+        TokenKind::Identifier
         | TokenKind::For
         | TokenKind::In
         | TokenKind::Pass

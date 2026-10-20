@@ -82,7 +82,6 @@ pub(crate) fn classify_vstack_opcode(
         // dropping the kept accumulator below a residual-call condition
         // (`s = s + (i if f(...) else 0)`).
         | Instruction::ToBool
-        | Instruction::GetIter
         | Instruction::GetLen
         // MATCH_SEQUENCE / MATCH_MAPPING / MATCH_KEYS peek their operands and
         // push one result (liveness `(d + 1, d + 1)`), the same shape as GET_LEN
@@ -240,6 +239,10 @@ pub(crate) fn classify_vstack_opcode(
             VstackOpClass::LoadSpecialMethod
         }
 
+        // GET_ITER pops the iterable and pushes iterator then index-or-NULL,
+        // the same two-push shape as LOAD_SPECIAL's method form.
+        Instruction::GetIter { .. } => VstackOpClass::LoadSpecialMethod,
+
         // SWAP(i): exchange TOS with the box `i` positions below.  A pure
         // permutation (net depth 0); the decoded `i` drives the
         // `vstack_boxes` exchange in `reconcile_vstack_at_boundary`.
@@ -301,11 +304,12 @@ pub(crate) fn classify_vstack_opcode(
     }
 }
 
-/// The boxed constant a value `LOAD_CONST` / `LOAD_SMALL_INT` pushes, as a
-/// trace-constant OpRef, or `OpRef::NONE` when `instr` is neither (or its
-/// constant is unresolvable). Realizes the constant the same way
-/// `bh_load_const_fn` / `w_small_int_const` do, so the mirror carries the
-/// identical box the resume path would.
+/// The boxed constant a value `LOAD_CONST` / `LOAD_SMALL_INT` /
+/// prebuilt `LOAD_COMMON_CONSTANT` pushes, as a trace-constant OpRef, or
+/// `OpRef::NONE` when `instr` is none of those (or its constant is
+/// unresolvable). Realizes the constant the same way `bh_load_const_fn` /
+/// `w_small_int_const` / `load_common_constant_value` do, so the mirror
+/// carries the identical box the resume path would.
 fn loadconst_operand_ref<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &pyre_interpreter::CodeObject,
@@ -317,6 +321,14 @@ fn loadconst_operand_ref<Sym: WalkSym>(
         return ctx
             .trace_ctx
             .const_ref(pyre_object::w_small_int_const(val) as i64);
+    }
+    if let pyre_interpreter::bytecode::Instruction::LoadCommonConstant { idx } = instr {
+        let cc = pyre_interpreter::pyopcode::common_constant_arg(*idx, op_arg);
+        if !pyre_interpreter::opcode_ops::common_constant_is_prebuilt(cc) {
+            return OpRef::NONE;
+        }
+        let w_const = pyre_interpreter::opcode_ops::load_common_constant_value(cc);
+        return ctx.trace_ctx.const_ref(w_const as i64);
     }
     let pyre_interpreter::bytecode::Instruction::LoadConst { consti } = instr else {
         return OpRef::NONE;
@@ -640,15 +652,17 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // leave an intentional hole so the capture overlay around
                 // stack_sync omits the slot and resume rematerializes it.
                 let mut top = ctx.frame_state.borrow().vstack_last_ref;
-                // `LOAD_CONST` / `LOAD_SMALL_INT` push that constant. A
-                // `ref_copy` renaming does not stamp `vstack_last_ref`, so
-                // the previous opcode's ref (the `None` a generator send
-                // pushed) would otherwise become this TOS and the yield
-                // would finish with it.
+                // `LOAD_CONST` / `LOAD_SMALL_INT` / a prebuilt
+                // `LOAD_COMMON_CONSTANT` push that constant. A `ref_copy`
+                // renaming does not stamp `vstack_last_ref`, so the previous
+                // opcode's ref (the `None` a generator send pushed) would
+                // otherwise become this TOS and the yield would finish with
+                // it.
                 let const_result = matches!(
                     instr,
                     pyre_interpreter::bytecode::Instruction::LoadSmallInt { .. }
                         | pyre_interpreter::bytecode::Instruction::LoadConst { .. }
+                        | pyre_interpreter::bytecode::Instruction::LoadCommonConstant { .. }
                 );
                 if top == OpRef::NONE || const_result {
                     let from_const = loadconst_operand_ref(ctx, code, &instr, op_arg);

@@ -11,7 +11,7 @@ use pyre_object::{
     w_str_new, w_str_new_managed, w_tuple_new,
 };
 use rustpython_compiler_core::SourceLocation;
-use rustpython_compiler_core::bytecode::PyCodeLocationInfoKind;
+use rustpython_compiler_core::bytecode::{Constants, PyCodeLocationInfoKind};
 
 const YIELDS_INSIDE_TRY_BIT: u16 = 0x8000;
 
@@ -1204,6 +1204,9 @@ fn w_code_new_owned(
     let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
     let code_ptr_aligned = !code_ptr.is_null() && (code_ptr as i64) & align_mask == 0;
     if code_ptr_aligned {
+        // The compiler emits GET_ITER yield-from mode 1; resolve it to the
+        // coro-check / no-check mode the eval loop executes (`fixup_get_iter`).
+        unsafe { fixup_code_get_iter(&mut *(code_ptr as *mut crate::CodeObject)) };
         // The expanded `locations` array is redundant with `linetable`; hand it
         // to [`code_locations`] to rebuild on the first reader that wants it.
         // `first_line_number` is the value the array was decoded against here;
@@ -3641,19 +3644,113 @@ pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
     unsafe { (*(obj as *const PyCode)).code_ptr }
 }
 
+/// `Constants<ConstantData>` is a single-field tuple wrapping `Box<[ConstantData]>`.
+/// `DerefMut` is gone; recover a mutable slice from that layout so nested
+/// constants keep their addresses. rustpython-compiler-core exposes only
+/// `as_tuple()` (`&C::Tuple`); there is no `&mut` accessor.
+const _: () = {
+    assert!(
+        std::mem::size_of::<Constants<crate::bytecode::ConstantData>>()
+            == std::mem::size_of::<Box<[crate::bytecode::ConstantData]>>()
+    );
+    assert!(
+        std::mem::align_of::<Constants<crate::bytecode::ConstantData>>()
+            == std::mem::align_of::<Box<[crate::bytecode::ConstantData]>>()
+    );
+};
+
+fn constants_as_mut_slice(
+    constants: &mut Constants<crate::bytecode::ConstantData>,
+) -> &mut [crate::bytecode::ConstantData] {
+    debug_assert_eq!(
+        std::mem::size_of_val(constants),
+        std::mem::size_of::<Box<[crate::bytecode::ConstantData]>>()
+    );
+    debug_assert_eq!(
+        std::mem::align_of_val(constants),
+        std::mem::align_of::<Box<[crate::bytecode::ConstantData]>>()
+    );
+    // SAFETY: `Constants<C>` is `struct Constants<C>(C::Tuple)` and
+    // `ConstantData::Tuple` is `Box<[ConstantData]>`. Size and align match
+    // the compile-time asserts above; nested constant addresses stay put.
+    let tuple = unsafe {
+        &mut *std::ptr::from_mut(constants).cast::<Box<[crate::bytecode::ConstantData]>>()
+    };
+    tuple.as_mut()
+}
+
+/// Resolve compiler-emitted GET_ITER yield-from mode 1 to the coro-check
+/// modes `fixup_get_iter` writes, put BUILD_LIST_FROM_ARG back in front of
+/// GET_ITER, and walk nested code constants.
+pub fn fixup_code_get_iter(code: &mut crate::CodeObject) {
+    code.instructions.fixup_get_iter(code.flags);
+    reorder_build_list_from_arg(code);
+    for constant in constants_as_mut_slice(&mut code.constants) {
+        fixup_constant_get_iter(constant);
+    }
+}
+
+/// Temporary patch until the codegen emits BUILD_LIST_FROM_ARG before
+/// GET_ITER on the non-inlined list-comprehension path, as the inlined path
+/// already does. The pinned compiler emits `GET_ITER` (plus its CACHE units)
+/// then `BUILD_LIST_FROM_ARG`; GET_ITER pushes the iterator and an index slot,
+/// so BUILD_LIST_FROM_ARG (pop one value, push the list, push the value back)
+/// would take the NULL index slot. Rotate each such pair to
+/// `BUILD_LIST_FROM_ARG; GET_ITER (+ caches)`, which leaves
+/// `[list, iterator, index]` on the stack, and move the per-unit locations
+/// with it.
+fn reorder_build_list_from_arg(code: &mut crate::CodeObject) {
+    use crate::bytecode::{CodeUnit, Instruction};
+    let len = code.instructions.len();
+    let ptr = code.instructions.units_ptr() as *mut CodeUnit;
+    let mut i = 0usize;
+    while i < len {
+        let unit = code.instructions[i];
+        let last = i + 1 + unit.op.cache_entries();
+        if matches!(unit.op, Instruction::GetIter { .. })
+            && last < len
+            && matches!(code.instructions[last].op, Instruction::BuildListFromArg)
+        {
+            // SAFETY: `i..=last` lies inside the `len` units the code object owns.
+            unsafe { std::slice::from_raw_parts_mut(ptr.add(i), last - i + 1) }.rotate_right(1);
+            if code.locations.len() == len {
+                code.locations[i..=last].rotate_right(1);
+            }
+        }
+        i += 1 + code.instructions[i].op.cache_entries();
+    }
+}
+
+fn fixup_constant_get_iter(constant: &mut crate::bytecode::ConstantData) {
+    match constant {
+        crate::bytecode::ConstantData::Code { code } => fixup_code_get_iter(code),
+        crate::bytecode::ConstantData::Tuple { elements }
+        | crate::bytecode::ConstantData::Frozenset { elements } => {
+            for nested in elements {
+                fixup_constant_get_iter(nested);
+            }
+        }
+        crate::bytecode::ConstantData::Slice { elements } => {
+            for nested in elements.iter_mut() {
+                fixup_constant_get_iter(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `importing.py update_code_filenames`: set `source_path` on `code` and,
 /// recursively, on every nested code constant whose filename still matches the
 /// root's *original* name (leaving unrelated inlined filenames untouched).
 ///
-/// The table is edited through `Constants`' `DerefMut`, so every constant keeps
-/// its address. Nested constants are wrapped in place by
+/// Nested constants are wrapped in place by
 /// [`box_code_constant_in_place`], and a wrapper published before this runs
 /// reads the new name out of the object it already points at — which is what
 /// `update_code_filenames` mutating already-wrapped nested `PyCode` constants
 /// amounts to.
 fn fix_code_filenames(code: &mut crate::CodeObject, oldname: &str, newname: &str) {
     code.source_path = newname.to_owned();
-    for constant in code.constants.iter_mut() {
+    for constant in constants_as_mut_slice(&mut code.constants) {
         if let crate::bytecode::ConstantData::Code { code: nested } = constant
             && nested.source_path == oldname
         {
@@ -4132,23 +4229,29 @@ fn base_op(code: &crate::CodeObject, index: usize) -> Option<crate::bytecode::In
     Some(op.to_base().unwrap_or(op))
 }
 
-/// `code->_co_firsttraceable` — the index of the first `RESUME`, which is where
-/// a frame that has not run an instruction is reported to be.
+/// `code->_co_firsttraceable` — the index of the first `RESUME` that is not a
+/// generator expression's `RESUME_AT_GEN_EXPR_START`, which is where a frame
+/// that has not run an instruction is reported to be.
 ///
 /// `init_code` (`Objects/codeobject.c`) scans for it once and stores it; this
 /// walks instead, which costs the prologue's length because it stops at that
 /// `RESUME` — within a handful of units of the start for every code object the
 /// compiler produces.  Everything ahead of it is what the compiler inserts:
-/// `COPY_FREE_VARS`, `MAKE_CELL`, and a generator's `RETURN_GENERATOR` /
-/// `POP_TOP` pair.  A code object with no `RESUME` at all leaves the index past
-/// the end, so it starts no line anywhere — what `init_code`'s scan does with
-/// one too.
+/// `COPY_FREE_VARS`, `MAKE_CELL`, a generator expression's
+/// `RESUME RESUME_AT_GEN_EXPR_START; LOAD_FAST .0; GET_ITER`, and a
+/// generator's `RETURN_GENERATOR` / `POP_TOP` pair.  A code object with no
+/// such `RESUME` at all leaves the index past the end, so it starts no line
+/// anywhere — what `init_code`'s scan does with one too.
 pub fn first_traceable_index(code: &crate::CodeObject) -> usize {
     use crate::bytecode::Instruction;
+    use crate::bytecode::oparg::{ResumeContext, ResumeLocation};
 
     let mut index = 0;
     while let Some(op) = base_op(code, index) {
-        if matches!(op, Instruction::Resume { .. }) {
+        if matches!(op, Instruction::Resume { .. })
+            && u32::from(u8::from(code.instructions[index].arg)) & ResumeContext::LOCATION_MASK
+                != u32::from(ResumeLocation::AtGenExprStart.as_u8())
+        {
             break;
         }
         index += 1;
@@ -4193,6 +4296,11 @@ pub fn after_return_generator_index(code: &crate::CodeObject) -> Option<usize> {
 ///   `POP_ITER`.  `END_FOR` and `END_SEND` are skipped by the `FOR_ITER` /
 ///   `SEND` ahead of them; the other three carry no line event of their own
 ///   even though the line table gives them a line.
+/// * cache units that follow an instruction.  `initialize_lines` walks
+///   `_PyInstruction_GetLength` and stamps `for (j = 1; j < length; j++)`
+///   so a `CACHE` never carries `INSTRUMENTED_LINE`.  `RESUME` now has
+///   `cache_entries=1`, and that unit inherits the `def` line; tracing it
+///   would put a line event on the `def` line at every call.
 ///
 /// [`crate::PyFrame::get_lineno_for_pc_tracing`] needs both because the
 /// prologue and the `RESUME` that ends it are all stamped with the `def` line,
@@ -4214,7 +4322,8 @@ pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool
     };
     !matches!(
         op,
-        Instruction::EndAsyncFor
+        Instruction::Cache
+            | Instruction::EndAsyncFor
             | Instruction::EndFor
             | Instruction::EndSend
             | Instruction::PopIter
@@ -4504,7 +4613,7 @@ fn retire_code_unit(owner: *mut crate::CodeObject, members: &[usize]) {
 /// Release one body's payloads and recurse through the code constants nested
 /// in it, which are the graph's other members.
 fn release_code_object_body(code: &mut crate::CodeObject) {
-    for constant in code.constants.iter_mut() {
+    for constant in constants_as_mut_slice(&mut code.constants) {
         release_constant_payload(constant);
     }
     code.instructions = crate::bytecode::CodeUnits::from(Vec::new());

@@ -195,10 +195,10 @@ This overturned a weeks-old "unfixable by construction" verdict on
 `forcings: 0`, and the `@jit.look_inside_iff` on `getframe`
 (`pypy/module/sys/vm.py`) named the reason.
 
-## Spec follows CPython 3.14t; engineering follows PyPy
+## Spec follows CPython 3.15t; engineering follows PyPy
 
-**Pursue PyPy parity to the extreme as engineering, and CPython 3.14t as spec;
-where they collide, take the 3.14t behaviour and engineer it the way PyPy
+**Pursue PyPy parity to the extreme as engineering, and CPython 3.15t as spec;
+where they collide, take the 3.15t behaviour and engineer it the way PyPy
 would.** Neither goal yields wholesale — the axis decides which one governs the
 line in front of you.
 
@@ -236,9 +236,9 @@ argument shapes. Everything else follows PyPy **unconditionally**: names, module
 paths, control-flow order, data structures, storage owner, JIT hints. A
 structural divergence does not become a spec fix by sitting next to one.
 
-**It is not a 3.11-vs-3.14 question** — six of seven adjudicated cases had no
+**It is not a 3.11-vs-3.15 question** — six of seven adjudicated cases had no
 version delta at all (`sched_setscheduler` since 3.3, `PyUnicode_FSConverter`
-since 3.3, PEP 529, PEP 471). "3.14" pins *which* CPython you read
+since 3.3, PEP 529, PEP 471). "3.15" pins *which* CPython you read
 (`lib-python/stdlib-version.txt`); a missing delta is not grounds to refuse the
 exception, and a real one earns nothing by itself.
 
@@ -246,7 +246,7 @@ exception, and a real one earns nothing by itself.
 `/parity` under "SPEC-DEVIATION" — do not invoke this ruling without reading it.
 
 1. Can a Python snippet print a difference? No → ordinary parity finding.
-2. Do you hold an admissible 3.14 artefact — an in-tree `lib-python/3/…`
+2. Do you hold an admissible 3.15 artefact — an in-tree `lib-python/3/…`
    assertion, a measured run at the pinned version, or C source read at that tag?
    Prose is not admissible; a comment in pyre's own source is never the artefact.
 3. Do the two upstreams actually disagree? If they agree and pyre differs from
@@ -259,11 +259,11 @@ exception, and a real one earns nothing by itself.
 5. Per-site artefact plus a blast-radius census: every departing site needs the
    artefact forcing *that* site ("consistency with a sibling" is not one), then
    `rg` pyre's own readers, `pyre-jit*` and `majit*` included.
-6. Does pyre land on 3.14t across the whole decision? Landing where **neither**
+6. Does pyre land on 3.15t across the whole decision? Landing where **neither**
    upstream sits is a defect however well one axis matched.
 
 File the result under the review's `## 4. Structural adaptations` as
-`[3.14-spec] <ours> ↔ <pypy> — <observable>; evidence: <route + cite>`, and
+`[3.15-spec] <ours> ↔ <pypy> — <observable>; evidence: <route + cite>`, and
 comment at the site citing both sides.
 
 ## Porting discipline

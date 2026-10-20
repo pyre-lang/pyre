@@ -2657,14 +2657,16 @@ pub(crate) fn export_state_operands(
 /// then overwrite" pattern from leaking the stub to in-flight recursive
 /// callers.
 pub(crate) struct ExportCache {
-    // Keyed by operand identity (`Rc::ptr_eq`, const by value) — the resolved
-    // box `get_box_replacement(opref)`. virtualstate.py create_state keys `self.info`
-    // (a plain identity dict) by `get_box_replacement(box)` and relies on "same
-    // resolved box → same key" for finished / in_progress dedup. A bound
-    // producer resolves to its one canonical `Rc` (memoized `from_bound_op`),
-    // and value-equal constants merge via the operand's `same_constant` (matching
-    // RPython's shared-instance dedup; the benign over-merge is on not-virtual
-    // const nodes that emit no fail-arg box).
+    // Keyed by operand identity (`Rc::ptr_eq`) — the resolved box
+    // `get_box_replacement(opref)`. virtualstate.py create_state keys
+    // `self.info` (a plain identity dict) by `get_box_replacement(box)`.
+    // A bound producer resolves to its one canonical `Rc` (memoized
+    // `from_bound_op`). Constants are *not* stored here: `history.py
+    // ConstInt.__init__` mints a fresh instance per use, while pyre's
+    // `OpRef::ConstInt(n)` / `const_operands` intern by value, so caching
+    // them would make the renum check of `virtualstate.py
+    // AbstractVirtualStateInfo.generate_guards` treat a jump-arg 5 and a
+    // virtual `W_UnicodeObject.len = 5` as one box.
     //
     // bind-at-alloc invariant: every position reaching export resolves to a
     // bound box (debug-asserted in `export_single_value`). Production forced
@@ -2755,8 +2757,7 @@ fn export_single_operand(
     // lookup on `self.info`: resolve the forwarding chain BEFORE the cache
     // lookup so two field references forwarding to the same target collapse
     // onto the same VirtualStateInfo. Key the DAG cache by the resolved box's
-    // identity (`Rc::ptr_eq`, const by value) — the bound producer's one
-    // canonical `Rc`.
+    // identity (`Rc::ptr_eq`) — the bound producer's one canonical `Rc`.
     let box_ = operand.get_box_replacement(false);
     let opref = box_.to_opref();
     // bind-at-alloc invariant (see ExportCache): every position reaching
@@ -2769,8 +2770,13 @@ fn export_single_operand(
          must be a bound box; virtualstate.py:711-720)"
     );
     // virtualstate.py:714-716: cache hit returns the cached state directly.
-    if let Some(cached) = cache.finished.get(&box_) {
-        return Rc::clone(cached);
+    // Packed `Operand` constants intern by value (`OpRef::ConstInt`,
+    // `const_operands`); `history.py ConstInt` does not, so a constant is a
+    // fresh `self.info` key per `create_state` call.
+    if !box_.is_constant() {
+        if let Some(cached) = cache.finished.get(&box_) {
+            return Rc::clone(cached);
+        }
     }
     // Cycle: this opref is currently being exported on the parent stack.
     // Return a fresh Unknown leaf so the back-edge is visibly non-virtual
@@ -2785,7 +2791,7 @@ fn export_single_operand(
     // closing the cycle on one node, per `export_single_value`'s doc) is
     // therefore latent — no
     // benchmark constructs the necessary self-referential structures.
-    if cache.in_progress.contains(&box_) {
+    if !box_.is_constant() && cache.in_progress.contains(&box_) {
         // Fallback to Ref for the cycle leaf: pyre's virtual DAGs only
         // form through ptr fields, so the only reachable cycles are on
         // Ref-typed nodes. Matches `not_virtual(cpu, 'r', None)` in
@@ -2794,7 +2800,9 @@ fn export_single_operand(
         return VirtualStateInfoNode::new_rc(VirtualStateInfo::Unknown(Type::Ref));
     }
     let key = box_.clone();
-    cache.in_progress.insert(key.clone());
+    if !box_.is_constant() {
+        cache.in_progress.insert(key.clone());
+    }
 
     let info = export_single_value_inner(&box_, ctx, cache);
     // virtualstate.py NotVirtualStateInfoPtr.__init__: retain the
@@ -2815,8 +2823,17 @@ fn export_single_operand(
         None
     };
     let rc = VirtualStateInfoNode::new_rc_with_lenbound(info, lenbound);
-    cache.in_progress.swap_remove(&key);
-    cache.finished.insert(key, Rc::clone(&rc));
+    if !box_.is_constant() {
+        cache.in_progress.swap_remove(&key);
+        // `history.py ConstInt.__init__` stores `value` on a fresh instance;
+        // `virtualstate.py create_state` therefore gives two `ConstInt(5)` uses
+        // two nodes and two `enum` positions. Caching interned constant
+        // operands would make the renum check of `virtualstate.py
+        // AbstractVirtualStateInfo.generate_guards` treat a jump-arg 5 and `W_UnicodeObject.len = 5` as one box, so a
+        // no-padding bridge whose `len` is still the live int2dec length
+        // raises VirtualStatesCantMatch.
+        cache.finished.insert(key, Rc::clone(&rc));
+    }
     rc
 }
 
@@ -3682,6 +3699,25 @@ mod tests {
             "a state exported from `args` must re-match `args`; \
              a failure here means the preview is no longer a self-match and the \
              optimizer's `building_bridge` branch is now reachable"
+        );
+    }
+
+    /// `history.py ConstInt.__init__` mints a fresh instance per use, so
+    /// `virtualstate.py create_state` gives two `ConstInt(5)` boxes two
+    /// `enum` positions. `OptContext.const_operands` interns `OpRef::ConstInt(5)`
+    /// onto one `Operand`; without skipping that key in `ExportCache`,
+    /// `generate_guards` renum treats a jump-arg 5 and `W_UnicodeObject.len = 5`
+    /// as one box.
+    #[test]
+    fn independent_const_int_uses_do_not_share_virtualstate_position() {
+        let ctx = OptContext::new(32);
+        let five = OpRef::const_int(5);
+        let state = export_state(&[five, five], &ctx);
+        assert_eq!(state.state.len(), 2);
+        assert_ne!(
+            state.state[0].position.get(),
+            state.state[1].position.get(),
+            "interned ConstInt operands must not share generate_guards renum positions"
         );
     }
 

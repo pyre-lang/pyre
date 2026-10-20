@@ -1332,14 +1332,14 @@ pub(super) fn ensure_linked() {
 #[cfg(test)]
 mod tests {
     /// A `PyModuleDef_Slot.slot` is the number an extension compiled against
-    /// `include/pyre3.14t/moduleobject.h` wrote, so the identifiers are one
+    /// `include/pyre3.15t/moduleobject.h` wrote, so the identifiers are one
     /// table in two places.  This walks the header and rejects any identifier
     /// whose number the Rust side spells differently, or does not spell at
     /// all; `_Py_mod_LAST_SLOT` is what the reader refuses past, so it is held
     /// to the highest of them.
     #[test]
     fn every_module_slot_is_the_number_the_header_gives_it() {
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/moduleobject.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/moduleobject.h");
 
         let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
         let mut last_slot = None;
@@ -1396,7 +1396,7 @@ mod tests {
     /// is what an extension's own `PyModule_Create` passes.
     #[test]
     fn both_module_versions_are_the_numbers_the_header_gives_them() {
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/patchlevel.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/patchlevel.h");
 
         for (name, ours) in [
             ("PYTHON_API_VERSION", super::PYTHON_API_VERSION),

@@ -2846,8 +2846,20 @@ mod certificate_methods {
             if encoding == 1 || encoding == 0x101 {
                 let encoded = rustpython_common::binascii::b2a_base64(
                     unsafe { pyre_object::bytesobject::w_bytes_data(self.der) },
+                    true,
+                    0,
                     false,
-                );
+                    rustpython_common::binascii::BASE64_ALPHABET,
+                )
+                .map_err(|e| {
+                    pyre_interpreter::PyError::value_error(match e {
+                        rustpython_common::binascii::Error::Memory => "out of memory",
+                        rustpython_common::binascii::Error::TooMuchBase64Data => {
+                            "Too much data for base64"
+                        }
+                        _ => "base64 encode failed",
+                    })
+                })?;
                 let mut pem = String::with_capacity(encoded.len() + 64);
                 pem.push_str("-----BEGIN CERTIFICATE-----\n");
                 for line in encoded.chunks(64) {
@@ -3129,6 +3141,14 @@ fn test_decode_cert(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
     Ok(decoded_certificate_dict(cert))
 }
 
+/// `_ssl_get_sigalgs_impl`. `SSL_get1_builtin_sigalgs` needs OpenSSL 3.4;
+/// `OPENSSL_VERSION_NUMBER` is `0x30000000`, so this raises.
+fn get_sigalgs(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    Err(pyre_interpreter::PyError::not_implemented(
+        "Getting signature algorithms requires OpenSSL 3.4 or later.",
+    ))
+}
+
 pyre_interpreter::py_module! {
     "_ssl",
     interpleveldefs: {
@@ -3190,6 +3210,7 @@ pyre_interpreter::py_module! {
         "HAS_TLSv1_2" => w_bool_from(true),
         "HAS_TLSv1_3" => w_bool_from(true),
         "HAS_PSK" => w_bool_from(false),
+        "HAS_PSK_TLS13" => w_bool_from(false),
         "HAS_PHA" => w_bool_from(false)
     },
     int_constants: {
@@ -3270,6 +3291,7 @@ pyre_interpreter::py_module! {
         "txt2obj" / * = txt2obj; pyre_interpreter::Signature::new(vec!["txt", "name"], None, None, 0, 0),
         "nid2obj" / 1 = nid2obj,
         "get_default_verify_paths" / 0 = get_default_verify_paths,
+        "get_sigalgs" / 0 = get_sigalgs,
         "_test_decode_cert" / 1 = test_decode_cert
     },
     extra_init: |ns| {

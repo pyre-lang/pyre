@@ -73,7 +73,7 @@ TIMEOUT = 300
 # The reference the control leg has to be, for the same reason the parity
 # runner pins it: an older interpreter disagrees about things that are not
 # what this gate measures.
-CPYTHON_TARGET = (3, 14)
+CPYTHON_TARGET = (3, 15)
 
 SDIST = "stpkg-0.2.0.tar.gz"
 SDIST_MEMBERS = {
@@ -581,7 +581,7 @@ def _cpython() -> str | None:
     failure should still report it.
     """
     named = os.environ.get("PYRE_CHECK_PYTHON3")
-    for candidate in [named] if named else ["python3.14", "python3", "python"]:
+    for candidate in [named] if named else ["python3.15", "python3", "python"]:
         if named is None and shutil.which(candidate) is None:
             continue
         probed = _probe(candidate)

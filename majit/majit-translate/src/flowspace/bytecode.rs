@@ -11,7 +11,7 @@
 //!
 //! Rust has no equivalent host-language opcode module, so we reach for
 //! the externally-owned `rustpython-compiler-core` crate, which plays
-//! the same role: a neutral third-party source of CPython-3.14 opcode
+//! the same role: a neutral third-party source of CPython-3.15 opcode
 //! definitions (`Instruction`, `CodeObject`, `ConstantData`, ...).
 //! majit-translate wraps it here in `HostCode`, exactly as RPython
 //! wraps `opcode`.
@@ -103,7 +103,7 @@ pub fn cpython_code_signature(code: &HostCode) -> Signature {
 ///
 /// RPython's `__init__` stores `code` as the raw `co_code` byte string
 /// because PyPy-2.7 carried a pre-wordcode bytecode format. The CPython
-/// 3.14 equivalent in RustPython is `CodeUnits` (a
+/// 3.15 equivalent in RustPython is `CodeUnits` (a
 /// two-byte-per-instruction container); we store that directly as
 /// `co_code` to avoid a second copy into raw bytes. The RPython walker
 /// (F2.3 port of `HostCode.read`) becomes a `CodeUnits` iterator
@@ -345,7 +345,7 @@ impl HostCode {
     /// ### Deviation from RPython (parity rule #1)
     ///
     /// RPython returns the opcode **name** as a string (`opname`); we
-    /// return the typed `Instruction` enum because CPython 3.14's
+    /// return the typed `Instruction` enum because CPython 3.15's
     /// wordcode format is enum-typed at the RustPython layer. The
     /// string name was used upstream to drive attribute lookup
     /// (`self.opcode_<NAME>(oparg)`), which is not idiomatic in Rust
@@ -508,7 +508,7 @@ mod test {
         }
         assert!(!seen.is_empty());
         // Last instruction of a `return x` body is ReturnValue on CPython
-        // 3.14 wordcode.
+        // 3.15 wordcode.
         assert!(
             matches!(seen.last(), Some(Instruction::ReturnValue)),
             "expected terminal ReturnValue, got {:?}",

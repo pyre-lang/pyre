@@ -36,7 +36,7 @@ fn main() {
         for source in cpyext_sources {
             println!("cargo:rerun-if-changed={source}");
         }
-        let include = Path::new("../../include/pyre3.14t");
+        let include = Path::new("../../include/pyre3.15t");
         println!("cargo:rerun-if-changed={}", include.display());
         cc::Build::new()
             .files(cpyext_sources)

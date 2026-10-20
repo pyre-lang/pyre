@@ -1,6 +1,9 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=entry-bridge:_coerce_args
+# pyre-check: selfcheck-compiles=loop:_coerce_args
 # pyre-check: requires-modules=_tokenize,math,unicodedata
+# The 3.15 `_coerce_args` loops over every argument to find the first
+# non-empty one, so it compiles as a loop of its own rather than only as an
+# entry bridge.
 # After compiling `_coerce_args` on 5-field `SplitResult` (urlunsplit via RFC
 # urljoin traffic), a 6-field `ParseResultBytes.geturl` must still unpack
 # through `urlunparse` (`scheme, netloc, url, params, query, fragment,

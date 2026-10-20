@@ -552,6 +552,10 @@ pub static TUPLE_USER_TYPE: PyType = new_user_pytype(
     std::mem::offset_of!(crate::tupleobject::W_TupleObjectUser, map),
 );
 pub static DICT_TYPE: PyType = new_pytype("dict");
+/// Layout tag for the builtin `frozendict` type. Instances reuse the
+/// `W_DictObject` payload (`W_DICT_GC_TYPE_ID`) the way `frozenset` reuses
+/// `W_SetObject`; the Python-visible type is not a `dict` subclass.
+pub static FROZENDICT_TYPE: PyType = new_pytype("frozendict");
 pub static LONG_TYPE: PyType = new_pytype_with_user_subclass("int", &LONG_USER_TYPE);
 /// `W_LongObjectUser` (`typedef.py` `_getusercls(W_LongObject)`).
 pub static LONG_USER_TYPE: PyType = new_user_pytype(
@@ -1989,6 +1993,38 @@ pub unsafe fn is_exact_list(obj: PyObjectRef) -> bool {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_dict(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &DICT_TYPE) || crate::dictmultiobject::is_module_dict(obj) }
+}
+
+/// Exact `frozendict` layout (`ob_type` is [`FROZENDICT_TYPE`]). A
+/// `frozendict` subclass is an instance with reserved-slot backing, so this
+/// is false there — matching `is_dict` for dict subclasses.
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_frozendict(obj: PyObjectRef) -> bool {
+    unsafe { py_type_check(obj, &FROZENDICT_TYPE) }
+}
+
+/// `PyAnyDict_Check`: a `dict` (including a module dict) or an exact
+/// `frozendict`. Subclass instances of either type keep their payload in a
+/// reserved slot and are not this layout.
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_any_dict(obj: PyObjectRef) -> bool {
+    unsafe { is_dict(obj) || is_frozendict(obj) }
+}
+
+/// Exact `dict` or exact `frozendict` (`PyAnyDict_CheckExact`), including
+/// a module dict whose `w_class` is `dict`.
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn is_exact_any_dict(obj: PyObjectRef) -> bool {
+    unsafe { is_exact_type(obj, &DICT_TYPE) || is_exact_type(obj, &FROZENDICT_TYPE) }
 }
 
 #[inline]

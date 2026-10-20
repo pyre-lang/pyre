@@ -718,6 +718,19 @@ pub fn init_typeobjects() {
             );
         }
 
+        // frozendict — same `W_DictObject` payload as `dict`, separate type
+        // (`PyFrozenDict_Type`). Not a dict subclass; MRO is (frozendict, object).
+        let frozendict_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "frozendict",
+            init_frozendict_type,
+            object_type,
+            &pyre_object::FROZENDICT_TYPE as *const PyType,
+        ));
+        reg.insert(
+            &pyre_object::FROZENDICT_TYPE as *const PyType as usize,
+            frozendict_type as usize,
+        );
+
         // mappingproxy — `pypy/objspace/std/dictproxyobject.py:103`
         // `W_DictProxyObject.typedef = TypeDef('mappingproxy', ...)`,
         // bases=(object,).  The TypeDef surface (keys/values/items/get/
@@ -1185,6 +1198,32 @@ pub fn init_typeobjects() {
         reg.insert(
             &pyre_object::sliceobject::SLICE_TYPE as *const PyType as usize,
             slice_type as usize,
+        );
+
+        // `PySentinel_Type` — PEP 661 `sentinel`.
+        let sentinel_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "sentinel",
+            crate::sentinel::init_sentinel_type,
+            object_type,
+            &pyre_object::sentinel::SENTINEL_TYPE as *const PyType,
+        ));
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sentinel_type, false) };
+        reg.insert(
+            &pyre_object::sentinel::SENTINEL_TYPE as *const PyType as usize,
+            sentinel_type as usize,
+        );
+
+        // `PyLazyImport_Type` — PEP 810 `lazy_import`.
+        let lazy_import_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "lazy_import",
+            crate::lazyimport::init_lazy_import_type,
+            object_type,
+            &pyre_object::lazyimport::LAZY_IMPORT_TYPE as *const PyType,
+        ));
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(lazy_import_type, false) };
+        reg.insert(
+            &pyre_object::lazyimport::LAZY_IMPORT_TYPE as *const PyType as usize,
+            lazy_import_type as usize,
         );
 
         // `_sre` TypeDefs (`W_SRE_Pattern.typedef` and siblings) are built by
@@ -1745,7 +1784,7 @@ pub fn init_typeobjects() {
             ),
             (
                 &pyre_object::functional::REVERSED_TYPE as *const PyType,
-                "(sequence, /)",
+                "(object, /)",
             ),
             (
                 &pyre_object::functional::MAP_TYPE as *const PyType,
@@ -1819,6 +1858,7 @@ pub fn init_typeobjects() {
         // `inherit_flag_map_or_seq`.
         for (pytype, flag) in [
             (&pyre_object::pyobject::DICT_TYPE, b'M'),
+            (&pyre_object::pyobject::FROZENDICT_TYPE, b'M'),
             (&pyre_object::pyobject::MAPPING_PROXY_TYPE, b'M'),
             (&pyre_object::pyobject::STR_TYPE, b'S'),
             (&pyre_object::bytesobject::BYTES_TYPE, b'S'),
@@ -2269,7 +2309,12 @@ pub(crate) fn method_owner(type_name: &str) -> Option<&'static crate::gateway::M
         // A dict subclass keeps its entries in a reserved-slot backing
         // rather than the dict layout, and the dict methods already read
         // through to it, so "has a dict backing" is the receiver test.
+        // `has_dict_backing` refuses frozendict (`PyFrozenDict_Check`).
         "dict" => crate::type_methods::has_dict_backing,
+        // `PyFrozenDict_Check`: exact frozendict and subclasses. Without this
+        // row the type falls through to `untested_method_owner` and every
+        // descriptor accepts a foreign receiver.
+        "frozendict" => crate::type_methods::has_frozendict_backing,
         "list" => pyre_object::is_list,
         "tuple" => pyre_object::is_tuple,
         "set" => pyre_object::is_set,
@@ -5387,6 +5432,95 @@ fn dict_descr_new_from(cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
     );
     Ok(instance)
 }
+
+fn frozendict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = if args.is_empty() {
+        pyre_object::PY_NULL
+    } else {
+        args[0]
+    };
+    frozendict_new_from(cls, args.get(1..).unwrap_or(&[]), None)
+}
+
+fn frozendict_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let (pos, kwargs) = crate::builtins::arguments_pos_and_kwargs(args)?;
+    frozendict_new_from(
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
+        &pos,
+        kwargs,
+    )
+}
+
+/// `frozendict_vectorcall` / `frozendict_new`: fill in `__new__`. Exact
+/// `frozendict(exact_fd)` with no kwargs is identity.
+fn frozendict_new_from(
+    cls: PyObjectRef,
+    pos: &[PyObjectRef],
+    kwargs: Option<PyObjectRef>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    let no_kwargs = kwargs.is_none();
+    if no_kwargs
+        && pos.len() == 1
+        && (cls.is_null() || std::ptr::eq(cls, fd_type))
+        && unsafe { pyre_object::is_exact_type(pos[0], &pyre_object::FROZENDICT_TYPE) }
+    {
+        return Ok(pos[0]);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let pos_base = pyre_object::gc_roots::pin_roots(pos);
+    let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwargs.unwrap_or(pyre_object::PY_NULL));
+    let instance = frozendict_alloc(pyre_object::gc_roots::shadow_stack_get(cls_slot))?;
+    let inst_slot = pyre_object::gc_roots::shadow_stack_len();
+    let instance = pyre_object::gc_roots::pin_root(instance);
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "frozendict expected at most 1 argument, got {}",
+            pos.len()
+        )));
+    }
+    if pos.len() == 1 {
+        crate::type_methods::dict_update1(
+            instance,
+            pyre_object::gc_roots::shadow_stack_get(pos_base),
+        )?;
+    }
+    let kwargs = pyre_object::gc_roots::shadow_stack_get(kwargs_slot);
+    if !kwargs.is_null() {
+        crate::type_methods::dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(inst_slot),
+            kwargs,
+        )?;
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot))
+}
+
+fn frozendict_alloc(cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    if cls.is_null() || std::ptr::eq(cls, fd_type) {
+        return Ok(pyre_object::w_frozendict_new());
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let instance = pyre_object::w_instance_new(cls);
+    let instance = pyre_object::gc_roots::pin_root(instance);
+    let backing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    crate::type_methods::set_dict_backing(
+        instance,
+        pyre_object::gc_roots::shadow_stack_get(backing_slot),
+    );
+    Ok(instance)
+}
+
 /// `boolobject.py descr_new`: `space.newbool(space.is_true(w_obj))`.
 ///
 /// The body is this leaf so `BuiltinCode.func` joins the wrapper family.
@@ -9105,8 +9239,16 @@ fn init_str_type(ns: PyObjectRef) {
 fn dict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_dict_receiver(args, "__sizeof__", false)?;
     crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    mapping_sizeof(args[0])
+}
 
-    let receiver = args[0];
+fn frozendict_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "__sizeof__", false)?;
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    mapping_sizeof(args[0])
+}
+
+fn mapping_sizeof(receiver: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let receiver_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(receiver);
@@ -9242,11 +9384,22 @@ fn dict_fromkeys_impl(
     // and route through `space.setitem` so the result is an instance
     // of the subclass.
     let mut value = value;
-    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-    if cls.is_null()
+    let mut w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    let w_fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    let exact_fd = !cls.is_null()
+        && !w_fd_type.is_null()
+        && pyre_object::with_roots!(cls, iterable, value, w_dict_type =>
+            crate::baseobjspace::is_w(cls, w_fd_type)
+        );
+    if exact_fd
+        || cls.is_null()
         || pyre_object::with_roots!(cls, iterable, value => crate::baseobjspace::is_w(cls, w_dict_type))
     {
-        let mut d = pyre_object::w_dict_new();
+        let mut d = if exact_fd {
+            pyre_object::w_frozendict_new()
+        } else {
+            pyre_object::w_dict_new()
+        };
         // Python 3.14's exact-set/frozenset fast path carries each
         // entry's cached hash into the new exact dict.  This is the
         // reverse of `set_update_dict_lock_held` and avoids a
@@ -9270,7 +9423,7 @@ fn dict_fromkeys_impl(
                 let d = pyre_object::gc_roots::shadow_stack_get(sp);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                 unsafe { pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash) }
-                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
+                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key.obj))?;
                 index = slot + 1;
             }
             return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
@@ -9304,7 +9457,7 @@ fn dict_fromkeys_impl(
                 let d = pyre_object::gc_roots::shadow_stack_get(sp);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
                 pyre_object::w_dict_store_checked(d, key, value)
-                    .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))?;
+                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(d, key))?;
             }
             pyre_object::gc_roots::shadow_stack_get(sp)
         };
@@ -9317,11 +9470,52 @@ fn dict_fromkeys_impl(
         // the fill value, the new dict and every collected key ride the
         // shadow stack rather than a raw `Vec`.
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::pin_roots(&[iterable, value]);
-        let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        let d = crate::call::call_function_impl_result(cls, &[])?;
+        let sp = pyre_object::gc_roots::pin_roots(&[iterable, value, cls]);
+        let d = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            &[],
+        )?;
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-        let d = pyre_object::gc_roots::pin_root(d);
+        let _ = pyre_object::gc_roots::pin_root(d);
+        let w_fd_type = crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE);
+        // `_PyDict_FromKeys` `need_copy`: `cls()` returned a frozendict
+        // (exact or subclass). Fill an unpublished exact copy, then `cls(copy)`.
+        let need_copy = !w_fd_type.is_null()
+            && unsafe {
+                crate::baseobjspace::isinstance_w(
+                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                    w_fd_type,
+                )
+            };
+        if need_copy {
+            let src = crate::type_methods::resolve_dict_backing(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            );
+            let work = unsafe {
+                if src.is_null() {
+                    pyre_object::w_frozendict_new()
+                } else {
+                    pyre_object::w_frozendict_copy_from(src)
+                }
+            };
+            let work_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(work);
+            let items =
+                crate::baseobjspace::listview(pyre_object::gc_roots::shadow_stack_get(sp), -1)?;
+            let key_base = pyre_object::gc_roots::pin_roots(&items);
+            let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
+            for i in 0..key_len {
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + i);
+                let work = pyre_object::gc_roots::shadow_stack_get(work_slot);
+                let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+                unsafe { pyre_object::w_dict_store_checked(work, key, value) }
+                    .map_err(|_| crate::baseobjspace::take_pending_mapping_key_error(work, key))?;
+            }
+            return crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(sp + 2),
+                &[pyre_object::gc_roots::shadow_stack_get(work_slot)],
+            );
+        }
         let items = crate::baseobjspace::listview(pyre_object::gc_roots::shadow_stack_get(sp), -1)?;
         let key_base = pyre_object::gc_roots::pin_roots(&items);
         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
@@ -9783,7 +9977,7 @@ fn init_dict_type(ns: PyObjectRef) {
                     // NotImplemented. Handing it to `compare` would re-dispatch
                     // to this `__eq__` (the operand is not a dict for compare's
                     // fast path) and recurse.
-                    if !unsafe { pyre_object::is_dict(b) } {
+                    if !unsafe { pyre_object::is_any_dict(b) } {
                         return Ok(pyre_object::w_not_implemented());
                     }
                     crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)
@@ -10062,6 +10256,533 @@ fn init_dict_type(ns: PyObjectRef) {
         ("clear", "($self, /)"),
         ("copy", "($self, /)"),
         ("__reversed__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            text_signature,
+        );
+    }
+}
+
+fn frozendict_is_any_dict(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    if unsafe { pyre_object::is_any_dict(obj) } {
+        return true;
+    }
+    let fd_type = gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    if !fd_type.is_null() && unsafe { crate::baseobjspace::isinstance_w(obj, fd_type) } {
+        return true;
+    }
+    unsafe { crate::baseobjspace::isinstance_dict_w(obj) }
+}
+
+/// `frozendict_or` then `_PyDict_Or`. Identity only when
+/// `PyFrozenDict_CheckExact(self)`; a frozendict left copies as an exact
+/// `frozendict`, a dict left copies as a `dict`.
+fn frozendict_or_binop(
+    left: PyObjectRef,
+    right: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[left, right]);
+    let left = || pyre_object::gc_roots::shadow_stack_get(base);
+    let right = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if unsafe { pyre_object::is_exact_type(left(), &pyre_object::FROZENDICT_TYPE) } {
+        if unsafe {
+            pyre_object::w_dict_len(left()) == 0
+                && pyre_object::is_exact_type(right(), &pyre_object::FROZENDICT_TYPE)
+        } {
+            return Ok(right());
+        }
+        if unsafe {
+            pyre_object::is_exact_any_dict(right()) && pyre_object::w_dict_len(right()) == 0
+        } {
+            return Ok(left());
+        }
+    }
+    if !frozendict_is_any_dict(left()) || !frozendict_is_any_dict(right()) {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let fd_type = gettypeobject(&pyre_object::FROZENDICT_TYPE);
+    let left_is_fd =
+        !fd_type.is_null() && unsafe { crate::baseobjspace::isinstance_w(left(), fd_type) };
+    if left_is_fd {
+        let src = crate::type_methods::resolve_dict_backing(left());
+        let new = unsafe {
+            if src.is_null() {
+                pyre_object::w_frozendict_new()
+            } else {
+                pyre_object::w_frozendict_copy_from(src)
+            }
+        };
+        let new_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(new);
+        crate::type_methods::dict_update1(
+            pyre_object::gc_roots::shadow_stack_get(new_slot),
+            right(),
+        )?;
+        Ok(pyre_object::gc_roots::shadow_stack_get(new_slot))
+    } else {
+        let mut src = crate::type_methods::resolve_dict_backing(left());
+        let other =
+            pyre_object::with_roots!(src => crate::type_methods::resolve_dict_backing(right()));
+        Ok(dict_or_new(src, other))
+    }
+}
+
+fn frozendict_descr_or(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    frozendict_or_binop(args[0], args[1])
+}
+
+fn frozendict_descr_ror(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    frozendict_or_binop(args[1], args[0])
+}
+
+fn frozendict_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "copy", false)?;
+    crate::type_methods::arity_exact(args, "copy", 0)?;
+    let self_ = args[0];
+    if unsafe { pyre_object::is_exact_type(self_, &pyre_object::FROZENDICT_TYPE) } {
+        return Ok(self_);
+    }
+    let src = crate::type_methods::resolve_dict_backing(self_);
+    unsafe {
+        if src.is_null() {
+            Ok(pyre_object::w_frozendict_new())
+        } else {
+            Ok(pyre_object::w_frozendict_copy_from(src))
+        }
+    }
+}
+
+fn frozendict_getnewargs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "__getnewargs__", false)?;
+    crate::type_methods::arity_no_args(args, "__getnewargs__")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let src = crate::type_methods::resolve_dict_backing(args[0]);
+    let d = unsafe {
+        if src.is_null() {
+            pyre_object::w_dict_new()
+        } else {
+            pyre_object::w_dict_copy(src)
+        }
+    };
+    let d_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(d);
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(d_slot),
+    ]))
+}
+
+fn frozendict_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_str_new_managed("frozendict()"));
+    }
+    crate::type_methods::require_frozendict_receiver(args, "__repr__", false)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let backing = crate::type_methods::resolve_dict_backing(obj);
+    if backing.is_null() {
+        let tp_name = crate::error::type_name_of(obj);
+        return Err(crate::PyError::type_error(format!(
+            "descriptor '__repr__' for 'frozendict' objects \
+             doesn't apply to a '{tp_name}' object"
+        )));
+    }
+    let name = if let Some(w_type) = r#type(obj) {
+        unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) }
+    } else {
+        "frozendict"
+    };
+    if unsafe { pyre_object::w_dict_len(backing) } == 0 {
+        return Ok(pyre_object::w_str_new_managed(&format!("{name}()")));
+    }
+    let body = unsafe { crate::display::dict_repr(backing)? };
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.push_str(name);
+    out.push_str("(");
+    out.push_wtf8(&body);
+    out.push_str(")");
+    Ok(pyre_object::w_str_from_wtf8_managed(out))
+}
+
+fn frozendict_descr_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_frozendict_receiver(args, "__hash__", false)?;
+    crate::type_methods::arity_no_args(args, "__hash__")?;
+    let mut recv = args[0];
+    let src = pyre_object::with_roots!(recv => crate::type_methods::resolve_dict_backing(recv));
+    let src = if src.is_null() { recv } else { src };
+    Ok(pyre_object::w_int_new(
+        crate::builtins::frozendict_structural_hash(src)?,
+    ))
+}
+
+fn frozendict_descr_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_exact(args, "__getitem__", 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let backing = crate::type_methods::resolve_dict_backing(self_);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if backing.is_null() {
+        return crate::baseobjspace::getitem(self_, key);
+    }
+    match unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(backing, key) } {
+        Ok(Some(val)) => Ok(val),
+        Ok(None) => crate::baseobjspace::dict_missing_or_key_error(self_, key),
+        Err(_) => Err(crate::baseobjspace::take_pending_mapping_key_error(
+            self_, key,
+        )),
+    }
+}
+
+fn frozendict_descr_contains(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_exact(args, "__contains__", 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let backing = crate::type_methods::resolve_dict_backing(self_);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if backing.is_null() {
+        return Ok(pyre_object::w_bool_from(
+            crate::baseobjspace::contains_slot(self_, key)?,
+        ));
+    }
+    match unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(backing, key) } {
+        Ok(v) => Ok(pyre_object::w_bool_from(v.is_some())),
+        Err(_) => Err(crate::baseobjspace::take_pending_mapping_key_error(
+            self_, key,
+        )),
+    }
+}
+
+fn frozendict_descr_len(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 0)?;
+    let mut recv = args[0];
+    let backing = pyre_object::with_roots!(recv => crate::type_methods::resolve_dict_backing(recv));
+    if backing.is_null() {
+        return crate::baseobjspace::len_slot(recv);
+    }
+    Ok(pyre_object::w_int_new(
+        unsafe { pyre_object::w_dict_len(backing) } as i64,
+    ))
+}
+
+fn frozendict_descr_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.is_empty() {
+        return Ok(pyre_object::w_none());
+    }
+    let mut recv = args[0];
+    let backing = pyre_object::with_roots!(recv => crate::type_methods::resolve_dict_backing(recv));
+    if backing.is_null() {
+        return crate::baseobjspace::iter(recv);
+    }
+    crate::baseobjspace::iter(backing)
+}
+
+fn frozendict_descr_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_iterator_receiver(
+        args,
+        "__reversed__",
+        true,
+        "frozendict",
+        &pyre_object::FROZENDICT_TYPE,
+        true,
+    )?;
+    let d = crate::type_methods::resolve_dict_backing(args[0]);
+    Ok(
+        pyre_object::dictmultiobject::w_dict_view_reverse_iterator_new(
+            d,
+            pyre_object::dictmultiobject::DictViewKind::Keys,
+        ),
+    )
+}
+
+fn frozendict_descr_eq(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    if unsafe { pyre_object::is_dict_proxy(pyre_object::gc_roots::shadow_stack_get(base + 1)) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let resolve = |o: PyObjectRef| {
+        let backing = crate::type_methods::resolve_dict_backing(o);
+        if backing.is_null() { o } else { backing }
+    };
+    let mut a = resolve(pyre_object::gc_roots::shadow_stack_get(base));
+    let b =
+        pyre_object::with_roots!(a => resolve(pyre_object::gc_roots::shadow_stack_get(base + 1)));
+    if !unsafe { pyre_object::is_any_dict(b) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    crate::baseobjspace::compare(a, b, crate::baseobjspace::CompareOp::Eq)
+}
+
+fn frozendict_descr_ne(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_slot(args, 1)?;
+    let _scope = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    if unsafe { pyre_object::is_dict_proxy(pyre_object::gc_roots::shadow_stack_get(base + 1)) } {
+        return Ok(pyre_object::w_not_implemented());
+    }
+    let eq = frozendict_descr_eq(&[
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ])?;
+    if unsafe { pyre_object::is_not_implemented(eq) } {
+        return Ok(eq);
+    }
+    Ok(pyre_object::w_bool_from(!crate::baseobjspace::is_true(eq)?))
+}
+
+fn init_frozendict_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__doc__",
+            w_str_new(
+                "frozendict() -> new empty immutable dictionary\n\
+                 frozendict(mapping) -> new immutable dictionary initialized from a mapping\n\
+                     object's (key, value) pairs\n\
+                 frozendict(iterable) -> new immutable dictionary initialized as if via:\n\
+                     d = {}\n\
+                     for k, v in iterable:\n\
+                         d[k] = v\n\
+                     d = frozendict(d)\n\
+                 frozendict(**kwargs) -> new immutable dictionary initialized with the name=value\n\
+                     pairs in the keyword argument list.  For example:  frozendict(one=1, two=2)",
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__sizeof__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__sizeof__",
+                frozendict_descr_sizeof,
+                1,
+                "($self, /)",
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__new__",
+            make_new_descr_passthrough1(frozendict_descr_new, frozendict_descr_new_args)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "get",
+            make_builtin_function("get", crate::type_methods::__majit_wrap_dict_descr_get)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "keys",
+            make_builtin_function_with_arity(
+                "keys",
+                crate::type_methods::__majit_wrap_dict_descr_keys,
+                1,
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "values",
+            make_builtin_function_with_arity(
+                "values",
+                crate::type_methods::__majit_wrap_dict_descr_values,
+                1,
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "items",
+            make_builtin_function_with_arity(
+                "items",
+                crate::type_methods::__majit_wrap_dict_descr_items,
+                1,
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__getitem__",
+            make_builtin_function_with_arity("__getitem__", frozendict_descr_getitem, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__contains__",
+            make_builtin_function_with_arity("__contains__", frozendict_descr_contains, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__len__",
+            make_builtin_function_with_arity("__len__", frozendict_descr_len, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__repr__",
+            make_builtin_function_with_arity("__repr__", frozendict_descr_repr, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__iter__",
+            make_builtin_function_with_arity("__iter__", frozendict_descr_iter, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__hash__",
+            crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                "__hash__",
+                frozendict_descr_hash,
+                1,
+                "($self, /)",
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__eq__",
+            make_builtin_function_with_arity("__eq__", frozendict_descr_eq, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__ne__",
+            make_builtin_function_with_arity("__ne__", frozendict_descr_ne, 2)
+        )
+    };
+    for name in ["__lt__", "__le__", "__gt__", "__ge__"] {
+        unsafe {
+            crate::__pyre_put_new!(
+                ns_slot,
+                name,
+                make_builtin_function_with_arity(name, |_| Ok(w_not_implemented()), 2)
+            )
+        };
+    }
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__or__",
+            make_builtin_function_with_arity("__or__", frozendict_descr_or, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__ror__",
+            make_builtin_function_with_arity("__ror__", frozendict_descr_ror, 2)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__reversed__",
+            make_builtin_function_with_arity("__reversed__", frozendict_descr_reversed, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "copy",
+            make_builtin_function_with_arity("copy", frozendict_method_copy, 1)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__getnewargs__",
+            make_builtin_function_with_arity("__getnewargs__", frozendict_getnewargs, 1)
+        )
+    };
+    let fromkeys = crate::gateway::make_builtin_function_with_text_signature(
+        "fromkeys",
+        descr_fromkeys,
+        "($type, iterable, value=None, /)",
+    );
+    let fromkeys_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(fromkeys);
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "fromkeys",
+            pyre_object::function::w_classmethod_new(pyre_object::gc_roots::shadow_stack_get(
+                fromkeys_slot
+            ))
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__iter__", "($self, /)"),
+        ("__or__", "($self, value, /)"),
+        ("__ror__", "($self, value, /)"),
+        ("__len__", "($self, /)"),
+        ("__getitem__", "($self, key, /)"),
+        ("__contains__", "($self, key, /)"),
+        ("get", "($self, key, default=None, /)"),
+        ("keys", "($self, /)"),
+        ("items", "($self, /)"),
+        ("values", "($self, /)"),
+        ("copy", "($self, /)"),
+        ("__reversed__", "($self, /)"),
+        ("__getnewargs__", "($self, /)"),
     ] {
         set_type_callable_text_signature(
             pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -14343,6 +15064,9 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
         (6 * word, word)
     } else if is(&pyre_object::DICT_TYPE) {
         (8 * word, 0)
+    } else if is(&pyre_object::FROZENDICT_TYPE) {
+        // `PyFrozenDictObject`: `PyDictObject` plus `ma_hash`.
+        (9 * word, 0)
     } else if is(&pyre_object::setobject::SET_TYPE) || is(&pyre_object::setobject::FROZENSET_TYPE) {
         (27 * word, 0)
     } else if is(&pyre_object::functional::RANGE_TYPE) {
@@ -26123,7 +26847,7 @@ fn init_bytes_type(ns: PyObjectRef) {
                         None,
                         None,
                         0,
-                        4,
+                        3,
                     ),
                 ),
                 1,
@@ -26597,7 +27321,7 @@ fn init_bytes_type(ns: PyObjectRef) {
         ("lower", "($self, /)"),
         ("lstrip", "($self, bytes=None, /)"),
         ("partition", "($self, sep, /)"),
-        ("replace", "($self, old, new, count=-1, /)"),
+        ("replace", "($self, old, new, /, count=-1)"),
         ("removeprefix", "($self, prefix, /)"),
         ("removesuffix", "($self, suffix, /)"),
         ("rfind", "($self, sub[, start[, end]], /)"),
@@ -29895,6 +30619,86 @@ fn descr_reverse(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_none())
 }
 
+/// `bytearray_take_bytes_impl` — take the first *n* bytes (or all, when *n*
+/// is omitted/`None`) as a new `bytes`, leaving the rest in `self`.
+fn bytearray_method_take_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::require_receiver(args, "take_bytes")?;
+    crate::type_methods::arity_at_most(args, "take_bytes", 1)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let to_take_spec = if args.len() > 1 {
+        let mut w_n = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        if unsafe { pyre_object::is_none(w_n) } {
+            None
+        } else if !unsafe { crate::builtins::index_check(w_n) } {
+            return Err(crate::PyError::type_error("n must be an integer or None"));
+        } else {
+            let indexed = pyre_object::with_roots!(w_n => crate::baseobjspace::space_index(w_n))?;
+            match pyre_object::with_roots!(w_n => crate::baseobjspace::int_w(indexed)) {
+                Ok(i) => Some(i),
+                Err(e) if e.kind == crate::PyErrorKind::OverflowError => {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            crate::baseobjspace::object_functionstr_type_name(w_n)
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    } else {
+        None
+    };
+    // `n.__index__()` may have resized `self`; use the current size.
+    let size = unsafe { pyre_object::bytearrayobject::w_bytearray_len(recv()) } as i64;
+    let to_take = match to_take_spec {
+        None => size,
+        Some(n) if n < 0 => n + size,
+        Some(n) => n,
+    };
+    if to_take < 0 || to_take > size {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::IndexError,
+            format!("can't take {to_take} bytes outside size {size}"),
+        ));
+    }
+    let ba = recv();
+    unsafe { crate::builtins::bytearray_check_exports(ba)? };
+    let ba_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(ba);
+    if to_take == 0 || size == 0 {
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
+    }
+    let to_take = to_take as usize;
+    let old_size = unsafe {
+        pyre_object::bytearrayobject::w_bytearray_len(pyre_object::gc_roots::shadow_stack_get(
+            ba_slot,
+        ))
+    };
+    if to_take == old_size {
+        let taken = unsafe {
+            let ba = pyre_object::gc_roots::shadow_stack_get(ba_slot);
+            let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+            let taken = std::mem::take(vec);
+            pyre_object::bytearrayobject::w_bytearray_reinit_empty(ba);
+            taken
+        };
+        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&taken));
+    }
+    let mut taken = crate::builtins::try_vec_with_capacity::<u8>(to_take)?;
+    unsafe {
+        let ba = pyre_object::gc_roots::shadow_stack_get(ba_slot);
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
+        taken.extend_from_slice(&vec[..to_take]);
+        vec.drain(..to_take);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(ba, old_size);
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&taken))
+}
+
 /// `bytearrayobject.py:descr_clear` — empty the bytearray in place.
 fn descr_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "clear")?;
@@ -30541,7 +31345,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
                         None,
                         None,
                         0,
-                        4,
+                        3,
                     ),
                 ),
                 1,
@@ -30802,6 +31606,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
             make_builtin_function("copy", bytearray_method_copy)
         )
     };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "take_bytes",
+            make_builtin_function("take_bytes", bytearray_method_take_bytes)
+        )
+    };
     // Subscript slots exposed as callable dunders.  Each binds the direct
     // slot body so a subclass override's `super().__getitem__` reaches the
     // inherited builtin subscript instead of re-entering override dispatch.
@@ -31013,7 +31824,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         ("partition", "($self, sep, /)"),
         ("pop", "($self, index=-1, /)"),
         ("remove", "($self, value, /)"),
-        ("replace", "($self, old, new, count=-1, /)"),
+        ("replace", "($self, old, new, /, count=-1)"),
         ("removeprefix", "($self, prefix, /)"),
         ("removesuffix", "($self, suffix, /)"),
         ("resize", "($self, size, /)"),
@@ -31029,6 +31840,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         ("startswith", "($self, prefix[, start[, end]], /)"),
         ("strip", "($self, bytes=None, /)"),
         ("swapcase", "($self, /)"),
+        ("take_bytes", "($self, n=None, /)"),
         ("title", "($self, /)"),
         ("translate", "($self, table, /, delete=b'')"),
         ("upper", "($self, /)"),
@@ -33440,7 +34252,28 @@ fn generator_getter_for(args: &[PyObjectRef], field: usize, kind: u8) -> crate::
             }
         }
         5 => return generator_name_value(obj, false),
-        _ => return generator_name_value(obj, true),
+        6 => return generator_name_value(obj, true),
+        // `gen_getstate` / `cr_getstate` / `ag_getstate`: the frame state
+        // named with the kind's prefix.
+        _ => {
+            let state = unsafe {
+                if pyre_object::generator::w_generator_is_running(obj) {
+                    "RUNNING"
+                } else if pyre_object::generator::w_generator_is_exhausted(obj) {
+                    "CLOSED"
+                } else if pyre_object::generator::w_generator_is_started(obj) {
+                    "SUSPENDED"
+                } else {
+                    "CREATED"
+                }
+            };
+            let prefix = match kind {
+                0 => "GEN",
+                1 => "CORO",
+                _ => "AGEN",
+            };
+            w_str_new_managed(&format!("{prefix}_{state}"))
+        }
     })
 }
 
@@ -33476,6 +34309,9 @@ fn generator_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 }
 fn generator_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     generator_getter(args, 6)
+}
+fn generator_get_state(args: &[PyObjectRef]) -> crate::PyResult {
+    generator_getter(args, 7)
 }
 fn coroutine_get_running(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 0)
@@ -33521,6 +34357,9 @@ fn coroutine_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 fn coroutine_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 6)
 }
+fn coroutine_get_state(args: &[PyObjectRef]) -> crate::PyResult {
+    coroutine_getter(args, 7)
+}
 fn async_generator_get_running(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = args.get(1).copied().unwrap_or(PY_NULL);
     if !unsafe { pyre_object::generator::is_async_generator(obj) } {
@@ -33549,6 +34388,9 @@ fn async_generator_get_name(args: &[PyObjectRef]) -> crate::PyResult {
 }
 fn async_generator_get_qualname(args: &[PyObjectRef]) -> crate::PyResult {
     async_generator_getter(args, 6)
+}
+fn async_generator_get_state(args: &[PyObjectRef]) -> crate::PyResult {
+    async_generator_getter(args, 7)
 }
 
 fn generator_set_name_common(args: &[PyObjectRef], qualname: bool, kind: u8) -> crate::PyResult {
@@ -33797,6 +34639,7 @@ fn init_generator_type(ns: PyObjectRef) {
     for (name, getter) in [
         ("gi_running", generator_get_running as DunderFn),
         ("gi_suspended", generator_get_suspended as DunderFn),
+        ("gi_state", generator_get_state as DunderFn),
         ("gi_frame", generator_get_frame as DunderFn),
         ("gi_code", generator_get_code as DunderFn),
         ("gi_yieldfrom", generator_get_yieldfrom as DunderFn),
@@ -33993,6 +34836,7 @@ fn init_coroutine_type(ns: PyObjectRef) {
     for (name, getter) in [
         ("cr_running", coroutine_get_running as DunderFn),
         ("cr_suspended", coroutine_get_suspended as DunderFn),
+        ("cr_state", coroutine_get_state as DunderFn),
         ("cr_frame", coroutine_get_frame as DunderFn),
         ("cr_code", coroutine_get_code as DunderFn),
         ("cr_await", coroutine_get_await as DunderFn),
@@ -34179,6 +35023,7 @@ fn init_async_generator_type(ns: PyObjectRef) {
     for (name, getter) in [
         ("ag_running", async_generator_get_running as DunderFn),
         ("ag_suspended", async_generator_get_suspended as DunderFn),
+        ("ag_state", async_generator_get_state as DunderFn),
         ("ag_frame", async_generator_get_frame as DunderFn),
         ("ag_code", async_generator_get_code as DunderFn),
         ("ag_await", async_generator_get_await as DunderFn),
@@ -34946,7 +35791,7 @@ fn init_range_iterator_type(ns: PyObjectRef) {
             ("__length_hint__", "($self, /)"),
             ("__next__", "($self, /)"),
             ("__reduce__", "($self, /)"),
-            ("__setstate__", "($self, object, /)"),
+            ("__setstate__", "($self, state, /)"),
         ],
     );
 }
@@ -35000,7 +35845,7 @@ fn init_long_range_iterator_type(ns: PyObjectRef) {
             ("__length_hint__", "($self, /)"),
             ("__next__", "($self, /)"),
             ("__reduce__", "($self, /)"),
-            ("__setstate__", "($self, object, /)"),
+            ("__setstate__", "($self, state, /)"),
         ],
     );
 }

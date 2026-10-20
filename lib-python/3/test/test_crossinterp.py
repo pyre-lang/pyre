@@ -1,6 +1,4 @@
 import contextlib
-import importlib
-import importlib.util
 import itertools
 import sys
 import traceback
@@ -159,6 +157,10 @@ BUILTIN_CONTAINERS = [
     {},
     {1: 7, 2: 8, 3: 9},
     {1: [1], 2: (2,), 3: {3: 4}},
+    # frozendict
+    frozendict(),
+    frozendict({1: 7, 2: 8, 3: 9}),
+    frozendict({1: [1], 2: (2,), 3: {3: 4}, 4: frozendict({5: 6})}),
     # set
     set(),
     {1, 2, 3},

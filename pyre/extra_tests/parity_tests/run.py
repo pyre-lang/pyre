@@ -2,7 +2,7 @@
 """Parity baseline runner.
 
 Runs every script under `pyre/extra_tests/parity_tests/` against:
-  - CPython 3.14 (`PYRE_CHECK_PYTHON3`, else `python3.14` on PATH),
+  - CPython 3.15 (`PYRE_CHECK_PYTHON3`, else `python3.15` on PATH),
   - the pyre-dynasm binary (release build),
   - the pyre-cranelift binary (release build, if present).
 
@@ -94,7 +94,7 @@ PARITY_REASON_PREFIX = "# parity-tests reason:"
 # that bury the ones that are. Comparing a backend against the wrong reference
 # measures nothing, so a run that cannot find the right one stops rather than
 # reporting what it found.
-CPYTHON_TARGET = (3, 14)
+CPYTHON_TARGET = (3, 15)
 
 PYPY_DIVERGES_PREFIX = "# pyre-check: pypy-diverges:"
 
@@ -278,7 +278,7 @@ def _probe(command: str) -> tuple[tuple[int, int], str] | None:
     """What the interpreter reports as its version and its own path.
 
     `None` when the command did not run at all, which on Windows is what a
-    `python3.14` that names an extensionless shim rather than an executable
+    `python3.15` that names an extensionless shim rather than an executable
     does — `shutil.which` finds it and `CreateProcess` cannot start it.
     """
     try:
@@ -312,7 +312,7 @@ def _cpython() -> str:
     that does not depend on the PATH they inherit.
     """
     named = os.environ.get("PYRE_CHECK_PYTHON3")
-    candidates = [named] if named else ["python3.14", "python3", "python"]
+    candidates = [named] if named else ["python3.15", "python3", "python"]
     rejected = []
     for candidate in candidates:
         if named is None and shutil.which(candidate) is None:

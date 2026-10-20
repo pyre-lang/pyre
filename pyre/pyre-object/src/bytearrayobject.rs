@@ -355,6 +355,21 @@ pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
     }
 }
 
+/// `bytearray_reinit_from_bytes(self, 0, 0)` — empty payload, `ob_alloc == 0`.
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_bytearray_reinit_empty(obj: PyObjectRef) {
+    unsafe {
+        let ba = &mut *(obj as *mut W_BytearrayObject);
+        (*ba.data).clear();
+        ba.set_length_relaxed(0);
+        ba.alloc = 0;
+        ba.logical_offset = 0;
+    }
+}
+
 /// CPython `bytearray_setslice_linear`: a shrinking prefix slice advances
 /// `ob_start` before entering the resize policy.
 /// # Safety

@@ -233,6 +233,18 @@ pub(crate) fn init_sre_pattern_type(ns: PyObjectRef) {
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
+            "prefixmatch",
+            sre_pattern_sig(
+                "prefixmatch",
+                sre_pattern_prefixmatch,
+                vec!["self", "string", "pos", "endpos"],
+                2,
+            )
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
             "match",
             sre_pattern_sig(
                 "match",
@@ -754,6 +766,13 @@ pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
             ns_slot,
             "__next__",
             make_builtin_function("__next__", sre_scanner_next_w)
+        )
+    };
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "prefixmatch",
+            make_builtin_function("prefixmatch", sre_scanner_match)
         )
     };
     unsafe {
@@ -1617,6 +1636,9 @@ fn make_match(
     w_sre_match_new(pat, string, w_buffer, pos, endpos, lastindex, &spans)
 }
 
+fn sre_pattern_prefixmatch(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    do_match(args, false, false, "prefixmatch")
+}
 fn sre_pattern_match(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     do_match(args, false, false, "match")
 }

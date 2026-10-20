@@ -6581,12 +6581,12 @@ pub extern "C" fn bh_delete_attr_fn(
 /// IMPORT_FROM residual (`import_from` HLOp → `residual_call_ir_r`).
 /// Resolves the attribute name from the jitcode's own code object via
 /// `name_idx` (same `co_names` invariant as `bh_load_attr_fn`) and runs
-/// `importing::import_from(module, name)` — first `getattr` on the module,
-/// then a `sys.modules` lookup for `<__name__>.<name>`.  Both can run a
-/// user `__getattribute__` / `__getattr__` → `MayForce`.  `module` is the
-/// peeked TOS (IMPORT_FROM does not pop it).  On error the exception is
-/// published through `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`
-/// and the call returns 0.
+/// `eval.rs import_from`: a lazy placeholder takes `lazy_import_from`,
+/// otherwise `importing::import_from` (getattr then a `sys.modules`
+/// lookup).  Both can run a user `__getattribute__` / `__getattr__` →
+/// `MayForce`.  `module` is the peeked TOS (IMPORT_FROM does not pop it).
+/// On error the exception is published through `BH_LAST_EXC_VALUE` for
+/// the trailing `GuardNoException` and the call returns 0.
 pub extern "C" fn bh_import_from_fn(
     module: PyObjectRef,
     w_code: PyObjectRef,
@@ -6605,7 +6605,14 @@ pub extern "C" fn bh_import_from_fn(
         return PY_NULL;
     }
     let name = code.names[idx].as_ref();
-    match pyre_interpreter::importing::import_from(module, name) {
+    // `pyopcode.py IMPORT_FROM` / `eval.rs import_from`: a lazy placeholder
+    // module is a projection (`_PyEval_LazyImportFrom`), not a getattr.
+    let result = if unsafe { pyre_object::is_lazy_import(module) } {
+        pyre_interpreter::lazyimport::lazy_import_from(module, name)
+    } else {
+        pyre_interpreter::importing::import_from(module, name)
+    };
+    match result {
         Ok(attr) => attr,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
@@ -7737,7 +7744,7 @@ pub extern "C" fn bh_match_class_fn(
 
 /// LOAD_COMMON_CONSTANT residual (`load_common_constant` HLOp →
 /// `residual_call_ir_r`).  `disc` is the `CommonConstant` discriminant
-/// (0-6).  Resolves the pushed object through the shared
+/// (0-11).  Resolves the pushed object through the shared
 /// `opcode_ops::load_common_constant_value`, matching the interpreter:
 /// immortal type/exception classes for the class variants, a freshly
 /// built builtin function for `all`/`any` (hence `MayForce` — it

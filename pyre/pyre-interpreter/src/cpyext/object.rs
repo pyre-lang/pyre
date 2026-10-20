@@ -1842,12 +1842,12 @@ pub unsafe extern "C" fn PyObject_CallOneArg(
 #[cfg(test)]
 mod tests {
     /// `Py_GetConstant` takes the number an extension compiled against
-    /// `include/pyre3.14t/object.h` wrote, so the identifiers are one table in
+    /// `include/pyre3.15t/object.h` wrote, so the identifiers are one table in
     /// two places.  This walks the header and rejects any identifier whose
     /// number the Rust side spells differently, or does not spell at all.
     #[test]
     fn every_constant_identifier_is_the_number_the_header_gives_it() {
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/object.h");
 
         let mut header: Vec<(&str, usize)> = Vec::new();
         for line in HEADER.lines() {

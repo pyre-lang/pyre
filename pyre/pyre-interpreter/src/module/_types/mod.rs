@@ -136,6 +136,11 @@ pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
     );
     store(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "LazyImportType",
+        crate::typedef::gettypeobject(&pyre_object::LAZY_IMPORT_TYPE),
+    );
+    store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "MappingProxyType",
         crate::typedef::gettypeobject(&pyre_object::MAPPING_PROXY_TYPE),
     );

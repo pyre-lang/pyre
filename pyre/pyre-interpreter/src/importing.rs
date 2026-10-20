@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
     Arc, LazyLock, OnceLock,
-    atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering},
 };
 // `Path` and `PathBuf` both appear in the host_env-independent module-search
 // surface — `SYS_PATH`, `find_module`, `parent_package_path`, `load_part`,
@@ -1365,7 +1365,7 @@ fn extension_abi_suffix() -> String {
             tag => format!("-{tag}"),
         };
         let shared_ext = if cfg!(windows) { ".pyd" } else { ".so" };
-        format!(".pyre314{platform_tag}{shared_ext}")
+        format!(".pyre315{platform_tag}{shared_ext}")
     }
 }
 
@@ -1540,7 +1540,7 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     let include_py = if extension_loader_present() && !base_prefix.as_os_str().is_empty() {
         base_prefix
             .join("include")
-            .join("pyre3.14t")
+            .join("pyre3.15t")
             .to_string_lossy()
             .into_owned()
     } else {
@@ -1572,7 +1572,7 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // `setuptools`' vendored `_distutils.sysconfig._get_python_inc_posix_prefix`
     // builds the include directory as `include/<impl><version><abiflags>` with
     // `<impl>` chosen by `IS_PYPY = '__pypy__' in sys.builtin_module_names`.
-    // Pyre answers that test and spells its own tree `pyre3.14t`, so the `-I`
+    // Pyre answers that test and spells its own tree `pyre3.15t`, so the `-I`
     // that `build_ext` appends names a directory pyre never installs.  `CFLAGS`
     // is the path that cannot be displaced: `configure_system` builds every
     // extension compile as `cc + ' ' + cflags`, and the unusable `-I` alongside
@@ -1592,8 +1592,8 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     store_str(vars_slot, "AR", "ar");
     store_str(vars_slot, "ARFLAGS", "rc");
     store_str(vars_slot, "EXE", "");
-    store_str(vars_slot, "VERSION", "3.14");
-    store_str(vars_slot, "LDVERSION", "3.14");
+    store_str(vars_slot, "VERSION", "3.15");
+    store_str(vars_slot, "LDVERSION", "3.15");
     // cpyext never uses Py_DEBUG.  Pyre runs its mutators without a global
     // interpreter lock.  Py_ENABLE_SHARED at 1 would add a python shared
     // object to link lines as `-lpython3.x`.
@@ -2594,7 +2594,7 @@ pub(crate) struct StartupPathConfig {
     pub base_prefix: PathBuf,
     /// Bootstrap search entries in PyPy's order.  A source checkout keeps
     /// `lib_pypy` before `lib-python/3`; an installed tree has one merged
-    /// `lib/pyre3.14t` entry.
+    /// `lib/pyre3.15t` entry.
     #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
     pub stdlib_paths: Vec<PathBuf>,
     /// The language stdlib root (the entry containing `os.py` / `site.py`).
@@ -2832,7 +2832,7 @@ fn find_invoked_executable() -> PathBuf {
 }
 
 /// Recognize both PyPy-style source trees (`lib-python/3`) and the packaged
-/// Pyre layout (`lib/pyre3.14t`).  The latter is the installation shape pip and
+/// Pyre layout (`lib/pyre3.15t`).  The latter is the installation shape pip and
 /// venv will consume; accepting the former keeps the repository executable as
 /// the untranslated/development oracle, matching PyPy's two
 /// `compute_stdlib_path_*` arms.
@@ -2845,7 +2845,7 @@ fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
     // `compute_stdlib_path_packaged` and `_sourcetree` both prefer the
     // versioned zip.  It belongs on sys.path, but it is not `sys._stdlib_dir`:
     // PyPy sets that attribute only for an entry containing a real `os.py`.
-    let lib_pyzip = prefix.join("python314.zip");
+    let lib_pyzip = prefix.join("python315.zip");
     if lib_pyzip.is_file() {
         return Some((vec![lib_pyzip], None));
     }
@@ -2869,7 +2869,7 @@ fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
     // `compute_stdlib_path`: release packaging merges the two source trees
     // into one implementation-version directory.
     for packaged in [
-        prefix.join("lib").join("pyre3.14t"),
+        prefix.join("lib").join("pyre3.15t"),
         // cargo-dist's Homebrew formula installs non-binary archive contents
         // into `pkgshare` (`<keg>/share/pyrex`).  This is still a single
         // interpreter-owned prefix, analogous to PyPy's macOS bundle search
@@ -2878,7 +2878,7 @@ fn stdlib_at_prefix(prefix: &Path) -> Option<(Vec<PathBuf>, Option<PathBuf>)> {
             .join("share")
             .join("pyrex")
             .join("lib")
-            .join("pyre3.14t"),
+            .join("pyre3.15t"),
     ] {
         if packaged.join("site.py").is_file() {
             let mut paths = vec![packaged.clone()];
@@ -2981,7 +2981,7 @@ fn prefix_from_stdlib(stdlib: &Path) -> PathBuf {
     let parent = stdlib.parent();
     if stdlib
         .file_name()
-        .is_some_and(|name| name == "python314.zip")
+        .is_some_and(|name| name == "python315.zip")
     {
         return parent.unwrap_or(stdlib).to_path_buf();
     }
@@ -3000,7 +3000,7 @@ fn prefix_from_stdlib(stdlib: &Path) -> PathBuf {
         .is_some_and(|name| name == "lib")
     {
         // cargo-dist Homebrew data lives at
-        // `<keg>/share/pyrex/lib/pyre3.14t`, while the executable still lives
+        // `<keg>/share/pyrex/lib/pyre3.15t`, while the executable still lives
         // at `<keg>/bin/pyre`.  An explicit PYRE_STDLIB pointing at that data
         // must recover the keg, not claim `<keg>/share/pyrex` as sys.prefix.
         if let Some(pyre_share) = parent.and_then(Path::parent)
@@ -4066,6 +4066,7 @@ static SYS_PYCACHE_PREFIX: LazyLock<Mutex<Option<std::ffi::OsString>>> =
 static SYS_WARN_DEFAULT_ENCODING: AtomicBool = AtomicBool::new(false);
 static SYS_CODE_DEBUG_RANGES: AtomicBool = AtomicBool::new(true);
 static SYS_CPU_COUNT: AtomicI64 = AtomicI64::new(-1);
+static SYS_LAZY_IMPORTS: AtomicI32 = AtomicI32::new(-1);
 
 /// Record whether the launcher was given `-S` (no `site` import), so the
 /// `sys.flags.no_site` field built during sys module init reflects it. Set
@@ -4114,12 +4115,19 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     *SYS_WARNOPTIONS.lock() = flags.warnoptions.clone();
     *SYS_STDIO_ENCODING.lock() = flags.stdio_encoding.clone();
     SYS_CPU_COUNT.store(flags.cpu_count.map_or(-1, i64::from), Ordering::Relaxed);
+    SYS_LAZY_IMPORTS.store(flags.lazy_imports, Ordering::Relaxed);
 }
 
 /// `config->cpu_count`: what `-X cpu_count` / PYTHON_CPU_COUNT configured,
 /// or -1 where neither named a count.
 pub fn cpu_count_config() -> i64 {
     SYS_CPU_COUNT.load(Ordering::Relaxed)
+}
+
+/// `PyConfig.lazy_imports` after `config_init_lazy_imports`: `-1` default,
+/// `1` for `-X lazy_imports=all` / `PYTHON_LAZY_IMPORTS=all`.
+pub fn lazy_imports_config() -> i32 {
+    SYS_LAZY_IMPORTS.load(Ordering::Relaxed)
 }
 
 /// Whether the launcher resolved `-X faulthandler` / `-X dev` /
@@ -8513,11 +8521,20 @@ pub fn import_from(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, c
         if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_none()
             && !unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, name) }
         {
-            let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+            let mut dict = unsafe { pyre_object::w_module_get_w_dict(module) };
             if !dict.is_null()
-                && let Some(value) = pyre_object::with_roots!(module => crate::baseobjspace::finditem_str(dict, name))?
+                && let Some(value) = pyre_object::with_roots!(module, dict =>
+                    crate::baseobjspace::finditem_str(dict, name)
+                )?
             {
+                if unsafe { is_lazy_import(value) } {
+                    return crate::lazyimport::maybe_reify_str(value, name, dict);
+                }
                 return Ok(value);
+            }
+            if let Some(loaded) = pyre_object::with_roots!(module => crate::lazyimport::try_load_lazy_submodule(module, name))?
+            {
+                return Ok(loaded);
             }
         }
     }
@@ -9027,17 +9044,17 @@ mod tests {
             PathBuf::from("/src/pyre")
         );
         assert_eq!(
-            prefix_from_stdlib(Path::new("/opt/pyre/lib/pyre3.14t")),
+            prefix_from_stdlib(Path::new("/opt/pyre/lib/pyre3.15t")),
             PathBuf::from("/opt/pyre")
         );
         assert_eq!(
             prefix_from_stdlib(Path::new(
-                "/opt/homebrew/Cellar/pyrex/0.0.2/share/pyrex/lib/pyre3.14t"
+                "/opt/homebrew/Cellar/pyrex/0.0.2/share/pyrex/lib/pyre3.15t"
             )),
             PathBuf::from("/opt/homebrew/Cellar/pyrex/0.0.2")
         );
         assert_eq!(
-            prefix_from_stdlib(Path::new("/opt/pyre/python314.zip")),
+            prefix_from_stdlib(Path::new("/opt/pyre/python315.zip")),
             PathBuf::from("/opt/pyre")
         );
     }
@@ -9050,10 +9067,10 @@ mod tests {
     #[test]
     fn stdlib_layout_prefers_the_versioned_zip_without_claiming_a_directory() {
         let tree = tempfile::tempdir().unwrap();
-        let packaged = tree.path().join("lib/pyre3.14t");
+        let packaged = tree.path().join("lib/pyre3.15t");
         std::fs::create_dir_all(&packaged).unwrap();
         std::fs::write(packaged.join("site.py"), "").unwrap();
-        let zip = tree.path().join("python314.zip");
+        let zip = tree.path().join("python315.zip");
         std::fs::write(&zip, "not opened during path discovery").unwrap();
 
         let (paths, stdlib_dir) = stdlib_at_prefix(tree.path()).unwrap();
@@ -9071,7 +9088,7 @@ mod tests {
         let tree = tempfile::tempdir().unwrap();
         let base = tree.path().join("base");
         let base_executable = base.join("bin/pyre");
-        let base_stdlib = base.join("lib/pyre3.14t");
+        let base_stdlib = base.join("lib/pyre3.15t");
         std::fs::create_dir_all(base_executable.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&base_stdlib).unwrap();
         std::fs::write(&base_executable, "").unwrap();
@@ -9295,8 +9312,8 @@ mod tests {
     fn cflags_include_path_survives_word_splitting() {
         // An ordinary prefix keeps reading the way it always has.
         assert_eq!(
-            quote_for_cflags("/opt/pyre/include/pyre3.14t"),
-            "/opt/pyre/include/pyre3.14t"
+            quote_for_cflags("/opt/pyre/include/pyre3.15t"),
+            "/opt/pyre/include/pyre3.15t"
         );
         // Anything a shell would split on, or that would end the region, is
         // spelled so `split_quoted` and a shell both return one word.

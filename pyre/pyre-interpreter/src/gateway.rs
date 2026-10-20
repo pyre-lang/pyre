@@ -1613,8 +1613,14 @@ pub unsafe fn builtin_code_no_keyword_arguments(
 /// slots everywhere except on the types that expose them through `tp_methods`.
 pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
     match name {
-        "__contains__" => !matches!(type_name, "dict" | "set" | "frozenset" | "FrameLocalsProxy"),
-        "__getitem__" => !matches!(type_name, "dict" | "list" | "FrameLocalsProxy"),
+        "__contains__" => !matches!(
+            type_name,
+            "dict" | "frozendict" | "set" | "frozenset" | "FrameLocalsProxy"
+        ),
+        "__getitem__" => !matches!(
+            type_name,
+            "dict" | "frozendict" | "list" | "FrameLocalsProxy"
+        ),
         _ => matches!(
             name,
             "__abs__"

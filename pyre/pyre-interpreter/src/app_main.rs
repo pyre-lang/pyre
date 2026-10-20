@@ -371,6 +371,8 @@ pub fn import_site(
     // The warnings bootstrap sits outside the `no_site` guard in `app_main.py`,
     // so `-S -Wxxx` still reports a bad filter.
     init_warnoptions(roots.get(globals_slot), ec_ptr);
+    // `pylifecycle.c`: apply `PyConfig.lazy_imports == 1` after site.
+    crate::lazyimport::apply_lazy_imports_mode_after_site();
     true
 }
 

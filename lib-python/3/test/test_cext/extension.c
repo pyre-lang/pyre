@@ -79,7 +79,7 @@ static PyMethodDef _testcext_methods[] = {
 static int
 _testcext_exec(PyObject *module)
 {
-    PyObject *result;
+    PyObject *result, *obj;
 
 #ifdef __STDC_VERSION__
     if (PyModule_AddIntMacro(module, __STDC_VERSION__) < 0) {
@@ -95,8 +95,19 @@ _testcext_exec(PyObject *module)
     Py_BUILD_ASSERT(sizeof(int) == sizeof(unsigned int));
     assert(Py_BUILD_ASSERT_EXPR(sizeof(int) == sizeof(unsigned int)) == 0);
 
+    // Test Py_CLEAR()
+    obj = NULL;
+    Py_CLEAR(obj);
+
+    // Test that Py_BEGIN_CRITICAL_SECTION is available
+    Py_BEGIN_CRITICAL_SECTION(module);
+    Py_END_CRITICAL_SECTION();
+
     return 0;
 }
+
+#define _FUNC_NAME(NAME) PyModExport_ ## NAME
+#define FUNC_NAME(NAME) _FUNC_NAME(NAME)
 
 // Converting from function pointer to void* has undefined behavior, but
 // works on all known platforms, and CPython's module and type slots currently
@@ -105,38 +116,42 @@ _testcext_exec(PyObject *module)
 _Py_COMP_DIAG_PUSH
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wpedantic"
+#pragma GCC diagnostic ignored "-Wcast-qual"
 #elif defined(__clang__)
 #pragma clang diagnostic ignored "-Wpedantic"
+#pragma clang diagnostic ignored "-Wcast-qual"
 #endif
 
-static PyModuleDef_Slot _testcext_slots[] = {
-    {Py_mod_exec, (void*)_testcext_exec},
-    {0, NULL}
+PyDoc_STRVAR(_testcext_doc, "C test extension.");
+PyABIInfo_VAR(abi_info);
+
+static PySlot _testcext_slots[] = {
+    PySlot_STATIC_DATA(Py_mod_abi, &abi_info),
+    PySlot_STATIC_DATA(Py_mod_name, STR(MODULE_NAME)),
+    PySlot_STATIC_DATA(Py_mod_doc, (void*)(char*)_testcext_doc),
+    PySlot_FUNC(Py_mod_exec, (void*)_testcext_exec),
+    PySlot_STATIC_DATA(Py_mod_methods, _testcext_methods),
+    PySlot_END,
 };
 
 _Py_COMP_DIAG_POP
 
-
-PyDoc_STRVAR(_testcext_doc, "C test extension.");
-
-static struct PyModuleDef _testcext_module = {
-    PyModuleDef_HEAD_INIT,  // m_base
-    STR(MODULE_NAME),  // m_name
-    _testcext_doc,  // m_doc
-    0,  // m_size
-    _testcext_methods,  // m_methods
-    _testcext_slots,  // m_slots
-    NULL,  // m_traverse
-    NULL,  // m_clear
-    NULL,  // m_free
-};
-
-
-#define _FUNC_NAME(NAME) PyInit_ ## NAME
-#define FUNC_NAME(NAME) _FUNC_NAME(NAME)
-
-PyMODINIT_FUNC
+PyMODEXPORT_FUNC
 FUNC_NAME(MODULE_NAME)(void)
 {
-    return PyModuleDef_Init(&_testcext_module);
+    return _testcext_slots;
+}
+
+// Also define the soft-deprecated entrypoint to ensure it isn't called
+
+#define _INITFUNC_NAME(NAME) PyInit_ ## NAME
+#define INITFUNC_NAME(NAME) _INITFUNC_NAME(NAME)
+
+PyMODINIT_FUNC
+INITFUNC_NAME(MODULE_NAME)(void)
+{
+    PyErr_SetString(
+        PyExc_AssertionError,
+        "PyInit_* function called while a PyModExport_* one is available");
+    return NULL;
 }

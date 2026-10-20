@@ -28,8 +28,8 @@
       "dynasm": "SKIP"
     },
     "test.test_abc": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_abstract_numbers": {
       "cranelift": "PASS",
@@ -41,7 +41,7 @@
     },
     "test.test_annotationlib": {
       "cranelift": "IMPORTERROR",
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_apple": {
       "cranelift": "PASS",
@@ -51,14 +51,14 @@
       "dynasm": "PASS"
     },
     "test.test_array": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_asdl_parser": {
       "dynasm": "SKIP",
       "reason": "CPython Parser/asdl internals"
     },
     "test.test_ast": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_asyncgen": {
       "dynasm": "PASS"
@@ -69,7 +69,7 @@
       "reason": "stalls in about one arm in four, at a test that wanders"
     },
     "test.test_atexit": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_audit": {
       "dynasm": "FAIL"
@@ -79,7 +79,7 @@
       "dynasm": "PASS"
     },
     "test.test_base64": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_baseexception": {
       "dynasm": "PASS"
@@ -95,7 +95,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_binascii": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_binop": {
       "cranelift": "PASS",
@@ -178,8 +178,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_code": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_code_module": {
       "cranelift": "PASS",
@@ -222,7 +222,7 @@
       "dynasm": "PASS"
     },
     "test.test_codecs": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_codeop": {
       "dynasm": "FAIL"
@@ -240,7 +240,7 @@
       "dynasm": "PASS"
     },
     "test.test_compile": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_compileall": {
       "dynasm": "PASS"
@@ -254,7 +254,7 @@
       "dynasm": "SKIP"
     },
     "test.test_complex": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_concurrent_futures": {
       "dynasm": "FAIL"
@@ -304,14 +304,14 @@
       "dynasm": "PASS"
     },
     "test.test_ctypes": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_curses": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_dataclasses": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_datetime": {
       "cranelift": "PASS",
@@ -341,8 +341,8 @@
       "dynasm": "PASS"
     },
     "test.test_defaultdict": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_deque": {
       "dynasm": "PASS"
@@ -358,7 +358,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dict": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_dict_version": {
       "dynasm": "SKIP",
@@ -384,8 +384,8 @@
       "dynasm": "PASS"
     },
     "test.test_dtrace": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "SKIP",
+      "dynasm": "SKIP"
     },
     "test.test_dynamic": {
       "cranelift": "PASS",
@@ -399,7 +399,7 @@
       "dynasm": "PASS"
     },
     "test.test_email": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_embed": {
       "dynasm": "SKIP",
@@ -431,8 +431,8 @@
       "dynasm": "PASS"
     },
     "test.test_exception_group": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_exception_hierarchy": {
       "dynasm": "PASS"
@@ -442,7 +442,7 @@
       "dynasm": "PASS"
     },
     "test.test_exceptions": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_extcall": {
       "dynasm": "FAIL"
@@ -455,7 +455,7 @@
       "dynasm": "FAIL"
     },
     "test.test_fcntl": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_file": {
       "dynasm": "PASS"
@@ -494,7 +494,7 @@
       "dynasm": "PASS"
     },
     "test.test_format": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_fractions": {
       "dynasm": "PASS"
@@ -517,11 +517,11 @@
       "dynasm": "PASS"
     },
     "test.test_funcattrs": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_functools": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_future_stmt": {
       "dynasm": "FAIL"
@@ -546,7 +546,7 @@
       "dynasm": "FAIL"
     },
     "test.test_genericalias": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_genericclass": {
       "cranelift": "PASS",
@@ -588,13 +588,13 @@
       "dynasm": "FAIL"
     },
     "test.test_gzip": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_hash": {
       "dynasm": "PASS"
     },
     "test.test_hashlib": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_heapq": {
       "cranelift": "PASS",
@@ -630,8 +630,8 @@
       "dynasm": "PASS"
     },
     "test.test_import": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_importlib": {
       "cranelift": "FAIL",
@@ -642,8 +642,8 @@
       "dynasm": "PASS"
     },
     "test.test_inspect": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_int": {
       "dynasm": "PASS"
@@ -682,7 +682,7 @@
       "dynasm": "PASS"
     },
     "test.test_json": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_keyword": {
       "cranelift": "PASS",
@@ -707,7 +707,7 @@
       "dynasm": "PASS"
     },
     "test.test_list": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_listcomps": {
       "dynasm": "PASS"
@@ -749,7 +749,7 @@
       "dynasm": "PASS"
     },
     "test.test_memoryview": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_metaclass": {
       "dynasm": "FAIL"
@@ -761,8 +761,8 @@
       "dynasm": "FAIL"
     },
     "test.test_mmap": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_module": {
       "dynasm": "FAIL"
@@ -833,7 +833,7 @@
       "dynasm": "CRASH"
     },
     "test.test_os": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_ossaudiodev": {
       "dynasm": "SKIP",
@@ -847,7 +847,7 @@
       "dynasm": "FAIL"
     },
     "test.test_patma": {
-      "dynasm": "PASS"
+      "dynasm": "IMPORTERROR"
     },
     "test.test_pdb": {
       "dynasm": "IMPORTERROR"
@@ -872,15 +872,15 @@
       "reason": "CPython perf map hooks"
     },
     "test.test_pickle": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_picklebuffer": {
       "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_pickletools": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_pkg": {
       "cranelift": "PASS",
@@ -907,8 +907,8 @@
       "dynasm": "FAIL"
     },
     "test.test_positional_only_arg": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_posix": {
       "dynasm": "FAIL"
@@ -1071,8 +1071,8 @@
       "dynasm": "PASS"
     },
     "test.test_socket": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_socketserver": {
       "dynasm": "PASS"
@@ -1087,8 +1087,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ssl": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_stable_abi_ctypes": {
       "dynasm": "SKIP",
@@ -1101,7 +1101,7 @@
       "dynasm": "PASS"
     },
     "test.test_str": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_strftime": {
       "cranelift": "PASS",
@@ -1124,7 +1124,7 @@
       "dynasm": "PASS"
     },
     "test.test_struct": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_structseq": {
       "dynasm": "PASS"
@@ -1147,7 +1147,7 @@
       "dynasm": "FAIL"
     },
     "test.test_symtable": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_syntax": {
       "dynasm": "FAIL"
@@ -1181,7 +1181,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_tempfile": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_termios": {
       "dynasm": "FAIL"
@@ -1202,7 +1202,7 @@
       "dynasm": "SKIP"
     },
     "test.test_threading": {
-      "dynasm": "PASS"
+      "dynasm": "TIMEOUT"
     },
     "test.test_threading_local": {
       "dynasm": "PASS"
@@ -1211,8 +1211,8 @@
       "dynasm": "PASS"
     },
     "test.test_time": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "FAIL",
+      "dynasm": "FAIL"
     },
     "test.test_timeit": {
       "cranelift": "PASS",
@@ -1249,7 +1249,7 @@
       "dynasm": "FAIL"
     },
     "test.test_tstring": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_ttk": {
       "dynasm": "SKIP",
@@ -1294,7 +1294,7 @@
       "reason": "imports `_datetime`, an extension module PyPy does not provide"
     },
     "test.test_typing": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_ucn": {
       "dynasm": "FAIL"
@@ -1329,7 +1329,7 @@
       "dynasm": "FAIL"
     },
     "test.test_unparse": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_urllib": {
       "dynasm": "PASS"
@@ -1391,7 +1391,7 @@
       "dynasm": "PASS"
     },
     "test.test_weakref": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_weakset": {
       "dynasm": "PASS"
@@ -1408,8 +1408,8 @@
       "reason": "needs audio hardware"
     },
     "test.test_with": {
-      "cranelift": "PASS",
-      "dynasm": "PASS"
+      "cranelift": "IMPORTERROR",
+      "dynasm": "IMPORTERROR"
     },
     "test.test_wsgiref": {
       "dynasm": "PASS"
@@ -1450,7 +1450,7 @@
       "dynasm": "PASS"
     },
     "test.test_zipfile": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_zipfile64": {
       "dynasm": "SKIP",
@@ -1461,10 +1461,10 @@
       "dynasm": "PASS"
     },
     "test.test_zipimport_support": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_zlib": {
-      "dynasm": "PASS"
+      "dynasm": "FAIL"
     },
     "test.test_zoneinfo": {
       "cranelift": "FAIL",
@@ -1475,5 +1475,5 @@
       "reason": "no PyPy owner for the _zstd accelerator"
     }
   },
-  "stdlib_version": "3.14.6"
+  "stdlib_version": "3.15.0"
 }

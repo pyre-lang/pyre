@@ -17,7 +17,7 @@ Apply these to every decision made while this skill is active, even if the user'
    - **NEW-DEVIATION** — introduced by us, in this diff or recent history, with no RPython backing. These must be removed. Replace with the correct RPython code, not with another adaptation.
    - **PRE-EXISTING-ADAPTATION** — a deviation documented with an RPython reference and an explanation of why the mechanical line-by-line port is blocked. **PRE-EXISTING-ADAPTATION is a temporary marker, not a permanent justification.** It is the label on a piece of technical debt: the code admits it diverges from RPython and commits to converging back. Its presence is not a reason to leave the code alone — it is a reason to fix it now if the blocker is no longer real, or to add a concrete "convergence path" comment if the blocker still holds. Every PRE-EXISTING-ADAPTATION encountered during a `/parity` pass must be re-evaluated: (a) is the blocker still real? (b) can it be ported right now, in this session? (c) if not, what specific dependency (helper, pass, data layout) would need to land first? Never use "it's marked PRE-EXISTING-ADAPTATION" as a reason to skip the fix. If the mechanical port is obvious and doesn't exceed session scope, do it now.
    - **PARITY** — matches RPython structure line-by-line. No action.
-   - **SPEC-DEVIATION** — a deviation from PyPy that makes pyre match the observable behaviour of the CPython pinned in `lib-python/stdlib-version.txt`, where PyPy and that CPython genuinely differ, adjudicated under AGENTS.md "Spec follows CPython 3.14; implementation follows PyPy". This is **not** a NEW-DEVIATION and is **not** auto-fixed under Principle 6 — reverting one to PyPy's shape re-introduces a known bug. Recognise it by the site comment citing both sides and the `§4 [3.14-spec]` entry in the review report. Audit it instead: does the comment carry an artefact (a `lib-python/3` `file:line`, a measured run at the pinned version, or C source read at that tag — never a pyre comment, never a PEP)? Does any PyPy-side hint govern the value it changes (`@jit.*`, `_immutable_*`, `_attrs_`, `make_sure_not_resized`, read across the whole definition including decorators, in `rpython/` too)? Does pyre now match PyPy on every adjacent observable that reads the state it changed? Any "no" makes it an ordinary NEW-DEVIATION again — report it, and restore PyPy's shape. Structure — names, control flow, data structures, storage owner — is never covered by this class and is audited as usual. The full six-test procedure is in "SPEC-DEVIATION: the six tests" at the end of this file.
+   - **SPEC-DEVIATION** — a deviation from PyPy that makes pyre match the observable behaviour of the CPython pinned in `lib-python/stdlib-version.txt`, where PyPy and that CPython genuinely differ, adjudicated under AGENTS.md "Spec follows CPython 3.15; implementation follows PyPy". This is **not** a NEW-DEVIATION and is **not** auto-fixed under Principle 6 — reverting one to PyPy's shape re-introduces a known bug. Recognise it by the site comment citing both sides and the `§4 [3.15-spec]` entry in the review report. Audit it instead: does the comment carry an artefact (a `lib-python/3` `file:line`, a measured run at the pinned version, or C source read at that tag — never a pyre comment, never a PEP)? Does any PyPy-side hint govern the value it changes (`@jit.*`, `_immutable_*`, `_attrs_`, `make_sure_not_resized`, read across the whole definition including decorators, in `rpython/` too)? Does pyre now match PyPy on every adjacent observable that reads the state it changed? Any "no" makes it an ordinary NEW-DEVIATION again — report it, and restore PyPy's shape. Structure — names, control flow, data structures, storage owner — is never covered by this class and is audited as usual. The full six-test procedure is in "SPEC-DEVIATION: the six tests" at the end of this file.
 
 4. **Performance can temporarily regress.** If a benchmark slows down because parity-correct code replaced a clever local shortcut, accept it. Performance is recovered by further line-by-line porting of the upstream optimization, not by reintroducing the shortcut. Neither the user nor the benchmark suite overrides the parity principle.
 
@@ -123,7 +123,7 @@ not only `rpython/jit/`.
 **Crate boundary invariant**: `majit/*` crates MUST NOT depend on any
 `pyre/*` crate, mirroring upstream's `rpython/` ⊥ `pypy/` separation.
 External third-party crates (e.g. `rustpython-compiler-core` for CPython
-3.14 bytecode tables) are allowed as they play the role of RPython's
+3.15 bytecode tables) are allowed as they play the role of RPython's
 host-stdlib imports (e.g. `from opcode import ...`).
 
 The following crates carry architectural divergences from upstream and their roots are PRE-EXISTING-ADAPTATIONs by design. Audit individual files against RPython as if the root were `rpython/jit/metainterp/`, and classify mismatches per the rules below.
@@ -238,20 +238,20 @@ Keep the tone direct and the citations concrete. No vague "I'll make sure this m
 ## SPEC-DEVIATION: the six tests
 
 Standing ruling: **pyre's *implementation* is a port of PyPy; pyre's *spec* —
-what a Python program can observe — is CPython 3.14.** A behavioural difference
-from PyPy is a parity regression **unless** a CPython 3.14 artefact shows PyPy is
+what a Python program can observe — is CPython 3.15.** A behavioural difference
+from PyPy is a parity regression **unless** a CPython 3.15 artefact shows PyPy is
 wrong about what the caller observes. Then it is a spec fix, and PyPy's shape
 still governs every other line on the way there.
 
-**This is not a 3.11-vs-3.14 question, and reading it as one is why this cluster
+**This is not a 3.11-vs-3.15 question, and reading it as one is why this cluster
 gets re-filed every cycle.** Of seven adjudicated cases, six have no version
 delta at all: `sched_setscheduler` has returned None since 3.3,
 `PyUnicode_FSConverter` has accepted bytes since 3.3, PEP 529 surrogatepass is
 3.6, `DirEntry` has cached its `stat_result` since PEP 471, audit hooks have
 suppressed everything under `Exception` since at least 3.9, and the `'%U'`
 attribute-error message is byte-identical in 3.13. These are standing
-PyPy-vs-CPython divergences, not PyPy lagging a release. "3.14" pins *which*
-CPython you read — `lib-python/stdlib-version.txt`, currently `v3.14.6` — it does
+PyPy-vs-CPython divergences, not PyPy lagging a release. "3.15" pins *which*
+CPython you read — `lib-python/stdlib-version.txt`, currently `v3.15.0` — it does
 not narrow the rule to version lag, and the absence of a delta is not grounds to
 refuse the exception. Conversely a real delta earns nothing on its own:
 `DirEntry.stat()` object caching predates 3.11 **and** still follows PyPy, for
@@ -275,7 +275,7 @@ reaches an answer PyPy also reaches, restore PyPy's shape.
 No → **STOP, this section does not apply.** Judge it as an ordinary parity
 finding.
 
-**2. Do you hold an admissible artefact for the 3.14 side?** One of three
+**2. Do you hold an admissible artefact for the 3.15 side?** One of three
 routes, and say which:
 
   a. **In-tree pin** — a `lib-python/3/` test that asserts it, or stdlib code
@@ -284,7 +284,7 @@ routes, and say which:
      `lib-python/stdlib-version.txt`, one fresh process per case, reading the
      observable directly rather than inferring it from a return value.
   c. **C source at the pinned tag in a named checkout**, quoted —
-     `git -C ~/Projects/cpython show v3.14.6:Modules/posixmodule.c`.
+     `git -C ~/Projects/cpython show v3.15.0:Modules/posixmodule.c`.
      `Modules/`, `Objects/` and `Python/` are **not in this tree** (`Include/`
      holds only a README); a claim about them names the checkout and the tag, or
      it is memory.
@@ -303,7 +303,7 @@ routes, and say which:
   **Platform clause.** When the behaviour is `#[cfg(windows)]`- or Linux-gated
   and neither oracle can execute it on this host, route (b) is unavailable — use
   (a) or (c) and record the platform in the finding *and* the code comment. An
-  unqualified "measured on python3.14" on a Windows-only path names a run that
+  unqualified "measured on python3.15" on a Windows-only path names a run that
   could not have happened.
 
 No artefact → **STOP. You may not invoke this section.**
@@ -381,10 +381,10 @@ implementation: restore it there and bring it to the user.
   "`is` is pointer identity in CPython" is not a spec fix — it is a JIT change
   with an unmeasured blast radius.
 
-**6. Does pyre land on 3.14 across the whole decision, and on PyPy everywhere
+**6. Does pyre land on 3.15 across the whole decision, and on PyPy everywhere
 else?** Adjacency is defined by **what reads the state you changed**, not by "the
 same function". A change that lands pyre where **neither** upstream sits is a
-defect regardless of which axis matched 3.14 — strictly worse than following
+defect regardless of which axis matched 3.15 — strictly worse than following
 PyPy, and filed under §1. `DirEntry` again: the entry's stat cache is read by
 `check_mode`/`is_dir` at `interp_scandir.py:317`, and `posixmodule.c` also
 aliases lstat into the stat slot for a non-symlink and seeds the cache from
@@ -393,7 +393,7 @@ invents a third behaviour.
 
 Reaching here: **not a parity regression.** File under `## 4. Structural
 adaptations` as
-`[3.14-spec] our_file.rs:line ↔ pypy_file.py:line — <observable>; evidence: <route + cite>`
+`[3.15-spec] our_file.rs:line ↔ pypy_file.py:line — <observable>; evidence: <route + cite>`
 so the next cycle sees it adjudicated instead of re-deriving it. That records the
 decision; it does not close it — per the codex-review skill, §4 is a
 classification, not a verdict.

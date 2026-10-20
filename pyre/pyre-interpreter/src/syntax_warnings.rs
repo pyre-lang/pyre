@@ -15,6 +15,7 @@
 use crate::PyError;
 use crate::compile::{CodeObject, CompileOpts, Mode, ast, parser};
 use ast::visitor::Visitor;
+use pyre_object::{PY_NULL, PyObjectRef};
 use ruff_text_size::TextRange;
 use rustpython_wtf8::Wtf8;
 
@@ -374,11 +375,14 @@ fn escalate(
 }
 
 /// `PyErr_WarnExplicitObject(PyExc_SyntaxWarning, ...)` for one invalid escape.
+/// `module` is `_PyErr_EmitSyntaxWarning`'s module argument (`PY_NULL` when
+/// `compile()` omitted it or passed `None`).
 fn warn_invalid_escape_sequence(
     source: &str,
     filename: &Wtf8,
     escape: &InvalidEscape,
     offset: usize,
+    module: PyObjectRef,
 ) -> Result<(), PyError> {
     // The filters and the once-registry are installed with the `_warnings`
     // module. A compile that runs before that point has nothing to match
@@ -405,13 +409,15 @@ fn warn_invalid_escape_sequence(
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
         filename.to_wtf8_buf(),
     ));
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module);
 
     crate::module::_warnings::do_warn_explicit(
         pyre_object::gc_roots::shadow_stack_get(category_slot),
         pyre_object::gc_roots::shadow_stack_get(message_slot),
         pyre_object::gc_roots::shadow_stack_get(filename_slot),
         lineno,
-        pyre_object::PY_NULL,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -439,6 +445,7 @@ fn warn_codegen_syntax(
     lineno: usize,
     offset: usize,
     message: &str,
+    module: PyObjectRef,
 ) -> Result<(), PyError> {
     if !crate::module::_warnings::state_is_readable() {
         return Ok(());
@@ -456,13 +463,15 @@ fn warn_codegen_syntax(
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
         filename.to_wtf8_buf(),
     ));
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module);
 
     crate::module::_warnings::do_warn_explicit(
         pyre_object::gc_roots::shadow_stack_get(category_slot),
         pyre_object::gc_roots::shadow_stack_get(message_slot),
         pyre_object::gc_roots::shadow_stack_get(filename_slot),
         lineno as i64,
-        pyre_object::PY_NULL,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -585,15 +594,20 @@ fn scan_replacement_field(
     filename: &Wtf8,
     start: usize,
     end: usize,
+    mut module: PyObjectRef,
 ) -> Result<(), PyError> {
     let bytes = source.as_bytes();
     let expression_end = replacement_expression_end(bytes, start, end);
-    scan_tokenizer_warnings(source, filename, start, expression_end)?;
+    pyre_object::with_roots!(module => {
+        scan_tokenizer_warnings(source, filename, start, expression_end, module)
+    })?;
     let mut index = expression_end;
     while index < end {
         if bytes[index] == b'{' {
             let inner_end = replacement_field_end(bytes, index + 1, end);
-            scan_replacement_field(source, filename, index + 1, inner_end)?;
+            pyre_object::with_roots!(module => {
+                scan_replacement_field(source, filename, index + 1, inner_end, module)
+            })?;
             index = inner_end + 1;
         } else {
             index += 1;
@@ -616,6 +630,7 @@ fn scan_interpolated_string(
     quote_index: usize,
     limit: usize,
     _raw: bool,
+    mut module: PyObjectRef,
 ) -> Result<usize, PyError> {
     let bytes = source.as_bytes();
     let quote = bytes[quote_index];
@@ -639,7 +654,9 @@ fn scan_interpolated_string(
             index += 2;
         } else if bytes[index] == b'{' {
             let field_end = replacement_field_end(bytes, index + 1, limit);
-            scan_replacement_field(source, filename, index + 1, field_end)?;
+            pyre_object::with_roots!(module => {
+                scan_replacement_field(source, filename, index + 1, field_end, module)
+            })?;
             index = field_end + 1;
         } else {
             index += 1;
@@ -656,7 +673,16 @@ fn scan_interpolated_string(
 /// scan before entering Ruff's parser, whose recovered tree otherwise loses
 /// the token boundary that owns the warning.
 pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &Wtf8) -> Result<(), PyError> {
-    scan_tokenizer_warnings(source, filename, 0, source.len())
+    emit_tokenizer_syntax_warnings_and_module(source, filename, PY_NULL)
+}
+
+/// [`emit_tokenizer_syntax_warnings`] with `compile()`'s `module` argument.
+pub fn emit_tokenizer_syntax_warnings_and_module(
+    source: &str,
+    filename: &Wtf8,
+    module: PyObjectRef,
+) -> Result<(), PyError> {
+    scan_tokenizer_warnings(source, filename, 0, source.len(), module)
 }
 
 /// [`emit_tokenizer_syntax_warnings`] over one byte range.  A replacement
@@ -667,6 +693,7 @@ fn scan_tokenizer_warnings(
     filename: &Wtf8,
     start: usize,
     end: usize,
+    mut module: PyObjectRef,
 ) -> Result<(), PyError> {
     let bytes = source.as_bytes();
     let mut index = start;
@@ -695,7 +722,9 @@ fn scan_tokenizer_warnings(
                     let raw = bytes[name_start..index]
                         .iter()
                         .any(|byte| byte.eq_ignore_ascii_case(&b'r'));
-                    index = scan_interpolated_string(source, filename, index, end, raw)?;
+                    index = pyre_object::with_roots!(module => {
+                        scan_interpolated_string(source, filename, index, end, raw, module)
+                    })?;
                 }
             }
             b'.' | b'0'..=b'9' => {
@@ -705,13 +734,16 @@ fn scan_tokenizer_warnings(
                 };
                 if token_end > index && numeric_keyword_suffix(&bytes[token_end..]) {
                     let (lineno, column) = line_offset_at(source, index);
-                    warn_codegen_syntax(
-                        source,
-                        filename,
-                        lineno,
-                        column,
-                        &format!("invalid {kind} literal"),
-                    )?;
+                    pyre_object::with_roots!(module => {
+                        warn_codegen_syntax(
+                            source,
+                            filename,
+                            lineno,
+                            column,
+                            &format!("invalid {kind} literal"),
+                            module,
+                        )
+                    })?;
                 }
                 index = token_end.max(index + 1);
             }
@@ -731,15 +763,43 @@ pub fn compile_with_codegen_warnings(
     filename: &Wtf8,
     opts: CompileOpts,
 ) -> Result<CodeObject, SourceCompileError> {
+    compile_with_codegen_warnings_and_module(source, mode, filename, opts, PY_NULL)
+}
+
+/// [`compile_with_codegen_warnings`] with `compile()`'s `module` argument
+/// (`builtin_compile_impl` `modname`).
+pub fn compile_with_codegen_warnings_and_module(
+    source: &str,
+    mode: Mode,
+    filename: &Wtf8,
+    opts: CompileOpts,
+    module: PyObjectRef,
+) -> Result<CodeObject, SourceCompileError> {
     // pyopcode.py BUILD_LIST_FROM_ARG: ast.ListComp.build_container_and_load_iter.
     let opts = CompileOpts {
         build_list_from_arg: true,
         ..opts
     };
     crate::module::thread::ensure_runtime_thread();
+    let _module_roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module);
     let source = crate::compile::universal_newline(source);
-    emit_tokenizer_syntax_warnings(&source, filename).map_err(SourceCompileError::Warning)?;
-    emit_escape_warnings(&source, filename).map_err(SourceCompileError::Warning)?;
+    let filename_s = filename.to_string_lossy();
+    let flags = crate::lazyimport::collect_lazy_import_flags(&source, filename_s.as_ref(), mode)
+        .map_err(SourceCompileError::Compile)?;
+    emit_tokenizer_syntax_warnings_and_module(
+        &source,
+        filename,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+    )
+    .map_err(SourceCompileError::Warning)?;
+    emit_escape_warnings_and_module(
+        &source,
+        filename,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+    )
+    .map_err(SourceCompileError::Warning)?;
     let escalated = core::cell::Cell::new(None);
     // The compiler's `source_path` is a `String`. A lone surrogate stays on
     // the warning; the code object is renamed afterwards.
@@ -751,6 +811,7 @@ pub fn compile_with_codegen_warnings(
             location.line.get(),
             location.character_offset.get(),
             &message,
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
         )
         .map_err(|error| {
             escalated.set(Some(error));
@@ -780,8 +841,17 @@ pub fn compile_with_codegen_warnings(
                 opts,
                 &mut handler,
             )
+            .map(|mut code| {
+                crate::pycode::fixup_code_get_iter(&mut code);
+                crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
+                code
+            })
         }),
-        Ok(code) => Ok(code),
+        Ok(mut code) => {
+            crate::pycode::fixup_code_get_iter(&mut code);
+            crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
+            Ok(code)
+        }
     };
     match escalated.take() {
         Some(error) => Err(SourceCompileError::Warning(error)),
@@ -802,12 +872,39 @@ pub fn compile_ast_with_codegen_warnings(
     mode: Mode,
     opts: CompileOpts,
 ) -> Result<CodeObject, SourceCompileError> {
+    compile_ast_with_codegen_warnings_and_module(
+        module,
+        source_file,
+        source,
+        filename,
+        mode,
+        opts,
+        PY_NULL,
+    )
+}
+
+/// [`compile_ast_with_codegen_warnings`] with `compile()`'s `module` argument.
+pub fn compile_ast_with_codegen_warnings_and_module(
+    module: ast::Mod,
+    source_file: rustpython_compiler::core::SourceFile,
+    source: &str,
+    filename: &Wtf8,
+    mode: Mode,
+    opts: CompileOpts,
+    compile_module: PyObjectRef,
+) -> Result<CodeObject, SourceCompileError> {
     // pyopcode.py BUILD_LIST_FROM_ARG: ast.ListComp.build_container_and_load_iter.
     let opts = CompileOpts {
         build_list_from_arg: true,
         ..opts
     };
     crate::module::thread::ensure_runtime_thread();
+    let _module_roots = pyre_object::gc_roots::push_roots();
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(compile_module);
+    let filename_s = filename.to_string_lossy();
+    let flags = crate::lazyimport::flags_from_mod(&module, source, filename_s.as_ref())
+        .map_err(SourceCompileError::Compile)?;
     let escalated = core::cell::Cell::new(None);
     let mut handler = |location: crate::compile::SourceLocation, message: String| {
         warn_codegen_syntax(
@@ -816,6 +913,7 @@ pub fn compile_ast_with_codegen_warnings(
             location.line.get(),
             location.character_offset.get(),
             &message,
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
         )
         .map_err(|error| {
             escalated.set(Some(error));
@@ -838,6 +936,11 @@ pub fn compile_ast_with_codegen_warnings(
         Some(error) => Err(SourceCompileError::Warning(error)),
         None => result
             .map_err(crate::compile::CompileError::from)
+            .map(|mut code| {
+                crate::pycode::fixup_code_get_iter(&mut code);
+                crate::lazyimport::patch_import_name_bit0(&mut code, &flags);
+                code
+            })
             .map_err(SourceCompileError::Compile),
     }
 }
@@ -845,6 +948,7 @@ pub fn compile_ast_with_codegen_warnings(
 struct EscapeWarningVisitor<'a> {
     source: &'a str,
     filename: &'a Wtf8,
+    module: PyObjectRef,
     error: Option<PyError>,
 }
 
@@ -862,7 +966,13 @@ impl<'a> EscapeWarningVisitor<'a> {
         if let Some((start, end)) = content_bounds(self.source, range)
             && let Some((escape, offset)) = first_invalid_escape(self.source, start, end, is_bytes)
         {
-            let result = warn_invalid_escape_sequence(self.source, self.filename, &escape, offset);
+            let result = warn_invalid_escape_sequence(
+                self.source,
+                self.filename,
+                &escape,
+                offset,
+                self.module,
+            );
             self.record(result);
         }
     }
@@ -882,7 +992,13 @@ impl<'a> EscapeWarningVisitor<'a> {
             return;
         }
         if let Some((escape, offset)) = first_invalid_escape(self.source, start, end, false) {
-            let result = warn_invalid_escape_sequence(self.source, self.filename, &escape, offset);
+            let result = warn_invalid_escape_sequence(
+                self.source,
+                self.filename,
+                &escape,
+                offset,
+                self.module,
+            );
             self.record(result);
             return;
         }
@@ -899,7 +1015,13 @@ impl<'a> EscapeWarningVisitor<'a> {
                 sequence: (after as char).to_string(),
                 octal: false,
             };
-            let result = warn_invalid_escape_sequence(self.source, self.filename, &brace, end - 1);
+            let result = warn_invalid_escape_sequence(
+                self.source,
+                self.filename,
+                &brace,
+                end - 1,
+                self.module,
+            );
             self.record(result);
         }
     }
@@ -951,9 +1073,9 @@ impl<'a> Visitor<'a> for EscapeWarningVisitor<'a> {
                 }
             }
             ast::Expr::FString(fstring) => {
-                for part in fstring.value.as_slice() {
+                for part in fstring.value.iter() {
                     match part {
-                        ast::FStringPart::Literal(literal) => {
+                        ast::FStringPartRef::Literal(literal) => {
                             if !matches!(
                                 literal.flags.prefix(),
                                 ast::str_prefix::StringLiteralPrefix::Raw { .. }
@@ -961,7 +1083,7 @@ impl<'a> Visitor<'a> for EscapeWarningVisitor<'a> {
                                 self.check_quoted_literal(literal.range, false);
                             }
                         }
-                        ast::FStringPart::FString(fstring) => {
+                        ast::FStringPartRef::FString(fstring) => {
                             if !matches!(
                                 fstring.flags.prefix(),
                                 ast::str_prefix::FStringPrefix::Raw { .. }
@@ -983,6 +1105,15 @@ impl<'a> Visitor<'a> for EscapeWarningVisitor<'a> {
 /// recovered: the tokenizer reports an escape it has already passed even when
 /// the parse fails later, so `'\\e' $` warns once and then raises.
 pub fn emit_escape_warnings(source: &str, filename: &Wtf8) -> Result<(), PyError> {
+    emit_escape_warnings_and_module(source, filename, PY_NULL)
+}
+
+/// [`emit_escape_warnings`] with `compile()`'s `module` argument.
+pub fn emit_escape_warnings_and_module(
+    source: &str,
+    filename: &Wtf8,
+    module: PyObjectRef,
+) -> Result<(), PyError> {
     // No escape without a backslash, so the reparse is skipped for the vast
     // majority of modules rather than paid on every compile.
     if !source.contains('\\') {
@@ -992,6 +1123,7 @@ pub fn emit_escape_warnings(source: &str, filename: &Wtf8) -> Result<(), PyError
     let mut visitor = EscapeWarningVisitor {
         source,
         filename,
+        module,
         error: None,
     };
     match parsed.syntax() {

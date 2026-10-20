@@ -85,6 +85,9 @@ pub struct LaunchFlags {
     /// `config->cpu_count`: the count `-X cpu_count` or PYTHON_CPU_COUNT
     /// named, resolved by [`finalize`]; `None` is `-1`, no configured count.
     pub cpu_count: Option<i32>,
+    /// `PyConfig.lazy_imports` (`config_init_lazy_imports`): `-1` (normal)
+    /// or `1` (`all`). Resolved in [`finalize`].
+    pub lazy_imports: i32,
 }
 
 /// Environment the launcher options resolve against, when the process
@@ -133,6 +136,7 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
     "PYTHONIOENCODING",
     "PYTHON_CPU_COUNT",
     "PYTHONNODEBUGRANGES",
+    "PYTHON_LAZY_IMPORTS",
     "LC_ALL",
     "LC_CTYPE",
     "LANG",
@@ -231,6 +235,14 @@ impl PreConfigError {
             func: "preconfig_init_utf8_mode",
             detail,
             state: "preinitializing",
+        }
+    }
+
+    fn lazy_imports(detail: &'static str) -> Self {
+        PreConfigError {
+            func: "config_init_lazy_imports",
+            detail,
+            state: "preinitialized",
         }
     }
 
@@ -505,5 +517,48 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
     }
     flags.warnoptions = warnoptions;
     flags.cpu_count = resolve_cpu_count(&flags)?;
+    flags.lazy_imports = resolve_lazy_imports(&flags)?;
     Ok(flags)
+}
+
+/// `config_init_lazy_imports`: env then `-X lazy_imports=`, xoption wins.
+fn resolve_lazy_imports(flags: &LaunchFlags) -> Result<i32, PreConfigError> {
+    let mut lazy = -1;
+    if !flags.ignore_environment
+        && let Some(value) = read_raw("PYTHON_LAZY_IMPORTS")
+        && !value.is_empty()
+    {
+        lazy = match value.as_slice() {
+            b"all" => 1,
+            b"normal" => -1,
+            _ => {
+                return Err(PreConfigError::lazy_imports(
+                    "PYTHON_LAZY_IMPORTS: invalid value; expected 'all' or 'normal'",
+                ));
+            }
+        };
+    }
+    for option in &flags.xoptions {
+        let bytes = option.as_encoded_bytes();
+        let Some(rest) = bytes.strip_prefix(b"lazy_imports") else {
+            continue;
+        };
+        let val = if rest.is_empty() {
+            &b""[..]
+        } else if rest[0] == b'=' {
+            &rest[1..]
+        } else {
+            continue;
+        };
+        lazy = match val {
+            b"all" => 1,
+            b"normal" => -1,
+            _ => {
+                return Err(PreConfigError::lazy_imports(
+                    "-X lazy_imports: invalid value; expected 'all' or 'normal'",
+                ));
+            }
+        };
+    }
+    Ok(lazy)
 }

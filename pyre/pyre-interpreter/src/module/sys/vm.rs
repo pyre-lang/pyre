@@ -1928,7 +1928,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(
         roots.get(ns_slot),
         "version",
-        w_str_new(&format!("3.14.6 (pyre 0.0.1) [{compiler}]")),
+        w_str_new(&format!("3.15.0 (pyre 0.0.1) [{compiler}]")),
     );
     // The stdlib branches on this name to decide what a platform can do, and
     // the two spellings it knows for a WebAssembly guest are `emscripten` and
@@ -1962,16 +1962,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // (`Py_GIL_DISABLED` is 1 and `abi_thread` is `t`), not
     // `sys._is_gil_enabled()`, which reports whether the lock is on right now.
     // `venv.EnvBuilder.setup_python` reads the same config var to name
-    // `python3.14t.exe`.
+    // `python3.15t.exe`.
     //
-    // [3.14-spec] `version.py get_winver` answers "%d.%d" with no ABI tag;
+    // [3.15-spec] `version.py get_winver` answers "%d.%d" with no ABI tag;
     // `dl_nt.c PyWin_DLLVersionString` is `MS_DLL_ID`, which
-    // `PCbuild/python.props` sets to `FreethreadedSysWinVer` ("3.14t") for a
+    // `PCbuild/python.props` sets to `FreethreadedSysWinVer` ("3.15t") for a
     // free-threaded build. Windows only; evidence is the build source at
-    // v3.14.6, and `lib-python/3/site.py _get_path` builds the user site
+    // v3.15.0, and `lib-python/3/site.py _get_path` builds the user site
     // directory from `sys.winver.replace('.', '')`.
     #[cfg(windows)]
-    module_ns_store(roots.get(ns_slot), "winver", w_str_new("3.14t"));
+    module_ns_store(roots.get(ns_slot), "winver", w_str_new("3.15t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
     // published beside `winver` because both come from the same `MS_COREDLL`
     // block.  `ctypes/__init__.py` builds `pythonapi` out of it with no
@@ -1999,7 +1999,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }),
     );
     // sys.version_info — structseq(major, minor, micro, releaselevel,
-    // serial); a tuple subclass so `>= (3, 14)` / `[0]` and `.major` both work.
+    // serial); a tuple subclass so `>= (3, 15)` / `[0]` and `.major` both work.
     {
         let version_info_type =
             crate::_structseq::disallow_instantiation(crate::_structseq::make_struct_seq(
@@ -2008,8 +2008,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ));
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_int_new(3));
-        fields.push(w_int_new(14));
-        fields.push(w_int_new(6));
+        fields.push(w_int_new(15));
+        fields.push(w_int_new(0));
         fields.push(w_str_new("final"));
         fields.push(w_int_new(0));
         let vi = crate::_structseq::new_instance(version_info_type, fields.take());
@@ -2038,6 +2038,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     let modules_dict = w_dict_new();
     crate::importing::set_sys_modules_dict(modules_dict);
     module_ns_store(roots.get(ns_slot), "modules", modules_dict);
+    // `sys.lazy_modules` — `_PyImport_InitLazyModules` / `PySet_New`.
+    {
+        let lazy_modules_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_set_new());
+        crate::module::sys::state::set_lazy_modules(pyre_object::gc_roots::shadow_stack_get(
+            lazy_modules_slot,
+        ));
+        module_ns_store(
+            roots.get(ns_slot),
+            "lazy_modules",
+            pyre_object::gc_roots::shadow_stack_get(lazy_modules_slot),
+        );
+    }
     // sys.path — flush the native search-path seed into the authoritative list
     // the instant `sys` exists; from here on the Python list is the source of
     // truth and `add_sys_path` mutates it in place.
@@ -2158,19 +2171,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `__metaclass__ = structseqtype`: an immutable tuple subclass whose
     // first `n_sequence_fields` entries are also indexable, so
     // `sys.flags[3] is sys.flags.optimize` and `isinstance(sys.flags,
-    // tuple)` both hold.  `gil`, `thread_inherit_context` and
-    // `context_aware_warnings` sit past the sequence as named-only extras,
-    // which is what makes `n_fields` (21) exceed `len()` (18).
+    // tuple)` both hold.  `gil`, `thread_inherit_context`,
+    // `context_aware_warnings` and `lazy_imports` sit past the sequence as
+    // named-only extras, which is what makes `n_fields` (22) exceed `len()` (18).
     //
-    // [3.14-spec] `app.py sysflags` ends `int_max_str_digits` (16),
-    // `safe_path` (17) and has none of the three extras; `sysmodule.c
+    // [3.15-spec] `app.py sysflags` ends `int_max_str_digits` (16),
+    // `safe_path` (17) and has none of the four extras; `sysmodule.c
     // flags_fields` orders `safe_path` before `int_max_str_digits`
     // (`SYS_FLAGS_INT_MAX_STR_DIGITS 17`) and `set_flags_from_config` fills
-    // `gil`, `thread_inherit_context`, `context_aware_warnings`. Evidence:
+    // `gil`, `thread_inherit_context`, `context_aware_warnings` and
+    // `lazy_imports`. Evidence:
     // `lib-python/3/test/test_cmd_line.py` `test_python_gil` prints
     // `sys.flags.gil`, and `test_sys.py` `test_pythontypes` sizes
-    // `sys.flags` as "+3 for the 'gil', 'thread_inherit_context' and
-    // 'context_aware_warnings' flags".
+    // `sys.flags` with the 'gil', 'thread_inherit_context',
+    // 'context_aware_warnings' and 'lazy_imports' extras.
     {
         let flags_type = crate::_structseq::disallow_instantiation(
             crate::_structseq::make_struct_seq_with_extra(
@@ -2195,7 +2209,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "safe_path",
                     "int_max_str_digits",
                 ],
-                &["gil", "thread_inherit_context", "context_aware_warnings"],
+                &[
+                    "gil",
+                    "thread_inherit_context",
+                    "context_aware_warnings",
+                    "lazy_imports",
+                ],
             ),
         );
         let _flag_roots = pyre_object::gc_roots::push_roots();
@@ -2205,6 +2224,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
         let warn_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+        let lazy_imports_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(
+            crate::importing::lazy_imports_config() as i64,
+        ));
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL
         // while `verbose` is UINT, so `-dd` reports 1 here and 2
@@ -2256,6 +2279,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 (
                     "context_aware_warnings",
                     pyre_object::gc_roots::shadow_stack_get(warn_slot),
+                ),
+                (
+                    "lazy_imports",
+                    pyre_object::gc_roots::shadow_stack_get(lazy_imports_slot),
                 ),
             ],
         );
@@ -2435,6 +2462,101 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 Ok(w_none())
             },
             1,
+        ),
+    );
+    // `sys_set_lazy_imports_impl` / `sys_get_lazy_imports_impl`.
+    module_ns_store(
+        roots.get(ns_slot),
+        "set_lazy_imports",
+        make_builtin_function_with_arity(
+            "set_lazy_imports",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(if args.is_empty() {
+                        "set_lazy_imports() missing 1 required positional argument: 'mode'"
+                    } else {
+                        "set_lazy_imports() takes 1 positional argument but 2 were given"
+                    }));
+                }
+                let mode = args[0];
+                if unsafe { !is_str(mode) } {
+                    return Err(crate::PyError::type_error(
+                        "mode must be a string: 'normal' or 'all'",
+                    ));
+                }
+                let Some(s) = (unsafe { w_str_get_value_opt(mode) }) else {
+                    return Err(crate::PyError::type_error(
+                        "mode must be a string: 'normal' or 'all'",
+                    ));
+                };
+                let lazy_mode = match s {
+                    "normal" => 0,
+                    "all" => 1,
+                    _ => {
+                        return Err(crate::PyError::value_error(
+                            "mode must be 'normal' or 'all'",
+                        ));
+                    }
+                };
+                crate::module::sys::state::set_lazy_imports_mode(lazy_mode);
+                Ok(w_none())
+            },
+            1,
+        ),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "get_lazy_imports",
+        make_builtin_function_with_arity(
+            "get_lazy_imports",
+            |args| {
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "get_lazy_imports() takes no arguments",
+                    ));
+                }
+                match crate::module::sys::state::lazy_imports_mode() {
+                    0 => Ok(w_str_new("normal")),
+                    1 => Ok(w_str_new("all")),
+                    _ => Err(crate::PyError::runtime_error("unknown lazy imports mode")),
+                }
+            },
+            0,
+        ),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "set_lazy_imports_filter",
+        make_builtin_function_with_arity(
+            "set_lazy_imports_filter",
+            |args| {
+                if args.len() != 1 {
+                    return Err(crate::PyError::type_error(if args.is_empty() {
+                        "set_lazy_imports_filter() missing 1 required positional argument: 'filter'"
+                    } else {
+                        "set_lazy_imports_filter() takes 1 positional argument but 2 were given"
+                    }));
+                }
+                crate::module::sys::state::set_lazy_imports_filter(args[0])?;
+                Ok(w_none())
+            },
+            1,
+        ),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "get_lazy_imports_filter",
+        make_builtin_function_with_arity(
+            "get_lazy_imports_filter",
+            |args| {
+                if !args.is_empty() {
+                    return Err(crate::PyError::type_error(
+                        "get_lazy_imports_filter() takes no arguments",
+                    ));
+                }
+                Ok(crate::module::sys::state::lazy_imports_filter().unwrap_or_else(w_none))
+            },
+            0,
         ),
     );
     module_ns_store(
@@ -2635,7 +2757,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             (version_major << 24) | (version_minor << 16) | (version_micro << 8) | 0xf0;
         let hexversion = w_int_new(implementation_hexversion);
         crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "hexversion", hexversion);
-        let cache_tag = w_str_new("pyre314");
+        let cache_tag = w_str_new("pyre315");
         crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "cache_tag", cache_tag);
         // PEP 734. pyre runs one interpreter per process, so the answer is
         // false; `sys.implementation` carries the name either way from 3.14 on.
@@ -2754,7 +2876,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let value = crate::_structseq::new_instance(ty, fields.take());
         module_ns_store(roots.get(ns_slot), "int_info", value);
     }
-    module_ns_store(roots.get(ns_slot), "hexversion", w_int_new(0x030e06f0));
+    module_ns_store(roots.get(ns_slot), "hexversion", w_int_new(0x030F00F0));
     #[cfg(feature = "host_env")]
     {
         // `app_main.setup_bootstrap_path` obtains all five values from one
@@ -3874,7 +3996,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     module_ns_store(roots.get(ns_slot), "meta_path", meta_path);
     // sys.dont_write_bytecode — mirrors `sys.flags.dont_write_bytecode`
     // (`-B` / PYTHONDONTWRITEBYTECODE). The flag is honoured, not merely
-    // reported: `_bootstrap_external` writes `__pycache__/*.pyre314.pyc` next
+    // reported: `_bootstrap_external` writes `__pycache__/*.pyre315.pyc` next
     // to every source it imports unless it is set.
     module_ns_store(
         roots.get(ns_slot),

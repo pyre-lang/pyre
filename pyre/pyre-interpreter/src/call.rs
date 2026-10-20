@@ -7806,11 +7806,10 @@ pub unsafe fn create_all_slots(
         let base_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
         assert!(!base_layout.is_null(), "ready base must own a Layout");
         let base_nslots = (*base_layout).nslots;
-        // `type_new_slots`: a variable-sized base may add a
-        // managed instance dict, but may not add weakrefs or any explicit
-        // `__slots__` entry.  Derive this from the same layout metadata which
-        // exposes `tp_itemsize`, so newly ported variable builtins cannot be
-        // omitted from type creation semantics.
+        // `type_new_descriptors`: a variable-sized base may add `__dict__`
+        // and `__weakref__`. Remaining names are allowed only for a tuple
+        // subclass (`Py_TPFLAGS_TUPLE_SUBCLASS`). Derive variable size from
+        // the same layout metadata which exposes `tp_itemsize`.
         let base_has_variable_items = crate::typedef::cpython_type_layout(w_bestbase)
             .is_some_and(|(_, itemsize)| itemsize != 0);
 
@@ -7826,12 +7825,6 @@ pub unsafe fn create_all_slots(
             let all_names = pyre_object::with_roots!(w_slots => collect_slot_names(w_slots))?;
             w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
             w_bestbase = pyre_object::gc_roots::shadow_stack_get(bestbase_slot);
-            if base_has_variable_items && !all_names.is_empty() {
-                return Err(crate::PyError::type_error(format!(
-                    "nonempty __slots__ not supported for subtype of '{}'",
-                    pyre_object::w_type_get_name(w_bestbase)
-                )));
-            }
             for slot_name in &all_names {
                 match slot_name.as_str() {
                     // typeobject.py:1165-1169: __dict__ slot
@@ -7863,6 +7856,24 @@ pub unsafe fn create_all_slots(
                     }
                     // typeobject.py:1175-1176: regular slot name
                     _ => newslotnames.push(slot_name.clone()),
+                }
+            }
+            // [3.15-spec] type_new_descriptors: leftover names after
+            // filtering `__dict__`/`__weakref__` are "arbitrary __slots__".
+            // typeobject.py create_all_slots has no equivalent check.
+            // Observable: `class C(tuple): __slots__ = ('a',)` succeeds;
+            // `class C(int): __slots__ = ('a',)` raises TypeError.
+            // Evidence: Objects/typeobject.c type_new_descriptors,
+            // Doc/whatsnew/3.15.rst, measured 3.15.0 oracle.
+            if !newslotnames.is_empty() && base_has_variable_items {
+                let tuple_type = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+                let is_tuple_subclass =
+                    !tuple_type.is_null() && issubtype_ptr(w_bestbase, tuple_type);
+                if !is_tuple_subclass {
+                    return Err(crate::PyError::type_error(format!(
+                        "arbitrary __slots__ not supported for subtype of '{}'",
+                        pyre_object::w_type_get_name(w_bestbase)
+                    )));
                 }
             }
             // typeobject.py:1178: string_sort(newslotnames)

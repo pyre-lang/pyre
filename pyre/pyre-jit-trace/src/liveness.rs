@@ -623,11 +623,13 @@ pub(crate) fn stack_effects(
         | Instruction::StoreName { .. }
         | Instruction::StoreGlobal { .. }
         | Instruction::StoreDeref { .. }
-        | Instruction::EndSend
         // SET_FUNCTION_ATTRIBUTE pops the attribute value (TOS) and leaves the
         // function (TOS1) it was applied to.
-        | Instruction::SetFunctionAttribute { .. }
-        | Instruction::PopIter => (d - 1, d - 1),
+        | Instruction::SetFunctionAttribute { .. } => (d - 1, d - 1),
+        // END_SEND pops result, index-or-NULL, and receiver, then pushes result.
+        Instruction::EndSend => (d - 2, d - 2),
+        // POP_ITER discards the index-or-NULL slot and the iterator.
+        Instruction::PopIter => (d - 2, d - 2),
         // YieldValue: sends TOS to caller, receives new value back. Net 0.
         Instruction::YieldValue { .. } => (d, d),
         // Send/send_value pops the sent value and pushes either next() or StopIteration.value.
@@ -657,10 +659,10 @@ pub(crate) fn stack_effects(
         Instruction::UnaryNegative
         | Instruction::UnaryNot
         | Instruction::UnaryInvert
-        | Instruction::GetIter
-        | Instruction::GetYieldFromIter
         | Instruction::GetAiter
         | Instruction::GetAwaitable { .. } => (d, d),
+        // GET_ITER pops the iterable and pushes iterator then index-or-NULL.
+        Instruction::GetIter { .. } => (d + 1, d + 1),
         // ConvertValue/convert_value pops the input and pushes the converted value.
         Instruction::ConvertValue { .. } => (d, d),
         // FormatSimple/format_simple pops the value and pushes its formatted string.
@@ -744,9 +746,8 @@ pub(crate) fn stack_effects(
         | Instruction::PopJumpIfNone { .. }
         | Instruction::PopJumpIfNotNone { .. } => (d - 1, d - 1),
         // ForIter: fallthrough pushes TOS_next (+1); the exhaustion branch
-        // keeps the iterator on the value stack (net 0) — it stays at TOS
-        // through END_FOR until the following POP_ITER pops it, so the
-        // branch-target depth still counts the iterator slot.
+        // keeps the iterator and its index-or-NULL slot (net 0) until
+        // POP_ITER pops both, so the branch-target depth still counts them.
         Instruction::ForIter { .. } => (d + 1, d),
         // WithExceptStart/with_except_start preserves five inputs and pushes the exit result.
         Instruction::WithExceptStart => (d + 1, d + 1),

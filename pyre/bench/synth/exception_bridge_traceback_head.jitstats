@@ -1,4 +1,4 @@
-bridges_compiled=4
+bridges_compiled=3
 descr_set_absent=0
 descr_set_ambiguous=0
 descr_set_stale_absent=0
@@ -12,8 +12,8 @@ fbw_rolled_back_with_effects=0
 fbw_store_journal_rollback_failed=0
 field_pos_attached_misplaced=0
 field_pos_spec_misplaced=0
-guard_failures=802
+guard_failures=602
 internal_compile_panics=0
 loops_aborted=0
-loops_compiled=2
+loops_compiled=1
 retraces_compiled=0

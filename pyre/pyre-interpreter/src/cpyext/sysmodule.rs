@@ -85,7 +85,7 @@ pub unsafe extern "C" fn PySys_AuditTuple(event: *const c_char, args: *mut CPyOb
 /// The digits are `sys.version_info`'s, and `patchlevel.h` states the same
 /// four; `PY_RELEASE_LEVEL_FINAL` with serial 0 is the low byte.
 #[unsafe(no_mangle)]
-pub static Py_Version: std::ffi::c_ulong = 0x030e_06f0;
+pub static Py_Version: std::ffi::c_ulong = 0x030F_00F0;
 
 pub(super) fn ensure_linked() {
     std::hint::black_box(PySys_GetObject as *const ());

@@ -58,7 +58,7 @@ pub struct CPyThreadState {
 }
 
 /// The layout is written out twice -- here and in
-/// `include/pyre3.14t/pystate.h` -- so a field added to one without the other
+/// `include/pyre3.15t/pystate.h` -- so a field added to one without the other
 /// stops compiling rather than writing somewhere unclaimed.
 const _: () = {
     assert!(std::mem::offset_of!(CPyThreadState, interp) == 0);

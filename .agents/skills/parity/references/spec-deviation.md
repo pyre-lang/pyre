@@ -1,6 +1,6 @@
 # SPEC-DEVIATION: the six tests
 
-Read the current repository `AGENTS.md` first. CPython 3.14 means **3.14t**
+Read the current repository `AGENTS.md` first. CPython 3.15 means **3.15t**
 (the free-threaded build) throughout this reference. Historical versions,
 measurements, and line numbers below are examples from the source skill,
 not fresh evidence: read the current pin, rerun applicable oracles, and cite
@@ -9,20 +9,20 @@ run the available `pypy3` fixture before source inspection or diagnosis.
 
 
 Standing ruling: **pyre's *implementation* is a port of PyPy; pyre's *spec* —
-what a Python program can observe — is CPython 3.14.** A behavioural difference
-from PyPy is a parity regression **unless** a CPython 3.14 artefact shows PyPy is
+what a Python program can observe — is CPython 3.15.** A behavioural difference
+from PyPy is a parity regression **unless** a CPython 3.15 artefact shows PyPy is
 wrong about what the caller observes. Then it is a spec fix, and PyPy's shape
 still governs every other line on the way there.
 
-**This is not a 3.11-vs-3.14 question, and reading it as one is why this cluster
+**This is not a 3.11-vs-3.15 question, and reading it as one is why this cluster
 gets re-filed every cycle.** Of seven adjudicated cases, six have no version
 delta at all: `sched_setscheduler` has returned None since 3.3,
 `PyUnicode_FSConverter` has accepted bytes since 3.3, PEP 529 surrogatepass is
 3.6, `DirEntry` has cached its `stat_result` since PEP 471, audit hooks have
 suppressed everything under `Exception` since at least 3.9, and the `'%U'`
 attribute-error message is byte-identical in 3.13. These are standing
-PyPy-vs-CPython divergences, not PyPy lagging a release. "3.14" pins *which*
-CPython you read — `lib-python/stdlib-version.txt`, currently `v3.14.6` — it does
+PyPy-vs-CPython divergences, not PyPy lagging a release. "3.15" pins *which*
+CPython you read — `lib-python/stdlib-version.txt`, currently `v3.15.0` — it does
 not narrow the rule to version lag, and the absence of a delta is not grounds to
 refuse the exception. Conversely a real delta earns nothing on its own:
 `DirEntry.stat()` object caching predates 3.11 **and** still follows PyPy, for
@@ -45,7 +45,7 @@ reaches an answer PyPy also reaches, restore PyPy's shape.
 No → **STOP, this section does not apply.** Judge it as an ordinary parity
 finding.
 
-**2. Do you hold an admissible artefact for the 3.14 side?** One of three
+**2. Do you hold an admissible artefact for the 3.15 side?** One of three
 routes, and say which:
 
   a. **In-tree pin** — a `lib-python/3/` test that asserts it, or stdlib code
@@ -54,7 +54,7 @@ routes, and say which:
      `lib-python/stdlib-version.txt`, using the free-threaded build, one fresh process per case, reading the
      observable directly rather than inferring it from a return value.
   c. **C source at the pinned tag in a named checkout**, quoted —
-     `git -C ~/Projects/cpython show v3.14.6:Modules/posixmodule.c`.
+     `git -C ~/Projects/cpython show v3.15.0:Modules/posixmodule.c`.
      `Modules/`, `Objects/` and `Python/` are **not in this tree** (`Include/`
      holds only a README); a claim about them names the checkout and the tag, or
      it is memory.
@@ -73,7 +73,7 @@ routes, and say which:
   **Platform clause.** When the behaviour is `#[cfg(windows)]`- or Linux-gated
   and neither oracle can execute it on this host, route (b) is unavailable — use
   (a) or (c) and record the platform in the finding *and* the code comment. An
-  unqualified "measured on python3.14" on a Windows-only path names a run that
+  unqualified "measured on python3.15" on a Windows-only path names a run that
   could not have happened.
 
 No artefact → **STOP. You may not invoke this section.**
@@ -151,10 +151,10 @@ implementation: restore it there and bring it to the user.
   "`is` is pointer identity in CPython" is not a spec fix — it is a JIT change
   with an unmeasured blast radius.
 
-**6. Does pyre land on 3.14 across the whole decision, and on PyPy everywhere
+**6. Does pyre land on 3.15 across the whole decision, and on PyPy everywhere
 else?** Adjacency is defined by **what reads the state you changed**, not by "the
 same function". A change that lands pyre where **neither** upstream sits is a
-defect regardless of which axis matched 3.14 — strictly worse than following
+defect regardless of which axis matched 3.15 — strictly worse than following
 PyPy, and filed under §1. `DirEntry` again: the entry's stat cache is read by
 `check_mode`/`is_dir` at `interp_scandir.py:317`, and `posixmodule.c` also
 aliases lstat into the stat slot for a non-symlink and seeds the cache from
@@ -163,7 +163,7 @@ invents a third behaviour.
 
 Reaching here: **not a parity regression.** File under `## 4. Structural
 adaptations` as
-`[3.14-spec] our_file.rs:line ↔ pypy_file.py:line — <observable>; evidence: <route + cite>`
+`[3.15-spec] our_file.rs:line ↔ pypy_file.py:line — <observable>; evidence: <route + cite>`
 so the next cycle sees it adjudicated instead of re-deriving it. That records the
 decision; it does not close it — per the codex-review skill, §4 is a
 classification, not a verdict.

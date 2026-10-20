@@ -1556,9 +1556,11 @@ pub const FRAME_DEBUG_DATA_GC_TYPE_ID: u32 = 98;
 
 /// GC header size in bytes — single source of truth is
 /// [`majit_gc::header::GcHeader::SIZE`]. Every `FixedObjectArray` and
-/// `PyFrame` allocation prepends this many zero bytes so RPython-style
+/// `PyFrame` allocation prepends this many bytes so RPython-style
 /// write barriers (`*(obj + wb_byteofs) & mask`) read a valid header with
-/// `TRACK_YOUNG_PTRS=0` and skip the slow path. Scalar `value`
+/// `TRACK_YOUNG_PTRS=0` and skip the slow path. A std-alloc
+/// `FixedObjectArray` stamps [`pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID`]
+/// into that header and keeps the flags clear. Scalar `value`
 /// allocations route through [`majit_gc::header::alloc_with_gc_header`].
 pub const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
@@ -1592,9 +1594,10 @@ fn fixed_array_layout(len: usize) -> std::alloc::Layout {
 }
 
 /// Allocate a fixed-length GcArray-shaped `FixedObjectArray` with all
-/// slots initialised to `fill`. The allocation is prefixed with a
-/// zeroed GC header ([`GC_HEADER_SIZE`] bytes) so the write barrier
-/// fast-path sees `TRACK_YOUNG_PTRS=0`.
+/// slots initialised to `fill`. The allocation is prefixed with a GC
+/// header ([`GC_HEADER_SIZE`] bytes) whose type id is
+/// [`pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID`] and whose flags stay
+/// zero so the write barrier fast-path sees `TRACK_YOUNG_PTRS=0`.
 ///
 /// The returned pointer points at the length prefix; items follow
 /// immediately in memory at `FIXED_ARRAY_ITEMS_OFFSET` — matching
@@ -1612,6 +1615,12 @@ pub unsafe fn alloc_fixed_array_with_header(
         if raw.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+        // Stamp the object-array tid; leave the flag half zero so
+        // `set_ref` / `remember_frame_locals_array` still skip the
+        // write-barrier slow path (`incminimark.py write_barrier`).
+        (raw as *mut majit_gc::header::GcHeader).write(majit_gc::header::GcHeader::new(
+            pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
+        ));
         let arr = raw.add(GC_HEADER_SIZE) as *mut FixedObjectArray;
         (*arr).len = len;
         let items = (arr as *mut u8).add(pyre_object::FIXED_ARRAY_ITEMS_OFFSET)
@@ -1678,9 +1687,10 @@ unsafe fn alloc_frame_locals_array(
 ///
 /// `incminimark.py write_barrier` remembers an object only when
 /// `GCFLAG_TRACK_YOUNG_PTRS` is set. Nursery objects are born without that
-/// flag, and a raw `alloc_fixed_array_with_header` block has a zeroed header
-/// (`GcFramePrefix`), so the flag test covers both regimes. The membership
-/// query would only reject the same flag-clear addresses.
+/// flag, and a raw `alloc_fixed_array_with_header` block stamps the
+/// object-array tid with a zero flag word, so the flag test covers both
+/// regimes. The membership query would only reject the same flag-clear
+/// addresses. Deallocation uses `try_gc_owns_object`, not the tid.
 ///
 /// `dont_look_inside`: the flag is mutable GC state. A traced load can
 /// keep the clear bit from the young birth and skip the barrier after the
@@ -3045,7 +3055,12 @@ fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
                     }
                     stacks[j] = next_stack;
                 }
-                Instruction::GetIter | Instruction::GetAiter => {
+                Instruction::GetIter { .. } => {
+                    next_stack = mark_push_value(mark_pop_value(next_stack), StackKind::Iterator);
+                    next_stack = mark_push_value(next_stack, StackKind::Null);
+                    stacks[next_i] = next_stack;
+                }
+                Instruction::GetAiter => {
                     next_stack = mark_push_value(mark_pop_value(next_stack), StackKind::Iterator);
                     stacks[next_i] = next_stack;
                 }
@@ -3063,14 +3078,13 @@ fn mark_stacks(code: &CodeObject, len: usize) -> Vec<i64> {
                         stacks[j] = next_stack;
                     }
                 }
-                // The for-loop iterator is one slot here (`GET_ITER` above):
-                // `end_for` leaves the stack alone and `pop_iter` pops that
-                // one slot, where `stack_effect` counts the iterator/index
-                // pair of the bytecode's own stack model.
+                // GET_ITER pushes iterator then the index-or-NULL slot.
+                // `end_for` leaves the stack alone and `pop_iter` pops both.
                 Instruction::EndFor => {
                     stacks[next_i] = next_stack;
                 }
                 Instruction::PopIter => {
+                    next_stack = mark_pop_value(next_stack);
                     next_stack = mark_pop_value(next_stack);
                     stacks[next_i] = next_stack;
                 }
@@ -6695,31 +6709,42 @@ impl PyFrame {
             != 0
     }
 
-    /// Run the compiler-inserted generator prefix (`COPY_FREE_VARS`,
-    /// `MAKE_CELL`, …) before the generator object is allocated.
+    /// Run the compiler-inserted generator prefix before the generator
+    /// object is allocated.
     ///
-    /// CPython 3.14 `insert_prefix_instructions` places those opcodes ahead of
-    /// `RETURN_GENERATOR`; `RETURN_GENERATOR` then copies the frame with
-    /// `instr_ptr` already past it (`generated_cases.c.h TARGET(RETURN_GENERATOR)`).
-    /// PyPy creates every cell in `initialize_frame_scopes` / `init_cells`
-    /// before `GeneratorIterator(frame)`. pyre wraps the frame at call time,
-    /// so this walk is what makes the cells exist on an unstarted `gi_frame`.
+    /// `insert_prefix_instructions` places `COPY_FREE_VARS` / `MAKE_CELL`
+    /// ahead of `RETURN_GENERATOR`, and a generator expression's code
+    /// (`codegen.c` `codegen_comprehension`) also acquires its outermost
+    /// iterator there: `RESUME RESUME_AT_GEN_EXPR_START; LOAD_FAST .0;
+    /// GET_ITER`, or `GET_AITER` for an `async for` outermost clause, with
+    /// `optimize_load_fast` free to turn the `LOAD_FAST` into
+    /// `LOAD_FAST_BORROW`. A non-iterable raises when the generator
+    /// expression is created. `RETURN_GENERATOR` then copies the frame, value stack
+    /// included, with `instr_ptr` already past it
+    /// (`generated_cases.c.h TARGET(RETURN_GENERATOR)`). PyPy creates every
+    /// cell in `initialize_frame_scopes` / `init_cells` before
+    /// `GeneratorIterator(frame)`. pyre wraps the frame at call time, so this
+    /// walk is what makes the cells and the iterator exist on an unstarted
+    /// `gi_frame`.
     ///
     /// The prefix handlers are the same `execute_make_cell` /
-    /// `execute_copy_free_vars` the eval loop uses. `RETURN_GENERATOR` itself
-    /// is not executed: the generator is allocated by the caller after this
-    /// returns. The frame stays at `last_instr == -1`; [`Self::next_instr`]
-    /// reports `after_return_generator_index` (the `POP_TOP`) so the first
-    /// resume starts there.
+    /// `execute_copy_free_vars` / `execute_load_fast` / `execute_get_iter` /
+    /// `execute_get_aiter` the eval loop uses. `RETURN_GENERATOR` itself is not executed: the
+    /// generator is allocated by the caller after this returns. The frame
+    /// stays at `last_instr == -1`; [`Self::next_instr`] reports
+    /// `after_return_generator_index` (the `POP_TOP`) so the first resume
+    /// starts there. An error raised here propagates to the caller without a
+    /// traceback entry for this frame, which `_PyFrame_IsIncomplete` keeps out
+    /// of tracebacks until it reaches `_co_firsttraceable`.
     pub fn run_generator_prologue(&mut self) -> Result<(), crate::PyError> {
         let Some(after_return_generator) = crate::pycode::after_return_generator_index(self.code())
         else {
             return Ok(());
         };
+        let code = unsafe { &*pyframe_get_pycode(self) };
         let mut pc = 0usize;
         while pc < after_return_generator {
-            let Some((instruction, op_arg)) =
-                crate::pyopcode::decode_instruction_at(self.code(), pc)
+            let Some((instruction, op_arg)) = crate::pyopcode::decode_instruction_at(code, pc)
             else {
                 break;
             };
@@ -6730,13 +6755,24 @@ impl PyFrame {
                 crate::bytecode::Instruction::CopyFreeVars { .. } => {
                     let _ = crate::pyopcode::execute_copy_free_vars(self, instruction, op_arg)?;
                 }
+                crate::bytecode::Instruction::LoadFast { .. }
+                | crate::bytecode::Instruction::LoadFastBorrow { .. } => {
+                    let _ = crate::pyopcode::execute_load_fast(self, code, instruction, op_arg)?;
+                }
+                crate::bytecode::Instruction::GetIter { .. } => {
+                    let _ = crate::pyopcode::execute_get_iter(self, instruction, op_arg)?;
+                }
+                crate::bytecode::Instruction::GetAiter => {
+                    let _ = crate::pyopcode::execute_get_aiter(self)?;
+                }
                 crate::bytecode::Instruction::ReturnGenerator => {
                     // CPython copies the frame after this opcode; do not
                     // execute it. The caller allocates the generator.
                     break;
                 }
-                crate::bytecode::Instruction::ExtendedArg | crate::bytecode::Instruction::Cache => {
-                }
+                crate::bytecode::Instruction::Resume { .. }
+                | crate::bytecode::Instruction::ExtendedArg
+                | crate::bytecode::Instruction::Cache => {}
                 other => {
                     debug_assert!(
                         false,
@@ -7631,7 +7667,8 @@ mod tests {
     #[test]
     fn mark_stacks_after_inner_loop_keeps_outer_iterator() {
         // The statement after an inner loop still runs inside the outer one,
-        // so its entry stack is exactly the outer loop's iterator.
+        // so its entry stack is the outer loop's iterator plus the NULL
+        // GET_ITER leaves under it.
         let code = crate::compile_exec(
             "for i in [1]:
     for j in [2]:
@@ -7651,7 +7688,10 @@ x = 7
                 .map(|pc| stacks[pc])
                 .expect("line has a start")
         };
-        let outer = mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator);
+        let outer = mark_push_value(
+            mark_push_value(MARK_EMPTY_STACK, StackKind::Iterator),
+            StackKind::Null,
+        );
         assert_eq!(entry(4), outer);
         assert_eq!(entry(5), MARK_EMPTY_STACK);
     }

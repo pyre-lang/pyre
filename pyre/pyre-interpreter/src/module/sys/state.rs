@@ -10,6 +10,8 @@
 
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+use pyre_object::PyObjectRef;
+
 /// Default recursion limit, matching CPython / PyPy. `Module.__init__`
 /// sets `self.recursionlimit = 1000` in the PyPy tree
 /// (`pypy/module/sys/moduledef.py`).
@@ -47,16 +49,36 @@ pub const MAX_STR_DIGITS_THRESHOLD: i32 = 640;
 /// field (`set_int_max_str_digits` writes `state.w_int_max_str_digits`).
 pub struct SysState {
     int_max_str_digits: AtomicI32,
+    lazy_imports_mode: AtomicI32,
+    lazy_imports_filter: AtomicUsize,
+    lazy_modules: AtomicUsize,
+    lazy_pending_submodules: AtomicUsize,
 }
 
 impl SysState {
     pub const fn new() -> Self {
         Self {
             int_max_str_digits: AtomicI32::new(DEFAULT_MAX_STR_DIGITS),
+            lazy_imports_mode: AtomicI32::new(0),
+            lazy_imports_filter: AtomicUsize::new(0),
+            lazy_modules: AtomicUsize::new(0),
+            lazy_pending_submodules: AtomicUsize::new(0),
         }
     }
 
-    pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut pyre_object::PyObjectRef)) {}
+    pub fn walk_roots(&self, forward: &mut dyn FnMut(&mut pyre_object::PyObjectRef)) {
+        walk_atomic_ptr(&self.lazy_imports_filter, forward);
+        walk_atomic_ptr(&self.lazy_modules, forward);
+        walk_atomic_ptr(&self.lazy_pending_submodules, forward);
+    }
+}
+
+fn walk_atomic_ptr(slot: &AtomicUsize, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    let mut p = slot.load(Ordering::Relaxed) as PyObjectRef;
+    if !p.is_null() {
+        forward(&mut p);
+        slot.store(p as usize, Ordering::Relaxed);
+    }
 }
 
 impl Default for SysState {
@@ -112,6 +134,67 @@ pub fn set_int_max_str_digits(maxdigits: i32) -> Result<(), crate::PyError> {
             format!("maxdigits {maxdigits} must be 0 or larger than {MAX_STR_DIGITS_THRESHOLD}"),
         ))
     }
+}
+
+/// `PyImport_GetLazyImportsMode` / `PyImport_LAZY_NORMAL` / `LAZY_ALL`.
+pub fn lazy_imports_mode() -> i32 {
+    sys_state().lazy_imports_mode.load(Ordering::Relaxed)
+}
+
+pub fn set_lazy_imports_mode(mode: i32) {
+    sys_state().lazy_imports_mode.store(mode, Ordering::Relaxed);
+}
+
+pub fn lazy_imports_filter() -> Option<PyObjectRef> {
+    let p = sys_state().lazy_imports_filter.load(Ordering::Acquire) as PyObjectRef;
+    if p.is_null() { None } else { Some(p) }
+}
+
+/// `PyImport_SetLazyImportsFilter`.
+pub fn set_lazy_imports_filter(filter: PyObjectRef) -> Result<(), crate::PyError> {
+    let stored = if filter.is_null() || unsafe { pyre_object::is_none(filter) } {
+        0
+    } else if !crate::baseobjspace::callable_w(filter) {
+        return Err(crate::PyError::value_error(
+            "filter provided but is not callable",
+        ));
+    } else {
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        filter as usize
+    };
+    sys_state()
+        .lazy_imports_filter
+        .store(stored, Ordering::Release);
+    Ok(())
+}
+
+pub fn lazy_modules() -> PyObjectRef {
+    sys_state().lazy_modules.load(Ordering::Acquire) as PyObjectRef
+}
+
+pub fn set_lazy_modules(set: PyObjectRef) {
+    sys_state()
+        .lazy_modules
+        .store(set as usize, Ordering::Release);
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+}
+
+pub fn lazy_pending_submodules() -> PyObjectRef {
+    sys_state().lazy_pending_submodules.load(Ordering::Acquire) as PyObjectRef
+}
+
+pub fn ensure_lazy_pending_submodules() -> PyObjectRef {
+    let state = sys_state();
+    let existing = state.lazy_pending_submodules.load(Ordering::Acquire) as PyObjectRef;
+    if !existing.is_null() {
+        return existing;
+    }
+    let d = pyre_object::w_dict_new();
+    state
+        .lazy_pending_submodules
+        .store(d as usize, Ordering::Release);
+    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    d
 }
 
 #[cfg(test)]

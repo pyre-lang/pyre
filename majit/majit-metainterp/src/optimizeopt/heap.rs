@@ -3519,9 +3519,15 @@ impl OptHeap {
                         op.descr
                     );
                 }
-                // RPython emitting_operation: calls go through
-                // force_from_effectinfo (selective) or clean_caches,
-                // NOT force_all_lazy. force_all_lazy is only in flush().
+                // heap.py `emit()` postpones CALL_MAY_FORCE after
+                // `emitting_operation`. This arm returns Remove, so
+                // `propagate_forward`'s emit() parity does not run
+                // `emitting_operation`; do that flush here, at first
+                // see, before postponing.
+                // heap.py `emitting_operation`: is_call +
+                // `has_random_effects()` falls through to
+                // `force_all_lazy_sets` then `clean_caches`; otherwise
+                // `force_from_effectinfo` and return.
                 let escaped_owners = self.call_argument_owner_closure(op, ctx);
                 self.mark_escaped_varargs(op, ctx);
                 // See `emit_residual_call`: this pyre-specific flush is
@@ -3530,6 +3536,7 @@ impl OptHeap {
                 // Postpone the call — it will be emitted when GUARD_NOT_FORCED arrives.
                 self.postponed_op = Some(op.clone());
                 if Self::call_has_random_effects(op) {
+                    self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
                     self.clean_caches(ctx);
                 } else {
                     self.force_from_effectinfo(op, ctx);
@@ -8132,6 +8139,73 @@ mod tests {
             gets_after,
             1,
             "a field read cached before an unanalyzed residual must not be reused after it; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_call_may_force_random_effects_flushes_lazy_sets_and_drops_field_cache() {
+        // heap.py `emit()` calls `emitting_operation` before postponing
+        // CALL_MAY_FORCE. `emitting_operation` for is_call +
+        // `has_random_effects()` falls through to `force_all_lazy_sets`
+        // then `clean_caches`, so a lazy `setfield_gc` is emitted at
+        // first see — not left for `force_lazy_sets_for_guard` on
+        // GUARD_NOT_FORCED, which would park a virtual rhs in
+        // pendingfields (`heap.py` `force_lazy_sets_for_guard`) that a
+        // callee CALL_ASSEMBLER guard never carries.
+        let field = descr(0);
+        let call_d = call_descr(83, crate::call_descr::default_effect_info());
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                field.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
+                ],
+                field.clone(),
+            ),
+            Op::with_descr(
+                OpCode::CallMayForceN,
+                &[rooted_inputarg_operand(Type::Ref, 200)],
+                call_d,
+            ),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::with_descr(
+                OpCode::GetfieldGcI,
+                &[rooted_inputarg_operand(Type::Ref, 100)],
+                field,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[101]);
+
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallMayForceN)
+            .expect("CALL_MAY_FORCE must survive");
+        let setfield_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("lazy setfield_gc must be emitted");
+        assert!(
+            setfield_pos < call_pos,
+            "setfield_gc must be emitted before CALL_MAY_FORCE; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+        let gets_after = result
+            .iter()
+            .skip(call_pos)
+            .filter(|op| op.opcode == OpCode::GetfieldGcI)
+            .count();
+        assert_eq!(
+            gets_after,
+            1,
+            "a field read cached before a random-effects CALL_MAY_FORCE must not be reused after it; got {:?}",
             result.iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
     }

@@ -26,7 +26,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 CPYEXT = ROOT / "pyre/pyre-interpreter/src/cpyext"
-HEADER_DIR = ROOT / "include/pyre3.14t"
+HEADER_DIR = ROOT / "include/pyre3.15t"
 RECORD = pathlib.Path(__file__).resolve().parent / "cpython-abi.txt"
 GENERATED = HEADER_DIR / "pyre_decl.h"
 
@@ -608,7 +608,7 @@ def main():
 
     snapshot = sub.add_parser("snapshot", help="rewrite the recorded CPython declarations")
     snapshot.add_argument("include", help="a CPython checkout's Include directory")
-    snapshot.add_argument("--version", default="3.14", help="what to record as the source")
+    snapshot.add_argument("--version", default="3.15", help="what to record as the source")
     snapshot.set_defaults(run=command_snapshot)
 
     check = sub.add_parser("check", help="every export against the record")

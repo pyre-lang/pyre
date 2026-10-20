@@ -41,7 +41,7 @@ libc = { workspace = true }
 #
 # Rust has no "host Python" the same way CPython does. rustpython-compiler-core
 # plays the role of the stdlib `opcode` module here: a neutral crate that
-# owns the CPython-3.14 opcode definitions (Instruction, CodeObject,
+# owns the CPython-3.15 opcode definitions (Instruction, CodeObject,
 # ConstantData, ...). majit-translate wraps it in
 # flowspace::bytecode::HostCode, exactly the way RPython wraps `opcode`.
 #

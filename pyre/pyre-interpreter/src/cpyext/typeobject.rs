@@ -235,7 +235,7 @@ pub struct CPyTypeObject {
 }
 
 /// C-visible `PyHeapTypeObject`, the twin of the struct in
-/// `include/pyre3.14t/structmember.h`.
+/// `include/pyre3.15t/structmember.h`.
 ///
 /// This is the shape every type mirror is allocated at, which is what
 /// `tp_basicsize` answers for `type` and the metaclasses derived from it.  The
@@ -7394,7 +7394,7 @@ mod tests {
     /// number the Rust side spells differently, or does not spell at all.
     #[test]
     fn every_slot_id_is_the_number_the_header_gives_it() {
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/typeslots.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/typeslots.h");
 
         let mut checked = 0;
         for line in HEADER.lines() {
@@ -7437,14 +7437,14 @@ mod tests {
     }
 
     /// A member's `flags` word is one thing two places spell: an extension
-    /// compiled against `include/pyre3.14t/object.h` builds it, and this file
+    /// compiled against `include/pyre3.15t/object.h` builds it, and this file
     /// reads it.  Nothing tied the two together, so this walks the header and
     /// rejects any flag whose bit the Rust side spells differently.
     #[test]
     fn every_member_flag_is_the_bit_the_header_gives_it() {
         use bitflags::Flags as _;
 
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/object.h");
 
         // `Py_READONLY`, `Py_AUDIT_READ`, `Py_RELATIVE_OFFSET` -- decimal, and
         // the only `Py_` macros that are.  The type codes beside them are
@@ -7492,14 +7492,14 @@ mod tests {
     }
 
     /// A `PySlot`'s `sl_flags` is one thing two places spell: an extension
-    /// compiled against `include/pyre3.14t/object.h` builds it, and the two
+    /// compiled against `include/pyre3.15t/object.h` builds it, and the two
     /// slot-array readers test it.  This walks the header and rejects any flag
     /// whose bit the Rust side spells differently.
     #[test]
     fn every_slot_flag_is_the_bit_the_header_gives_it() {
         use bitflags::Flags as _;
 
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/object.h");
 
         let mut header: Vec<(&str, u16)> = Vec::new();
         for line in HEADER.lines() {
@@ -7551,8 +7551,8 @@ mod tests {
     /// side numbers differently, or does not spell at all.
     #[test]
     fn every_member_type_code_is_the_number_the_header_gives_it() {
-        const OBJECT_H: &str = include_str!("../../../../include/pyre3.14t/object.h");
-        const STRUCTMEMBER_H: &str = include_str!("../../../../include/pyre3.14t/structmember.h");
+        const OBJECT_H: &str = include_str!("../../../../include/pyre3.15t/object.h");
+        const STRUCTMEMBER_H: &str = include_str!("../../../../include/pyre3.15t/structmember.h");
 
         // `Py_T_SHORT 0` and the two the interpreter keeps to itself,
         // `_Py_T_OBJECT` and `_Py_T_NONE`.

@@ -4,7 +4,9 @@ import threading
 from threading import Thread
 from unittest import TestCase
 import gc
+import weakref
 
+from test import support
 from test.support import threading_helper
 
 
@@ -94,6 +96,39 @@ class TestGC(TestCase):
         thread.start()
         thread.join()
 
+    def test_merge_brc_queue_of_detached_thread(self):
+        # GH-157838: objects queued for merging by a thread that is detached
+        # (blocked in a lock acquire, sleep, etc.) are merged and freed on its
+        # behalf instead of staying alive until it runs Python code again.
+        lock = threading.Lock()
+        lock.acquire()
+        ready = threading.Event()
+        objs = []
+
+        def worker():
+            # Objects owned by this thread; only the list holds a reference.
+            objs.extend(MyObj() for _ in range(100))
+            ready.set()
+            lock.acquire()  # block while detached
+
+        thread = Thread(target=worker)
+        thread.start()
+        try:
+            ready.wait()
+            # The worker may not have detached yet when the first objects
+            # are dropped; keep trying until one is freed immediately.
+            for _ in support.sleeping_retry(support.SHORT_TIMEOUT, error=False):
+                obj = objs.pop()
+                wr = weakref.ref(obj)
+                del obj
+                if wr() is None:
+                    break
+            else:
+                self.fail("object not freed while owning thread was detached")
+        finally:
+            lock.release()
+            thread.join()
+
     def test_set_threshold(self):
         # GH-148613: Setting the GC threshold from another thread could cause a
         # race between the `gc_should_collect` and `gc_set_threshold` functions.
@@ -123,6 +158,35 @@ class TestGC(TestCase):
                 pass
         finally:
             gc.set_threshold(*current_threshold)
+
+    def test_get_count(self):
+        class CyclicReference:
+            def __init__(self):
+                self.ref = self
+
+        NUM_ALLOCATORS = 7
+        NUM_READERS = 1
+        NUM_THREADS = NUM_ALLOCATORS + NUM_READERS
+        NUM_ITERS = 1000
+
+        barrier = threading.Barrier(NUM_THREADS)
+
+        def allocator():
+            barrier.wait()
+            for _ in range(NUM_ITERS):
+                CyclicReference()
+
+
+        def reader():
+            barrier.wait()
+            for _ in range(NUM_ITERS):
+                gc.get_count()
+
+        threads = [Thread(target=allocator) for _ in range(NUM_ALLOCATORS)]
+        threads.extend(Thread(target=reader) for _ in range(NUM_READERS))
+
+        with threading_helper.start_threads(threads):
+            pass
 
 
 if __name__ == "__main__":

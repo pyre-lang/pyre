@@ -14,7 +14,7 @@ bitflags::bitflags! {
     /// carries as `tp_flags`.
     ///
     /// Two places spell this table: the header an extension compiles against
-    /// (`include/pyre3.14t/object.h`) and this declaration.  Upstream keeps no
+    /// (`include/pyre3.15t/object.h`) and this declaration.  Upstream keeps no
     /// such pair -- `cpyext/api.py` reads each value out of the real header
     /// with `rffi_platform.ConstantInteger` -- so
     /// `every_tp_flag_is_the_bit_the_header_gives_it` compares the two,
@@ -2939,7 +2939,7 @@ mod tests {
     }
 
     /// `tp_flags` is one word two places spell: an extension compiled against
-    /// `include/pyre3.14t/object.h` puts bits into it, and this file publishes
+    /// `include/pyre3.15t/object.h` puts bits into it, and this file publishes
     /// them.  Nothing ties the two together -- upstream has no such pair,
     /// because `api.py` reads each value out of the real header with
     /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
@@ -2952,7 +2952,7 @@ mod tests {
     fn every_tp_flag_is_the_bit_the_header_gives_it() {
         use bitflags::Flags as _;
 
-        const HEADER: &str = include_str!("../../../include/pyre3.14t/object.h");
+        const HEADER: &str = include_str!("../../../include/pyre3.15t/object.h");
 
         // `(1UL << N)`, and the bare `0UL` that `DEFAULT` and the Stackless
         // extension carry.  A composite body names other flags rather than a

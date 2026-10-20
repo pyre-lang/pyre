@@ -31,7 +31,7 @@ pub fn eval_slice_index(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
         Ok(v) => Ok(v),
         Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(crate::PyError::new(
             crate::PyErrorKind::TypeError,
-            "slice indices must be integers or None or have an __index__ method".to_string(),
+            "slice indices must be integers or have an __index__ method".to_string(),
         )),
         Err(e) => Err(e),
     }

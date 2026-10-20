@@ -138,6 +138,26 @@ fn normalize(encoding: &str) -> String {
     chars
 }
 
+/// `_Py_normalize_encoding` with `to_lower=0`: collapse runs of non-ASCII-
+/// alphanumeric bytes (other than `.`) to `_`, and leave case alone.
+/// `_codecs__normalize_encoding_impl` walks the UTF-8 of `encoding`.
+fn normalize_encoding_keep_case(encoding: &str) -> String {
+    let mut chars = String::new();
+    let mut punct = false;
+    for &b in encoding.as_bytes() {
+        if b.is_ascii_alphanumeric() || b == b'.' {
+            if punct && !chars.is_empty() {
+                chars.push('_');
+            }
+            chars.push(b as char);
+            punct = false;
+        } else {
+            punct = true;
+        }
+    }
+    chars
+}
+
 fn is_callable(obj: PyObjectRef) -> bool {
     // interp_codecs.py:151/663 `space.is_true(space.callable(...))`.
     !obj.is_null() && crate::baseobjspace::callable_w(obj)
@@ -2297,6 +2317,16 @@ crate::py_module! {
             errors: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
             codec_encode_or_decode(obj, encoding, errors, false)
+        }
+        fn _normalize_encoding(encoding: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            if !unsafe { is_str(encoding) } {
+                return Err(crate::PyError::type_error(format!(
+                    "_normalize_encoding() argument 'encoding' must be str, not {}",
+                    crate::type_methods::clinic_arg_type_name(encoding)
+                )));
+            }
+            let encoding = crate::baseobjspace::str_utf8_w(encoding)?;
+            Ok(w_str_new_managed(&normalize_encoding_keep_case(encoding)))
         }
     },
     functions: {

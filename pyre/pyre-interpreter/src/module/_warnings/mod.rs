@@ -437,6 +437,7 @@ pub(crate) fn show_warning(
     lineno: i64,
     source_line: PyObjectRef,
     source: PyObjectRef,
+    module: PyObjectRef,
 ) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let message_slot = pin_root_slot(message);
@@ -445,6 +446,7 @@ pub(crate) fn show_warning(
     let filename_slot = pin_root_slot(filename);
     let source_line_slot = pin_root_slot(source_line);
     let source_slot = pin_root_slot(source);
+    let module_slot = pin_root_slot(module);
     if let Some(show) = warnings_attr("_showwarnmsg") {
         let show_slot = pin_root_slot(show);
         if !crate::baseobjspace::callable_w(pyre_object::gc_roots::shadow_stack_get(show_slot)) {
@@ -469,6 +471,13 @@ pub(crate) fn show_warning(
                     w_none()
                 } else {
                     pyre_object::gc_roots::shadow_stack_get(source_slot)
+                },
+                // `call_show_warning` 8th positional: original `module`
+                // (`None` when `PyErr_WarnExplicitObject` passed NULL).
+                if pyre_object::gc_roots::shadow_stack_get(module_slot).is_null() {
+                    w_none()
+                } else {
+                    pyre_object::gc_roots::shadow_stack_get(module_slot)
                 },
             ],
         )?;
@@ -559,6 +568,8 @@ pub(crate) fn show_warning(
 }
 
 /// One-word residual-call ABI for [`show_warning`].
+/// Same eight arguments as the interpreter helper, including `module`
+/// (`do_warn_explicit` / `call_show_warning` 8th positional).
 pub extern "C" fn show_warning_jit_abi(
     message: PyObjectRef,
     text: PyObjectRef,
@@ -567,6 +578,7 @@ pub extern "C" fn show_warning_jit_abi(
     lineno: i64,
     source_line: PyObjectRef,
     source: PyObjectRef,
+    module: PyObjectRef,
 ) -> i64 {
     match show_warning(
         message,
@@ -576,6 +588,7 @@ pub extern "C" fn show_warning_jit_abi(
         lineno,
         source_line,
         source,
+        module,
     ) {
         Ok(()) => 0,
         Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
@@ -845,6 +858,7 @@ pub(crate) fn do_warn_explicit(
             lineno,
             pyre_object::gc_roots::shadow_stack_get(source_line_slot),
             pyre_object::gc_roots::shadow_stack_get(source_slot),
+            pyre_object::gc_roots::shadow_stack_get(input_module_slot),
         )?;
     }
     Ok(())

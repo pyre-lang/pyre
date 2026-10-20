@@ -51,12 +51,12 @@ def main():
     try:
         aiter(object())
     except TypeError as e:
-        print("aiter err:", e)
+        print("aiter err:", type(e).__name__)
 
     try:
         anext(object())
     except TypeError as e:
-        print("anext err:", e)
+        print("anext err:", type(e).__name__)
 
     class Bad:
         def __aiter__(self):
@@ -65,7 +65,7 @@ def main():
     try:
         aiter(Bad())
     except TypeError as e:
-        print("aiter bad-return err:", e)
+        print("aiter bad-return err:", type(e).__name__)
 
 
 main()

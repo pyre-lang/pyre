@@ -12,6 +12,10 @@
 # 2.4x and 2.7x and would gate this fixture at WASM_MAX_DYNASM_RATIO without
 # an allowance at all; the allowance is for the darwin reading no CI run
 # measures.
+# pyre-check: jitstats-band=fbw_blackhole_adopted_single_frame=1,fbw_blackhole_adopted_multi_frame=1
+# The blackhole adoptions split between single- and multi-frame by host:
+# against the baseline's 0/2, darwin dynasm has read 0/3 at every
+# PYPY_GC_NURSERY from 1M to 16M.
 # The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
 # pickle drives it 122 times here, more than any other fixture.  It also reaches
 # `builtin_getattr`, which a corpus census found no other fixture firing: once

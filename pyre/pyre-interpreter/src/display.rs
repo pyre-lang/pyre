@@ -430,6 +430,32 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     Ok(out)
 }
 
+/// `frozendict_repr`: empty is `Name()`, otherwise `Name({...})` wrapping
+/// the dict-body repr. `Name` is `Py_TYPE(self)->tp_name`.
+///
+/// # Safety
+/// `obj` must be a live exact `frozendict` (`W_DictObject` payload).
+pub unsafe fn frozendict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    let name = if let Some(w_type) = crate::typedef::r#type(obj) {
+        pyre_object::w_type_get_name(w_type.as_ptr())
+    } else {
+        "frozendict"
+    };
+    if pyre_object::w_dict_len(obj) == 0 {
+        let mut out = Wtf8Buf::new();
+        out.push_str(name);
+        out.push_str("()");
+        return Ok(out);
+    }
+    let body = dict_repr(obj)?;
+    let mut out = Wtf8Buf::new();
+    out.push_str(name);
+    out.push_str("(");
+    out.push_wtf8(&body);
+    out.push_str(")");
+    Ok(out)
+}
+
 /// `listobject.py W_ListObject.descr_repr`, factored out so the TypeDef slot
 /// and the native `py_repr` fast path use the same recursion guard and item
 /// walk. Calling the base descriptor on a subclass must not redispatch its
@@ -576,7 +602,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             || std::ptr::eq(tp, &STR_TYPE as *const PyType)
             || std::ptr::eq(tp, &pyre_object::LIST_TYPE as *const PyType)
             || pyre_object::is_tuple(obj)
-            || pyre_object::is_dict(obj)
+            || pyre_object::is_any_dict(obj)
             || pyre_object::is_set_or_frozenset(obj)
             || std::ptr::eq(tp, &pyre_object::interp_array::ARRAY_TYPE as *const PyType)
             || std::ptr::eq(
@@ -970,6 +996,8 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 }
             }
             return tuple_repr(obj());
+        } else if unsafe { pyre_object::is_frozendict(obj()) } {
+            return unsafe { frozendict_repr(obj()) };
         } else if unsafe { pyre_object::is_dict(obj()) } {
             return unsafe { dict_repr(obj()) };
         } else if pyre_object::sliceobject::is_slice(obj()) {

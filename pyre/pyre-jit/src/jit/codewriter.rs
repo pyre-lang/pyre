@@ -3413,6 +3413,17 @@ fn frontend_load_const_flow_value(
     pyobject_const_ref_value(pyre_interpreter::pyframe::load_const_from_code(code, idx))
 }
 
+/// `flowcontext.py LOAD_CONST`: a prebuilt common constant is a static const
+/// push. `all` / `any` allocate a fresh builtin function in
+/// `load_common_constant_value`, so those stay a residual.
+fn frontend_load_common_constant_flow_value(
+    cc: pyre_interpreter::bytecode::CommonConstant,
+) -> Option<super::flow::FlowValue> {
+    pyre_interpreter::opcode_ops::common_constant_is_prebuilt(cc).then(|| {
+        pyobject_const_ref_value(pyre_interpreter::opcode_ops::load_common_constant_value(cc))
+    })
+}
+
 fn set_last_bool_exitcase(block: &super::flow::BlockRef, branch_taken: bool) {
     let link = block
         .borrow()
@@ -3803,6 +3814,7 @@ struct FnPtrIndices {
     unbound_local_error_fn: HelperHandle,
     clear_in_flight_exception_fn: HelperHandle,
     bytecode_trace_jitted_slow_fn: HelperHandle,
+    eval_lazy_import_name_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -4572,6 +4584,14 @@ fn register_helper_fn_pointers(
         cpu.newlist_from_iter_hint_fn as *const (),
         CallFlavor::MayForce,
     );
+    // `eval_lazy_import_name` runs `__lazy_import__` / `__import__` and
+    // may execute module-level Python → `MayForce`. Appended last so
+    // every pre-existing helper index remains stable.
+    let eval_lazy_import_name_fn = bind(
+        assembler,
+        cpu.eval_lazy_import_name_fn as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4682,6 +4702,7 @@ fn register_helper_fn_pointers(
         unbound_local_error_fn,
         clear_in_flight_exception_fn,
         bytecode_trace_jitted_slow_fn,
+        eval_lazy_import_name_fn,
     }
 }
 
@@ -6859,6 +6880,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: bytecode_trace_jitted_slow_fn_idx,
                     flavor: bytecode_trace_jitted_slow_fn_flavor,
+                },
+            eval_lazy_import_name_fn:
+                HelperHandle {
+                    idx: eval_lazy_import_name_fn_idx,
+                    flavor: _eval_lazy_import_name_fn_flavor,
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
@@ -11349,42 +11375,65 @@ impl CodeWriter {
                         }
 
                         // GET_ITER — pop the iterable, call `iter(obj)`, push the
-                        // iterator.  Net: 0 (replace TOS).  Residual-call lowering
-                        // (range-only spike) so the for-loop body stays on the
-                        // full-body-walk tracer like a while-loop, instead of the
-                        // `abort_permanent` decline that routed it to the weaker
-                        // trait leg (the +1 double-apply, #57).  pyopcode.rs
-                        // `opcode_get_iter` → `baseobjspace::iter`; a user
-                        // `__iter__` may run Python → `CallFlavor::MayForce`.
-                        Instruction::GetIter => {
-                            let _iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let iter_var = residual_call!(
-                                get_iter_fn_idx,
-                                CallFlavor::MayForce,
-                                majit_ir::RuntimeHelperKind::GetIter,
-                                vec![],
-                                vec![iterable_value],
-                                vec![],
-                                vec![Kind::Ref],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            );
-                            let iter_value = iter_var
-                                .map(super::flow::FlowValue::from)
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            // Physically write the iterator into its value-stack
-                            // slot (`pyframe.py pushvalue` →
-                            // `setarrayitem_vable_r` via `jtransform.py do_fixed_list_setitem
-                            // do_fixed_list_setitem`), not just bump the symbolic
-                            // depth.  The following FOR_ITER reads the iterator
-                            // back through `getarrayitem_vable_r`, and the
-                            // blackhole runs GET_ITER→FOR_ITER from the jitcode on
-                            // a mid-frame resume, so the slot must be populated by
-                            // the emitted op rather than relying on a prior
-                            // interpreter write.
-                            current_state.stack.push(iter_value.clone());
-                            emit_pushvalue_ref!(current_depth, current_depth, iter_value, py_pc);
+                        // iterator then the index-or-NULL slot.  Net: +1.
+                        // Residual-call lowering (range-only spike) so the
+                        // for-loop body stays on the full-body-walk tracer like
+                        // a while-loop, instead of the `abort_permanent` decline
+                        // that routed it to the weaker trait leg (the +1
+                        // double-apply, #57).  pyopcode.rs `opcode_get_iter` →
+                        // `baseobjspace::iter`; a user `__iter__` may run
+                        // Python → `CallFlavor::MayForce`.
+                        Instruction::GetIter { mode } => {
+                            let yield_from = mode.get(op_arg);
+                            if yield_from != 0 {
+                                let _ = current_state.stack.pop();
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_state.stack.push(null_stack_sentinel());
+                                // Genuine trace boundary: yield-from GET_ITER
+                                // heads a SEND that suspends the frame.
+                                emit_abort_permanent!(py_pc);
+                            } else {
+                                let _iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let iterable_value =
+                                    pop_ref_or_fresh(&mut current_state, &mut graph);
+                                let iter_var = residual_call!(
+                                    get_iter_fn_idx,
+                                    CallFlavor::MayForce,
+                                    majit_ir::RuntimeHelperKind::GetIter,
+                                    vec![],
+                                    vec![iterable_value],
+                                    vec![],
+                                    vec![Kind::Ref],
+                                    ResKind::Ref,
+                                    py_pc as i64,
+                                );
+                                let iter_value = iter_var
+                                    .map(super::flow::FlowValue::from)
+                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                                // Physically write the iterator into its value-stack
+                                // slot (`pyframe.py pushvalue` →
+                                // `setarrayitem_vable_r` via `jtransform.py do_fixed_list_setitem
+                                // do_fixed_list_setitem`), not just bump the symbolic
+                                // depth.  The following FOR_ITER reads the iterator
+                                // back through `getarrayitem_vable_r`, and the
+                                // blackhole runs GET_ITER→FOR_ITER from the jitcode on
+                                // a mid-frame resume, so the slot must be populated by
+                                // the emitted op rather than relying on a prior
+                                // interpreter write.
+                                current_state.stack.push(iter_value.clone());
+                                emit_pushvalue_ref!(
+                                    current_depth,
+                                    current_depth,
+                                    iter_value,
+                                    py_pc
+                                );
+                                current_state.stack.push(null_stack_sentinel());
+                                emit_pushvalue_ref_const!(
+                                    current_depth,
+                                    pyre_object::PY_NULL as i64,
+                                    py_pc
+                                );
+                            }
                         }
 
                         // FOR_ITER — peek the iterator (kept on the stack), call
@@ -11423,7 +11472,8 @@ impl CodeWriter {
                             // `compute_liveness` marks it live at the FOR_ITER
                             // `-live-` marker and `build_pcdep_color_slots` keeps
                             // its `(color -> slot)` entry for the M3 body-guard
-                            // resume.  TOS is the iterator (`current_depth - 1`).
+                            // resume.  TOS is the index-or-NULL slot; the
+                            // iterator is TOS1 (`current_depth - 2`).
                             //
                             // The per-iteration reload is unconditional for
                             // portals.  Deep operand-stack kept temps that an
@@ -11433,7 +11483,7 @@ impl CodeWriter {
                             // `walker_capture_snapshot_for_last_guard_impl`
                             // (jitcode_dispatch.rs), porting
                             // `get_list_of_active_boxes` (pyjitpl.py).
-                            let iter_slot_depth = current_depth.saturating_sub(1);
+                            let iter_slot_depth = current_depth.saturating_sub(2);
                             let iter_abs_slot =
                                 (stack_base_absolute + iter_slot_depth as usize) as i64;
                             let v_iter_idx: super::flow::FlowValue =
@@ -11718,16 +11768,13 @@ impl CodeWriter {
                         }
 
                         Instruction::PopIter => {
-                            // pop iterator: net -1. `PyFrame::pop`
-                            // (pyframe.rs:3002-3010, `popvalue_maybe_none`
-                            // pyframe.py) writes NULL over the slot
-                            // before it lowers `valuestackdepth`, so the pop
-                            // goes through `emit_popvalue_ref!` like every
-                            // other one rather than moving the depth alone.
-                            // The walker's symbolic stack pops in lock-step:
-                            // leaving `current_state.stack` one slot ahead
-                            // makes later stack permutations and stores consume
-                            // the wrong symbolic values.
+                            // Discard the index-or-NULL slot and the iterator.
+                            // `PyFrame::pop` (`popvalue_maybe_none` pyframe.py)
+                            // writes NULL over each slot before it lowers
+                            // `valuestackdepth`, so both pops go through
+                            // `emit_popvalue_ref!`.
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            let _null = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let _iterator_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                         }
@@ -12673,12 +12720,14 @@ impl CodeWriter {
                             push_and_bump!(result_value.into(), py_pc);
                         }
 
-                        // EndSend: pops result (TOS), pops iter (TOS1), pushes result back.
-                        // Net: -1. Preserve result identity. `eval.rs`'s `end_send`.
+                        // EndSend: pops result, index-or-NULL, and receiver,
+                        // then pushes result. Net: -2. `eval.rs`'s `end_send`.
                         Instruction::EndSend => {
                             let result = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
-                            let _ = current_state.stack.pop(); // iter
+                            let _ = current_state.stack.pop(); // index-or-NULL
+                            current_depth = current_depth.saturating_sub(1);
+                            let _ = current_state.stack.pop(); // receiver
                             current_depth = current_depth.saturating_sub(1);
                             current_state.stack.push(result);
                             current_depth += 1;
@@ -12699,19 +12748,17 @@ impl CodeWriter {
                         // trace `_gcd_import`; one monolithic residual hid
                         // the entire importer.
                         Instruction::ImportName { namei } => {
-                            let name_idx = namei.get(op_arg) as usize;
+                            // rustpython-codegen packs `(name_idx << 2) | flags`;
+                            // `import_name_index` / `execute_import_name`
+                            // (`pyopcode.rs`): bit0 explicit lazy, bit1
+                            // forced eager.
+                            let packed = namei.get(op_arg);
+                            let name_idx = pyre_interpreter::import_name_index(packed);
+                            let import_flags = packed & 3;
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let fromlist_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let level_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-
-                            let callable = emit_frontend_frame_only_ref(
-                                &mut graph,
-                                &current_block.block(),
-                                "load_import",
-                                frame_var.into(),
-                                py_pc as i64,
-                            );
 
                             let name = code
                                 .names
@@ -12727,53 +12774,108 @@ impl CodeWriter {
                                 )
                             };
                             let name_value = pyobject_const_ref_value(w_name);
-                            // Every per-code jitcode now carries its own red
-                            // frame.  Read that frame's live w_globals exactly
-                            // as PyPy's `self.get_w_globals()` does; an inlined
-                            // callee must never inherit the caller's namespace
-                            // or a code-wrapper constant in its place.
-                            let globals_value: super::flow::FlowValue =
-                                emit_frontend_frame_only_ref(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "load_import_globals",
-                                    frame_var.into(),
+                            // `eval.rs import_name` calls
+                            // `eval_lazy_import_name` when flags bit 2 is
+                            // clear. That helper then checks
+                            // `is_module_level_frame` (`globals is
+                            // locals`). `CO_NEWLOCALS` frames (functions,
+                            // class bodies) bind a distinct mapping
+                            // (`pyframe.py initialize_frame_scopes`) so
+                            // they cannot go lazy — keep the `__import__`
+                            // / `_gcd_import` descent. A `!CO_NEWLOCALS`
+                            // code object *can* run as module-level
+                            // (`exec` with one dict) or not (`exec` with
+                            // two); the residual repeats the interpreter
+                            // decision at run time.
+                            let can_go_lazy = (import_flags & 2) == 0
+                                && !code.flags.contains(CodeFlags::NEWLOCALS);
+                            if can_go_lazy {
+                                let result_value = residual_call!(
+                                    eval_lazy_import_name_fn_idx,
+                                    CallFlavor::MayForce,
+                                    vec![super::flow::Constant::signed(
+                                        (import_flags & 1) as i64
+                                    )
+                                    .into()],
+                                    vec![
+                                        frame_var.into(),
+                                        name_value,
+                                        fromlist_value,
+                                        level_value,
+                                    ],
+                                    vec![],
+                                    vec![
+                                        Kind::Ref,
+                                        Kind::Ref,
+                                        Kind::Ref,
+                                        Kind::Ref,
+                                        Kind::Int,
+                                    ],
+                                    ResKind::Ref,
                                     py_pc as i64,
                                 )
-                                .into();
-                            // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug
-                            // locals and substitutes `None` only when the frame
-                            // has none.  A baked `None` here would hide a
-                            // materialized mapping from a custom `__import__`.
-                            let locals_value = emit_frontend_frame_only_ref(
-                                &mut graph,
-                                &current_block.block(),
-                                "load_import_locals",
-                                frame_var.into(),
-                                py_pc as i64,
-                            );
-                            let result_value = emit_frontend_simple_call(
-                                &mut graph,
-                                &current_block.block(),
-                                callable.into(),
-                                super::flow::Constant::none().into(),
-                                vec![
-                                    name_value,
-                                    globals_value,
-                                    locals_value.into(),
-                                    fromlist_value,
-                                    level_value,
-                                ],
-                                py_pc as i64,
-                            );
-                            push_and_bump!(result_value.into(), py_pc);
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
+                                push_and_bump!(result_value, py_pc);
+                            } else {
+                                let callable = emit_frontend_frame_only_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_import",
+                                    frame_var.into(),
+                                    py_pc as i64,
+                                );
+                                // Every per-code jitcode now carries its own red
+                                // frame.  Read that frame's live w_globals exactly
+                                // as PyPy's `self.get_w_globals()` does; an inlined
+                                // callee must never inherit the caller's namespace
+                                // or a code-wrapper constant in its place.
+                                let globals_value: super::flow::FlowValue =
+                                    emit_frontend_frame_only_ref(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        "load_import_globals",
+                                        frame_var.into(),
+                                        py_pc as i64,
+                                    )
+                                    .into();
+                                // `pyopcode.py`'s `IMPORT_NAME` reads the frame's debug
+                                // locals and substitutes `None` only when the frame
+                                // has none.  A baked `None` here would hide a
+                                // materialized mapping from a custom `__import__`.
+                                let locals_value = emit_frontend_frame_only_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_import_locals",
+                                    frame_var.into(),
+                                    py_pc as i64,
+                                );
+                                let result_value = emit_frontend_simple_call(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    callable.into(),
+                                    super::flow::Constant::none().into(),
+                                    vec![
+                                        name_value,
+                                        globals_value,
+                                        locals_value.into(),
+                                        fromlist_value,
+                                        level_value,
+                                    ],
+                                    py_pc as i64,
+                                );
+                                push_and_bump!(result_value.into(), py_pc);
+                            }
                         }
 
                         // ImportFrom: peek module, push attr. Net: +1.
                         Instruction::ImportFrom { namei } => {
-                            // pyopcode.py IMPORT_FROM — PEEK the module (TOS,
-                            // NOT popped) and push `getattr(module, name)` (with
-                            // a `sys.modules` fallback) via the `import_from`
+                            // pyopcode.py IMPORT_FROM / `eval.rs import_from`
+                            // — PEEK the module (TOS, NOT popped). A lazy
+                            // placeholder TOS is `lazy_import_from`; a real
+                            // module is `getattr` with a `sys.modules`
+                            // fallback. Both arms live in `bh_import_from_fn`
+                            // via the `import_from`
                             // HLOp → `residual_call_ir_r(import_from_fn,
                             // ListI([name_idx]), ListR([module, code]))`.  Net
                             // +1; the module stays on the stack.  Surrogate
@@ -13476,35 +13578,34 @@ impl CodeWriter {
                         // LoadCommonConstant(idx): pushes 1 (the resolved
                         // CommonConstant object). Net +1.
                         //
-                        // `flowcontext.py` resolves LOAD_COMMON_CONSTANT to a
-                        // static const push (exception class, builtin type, or
-                        // `all`/`any` via find_global).  The meta-trace records a
-                        // `load_common_constant(disc)` HLOp lowered to
-                        // `residual_call_ir_r(load_common_constant_fn,
-                        // ListI[disc], ListR[])`.  `disc` is the compile-time
-                        // `CommonConstant` discriminant baked as a constant;
-                        // `bh_load_common_constant_fn` re-resolves it through the
-                        // shared `opcode_ops::load_common_constant_value`.  The
-                        // `all`/`any` variants allocate a builtin function, so
-                        // the residual is `MayForce` — a fresh object each call,
-                        // never const-folded.
+                        // `flowcontext.py LOAD_CONST` pushes interned
+                        // singletons (`None`, `True`, `False`, empty str, `-1`)
+                        // and builtin types as `Hlvalue::Constant`. Residualise
+                        // only the allocating variants (`all`/`any`): those
+                        // keep `load_common_constant(disc)`
+                        // → `residual_call_ir_r(load_common_constant_fn,
+                        // ListI[disc], ListR[])` with `MayForce`.
                         Instruction::LoadCommonConstant { idx } => {
-                            let disc: u32 =
-                                pyre_interpreter::pyopcode::common_constant_arg(idx, op_arg).into();
-                            let result_value = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "load_common_constant",
-                                vec![
-                                    super::flow::FlowValue::Constant(
-                                        super::flow::Constant::signed(disc as i64),
-                                    )
-                                    .into(),
-                                ],
-                                Kind::Ref,
-                                py_pc as i64,
-                            );
-                            push_and_bump!(result_value.into(), py_pc);
+                            let cc = pyre_interpreter::pyopcode::common_constant_arg(idx, op_arg);
+                            if let Some(value) = frontend_load_common_constant_flow_value(cc) {
+                                push_and_bump!(value, py_pc);
+                            } else {
+                                let disc: u32 = cc.into();
+                                let result_value = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_common_constant",
+                                    vec![
+                                        super::flow::FlowValue::Constant(
+                                            super::flow::Constant::signed(disc as i64),
+                                        )
+                                        .into(),
+                                    ],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                );
+                                push_and_bump!(result_value.into(), py_pc);
+                            }
                         }
 
                         // pyopcode.py `PyFrame.LOAD_LOCALS` and
@@ -13622,16 +13723,6 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             push_and_bump!(result_value.into(), py_pc);
-                        }
-
-                        // Pops 1, pushes 1 (net 0). Replace shadow value.
-                        Instruction::GetYieldFromIter => {
-                            let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            // Genuine trace boundary: this only heads a
-                            // `yield from` delegation, whose SEND suspends the
-                            // frame — not expressible as a residual call.
-                            emit_abort_permanent!(py_pc);
                         }
 
                         // Structural adaptation: async opcodes. Pyre's dispatcher
@@ -14056,13 +14147,13 @@ impl CodeWriter {
                             emit_abort_permanent!(py_pc);
                         }
 
-                        // CleanupThrow: `(sub_iter, last_sent_val, exc_value --
-                        // none, value)`. Net: -1.
+                        // CleanupThrow: `(sub_iter, null_in, last_sent_val, exc
+                        // -- none, null_out, value)`. Net: -1.
                         Instruction::CleanupThrow => {
-                            for _ in 0..3 {
+                            for _ in 0..4 {
                                 pop_and_decr_depth(&mut current_state, &mut current_depth);
                             }
-                            for _ in 0..2 {
+                            for _ in 0..3 {
                                 push_fresh_ref(&mut current_state, &mut graph);
                                 current_depth += 1;
                             }
@@ -14176,6 +14267,7 @@ impl CodeWriter {
                         | Instruction::BinaryOpSubscrListSlice
                         | Instruction::BinaryOpSubscrStrInt
                         | Instruction::BinaryOpSubscrTupleInt
+                        | Instruction::BinaryOpSubscrUstrInt
                         | Instruction::BinaryOpSubtractFloat
                         | Instruction::BinaryOpSubtractInt
                         | Instruction::CallAllocAndEnterInit
@@ -14195,6 +14287,8 @@ impl CodeWriter {
                         | Instruction::CallMethodDescriptorFastWithKeywords
                         | Instruction::CallMethodDescriptorNoargs
                         | Instruction::CallMethodDescriptorO
+                        | Instruction::CallExNonPyGeneral
+                        | Instruction::CallExPy
                         | Instruction::CallNonPyGeneral
                         | Instruction::CallPyExactArgs
                         | Instruction::CallPyGeneral
@@ -14210,6 +14304,9 @@ impl CodeWriter {
                         | Instruction::ForIterList
                         | Instruction::ForIterRange
                         | Instruction::ForIterTuple
+                        | Instruction::ForIterVirtual
+                        | Instruction::GetIterSelf
+                        | Instruction::GetIterVirtual
                         | Instruction::LoadAttrClass
                         | Instruction::LoadAttrClassWithMetaclassCheck
                         | Instruction::LoadAttrGetattributeOverridden
@@ -14223,14 +14320,15 @@ impl CodeWriter {
                         | Instruction::LoadAttrProperty
                         | Instruction::LoadAttrSlot
                         | Instruction::LoadAttrWithHint
-                        | Instruction::LoadConstImmortal
-                        | Instruction::LoadConstMortal
                         | Instruction::LoadGlobalBuiltin
                         | Instruction::LoadGlobalModule
                         | Instruction::LoadSuperAttrAttr
                         | Instruction::LoadSuperAttrMethod
                         | Instruction::ResumeCheck
+                        | Instruction::ResumeCheckJit
+                        | Instruction::SendAsyncGen
                         | Instruction::SendGen
+                        | Instruction::SendVirtual
                         | Instruction::StoreAttrInstanceValue
                         | Instruction::StoreAttrSlot
                         | Instruction::StoreAttrWithHint
@@ -14284,7 +14382,8 @@ impl CodeWriter {
                         | Instruction::InterpreterExit
                         | Instruction::JumpBackwardJit
                         | Instruction::JumpBackwardNoJit
-                        | Instruction::Reserved => {
+                        | Instruction::Reserved
+                        | Instruction::TraceRecord => {
                             emit_abort_permanent!(py_pc);
                         }
                     }
@@ -17582,6 +17681,45 @@ mod tests {
         let link_borrow = link.borrow();
         assert_eq!(link_borrow.exitcase, Some(Constant::bool(true).into()));
         assert_eq!(link_borrow.llexitcase, Some(Constant::bool(true).into()));
+    }
+
+    #[test]
+    fn frontend_load_common_constant_none_is_interned_ref() {
+        let first = frontend_load_common_constant_flow_value(
+            pyre_interpreter::bytecode::CommonConstant::None,
+        );
+        let second = frontend_load_common_constant_flow_value(
+            pyre_interpreter::bytecode::CommonConstant::None,
+        );
+        match (first, second) {
+            (Some(FlowValue::Constant(a)), Some(FlowValue::Constant(b))) => {
+                assert_eq!(a.kind, Some(Kind::Ref));
+                assert_eq!(a.value, b.value);
+                assert_eq!(
+                    a.value,
+                    super::super::flow::ConstantValue::Signed(pyre_object::w_none() as i64),
+                );
+            }
+            other => {
+                panic!("LOAD_COMMON_CONSTANT None must be an interned Ref constant, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn frontend_load_common_constant_all_stays_residual() {
+        assert!(
+            frontend_load_common_constant_flow_value(
+                pyre_interpreter::bytecode::CommonConstant::BuiltinAll,
+            )
+            .is_none()
+        );
+        assert!(
+            frontend_load_common_constant_flow_value(
+                pyre_interpreter::bytecode::CommonConstant::BuiltinAny,
+            )
+            .is_none()
+        );
     }
 
     #[test]

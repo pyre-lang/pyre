@@ -22,21 +22,21 @@ promising a repro:
 |---|---|---|
 | A crash / wrong answer from a bench or script | **yes** | run the binary directly |
 | `pyre/cpython_tests/run.py` — the `CPython suite (gate)` job | **yes** | the runner needs no oracle |
-| `pyre/check.py` ratio + jitstats gates | **no** | needs CPython **3.14** and `pypy3`; the image has python 3.12 and no pypy |
-| `pyre/extra_tests/parity_tests/run.py` | **no** | also needs CPython 3.14 as its oracle |
+| `pyre/check.py` ratio + jitstats gates | **no** | needs CPython **3.15** and `pypy3`; the image has python 3.12 and no pypy |
+| `pyre/extra_tests/parity_tests/run.py` | **no** | also needs CPython 3.15 as its oracle |
 
 The parity gap will matter more than it does today: the runner supports a
 `# pyre-check: platforms=linux` header that *skips* a fixture on macOS, so the
 container would be the only place on this machine that runs it — and it is
 exactly where the oracle is missing. No fixture uses that header yet. Until one
-does, or until the image carries CPython 3.14, run the script directly against
+does, or until the image carries CPython 3.15, run the script directly against
 the Linux binary and diff its output against the macOS CPython by hand.
 
-`pyre/check.py` refuses up front with *"no CPython 3.14 to measure against …
+`pyre/check.py` refuses up front with *"no CPython 3.15 to measure against …
 python3: 3.12. Name one with PYRE_CHECK_PYTHON3."* Do not work around it by
 pointing `PYRE_CHECK_PYTHON3` at 3.12 — the message explains why an older
 CPython disagrees on version-sensitive behaviour and timings. Closing that gap
-means adding CPython 3.14 and pypy3 to the image, which is a deliberate change
+means adding CPython 3.15 and pypy3 to the image, which is a deliberate change
 to `tools/`, not something to improvise per run.
 
 ## Images

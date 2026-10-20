@@ -1141,6 +1141,7 @@ publish_helpers!(publish_p4 publish_pa4 publish_up4 publish_upa4 publish_cp4 pub
 publish_helpers!(publish_p5 publish_pa5 publish_up5 publish_upa5 publish_cp5 publish_cpa5 rust_addr5 unsafe_addr5 extern_addr5, A1, A2, A3, A4, A5);
 publish_helpers!(publish_p6 publish_pa6 publish_up6 publish_upa6 publish_cp6 publish_cpa6 rust_addr6 unsafe_addr6 extern_addr6, A1, A2, A3, A4, A5, A6);
 publish_helpers!(publish_p7 publish_pa7 publish_up7 publish_upa7 publish_cp7 publish_cpa7 rust_addr7 unsafe_addr7 extern_addr7, A1, A2, A3, A4, A5, A6, A7);
+publish_helpers!(publish_p8 publish_pa8 publish_up8 publish_upa8 publish_cp8 publish_cpa8 rust_addr8 unsafe_addr8 extern_addr8, A1, A2, A3, A4, A5, A6, A7, A8);
 
 macro_rules! p0 {
     ($e:expr, $p:expr, $f:path $(,)?) => {
@@ -1295,13 +1296,13 @@ macro_rules! cpa5 {
         publish_cpa5($e, $m, $r, |a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f);
     };
 }
-macro_rules! cpa7 {
+macro_rules! cpa8 {
     ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
-        publish_cpa7(
+        publish_cpa8(
             $e,
             $m,
             $r,
-            |a0, a1, a2, a3, a4, a5, a6| $f(a0, a1, a2, a3, a4, a5, a6),
+            |a0, a1, a2, a3, a4, a5, a6, a7| $f(a0, a1, a2, a3, a4, a5, a6, a7),
             $f,
         );
     };
@@ -3149,6 +3150,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::dunder_import_name_obj",
         crate::importing::dunder_import_name_obj_jit_abi,
     );
+    cpa5!(
+        &mut entries,
+        "pyre_interpreter::lazyimport::eval_lazy_import_name",
+        "pyre_interpreter::eval_lazy_import_name",
+        crate::lazyimport::eval_lazy_import_name_jit_abi,
+    );
     cpa2!(
         &mut entries,
         "pyre_interpreter::importing::handle_fromlist_fast",
@@ -4991,7 +4998,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::arm_async_eval_breaker",
         crate::executioncontext::arm_async_eval_breaker,
     );
-    cpa7!(
+    cpa8!(
         &mut entries,
         "pyre_interpreter::module::_warnings::show_warning",
         "pyre_interpreter::show_warning",
@@ -6361,6 +6368,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("pyobject::LIST_USER_TYPE", pyobject::LIST_USER_TYPE),
         pytype_addr!("pyobject::TUPLE_TYPE", pyobject::TUPLE_TYPE),
         pytype_addr!("pyobject::DICT_TYPE", pyobject::DICT_TYPE),
+        pytype_addr!("pyobject::FROZENDICT_TYPE", pyobject::FROZENDICT_TYPE),
         pytype_addr!("pyobject::LONG_TYPE", pyobject::LONG_TYPE),
         pytype_addr!("pyobject::LONG_USER_TYPE", pyobject::LONG_USER_TYPE),
         pytype_addr!("pyobject::NONE_TYPE", pyobject::NONE_TYPE),

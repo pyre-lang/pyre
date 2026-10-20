@@ -147,9 +147,11 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
 }
 
 fn symtable_data(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
-    if args.len() != 3 {
+    // `_symtable_symtable_impl`: three positional arguments plus kw-only
+    // `module`. The Python wrapper always forwards the fourth slot.
+    if args.len() != 3 && args.len() != 4 {
         return Err(pyre_interpreter::PyError::type_error(format!(
-            "_symtable.symtable() takes exactly 3 arguments ({} given)",
+            "symtable() takes exactly 3 positional arguments ({} given)",
             args.len()
         )));
     }
@@ -158,6 +160,28 @@ fn symtable_data(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     for &arg in args {
         let _ = pyre_object::gc_roots::pin_root(arg);
     }
+    // `_symtable_symtable_impl`: `modname == Py_None` becomes NULL so a
+    // SyntaxWarning's filter still derives the module from the filename;
+    // a str is `_PyErr_EmitSyntaxWarning`'s `module`.
+    let compile_module = {
+        let module = if args.len() == 4 {
+            pyre_object::gc_roots::shadow_stack_get(base + 3)
+        } else {
+            pyre_object::PY_NULL
+        };
+        if module.is_null() || unsafe { pyre_object::is_none(module) } {
+            pyre_object::PY_NULL
+        } else if unsafe { pyre_object::is_str(module) } {
+            module
+        } else {
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "symtable() argument 'module' must be str or None, not {}",
+                pyre_interpreter::type_methods::arg_type_name(module)
+            )));
+        }
+    };
+    let _ = pyre_object::gc_roots::pin_root(compile_module);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_filename = unsafe {
         let arg = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if pyre_object::is_str(arg) {
@@ -206,6 +230,23 @@ fn symtable_data(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let mode = mode_text
         .parse::<rustpython_compiler::Mode>()
         .map_err(|err| pyre_interpreter::PyError::value_error(err.to_string()))?;
+    // `_Py_SymtableStringObjectFlags` parses through
+    // `_PyParser_ASTFromString`, which emits tokenizer and escape warnings
+    // with the same `module` `compile()` uses.
+    let filename_wtf8 = unsafe {
+        pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(filename_slot))
+    }
+    .to_owned();
+    pyre_interpreter::syntax_warnings::emit_tokenizer_syntax_warnings_and_module(
+        &source,
+        &filename_wtf8,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+    )?;
+    pyre_interpreter::syntax_warnings::emit_escape_warnings_and_module(
+        &source,
+        &filename_wtf8,
+        pyre_object::gc_roots::shadow_stack_get(module_slot),
+    )?;
     let table =
         rustpython_compiler::compile_symtable(&source, mode, &filename).map_err(|compile_err| {
             let mut err =
@@ -280,12 +321,12 @@ def _entry(data):
     return _Entry(data)
 
 
-def symtable(source, filename, mode, /):
+def symtable(source, filename, startstr, /, *, module=None):
     import _symtable
-    return _entry(_symtable._symtable_data(source, filename, mode))
+    return _entry(_symtable._symtable_data(source, filename, startstr, module))
 "# => ["_Entry", "_entry", "symtable"],
     },
     functions: {
-        "_symtable_data" / 3 = symtable_data,
+        "_symtable_data" / 4 = symtable_data,
     },
 }

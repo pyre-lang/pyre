@@ -88,7 +88,7 @@ pub(super) fn trap<T>(result: Result<T, crate::PyError>) -> Option<T> {
 // ── the StopIteration mirror ────────────────────────────────────────────
 
 /// C-visible `PyStopIterationObject`, the twin of the struct in
-/// `include/pyre3.14t/pyerrors.h`.
+/// `include/pyre3.15t/pyerrors.h`.
 ///
 /// The fields are `pyerrors.py PyStopIterationObjectFields`: the header and
 /// `value`, with none of the exception words a runtime that keeps its

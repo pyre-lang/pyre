@@ -12,7 +12,7 @@ use pyre_object::PyObjectRef;
 use std::ffi::c_int;
 
 /// C-visible `PySliceObject`, the twin of the struct in
-/// `include/pyre3.14t/sliceobject.h`.
+/// `include/pyre3.15t/sliceobject.h`.
 ///
 /// Field order is `sliceobject.py PySliceObjectFields`, which names them
 /// `start`, `step`, `stop`; the header spells the order CPython's does, and

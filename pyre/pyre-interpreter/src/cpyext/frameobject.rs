@@ -21,7 +21,7 @@ use std::ffi::c_int;
 use std::hash::BuildHasherDefault;
 
 /// C-visible `PyFrameObject`, the twin of `struct _frame` in
-/// `include/pyre3.14t/frameobject.h`.
+/// `include/pyre3.15t/frameobject.h`.
 ///
 /// Field order is `frameobject.py PyFrameObjectFields`.
 #[repr(C)]

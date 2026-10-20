@@ -5,14 +5,14 @@
 
 # End-to-end check for single-phase extension loading.
 #
-# The fixture is compiled against pyre's own 3.14 ABI header, discovered by
+# The fixture is compiled against pyre's own 3.15 ABI header, discovered by
 # the normal import path, loaded through `PyInit_*`, and created by the C call
 # back into the executable's exported `PyModule_Create2`.
 
 import _imp
 import _sysconfig
 import sys
-expected_suffix = ('.pyre314-darwin.so' if __import__('sys').platform == 'darwin' else '.pyre314-x86_64-linux-gnu.so' if __import__('platform').machine() == 'x86_64' else '.pyre314-aarch64-linux-gnu.so' if __import__('platform').machine() == 'aarch64' else '.pyre314-linux-gnu.so')
+expected_suffix = ('.pyre315-darwin.so' if __import__('sys').platform == 'darwin' else '.pyre315-x86_64-linux-gnu.so' if __import__('platform').machine() == 'x86_64' else '.pyre315-aarch64-linux-gnu.so' if __import__('platform').machine() == 'aarch64' else '.pyre315-linux-gnu.so')
 suffixes = _imp.extension_suffixes()
 assert suffixes[0] == expected_suffix
 assert '.abi3.so' in suffixes

@@ -165,6 +165,7 @@ pub mod codec_engine;
 pub mod jit_builtin_folds;
 pub mod jit_fnaddr;
 pub mod launch_env;
+pub mod lazyimport;
 pub mod listobject;
 pub mod listsort;
 pub mod loop_headers;
@@ -178,6 +179,7 @@ pub mod reduce_protocol;
 #[cfg(any(unix, windows))]
 pub mod rsocket_rffi;
 pub mod runtime_ops;
+pub mod sentinel;
 pub mod shared_opcode;
 pub mod shutdown;
 pub mod sliceobject;
@@ -1388,6 +1390,26 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             },
             typed::<pyre_object::instancemethod::InstanceMethod>(),
         ),
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                220
+            } else if WINDOWS_CONSOLE_IO {
+                224
+            } else {
+                222
+            },
+            typed::<pyre_object::W_SentinelObject>(),
+        ),
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                221
+            } else if WINDOWS_CONSOLE_IO {
+                225
+            } else {
+                223
+            },
+            typed::<pyre_object::W_LazyImportObject>(),
+        ),
     ];
     aliases.extend(module_subclass_range_aliases());
     aliases.push(pyre_object::pyobject::subclass_range_alias(
@@ -1411,11 +1433,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    220
-} else if WINDOWS_CONSOLE_IO {
-    224
-} else {
     222
+} else if WINDOWS_CONSOLE_IO {
+    226
+} else {
+    224
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this
@@ -1476,6 +1498,10 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
         221
     };
     active.push((instancemethod_id, Some(0)));
+    // PEP 661 `sentinel` / PEP 810 `lazy_import` — after `instancemethod`
+    // so platform-gated posix/console ids stay put (`build_gc` order).
+    active.push((instancemethod_id + 1, Some(0)));
+    active.push((instancemethod_id + 2, Some(0)));
     let module_types = module_gc_types();
     active.extend(
         module_types

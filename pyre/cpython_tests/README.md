@@ -22,7 +22,7 @@ pyre's plain-Python runner convention (no pytest / RPython dependency).
   and `ndarray` comes from `Modules/_testbuffer.c`, which CPython builds beside
   its interpreter. The runner compiles `lib_pypy/_testbuffer.c` — that file
   verbatim, and unchanged across 3.14.6 and 3.14.7 — against
-  `include/pyre3.14t` and puts it on `PYTHONPATH` for that module alone,
+  `include/pyre3.15t` and puts it on `PYTHONPATH` for that module alone,
   because several other modules assert on the path their child interpreters
   inherit. An interpreter without `cpyext`, a platform the feature is not
   compiled for, or a missing C compiler leaves it unbuilt and the class
@@ -153,7 +153,7 @@ first:
 2. **Semantic FAILs** already inside unittest (`test_xml_etree` self-closing
    reparse, `test_syntax` `expected ':'`, POSIX `pwd`/`grp`/`select`,
    `bz2`/`lzma`, `shutil`/`traceback`/`zoneinfo`). `test_site` is the
-   PyPy-shaped `lib/pyre3.14t` layout, not a path bug.
+   PyPy-shaped `lib/pyre3.15t` layout, not a path bug.
 3. **Missing PyPy product modules**, ported natively (do not put `lib_pypy`
    on `sys.path`): `_sqlite3`, `_curses`, `_gdbm`/`_dbm`, Linux `crypt`.
    Do not implement `_datetime`, `_zstd`, or the subinterpreter modules.

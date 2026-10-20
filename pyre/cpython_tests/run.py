@@ -284,7 +284,7 @@ TEST_EXTENSION_SOURCES = {
     "_testsinglephase": ROOT / "lib_pypy" / "_testsinglephase.c",
     "_testmultiphase": ROOT / "lib_pypy" / "_testmultiphase.c",
 }
-CPYEXT_INCLUDE = ROOT / "include" / "pyre3.14t"
+CPYEXT_INCLUDE = ROOT / "include" / "pyre3.15t"
 # The headers CPython keeps out of an installed tree and builds these modules
 # against inside its own: `_PyNamespace_New` and the argument parser Argument
 # Clinic writes calls to both live behind one.

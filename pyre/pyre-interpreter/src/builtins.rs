@@ -3254,7 +3254,7 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
 
 /// `pypy/interpreter/gateway.py GatewayCache.build` parity — attach
 /// the text signature after constructing the builtin function. The spellings
-/// are CPython 3.14's public `builtins` signatures, which take precedence when
+/// are the public `builtins` signatures, which take precedence when
 /// PyPy 3.11's generated signature differs.
 fn install_builtin_text_signatures(ns: PyObjectRef) {
     const SIGNATURES: &[(&str, &str)] = &[
@@ -3262,22 +3262,22 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
             "__import__",
             "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)",
         ),
-        ("abs", "($module, x, /)"),
+        ("abs", "($module, number, /)"),
         ("aiter", "($module, async_iterable, /)"),
         ("all", "($module, iterable, /)"),
         (
             "anext",
-            "($module, aiterator, default=<unrepresentable>, /)",
+            "($module, async_iterator, default=<unrepresentable>, /)",
         ),
         ("any", "($module, iterable, /)"),
         ("ascii", "($module, obj, /)"),
-        ("bin", "($module, number, /)"),
+        ("bin", "($module, integer, /)"),
         ("breakpoint", "($module, /, *args, **kws)"),
         ("callable", "($module, obj, /)"),
         ("chr", "($module, i, /)"),
         (
             "compile",
-            "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, _feature_version=-1)",
+            "($module, /, source, filename, mode, flags=0,\n        dont_inherit=False, optimize=-1, *, module=None,\n        _feature_version=-1)",
         ),
         ("delattr", "($module, obj, name, /)"),
         ("divmod", "($module, x, y, /)"),
@@ -3290,14 +3290,14 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
         ("globals", "($module, /)"),
         ("hasattr", "($module, obj, name, /)"),
         ("hash", "($module, obj, /)"),
-        ("hex", "($module, number, /)"),
+        ("hex", "($module, integer, /)"),
         ("id", "($module, obj, /)"),
         ("input", "($module, prompt='', /)"),
         ("isinstance", "($module, obj, class_or_tuple, /)"),
         ("issubclass", "($module, cls, class_or_tuple, /)"),
         ("len", "($module, obj, /)"),
         ("locals", "($module, /)"),
-        ("oct", "($module, number, /)"),
+        ("oct", "($module, integer, /)"),
         (
             "open",
             "($module, /, file, mode='r', buffering=-1, encoding=None,\n     errors=None, newline=None, closefd=True, opener=None)",
@@ -3306,7 +3306,7 @@ fn install_builtin_text_signatures(ns: PyObjectRef) {
         ("pow", "($module, /, base, exp, mod=None)"),
         (
             "print",
-            "($module, /, *args, sep=' ', end='\\n', file=None, flush=False)",
+            "($module, /, *objects, sep=' ', end='\\n', file=None, flush=False)",
         ),
         ("repr", "($module, obj, /)"),
         ("round", "($module, /, number, ndigits=None)"),
@@ -3577,6 +3577,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "frozendict",
+        || crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "object",
         || {
             // `object` is a W_TypeObject, not a builtin function.
@@ -3812,6 +3817,11 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     );
     crate::module_ns_get_or_insert_with(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "sentinel",
+        || crate::typedef::gettypeobject(&pyre_object::SENTINEL_TYPE),
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__debug__",
         || w_bool_from(true),
     );
@@ -3882,7 +3892,8 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
         "compile",
         || {
             // `compile(source, filename, mode, flags=0, dont_inherit=False,
-            // optimize=-1, *, _feature_version=-1)` — Signature bind.
+            // optimize=-1, *, module=None, _feature_version=-1)` —
+            // `builtin_compile_impl`.
             crate::function_set_kwonly_defaults!(
                 crate::gateway::function_set_null_positional_defaults(
                     crate::gateway::make_module_builtin_function_with_arity_and_sig(
@@ -3897,16 +3908,18 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
                                 "flags",
                                 "dont_inherit",
                                 "optimize",
+                                "module",
                                 "_feature_version",
                             ],
                             None,
                             None,
-                            1,
+                            2,
                             0,
                         ),
                     ),
                     3,
                 ),
+                "module" => pyre_object::w_none(),
                 "_feature_version" => pyre_object::w_int_new(-1),
             )
         },
@@ -4237,6 +4250,16 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
     );
     pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
         crate::__pyre_store!(ns, "ModuleNotFoundError", exc_type);
+    });
+    let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error, import_error => make_exc_type_with_doc(
+            "ImportCycleError",
+            "Import produces a cycle.",
+            exc_import_error_new,
+            import_error,
+        )
+    );
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+        crate::__pyre_store!(ns, "ImportCycleError", exc_type);
     });
     let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error =>
         make_exc_type_with_doc(
@@ -4845,6 +4868,31 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             );
             crate::importing::set_default_importlib_import(w_import);
             w_import
+        },
+    );
+    crate::module_ns_get_or_insert_with(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__lazy_import__",
+        || {
+            // `__lazy_import__(name, globals=None, locals=None, fromlist=(), level=0)`
+            // (`builtin___lazy_import___impl`).
+            let w_lazy = crate::gateway::function_set_null_positional_defaults(
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    "__lazy_import__",
+                    crate::lazyimport::builtin_lazy_import,
+                    crate::HOPELESS,
+                    crate::gateway::Signature::new(
+                        vec!["name", "globals", "locals", "fromlist", "level"],
+                        None,
+                        None,
+                        0,
+                        0,
+                    ),
+                ),
+                4,
+            );
+            crate::lazyimport::set_default_lazy_import(w_lazy);
+            w_lazy
         },
     );
 
@@ -15973,7 +16021,7 @@ fn keyword_generator_assignment_span(source: &str) -> Option<(usize, usize)> {
             continue;
         };
         let plain_function_parameters = open_index >= 2
-            && significant[open_index - 1].0 == TokenKind::Name
+            && significant[open_index - 1].0 == TokenKind::Identifier
             && significant[open_index - 2].0 == TokenKind::Def;
         let typed_function_parameters = (open_index >= 1
             && significant[open_index - 1].0 == TokenKind::Rsqb)
@@ -15985,7 +16033,7 @@ fn keyword_generator_assignment_span(source: &str) -> Option<(usize, usize)> {
             .flatten()
             .is_some_and(|bracket| {
                 bracket >= 2
-                    && significant[bracket - 1].0 == TokenKind::Name
+                    && significant[bracket - 1].0 == TokenKind::Identifier
                     && significant[bracket - 2].0 == TokenKind::Def
             });
         if plain_function_parameters || typed_function_parameters {
@@ -16016,7 +16064,7 @@ fn keyword_generator_assignment_span(source: &str) -> Option<(usize, usize)> {
             .map_or(open_index + 1, |index| index + 1);
         let argument = &significant[argument_start..for_index];
         if argument.len() < 3
-            || argument[0].0 != TokenKind::Name
+            || argument[0].0 != TokenKind::Identifier
             || argument[1].0 != TokenKind::Equal
         {
             continue;
@@ -16249,7 +16297,7 @@ fn value_opens_with_bitwise_or(source: &str, expr: &rustpython_compiler::ast::Ex
             .first()
             .is_some_and(|value| value_opens_with_bitwise_or(source, value)),
         Expr::BinOp(node) => value_opens_with_bitwise_or(source, &node.left),
-        Expr::Compare(node) => value_opens_with_bitwise_or(source, &node.left),
+        Expr::Compare(node) => value_opens_with_bitwise_or(source, node.first_operand()),
         Expr::If(node) => value_opens_with_bitwise_or(source, &node.body),
         Expr::Tuple(node) => node
             .elts
@@ -16564,6 +16612,36 @@ fn nonascii_bytes_literal_span(source: &str, raw_index: usize) -> Option<(usize,
         cursor += 1;
     }
     None
+}
+
+/// True when `[start, end)` is a `b`/`rb` literal whose text is not all ASCII.
+/// Ruff accepts that token and then names the assignment; the tokenizer
+/// rejects the literal first (`parse_string_literal`).
+fn nonascii_bytes_token_overlapping(
+    source: &str,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if start >= end || end > source.len() {
+        return None;
+    }
+    let token = &source.as_bytes()[start..end];
+    let quote_at = token
+        .iter()
+        .position(|byte| matches!(*byte, b'\'' | b'"'))?;
+    let prefix = &token[..quote_at];
+    if prefix.is_empty()
+        || !prefix.iter().any(|byte| matches!(*byte, b'b' | b'B'))
+        || !prefix
+            .iter()
+            .all(|byte| matches!(*byte, b'b' | b'B' | b'r' | b'R'))
+    {
+        return None;
+    }
+    token
+        .iter()
+        .any(|byte| !byte.is_ascii())
+        .then_some((start, end))
 }
 
 /// `Parser/lexer/lexer.c` `maybe_raise_syntax_error_for_string_prefixes`.
@@ -17843,10 +17921,27 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // where an unfinished compound statement legitimately fails ahead of the
     // end -- `if 1:` wants an indented block the source has not reached -- so
     // the test is `eval`'s alone.
+    // Byte offsets again: the span of an expected-indented-block error covers
+    // the blank run that should have held the block.
+    fn block_span_is_blank(source: &str, range: &ruff_text_size::TextRange) -> bool {
+        let bytes = source.as_bytes();
+        let from = range.start().to_usize().saturating_add(1).min(bytes.len());
+        let to = range.end().to_usize().saturating_add(1).min(bytes.len());
+        from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+    }
+
     fn parse_reached_end_of_source(e: &crate::compile::CompileError, source: &str) -> bool {
         match e {
             crate::compile::CompileError::Parse(error) => {
+                // `is_unclosed_string` / `is_unclosed_bracket` are the
+                // compiler's own "more input could close this" flags
+                // (`unclosed_string_is_continuable`, `eof_parse_diagnostic`).
+                // Their `raw_location` is the opener, which sits short of
+                // EOF, so the byte-end test alone would reject `'a` and
+                // `[1,` in `eval` as finished programs.
                 error.raw_location.end().to_usize() >= source.len()
+                    || error.is_unclosed_bracket
+                    || error.is_unclosed_string
             }
             crate::compile::CompileError::Codegen(_) => false,
         }
@@ -17859,34 +17954,22 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             let unfinished = match &e {
                 crate::compile::CompileError::Parse(error) => match &error.error {
                     ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
-                    _ if error.is_unclosed_bracket => true,
+                    _ if error.is_unclosed_bracket || error.is_unclosed_string => true,
                     ParseErrorType::Lexical(LexicalErrorType::FStringError(
-                        InterpolatedStringErrorType::UnterminatedTripleQuotedString,
+                        InterpolatedStringErrorType::UnterminatedTripleQuotedString { .. },
                     )) => true,
-                    ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
+                    ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError { .. }) => {
                         let loc = error.raw_location.start().to_usize();
                         open_literal_wants_more_input(source, loc, mode)
+                    }
+                    ParseErrorType::ExpectedIndentedBlock { .. } => {
+                        block_span_is_blank(source, &error.raw_location)
                     }
                     ParseErrorType::OtherError(message)
                         if message.starts_with("Expected an indented block after")
                             || message.starts_with("expected an indented block after") =>
                     {
-                        // Byte offsets again: the span covers the blank run that
-                        // should have held the indented block.
-                        let bytes = source.as_bytes();
-                        let from = error
-                            .raw_location
-                            .start()
-                            .to_usize()
-                            .saturating_add(1)
-                            .min(bytes.len());
-                        let to = error
-                            .raw_location
-                            .end()
-                            .to_usize()
-                            .saturating_add(1)
-                            .min(bytes.len());
-                        from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+                        block_span_is_blank(source, &error.raw_location)
                     }
                     // `codeop._maybe_compile` retries a failed command with one
                     // trailing newline.  The pinned RustPython parser reports the
@@ -18412,10 +18495,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let assignment_error = (!literal_content_error)
         .then(|| assignment_target_error(&e, source, mode))
         .flatten();
-    if let Some((replacement, _, _)) = &assignment_error {
+    let assignment_bytes_span = assignment_error
+        .as_ref()
+        .and_then(|(_, start, end)| nonascii_bytes_token_overlapping(source, *start, *end));
+    if assignment_bytes_span.is_some() {
+        msg = "bytes can only contain ASCII literal characters".to_owned();
+    } else if let Some((replacement, _, _)) = &assignment_error {
         msg = replacement.clone();
     }
-    let assignment_span = assignment_error.map(|(_, start, end)| (start, end));
+    let assignment_span = if assignment_bytes_span.is_some() {
+        None
+    } else {
+        assignment_error.map(|(_, start, end)| (start, end))
+    };
     let keyword_generator_span = (msg == "invalid syntax")
         .then(|| keyword_generator_assignment_span(source))
         .flatten()
@@ -18484,6 +18576,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let diagnostic_span = leading_indent_span
         .or(escape_span)
         .or(literal_span)
+        .or(assignment_bytes_span)
         .or(nested_empty_field_span)
         .or(conversion_span)
         .or(prefix_span)
@@ -18522,11 +18615,34 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         let (end_lineno, end_byte_offset) = parser_end
             .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
             .unwrap_or((lineno, byte_offset));
-        let end_offset = if parser_error && diagnostic_end.is_some() {
+        let mut end_offset = if parser_error && diagnostic_end.is_some() {
             syntax_error_character_offset(source, end_lineno, end_byte_offset)
         } else {
             end_byte_offset
         };
+        // Tokenizer `_PyTokenizer_syntaxerror` diagnostics (`_syntaxerror_range`
+        // with `col_offset = -1`) report an inclusive one-character span, so
+        // `offset == end_offset`.  That contract is unchanged in 3.15.  RustPython
+        // `adjusted_error_locations` widens every empty parser range by one
+        // (#8983), which is exclusive.  Snap those tokenizer failures here;
+        // `'1 = 1'` is a parser assignment diagnostic and stays exclusive
+        // `(1, 1, 1, 2)`.
+        if parser_error
+            && (msg.starts_with("unmatched ")
+                || msg.starts_with("closing parenthesis ")
+                || msg.starts_with("invalid digit ")
+                || matches!(
+                    msg.as_str(),
+                    "invalid decimal literal"
+                        | "invalid hexadecimal literal"
+                        | "invalid octal literal"
+                        | "invalid binary literal"
+                ))
+            && end_lineno == lineno
+            && end_offset == offset.saturating_add(1)
+        {
+            end_offset = offset;
+        }
         let filename = e.source_path().to_string();
         // Parser errors own their source text directly, keeping the trailing
         // newline like `e.text`.  Later compiler failures omit it for the
@@ -18883,6 +18999,27 @@ fn syntax_error_subclass(
         // as the tokenizer writes it, so it keeps the parser's.
         ParseErrorType::UnexpectedIndentation => Some(indentation(Some("unexpected indent"))),
         ParseErrorType::Lexical(LexicalErrorType::IndentationError) => Some(indentation(None)),
+        ParseErrorType::Lexical(LexicalErrorType::TabError) => Some((
+            "TabError",
+            Some("inconsistent use of tabs and spaces in indentation".to_owned()),
+        )),
+        // A compound header with `NEWLINE !INDENT` is now a structured
+        // `ExpectedIndentedBlock`; keep IndentationError, or TabError when
+        // the same source also mixes tabs and spaces.
+        ParseErrorType::ExpectedIndentedBlock { clause, line } => {
+            match first_indent_fault(source) {
+                Some(IndentFault::TabsAndSpaces) => Some((
+                    "TabError",
+                    Some("inconsistent use of tabs and spaces in indentation".to_owned()),
+                )),
+                _ => Some((
+                    "IndentationError",
+                    Some(format!(
+                        "expected an indented block after {clause} on line {line}"
+                    )),
+                )),
+            }
+        }
         // `pegen`'s "expected an indented block after <clause> on line N",
         // which the compiler reconstructs as a plain message.
         ParseErrorType::OtherError(msg) if msg.starts_with("expected an indented block") => {
@@ -19101,8 +19238,9 @@ pub(crate) fn replace_compile_syntax_error_filename(
 
 fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Bound scope from `parse_obj`: `source`, `filename`, `mode`, `flags`,
-    // `dont_inherit`, `optimize`, kw-only `_feature_version` (`PY_NULL` omitted).
-    // PyCF_ONLY_AST follows PyPy's compile_to_ast boundary.
+    // `dont_inherit`, `optimize`, kw-only `module` / `_feature_version`
+    // (`PY_NULL` omitted). PyCF_ONLY_AST follows PyPy's compile_to_ast
+    // boundary. `module` is `builtin_compile_impl`'s `modname`.
     let source = args
         .first()
         .copied()
@@ -19139,8 +19277,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         .copied()
         .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
-    let feature_obj = args
+    let module_obj = args
         .get(6)
+        .copied()
+        .filter(|o| !o.is_null())
+        .unwrap_or(pyre_object::PY_NULL);
+    let feature_obj = args
+        .get(7)
         .copied()
         .filter(|o| !o.is_null())
         .unwrap_or(pyre_object::PY_NULL);
@@ -19157,9 +19300,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         flags_obj,
         dont_inherit_obj,
         optimize_obj,
+        module_obj,
         feature_obj,
     ]);
-    pyre_object::gc_roots::normalize_roots(compile_base, 7);
+    pyre_object::gc_roots::normalize_roots(compile_base, 8);
     let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(compile_base + i);
     // `compiling.py:12-13 unwrap_spec(filename='fsencode', mode='text')`.
     let filename_bytes = crate::gateway::fsencode_bytes_w(reload(1))?;
@@ -19193,12 +19337,30 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } else {
         crate::baseobjspace::gateway_int_w(reload(5))?
     };
+    // `builtin_compile_impl`: `modname == Py_None` becomes NULL so a
+    // SyntaxWarning's filter still derives the module from the filename;
+    // a str is `_PyErr_EmitSyntaxWarning`'s `module`.
+    let compile_module = {
+        let module = reload(6);
+        if module.is_null() || unsafe { is_none(module) } {
+            pyre_object::PY_NULL
+        } else if unsafe { is_str(module) } {
+            module
+        } else {
+            return Err(crate::PyError::type_error(format!(
+                "compile() argument 'module' must be str or None, not {}",
+                crate::type_methods::arg_type_name(module)
+            )));
+        }
+    };
+    let compile_module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(compile_module);
     // PyPy `PythonAstCompiler.compile_to_ast` passes this keyword-only value
     // through `CompileInfo.feature_version` to the parser.
-    let feature_version = if reload(6).is_null() {
+    let feature_version = if reload(7).is_null() {
         -1
     } else {
-        let value = crate::baseobjspace::gateway_int_w(reload(6))?;
+        let value = crate::baseobjspace::gateway_int_w(reload(7))?;
         i64::from(i32::try_from(value).map_err(|_| {
             crate::PyError::overflow_error("Python int too large to convert to C int")
         })?)
@@ -19329,8 +19491,16 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // an app-visible AST.  The ordinary code path runs both scans inside
         // `compile_with_codegen_warnings`; ONLY_AST has no codegen boundary,
         // so keep the tokenizer order explicitly here.
-        crate::syntax_warnings::emit_tokenizer_syntax_warnings(source, &filename_text)?;
-        crate::syntax_warnings::emit_escape_warnings(source, &filename_text)?;
+        crate::syntax_warnings::emit_tokenizer_syntax_warnings_and_module(
+            source,
+            &filename_text,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
+        )?;
+        crate::syntax_warnings::emit_escape_warnings_and_module(
+            source,
+            &filename_text,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
+        )?;
     }
     if flags & PYCF_ONLY_AST != 0 {
         // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
@@ -19411,18 +19581,24 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         });
     }
     let code = if let Some(source) = source_str.as_deref() {
-        crate::syntax_warnings::compile_with_codegen_warnings(source, mode, &filename_text, opts)
-            .map_err(|error| match error {
-                crate::syntax_warnings::SourceCompileError::Compile(error) => {
-                    compile_err_to_syntax_error_maybe_incomplete(
-                        error,
-                        source,
-                        mode,
-                        flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
-                    )
-                }
-                crate::syntax_warnings::SourceCompileError::Warning(error) => error,
-            })
+        crate::syntax_warnings::compile_with_codegen_warnings_and_module(
+            source,
+            mode,
+            &filename_text,
+            opts,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
+        )
+        .map_err(|error| match error {
+            crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                compile_err_to_syntax_error_maybe_incomplete(
+                    error,
+                    source,
+                    mode,
+                    flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
+                )
+            }
+            crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+        })
     } else {
         crate::module::_ast::convert::compile_object(
             reload(0),
@@ -19430,6 +19606,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             &filename_text,
             mode,
             opts,
+            pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
         )
     }
     .map_err(|error| {
@@ -19503,6 +19680,33 @@ pub fn exec_or_eval(
     let _ns_roots = pyre_object::gc_roots::push_roots();
     let ns_base = pyre_object::gc_roots::pin_roots(&[source, globals_arg, locals_arg, closure]);
     let reload_ns = |i: usize| pyre_object::gc_roots::shadow_stack_get(ns_base + i);
+    // compiling.py eval plants `__builtins__` after `compiler.compile`.
+    // `builtin_eval_impl` runs `_PyEval_EnsureBuiltins` first, so
+    // `eval("", frozendict())` TypeErrors instead of SyntaxError on the
+    // empty eval source (`test_eval_frozendict`).
+    {
+        let w_globals = reload_ns(1);
+        if !w_globals.is_null()
+            && !unsafe { pyre_object::is_none(w_globals) }
+            && unsafe { crate::type_methods::has_frozendict_backing(w_globals) }
+        {
+            let _fd_roots = pyre_object::gc_roots::push_roots();
+            let g_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_globals);
+            let key_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
+                "__builtins__",
+            ));
+            if !crate::baseobjspace::contains(
+                pyre_object::gc_roots::shadow_stack_get(g_slot),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+            )? {
+                return Err(crate::PyError::type_error(
+                    "cannot assign __builtins__ to frozendict globals",
+                ));
+            }
+        }
+    }
     // Resolve a runnable code object: accept a precompiled W_Code or
     // compile a str on the fly.  `source_is_code` records whether the
     // original argument was already a code object (vs a compiled str /
@@ -19603,6 +19807,15 @@ pub fn exec_or_eval(
         }
     }
 
+    /// `PyAnyDict_Check`: a dict (including a dict subclass) or a
+    /// `frozendict` (including a subclass).  `pyopcode.py ensure_ns` tests
+    /// `isinstance_w(w_dict)` only; 3.15 admits frozendict as eval/exec
+    /// globals (`lib-python/3/test/test_builtin.py` `test_eval_frozendict`,
+    /// `test_exec_frozendict`).
+    fn is_any_dict_w(w_obj: PyObjectRef) -> bool {
+        is_dict_w(w_obj) || unsafe { crate::type_methods::has_frozendict_backing(w_obj) }
+    }
+
     /// `PyEval_GetBuiltins()` — the value `exec`/`eval` plant under
     /// `__builtins__` in a namespace that lacks it.  PyPy stores the picked
     /// `Module` (`compiling.py space.builtin`); 3.14 stores that module's
@@ -19646,6 +19859,14 @@ pub fn exec_or_eval(
         let w_builtin = || pyre_object::gc_roots::shadow_stack_get(base + 1);
         let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
         if !crate::baseobjspace::contains(w_globals(), key())? {
+            // `_PyEval_EnsureBuiltins` / `set_globals_builtins`: a missing
+            // `__builtins__` is planted with `setitem_str` (`compiling.py
+            // eval`).  A frozendict cannot take that store.
+            if unsafe { crate::type_methods::has_frozendict_backing(w_globals()) } {
+                return Err(crate::PyError::type_error(
+                    "cannot assign __builtins__ to frozendict globals",
+                ));
+            }
             crate::baseobjspace::setitem(w_globals(), key(), w_builtin())?;
         }
         Ok(())
@@ -19682,6 +19903,19 @@ pub fn exec_or_eval(
         let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
             "__builtins__",
         ));
+        let w_globals = || pyre_object::gc_roots::shadow_stack_get(base);
+        let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
+        // `pyopcode.py exec_` plants through `setdefault` on the original
+        // globals object.  A frozendict has no `setdefault`; a missing
+        // `__builtins__` is `_PyEval_EnsureBuiltins`' refusal instead.
+        if unsafe { crate::type_methods::has_frozendict_backing(w_globals()) } {
+            if !crate::baseobjspace::contains(w_globals(), key())? {
+                return Err(crate::PyError::type_error(
+                    "cannot assign __builtins__ to frozendict globals",
+                ));
+            }
+            return Ok(());
+        }
         let setdefault = crate::baseobjspace::getattr_str(
             pyre_object::gc_roots::shadow_stack_get(base),
             "setdefault",
@@ -19700,19 +19934,22 @@ pub fn exec_or_eval(
     //   globals: not None ⇒ isinstance_w(w_dict) else TypeError
     //   locals : not None ⇒ space.lookup(__getitem__) is not None
     //                       else TypeError "must be a mapping or None"
-    if !is_none_or_null(globals_arg) && !is_dict_w(globals_arg) {
+    // 3.15 `builtin_eval_impl` / `builtin_exec_impl` use `PyAnyDict_Check`,
+    // so a frozendict is a valid globals mapping.
+    if !is_none_or_null(globals_arg) && !is_any_dict_w(globals_arg) {
         // `builtin_eval_impl` splits on `PyMapping_Check`, so a mapping that
         // is merely not a dict is told how to pass it as the locals instead;
         // `builtin_exec_impl` names the type it got.
         let message = if is_eval {
             if unsafe { crate::baseobjspace::lookup(globals_arg, "__getitem__").is_some() } {
-                "globals must be a real dict; try eval(expr, {}, mapping)".to_string()
+                "globals must be a real dict or a frozendict; try eval(expr, {}, mapping)"
+                    .to_string()
             } else {
-                "globals must be a dict".to_string()
+                "globals must be a dict or a frozendict".to_string()
             }
         } else {
             format!(
-                "exec() globals must be a dict, not {}",
+                "exec() globals must be a dict or a frozendict, not {}",
                 type_name_of(globals_arg)
             )
         };
@@ -20692,6 +20929,48 @@ pub(crate) fn frozenset_structural_hash(obj: PyObjectRef) -> i64 {
     frozenset_hash_from_storage(obj)
 }
 
+/// `frozendict_hash`: XOR-fold of `frozendict_pair_hash` (`tuple_hash` of
+/// each `(key_hash, value_hash)`) then the `frozenset_hash` finish
+/// (`_shuffle_bits` / `(n+1)*1927868237`). Equivalent to
+/// `hash(frozenset(fd.items()))`.
+pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let mut pair_hashes: Vec<i64> = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let Some(slot) = (unsafe { pyre_object::dictmultiobject::w_dict_next_slot(obj, index) })
+        else {
+            break;
+        };
+        let hashed = unsafe { pyre_object::dictmultiobject::w_dict_nth_hashed_key(obj, slot) };
+        let Some(value) = (unsafe { pyre_object::dictmultiobject::w_dict_nth_value(obj, slot) })
+        else {
+            break;
+        };
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let key_hash = if let Some(key) = hashed {
+            key.hash
+        } else {
+            let Some((k, _)) =
+                (unsafe { pyre_object::dictmultiobject::w_dict_nth_item(obj, slot) })
+            else {
+                break;
+            };
+            let k_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(k);
+            try_hash_value(pyre_object::gc_roots::shadow_stack_get(k_slot))?
+        };
+        let value_hash = try_hash_value(pyre_object::gc_roots::shadow_stack_get(value_slot))?;
+        pair_hashes.push(_hash_tuple_xx(&[key_hash, value_hash]));
+        index = slot + 1;
+    }
+    Ok(_hash_frozenset(&pair_hashes))
+}
+
 pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
@@ -20786,6 +21065,9 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         }
         if pyre_object::is_frozenset(obj) {
             return Ok(frozenset_hash_from_storage(obj));
+        }
+        if pyre_object::is_frozendict(obj) {
+            return frozendict_structural_hash(obj);
         }
         if pyre_object::is_generic_alias(obj) {
             // GenericAlias.__hash__ (`_pypy_generic_alias.py`) —

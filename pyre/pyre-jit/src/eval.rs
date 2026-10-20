@@ -4845,6 +4845,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_object::instancemethod::InstanceMethod
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // PEP 661 `sentinel` / PEP 810 `lazy_import` — after `instancemethod`
+    // so platform-gated posix/console ids stay put.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::sentinel::W_SentinelObject as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_object::lazyimport::W_LazyImportObject
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
     // The classes `pyre-module` registers close the rclass census, numbered
     // from `MODULE_FIRST_TYPE_ID` in the order its hooks list them.
     assert_eq!(

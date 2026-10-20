@@ -504,13 +504,17 @@ pub fn w_int_small_cache_base_ptr() -> PyObjectRef {
     SMALL_INTS.0.as_ptr().cast_mut() as PyObjectRef
 }
 
-/// Compact integer-literal range for `LOAD_SMALL_INT` (oparg 0..=255).
-/// Values outside this range fall back to [`w_int_new`].
-pub const SMALL_INT_CONST_FROM: i64 = 0;
+/// Interned integer-literal range: `LOAD_SMALL_INT` (oparg 0..=255) and
+/// `LOAD_COMMON_CONSTANT` `CONSTANT_MINUS_ONE`, which
+/// `pycore_init_common_consts` takes from `_PyLong_SMALL_INTS`
+/// (`-_PY_NSMALLNEGINTS` inclusive upwards). Values outside this range fall
+/// back to [`w_int_new`].
+pub const SMALL_INT_CONST_FROM: i64 = -5;
 pub const SMALL_INT_CONST_TO: i64 = 256;
 
-static SMALL_INT_CONSTS: [std::sync::OnceLock<usize>; 256] =
-    [const { std::sync::OnceLock::new() }; 256];
+static SMALL_INT_CONSTS: [std::sync::OnceLock<usize>;
+    (SMALL_INT_CONST_TO - SMALL_INT_CONST_FROM) as usize] =
+    [const { std::sync::OnceLock::new() }; (SMALL_INT_CONST_TO - SMALL_INT_CONST_FROM) as usize];
 
 /// Interned box for a `LOAD_SMALL_INT` literal.
 ///
@@ -625,6 +629,9 @@ mod tests {
             assert!(is_int(a));
             assert_eq!(w_int_get_value(a), 1);
         }
+        let minus_one = w_small_int_const(-1);
+        assert_eq!(minus_one, w_small_int_const(-1));
+        unsafe { assert_eq!(w_int_get_value(minus_one), -1) };
         let outside = w_small_int_const(SMALL_INT_CONST_TO);
         assert_ne!(outside, w_small_int_const(SMALL_INT_CONST_TO));
     }

@@ -15,7 +15,7 @@ A script's leading comment block carries directives:
     # cpyext-expect-stderr-contains: <text>
 
 The fixture is compiled the way the Rust `Fixtures::compile_with_suffix` did:
-`$CC` or `cc`, `-I include/pyre3.14t`, `-o`, `-Werror`, then
+`$CC` or `cc`, `-I include/pyre3.15t`, `-o`, `-Werror`, then
 `-bundle -undefined dynamic_lookup` on macOS or `-fPIC -shared` elsewhere.
 The native suffix matches `_imp.extension_suffixes()` (darwin; x86_64 or
 aarch64 linux-gnu; plain linux-gnu).  A second word on `cpyext-fixture`
@@ -50,7 +50,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 FIXTURES = ROOT / "pyre" / "pyrex" / "tests" / "fixtures"
-INCLUDE = ROOT / "include" / "pyre3.14t"
+INCLUDE = ROOT / "include" / "pyre3.15t"
 DEFAULT_PYRE = ROOT / "target" / "release" / "pyre-dynasm"
 
 _DIRECTIVE = re.compile(r"# cpyext-([a-z0-9-]+):\s*(.*)$")
@@ -59,13 +59,13 @@ _DIRECTIVE = re.compile(r"# cpyext-([a-z0-9-]+):\s*(.*)$")
 def extension_suffix() -> str:
     """The suffix `_imp.extension_suffixes()` reports for this host."""
     if sys.platform == "darwin":
-        return ".pyre314-darwin.so"
+        return ".pyre315-darwin.so"
     machine = platform.machine()
     if machine == "x86_64":
-        return ".pyre314-x86_64-linux-gnu.so"
+        return ".pyre315-x86_64-linux-gnu.so"
     if machine == "aarch64":
-        return ".pyre314-aarch64-linux-gnu.so"
-    return ".pyre314-linux-gnu.so"
+        return ".pyre315-aarch64-linux-gnu.so"
+    return ".pyre315-linux-gnu.so"
 
 
 def _scripts(filter_substring: str | None) -> list[Path]:

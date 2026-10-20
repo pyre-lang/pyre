@@ -244,25 +244,25 @@ pub fn after_fork_child() {
 
 pub const fn soabi() -> &'static str {
     if cfg!(target_os = "macos") {
-        "pyre314-darwin"
+        "pyre315-darwin"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        "pyre314-x86_64-linux-gnu"
+        "pyre315-x86_64-linux-gnu"
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        "pyre314-aarch64-linux-gnu"
+        "pyre315-aarch64-linux-gnu"
     } else {
-        "pyre314-linux-gnu"
+        "pyre315-linux-gnu"
     }
 }
 
 pub const fn extension_suffix() -> &'static str {
     if cfg!(target_os = "macos") {
-        ".pyre314-darwin.so"
+        ".pyre315-darwin.so"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        ".pyre314-x86_64-linux-gnu.so"
+        ".pyre315-x86_64-linux-gnu.so"
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-        ".pyre314-aarch64-linux-gnu.so"
+        ".pyre315-aarch64-linux-gnu.so"
     } else {
-        ".pyre314-linux-gnu.so"
+        ".pyre315-linux-gnu.so"
     }
 }
 

@@ -667,6 +667,15 @@ pub fn bool_value_from_truth(value: bool) -> PyObjectRef {
     w_bool_from(value)
 }
 
+/// Whether [`load_common_constant_value`] returns one prebuilt object for
+/// `cc` (a singleton, the interned `""` or `-1`, a builtin class), which the
+/// JIT pushes as a constant the way `flowcontext.py LOAD_CONST` does. `all`
+/// and `any` build a fresh builtin function on every call.
+pub fn common_constant_is_prebuilt(cc: crate::bytecode::CommonConstant) -> bool {
+    use crate::bytecode::CommonConstant;
+    !matches!(cc, CommonConstant::BuiltinAll | CommonConstant::BuiltinAny)
+}
+
 /// LOAD_COMMON_CONSTANT — resolve a `CommonConstant` to the object the
 /// interpreter pushes.  Shared by the interpreter's `load_common_constant`
 /// handler and the JIT residual `bh_load_common_constant_fn` so both
@@ -707,6 +716,13 @@ pub fn load_common_constant_value(cc: crate::bytecode::CommonConstant) -> PyObje
         CommonConstant::BuiltinSet => {
             crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE)
         }
+        CommonConstant::None => pyre_object::w_none(),
+        CommonConstant::EmptyStr => {
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(""))
+        }
+        CommonConstant::True => w_bool_from(true),
+        CommonConstant::False => w_bool_from(false),
+        CommonConstant::MinusOne => pyre_object::w_small_int_const(-1),
     }
 }
 

@@ -16,10 +16,18 @@ use crate::PyResult;
 /// `_NOT_PROVIDED` sentinel stays in the intermediate namespace that both
 /// functions retain as their `__globals__`, so only the two public names
 /// need to be surfaced.  `anext` calls `__anext__` before constructing its
-/// default wrapper, matching CPython 3.14's `builtin_anext_impl` synchronous
-/// exception behavior.
+/// default wrapper, matching `builtin_anext_impl` synchronous exception
+/// behavior.
 const ASYNC_OP_SRC: &str = r#"
 _NOT_PROVIDED = object()
+
+def _type_fqname(obj):
+    t = type(obj)
+    mod = getattr(t, "__module__", "")
+    name = getattr(t, "__qualname__", t.__name__)
+    if not mod or mod == "builtins" or mod == "__main__":
+        return name
+    return f"{mod}.{name}"
 
 def aiter(obj):
     """aiter(async_iterable) -> async_iterator
@@ -33,7 +41,9 @@ def aiter(obj):
         raise TypeError(f"'{type(obj).__name__}' object is not an async iterable")
     ait = meth(obj)
     if not hasattr(ait, '__anext__'):
-        raise TypeError(f"aiter() returned not an async iterator of type '{type(ait).__name__}'")
+        raise TypeError(
+            f"{_type_fqname(obj)}.__aiter__() must return an async iterator, not {_type_fqname(ait)}"
+        )
     return ait
 
 def anext(iterator, default=_NOT_PROVIDED):

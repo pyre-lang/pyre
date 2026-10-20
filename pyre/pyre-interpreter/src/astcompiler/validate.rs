@@ -671,16 +671,17 @@ impl AstValidator {
             },
             ast::Expr::YieldFrom(node) => self.validate_expr(&node.value, ast::ExprContext::Load),
             ast::Expr::Compare(node) => {
-                if node.comparators.is_empty() {
+                if node.operands.len() < 2 {
                     return Err(validation_error("Compare with no comparators"));
                 }
-                if node.comparators.len() != node.ops.len() {
+                if node.ops.len() + 1 != node.operands.len() {
                     return Err(validation_error(
                         "Compare has a different number of comparators and operands",
                     ));
                 }
-                self.validate_exprs(&node.comparators, ast::ExprContext::Load)?;
-                self.validate_expr(&node.left, ast::ExprContext::Load)
+                // validate.py visit_Compare: comparators first, then left.
+                self.validate_exprs(node.comparators(), ast::ExprContext::Load)?;
+                self.validate_expr(node.first_operand(), ast::ExprContext::Load)
             }
             ast::Expr::Call(node) => {
                 self.validate_expr(&node.func, ast::ExprContext::Load)?;

@@ -360,6 +360,14 @@ fn load_attr_name_index(oparg: u32) -> usize {
     (oparg >> 1) as usize
 }
 
+/// rustpython-codegen `compile.rs` emits `(name_idx << 2) | flags` for
+/// `Instruction::ImportName`. rustpython-vm `frame.rs` reads
+/// `names[arg >> 2]`. The low bits are the PEP 810 lazy-import flag;
+/// pyre's 3.14 spec ignores them.
+fn import_name_name_index(oparg: u32) -> usize {
+    (oparg >> 2) as usize
+}
+
 fn build_call_shape_constant(shape: &CallShape) -> Hlvalue {
     Hlvalue::Constant(Constant::new(ConstValue::Tuple(vec![
         ConstValue::Int(shape.shape_cnt as i64),
@@ -2243,6 +2251,21 @@ impl FlowContext {
                         rustpython_compiler_core::bytecode::oparg::CommonConstant::BuiltinSet => {
                             self.find_global("set")?
                         }
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::None => {
+                            Hlvalue::Constant(Constant::new(ConstValue::None))
+                        }
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::EmptyStr => {
+                            Hlvalue::Constant(Constant::new(ConstValue::uni_str(String::new())))
+                        }
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::True => {
+                            Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+                        }
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::False => {
+                            Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+                        }
+                        rustpython_compiler_core::bytecode::oparg::CommonConstant::MinusOne => {
+                            Hlvalue::Constant(Constant::new(ConstValue::Int(-1)))
+                        }
                     };
                     self.pushvalue(StackElem::Value(value));
                     Ok(None)
@@ -2700,15 +2723,18 @@ impl FlowContext {
                 Instruction::UnpackEx { .. } => {
                     self.unsupported_rpython("extended iterable unpacking is not RPython")
                 }
-                Instruction::GetIter => {
+                Instruction::GetIter { .. } => {
                     let iterable = self.pop_hlvalue()?;
                     let iterator = self.eval_hlop(OpKind::Iter, vec![iterable])?;
                     self.pushvalue(StackElem::Value(iterator));
+                    self.pushvalue(StackElem::Value(null_value()));
                     Ok(None)
                 }
                 Instruction::ForIter { .. } => {
+                    let w_null = self.popvalue();
                     let w_iterator = self.pop_hlvalue()?;
                     self.pushvalue(StackElem::Value(w_iterator.clone()));
+                    self.pushvalue(w_null);
                     self.blockstack.push(FrameBlock::new(
                         oparg as i64,
                         self.stackdepth(),
@@ -2719,7 +2745,13 @@ impl FlowContext {
                     self.pushvalue(StackElem::Value(w_nextitem));
                     Ok(None)
                 }
-                Instruction::EndFor | Instruction::PopIter => {
+                Instruction::EndFor => {
+                    // pyopcode.rs `end_for` is a no-op; POP_ITER pops the
+                    // iterator and the GET_ITER index-or-NULL slot.
+                    Ok(None)
+                }
+                Instruction::PopIter => {
+                    self.popvalue();
                     self.popvalue();
                     Ok(None)
                 }
@@ -2790,7 +2822,7 @@ impl FlowContext {
                     // (`flowcontext.py`).
                     let w_fromlist = self.pop_hlvalue()?;
                     let w_level = self.pop_hlvalue()?;
-                    let w_modulename = self.getname_w(oparg as usize)?;
+                    let w_modulename = self.getname_w(import_name_name_index(oparg))?;
                     let modulename = match &w_modulename {
                         Hlvalue::Constant(Constant { value, .. }) => {
                             value.as_text().map(str::to_owned).ok_or_else(|| {
@@ -3344,6 +3376,7 @@ impl FlowContext {
                 | Instruction::BinaryOpSubscrListSlice
                 | Instruction::BinaryOpSubscrStrInt
                 | Instruction::BinaryOpSubscrTupleInt
+                | Instruction::BinaryOpSubscrUstrInt
                 | Instruction::BinaryOpSubtractFloat
                 | Instruction::BinaryOpSubtractInt
                 | Instruction::CallAllocAndEnterInit
@@ -3363,6 +3396,8 @@ impl FlowContext {
                 | Instruction::CallMethodDescriptorFastWithKeywords
                 | Instruction::CallMethodDescriptorNoargs
                 | Instruction::CallMethodDescriptorO
+                | Instruction::CallExNonPyGeneral
+                | Instruction::CallExPy
                 | Instruction::CallNonPyGeneral
                 | Instruction::CallPyExactArgs
                 | Instruction::CallPyGeneral
@@ -3378,6 +3413,9 @@ impl FlowContext {
                 | Instruction::ForIterList
                 | Instruction::ForIterRange
                 | Instruction::ForIterTuple
+                | Instruction::ForIterVirtual
+                | Instruction::GetIterSelf
+                | Instruction::GetIterVirtual
                 | Instruction::LoadAttrClass
                 | Instruction::LoadAttrClassWithMetaclassCheck
                 | Instruction::LoadAttrGetattributeOverridden
@@ -3391,14 +3429,15 @@ impl FlowContext {
                 | Instruction::LoadAttrProperty
                 | Instruction::LoadAttrSlot
                 | Instruction::LoadAttrWithHint
-                | Instruction::LoadConstImmortal
-                | Instruction::LoadConstMortal
                 | Instruction::LoadGlobalBuiltin
                 | Instruction::LoadGlobalModule
                 | Instruction::LoadSuperAttrAttr
                 | Instruction::LoadSuperAttrMethod
                 | Instruction::ResumeCheck
+                | Instruction::ResumeCheckJit
+                | Instruction::SendAsyncGen
                 | Instruction::SendGen
+                | Instruction::SendVirtual
                 | Instruction::StoreAttrInstanceValue
                 | Instruction::StoreAttrSlot
                 | Instruction::StoreAttrWithHint
@@ -3452,7 +3491,8 @@ impl FlowContext {
                 | Instruction::InterpreterExit
                 | Instruction::JumpBackwardJit
                 | Instruction::JumpBackwardNoJit
-                | Instruction::Reserved => Err(FlowContextError::BytecodeCorruption(
+                | Instruction::Reserved
+                | Instruction::TraceRecord => Err(FlowContextError::BytecodeCorruption(
                     BytecodeCorruption::new(format!(
                         "interpreter-internal opcode reached flowspace: {instruction:?}"
                     )),
@@ -3479,12 +3519,6 @@ impl FlowContext {
                     // Python 2.7 form. 3.14 `GET_LEN` is a helper opcode for
                     // match statements and is outside the RPython scope.
                     self.unsupported_rpython("GET_LEN is used by match statements (not RPython)")
-                }
-                Instruction::GetYieldFromIter => {
-                    // `yield from` also falls through to the ordinary generator
-                    // path in `flowcontext.py`; the Rust port does not support
-                    // generators yet.
-                    self.unsupported_rpython("`yield from` is not supported by flowspace yet")
                 }
             }
         })();

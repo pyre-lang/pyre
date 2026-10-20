@@ -710,6 +710,16 @@ pub struct Cpu {
     /// IMPORT_NAME's globals argument — `self.get_w_globals()`.  (frame) → ref.
     pub load_import_globals_fn:
         extern "C" fn(*mut pyre_interpreter::PyFrame) -> pyre_object::PyObjectRef,
+    /// IMPORT_NAME residual for opcodes that can still take the PEP 810
+    /// lazy route (`eval_lazy_import_name`). Frame plus name / fromlist /
+    /// level / explicit-lazy bit; `MayForce` / can-raise.
+    pub eval_lazy_import_name_fn: extern "C" fn(
+        *mut pyre_interpreter::PyFrame,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        i64,
+    ) -> pyre_object::PyObjectRef,
     /// `newtuple(list_w)` (`objspace.py:332`) — (ref array) → new tuple.
     /// The array is the forced `popvalues` list; length travels inside
     /// the array, so any arity fits.
@@ -1017,6 +1027,10 @@ impl Cpu {
             load_import_fn: cpu_word!(1, crate::call_jit::bh_load_import_fn),
             load_import_locals_fn: cpu_word!(1, crate::call_jit::bh_load_import_locals_fn),
             load_import_globals_fn: cpu_word!(1, crate::call_jit::bh_load_import_globals_fn),
+            eval_lazy_import_name_fn: cpu_word!(
+                5,
+                pyre_interpreter::lazyimport::eval_lazy_import_name_jit_abi
+            ),
             newtuple_from_array_fn: cpu_word!(1, crate::call_jit::bh_newtuple_from_array),
             build_map_from_array_fn: cpu_word!(1, crate::call_jit::bh_build_map_from_array),
             build_set_from_array_fn: cpu_word!(1, crate::call_jit::bh_build_set_from_array),

@@ -76,7 +76,11 @@ pub struct W_Unpickler {
     /// slots hold `PY_NULL`; the Object strategy keeps stored values by pointer
     /// identity (a GET returns the exact memoized object).
     w_memo: PyObjectRef,
-    /// Next free memo slot (`_memo_append` target); invariant `== len(w_memo)`.
+    /// Sparse backup memo (`_Unpickler_MemoPut`); `None` while unset.
+    w_memo_dict: PyObjectRef,
+    /// Next free memo slot (`_memo_append` target). Dense PUTs keep this in
+    /// step with `len(w_memo)`; a sparse PUT that lands in `w_memo_dict` can
+    /// leave it ahead of the list length.
     memo_index: i64,
     /// Active frame bytes (`bytes`) or None.
     w_frame: PyObjectRef,
@@ -128,6 +132,7 @@ impl W_Unpickler {
                 w_stack: pyre_object::w_none(),
                 w_metastack: pyre_object::w_none(),
                 w_memo: pyre_object::w_none(),
+                w_memo_dict: pyre_object::w_none(),
                 memo_index: 0,
                 w_frame: pyre_object::w_none(),
                 frame_index: 0,
@@ -254,6 +259,9 @@ impl W_Unpickler {
         current.w_stack = pyre_object::w_none();
         current.w_metastack = pyre_object::w_none();
         current.w_memo = pyre_object::gc_roots::shadow_stack_get(memo_slot);
+        // `_pickle_Unpickler___init___impl` calls `Unpickler_clear`, which
+        // `Py_CLEAR`s `memo_dict` before `_Unpickler_MemoCleanup`.
+        current.w_memo_dict = pyre_object::w_none();
         current.memo_index = 0;
         current.w_frame = pyre_object::w_none();
         current.frame_index = 0;
@@ -323,6 +331,7 @@ impl W_Unpickler {
             let w_memo = pyre_object::listobject::w_list_new_empty();
             let me = cur(slot);
             me.w_memo = w_memo;
+            me.w_memo_dict = pyre_object::w_none();
             me.memo_index = 0;
             unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
         }
@@ -503,53 +512,43 @@ impl W_Unpickler {
         proxy
     }
 
-    /// `Unpickler.memo` setter — an `UnpicklerMemoProxy` snapshots the source
-    /// unpickler's memo (read out as a `{index: obj}` dict via `copy`) and
-    /// rebuilds it into this one's position-indexed memo list, NULL-filling any
-    /// gap. A plain dict assignment validates its keys (non-negative integers)
-    /// and then leaves the memo empty: the entries are written into the memo
-    /// that is replaced wholesale. Any other type is a `TypeError`.
+    /// `Unpickler.memo` setter — `Unpickler_set_memo`.
+    ///
+    /// A proxy copies the source's dense array only (`_Unpickler_NewMemo` +
+    /// `Py_XNewRef` each `memo[i]`); neither side's `memo_dict` is copied or
+    /// cleared. A dict allocates `_Unpickler_NewMemo(len(dict))`, then
+    /// `_Unpickler_MemoPut(self, idx, value)` each pair against the *current*
+    /// memo, then `_Unpickler_MemoCleanup` and installs that empty array — so
+    /// sparse keys survive in `w_memo_dict` and dense keys leave with the old
+    /// array.
     #[setter]
     fn set_memo(&mut self, w_value: PyObjectRef) -> Result<(), PyError> {
         let self_obj = self as *mut W_Unpickler as PyObjectRef;
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self_obj);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        if UnpicklerMemoProxy::from_obj(w_value).is_some() {
-            let w_dict = call_meth(w_value, "copy", &[])?;
-            let _ = pyre_object::gc_roots::pin_root(w_dict);
-            let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let (w_list, next) =
-                memo_list_from_dict(pyre_object::gc_roots::shadow_stack_get(dict_slot))?;
-            // `memo_list_from_dict`'s `w_list_new` may have collected; re-read self.
-            let me = unsafe {
-                &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut W_Unpickler)
-            };
-            me.w_memo = w_list;
-            me.memo_index = next;
-            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(w_value);
+        let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+        if let Some(px) = UnpicklerMemoProxy::from_obj(w_value) {
+            let src = px.w_unpickler;
+            let _ = pyre_object::gc_roots::pin_root(src);
+            let src_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let new_memo = memo_copy_dense_list(src_slot);
+            let _ = pyre_object::gc_roots::pin_root(new_memo);
+            let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            memo_replace_dense(self_slot, pyre_object::gc_roots::shadow_stack_get(new_slot));
         } else if unsafe { pyre_object::is_dict(w_value) } {
-            // Validate keys, then discard: a dict assignment yields an empty memo.
-            let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_value) };
-            for (k, _) in &items {
-                if !unsafe { pyre_object::is_int(*k) } {
-                    return Err(PyError::type_error("memo key must be integers"));
-                }
-                if pyre_interpreter::baseobjspace::int_w(*k)? < 0 {
-                    return Err(PyError::value_error("memo key must be positive integers."));
-                }
-            }
-            let empty = pyre_object::listobject::w_list_new_empty();
-            let me = unsafe {
-                &mut *(pyre_object::gc_roots::shadow_stack_get(self_slot) as *mut W_Unpickler)
-            };
-            me.w_memo = empty;
-            me.memo_index = 0;
-            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+            memo_assign_from_dict(
+                self_slot,
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            )?;
         } else {
             return Err(PyError::type_error(format!(
                 "'memo' attribute must be an UnpicklerMemoProxy object or dict, not {}",
-                pyre_interpreter::baseobjspace::object_functionstr_type_name(w_value),
+                pyre_interpreter::baseobjspace::object_functionstr_type_name(
+                    pyre_object::gc_roots::shadow_stack_get(value_slot),
+                ),
             )));
         }
         Ok(())
@@ -597,7 +596,7 @@ fn attribute_error_with_context(message: String, mut context: PyError) -> PyErro
 }
 
 /// `interp_pickle.py UnpicklerMemoProxy` — a live view of an unpickler's
-/// index→object memo (a Python `dict`). `copy` snapshots it; `clear` resets it.
+/// memo. `copy` / `clear` / assignment follow the 3.15 dense-array surface.
 ///
 /// Held in its own module so `#[pyre_methods]` emits a `type_object()` that
 /// does not clash with `W_Unpickler`'s (each impl emits a module-scoped one).
@@ -614,66 +613,67 @@ mod memo_proxy {
 
     #[pyre_interpreter::pyre_methods(doc = "Proxy for an Unpickler's memo.")]
     impl UnpicklerMemoProxy {
-        /// `UnpicklerMemoProxy.copy` — a shallow `{index: obj}` copy of the memo,
-        /// projecting the position-indexed memo list (NULL slots omitted).
+        /// `_pickle_UnpicklerMemoProxy_copy_impl` — occupied dense-array slots
+        /// only; `memo_dict` is not included.
         fn copy(&self) -> Result<PyObjectRef, PyError> {
-            let w_unpickler = self.w_unpickler;
-            let w_memo = unsafe { &*(w_unpickler as *const W_Unpickler) }.w_memo;
-            let w_dict = pyre_object::dictmultiobject::w_dict_new();
-            if unsafe { pyre_object::is_none(w_memo) } {
-                return Ok(w_dict);
-            }
             let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(w_memo);
-            let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let _ = pyre_object::gc_roots::pin_root(self.w_unpickler);
+            let unpickler_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_dict = pyre_object::dictmultiobject::w_dict_new();
             let _ = pyre_object::gc_roots::pin_root(w_dict);
             let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let len = unsafe {
-                pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
-                    memo_slot,
-                ))
-            } as i64;
-            for i in 0..len {
-                let v = unsafe {
-                    pyre_object::listobject::w_list_getitem(
-                        pyre_object::gc_roots::shadow_stack_get(memo_slot),
-                        i,
-                    )
-                };
-                if let Some(v) = v
-                    && !v.is_null()
-                {
-                    // `w_dict_setitem` boxes the int key (`w_int_new`), which
-                    // may collect and move `v`; pin it across the store.
-                    let _r = pyre_object::gc_roots::push_roots();
-                    let _ = pyre_object::gc_roots::pin_root(v);
-                    let v_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                    let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
-                    unsafe {
-                        pyre_object::dictmultiobject::w_dict_setitem(
-                            w_dict,
+            let w_memo = unsafe {
+                &*(pyre_object::gc_roots::shadow_stack_get(unpickler_slot) as *const W_Unpickler)
+            }
+            .w_memo;
+            if !unsafe { pyre_object::is_none(w_memo) } {
+                let _ = pyre_object::gc_roots::pin_root(w_memo);
+                let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let len = unsafe {
+                    pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
+                        memo_slot,
+                    ))
+                } as i64;
+                for i in 0..len {
+                    let v = unsafe {
+                        pyre_object::listobject::w_list_getitem(
+                            pyre_object::gc_roots::shadow_stack_get(memo_slot),
                             i,
-                            pyre_object::gc_roots::shadow_stack_get(v_slot),
                         )
                     };
+                    if let Some(v) = v
+                        && !v.is_null()
+                    {
+                        // `w_dict_setitem` boxes the int key (`w_int_new`), which
+                        // may collect and move `v`; pin it across the store.
+                        let _r = pyre_object::gc_roots::push_roots();
+                        let _ = pyre_object::gc_roots::pin_root(v);
+                        let v_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        let w_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+                        unsafe {
+                            pyre_object::dictmultiobject::w_dict_setitem(
+                                w_dict,
+                                i,
+                                pyre_object::gc_roots::shadow_stack_get(v_slot),
+                            )
+                        };
+                    }
                 }
             }
             Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
         }
 
-        /// `UnpicklerMemoProxy.clear` — empty the unpickler's memo.
+        /// `_pickle_UnpicklerMemoProxy_clear_impl` — `_Unpickler_MemoCleanup`
+        /// then `_Unpickler_NewMemo` of the same dense size. `memo_dict` is
+        /// not touched.
         fn clear(&self) {
-            let w_unpickler = self.w_unpickler;
             let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(w_unpickler);
+            let _ = pyre_object::gc_roots::pin_root(self.w_unpickler);
             let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
             let empty = pyre_object::listobject::w_list_new_empty();
-            let u = unsafe {
-                &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Unpickler)
-            };
-            u.w_memo = empty;
-            u.memo_index = 0;
-            unpickler_write_barrier(u as *mut W_Unpickler as PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(empty);
+            let empty_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            super::memo_replace_dense(slot, pyre_object::gc_roots::shadow_stack_get(empty_slot));
         }
     }
 }
@@ -795,14 +795,33 @@ fn memoryview_type() -> Result<PyObjectRef, PyError> {
 
 // ── memo helpers ─────────────────────────────────────────────────────
 
-/// `_memo_put` — store `w_val` at index `i`, growing the list (NULL-filling any
-/// gap) and advancing the next-free slot.
+/// `_Unpickler_MemoPut` — store `w_val` at index `i`. A dense index grows the
+/// list (NULL-filling any gap); a sparse index (`i >= len` and `i > len * 2`)
+/// goes into `w_memo_dict` instead.
 fn memo_put(slot: usize, i: i64, w_val: PyObjectRef) {
-    let me = cur(slot);
-    let len = unsafe { pyre_object::listobject::w_list_len(me.w_memo) } as i64;
-    if i < len {
+    let len = unsafe { pyre_object::listobject::w_list_len(cur(slot).w_memo) } as i64;
+    if i >= len && i > len.saturating_mul(2) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(w_val);
+        let val_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        if unsafe { pyre_object::is_none(cur(slot).w_memo_dict) } {
+            let w_dict = pyre_object::dictmultiobject::w_dict_new();
+            let me = cur(slot);
+            me.w_memo_dict = w_dict;
+            unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+        }
+        let _ = pyre_object::gc_roots::pin_root(cur(slot).w_memo_dict);
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                i,
+                pyre_object::gc_roots::shadow_stack_get(val_slot),
+            )
+        };
+    } else if i < len {
         // In-range overwrite: no allocation, so no relocation.
-        unsafe { pyre_object::listobject::w_list_setitem(me.w_memo, i, w_val) };
+        unsafe { pyre_object::listobject::w_list_setitem(cur(slot).w_memo, i, w_val) };
     } else {
         // Grow. `w_list_append` may collect; pin the value and re-read self/list.
         let _roots = pyre_object::gc_roots::push_roots();
@@ -843,8 +862,47 @@ fn memo_get(slot: usize, i: i64) -> Result<PyObjectRef, PyError> {
             "Memo value not found at index {i}"
         )));
     }
-    let me = cur(slot);
-    match unsafe { pyre_object::listobject::w_list_getitem(me.w_memo, i) } {
+    match unsafe { pyre_object::listobject::w_list_getitem(cur(slot).w_memo, i) } {
+        Some(v) if !v.is_null() => return Ok(v),
+        _ => {}
+    }
+    let w_memo_dict = cur(slot).w_memo_dict;
+    if unsafe { pyre_object::is_none(w_memo_dict) } {
+        return Err(unpickling_error(&format!(
+            "Memo value not found at index {i}"
+        )));
+    }
+    // `_Unpickler_MemoGet`: box the index, then either migrate a dict entry
+    // into a live list slot or read it in place. `w_int_new` can collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(w_memo_dict);
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let w_key = pyre_object::w_int_new(i);
+    let _ = pyre_object::gc_roots::pin_root(w_key);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let len = unsafe { pyre_object::listobject::w_list_len(cur(slot).w_memo) } as i64;
+    let w_memo_dict = pyre_object::gc_roots::shadow_stack_get(dict_slot);
+    let w_key = pyre_object::gc_roots::shadow_stack_get(key_slot);
+    let found = if i < len {
+        match unsafe { pyre_object::dictmultiobject::w_dict_pop_checked(w_memo_dict, w_key) } {
+            Ok(Some(v)) => {
+                let _ = pyre_object::gc_roots::pin_root(v);
+                let val_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                unsafe {
+                    pyre_object::listobject::w_list_setitem(
+                        cur(slot).w_memo,
+                        i,
+                        pyre_object::gc_roots::shadow_stack_get(val_slot),
+                    )
+                };
+                Some(pyre_object::gc_roots::shadow_stack_get(val_slot))
+            }
+            _ => None,
+        }
+    } else {
+        unsafe { pyre_object::dictmultiobject::w_dict_lookup(w_memo_dict, w_key) }
+    };
+    match found {
         Some(v) if !v.is_null() => Ok(v),
         _ => Err(unpickling_error(&format!(
             "Memo value not found at index {i}"
@@ -852,27 +910,114 @@ fn memo_get(slot: usize, i: i64) -> Result<PyObjectRef, PyError> {
     }
 }
 
-/// Build a position-indexed memo `list` from a `{index: obj}` dict (as produced
-/// by `UnpicklerMemoProxy.copy`), NULL-filling any gap. Returns the list and the
-/// next-free index (`max_index + 1`).
-fn memo_list_from_dict(w_dict: PyObjectRef) -> Result<(PyObjectRef, i64), PyError> {
-    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_dict) };
-    let mut max_idx: i64 = -1;
-    for (k, _) in &items {
-        let idx = pyre_interpreter::baseobjspace::int_w(*k)?;
-        if idx > max_idx {
-            max_idx = idx;
+/// Replace the dense memo list. `w_memo_dict` is left as-is
+/// (`_Unpickler_MemoCleanup` does not `Py_CLEAR(memo_dict)`).
+fn memo_replace_dense(slot: usize, w_list: PyObjectRef) {
+    let me = cur(slot);
+    me.w_memo = w_list;
+    unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+}
+
+/// Snapshot the source unpickler's dense list, NULL slots included
+/// (`Unpickler_set_memo` proxy branch: `_Unpickler_NewMemo` + `Py_XNewRef`
+/// each `memo[i]`).
+fn memo_copy_dense_list(src_slot: usize) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let w_src = cur(src_slot).w_memo;
+    let _ = pyre_object::gc_roots::pin_root(w_src);
+    let src_memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let dst = pyre_object::listobject::w_list_new_empty();
+    let _ = pyre_object::gc_roots::pin_root(dst);
+    let dst_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if unsafe { pyre_object::is_none(pyre_object::gc_roots::shadow_stack_get(src_memo_slot)) } {
+        return pyre_object::gc_roots::shadow_stack_get(dst_slot);
+    }
+    let len = unsafe {
+        pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(src_memo_slot))
+    } as i64;
+    for i in 0..len {
+        unsafe {
+            pyre_object::listobject::w_list_append(
+                pyre_object::gc_roots::shadow_stack_get(dst_slot),
+                pyre_object::PY_NULL,
+            )
+        };
+        let v = unsafe {
+            pyre_object::listobject::w_list_getitem(
+                pyre_object::gc_roots::shadow_stack_get(src_memo_slot),
+                i,
+            )
+        };
+        if let Some(v) = v
+            && !v.is_null()
+        {
+            let _r = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(v);
+            let v_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            unsafe {
+                pyre_object::listobject::w_list_setitem(
+                    pyre_object::gc_roots::shadow_stack_get(dst_slot),
+                    i,
+                    pyre_object::gc_roots::shadow_stack_get(v_slot),
+                )
+            };
         }
     }
-    let mut slots: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; (max_idx + 1) as usize];
-    for (k, v) in &items {
-        let idx = pyre_interpreter::baseobjspace::int_w(*k)? as usize;
-        slots[idx] = *v;
+    pyre_object::gc_roots::shadow_stack_get(dst_slot)
+}
+
+/// `Unpickler_set_memo` dict branch: `_Unpickler_NewMemo(PyDict_GET_SIZE)`,
+/// `_Unpickler_MemoPut` each pair against the current memo, then
+/// `_Unpickler_MemoCleanup` and install the empty array.
+fn memo_assign_from_dict(self_slot: usize, w_mapping: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(w_mapping);
+    let mapping_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let n = unsafe {
+        pyre_object::dictmultiobject::w_dict_len(pyre_object::gc_roots::shadow_stack_get(
+            mapping_slot,
+        ))
+    };
+    let new_memo = pyre_object::listobject::w_list_new_empty();
+    let _ = pyre_object::gc_roots::pin_root(new_memo);
+    let new_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    for _ in 0..n {
+        unsafe {
+            pyre_object::listobject::w_list_append(
+                pyre_object::gc_roots::shadow_stack_get(new_slot),
+                pyre_object::PY_NULL,
+            )
+        };
     }
-    Ok((
-        pyre_object::listobject::w_list_new_object(slots),
-        max_idx + 1,
-    ))
+    let pairs = unsafe {
+        pyre_object::dictmultiobject::w_dict_items(pyre_object::gc_roots::shadow_stack_get(
+            mapping_slot,
+        ))
+    };
+    let mut flat = Vec::with_capacity(pairs.len() * 2);
+    for (k, v) in pairs {
+        flat.push(k);
+        flat.push(v);
+    }
+    let n_flat = flat.len();
+    let base = pyre_object::gc_roots::pin_roots(&flat);
+    for i in (0..n_flat).step_by(2) {
+        let w_key = pyre_object::gc_roots::shadow_stack_get(base + i);
+        if unsafe { !pyre_object::is_int_or_long(w_key) } {
+            return Err(PyError::type_error("memo key must be integers"));
+        }
+        let idx = pyre_interpreter::baseobjspace::int_w(w_key)?;
+        if idx < 0 {
+            return Err(PyError::value_error("memo key must be positive integers."));
+        }
+        memo_put(
+            self_slot,
+            idx,
+            pyre_object::gc_roots::shadow_stack_get(base + i + 1),
+        );
+    }
+    memo_replace_dense(self_slot, pyre_object::gc_roots::shadow_stack_get(new_slot));
+    Ok(())
 }
 
 // ── reading ──────────────────────────────────────────────────────────

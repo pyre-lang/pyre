@@ -112,7 +112,7 @@ fn legacy_feature_version_error(
                 }
             }
             if self.minor < 6 {
-                let async_comprehension = match expression {
+                let async_comprehension: Option<&[ast::Comprehension]> = match expression {
                     ast::Expr::ListComp(node) => Some(&node.generators),
                     ast::Expr::SetComp(node) => Some(&node.generators),
                     ast::Expr::DictComp(node) => Some(&node.generators),
@@ -170,11 +170,11 @@ fn legacy_feature_version_error(
 /// CPython `_PyPegen_new_identifier` refuses a lexer name whose NFKC form is
 /// one of the three constant keywords.  Ruff already performs that same NFKC
 /// conversion when it builds the AST, but (unlike CPython) leaves the result
-/// as an identifier.  Inspecting only `Name` tokens keeps this a parser check:
+/// as an identifier.  Inspecting only `Identifier` tokens keeps this a parser check:
 /// a literal `None`/`True`/`False` token is, of course, valid.
 fn validate_parser_identifiers(source: &str, tokens: &ast::token::Tokens) -> AstResult<()> {
     for token in tokens.iter() {
-        if token.kind() != ast::token::TokenKind::Name {
+        if token.kind() != ast::token::TokenKind::Identifier {
             continue;
         }
         let (_, range) = token.as_tuple();
@@ -237,7 +237,11 @@ pub fn compile_object(
     warning_filename: &Wtf8,
     mode: crate::compile::Mode,
     opts: crate::compile::CompileOpts,
+    compile_module: PyObjectRef,
 ) -> AstResult<crate::compile::CodeObject> {
+    let _compile_module_roots = pyre_object::gc_roots::push_roots();
+    let compile_module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(compile_module);
     let ast_module = pyre_object::with_roots!(object => crate::importing::importhook(
         rustpython_wtf8::Wtf8::new("_ast"),
         PY_NULL,
@@ -262,13 +266,14 @@ pub fn compile_object(
     crate::astcompiler::validate::validate_ast(&module)?;
     let source_file =
         rustpython_compiler::core::SourceFileBuilder::new(filename, text.clone()).finish();
-    crate::syntax_warnings::compile_ast_with_codegen_warnings(
+    crate::syntax_warnings::compile_ast_with_codegen_warnings_and_module(
         module,
         source_file,
         &text,
         warning_filename,
         mode,
         opts,
+        pyre_object::gc_roots::shadow_stack_get(compile_module_slot),
     )
     .map_err(|error| match error {
         crate::syntax_warnings::SourceCompileError::Compile(error) => {
@@ -567,6 +572,15 @@ impl ObjectConverter {
         }
     }
 
+    fn opt_is_lazy(&self, object: PyObjectRef) -> AstResult<bool> {
+        match self.optional_field(object, "is_lazy")? {
+            Some(value) if unsafe { !pyre_object::is_none(value) } => {
+                crate::baseobjspace::is_true(value)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn list(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<PyObjectRef>> {
         let value = self.field(object, field, node)?;
         if !unsafe { pyre_object::is_list(value) } {
@@ -852,7 +866,7 @@ impl ObjectConverter {
                 Some(Box::new(ast::Arguments {
                     node_index: Default::default(),
                     range,
-                    args: bases.into_boxed_slice(),
+                    args: bases.into(),
                     keywords: keywords.into(),
                     runtime_args: None,
                     runtime_bases: None,
@@ -1069,18 +1083,21 @@ impl ObjectConverter {
                 msg,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Import"))? {
+            let names = pyre_object::with_roots!(object => self.aliases(object, "Import"))?;
+            let is_lazy = self.opt_is_lazy(object)?;
             Ok(ast::Stmt::Import(ast::StmtImport {
                 node_index: Default::default(),
                 range,
-                names: self.aliases(object, "Import")?,
-                is_lazy: false,
+                names,
+                is_lazy,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "ImportFrom"))? {
             let module = pyre_object::with_roots!(object => self.opt_identifier(object, "module"))?;
             let names = pyre_object::with_roots!(object => self.aliases(object, "ImportFrom"))?;
             // `level` is optional on a hand-built node and defaults to absolute.
-            let level = match self.optional_field(object, "level")? {
-                Some(value) => self.obj_to_int(value)?,
+            let level = match pyre_object::with_roots!(object => self.optional_field(object, "level"))?
+            {
+                Some(value) => pyre_object::with_roots!(object => self.obj_to_int(value))?,
                 None => 0,
             };
             if level < 0 {
@@ -1092,13 +1109,14 @@ impl ObjectConverter {
             let level = u32::try_from(level).map_err(|_| {
                 crate::PyError::overflow_error("Python int too large to convert to C int")
             })?;
+            let is_lazy = self.opt_is_lazy(object)?;
             Ok(ast::Stmt::ImportFrom(ast::StmtImportFrom {
                 node_index: Default::default(),
                 range,
                 module,
                 names,
                 level,
-                is_lazy: false,
+                is_lazy,
                 runtime_level: None,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Global"))? {
@@ -1740,7 +1758,7 @@ impl ObjectConverter {
                 arguments: ast::Arguments {
                     node_index: Default::default(),
                     range,
-                    args: args.into_boxed_slice(),
+                    args: args.into(),
                     keywords: keywords.into(),
                     runtime_args: None,
                     runtime_bases: None,
@@ -1923,7 +1941,7 @@ impl ObjectConverter {
                 range,
                 key: Some(key),
                 value,
-                generators,
+                generators: generators.into_boxed_slice(),
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "GeneratorExp"))? {
             let elt =
@@ -1963,12 +1981,14 @@ impl ObjectConverter {
             .map(|op| self.cmpop(op))
             .collect::<Result<Vec<_>, _>>()?;
             let comparators = self.exprs(object, "comparators", "Compare")?;
+            let mut operands = Vec::with_capacity(comparators.len() + 1);
+            operands.push(*left);
+            operands.extend(comparators);
             Ok(ast::Expr::Compare(ast::ExprCompare {
                 node_index: Default::default(),
                 range,
-                left,
                 ops: ops.into_boxed_slice(),
-                comparators: comparators.into_boxed_slice(),
+                operands: operands.into_boxed_slice(),
                 runtime_comparators: None,
             }))
         } else if pyre_object::with_roots!(object => self.is_node(object, "Subscript"))? {
@@ -2398,13 +2418,12 @@ pub fn parse_to_object_with_opts(
         | crate::compile::Mode::BlockExpr => parser::Mode::Module,
     };
     // PyPy `CompileInfo.feature_version` carries the requested grammar version
-    // into `PythonParser.parse_source`.  CPython 3.14 treats every negative
-    // value and every future minor as the current grammar, so never expose
-    // Ruff's preview 3.15 grammar through this 3.14 boundary.
+    // into `PythonParser.parse_source`.  Negative values and future minors
+    // use the current grammar.
     let minor = if feature_version < 0 {
-        14
+        15
     } else {
-        feature_version.min(14) as u8
+        feature_version.min(15) as u8
     };
     let options = parser::ParseOptions::from(parse_mode)
         .with_target_version(ast::PythonVersion { major: 3, minor });
@@ -2499,9 +2518,9 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
 
     let source = &*crate::compile::universal_newline(source);
     let minor = if feature_version < 0 {
-        14
+        15
     } else {
-        feature_version.min(14) as u8
+        feature_version.min(15) as u8
     };
     let options = parser::ParseOptions::from(parser::Mode::Expression)
         .with_target_version(ast::PythonVersion { major: 3, minor });
@@ -2613,7 +2632,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
         parser::ParseOptions::from(parser::Mode::Expression).with_target_version(
             ast::PythonVersion {
                 major: 3,
-                minor: 14,
+                minor: 15,
             },
         )
     } else {
@@ -3314,7 +3333,13 @@ impl Converter<'_> {
             Stmt::Import(node) => self.node(
                 "Import",
                 Some(range(node.range)),
-                &[("names", self.aliases(&node.names)?)],
+                &[
+                    ("names", self.aliases(&node.names)?),
+                    (
+                        "is_lazy",
+                        self.pin(pyre_object::w_int_new(i64::from(node.is_lazy))),
+                    ),
+                ],
             ),
             Stmt::ImportFrom(node) => self.node(
                 "ImportFrom",
@@ -3330,6 +3355,10 @@ impl Converter<'_> {
                         self.pin(pyre_object::w_int_new(
                             node.runtime_level.unwrap_or(node.level as i32) as i64,
                         )),
+                    ),
+                    (
+                        "is_lazy",
+                        self.pin(pyre_object::w_int_new(i64::from(node.is_lazy))),
                     ),
                 ],
             ),
@@ -3520,9 +3549,9 @@ impl Converter<'_> {
                     "Compare",
                     Some(range(n.range)),
                     &[
-                        ("left", self.expr(&n.left)?),
+                        ("left", self.expr(n.first_operand())?),
                         ("ops", self.list(ops)),
-                        ("comparators", self.expr_list(&n.comparators)?),
+                        ("comparators", self.expr_list(n.comparators())?),
                     ],
                 )
             }
@@ -3678,12 +3707,12 @@ impl Converter<'_> {
         let mut parts = Vec::new();
         for part in node.value.iter() {
             match part {
-                ast::FStringPart::Literal(literal) => push_literal(
+                ast::FStringPartRef::Literal(literal) => push_literal(
                     &mut parts,
                     range(literal.range),
                     &string_literal_part_value(&self.source_file, literal),
                 ),
-                ast::FStringPart::FString(fstring) => {
+                ast::FStringPartRef::FString(fstring) => {
                     self.interpolated_elements(&fstring.elements, fstring.flags.into(), &mut parts)?
                 }
             }

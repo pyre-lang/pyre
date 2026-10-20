@@ -129,7 +129,7 @@ assign one disposition:
   work can now reach. A fixed section-3/4 item moves into this cycle's diff
   exactly like a section-1/2 fix; verify the same way (Step 3).
 - **won't-fix (documented)** — the divergence is *correct as-is*: a deliberate,
-  still-valid structural adaptation (RPython↔Rust language gap, 3.11↔3.14
+  still-valid structural adaptation (RPython↔Rust language gap, 3.11↔3.15
   opcode difference, GIL/free-threading, no-filesystem/no-libc on wasm, …).
   Confirm the upstream decision point it encodes and ensure an in-code comment
   cites it; if the comment is missing, that documentation *is* the fix and is

@@ -9,7 +9,6 @@ from test.support import import_helper, Py_DEBUG
 _queues = import_helper.import_module('_interpqueues')
 from concurrent import interpreters
 from concurrent.interpreters import _queues as queues, _crossinterp
-import test._crossinterp_definitions as defs
 from .utils import _run_output, TestBase as _TestBase
 
 HUGE_TIMEOUT = 3600

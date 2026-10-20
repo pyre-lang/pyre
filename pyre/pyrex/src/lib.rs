@@ -1423,11 +1423,10 @@ fn finalize_system_exit(
 /// by an explicit exit status yet.
 ///
 /// `_PyErr_PrintEx` records one, and `Py_RunMain` consults it after the prompt
-/// and after `Py_FinalizeEx`, so an interrupt raised by the program under `-i`
-/// still ends the process by SIGINT once the prompt is done -- and so does one
-/// raised at the prompt itself.  An explicit `exit(n)` answers it, `exit(0)`
-/// included, because `SystemExit` leaves through `Py_Exit` without passing the
-/// check.
+/// and after `Py_FinalizeEx`, overwriting any `exitcode` the prompt produced.
+/// An interrupt raised by the program under `-i` still ends the process by
+/// SIGINT once the prompt is done -- and so does one raised at the prompt
+/// itself, even when the prompt then calls `exit(n)`.
 static UNHANDLED_KEYBOARD_INTERRUPT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

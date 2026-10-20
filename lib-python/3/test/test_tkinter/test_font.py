@@ -1,3 +1,4 @@
+import collections.abc
 import unittest
 import tkinter
 from tkinter import font
@@ -20,6 +21,7 @@ class FontTest(AbstractTkTest, unittest.TestCase):
             cls.font = font.Font(root=cls.root, name=fontname, exists=False)
 
     def test_configure(self):
+        self.assertEqual(self.font.config, self.font.configure)
         options = self.font.configure()
         self.assertGreaterEqual(set(options),
             {'family', 'size', 'weight', 'slant', 'underline', 'overstrike'})
@@ -35,6 +37,58 @@ class FontTest(AbstractTkTest, unittest.TestCase):
             self.assertIsInstance(options[key], sizetype)
             self.assertIsInstance(self.font.cget(key), sizetype)
             self.assertIsInstance(self.font[key], sizetype)
+        self.assertRaisesRegex(tkinter.TclError, 'bad option "-spam"',
+                               self.font.cget, 'spam')
+        self.assertRaisesRegex(tkinter.TclError, 'bad option "-spam"',
+                               self.font.configure, spam='x')
+        self.assertRaises(TypeError, self.font.cget)
+        self.assertRaises(TypeError, self.font.cget, 'size', 'weight')
+
+    def test_create_from_named_font(self):
+        # gh-143990: a font created from a named font copies its configured
+        # options, preserving a size specified in pixels (a negative size).
+        sizetype = int if self.wantobjects else str
+        named = font.Font(root=self.root, name='my named font',  # name with spaces
+                          family='Times', size=-20, weight='bold')
+        # The source is the name of a named font or a Font representing one.
+        for source in ['my named font', named]:
+            with self.subTest(source=source):
+                f = font.Font(root=self.root, font=source)
+                self.assertEqual(f.cget('size'), sizetype(-20))
+                self.assertEqual(f.actual('family'), named.actual('family'))
+                self.assertEqual(f.actual('weight'), 'bold')
+
+    def test_create_from_description(self):
+        # gh-143990: a font created from a font description is resolved via
+        # "font actual", so a size in pixels (negative) becomes a size in points.
+        descriptions = [
+            ('Times', -20),                     # tuple
+            ('Times', -20, 'bold'),             # tuple with a style
+            'Times -20',                        # string
+            'Times -20 bold',                   # string with a style
+            '{Times New Roman} -20',            # string, family with spaces
+        ]
+        for desc in descriptions:
+            with self.subTest(font=desc):
+                f = font.Font(root=self.root, font=desc)
+                self.assertGreater(int(f.cget('size')), 0)  # pixels -> points
+
+    def test_copy(self):
+        # size=-20 (pixels): copy() copies the configured options, so the
+        # size is preserved rather than resolved (gh-143990).
+        f = font.Font(root=self.root, family='Times', size=-20, weight='bold')
+        copied = f.copy()
+        self.assertIsInstance(copied, font.Font)
+        self.assertIsNot(copied, f)
+        self.assertNotEqual(copied.name, f.name)
+        self.assertEqual(copied.actual(), f.actual())
+        sizetype = int if self.wantobjects else str
+        self.assertEqual(copied.cget('size'), sizetype(-20))
+        # The copy is independent of the original.
+        copied.configure(size=20)
+        self.assertEqual(f.cget('size'), sizetype(-20))
+        self.assertEqual(copied.cget('size'), sizetype(20))
+        self.assertRaises(TypeError, f.copy, 'x')
 
     def test_unicode_family(self):
         family = 'MS \u30b4\u30b7\u30c3\u30af'
@@ -59,6 +113,9 @@ class FontTest(AbstractTkTest, unittest.TestCase):
         for key in 'size', 'underline', 'overstrike':
             self.assertIsInstance(options[key], sizetype)
             self.assertIsInstance(self.font.actual(key), sizetype)
+        self.assertRaisesRegex(tkinter.TclError, 'bad option "-spam"',
+                               self.font.actual, 'spam')
+        self.assertRaises(TypeError, self.font.actual, 'size', 'weight', 'slant')
 
     def test_name(self):
         self.assertEqual(self.font.name, fontname)
@@ -82,6 +139,11 @@ class FontTest(AbstractTkTest, unittest.TestCase):
 
     def test_measure(self):
         self.assertIsInstance(self.font.measure('abc'), int)
+        self.assertEqual(self.font.measure(''), 0)
+        self.assertIsInstance(
+            self.font.measure('abc', displayof=self.root), int)
+        self.assertRaises(TypeError, self.font.measure)
+        self.assertRaises(TypeError, self.font.measure, 'a', 'b', 'c')
 
     def test_metrics(self):
         metrics = self.font.metrics()
@@ -89,8 +151,12 @@ class FontTest(AbstractTkTest, unittest.TestCase):
             {'ascent', 'descent', 'linespace', 'fixed'})
         for key in metrics:
             self.assertEqual(self.font.metrics(key), metrics[key])
+            self.assertEqual(self.font.metrics(key, displayof=self.root),
+                             metrics[key])
             self.assertIsInstance(metrics[key], int)
             self.assertIsInstance(self.font.metrics(key), int)
+        self.assertRaisesRegex(tkinter.TclError, 'bad metric "-spam"',
+                               self.font.metrics, 'spam')
 
     def test_families(self):
         families = font.families(self.root)
@@ -118,6 +184,16 @@ class FontTest(AbstractTkTest, unittest.TestCase):
         self.assertEqual(
             repr(self.font), f'<tkinter.font.Font object {fontname!r}>'
         )
+
+    def test_iterable_protocol(self):
+        self.assertNotIsSubclass(font.Font, collections.abc.Iterable)
+        self.assertNotIsSubclass(font.Font, collections.abc.Container)
+        self.assertNotIsInstance(self.font, collections.abc.Iterable)
+        self.assertNotIsInstance(self.font, collections.abc.Container)
+        with self.assertRaisesRegex(TypeError, 'is not iterable'):
+            iter(self.font)
+        with self.assertRaisesRegex(TypeError, 'is not a container or iterable'):
+            self.font in self.font
 
 
 class DefaultRootTest(AbstractDefaultRootTest, unittest.TestCase):
@@ -158,6 +234,16 @@ class DefaultRootTest(AbstractDefaultRootTest, unittest.TestCase):
         root.destroy()
         tkinter.NoDefaultRoot()
         self.assertRaises(RuntimeError, font.nametofont, fontname)
+
+
+class TestModule(unittest.TestCase):
+    def test_deprecated__version__(self):
+        with self.assertWarnsRegex(
+            DeprecationWarning,
+            "'__version__' is deprecated and slated for removal in Python 3.20",
+        ) as cm:
+            getattr(font, "__version__")
+        self.assertEqual(cm.filename, __file__)
 
 
 if __name__ == "__main__":

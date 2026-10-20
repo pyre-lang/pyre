@@ -799,14 +799,14 @@ pub(super) fn ensure_linked() {
 #[cfg(test)]
 mod tests {
     /// An `AsNativeBytes` flags word is one thing two places spell: an
-    /// extension compiled against `include/pyre3.14t/longobject.h` builds it,
+    /// extension compiled against `include/pyre3.15t/longobject.h` builds it,
     /// and this file reads it.  This walks the header and rejects any flag
     /// whose bit the Rust side spells differently.
     #[test]
     fn every_native_bytes_flag_is_the_bit_the_header_gives_it() {
         use bitflags::Flags as _;
 
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/longobject.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/longobject.h");
 
         let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
         for line in HEADER.lines() {

@@ -670,7 +670,7 @@ pub fn new_pycfunction_in_class(
 }
 
 /// C-visible `PyCFunctionObject`, the twin of the struct in
-/// `include/pyre3.14t/methodobject.h`.
+/// `include/pyre3.15t/methodobject.h`.
 ///
 /// cffi reads `m_ml` and `m_module` off the block rather than through an entry
 /// point (`lib_obj.c _cpyextfunc_get`), and the module read is an identity
@@ -1034,7 +1034,7 @@ pub(super) fn ensure_linked() {
 #[cfg(test)]
 mod tests {
     /// `ml_flags` is one word two places spell: an extension compiled against
-    /// `include/pyre3.14t/methodobject.h` puts bits into it, and this file
+    /// `include/pyre3.15t/methodobject.h` puts bits into it, and this file
     /// reads them.  Nothing tied the two together -- upstream has no such
     /// pair, because `api.py` reads each value out of the real header with
     /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
@@ -1047,7 +1047,7 @@ mod tests {
     fn every_meth_flag_is_the_bit_the_header_gives_it() {
         use bitflags::Flags as _;
 
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/methodobject.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/methodobject.h");
 
         let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
         for line in HEADER.lines() {
