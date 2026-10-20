@@ -5195,6 +5195,8 @@ fn trace_bridge_via_interpret(
         virtual_count,
         majit_metainterp::default_bridge_array_descr,
         &[],
+        raw_values,
+        &retrace.fail_types,
     );
 
     let rebuilt = {

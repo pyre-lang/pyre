@@ -16239,10 +16239,10 @@ pub(crate) fn build_jit_state(
     frame: &PyFrame,
     virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> PyreJitState {
-    let mut jit_state = PyreJitState {
-        frame: frame as *const PyFrame as usize,
-        execution_context: pyre_interpreter::call::getexecutioncontext() as usize,
-    };
+    let mut jit_state = PyreJitState::new(
+        frame as *const PyFrame as usize,
+        pyre_interpreter::call::getexecutioncontext() as usize,
+    );
     assert!(
         jit_state.sync_from_virtualizable(virtualizable_info),
         "build_jit_state: frame must be a valid PyFrame with readable fields"

@@ -6445,9 +6445,13 @@ impl<S: JitState> JitDriver<S> {
                     raw_values,
                     &fail_types,
                 ),
-                None => {
-                    crate::BridgeVirtualCache::new(virtual_count, crate::default_bridge_array_descr)
-                }
+                None => crate::BridgeVirtualCache::recording(
+                    virtual_count,
+                    crate::default_bridge_array_descr,
+                    &[],
+                    raw_values,
+                    &fail_types,
+                ),
             };
             let mut frames = Vec::with_capacity(sections.len());
             for (depth, (jitcode, pc)) in sections.into_iter().enumerate() {
@@ -11806,12 +11810,13 @@ impl<S: JitState> JitDriver<S> {
             // `cpu.get_ref_value(self.deadframe, num)` at the moment the box
             // is decoded. The deadframe stays a traced root, so a collection
             // inside `allocate_with_vtable` forwards the slot before that
-            // read. Snapshotting the words here would leave that collection
-            // updating the caller's buffer while `setup_bridge_sym` still
-            // indexes the copy (`materialize_concrete_virtual_ptr` allocates,
-            // then a later field or box reads `fail_values[n]`). The caller
-            // keeps this slice on a GC-visible holder for the whole call —
-            // the deadframe, or `DeadFrameRefRoots` over the Ref slots.
+            // read. The recording cache copies the words into `fail_ref_roots`
+            // and registers them, matching that deadframe read for TAGBOX
+            // `decode_box` during `setfields`. `setup_bridge_sym` still takes
+            // this caller-held slice so Int/Float consume and the Box-arm
+            // fallback index the same buffer. The caller keeps it on a
+            // GC-visible holder for the whole call — the deadframe, or
+            // `DeadFrameRefRoots` over the Ref slots.
             // `resume.py` `rebuild_from_resumedata` walks every encoded
             // section: `read_jitcode_pos_pc` then `newframe(jitcode)` then
             // `consume_boxes` with that frame's `get_current_position_info`.
@@ -11887,6 +11892,8 @@ impl<S: JitState> JitDriver<S> {
                         virtual_count,
                         S::mint_bridge_array_descr,
                         &all_virtuals,
+                        frontend_fail_values,
+                        &retrace.fail_types,
                     )
                 }
             };
