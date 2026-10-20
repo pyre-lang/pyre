@@ -8295,18 +8295,30 @@ fn drive_generatorentry_trace(
     }
 
     let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
+    // Same two greens as `genentry_green_key(pycode)`.
+    let values = [
+        pycode as i64,
+        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
+    ];
+    let types = [majit_ir::GreenType::Ref, majit_ir::GreenType::Int];
     let action = {
         let (driver, _) = driver_pair();
         let meta = driver.meta_interp_mut();
         let mut descriptor =
             pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
         descriptor.index = jitcode.jitdriver_sd();
-        // `(0, 0)` keeps `force_start_tracing` on the u64 cell key.
-        // A non-zero code pointer rebinds through `with_typed_decision_key`
-        // to jd0's `(next_instr, is_being_profiled, pycode)` cell.
+        // The cell is created from the jd2 greens (`bound_reached`
+        // `JitCell(*greenargs)`), so the CALL_ASSEMBLER `genentry_green_key`
+        // lookup finds the same cell.
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(meta);
-        meta.force_start_tracing(green_key, (0, 0), None, Some(descriptor), &live_values)
+        meta.force_start_tracing(
+            green_key,
+            (0, 0),
+            Some((&values, &types)),
+            Some(descriptor),
+            &live_values,
+        )
     };
     if dbg {
         let name = match action {

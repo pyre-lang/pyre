@@ -34809,6 +34809,54 @@ mod tests {
     }
 
     #[test]
+    fn generatorentry_greens_force_start_and_typed_lookup_share_one_cell() {
+        // jd2 greens are `(pycode, GENERATORENTRY_JD_INDEX)` (`genentry_green_key`).
+        // `force_start_tracing` with those greenargs installs `JitCell(*greenargs)`,
+        // so a later CALL_ASSEMBLER `ensure_cell_for_key` finds that cell.
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let values = [0xabc0i64, 2];
+        let types = [majit_ir::GreenType::Ref, majit_ir::GreenType::Int];
+        let key = majit_ir::GreenKey::from_greenargs(&values, &types);
+        let green_key = key.get_uhash();
+        meta.force_start_tracing(
+            green_key,
+            (0, 0),
+            Some((&values, &types)),
+            None,
+            &[Value::Int(0)],
+        );
+        assert!(
+            meta.tracing.is_some(),
+            "force_start_tracing must start tracing"
+        );
+
+        {
+            let cell = meta
+                .warm_state_for_driver(0)
+                .lookup_chain_with_key(&key)
+                .expect("force-start installs a cell matching the jd2 greens");
+            assert!(
+                cell.comparekey(&values, &types),
+                "JitCell(*greenargs) stores comparekey"
+            );
+            assert!(cell.next.borrow().is_none(), "these greens own one cell");
+        }
+
+        meta.warm_state_for_driver(0).ensure_cell_for_key(&key);
+        assert_eq!(
+            meta.warm_state_for_driver(0).get_stats().num_cells,
+            1,
+            "ensure_cell_for_key must not mint a sibling"
+        );
+        assert_eq!(
+            meta.warm_state_for_driver(0).cell_key_for(&key),
+            Some(green_key),
+            "the started cell must be the typed cell of these greens"
+        );
+    }
+
+    #[test]
     fn portal_close_green_key_matches_the_bound_reached_cell() {
         // `compile.py` `compile_loop` files the procedure token on
         // `original_boxes[:num_green_args]` (`warmstate.py`
