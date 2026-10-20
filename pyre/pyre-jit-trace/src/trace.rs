@@ -2905,13 +2905,14 @@ fn seed_loop_entry_ref_slots(
 }
 
 /// The pc the interpreter resumes `frame` at, read back out of the frame the
-/// blackhole left: `pyframe.py next_instr` reads `last_instr + 1`.
+/// blackhole left: `PyFrame::next_instr`.  For `last_instr >= 0` that is
+/// `last_instr + 1`; an unstarted generator (`last_instr == -1`) rests on
+/// the `POP_TOP` after `RETURN_GENERATOR`.
 ///
 /// Used by the bail arms, which have no green list to take a coordinate from
 /// and do not need one — the frame already carries its own.
 fn frame_resume_py_pc(frame: usize) -> usize {
-    let last_instr = unsafe { (*(frame as *const pyre_interpreter::PyFrame)).last_instr };
-    (last_instr + 1).max(0) as usize
+    unsafe { (*(frame as *const pyre_interpreter::PyFrame)).next_instr() }
 }
 
 /// Hand a blackhole `ContinueRunningNormally` back the way upstream does:

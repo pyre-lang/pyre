@@ -568,16 +568,11 @@ pub mod frame_locals_proxy {
             let value_slot = key_slot + 1;
             if let Some(index) = self.fast_local_index(roots.get(key_slot))? {
                 let frame = self.frame();
-                let is_cell_slot = {
+                let is_cell_kind = {
                     let code = frame.code();
                     index >= code.varnames.len() || super::cell_slot(code, index)
                 };
-                let slot = locals_w!(frame)[index];
-                if is_cell_slot && !slot.is_null() {
-                    unsafe { pyre_object::w_cell_set(slot, roots.get(value_slot)) };
-                } else {
-                    frame.set_locals_w(index, roots.get(value_slot));
-                }
+                super::store_localsplus_slot(frame, index, is_cell_kind, roots.get(value_slot));
                 return Ok(());
             }
             // CPython 3.14 `framelocalsproxy_setitem`: a key which is not a
@@ -1482,12 +1477,14 @@ pub struct PyFrame {
     /// dispatch carries the next-to-execute pc as a separate `next_instr`
     /// local variable advanced by `next_instr += 2` after the opcode read.
     /// pyre packs the same information into `last_instr` plus the
-    /// `next_instr()` accessor below, which returns `last_instr + 1`.
-    /// `set_last_instr_from_next_instr` is the inverse setter, and the
-    /// JIT vable shadow `vable_last_instr` mirrors the same field. The
-    /// `±1` arithmetic on either side of the accessor cancels — the
-    /// runtime never observes a divergence — so this remains a structural
-    /// adaptation, not a parity bug.
+    /// `next_instr()` accessor below, which returns `last_instr + 1` once
+    /// a frame has dispatched, and `after_return_generator_index` (or 0)
+    /// while `last_instr` is still `-1`.  `set_last_instr_from_next_instr`
+    /// is the inverse setter, and the JIT vable shadow `vable_last_instr`
+    /// mirrors the same field. The `±1` arithmetic on either side of the
+    /// accessor cancels for a started frame — the runtime never observes a
+    /// divergence — so this remains a structural adaptation, not a parity
+    /// bug.
     pub last_instr: isize,
     /// Packed frame status bits, one byte in place of two RPython
     /// class-level bools: `FLAG_ESCAPED` (pyframe.py:80 escaped — see
@@ -2073,6 +2070,13 @@ impl FrameBox {
         qualname: Option<PyObjectRef>,
     ) -> crate::PyResult {
         self.fix_array_ptrs();
+        // CPython `insert_prefix_instructions` runs `COPY_FREE_VARS` /
+        // `MAKE_CELL` before `RETURN_GENERATOR` builds the object
+        // (`flowgraph.c`); PyPy creates the cells in
+        // `initialize_frame_scopes` / `init_cells` before
+        // `GeneratorIterator(frame)`.  pyre wraps at call time, so the
+        // prefix has to run here, before the generator is allocated.
+        self.run_generator_prologue()?;
         let register_final = unsafe {
             crate::pycode::w_code_yields_inside_try(self.pycode as pyre_object::PyObjectRef)
         };
@@ -3240,25 +3244,47 @@ fn cell_slot(code: &CodeObject, idx: usize) -> bool {
         && code.localspluskinds[idx] & crate::bytecode::CO_FAST_CELL != 0
 }
 
-/// `pyframe.py fast2locals`: a cellvar/freevar slot holds the Cell; the
-/// mapping gets `cell.get()`. An empty cell is skipped (contents `None`).
+/// `frameobject.c framelocalsproxy_getval`: a `CO_FAST_CELL` /
+/// `CO_FAST_FREE` slot is a Cell only after `MAKE_CELL` ran. Generator
+/// wrap runs that prefix (`run_generator_prologue`) before the object is
+/// handed out, so an unstarted `gi_frame` already holds cells. Null stays
+/// null; a Cell is `w_cell_get`; anything else is returned as the slot.
 #[inline]
 fn unwrap_cell_slot(slot: PyObjectRef) -> PyObjectRef {
     if slot.is_null() {
         PY_NULL
-    } else {
+    } else if unsafe { pyre_object::is_cell(slot) } {
         unsafe { pyre_object::w_cell_get(slot) }
+    } else {
+        slot
     }
 }
 
-/// Localsplus read: a `CO_FAST_CELL` / extra-band slot is always a Cell
-/// after `MAKE_CELL`, so the mapping stores `cell.get()`, not the Cell.
+/// Localsplus read: a `CO_FAST_CELL` / extra-band slot goes through
+/// [`unwrap_cell_slot`]. The kind bit alone does not mean the slot holds
+/// a Cell: `framelocalsproxy_getval` tests `PyCell_Check`.
 #[inline]
 fn unwrap_localsplus_slot(is_cell_slot: bool, slot: PyObjectRef) -> PyObjectRef {
     if is_cell_slot {
         unwrap_cell_slot(slot)
     } else {
         slot
+    }
+}
+
+/// `frameobject.c framelocalsproxy_setitem`: write through the cell only
+/// when the old value `PyCell_Check`s; otherwise store into the slot.
+fn store_localsplus_slot(
+    frame: &mut PyFrame,
+    index: usize,
+    is_cell_kind: bool,
+    value: PyObjectRef,
+) {
+    let slot = locals_w!(frame)[index];
+    if is_cell_kind && !slot.is_null() && unsafe { pyre_object::is_cell(slot) } {
+        unsafe { pyre_object::w_cell_set(slot, value) };
+    } else {
+        frame.set_locals_w(index, value);
     }
 }
 
@@ -5193,17 +5219,21 @@ impl PyFrame {
 
     /// pyframe.py resume_execute_frame, after any suspended delegate has
     /// either yielded or completed in `eval_frame_plain_with_resume`.
+    ///
+    /// CPython `gen_send_ex2` always `_PyFrame_StackPush`es the sent value
+    /// before eval, including the first resume: the frame rests on `POP_TOP`
+    /// after `RETURN_GENERATOR`, and that pop consumes it.  A later resume
+    /// after `YIELD_VALUE` uses the same push.  PyPy only pushes when
+    /// `last_instr != -1` because its first resume starts at pc 0 with no
+    /// `POP_TOP`; pyre runs CPython 3.14 bytecode, so first and later resumes
+    /// share the push.
     #[inline]
     pub fn resume_execute_frame(
         &mut self,
         w_arg_or_err: PyObjectRef,
     ) -> Result<usize, crate::PyError> {
-        if self.last_instr != -1 {
-            self.pushvalue(w_arg_or_err);
-            Ok(self.last_instr as usize + 1)
-        } else {
-            Ok(0)
-        }
+        self.pushvalue(w_arg_or_err);
+        Ok(self.next_instr())
     }
 
     /// PyPy-compatible execution entrypoint with optional inbound values.
@@ -6087,13 +6117,14 @@ impl PyFrame {
     /// `pyframe.py locals2fast` is `@jit.unroll_safe`.
     #[majit_macros::unroll_safe]
     pub fn locals2fast(&mut self, skip_free_vars: bool) -> Result<(), crate::PyError> {
-        // `pyframe.py:589` binds `w_locals` once, ahead of both loops, and
-        // every `space.finditem_str` below reads that one binding.  It
-        // allocates a key per slot and dispatches a `__getitem__` that may run
-        // Python, so it can collect, and the GC transform reloads both the
-        // binding and `self` from their root slots after each such call.
-        // Reproduce that rather than retaining either pre-move Rust pointer
-        // between iterations, exactly as the `fast2locals` twin does.
+        // `pyframe.py locals2fast` binds `w_locals` once, fills
+        // `new_fastlocals_w` from every varname lookup, then
+        // `setfastscope`, then the cellvars/freevars. A `__getitem__` that
+        // raises on a later name must leave the earlier fastlocals
+        // unchanged. Lookups allocate a key and may run Python, so they
+        // collect; pin each looked-up value the way
+        // `frame_locals_proxy_snapshot` pins a slot's value. A
+        // `Vec<PyObjectRef>` would not survive the next lookup.
         let frame_anchor = crate::eval::FrameAnchor::new(self);
         let w_locals = unsafe { (*frame_anchor.live()).get_w_locals() };
         if w_locals.is_null() {
@@ -6106,24 +6137,27 @@ impl PyFrame {
         let co_flags = unsafe { (*frame_anchor.live()).co_flags() };
         let numlocals = code.varnames.len();
 
+        let values_base = pyre_object::gc_roots::shadow_stack_len();
         for i in 0..numlocals {
             // FrameLocalsProxy writes do not target hidden comprehension
             // locals; they fall through to the underlying module/class
             // namespace instead (frameobject.c framelocalsproxy_getkeyindex).
             if hidden_local(code, i) {
+                let _ = locals_roots.pin_root(PY_NULL);
                 continue;
             }
             let name = &code.varnames[i];
             let w_value =
                 finditem_str_object(locals_roots.get(locals_slot), name)?.unwrap_or(PY_NULL);
-            let frame = unsafe { &mut *frame_anchor.live() };
-            let slot = locals_w!(frame)[i];
-            let is_cell_slot = cell_slot(code, i);
-            if is_cell_slot && !slot.is_null() {
-                unsafe { pyre_object::w_cell_set(slot, w_value) };
-            } else {
-                frame.set_locals_w(i, w_value);
+            let _ = locals_roots.pin_root(w_value);
+        }
+        for i in 0..numlocals {
+            if hidden_local(code, i) {
+                continue;
             }
+            let w_value = locals_roots.get(values_base + i);
+            let frame = unsafe { &mut *frame_anchor.live() };
+            store_localsplus_slot(frame, i, cell_slot(code, i), w_value);
         }
 
         // Same positional band as `fast2locals`: a filtered `Vec` would
@@ -6148,12 +6182,7 @@ impl PyFrame {
                 let w_value =
                     finditem_str_object(locals_roots.get(locals_slot), name)?.unwrap_or(PY_NULL);
                 let frame = unsafe { &mut *frame_anchor.live() };
-                let slot = locals_w!(frame)[idx];
-                if !slot.is_null() {
-                    unsafe { pyre_object::w_cell_set(slot, w_value) };
-                } else {
-                    frame.set_locals_w(idx, w_value);
-                }
+                store_localsplus_slot(frame, idx, true, w_value);
             }
         }
         Ok(())
@@ -6647,11 +6676,13 @@ impl PyFrame {
     /// `pycode.py` `PyCode.co_flags` — the compiler flag word
     /// (`astcompiler/consts.py` `CO_*` bits). `CodeFlags` is
     /// `repr(transparent)` over that `u32`; `bits()` is the word.
-    /// `code_flags_method` lowers the foreign `bitflags` body to a Deref
-    /// of `&self`, so this stays the idiomatic source spelling.
+    /// `pyframe.py` `_is_generator_or_coroutine` reads
+    /// `self.getcode().co_flags`; `getcode` is
+    /// `hint(self.pycode, promote=True)`. `code_flags_method` lowers the
+    /// foreign `bitflags` body to a Deref of `&self`.
     #[inline]
     pub fn co_flags(&self) -> u32 {
-        self.code().flags.bits()
+        self.getcode().flags.bits()
     }
 
     #[inline]
@@ -6662,6 +6693,63 @@ impl PyFrame {
                 | crate::astcompiler::consts::CO_COROUTINE
                 | crate::astcompiler::consts::CO_ASYNC_GENERATOR)
             != 0
+    }
+
+    /// Run the compiler-inserted generator prefix (`COPY_FREE_VARS`,
+    /// `MAKE_CELL`, …) before the generator object is allocated.
+    ///
+    /// CPython 3.14 `insert_prefix_instructions` places those opcodes ahead of
+    /// `RETURN_GENERATOR`; `RETURN_GENERATOR` then copies the frame with
+    /// `instr_ptr` already past it (`generated_cases.c.h TARGET(RETURN_GENERATOR)`).
+    /// PyPy creates every cell in `initialize_frame_scopes` / `init_cells`
+    /// before `GeneratorIterator(frame)`. pyre wraps the frame at call time,
+    /// so this walk is what makes the cells exist on an unstarted `gi_frame`.
+    ///
+    /// The prefix handlers are the same `execute_make_cell` /
+    /// `execute_copy_free_vars` the eval loop uses. `RETURN_GENERATOR` itself
+    /// is not executed: the generator is allocated by the caller after this
+    /// returns. The frame stays at `last_instr == -1`; [`Self::next_instr`]
+    /// reports `after_return_generator_index` (the `POP_TOP`) so the first
+    /// resume starts there.
+    pub fn run_generator_prologue(&mut self) -> Result<(), crate::PyError> {
+        let Some(after_return_generator) = crate::pycode::after_return_generator_index(self.code())
+        else {
+            return Ok(());
+        };
+        let mut pc = 0usize;
+        while pc < after_return_generator {
+            let Some((instruction, op_arg)) =
+                crate::pyopcode::decode_instruction_at(self.code(), pc)
+            else {
+                break;
+            };
+            match instruction {
+                crate::bytecode::Instruction::MakeCell { .. } => {
+                    let _ = crate::pyopcode::execute_make_cell(self, instruction, op_arg)?;
+                }
+                crate::bytecode::Instruction::CopyFreeVars { .. } => {
+                    let _ = crate::pyopcode::execute_copy_free_vars(self, instruction, op_arg)?;
+                }
+                crate::bytecode::Instruction::ReturnGenerator => {
+                    // CPython copies the frame after this opcode; do not
+                    // execute it. The caller allocates the generator.
+                    break;
+                }
+                crate::bytecode::Instruction::ExtendedArg | crate::bytecode::Instruction::Cache => {
+                }
+                other => {
+                    debug_assert!(
+                        false,
+                        "unexpected opcode in generator prologue at pc {pc}: {other:?}"
+                    );
+                    return Err(crate::PyError::system_error(format!(
+                        "unexpected opcode in generator prologue at pc {pc}: {other:?}"
+                    )));
+                }
+            }
+            pc += 1;
+        }
+        Ok(())
     }
 
     /// pyframe.py initialize_as_generator
@@ -6697,12 +6785,19 @@ impl PyFrame {
     /// pyre's CPython-aligned storage. See the field comment on `last_instr`
     /// for the convention difference. PyPy `pyopcode.py:172` would read this
     /// field directly; pyre derives it because storage matches `f_lasti`.
+    ///
+    /// An unstarted generator (`last_instr == -1` with a `RETURN_GENERATOR`
+    /// prefix) rests on the instruction after that opcode — the `POP_TOP` —
+    /// matching CPython's `instr_ptr` after `TARGET(RETURN_GENERATOR)`.
+    /// Regular frames have no such prefix and still start at 0.
     #[inline]
     pub fn next_instr(&self) -> usize {
         let last = self.last_instr;
-        let base: isize = if last < 0 { 0 } else { last };
-        let step: usize = if last < 0 { 0 } else { 1 };
-        (base as usize).wrapping_add(step)
+        if last < 0 {
+            crate::pycode::after_return_generator_index(self.code()).unwrap_or(0)
+        } else {
+            last as usize + 1
+        }
     }
 
     /// Inverse of `next_instr()`. Stores `next_instr - 1` so the field
@@ -7744,5 +7839,72 @@ x = 7
         assert!(!unsafe { pyre_object::is_cell(peek) });
         assert_eq!(unsafe { pyre_object::w_int_get_value(total) }, 0);
         assert_eq!(unsafe { pyre_object::w_int_get_value(peek) }, 39999);
+    }
+
+    /// An unstarted generator has already run `MAKE_CELL`, so a captured
+    /// argument slot holds a Cell wrapping the int. `framelocalsproxy_getval`
+    /// unwraps it and `f_locals['x']` is the int.
+    #[test]
+    fn unstarted_generator_f_locals_reads_raw_argument_before_make_cell() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let source = concat!(
+            "def gen(x):\n",
+            "    def capture():\n",
+            "        return x\n",
+            "    yield capture()\n",
+            "g = gen(42)\n",
+            "got = g.gi_frame.f_locals['x']\n",
+        );
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = super::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .unwrap_or_else(|err| panic!("exec failed: {err:?}"));
+        let w_globals = frame.get_w_globals();
+        let got = unsafe { pyre_object::w_dict_getitem_str(w_globals, "got") }.expect("got");
+        assert!(
+            !unsafe { pyre_object::is_cell(got) },
+            "unstarted generator f_locals['x'] must be the raw argument"
+        );
+        assert_eq!(unsafe { pyre_object::w_int_get_value(got) }, 42);
+    }
+
+    /// `pyframe.py locals2fast` fills `new_fastlocals_w` before storing, so a
+    /// mapping whose `__getitem__` raises on the second name leaves the first
+    /// fast local unchanged.
+    #[test]
+    fn locals2fast_getitem_error_leaves_earlier_local_unchanged() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let setup = concat!(
+            "class Boom:\n",
+            "    def __getitem__(self, key):\n",
+            "        if key == 'b':\n",
+            "            raise RuntimeError('boom')\n",
+            "        return 99\n",
+            "m = Boom()\n",
+        );
+        let setup_code = crate::compile_exec(setup).expect("compile setup");
+        let mut setup_frame = super::PyFrame::new(setup_code);
+        setup_frame
+            .execute_frame(None, None)
+            .unwrap_or_else(|err| panic!("setup failed: {err:?}"));
+        let mapping = unsafe { pyre_object::w_dict_getitem_str(setup_frame.get_w_globals(), "m") }
+            .expect("m");
+        let roots = pyre_object::gc_roots::push_roots();
+        let map_slot = roots.base();
+        let _ = roots.pin_root(mapping);
+
+        let mut frame = nested_function_frame("def f(a, b):\n    return a\n");
+        frame.set_locals_w(0, pyre_object::w_int_new(1));
+        frame.set_locals_w(1, pyre_object::w_int_new(2));
+        let err = frame
+            .setdictscope(roots.get(map_slot))
+            .expect_err("second name must raise");
+        assert_eq!(err.kind, crate::PyErrorKind::RuntimeError);
+        let still = locals_w!(frame)[0];
+        assert!(!unsafe { pyre_object::is_cell(still) });
+        assert_eq!(unsafe { pyre_object::w_int_get_value(still) }, 1);
     }
 }

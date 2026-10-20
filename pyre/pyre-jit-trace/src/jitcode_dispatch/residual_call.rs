@@ -7770,7 +7770,7 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
         decline!("ever-mutated");
     }
     // nestedscope.py `w_res = self._elidable_get(); if w_res is not None`.
-    let contents = unsafe { pyre_object::w_cell_get(cell) };
+    let contents = unsafe { pyre_object::w_cell_elidable_get(cell) };
     if contents.is_null() {
         decline!("contents-unbound");
     }

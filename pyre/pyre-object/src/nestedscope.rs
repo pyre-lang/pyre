@@ -171,15 +171,48 @@ pub unsafe fn is_cell(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &CELL_TYPE) }
 }
 
-/// Get the value stored in a cell.
-///
-/// `nestedscope.py Cell._elidable_get` is `@jit.elidable`.
+/// `nestedscope.py Cell._elidable_get` — `@jit.elidable` plain read of
+/// `w_value`.
 ///
 /// # Safety
 /// `obj` must point to a valid `Cell`.
 #[inline]
 #[majit_macros::elidable]
+pub unsafe fn w_cell_elidable_get(obj: PyObjectRef) -> PyObjectRef {
+    unsafe { (*(obj as *const Cell)).contents }
+}
+
+/// `nestedscope.py Cell.get`:
+///
+/// ```python
+/// def get(self):
+///     if jit.isconstant(self):
+///         if not self.family.ever_mutated:
+///             w_res = self._elidable_get()
+///             if w_res is not None:
+///                 return w_res
+///     if self.w_value is None:
+///         raise ValueError("get() from an empty cell")
+///     return self.w_value
+/// ```
+///
+/// The empty-cell `ValueError` stays with `LOAD_DEREF`; this returns
+/// `PY_NULL` for an empty cell the way the previous body did. A null
+/// family is treated as mutated.
+///
+/// # Safety
+/// `obj` must point to a valid `Cell`.
+#[inline]
 pub unsafe fn w_cell_get(obj: PyObjectRef) -> PyObjectRef {
+    if majit_rlib::jit::isconstant(&obj) {
+        let family = unsafe { w_cell_family(obj) };
+        if !family.is_null() && !unsafe { (*family).ever_mutated.get() } {
+            let w_res = unsafe { w_cell_elidable_get(obj) };
+            if !w_res.is_null() {
+                return w_res;
+            }
+        }
+    }
     unsafe { (*(obj as *const Cell)).contents }
 }
 
@@ -324,6 +357,17 @@ mod tests {
             assert!((*dummy_family()).ever_mutated.get());
         }
         assert_eq!(dummy_family(), dummy_family());
+    }
+
+    /// `nestedscope.py Cell.get` falls through to `w_value` when the family
+    /// is already mutated; `_elidable_get` is the same field.
+    #[test]
+    fn get_matches_elidable_get_on_a_dummy_family_cell() {
+        let cell = w_cell_new(0xBEEF as PyObjectRef, dummy_family());
+        unsafe {
+            assert_eq!(w_cell_get(cell), w_cell_elidable_get(cell));
+            assert_eq!(w_cell_get(cell), 0xBEEF as PyObjectRef);
+        }
     }
 
     /// Guard against drift between the constant colocated with

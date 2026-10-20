@@ -14027,13 +14027,13 @@ impl CodeWriter {
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.
-                        // On the first resume of an already-built generator the
-                        // opcode pushes a dummy `None` for the following
-                        // `POP_TOP` and continues (`return_generator`). It is
-                        // not a suspension: the frame exit is the later
-                        // `YIELD_VALUE`. Aborting here ends a walk that started
-                        // at the code object's entry before any yielded value
-                        // exists.
+                        // Wrapped generator frames never dispatch this opcode
+                        // (`run_generator_prologue` + first resume at
+                        // `POP_TOP`). A walk that still starts at pc 0 of
+                        // generator bytecode — this codewriter, or blackhole —
+                        // keeps the dummy `None` for the following `POP_TOP`
+                        // (`return_generator`). It is not a suspension: the
+                        // frame exit is the later `YIELD_VALUE`.
                         Instruction::ReturnGenerator => {
                             push_and_bump!(pyobject_const_ref_value(pyre_object::w_none()), py_pc,);
                         }

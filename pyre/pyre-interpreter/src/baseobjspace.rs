@@ -17225,14 +17225,11 @@ fn generator_unpack_into(
             // `frame.execute_frame(w_arg_or_err)` (generator.py),
             // which feeds `w_arg_or_err` to `resume_execute_frame` —
             // pushing it onto the YIELD result slot.  unpack_into
-            // always passes `space.w_None`, both for the never-started
-            // case (frame.last_instr == -1: PyPy
-            // `resume_execute_frame` skips the push and returns
-            // `r_uint(0)`) and for every subsequent resume.  Pyre's
-            // earlier `frame.execute_frame(None, None)` skipped the
-            // push entirely, so `yield`-expressions that bind the
-            // resume value (e.g. `x = yield`) would observe stale
-            // stack on the second iteration.
+            // always passes `space.w_None`.  The first resume of an
+            // unstarted generator (`last_instr == -1`) now also pushes:
+            // the frame rests on `POP_TOP` after the wrap-time prologue,
+            // and that pop consumes the None.  Later resumes after
+            // `YIELD_VALUE` use the same push so `x = yield` sees it.
             w_generator_set_started(gen_obj());
             let result = generator_invoke_execute_frame(
                 gen_obj(),
@@ -23380,7 +23377,13 @@ pub fn generator_send_ex_body(gen_obj: PyObjectRef, w_arg: PyObjectRef, throw: u
         // resume to `frame.execute_frame(w_arg_or_err)`.  In particular,
         // `PyFrame.resume_execute_frame` handles `w_yielding_from` only after
         // the outer frame has entered the execution context.
-        let w_inputvalue = if already_started && throw == 0 {
+        // CPython `gen_send_ex2` always StackPushes the sent value, including
+        // the first resume (the frame rests on `POP_TOP`).  Pass the argument
+        // on send/`__next__` whether or not the generator has started so
+        // `resume_execute_frame` shares that push.  `throw` still injects
+        // through `operr` with no sent value, matching PyPy's
+        // `SApplicationException` arm.
+        let w_inputvalue = if throw == 0 {
             pyre_object::gc_roots::shadow_stack_get(arg_slot)
         } else {
             pyre_object::PY_NULL
@@ -23783,7 +23786,9 @@ pub struct GeneratorResume {
 /// runs.  The tests here are `_send_ex`'s and `_invoke_execute_frame`'s own:
 /// a started, unexhausted, non-running generator with a live frame parked on
 /// a `YIELD_VALUE`.  A just-started generator (`last_instr == -1`) is
-/// excluded because its resume runs the prologue rather than a suspension.
+/// excluded: the wrap-time prologue has already run and the first resume
+/// starts at `POP_TOP` via `next_instr()`, but this fast path enters at
+/// `last_instr + 1`, which would be 0 while the sentinel is still `-1`.
 ///
 /// # Safety
 /// `w_obj` must be a live object pointer.
