@@ -5610,7 +5610,7 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     }
     // `_PyErr_Display` offers the exception to the stdlib renderer before
     // reaching its own, and that renderer writes to `sys.stderr` itself.
-    if crate::error::display_through_traceback_module(value(), traceback()) {
+    if crate::error::display_through_traceback_module(value(), traceback(), pyre_object::PY_NULL) {
         return Ok(w_none());
     }
     let mut rendered = Vec::new();

@@ -453,6 +453,18 @@ fn print_onerror_exception(mut error: PyError) {
     }
     let tb_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_tb);
+    // `errors.c format_unraisable_v` installs the traceback on the exception
+    // before the hook sees it.
+    if !unsafe { pyre_object::is_none(roots.get(tb_slot)) }
+        && unsafe { pyre_object::is_exception(roots.get(value_slot)) }
+    {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_traceback(
+                roots.get(value_slot),
+                roots.get(tb_slot),
+            )
+        };
+    }
     PyError::write_unraisable_default(
         pyre_object::w_none(),
         roots.get(type_slot),

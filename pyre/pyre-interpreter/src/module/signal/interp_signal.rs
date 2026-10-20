@@ -709,6 +709,16 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
     };
     let tb_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_tb);
+    // `errors.c format_unraisable_v` installs the traceback on the exception
+    // before the hook sees it.
+    if !unsafe { pyre_object::is_none(roots.get(tb_slot)) } {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_traceback(
+                roots.get(exc_slot),
+                roots.get(tb_slot),
+            )
+        };
+    }
     crate::PyError::write_unraisable_default(
         pyre_object::w_none(),
         roots.get(type_slot),

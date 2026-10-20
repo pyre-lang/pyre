@@ -3104,24 +3104,17 @@ impl PyError {
         }
     }
 
-    /// Write WTF-8 `buf` through the live `sys.stderr`, so the text spends that
-    /// stream's codec and error handler. False for a stream that is missing,
-    /// `None` or refuses the write, leaving the caller its own descriptor sink.
-    fn write_to_sys_stderr(buf: &[u8]) -> bool {
-        let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
-            return false;
-        };
-        let stderr = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
-            Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
-            _ => return false,
-        };
+    /// Write WTF-8 `buf` through `file.write` after minting a managed `str`.
+    /// False when the stream is unusable or the write raises; that error is
+    /// cleared. This is the conversion `write_to_sys_stderr` spends.
+    fn write_bytes_to_file(file: PyObjectRef, buf: &[u8]) -> bool {
         // Every writer into the buffer emits WTF-8, filenames included.  A
         // decode failure would mean a byte none of them put there; read it the
         // way a filesystem name is read so it keeps its escape instead of
         // folding to U+FFFD, and so this sink and the fd sink agree.
         let _roots = pyre_object::gc_roots::push_roots();
         let stream_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(stderr);
+        let _ = pyre_object::gc_roots::pin_root(file);
         let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
             Some(text) => pyre_object::w_str_from_wtf8_managed(text.to_wtf8_buf()),
             None => {
@@ -3142,54 +3135,113 @@ impl PyError {
         true
     }
 
-    /// pypy/interpreter/error.py `write_unraisable_default`.
+    /// Write WTF-8 `buf` through the live `sys.stderr`, so the text spends that
+    /// stream's codec and error handler. False for a stream that is missing,
+    /// `None` or refuses the write, leaving the caller its own descriptor sink.
+    fn write_to_sys_stderr(buf: &[u8]) -> bool {
+        let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
+            return false;
+        };
+        let stderr = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
+            Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
+            _ => return false,
+        };
+        Self::write_bytes_to_file(stderr, buf)
+    }
+
+    /// `error.py write_unraisable_default`, with the `errors.c
+    /// write_unraisable_exc_file` sink: only the live `sys.stderr`. A missing
+    /// `sys` module, a missing `stderr` attribute, or a `None` stream prints
+    /// nothing, and the stream is read before any `__repr__` runs
+    /// (`errors.c write_unraisable_exc`). The header is written through
+    /// `file.write`; the exception is rendered by
+    /// `traceback._print_exception_bltin` and, if that import or call fails, by
+    /// `write_exception_from_parts` with the supplied traceback on the same
+    /// stream.
     pub fn write_unraisable_default(
         space: PyObjectRef,
         w_type: PyObjectRef,
         mut w_value: PyObjectRef,
-        mut w_tb: PyObjectRef,
+        w_tb: PyObjectRef,
         first_line: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
         extra_line: &str,
     ) {
         let _ = (space, w_type);
-        let mut first_line = if first_line.is_empty() {
-            Wtf8Buf::from_string("Exception ignored in".to_string())
-        } else {
-            first_line.to_wtf8_buf()
+        let _roots = pyre_object::gc_roots::push_roots();
+        let value_slot = _roots.base();
+        let _ = _roots.pin_root(w_value);
+        let tb_slot = value_slot + 1;
+        let _ = _roots.pin_root(w_tb);
+        let object_slot = value_slot + 2;
+        let _ = _roots.pin_root(w_object);
+
+        let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
+            return;
         };
-        // `errors.c write_unraisable_exc_file` ends the stated message here,
-        // whether or not an object follows it.
-        first_line.push_str(":");
-        if !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) } {
-            let objrepr = pyre_object::with_roots!(w_tb, w_value =>
-                unsafe { crate::display::py_repr_wtf8(w_object) }
-            )
-            .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
-            first_line.push_str(" ");
-            first_line.push_wtf8(&objrepr);
-        }
-        let extra_line = if extra_line.is_empty() {
+        let file = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
+            Ok(w) if !w.is_null() && !unsafe { pyre_object::is_none(w) } => w,
+            _ => return,
+        };
+        let file_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(file);
+
+        // `errors.c write_unraisable_exc_file` writes the message, then ": "
+        // and the object's repr, each through `file.write`, so a `__repr__`
+        // runs after the message is out. With no message and no object there
+        // is no header and the exception is the first line. `extra_line`
+        // (`error.py write_unraisable_default`) takes the place of the final
+        // newline, and with it an empty message reads "Exception ignored in".
+        let write = |piece: &[u8]| Self::write_bytes_to_file(_roots.get(file_slot), piece);
+        let w_object = _roots.get(object_slot);
+        let has_object = !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) };
+        let end = if extra_line.is_empty() {
             "\n".to_string()
         } else {
             format!("{extra_line}:\n")
         };
-        let mut buf = Vec::new();
-        // The stream takes text, and the printer spells a lone surrogate as
-        // the escape it prints elsewhere rather than folding it to U+FFFD.
-        let _ = buf.write_all(first_line.as_bytes());
-        if !extra_line.is_empty() {
-            let _ = write!(&mut buf, "{extra_line}");
-        }
-        if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
-            if !w_tb.is_null() && !unsafe { pyre_object::is_none(w_tb) } {
-                unsafe { pyre_object::interp_exceptions::w_exception_set_traceback(w_value, w_tb) };
+        if has_object {
+            let lead = if first_line.is_empty() {
+                write(b"Exception ignored in: ")
+            } else {
+                write(first_line.as_bytes()) && write(b": ")
+            };
+            if !lead {
+                return;
             }
-            let err = unsafe { PyError::from_exc_object(w_value) };
-            let _ = write_exception(&mut buf, &err, true);
+            let objrepr = unsafe { crate::display::py_repr_wtf8(_roots.get(object_slot)) }
+                .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
+            if !write(objrepr.as_bytes()) || !write(end.as_bytes()) {
+                return;
+            }
+        } else if !first_line.is_empty() || !extra_line.is_empty() {
+            let msg: &[u8] = if first_line.is_empty() {
+                b"Exception ignored in"
+            } else {
+                first_line.as_bytes()
+            };
+            if !write(msg) || !write(format!(":{end}").as_bytes()) {
+                return;
+            }
         }
-        if !Self::write_to_sys_stderr(&buf) {
-            emit_report_to_host_stderr(&buf);
+
+        w_value = _roots.get(value_slot);
+        if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
+            // The printer reads the traceback resident on the exception; the
+            // callers standing for `errors.c format_unraisable_v` install
+            // theirs before reaching here, and the default hook does not.
+            if display_through_traceback_module(
+                _roots.get(value_slot),
+                pyre_object::PY_NULL,
+                _roots.get(file_slot),
+            ) {
+                return;
+            }
+            // The fallback prints the traceback it was handed.
+            let mut buf = Vec::new();
+            let _ =
+                write_exception_from_parts(&mut buf, _roots.get(value_slot), _roots.get(tb_slot));
+            let _ = Self::write_bytes_to_file(_roots.get(file_slot), &buf);
         }
     }
 
@@ -3496,7 +3548,15 @@ pub fn write_exception<W: Write>(
 /// The traceback is installed on the exception first because that is the only
 /// place the stdlib renderer looks for it; [`write_exception_from_parts`]
 /// performs the same install, and doing it twice writes the slot once.
-pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObjectRef) -> bool {
+///
+/// A null `file` is the one-argument call of `_PyErr_Display`; a stream is
+/// passed on as the second argument, as `errors.c write_unraisable_exc_file`
+/// does with the `sys.stderr` it already wrote the header to.
+pub fn display_through_traceback_module(
+    exc_value: PyObjectRef,
+    exc_tb: PyObjectRef,
+    file: PyObjectRef,
+) -> bool {
     if exc_value.is_null() || !unsafe { pyre_object::is_exception(exc_value) } {
         return false;
     }
@@ -3512,6 +3572,8 @@ pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObject
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc_value);
+    let file_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(file);
     if !exc_tb.is_null()
         && !unsafe { pyre_object::is_none(exc_tb) }
         && unsafe { crate::pytraceback::is_pytraceback(exc_tb) }
@@ -3552,9 +3614,16 @@ pub fn display_through_traceback_module(exc_value: PyObjectRef, exc_tb: PyObject
     }
     let printer_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(printer);
+    let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    let file = pyre_object::gc_roots::shadow_stack_get(file_slot);
+    let args: &[PyObjectRef] = if file.is_null() {
+        &[exc_value]
+    } else {
+        &[exc_value, file]
+    };
     let result = crate::baseobjspace::call_function(
         pyre_object::gc_roots::shadow_stack_get(printer_slot),
-        &[pyre_object::gc_roots::shadow_stack_get(exc_slot)],
+        args,
     );
     if result.is_null() {
         let _ = crate::call::take_call_error();
