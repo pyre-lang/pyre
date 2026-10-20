@@ -1052,6 +1052,12 @@ fn rewire_one_from_size_align_expect_site(
 /// to SSA), so nothing materializes a real `Layout`.  `result` is a fresh var
 /// for the `.ok()` `Some` payload, or the reused `from_size_align` result var
 /// for the by-value `.expect()` shape.
+///
+/// The ctor is a named-struct marker (`is_struct: true`) so the existing
+/// niladic-struct path (`scalar_replace_named_struct_aggregates`, then
+/// `jtransform` `OpKind::New`) can allocate a GC Layout when the value
+/// escapes, the same `malloc(GcStruct)` + `setfield` shape `rtyper` emits
+/// for a by-value aggregate.
 pub(crate) fn build_layout_aggregate(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -1062,11 +1068,7 @@ pub(crate) fn build_layout_aggregate(
 ) {
     let mut owner_path = crate::model::split_qualified_path(layout_owner);
     let ctor_name = owner_path.pop().unwrap_or_default();
-    let ctor_target = if owner_path.is_empty() {
-        CallTarget::synthetic_transparent_ctor(ctor_name)
-    } else {
-        CallTarget::synthetic_transparent_ctor_with_owner(owner_path, ctor_name)
-    };
+    let ctor_target = CallTarget::synthetic_transparent_struct_ctor(owner_path, ctor_name);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(result.clone()),
         kind: OpKind::Call {

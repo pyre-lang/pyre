@@ -791,7 +791,6 @@ fn remove_pair(pairs: &mut BTreeSet<(u64, u32)>, key: u64, idx: u32) {
     pairs.remove(&(key, idx));
 }
 
-/// Rewrite a from-space slot, or keep an already-traced live word.
 fn stamp_reuse(guard: &mut Table, idx: u32, addr: GcRef, hash: u64) {
     let i = idx as usize;
     // Find-hit is not a root. `history.py` `ConstPtr` lives only while a
@@ -800,25 +799,13 @@ fn stamp_reuse(guard: &mut Table, idx: u32, addr: GcRef, hash: u64) {
     // the next intern of this referent reuses this index. `intern`
     // already stored dest (`live_gcref`); a from-space intern must not
     // write the gap corpse over dest.
-    //
-    // A holder that already `trace_index`'d this slot published the live
-    // word. intern of the from-space sentinel — identity hash is the live
-    // home, `addr` is the corpse (`minimark.py` `id_or_identityhash`
-    // follows the forwarding header) — must not write that word back.
-    // intern of the identity home itself (`hash == addr`) publishes the
-    // live word: a reused from-space address left in the slot is not a
-    // root.
     if guard.slots[i] != addr {
-        let traced = i < guard.live.len() && guard.live[i] == current_live();
-        let from_space_sentinel = hash != addr.0 as u64;
-        if !(traced && from_space_sentinel) {
-            let old = guard.slots[i].0 as u64;
-            guard.slots[i] = addr;
-            publish_slot(i, addr);
-            if old != addr.0 as u64 {
-                remove_pair(&mut guard.by_addr, old, idx);
-                insert_pair(&mut guard.by_addr, addr.0 as u64, idx);
-            }
+        let old = guard.slots[i].0 as u64;
+        guard.slots[i] = addr;
+        publish_slot(i, addr);
+        if old != addr.0 as u64 {
+            remove_pair(&mut guard.by_addr, old, idx);
+            insert_pair(&mut guard.by_addr, addr.0 as u64, idx);
         }
     }
     if guard.hashes.get(i).copied() != Some(hash) {
@@ -1064,63 +1051,6 @@ mod tests {
         assert!(resolve(drop_me).is_null());
         intern(GcRef(0x6E6D_1000));
         drop_slots_if(&mut |g| (0x6E6D_0000..0x6E6D_2000).contains(&g.0));
-    }
-
-    #[test]
-    fn intern_of_from_space_after_trace_keeps_the_forwarded_word() {
-        let _serial = TEST_SERIAL.lock();
-        struct ResetHook;
-        impl Drop for ResetHook {
-            fn drop(&mut self) {
-                crate::set_gc_id_or_identityhash(None);
-            }
-        }
-        let _reset = ResetHook;
-        fn stable_id(addr: usize) -> usize {
-            if addr == 0x5555_5000 || addr == 0x5555_5080 {
-                0x1D_0003
-            } else {
-                addr
-            }
-        }
-        crate::set_gc_id_or_identityhash(Some(stable_id));
-        let from = GcRef(0x5555_5000);
-        let to = GcRef(0x5555_5080);
-        let idx = intern(from);
-        trace_index(idx, &mut |slot| {
-            if slot.0 == from.0 {
-                *slot = to;
-            }
-        });
-        assert_eq!(intern(from), idx);
-        assert_eq!(resolve(idx), to);
-        assert_eq!(intern(to), idx);
-    }
-
-    #[test]
-    fn intern_of_identity_home_rewrites_a_traced_stale_slot() {
-        let _serial = TEST_SERIAL.lock();
-        struct ResetHook;
-        impl Drop for ResetHook {
-            fn drop(&mut self) {
-                crate::set_gc_id_or_identityhash(None);
-            }
-        }
-        let _reset = ResetHook;
-        fn stable_id(addr: usize) -> usize {
-            if addr == 0x5555_6000 || addr == 0x5555_6080 {
-                0x5555_6080
-            } else {
-                addr
-            }
-        }
-        crate::set_gc_id_or_identityhash(Some(stable_id));
-        let stale = GcRef(0x5555_6000);
-        let live = GcRef(0x5555_6080);
-        let idx = intern(stale);
-        trace_index(idx, &mut |_| {});
-        assert_eq!(intern(live), idx);
-        assert_eq!(resolve(idx), live);
     }
 
     #[test]

@@ -2326,6 +2326,7 @@ fn collect_unsigned_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64
 /// `stamp_value_kind_from_value_type` does not invent a Ref.
 fn declared_result_concrete_type(
     kind: &OpKind,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<crate::codewriter::type_state::ConcreteType> {
     use crate::codewriter::type_state::ConcreteType;
     let ty = match kind {
@@ -2361,15 +2362,44 @@ fn declared_result_concrete_type(
         _ => return None,
     };
     match ty {
-        ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
+        ValueType::Int | ValueType::Unsigned | ValueType::State => Some(ConcreteType::Signed),
+        ValueType::Ref(Some(name))
+            if crate::front::llbc_hints::alloc_flavor_raw_contains(
+                raw_alloc_flavor_structs,
+                name,
+            ) =>
+        {
             Some(ConcreteType::Signed)
         }
-        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => Some(ConcreteType::GcRef),
+        // Generic Ref/Str already default to `'r'`. Stamping OBJECTPTR
+        // would make an untyped dest `_is_rclass_instance`. Bool is
+        // stamped as `lltype.Bool` in `stamp_unknown_results_from_declared_ty`
+        // so a True rename still matches a Bool `llexitcase`.
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder | ValueType::Bool => None,
         ValueType::Float => Some(ConcreteType::Float),
         ValueType::Void => Some(ConcreteType::Void),
         ValueType::Unknown | ValueType::Int128 | ValueType::UInt128 | ValueType::SingleFloat => {
             None
         }
+    }
+}
+
+fn op_declared_bool(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::LoadStatic { ty, .. } => *ty == ValueType::Bool,
+        OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. }
+        | OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. } => *result_ty == ValueType::Bool,
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. } => *item_ty == ValueType::Bool,
+        OpKind::ConstBool(_) => true,
+        _ => false,
     }
 }
 
@@ -2391,8 +2421,14 @@ fn link_arg_concrete_type(arg: &LinkArg) -> crate::codewriter::type_state::Concr
 /// `getkind`. The frontend leaves dests `Unknown` even when `ty` is Int
 /// (`W_BytesIO.pos`), so `get_value_kind_var` defaults to `'r'` and
 /// `p + count` becomes `ll_strconcat`. Stamp Unknown dests from the
-/// declared ty, then phis that join a single non-Unknown kind.
-fn stamp_unknown_results_from_declared_ty(graph: &FunctionGraph) {
+/// declared scalar ty, then phis that join a single Signed/Float/Void
+/// kind. A GcRef join is left Unknown: `getkind` already defaults to
+/// `'r'`, and publishing OBJECTPTR would make a later-block phi
+/// `_is_rclass_instance` against a rtyper-precise non-instance dest.
+fn stamp_unknown_results_from_declared_ty(
+    graph: &FunctionGraph,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) {
     use crate::codewriter::type_state::ConcreteType;
     for block in &graph.blocks {
         for op in &block.operations {
@@ -2416,7 +2452,13 @@ fn stamp_unknown_results_from_declared_ty(graph: &FunctionGraph) {
             if FunctionGraph::concretetype_of(result) != ConcreteType::Unknown {
                 continue;
             }
-            let Some(ct) = declared_result_concrete_type(&op.kind) else {
+            if op_declared_bool(&op.kind) {
+                result.set_concretetype(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                ));
+                continue;
+            }
+            let Some(ct) = declared_result_concrete_type(&op.kind, raw_alloc_flavor_structs) else {
                 continue;
             };
             FunctionGraph::set_concretetype_of_inline(result, ct);
@@ -2463,8 +2505,13 @@ fn stamp_unknown_results_from_declared_ty(graph: &FunctionGraph) {
                     }
                 }
                 if ok && let Some(kind) = agreed {
-                    FunctionGraph::set_concretetype_of_inline(arg, kind);
-                    grew = true;
+                    if matches!(
+                        kind,
+                        ConcreteType::Signed | ConcreteType::Float | ConcreteType::Void
+                    ) {
+                        FunctionGraph::set_concretetype_of_inline(arg, kind);
+                        grew = true;
+                    }
                 }
             }
         }
@@ -3653,7 +3700,14 @@ impl<'a> Transformer<'a> {
         // `jtransform.py getkind(v.concretetype)`: rtyper has already
         // written dest kinds. Stamp leftover Unknown dests from the
         // frontend ty so later blocks' `p + count` sees Signed, not Ref.
-        stamp_unknown_results_from_declared_ty(&rewritten);
+        {
+            let empty_raw = std::collections::HashSet::new();
+            if let Some(cc) = self.callcontrol.as_ref() {
+                stamp_unknown_results_from_declared_ty(&rewritten, &cc.raw_alloc_flavor_structs);
+            } else {
+                stamp_unknown_results_from_declared_ty(&rewritten, &empty_raw);
+            }
+        }
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -4468,6 +4522,14 @@ impl<'a> Transformer<'a> {
     /// `transform_graph` has `callcontrol is None` (`jtransform.py
     /// Transformer.get_vinfo`), so [`Self::flavor_raw_ref_is_int_banked`]
     /// cannot see the harvest; the lltype is the same fact.
+    ///
+    /// `field_owner_is_gc` defaults an undeclared owner to gc
+    /// (`getattr(STRUCT, '_gckind', 'gc')`). An isolated Int base is
+    /// already `getfield_raw_*`; that default would keep a host ADT
+    /// in the ref bank and emit `getfield_raw_r`, which
+    /// `jtransform.py rewrite_op_getfield` refuses. A recorded GC
+    /// owner (`FieldDescriptor.owner_declared_gc` or a `CallControl`
+    /// layout) stays Ref.
     fn gc_pointer_field_stays_ref(
         &self,
         field: &FieldDescriptor,
@@ -4477,10 +4539,17 @@ impl<'a> Transformer<'a> {
         if result.is_some_and(result_lltype_is_raw_ptr) {
             return false;
         }
-        matches!(
+        if !matches!(
             ty,
             ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
-        ) && !self.flavor_raw_ref_is_int_banked(ty)
+        ) || self.flavor_raw_ref_is_int_banked(ty)
+        {
+            return false;
+        }
+        if field.owner_declared_gc == Some(true) {
+            return true;
+        }
+        self.callcontrol.is_some()
             && crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
     }
 
@@ -5515,11 +5584,22 @@ impl<'a> Transformer<'a> {
                 rewrite_fixed_newlist(graph, op, args, self.callcontrol.as_deref())
             }
             // `rewrite_op_malloc`: flavor `'raw'` residualizes
-            // `raw_malloc_fixedsize`; a GC STRUCT whose first-field chain
-            // reaches a typeptr header is `new_with_vtable`. scalar_replace
-            // may have already emitted `New` before this pass sees the
-            // constructor.
+            // `raw_malloc_fixedsize` (`_rewrite_raw_malloc`); a raw Ptr is
+            // Int and never becomes `new(descr)`. A GC STRUCT whose
+            // first-field chain reaches a typeptr header is
+            // `new_with_vtable`. scalar_replace may have already emitted
+            // `New` before this pass sees the constructor.
             OpKind::New { owner } => {
+                if self.callcontrol.as_deref().is_some_and(|cc| {
+                    crate::front::llbc_hints::alloc_flavor_raw_contains(
+                        &cc.raw_alloc_flavor_structs,
+                        owner,
+                    )
+                }) {
+                    return self.rewrite_raw_malloc_fixedsize_owner(
+                        op, graph_name, graph, owner, false, false, true,
+                    );
+                }
                 let has_vtable = self.callcontrol.as_deref().is_some_and(|cc| {
                     crate::codewriter::heaptracker::callcontrol_has_vtable(cc, owner)
                 });
@@ -7584,6 +7664,141 @@ impl<'a> Transformer<'a> {
     /// `rewrite_op_malloc_varsize` passes the item count as
     /// `raw_malloc_varsize` (`[op.args[2]]`). `TYPE.OF == lltype.Char`
     /// takes `OS_RAW_MALLOC_VARSIZE_CHAR` and `EF_CAN_RAISE`.
+    /// Residual `ll_raw_malloc_fixedsize*` via `_handle_oopspec_call`
+    /// (`jtransform.py _rewrite_raw_malloc` → `rewrite_op_direct_call`).
+    /// `size` is already a Signed SSA value; the caller emits any
+    /// `ConstInt` that defines it.
+    fn rewrite_ll_raw_malloc_call(
+        &mut self,
+        op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+        size_var: crate::flowspace::model::Variable,
+        zero: bool,
+        add_memory_pressure: bool,
+        track_allocation: bool,
+    ) -> RewriteResult {
+        let leaf = raw_malloc_fixedsize_helper_leaf(zero, add_memory_pressure, track_allocation);
+        let target = CallTarget::function_path(["majit_rlib", "rffi", leaf]);
+        // `_rewrite_raw_malloc` returns the raw `Ptr` (an Address, kind
+        // `'i'`). The residual call's result is this op's own result
+        // Variable, typed Signed. `handle_residual_call` stamps that
+        // from `result_ty: Int`. A frontend SSA that still arrives in
+        // the ref bank is a typing defect at emission.
+        let call = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![LinkArg::Value(size_var.clone())],
+                result_ty: ValueType::Int,
+            },
+        };
+        match self._handle_oopspec_call(
+            graph,
+            &call,
+            &target,
+            std::slice::from_ref(&size_var),
+            &ValueType::Int,
+            graph_name,
+            OopSpecIndex::None,
+            None,
+            None,
+        ) {
+            RewriteResult::Replace(ops) => RewriteResult::Replace(ops),
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) | RewriteResult::Keep => {
+                panic!("ll_raw_malloc residual of {target} did not rewrite to a direct call")
+            }
+        }
+    }
+
+    /// Constant-size form of [`Self::rewrite_ll_raw_malloc_call`].
+    /// Without CallControl the oopspec residual cannot be built; leave
+    /// the original op (unit tests construct graphs without one).
+    fn rewrite_raw_malloc_const_size(
+        &mut self,
+        op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+        size: i64,
+        zero: bool,
+        add_memory_pressure: bool,
+        track_allocation: bool,
+    ) -> RewriteResult {
+        if self.callcontrol.is_none() {
+            return RewriteResult::Keep;
+        }
+        let size_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        match self.rewrite_ll_raw_malloc_call(
+            op,
+            graph_name,
+            graph,
+            size_var.clone(),
+            zero,
+            add_memory_pressure,
+            track_allocation,
+        ) {
+            RewriteResult::Replace(mut ops) => {
+                ops.insert(
+                    0,
+                    SpaceOperation {
+                        result: Some(size_var),
+                        kind: OpKind::ConstInt(size),
+                    },
+                );
+                RewriteResult::Replace(ops)
+            }
+            other => other,
+        }
+    }
+
+    /// `std::alloc::alloc_zeroed(layout)`: `getfield` of `layout.size`
+    /// (`__pos_0` of the GC Layout aggregate) and residualize
+    /// `ll_raw_malloc_fixedsize_zero`. `raw_malloc` never returns null.
+    fn rewrite_alloc_zeroed_from_layout(
+        &mut self,
+        op: &SpaceOperation,
+        layout: &crate::flowspace::model::Variable,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        if self.callcontrol.is_none() {
+            return RewriteResult::Keep;
+        }
+        let owner = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|seen| match &seen.kind {
+                OpKind::FieldWrite { base, field, .. } | OpKind::FieldRead { base, field, .. }
+                    if base == layout =>
+                {
+                    field.owner_root.clone()
+                }
+                _ => None,
+            });
+        let size =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        let mut ops = vec![SpaceOperation {
+            result: Some(size.clone()),
+            kind: OpKind::FieldRead {
+                base: layout.clone(),
+                field: FieldDescriptor::new("__pos_0", owner),
+                ty: ValueType::Unsigned,
+                pure: true,
+            },
+        }];
+        match self.rewrite_ll_raw_malloc_call(op, graph_name, graph, size, true, false, true) {
+            RewriteResult::Replace(call_ops) => {
+                ops.extend(call_ops);
+                RewriteResult::Replace(ops)
+            }
+            other => other,
+        }
+    }
+
     fn rewrite_op_raw_malloc(
         &mut self,
         op: &SpaceOperation,
@@ -7637,6 +7852,30 @@ impl<'a> Transformer<'a> {
                 n,
             );
         }
+        self.rewrite_raw_malloc_fixedsize_owner(
+            op,
+            graph_name,
+            graph,
+            owner,
+            zero,
+            add_memory_pressure,
+            track_allocation,
+        )
+    }
+
+    /// Fixed-size flavor-raw of `owner`. `New` / niladic struct ctor sites
+    /// pass the owner explicitly; `rewrite_op_raw_malloc` passes the flags
+    /// `_rewrite_raw_malloc` popped.
+    fn rewrite_raw_malloc_fixedsize_owner(
+        &mut self,
+        op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+        owner: &str,
+        zero: bool,
+        add_memory_pressure: bool,
+        track_allocation: bool,
+    ) -> RewriteResult {
         let layout = {
             let cc = self.callcontrol.as_deref().unwrap_or_else(|| {
                 panic!(
@@ -7663,46 +7902,15 @@ impl<'a> Transformer<'a> {
             op.result.is_some(),
             "raw malloc of {owner} has no result variable"
         );
-        let leaf = raw_malloc_fixedsize_helper_leaf(zero, add_memory_pressure, track_allocation);
-        let target = CallTarget::function_path(["majit_rlib", "rffi", leaf]);
-        let size_var = self.fresh_synthetic_variable_typed(
-            graph,
-            crate::codewriter::type_state::ConcreteType::Signed,
-        );
-        let call = SpaceOperation {
-            result: op.result.clone(),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: vec![LinkArg::Value(size_var.clone())],
-                result_ty: ValueType::Int,
-            },
-        };
-        let rewritten = self._handle_oopspec_call(
-            graph,
-            &call,
-            &target,
-            std::slice::from_ref(&size_var),
-            &ValueType::Int,
+        self.rewrite_raw_malloc_const_size(
+            op,
             graph_name,
-            OopSpecIndex::None,
-            None,
-            None,
-        );
-        match rewritten {
-            RewriteResult::Replace(mut ops) => {
-                ops.insert(
-                    0,
-                    SpaceOperation {
-                        result: Some(size_var),
-                        kind: OpKind::ConstInt(size as i64),
-                    },
-                );
-                RewriteResult::Replace(ops)
-            }
-            RewriteResult::Identity(_) | RewriteResult::Constant(_) | RewriteResult::Keep => {
-                panic!("raw malloc residual of {owner} did not rewrite to a direct call")
-            }
-        }
+            graph,
+            size as i64,
+            zero,
+            add_memory_pressure,
+            track_allocation,
+        )
     }
 
     /// `jtransform.py _rewrite_raw_malloc(op, 'raw_malloc_varsize', [n])`.
@@ -10201,9 +10409,9 @@ impl<'a> Transformer<'a> {
         // `jtransform.py rewrite_op_getfield`: a raw STRUCT with
         // `(kind, pure) == ('r', '')` raises. The assembler keys raw vs gc
         // off the *base register* (`is_gc = kc == 'r'`), not the owner's
-        // recorded gckind. When that base is already Int, stamp the loaded
-        // word into the int bank so assemble emits `getfield_raw_i`.
-        // Immutable fields already returned `_pure` above
+        // recorded gckind. A host ADT sitting in a raw STRUCT is an int
+        // word, the same crossing `split_raw_ref_array_access` already
+        // does. Immutable fields already returned `_pure` above
         // (`MapNodeTerminatorView.w_cls`).
         //
         // A GC owner with a Signed base is not that raw-struct arm:
@@ -10222,11 +10430,15 @@ impl<'a> Transformer<'a> {
             if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref()) {
                 self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
             } else {
+                let base = base.clone();
+                if let Some(split) = self.split_raw_ref_field_access(op, graph) {
+                    return split;
+                }
                 self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
                 return RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
                     kind: OpKind::FieldRead {
-                        base: base.clone(),
+                        base,
                         field: field.clone(),
                         ty: ValueType::Int,
                         pure: false,
@@ -10449,6 +10661,13 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
+        // `jtransform.py rewrite_op_setfield`: `if argname == 'raw' and
+        // kind == 'r': raise Exception("setfield_raw_r not supported")`.
+        // A host ADT stored in a raw STRUCT is an int word, not a GC
+        // pointer — the field analog of `split_raw_ref_array_access`.
+        if let Some(split) = self.split_raw_ref_field_access(op, graph) {
+            return split;
+        }
         if &typed_ty != ty {
             let base_var = match &op.kind {
                 OpKind::FieldWrite { base, .. } => base.clone(),
@@ -10475,6 +10694,130 @@ impl<'a> Transformer<'a> {
             segments.last().map(String::as_str),
             Some("items_block_items_base" | "items_block_items_ptr")
         )
+    }
+
+    /// A reference field of a raw (`Int`-based) STRUCT crosses as a word.
+    ///
+    /// `jtransform.py rewrite_op_getfield` / `rewrite_op_setfield` refuse
+    /// `getfield_raw_r` (without `_pure`) and `setfield_raw_r`: a raw
+    /// STRUCT has no GC-reference fields. A host ADT stored in one (the
+    /// `Mutex` inside flavor-raw `QuasiImmutLock`) is the same shape as a
+    /// reference item of a raw `Vec` buffer — an untraced word — so the
+    /// field is loaded as a word and cast with `cast_int_to_ptr`, or cast
+    /// with `cast_ptr_to_int` and stored as one.
+    fn split_raw_ref_field_access(
+        &mut self,
+        op: &SpaceOperation,
+        graph: &mut crate::model::FunctionGraph,
+    ) -> Option<RewriteResult> {
+        use crate::codewriter::type_state::ConcreteType;
+        match &op.kind {
+            OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+            } => {
+                // `Vec` header words (`buf`/`len`/`cap`) are already int;
+                // `rewrite_op_getsubstruct` leaves the interior address in
+                // the int bank and the subsequent word read stays a field.
+                if field.vec_part.is_some() {
+                    return None;
+                }
+                let result = op.result.as_ref()?;
+                if self.get_value_kind_var(base) != 'i' {
+                    return None;
+                }
+                let typed_ty = self.get_value_type(result).unwrap_or_else(|| ty.clone());
+                if !matches!(typed_ty, ValueType::Ref(_)) || self.get_value_kind_var(result) != 'r'
+                {
+                    return None;
+                }
+                if self.cast_int_to_ptr_is_int_identity(&typed_ty, Some(result))
+                    || self.flavor_raw_ref_is_int_banked(ty)
+                {
+                    self.stamp_int_banked_cast_int_to_ptr_result(graph, Some(result.clone()));
+                    return Some(RewriteResult::Replace(vec![SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::FieldRead {
+                            base: base.clone(),
+                            field: field.clone(),
+                            ty: ValueType::Int,
+                            pure: *pure,
+                        },
+                    }]));
+                }
+                let word = graph.alloc_value_var_with_type(ConcreteType::Signed);
+                Some(RewriteResult::Replace(vec![
+                    SpaceOperation {
+                        result: Some(word.clone()),
+                        kind: OpKind::FieldRead {
+                            base: base.clone(),
+                            field: field.clone(),
+                            ty: ValueType::Int,
+                            pure: *pure,
+                        },
+                    },
+                    SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::UnaryOp {
+                            op: "cast_int_to_ptr".into(),
+                            operand: word,
+                            result_ty: typed_ty,
+                        },
+                    },
+                ]))
+            }
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: crate::model::LinkArg::Value(value),
+                ty,
+            } => {
+                if field.vec_part.is_some() {
+                    return None;
+                }
+                if self.get_value_kind_var(base) != 'i' || self.get_value_kind_var(value) != 'r' {
+                    return None;
+                }
+                let typed_ty = self.get_value_type(value).unwrap_or_else(|| ty.clone());
+                if self.flavor_raw_ref_is_int_banked(&typed_ty)
+                    || self.flavor_raw_ref_is_int_banked(ty)
+                {
+                    self.stamp_int_banked_cast_int_to_ptr_result(graph, Some(value.clone()));
+                    return Some(RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: base.clone(),
+                            field: field.clone(),
+                            value: crate::model::LinkArg::Value(value.clone()),
+                            ty: ValueType::Int,
+                        },
+                    }]));
+                }
+                let word = graph.alloc_value_var_with_type(ConcreteType::Signed);
+                Some(RewriteResult::Replace(vec![
+                    SpaceOperation {
+                        result: Some(word.clone()),
+                        kind: OpKind::UnaryOp {
+                            op: "cast_ptr_to_int".into(),
+                            operand: value.clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    },
+                    SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: base.clone(),
+                            field: field.clone(),
+                            value: crate::model::LinkArg::Value(word),
+                            ty: ValueType::Int,
+                        },
+                    },
+                ]))
+            }
+            _ => None,
+        }
     }
 
     /// A reference item of a raw (`Int`-based) array crosses as a word.
@@ -11269,6 +11612,18 @@ impl<'a> Transformer<'a> {
                 }
                 return rewritten;
             }
+            // Leftover `<*T>::add` / `wrapping_add` the front did not
+            // intercept (`entry_at` returns the interior pointer, so
+            // `try_lower_struct_field_ptr_add` declines). Route through
+            // `rewrite_op_direct_ptradd`. No `TO.OF` → Keep, residualize;
+            // do not abort the leftover add (`reject_unresolved_call`
+            // LeaveFrame leaves the lookup dest unset).
+            if is_ptr_add_path(segments) && args.len() == 2 {
+                let rewritten = self.rewrite_op_direct_ptradd(op, args, result_ty, graph);
+                if !matches!(rewritten, RewriteResult::Keep) {
+                    return rewritten;
+                }
+            }
             // `rbuiltin.py rtype_cast_int_to_ptr`: drop the Void PTRTYPE
             // constant (`hop.inputargs(lltype.Void, lltype.Signed)`) and
             // genop unary `cast_int_to_ptr` with `v_input`. The 2-arg
@@ -11413,6 +11768,14 @@ impl<'a> Transformer<'a> {
                     "convert_longlong_bytes_to_float",
                     ValueType::Float,
                 );
+            }
+            // `alloc_zeroed` leaf is unique (`cutover::is_std_alloc_raw`).
+            // The Layout argument is the GC `{size, align}` aggregate;
+            // load size (`__pos_0`) and residualize
+            // `ll_raw_malloc_fixedsize_zero` (`_rewrite_raw_malloc`
+            // with `zero=True`).
+            if args.len() == 1 && segments.last().map(String::as_str) == Some("alloc_zeroed") {
+                return self.rewrite_alloc_zeroed_from_layout(op, &args[0], graph_name, graph);
             }
         }
         // RPython `IntegerRepr.rtype_float` (`rint.py`) converts an
@@ -11798,15 +12161,27 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
-        // The two signedness markers `front::mir` emits for a same-width
-        // reinterpret.  Both coerce their input to the result's low-level type
-        // and hand it back unchanged: `rtype_intmask` to `lltype.Signed`, and
-        // `r_uint`'s `ForTypeEntry::specialize_call` to whatever
-        // `hop.r_result.lowleveltype` is, under an
-        // `exception_cannot_occur()`.  The frontend preserves the coercion as
-        // this call-shaped marker because it skips the rtyper step that would
-        // otherwise consume it, so fold both through the same identity alias
-        // used for no-op coercions (`jtransform.py::_noop_rewrite`).
+        // The signedness / width markers `front::mir` emits for a same-width
+        // reinterpret.  Each coerces its input to the result's low-level type
+        // and hands it back unchanged under `exception_cannot_occur()`:
+        // `rtype_intmask` to `lltype.Signed`, `rtype_longlongmask` to
+        // `lltype.SignedLongLong`, and `r_uint`'s
+        // `ForTypeEntry::specialize_call` to whatever
+        // `hop.r_result.lowleveltype` is.  Upstream `rbuiltin.py` has no
+        // `ulonglongmask` function; `r_ulonglong` is `build_int(..., 64)` and
+        // its `specialize_call` is that same identity.  pyre's rtyper names
+        // the coerce `rtype_ulonglongmask` (`UnsignedLongLong`).  The
+        // frontend preserves the coercion as this call-shaped marker because
+        // it skips the rtyper step that would otherwise consume it, so fold
+        // them through the same identity alias used for no-op coercions
+        // (`jtransform.py::_noop_rewrite`).
+        //
+        // `SignedLongLong` / `UnsignedLongLong` are the machine word only
+        // when the target word is 8 bytes (`layout::target_word_size`).
+        // wasm32-unknown-unknown and other `target_pointer_width = "32"`
+        // cfgs exist in the tree (`codewriter/longlong.rs` `is_64_bit`);
+        // keep the longlong-mask identity on word size 8 so a 64-bit
+        // longlong is not folded onto a 32-bit word.
         //
         // Aliasing drops the marker's Unsigned annotation. Ordered compares
         // and `rshift` recover it in `prefix_unsigned_binop` from the
@@ -11815,10 +12190,16 @@ impl<'a> Transformer<'a> {
         if let CallTarget::FunctionPath { segments, .. } = target
             && let [head @ .., leaf] = segments.as_slice()
             && head == ["rpython", "rlib", "rarithmetic"]
-            && matches!(leaf.as_str(), "intmask" | "r_uint")
             && args.len() == 1
         {
-            return RewriteResult::Identity(args[0].clone());
+            let identity = match leaf.as_str() {
+                "intmask" | "r_uint" => true,
+                "longlongmask" | "ulonglongmask" => crate::layout::target_word_size() == 8,
+                _ => false,
+            };
+            if identity {
+                return RewriteResult::Identity(args[0].clone());
+            }
         }
         // A zero-arg transparent `Tuple` constructor is the unit value `()` —
         // the MIR return-place aggregate of a `-> ()` function (e.g.
@@ -11995,6 +12376,14 @@ impl<'a> Transformer<'a> {
         // registration would publish says "no pointers" for a struct whose
         // size says otherwise, and the collector would stop tracing through it.
         // The payload-less sum variant below declines for this same reason.
+        //
+        // A `#[repr(transparent)]` struct (`TypeDecl::is_repr_transparent`)
+        // is the field value: one non-ZST operand is that word. Same repr
+        // by definition (`same_as` / Identity). A unit-like zero-arg ctor
+        // still allocates.
+        if target.is_repr_transparent_struct() && args.len() == 1 {
+            return RewriteResult::Identity(args[0].clone());
+        }
         if let CallTarget::SyntheticTransparentCtor {
             is_struct: true, ..
         } = target
@@ -12002,6 +12391,21 @@ impl<'a> Transformer<'a> {
             && let ValueType::Ref(Some(owner)) = result_ty
             && let Some(alloc_owner) = self.struct_ctor_alloc_owner(owner)
         {
+            // `jtransform.py rewrite_op_malloc`: flavor raw is
+            // `_rewrite_raw_malloc` (`ll_raw_malloc_fixedsize`), never
+            // `new(descr)`. `history.getkind` of that Ptr is `'int'`
+            // (`rclass.py getgcflavor`).
+            if self.flavor_raw_ref_is_int_banked(result_ty) {
+                return self.rewrite_raw_malloc_fixedsize_owner(
+                    op,
+                    graph_name,
+                    graph,
+                    &alloc_owner,
+                    false,
+                    false,
+                    true,
+                );
+            }
             // `jtransform.py rewrite_op_malloc`: a struct whose first-field
             // chain reaches a typeptr header is `new_with_vtable`. The
             // vtable word is `descr.get_vtable()` at runtime.
@@ -12476,21 +12880,38 @@ impl<'a> Transformer<'a> {
                         && classes.len() == call_args.len()
                     {
                         for (arg, class) in call_args.iter_mut().zip(classes.chars()) {
-                            if class != 'r' || self.get_value_kind_var(arg) != 'i' {
-                                continue;
+                            let kind = self.get_value_kind_var(arg);
+                            if class == 'r' && kind == 'i' {
+                                let casted = graph.alloc_value_var_with_type(
+                                    crate::codewriter::type_state::ConcreteType::GcRef,
+                                );
+                                ptr_retypes.push(SpaceOperation {
+                                    result: Some(casted.clone()),
+                                    kind: OpKind::UnaryOp {
+                                        op: "cast_int_to_ptr".into(),
+                                        operand: arg.clone(),
+                                        result_ty: ValueType::Ref(None),
+                                    },
+                                });
+                                *arg = casted;
+                            } else if class == 'i' && kind == 'r' {
+                                // Flavor-raw FUNC.ARGS is int (`rclass.py
+                                // getgcflavor`). A still-Ref actual is the
+                                // address word (`rbuiltin.py
+                                // rtype_cast_ptr_to_int`).
+                                let casted = graph.alloc_value_var_with_type(
+                                    crate::codewriter::type_state::ConcreteType::Signed,
+                                );
+                                ptr_retypes.push(SpaceOperation {
+                                    result: Some(casted.clone()),
+                                    kind: OpKind::UnaryOp {
+                                        op: "cast_ptr_to_int".into(),
+                                        operand: arg.clone(),
+                                        result_ty: ValueType::Int,
+                                    },
+                                });
+                                *arg = casted;
                             }
-                            let casted = graph.alloc_value_var_with_type(
-                                crate::codewriter::type_state::ConcreteType::GcRef,
-                            );
-                            ptr_retypes.push(SpaceOperation {
-                                result: Some(casted.clone()),
-                                kind: OpKind::UnaryOp {
-                                    op: "cast_int_to_ptr".into(),
-                                    operand: arg.clone(),
-                                    result_ty: ValueType::Ref(None),
-                                },
-                            });
-                            *arg = casted;
                         }
                     }
                     let non_void_args = resolve_non_void_arg_types_from_vars(&call_args);
@@ -15181,40 +15602,14 @@ impl<'a> Transformer<'a> {
         // qualified key (in `call.rs`) and leaves the shell body-less in
         // `drain_pending_graphs`.
         let jitcode = if let Some(cc) = self.callcontrol.as_mut() {
-            // Same graph identity `declared_result_type_for_target` reads
-            // FUNC.RESULT from: crate-stripped funcobj, `__fn_const` strip,
-            // Method-name fallback. Spelled `target_to_path` alone would
-            // mint a second shell whose dest kind is the front Ref.
             let path = cc
-                .path_for_jitcode_lookup(target)
+                .target_to_path(target)
                 .unwrap_or_else(|| target_to_call_path(target));
             crate::jitcode::JitCodeHandle::new(cc.get_jitcode(&path))
         } else {
             crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(crate::jitcode::JitCode::new(
                 "<missing-callcontrol>",
             )))
-        };
-        // Assembled `calldescr.result_type` is FUNC.RESULT once the
-        // header OnceLock is set (`jitcode.py` `__init__`). A first-time
-        // shell has none; the graph returnblock path in
-        // `declared_result_type_for_target` covers that. `calldescr()` on
-        // an unset lock answers the empty default `'v'`.
-        let result_ty_from_calldescr = jitcode.calldescr.get().and_then(|d| match d.result_type {
-            'i' => Some(ValueType::Int),
-            'f' => Some(ValueType::Float),
-            'v' => Some(ValueType::Void),
-            _ => None,
-        });
-        let result_ty_owned;
-        let result_ty = match (result_ty, result_ty_from_calldescr) {
-            (
-                ValueType::Ref(_),
-                Some(scalar @ (ValueType::Int | ValueType::Float | ValueType::Void)),
-            ) => {
-                result_ty_owned = scalar;
-                &result_ty_owned
-            }
-            _ => result_ty,
         };
         // RPython jtransform.py: rewrite_call(op, 'inline_call', [jitcode])
         // Split args by kind (RPython make_three_lists)
@@ -16573,14 +16968,7 @@ impl<'a> Transformer<'a> {
         if args.len() != 1 {
             return false;
         }
-        let CallTarget::SyntheticTransparentCtor {
-            name,
-            owner_path: _,
-            is_struct: _,
-            variant_tag: _,
-            payload_void: _,
-        } = target
-        else {
+        let CallTarget::SyntheticTransparentCtor { name, .. } = target else {
             return false;
         };
         // Discriminator is the leaf name: `Ok`/`Err`/`Some` are the
@@ -20556,6 +20944,7 @@ mod tests {
                 size: 24,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "ob_header".into(),
@@ -20585,6 +20974,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "ob_type".into(),
@@ -20680,6 +21070,103 @@ mod tests {
         );
     }
 
+    fn rewrite_field_read_with_layout(
+        owner: &str,
+        field_name: &str,
+        ty: ValueType,
+        result_kind: ConcreteType,
+        fields: Vec<crate::call::StructFieldLayout>,
+        size: usize,
+    ) -> RewriteResult {
+        use crate::call::{CallControl, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
+                fields,
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("field_read_layout");
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(result_kind);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new(field_name, Some(owner.into())),
+                ty,
+                pure: false,
+            },
+        };
+        transformer.rewrite_operation(&op, "field_read_layout", &mut graph)
+    }
+
+    /// A JIT-boxed payload is published as `GCREF`. `from_type_strings` /
+    /// `field_metadata` then give a one-word Pointer row, so
+    /// `inline_substruct_field_layout` does not fire Identity.
+    #[test]
+    fn boxed_gcref_payload_from_type_strings_is_not_identity() {
+        use crate::call::StructLayout;
+
+        let word = crate::layout::target_word_size();
+        let owner = "jtransform_result::Result<ObjectKey, E>::Ok";
+        let known = std::collections::HashSet::from(["ObjectKey".to_string()]);
+        let sizes = std::collections::HashMap::from([("ObjectKey".to_string(), 2 * word)]);
+        let layout = StructLayout::from_type_strings(
+            &[("__pos_0".into(), "GCREF".into())],
+            &known,
+            &sizes,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(layout.fields.len(), 1, "GCREF is not a nested struct");
+        assert_eq!(
+            layout.fields[0].flag,
+            majit_ir::descr::ArrayFlag::Pointer,
+            "GCREF payload is one pointer word"
+        );
+        assert_eq!(layout.fields[0].size, word);
+        let result = rewrite_field_read_with_layout(
+            owner,
+            "__pos_0",
+            ValueType::Ref(None),
+            ConcreteType::GcRef,
+            layout.fields,
+            layout.size,
+        );
+        match result {
+            RewriteResult::Keep => {}
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter()
+                        .any(|op| matches!(&op.kind, OpKind::FieldRead { .. })),
+                    "GCREF payload FieldRead stays a FieldRead, ops={ops:?}"
+                );
+            }
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                panic!("GCREF payload FieldRead must load the pointer, not Identity the carrier")
+            }
+        }
+    }
+
     /// `(*raw).tags.buf` reads `tags` by place, without `taken_by_address`.
     /// On a raw holder that is still `rewrite_op_getsubstruct` (`int_add`).
     /// A GC holder keeps the value read.
@@ -20697,6 +21184,7 @@ mod tests {
                     size: 32,
                     align: 8,
                     gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    repr_transparent: false,
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -20846,6 +21334,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "value".into(),
                     offset: 0,
@@ -20865,6 +21354,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "kind".into(),
                     offset: 0,
@@ -21074,6 +21564,7 @@ mod tests {
                 size: 32,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "word".into(),
@@ -21103,6 +21594,7 @@ mod tests {
                 size: 16,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "x".into(),
                     offset: field_offset,
@@ -21251,6 +21743,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "count".into(),
                     offset: 0,
@@ -21293,6 +21786,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "roots".into(),
@@ -21379,6 +21873,7 @@ mod tests {
                 size: 2 * word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "roots".into(),
                     offset: 0,
@@ -21458,6 +21953,7 @@ mod tests {
                 size: word,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![StructFieldLayout {
                     name: "cell".into(),
                     offset: 0,
@@ -21723,6 +22219,7 @@ mod tests {
                     size: 32,
                     align: 8,
                     gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    repr_transparent: false,
                     fields: vec![
                         StructFieldLayout {
                             name: "word".into(),
@@ -21915,6 +22412,7 @@ mod tests {
                 size: 32,
                 align: 8,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "word".into(),
@@ -22108,6 +22606,7 @@ mod tests {
                 size: 24,
                 align: word,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![
                     StructFieldLayout {
                         name: "cell".to_string(),
@@ -29370,6 +29869,7 @@ mod tests {
                 size: 12,
                 align: 4,
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                repr_transparent: false,
                 fields: vec![],
                 host: None,
                 ll_struct: std::cell::RefCell::new(None),
@@ -34763,6 +35263,84 @@ mod tests {
         ));
     }
 
+    /// `rpython/rtyper/rbuiltin.py`: `rtype_longlongmask` returns its
+    /// single SignedLongLong input unchanged. Upstream has no
+    /// `rarithmetic.ulonglongmask`; `r_ulonglong`'s `specialize_call` and
+    /// pyre's `rtype_ulonglongmask` are the same identity onto
+    /// UnsignedLongLong. On a 32-bit target the CALL stays.
+    #[test]
+    fn rarithmetic_longlong_masks_elide_only_the_exact_single_arg_call() {
+        let word_is_longlong = crate::layout::target_word_size() == 8;
+        for leaf in ["longlongmask", "ulonglongmask"] {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new(leaf);
+            let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+            let extra = graph.alloc_value_var_with_type(ConcreteType::Signed);
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+            let target = CallTarget::function_path(["rpython", "rlib", "rarithmetic", leaf]);
+            let result_ty = ValueType::Int;
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+
+            let rewritten = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                leaf,
+                &mut graph,
+            );
+            if word_is_longlong {
+                assert!(
+                    matches!(rewritten, RewriteResult::Identity(alias) if alias == arg),
+                    "{leaf} must identity-elide on a 64-bit word"
+                );
+            } else {
+                assert!(
+                    !matches!(rewritten, RewriteResult::Identity(_)),
+                    "{leaf} must keep the CALL when longlong is wider than the word"
+                );
+            }
+
+            let wrong_target = CallTarget::function_path(["rlib", "rarithmetic", leaf]);
+            assert!(
+                !matches!(
+                    transformer.rewrite_op_direct_call(
+                        &op,
+                        &wrong_target,
+                        std::slice::from_ref(&arg),
+                        &result_ty,
+                        &format!("{leaf}_wrong_target"),
+                        &mut graph,
+                    ),
+                    RewriteResult::Identity(_)
+                ),
+                "{leaf} must not elide a crate-stripped path"
+            );
+            assert!(
+                !matches!(
+                    transformer.rewrite_op_direct_call(
+                        &op,
+                        &target,
+                        &[arg.clone(), extra.clone()],
+                        &result_ty,
+                        &format!("{leaf}_wrong_arity"),
+                        &mut graph,
+                    ),
+                    RewriteResult::Identity(_)
+                ),
+                "{leaf} must not elide a two-arg call"
+            );
+        }
+    }
+
     #[test]
     fn string_byte_getitem_marker_lowers_to_strgetitem() {
         use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
@@ -38482,6 +39060,343 @@ mod tests {
         ));
     }
 
+    /// A niladic named-struct ctor (`is_struct: true`, `Ref(Some(owner))`)
+    /// with a fieldful CallControl spec is `OpKind::New` of that owner
+    /// (`rewrite_op_malloc` / `new(descr)`). Layout uses this path; the
+    /// following `__pos_0` / `__pos_1` writes stay `setfield_gc`.
+    #[test]
+    fn niladic_struct_ctor_lowers_to_new() {
+        use crate::call::CallControl;
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        let owner = "core::alloc::layout::Layout";
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("__pos_0".to_string(), "usize".to_string()),
+                ("__pos_1".to_string(), "usize".to_string()),
+            ],
+        );
+        cc.set_struct_fields(struct_fields);
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("layout_ctor");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_struct_ctor(
+            vec!["core".into(), "alloc".into(), "layout".into()],
+            "Layout",
+        );
+        let result_ty = ValueType::Ref(Some(owner.to_string()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "layout_ctor",
+            &mut graph,
+        ) else {
+            panic!("niladic struct ctor must lower to New");
+        };
+        assert!(
+            matches!(
+                ops.as_slice(),
+                [SpaceOperation {
+                    result: Some(result),
+                    kind: OpKind::New { owner: allocated },
+                }] if result == &result_var && allocated == owner
+            ),
+            "expected New of {owner}, ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )),
+            "synthetic ctor must not remain, ops={ops:?}"
+        );
+    }
+
+    /// A `#[repr(transparent)]` one-field struct ctor is the field value
+    /// (`TypeDecl::is_repr_transparent`); it does not allocate.
+    #[test]
+    fn transparent_single_field_ctor_is_field_value() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("transparent_ctor");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_struct_ctor(
+            vec!["crate".into(), "wrapper".into()],
+            "Wrapper",
+        )
+        .with_repr_transparent();
+        let result_ty = ValueType::Ref(Some("crate::wrapper::Wrapper".into()));
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let RewriteResult::Identity(alias) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[arg.clone()],
+            &result_ty,
+            "transparent_ctor",
+            &mut graph,
+        ) else {
+            panic!("repr(transparent) one-field ctor must be the field value");
+        };
+        assert_eq!(alias, arg);
+    }
+
+    #[test]
+    fn niladic_struct_ctor_field_write_stays_for_setfield_gc() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("layout_store");
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let value = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let owner = "core::alloc::layout::Layout";
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor::new("__pos_1", Some(owner.into())),
+                value: LinkArg::Value(value),
+                ty: ValueType::Unsigned,
+            },
+        };
+        match transformer.rewrite_operation(&op, "layout_store", &mut graph) {
+            RewriteResult::Keep => {}
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter()
+                        .all(|op| !matches!(&op.kind, OpKind::RawStore { .. })),
+                    "Layout FieldWrite must not become raw_store, ops={ops:?}"
+                );
+                assert!(
+                    ops.iter()
+                        .any(|op| matches!(&op.kind, OpKind::FieldWrite { .. })),
+                    "Layout FieldWrite stays a FieldWrite for setfield_gc, ops={ops:?}"
+                );
+            }
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                panic!("Layout FieldWrite must Keep or stay FieldWrite")
+            }
+        }
+    }
+
+    /// `jtransform.py rewrite_op_setfield` refuses `setfield_raw_r`. A host
+    /// ADT stored in a raw STRUCT is an int word (`split_raw_ref_field_access`).
+    #[test]
+    fn raw_struct_field_write_of_ref_is_cast_ptr_to_int() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("raw_store_host");
+        let base = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: FieldDescriptor::new("__pos_0", Some("quasiimmut::QuasiImmutLock".into())),
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(Some("parking_lot::Mutex".into())),
+            },
+        };
+        let RewriteResult::Replace(ops) =
+            transformer.rewrite_operation(&op, "raw_store_host", &mut graph)
+        else {
+            panic!("raw FieldWrite of a Ref must split to int");
+        };
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: name, .. } if name == "cast_ptr_to_int"
+            )),
+            "expected cast_ptr_to_int, ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite {
+                    ty: ValueType::Int,
+                    ..
+                }
+            )),
+            "expected setfield of Int, ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldWrite {
+                    ty: ValueType::Ref(_),
+                    ..
+                }
+            )),
+            "Ref FieldWrite must not survive, ops={ops:?}"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_getfield` refuses non-pure `getfield_raw_r`.
+    #[test]
+    fn raw_struct_field_read_of_ref_is_cast_int_to_ptr() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("raw_load_host");
+        let base = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("__pos_0", Some("quasiimmut::QuasiImmutLock".into())),
+                ty: ValueType::Ref(Some("parking_lot::Mutex".into())),
+                pure: false,
+            },
+        };
+        let RewriteResult::Replace(ops) =
+            transformer.rewrite_operation(&op, "raw_load_host", &mut graph)
+        else {
+            panic!("raw FieldRead of a Ref must split to int");
+        };
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: name, .. } if name == "cast_int_to_ptr"
+            )),
+            "expected cast_int_to_ptr, ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead {
+                    ty: ValueType::Int,
+                    ..
+                }
+            )),
+            "expected getfield of Int, ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn niladic_struct_ctor_field_read_stays_for_getfield_gc() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("layout_load");
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let owner = "core::alloc::layout::Layout";
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base: base.clone(),
+                field: FieldDescriptor::new("__pos_0", Some(owner.into())),
+                ty: ValueType::Unsigned,
+                pure: false,
+            },
+        };
+        match transformer.rewrite_operation(&op, "layout_load", &mut graph) {
+            RewriteResult::Keep => {}
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter()
+                        .all(|op| !matches!(&op.kind, OpKind::RawLoad { .. })),
+                    "Layout FieldRead must not become raw_load, ops={ops:?}"
+                );
+                assert!(
+                    ops.iter()
+                        .any(|op| matches!(&op.kind, OpKind::FieldRead { .. })),
+                    "Layout FieldRead stays a FieldRead for getfield_gc, ops={ops:?}"
+                );
+            }
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                panic!("Layout FieldRead must Keep or stay FieldRead")
+            }
+        }
+    }
+
+    #[test]
+    fn alloc_zeroed_lowers_to_raw_malloc_fixedsize_zero() {
+        use crate::call::CallControl;
+
+        const ZERO: i64 = 0x2222_0002;
+        let mut cc = CallControl::new();
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments([
+                "majit_rlib",
+                "rffi",
+                "ll_raw_malloc_fixedsize_zero",
+            ]),
+            ZERO,
+        );
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("alloc_zeroed");
+        let layout = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["alloc", "alloc", "alloc_zeroed"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![layout.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&layout),
+            &result_ty,
+            "alloc_zeroed",
+            &mut graph,
+        ) else {
+            panic!("alloc_zeroed must lower to ll_raw_malloc_fixedsize_zero");
+        };
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { base, field, .. }
+                    if base == &layout && field.name == "__pos_0"
+            )),
+            "alloc_zeroed must getfield layout.size, ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(&op.kind, OpKind::RawLoad { .. })),
+            "alloc_zeroed must not raw_load a GC Layout, ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ConstFnAddr { value, .. } if *value == ZERO
+            )),
+            "expected ConstFnAddr of ll_raw_malloc_fixedsize_zero, ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::CallResidual { .. })),
+            "expected CallResidual of ll_raw_malloc_fixedsize_zero, ops={ops:?}"
+        );
+    }
+
     /// jtransform.py's generated `rewrite_op_uint_ne`: an unsigned compare
     /// in the rich graph re-enters as the signed int-bank opname, so no
     /// `uint_ne/ii>i` reaches the blackhole's dispatch table.
@@ -38713,6 +39628,7 @@ mod tests {
             size: 8,
             align: 8,
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            repr_transparent: false,
             fields: vec![StructFieldLayout {
                 name: "f".into(),
                 offset: 0,
@@ -45465,7 +46381,7 @@ mod tests {
                 array_type_id,
                 nolength,
                 array: _,
-                gckind: _,
+                gckind,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
@@ -45476,6 +46392,7 @@ mod tests {
                     Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
                 );
                 assert!(!nolength);
+                assert!(gckind.is_gc());
             }
             other => panic!("expected ArrayWrite, got {other:?}"),
         }

@@ -301,7 +301,7 @@ pub unsafe fn object_key_for(obj: PyObjectRef) -> ObjectKey {
 /// a throwaway `W_UnicodeObject` — the per-lookup allocation that otherwise
 /// leaks at every `getitem_str`.  PyPy's string-strategy `getitem_str`
 /// (`dictmultiobject.py`) likewise probes from the raw str.
-struct StrLookupKey<'a> {
+pub struct StrLookupKey<'a> {
     hash: i64,
     key: &'a str,
 }
@@ -5469,10 +5469,19 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
 /// `dictmultiobject.py self.unerase(w_dict.dstorage).get(self.unwrap(w_key), None)`.
 /// Caller must have already verified `is_correct_type(w_key)`.
 ///
-/// look_inside_iff lives on `ll_dict_lookup`.
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
+/// `ll_dict_lookup` (`rordereddict.py`).  The trampoline is the residual
+/// arm when the table is not virtual, matching
+/// [`w_dict_lookup_identity_strategy`] / [`dict_entries_probe_object`].
 ///
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
+fn w_dict_lookup_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let storage = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(storage) && majit_rlib::jit::isconstant(&key)
+}
+
+#[majit_macros::look_inside_iff(w_dict_lookup_int_strategy_iff)]
 pub unsafe fn w_dict_lookup_int_strategy(
     obj: PyObjectRef,
     key: PyObjectRef,

@@ -12,7 +12,7 @@ static STATIC_REFUSAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
 
 #[test]
 fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
-    const BASE: usize = 0x95_0000_0000;
+    const BASE: usize = 0x95_0000_0001;
     let _restore = [
         RestoreConstPtr::intern(BASE + 0x1020),
         RestoreConstPtr::intern(BASE + 0x2020),
@@ -50,17 +50,30 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     let b = BASE + 0x2000;
     let c = BASE + 0x3000;
     let t = BASE + 0x4000;
+    let mut ours = vec![
+        a,
+        a + 0x10,
+        a + 0x20,
+        b,
+        b + 0x10,
+        b + 0x20,
+        c,
+        c + 0x10,
+        c + 0x20,
+        t,
+    ];
     let frames = vec![
         InlineFrameGuard::enter(&outer, 0, false, false, vec![parent(a)], 0),
         InlineFrameGuard::enter(&outer, 0, false, false, vec![parent(b)], 0),
     ];
     let inner_frame = InlineFrameGuard::enter(&inner, 0, false, false, vec![parent(c)], 0);
-    let forward = || {
+    let mut forward = || {
         let mut seen = Vec::new();
         let mut visit = |root: &mut majit_ir::GcRef| {
-            if (BASE + 0x1000..BASE + 0x5000).contains(&root.0) {
+            if ours.contains(&root.0) {
                 seen.push(root.0);
                 root.0 += 0x80;
+                ours.push(root.0);
             }
         };
         // Live holders trace their indexes. The table walk forwards a
@@ -123,8 +136,113 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
 }
 
 #[test]
+fn session_roots_forward_helper_live_register_banks() {
+    // pyjitpl.py `walk_active_trace_refs` walks every `MIFrame.registers_r`.
+    // Helper subwalks park that list on `WalkSession.helper_live`.
+    const BASE: usize = 0x9b_0000_0001;
+    let word = BASE + 0x1000;
+    let _restore = RestoreConstPtr::intern(word + 0x20);
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let _roots = WalkSessionRoots::new(&session);
+    let registers_r = RegisterBank::new([OpRef::const_ptr(majit_ir::GcRef(word + 0x20))]);
+    let live = LiveFrameRegs::new(
+        &registers_r,
+        &RegisterBank::default(),
+        &RegisterBank::default(),
+        &WalkFrameState::default(),
+    );
+    session.borrow_mut().helper_live.push(live);
+    let mut seen = Vec::new();
+    let mut visit = |root: &mut majit_ir::GcRef| {
+        if root.0 == word + 0x20 {
+            seen.push(root.0);
+            root.0 += 0x80;
+        }
+    };
+    let _wave = majit_ir::const_ptr_table::Wave::enter();
+    majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
+    majit_ir::const_ptr_table::walk(&mut visit);
+    assert_eq!(seen, [word + 0x20]);
+}
+
+#[test]
+fn session_roots_forward_framestack_live_register_banks() {
+    // pyjitpl.py `walk_active_trace_refs` walks the executing
+    // `MIFrame.registers_r`. A Python / portal body parks that list on
+    // `framestack[*].live` at frame entry, not only when a child pauses it.
+    const BASE: usize = 0x9d_0000_0001;
+    let word = BASE + 0x1000;
+    let _restore = RestoreConstPtr::intern(word + 0x20);
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let _roots = WalkSessionRoots::new(&session);
+    let registers_r = RegisterBank::new([OpRef::const_ptr(majit_ir::GcRef(word + 0x20))]);
+    super::vable_ops::bind_paused_caller_regs(
+        &session,
+        &registers_r,
+        &RegisterBank::default(),
+        &RegisterBank::default(),
+        &WalkFrameState::default(),
+    );
+    let mut seen = Vec::new();
+    let mut visit = |root: &mut majit_ir::GcRef| {
+        if root.0 == word + 0x20 {
+            seen.push(root.0);
+            root.0 += 0x80;
+        }
+    };
+    let _wave = majit_ir::const_ptr_table::Wave::enter();
+    majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
+    majit_ir::const_ptr_table::walk(&mut visit);
+    assert_eq!(seen, [word + 0x20]);
+}
+
+#[test]
+fn session_roots_forward_last_exc_and_portal_call_frame() {
+    // pyjitpl.py `walk_active_trace_refs` forwards `last_exc_box` and the
+    // live FrontendOp `_resref` of every reachable Box. `portal_call_frame`
+    // is the same kind of owner field (`pyframe.py execute_frame` vref).
+    const BASE: usize = 0x9c_0000_0001;
+    let exc = BASE + 0x1000;
+    let frame = BASE + 0x1100;
+    let vref = BASE + 0x1200;
+    let _restore = [
+        RestoreConstPtr::intern(exc),
+        RestoreConstPtr::intern(frame),
+        RestoreConstPtr::intern(vref),
+    ];
+    let _runtime = crate::trace_ctx_for_test(0);
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let _roots = WalkSessionRoots::new(&session);
+    {
+        let mut session = session.borrow_mut();
+        session.last_exc_value = Some(OpRef::const_ptr(majit_ir::GcRef(exc)));
+        session.portal_call_frame = Some((
+            OpRef::const_ptr(majit_ir::GcRef(frame)),
+            OpRef::const_ptr(majit_ir::GcRef(vref)),
+        ));
+    }
+    let mut seen = Vec::new();
+    let mut visit = |root: &mut majit_ir::GcRef| {
+        if root.0 == exc || root.0 == frame || root.0 == vref {
+            seen.push(root.0);
+            root.0 += 0x80;
+        }
+    };
+    let _wave = majit_ir::const_ptr_table::Wave::enter();
+    majit_gc::shadow_stack::walk_my_extra_areas(&mut visit);
+    majit_ir::const_ptr_table::walk(&mut visit);
+    seen.sort_unstable();
+    assert_eq!(seen, [exc, frame, vref]);
+}
+
+#[test]
 fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
-    const BASE: usize = 0x96_0000_0000;
+    const BASE: usize = 0x96_0000_0001;
     let _restore = RestoreConstPtr::intern(BASE + 0x1020);
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
@@ -198,13 +316,15 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
 fn session_root_callback_rejects_a_borrow_across_collection() {
     let session = std::cell::RefCell::new(WalkSession::default());
     let held = session.borrow();
+    let payload = WalkSessionArea {
+        session: std::ptr::from_ref(&session),
+        owner: majit_metainterp::FrontendResrefOwner::NONE,
+    };
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         // Check the borrow contract without unwinding through a global
-        // root traversal.
-        walk_session_roots(
-            (&session as *const std::cell::RefCell<WalkSession>).cast(),
-            &mut |_| {},
-        );
+        // root traversal. `walk_session_roots` reads a `WalkSessionArea`,
+        // the extra-area payload `WalkSessionRoots::new` publishes.
+        walk_session_roots(std::ptr::from_ref(&payload).cast(), &mut |_| {});
     }));
     assert!(failed.is_err());
     drop(held);
@@ -342,7 +462,7 @@ fn finish_payload_of(outcome: &DispatchOutcome) -> Option<(OpRef, Type)> {
 
 #[test]
 fn finish_payload_root_walker_writes_back_forwarded_const_ptr() {
-    const BASE: usize = 0x97_0000_0000;
+    const BASE: usize = 0x97_0000_0001;
     let _restore = RestoreConstPtr::intern(BASE + 0x1000);
     let _runtime = crate::trace_ctx_for_test(0);
     let _stw = majit_gc::gc_sync::quiesce_mutators();
@@ -439,6 +559,23 @@ fn unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect() {
         before + 1,
         "the source arm must apply the observable side effect exactly once",
     );
+}
+
+/// `conditional_call_ir_v/iiIRd` stores the funcptr at pc+2. A scan that
+/// only looks at residual CALL (pc+1) would miss a hash that `rewrite.py`
+/// later turns into CallN.
+#[test]
+fn compute_reachable_symbolic_residuals_sees_conditional_call_funcptr() {
+    let mut builder = majit_metainterp::JitCodeBuilder::new();
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
+        "compute_reachable_symbolic_residuals_sees_conditional_call_funcptr",
+    ]);
+    let unbound = builder.add_fn_ptr(symbolic as usize as *const ());
+    builder.conditional_call_ir_v_typed_args(unbound, 0, &[]);
+    builder.void_return();
+    let jitcode = builder.finish();
+    let scan = majit_metainterp::jitcode::compute_reachable_symbolic_residuals(&jitcode);
+    assert_eq!(scan.targets, vec![symbolic]);
 }
 
 /// Pyre's runtime fnaddr patch must leave the portal closure free of symbolic
@@ -1811,6 +1948,81 @@ fn a_handler_abort_is_not_a_later_resume_blocker() {
     assert_eq!(resume_at_catch.blocker_after_effect, Some(0));
 }
 
+/// A→B→A with a blocker in B: both stored summaries name it (the SCC joint).
+/// The harness cannot install a multi-jitcode table, so this drives
+/// [`super::inline_call::summarize_call_graph_with_tracker`].
+#[test]
+fn a_cycle_summary_names_the_blocker_on_every_member() {
+    let blocker = 0x1234i64;
+    let b_local = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        blocker_effect_free: Some(blocker),
+        ..Default::default()
+    };
+    let (root, stored, walks) =
+        super::inline_call::summarize_call_graph_with_tracker(0, |id| match id {
+            0 => (
+                majit_jitcode::codewriter::jitcode::DescentBlockerSummary::default(),
+                vec![1],
+            ),
+            1 => (b_local, vec![0]),
+            _ => unreachable!(),
+        });
+    assert_eq!(walks, 2);
+    assert_eq!(root.blocker_effect_free, Some(blocker));
+    assert_eq!(
+        stored[0].unwrap().blocker_effect_free,
+        Some(blocker),
+        "A stores the joint result"
+    );
+    assert_eq!(
+        stored[1].unwrap().blocker_effect_free,
+        Some(blocker),
+        "B stores the joint result"
+    );
+}
+
+/// Diamond branching plus a chain of 2-cycles: each body is walked once.
+/// Without the tracker this enumerates simple paths (exponential in the
+/// double edges). The harness cannot install a multi-jitcode table, so this
+/// drives [`super::inline_call::summarize_call_graph_with_tracker`].
+#[test]
+fn a_chain_of_cycles_summary_walk_is_linear() {
+    const N: usize = 16;
+    let blocker = 7i64;
+    let (summary, stored, walks) = super::inline_call::summarize_call_graph_with_tracker(0, |id| {
+        let partner = id ^ 1;
+        let mut callees = vec![partner, partner];
+        if id % 2 == 0 && id + 2 < N {
+            callees.push(id + 2);
+        }
+        if id % 2 == 1 && id + 1 < N {
+            callees.push(id + 1);
+        }
+        let local = if id == N - 1 {
+            majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+                blocker_effect_free: Some(blocker),
+                ..Default::default()
+            }
+        } else {
+            majit_jitcode::codewriter::jitcode::DescentBlockerSummary::default()
+        };
+        (local, callees)
+    });
+    assert_eq!(walks, N, "one walk per body, not 2^(N/2) simple paths");
+    assert_eq!(summary.blocker_effect_free, Some(blocker));
+    for i in 0..N {
+        assert_eq!(
+            stored
+                .get(i)
+                .copied()
+                .flatten()
+                .and_then(|s| s.blocker_effect_free),
+            Some(blocker),
+            "joint result stored on member {i}"
+        );
+    }
+}
+
 /// Taken-path `blocker_after_effect` no longer refuses descent: a helper
 /// guard encodes the helper's own snapshot section and resumes there.
 #[test]
@@ -1941,9 +2153,9 @@ fn a_reachable_abort_is_a_resume_blocker() {
 }
 
 /// A continuation `inline_call` uses the callee's whole-body summary. An
-/// `abort` there is invisible to admission. The resume scan treats that
-/// callee as a blocker only when the blackhole would interpret it
-/// (`interpret_unresolved_inline_call`, `fnaddr=None`) and reach the abort.
+/// `abort` there is invisible to admission. The resume scan treats an
+/// interpreted callee (`interpret_unresolved_inline_call`, `fnaddr=None`)
+/// as a blocker, so a reachable abort inside that callee is reported.
 #[test]
 fn a_callees_reachable_abort_is_a_resume_blocker() {
     let real = 0x1234_5678i64;
@@ -1961,9 +2173,14 @@ fn a_callees_reachable_abort_is_a_resume_blocker() {
     assert_eq!(whole.blocker_effect_free, None);
     assert_eq!(whole.blocker_after_effect, None);
 
-    let resume = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[real], |d| {
-        (d == 7).then_some(callee)
-    });
+    let resume = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[real],
+        |d| (d == 7).then_some(callee),
+        |d| (d == 7).then_some(0),
+    );
     assert_eq!(resume.blocker_effect_free, Some(0));
 }
 
@@ -2100,6 +2317,65 @@ fn list_type_call_resume_levels_do_not_reach_a_blocker() {
         !super::inline_call::helper_resume_reaches_blocker(wrap.index(), resume_pc, Some(2)),
         "wrap_list_descr_init resume at the live marker before list_extend_items must not reach a blocker",
     );
+}
+
+/// A nested `inline_call_*` whose callee `fnaddr` is not callable is
+/// interpreted (`interpret_unresolved_inline_call`). An empty / pure
+/// callee finishes; the uncallable fnaddr alone is not a resume blocker
+/// (`BuildHasherDefault::default`). A residual or `abort` that callee
+/// can reach still is: numbering would let `reject_unresolved_call`
+/// bail with a blank dest. Whole-body admission does not name the
+/// uncallable callee itself as a blocker.
+#[test]
+fn an_uncallable_inline_callee_is_a_resume_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["hasher"]);
+    assert!(!majit_jitcode::codewriter::call::is_callable_fnaddr(
+        symbolic
+    ));
+    let empty = majit_jitcode::codewriter::jitcode::DescentBlockerSummary::default();
+    let residual = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        blocker_effect_free: Some(0),
+        ..Default::default()
+    };
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |d| {
+        (d == 7).then_some(empty)
+    });
+    assert_eq!(whole.blocker_effect_free, None);
+    assert_eq!(whole.blocker_after_effect, None);
+
+    let resume_empty = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[symbolic],
+        |d| (d == 7).then_some(empty),
+        |d| (d == 7).then_some(symbolic),
+    );
+    assert_eq!(resume_empty.blocker_effect_free, None);
+    assert_eq!(resume_empty.blocker_after_effect, None);
+
+    let resume = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[symbolic],
+        |d| (d == 7).then_some(residual),
+        |d| (d == 7).then_some(symbolic),
+    );
+    assert!(resume.blocker_effect_free.is_some());
+
+    let resume_unbound = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[],
+        |d| (d == 7).then_some(residual),
+        |d| (d == 7).then_some(0),
+    );
+    assert!(resume_unbound.blocker_effect_free.is_some());
 }
 
 /// Resume does not treat a residual whose funcbox register is a runtime-only
@@ -2840,7 +3116,13 @@ fn portal_may_force_records_the_callee_execution_context() {
         });
         if !wired {
             let mut jd = majit_metainterp::JitDriverStaticData::new(
-                vec![("pycode", Type::Ref)],
+                // Portal ABI: greens[next_instr, is_being_profiled, pycode]
+                // + reds[frame, ec] (`interp_jit.py` `PyPyJitDriver`).
+                vec![
+                    ("next_instr", Type::Int),
+                    ("is_being_profiled", Type::Int),
+                    ("pycode", Type::Ref),
+                ],
                 vec![("frame", Type::Ref), ("ec", Type::Ref)],
             );
             jd.portal_runner_adr = portal_runner_stub as *const () as i64;
@@ -2999,7 +3281,13 @@ fn loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec() {
         });
         if !wired {
             let mut jd = majit_metainterp::JitDriverStaticData::new(
-                vec![("pycode", Type::Ref)],
+                // Portal ABI: greens[next_instr, is_being_profiled, pycode]
+                // + reds[frame, ec] (`interp_jit.py` `PyPyJitDriver`).
+                vec![
+                    ("next_instr", Type::Int),
+                    ("is_being_profiled", Type::Int),
+                    ("pycode", Type::Ref),
+                ],
                 vec![("frame", Type::Ref), ("ec", Type::Ref)],
             );
             jd.portal_runner_adr = portal_runner_stub as *const () as i64;
@@ -4229,7 +4517,13 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
         });
         if !wired {
             let mut jd = majit_metainterp::JitDriverStaticData::new(
-                vec![("pycode", Type::Ref)],
+                // Portal ABI: greens[next_instr, is_being_profiled, pycode]
+                // + reds[frame, ec] (`interp_jit.py` `PyPyJitDriver`).
+                vec![
+                    ("next_instr", Type::Int),
+                    ("is_being_profiled", Type::Int),
+                    ("pycode", Type::Ref),
+                ],
                 vec![("frame", Type::Ref), ("ec", Type::Ref)],
             );
             jd.portal_runner_adr = portal_returns_int as *const () as i64;
@@ -4289,7 +4583,11 @@ fn loop_callee_portal_non_none_init_raises_without_aborting() {
     let callee_frame = OpRef::input_arg_ref(0);
     let callee_ec = OpRef::input_arg_ref(1);
     let instance = tc.const_ref(pyre_object::w_int_new(0) as i64);
-    let sentinel = 0xECu64;
+    // Residual marshal declines an unaligned Ref (`bits % align_of::<usize>()`
+    // in `try_execute_residual_call_via_executor_inner`, 8b71a70ace2).
+    // 0xEC % 8 == 4 left `ca_result` without a concrete, so the TypeError
+    // arm of `check_init_returned_none` never ran.
+    let sentinel = 0xE0u64;
     tc.set_opref_concrete(
         callee_frame,
         majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
@@ -4427,7 +4725,13 @@ fn loop_callee_portal_none_init_records_the_none_check() {
         });
         if !wired {
             let mut jd = majit_metainterp::JitDriverStaticData::new(
-                vec![("pycode", Type::Ref)],
+                // Portal ABI: greens[next_instr, is_being_profiled, pycode]
+                // + reds[frame, ec] (`interp_jit.py` `PyPyJitDriver`).
+                vec![
+                    ("next_instr", Type::Int),
+                    ("is_being_profiled", Type::Int),
+                    ("pycode", Type::Ref),
+                ],
                 vec![("frame", Type::Ref), ("ec", Type::Ref)],
             );
             jd.portal_runner_adr = portal_returns_none as *const () as i64;
@@ -4487,7 +4791,8 @@ fn loop_callee_portal_none_init_records_the_none_check() {
     let callee_frame = OpRef::input_arg_ref(0);
     let callee_ec = OpRef::input_arg_ref(1);
     let instance = tc.const_ref(pyre_object::w_int_new(0) as i64);
-    let sentinel = 0xECu64;
+    // Same alignment gate as `loop_callee_portal_non_none_init_raises_without_aborting`.
+    let sentinel = 0xE0u64;
     tc.set_opref_concrete(
         callee_frame,
         majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
@@ -18698,6 +19003,24 @@ fn symbolic_box_str_constant_residual_declines_unsafe_arguments() {
     }
 }
 
+#[test]
+fn unbound_symbolic_residual_is_not_a_complete_blackhole_image() {
+    // A look-inside wall (`symbolic == 0`) still converts: the blackhole
+    // can run the remaining Python. An unbound hash cannot, so adopting
+    // that image would continue from a pc that still needs the helper.
+    assert!(
+        DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 }
+            .leaves_complete_image()
+    );
+    assert!(
+        !DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: 0,
+            symbolic: 0x7ADD_0000_0001,
+        }
+        .leaves_complete_image()
+    );
+}
+
 /// Convenience: legacy signature used by elidable-classification
 /// tests with empty arglists (0 R args, descr arg_types=[]).
 /// `result_type` defaults to `Ref` matching `_r_r` shape. Callers
@@ -22198,6 +22521,9 @@ fn helper_descent_runs_the_limit_check_at_frame_entry() {
         "the enclosing frame aborts after the helper returns: {enclosing:?}"
     );
     let helper = walk_past_the_limit(true);
+    // `_interpret` / `blackhole_if_trace_too_long` after `run_one_step`:
+    // Continue already advanced banks, so the abort carries post-step pc
+    // (the `void_return/` at 5), not the CALL's opcode_position.
     assert!(
         matches!(helper, Err(DispatchError::TraceTooLong { pc: 0, .. })),
         "a transparent helper aborts at frame entry: {helper:?}"
@@ -23372,7 +23698,15 @@ fn helper_caught_subraise_checks_the_limit_at_handler_entry() {
         void_ret,
     ];
     let mut tc = fresh_trace_ctx();
-    let regs_r = distinct_const_refs(&mut tc, 4);
+    let mut regs_r = distinct_const_refs(&mut tc, 4);
+    // `raise/r` of r0: `opimpl_goto_if_exception_mismatch` runs
+    // `rclass.ll_isinstance` on `last_exc_value`, so the raised box must
+    // hold a real exception instance.
+    let exc = pyre_object::interp_exceptions::w_exception_new(
+        pyre_object::interp_exceptions::ExcKind::ValueError,
+        "boom",
+    );
+    regs_r[0] = tc.const_ref(exc as i64);
     let a = dummy_int_add_box(&mut tc);
     let b = dummy_int_add_box(&mut tc);
     let ops_at_entry = tc.num_recorded_ops();
@@ -24440,7 +24774,19 @@ fn install_named_helper_jitcode(
     num_regs_i: u8,
     num_regs_r: u8,
 ) -> usize {
-    let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+    install_named_helper_jitcode_with_fnaddr(name, code, startpoints, num_regs_i, num_regs_r, 0)
+}
+
+fn install_named_helper_jitcode_with_fnaddr(
+    name: &str,
+    code: Vec<u8>,
+    startpoints: impl IntoIterator<Item = usize>,
+    num_regs_i: u8,
+    num_regs_r: u8,
+    fnaddr: i64,
+) -> usize {
+    let mut runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+    runtime_jc.fnaddr = fnaddr;
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
         code,
         startpoints: Some(startpoints.into_iter().collect()),
@@ -24709,6 +25055,203 @@ fn helper_unjournaled_residual_then_later_abort_converts() {
     assert_eq!(
         replay_after, replay_before,
         "SubWalkDriver must not replay the parent CALL after an unrewindable nested abort"
+    );
+}
+
+static TRY_PERFORM_CALL_NATIVE_RUNS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn try_perform_call_counted_helper(a: i64, b: i64) -> i64 {
+    TRY_PERFORM_CALL_NATIVE_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    a.wrapping_add(b)
+}
+
+/// `try_do_residual_or_indirect_call` → `try_perform_call` with a Const
+/// funcptr registered in `bytecode_for_address`.
+fn probe_try_perform_call_helper_unbound(
+    helper_name: &'static str,
+    arm: impl FnOnce(usize),
+) -> (
+    Result<(DispatchOutcome, usize), DispatchError>,
+    Option<LatchedMultiFrameBlackhole>,
+    u32,
+) {
+    use crate::state::PyreSym;
+
+    let _clear = ClearTestHelperArm;
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let fail_pc = 4;
+    let helper_code: &'static [u8] = Box::leak(Box::new([int_add, 0, 1, 2, int_add, 0, 1, 2]));
+    let fnaddr = try_perform_call_counted_helper as *const () as i64;
+    let helper_index = install_named_helper_jitcode_with_fnaddr(
+        helper_name,
+        helper_code.to_vec(),
+        [0_usize, fail_pc],
+        3,
+        1,
+        fnaddr,
+    );
+    let helper_jc = super::residual_call::helper_jitcode_arc(helper_index)
+        .expect("installed helper jitcode must resolve");
+    crate::state::setup_indirectcalltargets(vec![helper_jc]);
+    let helper_body = SubJitCodeBody {
+        code: helper_code,
+        num_regs_r: 1,
+        num_regs_i: 3,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+        jitcode_index: Some(helper_index),
+    };
+    let lookup = {
+        let helper_body = helper_body.clone();
+        move |idx: usize| (idx == helper_index).then(|| helper_body.clone())
+    };
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc.const_int(fnaddr);
+    let arg0 = tc.const_int(40);
+    let arg1 = tc.const_int(2);
+    let regs_i = [funcbox, arg0, arg1, OpRef::NONE];
+    let descr = make_call_descr(
+        91,
+        vec![Type::Int, Type::Int],
+        Type::Int,
+        majit_ir::ExtraEffect::CannotRaise,
+    );
+    let descr_pool = vec![descr];
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_ir_i/iIRd>i")
+        .expect("`residual_call_ir_i/iIRd>i` must be in the insns table");
+    let code = [residual_byte, 0, 2, 1, 2, 0, 0, 0, 3];
+    let regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    TRY_PERFORM_CALL_NATIVE_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+    arm(helper_index);
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: {
+            let mut mode = test_fbw_mode();
+            mode.snapshot_sym = &snapshot_sym;
+            // Portal CallResult + an unpopulated caller declines look-inside
+            // (`helper_subwalk_level`). This fixture is the already-entered
+            // helper walk (`new_uninit` keeps `test_helper_snapshot_sym_absent`
+            // so `latch_test_helper_without_snapshot` can stage the image).
+            mode.transparent_helper_subwalk = true;
+            mode
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = step(&code, 0, &mut wc);
+    drop(wc);
+    std::hint::black_box(&mut snapshot_sym);
+    let latched = take_multi_frame_blackhole();
+    let native = TRY_PERFORM_CALL_NATIVE_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+    crate::state::setup_indirectcalltargets(Vec::new());
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    (result, latched, native)
+}
+
+/// An executed helper residual must not be cut and re-run as `do_residual_call`
+/// of the same helper (`MIFrame.do_residual_call` once, then
+/// `run_blackhole_interp_to_cancel_tracing` / `convert_and_run_from_pyjitpl`).
+#[test]
+fn try_perform_call_does_not_residualize_after_executed_residual_unbound() {
+    let (result, latched, native) = probe_try_perform_call_helper_unbound(
+        "try_perform_call_unbound_after_residual",
+        |helper| {
+            super::inline_call::arm_test_helper_unjournaled_then_unbound(helper, 4);
+        },
+    );
+    assert!(
+        matches!(
+            result,
+            Err(DispatchError::ResidualCallArgUnbound { pc: 4, .. })
+        ),
+        "try_perform_call must propagate ResidualCallArgUnbound after a live residual, \
+         not Ok(None) residualize: {result:?}"
+    );
+    let latched = latched.expect("unbound after an executed residual must latch a helper image");
+    let top = latched
+        .framestack
+        .frames
+        .last()
+        .expect("a latched helper image has a top frame");
+    assert!(
+        latched.origin == "mod2730-helper" || latched.origin == "mod2730",
+        "origin must be the helper/innermost latch, got {}",
+        latched.origin
+    );
+    assert_eq!(
+        top.jitcode.name(),
+        "try_perform_call_unbound_after_residual",
+        "convert copies the live helper MIFrame"
+    );
+    assert_eq!(
+        top.pc, 4,
+        "R2 has not run; blackhole resumes at the unbound residual pc"
+    );
+    assert_eq!(
+        native, 0,
+        "native helper must not run after the prefix residual already executed"
+    );
+}
+
+/// Zero-effect `ResidualCallArgUnbound` still residualizes the helper once
+/// (`do_residual_call` after a failed `perform_call`).
+#[test]
+fn try_perform_call_residualizes_zero_effect_unbound() {
+    let (result, latched, native) =
+        probe_try_perform_call_helper_unbound("try_perform_call_unbound_zero_effect", |helper| {
+            super::inline_call::arm_test_helper_unbound(helper, 4);
+        });
+    assert!(
+        result.is_ok(),
+        "zero-effect ResidualCallArgUnbound residualizes the helper: {result:?}"
+    );
+    assert!(
+        latched.is_none(),
+        "a hole with no prior residual is not a convert image"
+    );
+    assert_eq!(
+        native, 1,
+        "native helper runs once after the zero-effect look-inside decline"
     );
 }
 
@@ -25295,15 +25838,12 @@ fn helper_abort_resume_pc_prefers_published_live_after() {
     fbw_store_journal_reset();
 }
 
-/// `residual_call_refused_up_front` declines may-force residuals inside a
-/// transparent helper before `execute_varargs`. EF_CAN_RAISE CallR still
-/// executes (`do_residual_call`); refusing it residualizes list-iterator
-/// `descr_next` and drops `for_iter_list_fold` `hot_setstate_sentinel`.
-/// A trampoline that calls back into Python is `jit_may_force` so this
-/// refuse catches it (`dict_eq_hook` `hash_w_hooked` / `eq_w_hooked`).
+/// `residual_call_refused_up_front` refuses only a funcbox that cannot be
+/// called. A residual inside a transparent helper is recorded in that
+/// helper's `MIFrame` (`pyjitpl.py do_residual_call`), whatever its effect:
+/// its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` resume at the helper pc
+/// past the call (`capture_resumedata`), not at the Python CALL.
 fn residual_call_refused_up_front_probe(
-    opcode: majit_ir::OpCode,
-    extra: majit_ir::ExtraEffect,
     inline_subwalk: bool,
     transparent_helper_subwalk: bool,
 ) -> Option<(&'static str, i64, i64)> {
@@ -25311,8 +25851,6 @@ fn residual_call_refused_up_front_probe(
     let addr = pyre_interpreter::residual_word_addr!(2, add2_for_walker_test,) as i64;
     let funcbox = tc.const_int(addr);
     let allboxes = [funcbox];
-    let descr = make_call_descr(90, vec![], Type::Int, extra);
-    let call_descr = descr.as_call_descr().expect("CallDescr");
     let session = std::cell::RefCell::new(WalkSession::default());
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
@@ -25355,38 +25893,99 @@ fn residual_call_refused_up_front_probe(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    residual_call_refused_up_front(&wc, opcode, &allboxes, call_descr)
+    residual_call_refused_up_front(&wc, &allboxes)
 }
 
 #[test]
-fn residual_call_refused_up_front_declines_may_force_not_can_raise_in_transparent_helper() {
-    let can_raise = residual_call_refused_up_front_probe(
-        majit_ir::OpCode::CallR,
-        majit_ir::ExtraEffect::CanRaise,
-        true,
-        true,
+fn residual_call_refused_up_front_records_a_callable_residual_in_transparent_helper() {
+    assert_eq!(
+        residual_call_refused_up_front_probe(true, true),
+        None,
+        "a callable residual inside a transparent helper is recorded in its MIFrame"
     );
     assert_eq!(
-        can_raise, None,
-        "CanRaise CallR still executes; Python-callback trampolines are jit_may_force"
+        residual_call_refused_up_front_probe(false, false),
+        None,
+        "a callable residual on the portal walk is recorded"
     );
-    let cannot_raise = residual_call_refused_up_front_probe(
-        majit_ir::OpCode::CallR,
-        majit_ir::ExtraEffect::CannotRaise,
-        true,
-        true,
+}
+
+/// A helper MIFrame is convertible only when `jitcode.fnaddr` is callable.
+/// `handler_inline_call_*` (`blackhole.py`) takes `bhimpl_inline_call_*`
+/// only then; a Regular graph with `fnaddr=None` must not claim the abort.
+#[test]
+fn a_helper_is_convertible_only_when_its_fnaddr_is_callable() {
+    fn install(name: &str, fnaddr: i64) -> usize {
+        let mut runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+        runtime_jc.fnaddr = fnaddr;
+        runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+            code: vec![
+                *insns_opname_to_byte()
+                    .get("void_return/")
+                    .expect("`void_return/` must be in insns table"),
+            ],
+            startpoints: Some([0_usize].into_iter().collect()),
+            ..Default::default()
+        });
+        let jitcode = std::sync::Arc::new(runtime_jc);
+        let source = format!("# {name}\nNone");
+        let code = pyre_interpreter::compile_exec(&source).expect("test code should compile");
+        let key =
+            pyre_interpreter::w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.jitcode = jitcode;
+        let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
+            as *const crate::state::JitCode;
+        let index = unsafe { (*installed).index as usize };
+        assert!(
+            index >= crate::jitcode_runtime::jitcode_count(),
+            "test helper must sit above the build-time table, got {index}"
+        );
+        let resolved = super::residual_call::helper_jitcode_arc(index)
+            .expect("installed helper jitcode must resolve");
+        assert_eq!(resolved.fnaddr, fnaddr);
+        index
+    }
+
+    let callable = install("helper_callable_fnaddr", 0x1234_5678);
+    let symbolic = install(
+        "helper_symbolic_fnaddr",
+        majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["unbound_helper"]),
     );
-    assert_eq!(cannot_raise, None, "CannotRaise CallR still executes");
-    let may_force = residual_call_refused_up_front_probe(
-        majit_ir::OpCode::CallMayForceI,
-        majit_ir::ExtraEffect::RandomEffects,
+    let zero = install("helper_zero_fnaddr", 0);
+
+    assert!(super::residual_call::helper_jitcode_fnaddr_is_callable(
+        Some(callable)
+    ));
+    assert!(!super::residual_call::helper_jitcode_fnaddr_is_callable(
+        Some(symbolic)
+    ));
+    assert!(!super::residual_call::helper_jitcode_fnaddr_is_callable(
+        Some(zero)
+    ));
+    assert!(!super::residual_call::helper_jitcode_fnaddr_is_callable(
+        None
+    ));
+
+    assert!(super::residual_call::helper_frame_is_convertible(
         true,
+        Some(callable)
+    ));
+    assert!(!super::residual_call::helper_frame_is_convertible(
         true,
-    );
-    assert!(
-        matches!(may_force, Some(("may-force-in-transparent-helper", _, 0))),
-        "CallMayForce inside a transparent helper stays declined: {may_force:?}"
-    );
+        Some(symbolic)
+    ));
+    assert!(!super::residual_call::helper_frame_is_convertible(
+        true,
+        Some(zero)
+    ));
+    assert!(!super::residual_call::helper_frame_is_convertible(
+        true, None
+    ));
+    assert!(!super::residual_call::helper_frame_is_convertible(
+        false,
+        Some(callable)
+    ));
 }
 
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.
@@ -25476,6 +26075,27 @@ fn paused_helper_parent_for_activation(
     }
 }
 
+fn dummy_jitcode_index(name: &str) -> usize {
+    thread_local! {
+        static MAP: std::cell::RefCell<Vec<(String, usize)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static NEXT: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+    }
+    MAP.with(|map| {
+        let mut map = map.borrow_mut();
+        if let Some((_, idx)) = map.iter().find(|(n, _)| n == name) {
+            return *idx;
+        }
+        let idx = NEXT.with(|n| {
+            let v = n.get();
+            n.set(v + 1);
+            v
+        });
+        map.push((name.to_string(), idx));
+        idx
+    })
+}
+
 fn dummy_miframe(name: &str, pc: usize) -> majit_metainterp::MIFrame {
     let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
     runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
@@ -25483,6 +26103,11 @@ fn dummy_miframe(name: &str, pc: usize) -> majit_metainterp::MIFrame {
         startpoints: Some([0_usize].into_iter().collect()),
         ..Default::default()
     });
+    // Production stamps `jitcode.index` when the finished jitcode is appended
+    // to `all_jitcodes[]` (`stamp_payload_index` / `codewriter.py
+    // jitcode.index = index`). Dummy frames never take that append, so stamp
+    // a stable name-keyed index for tests that compare jitcode identity.
+    runtime_jc.set_index(dummy_jitcode_index(name));
     majit_metainterp::MIFrame::new(std::sync::Arc::new(runtime_jc), pc)
 }
 
@@ -25639,6 +26264,45 @@ fn splice_inserts_a_missing_helper_activation_below_the_innermost() {
             "lookup_type_special",
             "lookup_in_type_where_wtf8"
         ]
+    );
+    reset_single_frame_blackhole();
+    fbw_store_journal_reset();
+}
+
+/// An unpublished recursive helper at the same CALL pc as a published
+/// ancestor is still spliced. `convert_and_run_from_pyjitpl` copies each
+/// framestack entry; `ResumeDataLoopMemo.number` emits both headers.
+#[test]
+fn splice_inserts_a_recursive_helper_activation_with_the_same_call_pc() {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    let outer = WalkFrameState::new(WalkFrameStateData::default());
+    let inner = WalkFrameState::new(WalkFrameStateData::default());
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let _level = InlineFrameGuard::enter(
+        &session,
+        0,
+        false,
+        false,
+        vec![paused_helper_parent_for_activation(1848, 18, outer.clone())],
+        0,
+    );
+    {
+        let walk = session.borrow();
+        assert!(helper_activation_already_on_framestack(&walk, &outer));
+        assert!(!helper_activation_already_on_framestack(&walk, &inner));
+    }
+    let mut framestack = majit_metainterp::MIFrameStack::empty();
+    framestack.push(dummy_miframe("__next", 1206));
+    framestack.push(dummy_miframe("walk", 25));
+    framestack.push(dummy_miframe("lookup_in_type_where_wtf8", 106));
+    stage_test_multi_frame_stack(framestack);
+    assert!(splice_helper_frames_before_innermost(vec![dummy_handoff(
+        "walk", 25
+    )]));
+    assert_eq!(
+        latched_multi_frame_names(),
+        ["__next", "walk", "walk", "lookup_in_type_where_wtf8"]
     );
     reset_single_frame_blackhole();
     fbw_store_journal_reset();
@@ -31243,6 +31907,21 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
             "dict_get_slow arg {i} of 4"
         );
     }
+    // `generator_invoke_execute_frame_residual(gen, frame, w_inputvalue, throw)`
+    // — `next()` of a just-started generator passes `PY_NULL` for the sent
+    // value, and the body tests `w_inputvalue.is_null()` before the `Option`.
+    let (_, gen_invoke) = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .find(|&(path, _)| leaf_of(path) == "generator_invoke_execute_frame_residual")
+        .expect("generator_invoke_execute_frame_residual is a registered leaf");
+    for i in 0..4 {
+        assert_eq!(
+            is_sentinel(K::None, gen_invoke, i, 4),
+            i == 2,
+            "generator_invoke_execute_frame_residual arg {i} of 4"
+        );
+    }
+    assert!(!is_sentinel(K::None, gen_invoke, 2, 3));
     // `jit_portal_call_3(callable, null_or_self, a0, a1, a2)`. The plain-call
     // shape leaves `null_or_self` as `PY_NULL`; only that word is checked.
     let (_, portal) = pyre_interpreter::jit_trace_fnaddrs()
@@ -31293,6 +31972,98 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
     assert!(
         exempted.is_empty(),
         "unexpected exempt leaves: {exempted:?}"
+    );
+}
+
+extern "C" fn identity_ref_for_walker_test(inst: i64) -> i64 {
+    inst
+}
+
+/// `try_execute_residual_call_via_executor_inner` NULL-Ref refusal for one
+/// may-force residual whose arg0 is `const_null`. The dummy leaf returns
+/// `inst` unchanged, matching `virtualref.py force_virtual_if_necessary`.
+fn null_ref_may_force_outcome(oopspec: majit_ir::OopSpecIndex) -> ResidualExecOutcome {
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc
+        .const_int(pyre_interpreter::residual_word_addr!(1, identity_ref_for_walker_test,) as i64);
+    let allboxes = [funcbox, tc.const_null()];
+    let mut effect = majit_ir::EffectInfo::default();
+    effect.extraeffect = majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable;
+    effect.oopspecindex = oopspec;
+    let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
+        43,
+        vec![Type::Ref],
+        Type::Ref,
+        false,
+        std::mem::size_of::<usize>(),
+        effect,
+    ));
+    let call_descr = descr.as_call_descr().expect("CallMayForceR descr");
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let exec = try_execute_residual_call_via_executor_inner(
+        &mut wc,
+        majit_ir::OpCode::CallMayForceR,
+        &allboxes,
+        call_descr,
+        8,
+        None,
+        None,
+        false,
+        None,
+    )
+    .expect("a NULL OS_JIT_FORCE_VIRTUAL residual must not abort the walk");
+    drop(wc);
+    exec
+}
+
+#[test]
+fn jit_force_virtual_executes_a_null_ref_residual() {
+    assert_eq!(
+        null_ref_may_force_outcome(majit_ir::OopSpecIndex::None),
+        ResidualExecOutcome::Declined(ResidualDecline::Symbolic),
+        "a NULL Ref without OS_JIT_FORCE_VIRTUAL stays the existing refusal",
+    );
+    assert_eq!(
+        null_ref_may_force_outcome(majit_ir::OopSpecIndex::JitForceVirtual),
+        ResidualExecOutcome::Executed(Ok(0)),
+        "OS_JIT_FORCE_VIRTUAL still execute_varargs; NULL returns inst",
     );
 }
 

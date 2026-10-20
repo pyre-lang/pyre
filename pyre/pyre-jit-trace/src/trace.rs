@@ -420,6 +420,38 @@ pub fn set_walk_end_propagated_exception(err: pyre_interpreter::PyError) {
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
 }
 
+/// `pyjitpl.py finishframe_exception` always raises
+/// `ExitFrameWithExceptionRef` after `compile.giveup()`. Full-body Terminate
+/// used to leave that raise only in `FBW_FINISH_CONCRETE::Raise`, which the
+/// walk epilogue drops when the concrete is missing; the portal then
+/// `ContinueRunningNormally` and replays a spent residual. Park the same
+/// object on the walk-end carrier the portal already consumes first.
+fn park_walk_end_uncaught_exception() {
+    if !WALK_END_PROPAGATE_ALLOWED.with(|c| c.get()) {
+        return;
+    }
+    if WALK_END_PROPAGATED_EXCEPTION.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    let ptr = match crate::jitcode_dispatch::fbw_finish_concrete_peek() {
+        Some(crate::jitcode_dispatch::FinishConcrete::Raise(crate::state::ConcreteValue::Ref(
+            p,
+        ))) if !p.is_null() => p,
+        _ => {
+            let raw = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+            if raw == 0 {
+                return;
+            }
+            raw as pyre_object::PyObjectRef
+        }
+    };
+    if ptr.is_null() {
+        return;
+    }
+    let err = unsafe { pyre_interpreter::PyError::from_exc_object(ptr) };
+    WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(err));
+}
+
 /// Capture this mutator's raw walk-end carrier address for STW root walking.
 pub fn capture_walk_end_root_area() -> *const () {
     WALK_END_ROOT_AREA.with(|area| area as *const _ as *const ())
@@ -602,6 +634,12 @@ impl InlineRegisterBankGuard {
             }),
         }
     }
+}
+
+/// Owner copied into a `WalkSession` extra-area payload at publication.
+/// The extra-area callback reads that payload, not this cell.
+pub(crate) fn active_trace_resref_owner() -> majit_metainterp::FrontendResrefOwner {
+    ACTIVE_TRACE.with(|c| c.get().owner)
 }
 
 pub fn take_walk_end_restart_pc() -> Option<usize> {
@@ -6963,6 +7001,18 @@ fn run_perfn_walk<Sym: WalkSym>(
     // there is no store journal to commit and no concrete to keep.  pyre's
     // walker instead executes and journals residual effects while tracing, so
     // "do not run that region twice" has to be decided here.
+    // `pyjitpl.py finishframe_exception` still raises
+    // `ExitFrameWithExceptionRef` after `compile.giveup()`. A Symbolic
+    // residual decline leaves a hash CallR that compile-refuse will reject;
+    // the walk already produced the Terminate concrete, so dropping it
+    // replays a spent raise and the portal returns as if the call succeeded.
+    // `ValueUnavailable` still forces replay: that concrete is missing.
+    // An uncaught raise with no `Raise` concrete (`fbw_finish_is_exception`,
+    // null-guarded stash) is still a Terminate that must not replay: the
+    // residual already raised, and the portal takes
+    // `WALK_END_PROPAGATED_EXCEPTION`.
+    let (value_unavailable, _symbolic) = crate::jitcode_dispatch::fbw_unjournaled_kinds();
+    let finish_is_exception = crate::jitcode_dispatch::fbw_finish_is_exception();
     let terminate_no_replay = (!is_bridge_trace
         || crate::jitcode_dispatch::fbw_bridge_noreplay_armed())
         && matches!(
@@ -6972,8 +7022,8 @@ fn run_perfn_walk<Sym: WalkSym>(
                 _
             ))
         )
-        && crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some()
-        && !crate::jitcode_dispatch::fbw_has_unjournaled_effect();
+        && (crate::jitcode_dispatch::fbw_finish_concrete_peek().is_some() || finish_is_exception)
+        && !value_unavailable;
     // A terminal blackhole adoption is possible for the two dedicated
     // handoff errors and for the general WalkAbort family.  The latter was
     // added after this no-replay predicate and must be classified through the
@@ -8262,16 +8312,19 @@ fn full_body_walk_trace<Sym: WalkSym>(
                     // pyjitpl.py `compile_exit_frame_with_exception`) so the
                     // frame exits carrying the exception to the caller instead
                     // of aborting the bridge.
-                    _ if finish_is_exception => TraceAction::Finish {
-                        finish_args: vec![finish_arg],
-                        finish_arg_types: vec![majit_ir::Type::Ref],
-                        exit_with_exception: true,
-                        // The full-body walk delivers its own uncaught raise
-                        // through `WALK_END_PROPAGATED_EXCEPTION` (:557), so the
-                        // `raise` half of `finishframe_exception` is already
-                        // covered and no value needs to ride the action.
-                        exc_value: 0,
-                    },
+                    _ if finish_is_exception => {
+                        // `pyjitpl.py finishframe_exception` raises
+                        // `ExitFrameWithExceptionRef` after compile giveup.
+                        // Park the object on the walk-end carrier the portal
+                        // consumes before `fbw_finish_concrete_take`.
+                        park_walk_end_uncaught_exception();
+                        TraceAction::Finish {
+                            finish_args: vec![finish_arg],
+                            finish_arg_types: vec![majit_ir::Type::Ref],
+                            exit_with_exception: true,
+                            exc_value: 0,
+                        }
+                    }
                     _ => TraceAction::Finish {
                         finish_args: vec![finish_arg],
                         finish_arg_types: vec![finish_arg_type],

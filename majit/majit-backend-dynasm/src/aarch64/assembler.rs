@@ -357,9 +357,11 @@ pub(crate) fn build_malloc_slowpath_fixed(
     );
 
     // `_reload_frame_if_necessary` reapplies the frame write barrier after a
-    // moving collection.  No live register needs another save here: all of
-    // them are already resident in the jitframe, while x0 is parked beside
-    // LR across the host helper call.
+    // moving collection (`_write_barrier_fastpath(..., is_frame=True)` →
+    // `wb_slowpath[4]` → `get_write_barrier_fn` = `remember_young_pointer`).
+    // No live register needs another save here: all of them are already
+    // resident in the jitframe, while x0 is parked beside LR across the host
+    // helper call.
     if let Some(wb) = crate::runner::dynasm_write_barrier_descr() {
         let done_wb = mc.new_dynamic_label();
         let byteofs = wb.jit_wb_if_flag_byteofs;
@@ -384,7 +386,7 @@ pub(crate) fn build_malloc_slowpath_fixed(
         crate::aarch64::codebuilder::emit_mov_imm64_to(
             &mut mc,
             16,
-            crate::runner::dynasm_write_barrier as *const () as i64,
+            crate::runner::dynasm_jit_remember_young_pointer as *const () as i64,
         );
         dynasm!(mc ; .arch aarch64
             ; blr x16
@@ -533,14 +535,11 @@ pub(crate) fn build_wb_slowpath(
     use crate::aarch64::registers::{CALLER_RESP, CALLER_VFP_RESP, X19, X20};
     let descr = crate::runner::dynasm_write_barrier_descr()?;
     let func = if !withcards {
-        // `descr.get_write_barrier_fn(cpu)`. The frame takes the guarded
-        // entry, an ordinary store the one `gc.py get_write_barrier_fn`
-        // names.
-        if for_frame {
-            crate::runner::dynasm_write_barrier as *const () as i64
-        } else {
-            crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
-        }
+        // aarch64/assembler.py `_build_wb_slowpath`:
+        // `func = descr.get_write_barrier_fn(self.cpu)` for both
+        // `for_frame` and ordinary stores. `gc.py get_write_barrier_fn`
+        // is `get_write_barrier_failing_case` = `remember_young_pointer`.
+        crate::runner::dynasm_jit_remember_young_pointer as *const () as i64
     } else {
         if descr.jit_wb_cards_set == 0 {
             return None;
@@ -6354,9 +6353,12 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
+        // aarch64/opassembler.py `_genop_call`: `effectinfo is None or
+        // effectinfo.check_can_collect()` then `CallBuilder.emit` /
+        // `emit_no_collect`. A missing CallDescr is the None arm.
         let can_collect = op
             .with_call_descr(|descr| descr.get_extra_info().check_can_collect())
-            .unwrap_or(false);
+            .unwrap_or(true);
         if can_collect && let Some(gcmap) = self.pending_malloc_nursery_gcmap {
             self.push_gcmap(gcmap as *mut usize);
         }

@@ -17314,6 +17314,7 @@ mod rooted_recipe_ref_tests {
             nargs: 0,
             ctor_tail: false,
             len_tail: false,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         }
@@ -17911,9 +17912,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     // writing the virtualizable is still true of the app-level frame.
     let frame_vable = if let Some((frame, _)) = resumed {
         frame
-    } else if let Some(frame) = recipe.rebuilt_frame {
-        frame
-    } else if ctx.bridge_exception_resume_prepared() {
+    } else if recipe.rebuilt_frame.is_none() && ctx.bridge_exception_resume_prepared() {
         return None;
     } else {
         emit_reconstructed_callee_pyframe(ctx, recipe)?
@@ -18148,6 +18147,25 @@ pub(crate) fn setup_reconstructed_callee_frame(
             frame_vable,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
         );
+        // `PyFrame::finish_for_call_with_globals_obj` wrote the live array
+        // through `store_locals_cells_stack_w`; the recorded SETFIELD_GC
+        // still names the unexecuted NewArrayClear. `FieldUpdater.setfield`
+        // after a write that did not go through
+        // `execute_and_record(SETFIELD_GC)`.
+        let live_arr = unsafe { (*concrete_frame_ptr).locals_cells_stack_w };
+        if !live_arr.is_null() {
+            let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
+            let locals_idx = locals_descr.index();
+            let array_opref = match ctx.heapcache_getfield_cached(frame_vable, locals_idx) {
+                Some(cached) => cached,
+                None => ctx.const_ref(live_arr as i64),
+            };
+            let _ = ctx.try_set_opref_concrete(
+                array_opref,
+                majit_ir::Value::Ref(majit_ir::GcRef(live_arr as usize)),
+            );
+            ctx.heapcache_setfield_cached(frame_vable, locals_idx, array_opref);
+        }
         // Pins sit at `slot_root+k` (before the closure tuple). Later
         // `stack_slot_root + (k - stack_base)` therefore equals `slot_root+k`
         // for every live register, locals included.

@@ -509,6 +509,58 @@ pub(crate) fn owner_root_if_gc(addr: usize) -> Option<majit_gc::shadow_stack::Ow
     ))
 }
 
+/// Pin each live Ref in this MIFrame's register file across a collecting
+/// allocation (`getfield` `obj_pin`, `_ll_fixed_alloc_and_set_nonnull_r_trampoline`).
+///
+/// `walk_active_trace_refs` forwards `registers_r` / `RefFrontendOp._resref`.
+/// MiniMark does not scan the Rust locals that hold those words while
+/// `record_op` / `new_array_clear` append to the Trace pool, so the same
+/// words are pinned here and written back through `_resref` and the
+/// register shadow.
+pub(crate) fn pin_live_frame_ref_registers<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Vec<(usize, OpRef, majit_gc::shadow_stack::OwnerRootGuard)> {
+    let n = {
+        let data = ctx.frame_state.borrow();
+        ctx.registers_r.len().min(data.concrete_registers_r.len())
+    };
+    let mut pins = Vec::new();
+    for i in 0..n {
+        let Some(opref) = ctx.registers_r.get(i) else {
+            continue;
+        };
+        if opref.is_none() || opref.is_constant() {
+            continue;
+        }
+        let addr = match ctx.trace_ctx.box_value(opref) {
+            Some(majit_ir::Value::Ref(r)) if r.0 != 0 && r != majit_ir::GcRef::NO_CONCRETE => r.0,
+            _ => match ctx.frame_state.borrow().concrete_registers_r.get(i) {
+                Some(ConcreteValue::Ref(p)) if !p.is_null() => *p as usize,
+                _ => continue,
+            },
+        };
+        if let Some(pin) = owner_root_if_gc(addr) {
+            pins.push((i, opref, pin));
+        }
+    }
+    pins
+}
+
+/// Rewrite each pinned register's `_resref` and shadow to the forwarded word.
+pub(crate) fn refresh_live_frame_ref_registers<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pins: &[(usize, OpRef, majit_gc::shadow_stack::OwnerRootGuard)],
+) {
+    for &(i, opref, ref pin) in pins {
+        let forwarded = pin.get();
+        ctx.trace_ctx
+            .try_set_opref_concrete(opref, majit_ir::Value::Ref(forwarded));
+        if let Some(slot) = ctx.frame_state.borrow_mut().concrete_registers_r.get_mut(i) {
+            *slot = ConcreteValue::Ref(forwarded.0 as pyre_object::PyObjectRef);
+        }
+    }
+}
+
 /// One [`owner_root_if_gc`] per `Ref` concrete, for a fold that carries an
 /// operand list across the Trace-pool appends of its guards and sub-walk.
 pub(crate) fn owner_roots_for_concretes(
@@ -1375,6 +1427,30 @@ pub(crate) fn helper_jitcode_arc(
     })
 }
 
+/// Whether `jitcode.fnaddr` at this helper index can be called.
+///
+/// `handler_inline_call_*` (`blackhole.py`) takes `bhimpl_inline_call_*`
+/// only when `is_callable_fnaddr` holds. A Regular graph with
+/// `fnaddr=None` is interpreted (`interpret_unresolved_inline_call`).
+pub(crate) fn helper_jitcode_fnaddr_is_callable(index: Option<usize>) -> bool {
+    index
+        .and_then(helper_jitcode_arc)
+        .is_some_and(|jc| majit_jitcode::codewriter::call::is_callable_fnaddr(jc.fnaddr))
+}
+
+/// Whether this helper walk is an `MIFrame` the blackhole can `bh_call_*`.
+///
+/// A Regular callee with a non-callable `jitcode.fnaddr` is not that
+/// frame: latching it as innermost skips the enclosing walk's
+/// declined-subwalk recovery (`cut_declined_subwalk`).
+pub(crate) fn helper_frame_is_convertible(
+    transparent_helper_subwalk: bool,
+    transparent_helper_jitcode_index: Option<usize>,
+) -> bool {
+    transparent_helper_subwalk
+        && helper_jitcode_fnaddr_is_callable(transparent_helper_jitcode_index)
+}
+
 /// Jitcode index of the helper body about to be walked.
 ///
 /// `SubJitCodeBody.jitcode_index` is `JitCode.index` (`MIFrame.jitcode`).
@@ -1521,6 +1597,10 @@ pub(crate) fn splice_helper_frames_before_innermost(helpers: Vec<AbortHandoffFra
         let Some(innermost_banks) = latched.banks.pop() else {
             return false;
         };
+        // `helpers` is the unpublished suffix `splice_ancestor_helper_slice`
+        // already filtered by `WalkFrameState` Rc. `convert_and_run_from_pyjitpl`
+        // copies every framestack entry; recursive activations that share a
+        // CALL pc are distinct MIFrames (`_copy_data_from_miframe`).
         for helper in helpers {
             latched.framestack.push(helper.miframe);
             latched.banks.push(helper.banks);
@@ -1559,6 +1639,21 @@ pub(crate) fn build_helper_parent_miframe(
         skip_result,
     )
     .then_some(AbortHandoffFrame { miframe, banks })
+}
+
+/// Unit-test `WalkContext`s leave `snapshot_sym` null, or plant
+/// `PyreSym::new_uninit`'s `null_jitcode()` (index -1). Neither is a portal
+/// `capture_resumedata` can copy.
+#[cfg(test)]
+fn test_helper_snapshot_sym_absent<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    let ptr = ctx.fbw_mode.snapshot_sym;
+    if ptr.is_null() {
+        return true;
+    }
+    unsafe {
+        let jc = (*ptr).jitcode();
+        jc.is_null() || (*jc).index < 0
+    }
 }
 
 #[cfg(test)]
@@ -1648,12 +1743,42 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     resume_pc: usize,
     origin: &'static str,
 ) -> bool {
+    latch_abort_blackhole_innermost(ctx, resume_pc, origin, InnermostMiframeBuild::TraceTooLong)
+}
+
+pub(crate) fn latch_abort_blackhole_innermost<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    resume_pc: usize,
+    origin: &'static str,
+    innermost_build: InnermostMiframeBuild,
+) -> bool {
     if !ctx.is_authoritative_executor {
         latchdbg!("origin={origin} not-authoritative");
         return false;
     }
     if helper_blackhole_resumes_at_call(ctx) {
         latchdbg!("origin={origin} callee-prologue-call-entry");
+        return false;
+    }
+    // Declined-subwalk: `handler_inline_call_*` (`blackhole.py`) takes
+    // `bhimpl_inline_call_*` only when the callee fnaddr is callable, so an
+    // uncallable Regular helper is not a `bh_call_*` target. Keep this gate
+    // so latching that helper as innermost does not skip the enclosing walk's
+    // `cut_declined_subwalk`.
+    //
+    // Trace-too-long: `blackhole_if_trace_too_long` (`pyjitpl.py`) raises
+    // `SwitchToBlackhole(ABORT_TOO_LONG)` and `convert_and_run_from_pyjitpl`
+    // (`blackhole.py`) copies every live MIFrame, helper frames included.
+    // Converting a frame resumes it at its own pc and never calls that
+    // frame's own fnaddr, so this callable gate does not apply.
+    if !matches!(innermost_build, InnermostMiframeBuild::TraceTooLong)
+        && ctx.fbw_mode.transparent_helper_subwalk
+        && !helper_frame_is_convertible(
+            ctx.fbw_mode.transparent_helper_subwalk,
+            ctx.fbw_mode.transparent_helper_jitcode_index,
+        )
+    {
+        latchdbg!("origin={origin} helper-fnaddr-not-callable");
         return false;
     }
     let last_exc_value = match ctx.last_exc_value_concrete() {
@@ -1687,9 +1812,15 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             latchdbg!("origin={origin} no-snapshot-sym-jitcode");
             return false;
         };
-        let Some(AbortHandoffFrame { miframe, banks }) =
-            build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
-        else {
+        let Some(AbortHandoffFrame { miframe, banks }) = (match innermost_build {
+            InnermostMiframeBuild::LiveMarker(lastop) => {
+                build_single_frame_miframe(ctx, jitcode, resume_pc, lastop)
+                    .map(abort_handoff_from_minted)
+            }
+            InnermostMiframeBuild::TraceTooLong => {
+                build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
+            }
+        }) else {
             latchdbg!("origin={origin} sf-build-miframe");
             return false;
         };
@@ -1773,11 +1904,11 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // tests can observe `convert_and_run_from_pyjitpl` /
         // `_copy_data_from_miframe` (`blackhole.py`) of that level.
         #[cfg(test)]
-        if ctx.fbw_mode.transparent_helper_subwalk && ctx.fbw_mode.snapshot_sym.is_null() {
+        if ctx.fbw_mode.transparent_helper_subwalk && test_helper_snapshot_sym_absent(ctx) {
             return latch_test_helper_without_snapshot(ctx, resume_pc, origin, last_exc_value);
         }
         let Some((framestack, banks)) =
-            build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong, origin)
+            build_multi_frame_miframe(ctx, resume_pc, innermost_build, origin)
         else {
             latchdbg!("origin={origin} mf-build-miframe");
             return false;
@@ -3525,7 +3656,7 @@ fn build_parent_miframe_from_paused_live<Sym: WalkSym>(
 }
 
 #[derive(Clone, Copy)]
-enum InnermostMiframeBuild {
+pub(crate) enum InnermostMiframeBuild {
     LiveMarker(Option<(char, usize, i64)>),
     TraceTooLong,
 }
@@ -5640,6 +5771,12 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // passes `PY_NULL` for both tolerances, and `isclose`
                         // reads every slot through its `bound(i)` null filter.
                         "isclose_slow" => nargs == 4,
+                        // `generator_invoke_execute_frame_residual(gen, frame,
+                        // w_inputvalue, throw)` — `next()` on a just-started
+                        // generator passes `PY_NULL` for the sent value, and
+                        // the body tests `w_inputvalue.is_null()` before
+                        // turning it into `Option`.
+                        "generator_invoke_execute_frame_residual" => arg_index == 2 && nargs == 4,
                         _ => false,
                     }
                 })
@@ -5781,7 +5918,7 @@ fn repair_carrier_call_ref_args<Sym: WalkSym>(
 /// bridge resume, etc.).  Mirrors the callee/self resolution in
 /// `try_walker_call_assembler_self_recursive`.
 pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
     helper: majit_ir::RuntimeHelperKind,
 ) -> bool {
@@ -5797,13 +5934,14 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
     let Some(&callable_box) = allboxes.get(1) else {
         return false;
     };
-    let Some(majit_ir::Value::Ref(callable_ref)) = ctx.trace_ctx.box_value(callable_box) else {
+    // `walker_concrete_ref_object` is the object-word reader (`is_method`
+    // / `resolve_inlinable_callee`): a bit-cast small int is a non-null
+    // Ref and not a function. `box_value` has no null/alignment test, so
+    // `py_type_check` loaded `ob_type` from address 1
+    // (`residual_callee_is_walk_self_recursive`, cranelift IPS 07:08).
+    let Some(callable) = walker_concrete_ref_object(ctx, callable_box) else {
         return false;
     };
-    if callable_ref == majit_ir::GcRef::NO_CONCRETE || callable_ref.as_usize() == 0 {
-        return false;
-    }
-    let callable = callable_ref.as_usize() as pyre_object::PyObjectRef;
     unsafe {
         let Some((w_code, _nparams, _has_closure)) = resolve_inlinable_callee(callable) else {
             return false;
@@ -5823,16 +5961,12 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
 /// fold is Branch A (`ncells == 0`); a closure or cell-bearing body
 /// declines there and must not be inlined past `execute_frame` either.
 fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
+    ctx: &mut WalkContext<'_, '_, Sym>,
     callable: OpRef,
 ) -> bool {
-    let Some(majit_ir::Value::Ref(callable_ref)) = ctx.trace_ctx.box_value(callable) else {
+    let Some(obj) = walker_concrete_ref_object(ctx, callable) else {
         return false;
     };
-    if callable_ref == majit_ir::GcRef::NO_CONCRETE || callable_ref.as_usize() == 0 {
-        return false;
-    }
-    let obj = callable_ref.as_usize() as pyre_object::PyObjectRef;
     unsafe {
         let Some((w_code, _nparams, has_closure)) = resolve_inlinable_callee(obj) else {
             return false;
@@ -5881,8 +6015,14 @@ pub(crate) fn recorded_symbolic_funcptr<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     allboxes: &[OpRef],
 ) -> Option<i64> {
-    let funcbox = allboxes.first()?;
-    match ctx.trace_ctx.box_value(*funcbox) {
+    recorded_symbolic_funcptr_box(ctx, *allboxes.first()?)
+}
+
+fn recorded_symbolic_funcptr_box<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    funcbox: OpRef,
+) -> Option<i64> {
+    match ctx.trace_ctx.box_value(funcbox) {
         Some(majit_ir::Value::Int(addr))
             if addr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(addr) =>
         {
@@ -5963,6 +6103,33 @@ thread_local! {
 pub(crate) fn last_declined_symbolic_site()
 -> Option<(&'static std::panic::Location<'static>, OpCode)> {
     DECLINED_SYMBOLIC_SITE.with(|c| c.get())
+}
+
+/// `do_residual_call` / `execute_varargs` always runs the residual it records.
+/// A walk that cannot execute one has no dest (`make_result_of_lastop`) and
+/// must not continue as if it had. Abort at `pc` — the call was not run, so
+/// `convert_and_run_from_pyjitpl` (`blackhole.py`) / `aborted_tracing`
+/// (`pyjitpl.py`) runs it natively. Dest is not live.
+///
+/// `AfterResidualCall` is the executed sibling (pc already past dest).
+/// `PureUnfolded` still continues: recording `CALL_PURE_*` is the tracing
+/// behaviour for an elidable cannot-raise call (`ResidualDecline::PureUnfolded`).
+/// A non-authoritative walk leaves `Ok(Declined)` for the executor test.
+pub(crate) fn stop_unexecuted_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    cause: ResidualDecline,
+    patch_pos: Option<majit_metainterp::recorder::TracePosition>,
+) -> Result<(), DispatchError> {
+    fbw_abort_nested_unjournaled_residual(ctx, pc, Some(cause))?;
+    if !ctx.is_authoritative_executor || matches!(cause, ResidualDecline::PureUnfolded) {
+        fbw_mark_unjournaled_effect(cause);
+        return Ok(());
+    }
+    if let Some(pos) = patch_pos {
+        ctx.trace_ctx.cut_trace_with_snapshots(pos);
+    }
+    Err(DispatchError::DeclinedResidualCall { pc })
 }
 
 /// Helper kinds whose residual mutates live heap while RETURNING a value, so
@@ -6215,6 +6382,56 @@ fn may_force_call_value(
         majit_ir::Type::Ref => Some(majit_ir::Value::Ref(majit_ir::GcRef(result_i64 as usize))),
         majit_ir::Type::Float => Some(majit_ir::Value::Float(f64::from_bits(result_i64 as u64))),
         majit_ir::Type::Void => None,
+    }
+}
+
+/// Ref-typed residual arguments as `blackhole.py` `args_r`: MiniMark does
+/// not scan the Rust/`i64` copies `box_value` made, so the words live on
+/// the resume-ref root stack for the call (`walk_active_trace_refs`).
+/// Each Ref slot is registered in place so `execute_residual_call` reads
+/// the same words the collector rewrites.
+struct ResidualRefArgRoots {
+    depth: usize,
+}
+
+impl ResidualRefArgRoots {
+    fn enter(args: &mut [i64], types: &[majit_ir::Type]) -> Self {
+        let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+        for (i, slot) in args.iter_mut().enumerate() {
+            if matches!(types.get(i), Some(majit_ir::Type::Ref)) {
+                unsafe {
+                    majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(slot));
+                }
+            }
+        }
+        Self { depth }
+    }
+}
+
+impl Drop for ResidualRefArgRoots {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.depth);
+    }
+}
+
+fn refresh_residual_ref_args<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    args: &mut [i64],
+    allboxes: &[OpRef],
+    types: &[majit_ir::Type],
+) {
+    for (i, slot) in args.iter_mut().enumerate() {
+        if !matches!(types.get(i), Some(majit_ir::Type::Ref)) {
+            continue;
+        }
+        let Some(&arg) = allboxes.get(i + 1) else {
+            continue;
+        };
+        if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(arg)
+            && r != majit_ir::GcRef::NO_CONCRETE
+        {
+            *slot = r.as_usize() as i64;
+        }
     }
 }
 
@@ -6604,6 +6821,25 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             }
         }
     }
+    let helper = call_descr.get_extra_info().runtime_helper;
+    // `walker_concrete_ref_object`: a bit-cast small int is a non-null
+    // `Ref` and not an object. `is_builtin_ord_function` loaded `ob_type`
+    // from address 1 (`try_execute_residual_call_via_executor_inner`, cranelift
+    // IPS 07:33). Int/float slots may hold any bit pattern.
+    {
+        let align = std::mem::align_of::<usize>();
+        let types = call_descr.arg_types();
+        for (i, &arg) in args.iter().enumerate() {
+            let bits = arg as usize;
+            if bits == 0 || bits % align == 0 {
+                continue;
+            }
+            match types.get(i) {
+                Some(majit_ir::Type::Int) | Some(majit_ir::Type::Float) => {}
+                _ => return Ok(declined_symbolic(call_opcode)),
+            }
+        }
+    }
     // NULL-Ref-arg refusal. Pyre's
     // optimizer emits `guard_nonnull` after this walker fold, so a NULL
     // receiver dereferences before that guard exists; leave the call
@@ -6611,7 +6847,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // time.  `mayforce_null_ref_arg_is_checked_sentinel` names slots the
     // helper tests before use (`bh_call_fn_N`'s `null_or_self`, …), so a
     // concrete NULL there is executed.
-    let helper = call_descr.get_extra_info().runtime_helper;
     // `bh_load_method_self_fn` dereferences `attr` (`is_method`) before it
     // looks at `obj`. A null or unaligned word is not a PyObject — a
     // bit-cast of 1 reaches this executor as an Int box the Ref null-check
@@ -6628,6 +6863,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     }
     for (i, &arg) in args.iter().enumerate() {
         if arg != 0 || !matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) {
+            continue;
+        }
+        // `pyjitpl.py MIFrame.do_residual_call`: `OS_JIT_FORCE_VIRTUAL` still
+        // `execute_varargs`s after `_do_jit_force_virtual` returns None.
+        // `virtualref.py force_virtual_if_necessary`: NULL is the fast path.
+        if call_descr.get_extra_info().oopspecindex == OopSpecIndex::JitForceVirtual {
             continue;
         }
         // The funcbox coordinate the sentinel table needs to name a leaf the
@@ -7565,6 +7806,13 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 py_pc,
             )
         });
+        // Frame-chain / last_instr setup above can collect after the
+        // earlier `args` refresh. Re-read Ref words from `_resref`
+        // (`walk_active_trace_refs` / `forward_concrete_ref`) and keep
+        // those slots on the resume-ref root stack for the call
+        // (`blackhole.py` `args_r`).
+        refresh_residual_ref_args(ctx, &mut args, allboxes, call_descr.arg_types());
+        let _residual_arg_roots = ResidualRefArgRoots::enter(&mut args, call_descr.arg_types());
         let _suspend = majit_metainterp::TraceContinuationSuspendGuard::enter(ctx.trace_ctx);
         let exec_result =
             majit_metainterp::executor::execute_residual_call(call_descr, func_ptr, &args);
@@ -10831,7 +11079,9 @@ fn try_perform_call<Sym: WalkSym>(
         // another `MIFrame`; the walker is one walk with a reentry flag.
         return Ok(None);
     }
-    let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
+    let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index())
+        .or_else(|| (ctx.sub_jitcode_lookup)(jitcode.index()))
+    else {
         // A jitcode with no body cannot `perform_call`.
         return Ok(None);
     };
@@ -10854,7 +11104,16 @@ fn try_perform_call<Sym: WalkSym>(
     // caller at op_pc; run_sub_jitcode_walk installs the callee's index on
     // its own frame. Installing it here made nested residual descents save
     // the caller's pc against the callee's unrelated bytecode.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let effects_before = fbw_executed_effect_count();
+    let unjournaled_before = fbw_has_unjournaled_effect();
+    let residuals_before = fbw_executed_residual_counts();
     let exc_before = ctx.last_exc_value();
+    // Leave `transparent_helper_jitcode_index` as the caller's `MIFrame.jitcode`
+    // until `run_codewriter_helper_inline_call` has numbered that frame
+    // (`pyjitpl.py` `capture_resumedata` / `perform_call`: the caller stays
+    // paused past its call). Switching to the callee first made
+    // `compute_paused_helper_caller_frame` decode `op_pc` in the callee body.
     let walk = run_codewriter_helper_inline_call(
         ctx,
         op_pc,
@@ -10869,7 +11128,35 @@ fn try_perform_call<Sym: WalkSym>(
     let walk_outcome = match walk {
         Ok(outcome) => outcome,
         Err(error) if abort_blackhole_latched() => return Err(error),
+        Err(
+            error @ (DispatchError::GuardResumeCoordinateUnavailable { .. }
+            | DispatchError::ResidualCallArgUnbound { .. }),
+        ) => {
+            let nothing_applied = fbw_executed_effect_count() == effects_before
+                && !unjournaled_before
+                && !fbw_has_unjournaled_effect();
+            let residual_executed = helper_subwalk_executed_residual(&error, residuals_before);
+            if nothing_applied && !residual_executed {
+                // Resume has no coordinate / an inner residual saw `OpRef::NONE`
+                // before any `do_residual_call`. The call stays residual.
+                cut_declined_subwalk(ctx, pre_fold_pos);
+                return Ok(None);
+            }
+            // `perform_call` already entered this helper. A later unbound
+            // residual is `run_blackhole_interp_to_cancel_tracing` /
+            // `convert_and_run_from_pyjitpl`, not `do_residual_call` of H.
+            return Err(error);
+        }
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. }) => {
+            let nothing_applied = fbw_executed_effect_count() == effects_before
+                && !unjournaled_before
+                && !fbw_has_unjournaled_effect();
+            if nothing_applied {
+                // Subwalk declined before mutating the trace: same as
+                // `do_residual_call` after a failed `perform_call`.
+                cut_declined_subwalk(ctx, pre_fold_pos);
+                return Ok(None);
+            }
             // `perform_call` has entered this generated body. An unlowered
             // operation aborts tracing; it does not change this call into a
             // residual of the Rust function. In particular, a dyn method's
@@ -10891,12 +11178,44 @@ struct RecordedResidual {
     is_list_wb: bool,
     raised: bool,
     can_raise: bool,
+    /// `executor.execute_varargs` ran (`MIFrame.do_residual_call`).
+    executed: bool,
+    /// Non-void dest after `make_result_of_lastop`.
+    lastop: Option<(char, usize, i64)>,
+}
+
+impl RecordedResidual {
+    fn wrap_after_execute(&self, next_pc: usize, error: DispatchError) -> DispatchError {
+        if self.executed {
+            error.after_residual_call(next_pc, self.lastop)
+        } else {
+            error
+        }
+    }
 }
 
 struct ResidualHookState {
     ran: bool,
     recorded: OpRef,
     is_list_wb: bool,
+    lastop: Option<(char, usize, i64)>,
+}
+
+fn lastop_from_recorded_value(
+    dst_bank: char,
+    dst: usize,
+    value: Option<majit_ir::Value>,
+) -> Option<(char, usize, i64)> {
+    if dst_bank == 'v' {
+        return None;
+    }
+    let bits = match value? {
+        majit_ir::Value::Int(n) => n,
+        majit_ir::Value::Ref(majit_ir::GcRef(p)) => p as i64,
+        majit_ir::Value::Float(f) => f.to_bits() as i64,
+        majit_ir::Value::Void => return None,
+    };
+    Some((dst_bank, dst, bits))
 }
 
 /// Record the residual. `list_write_barrier` is the iRd / iIRd stand-in
@@ -11177,6 +11496,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
         ran: false,
         recorded: OpRef::NONE,
         is_list_wb: false,
+        lastop: None,
     };
     let descr_for_record = descr.clone();
     let ei_for_record = ei.clone();
@@ -11224,6 +11544,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
             hook_state.is_list_wb = wb;
             if value.is_some() {
                 write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, rec)?;
+                hook_state.lastop = lastop_from_recorded_value(dst_bank, dst, value);
             }
             Ok(rec)
         };
@@ -11261,6 +11582,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
                 // (`helper_capability_gap_resume_pc`).
                 if hook_state.ran {
                     ctx.live_after_jit_pc = next_pc;
+                    return Err(error.after_residual_call(next_pc, hook_state.lastop));
                 }
                 return Err(error);
             }
@@ -11291,6 +11613,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
         ctx.live_after_jit_pc = next_pc;
     }
     let can_raise = can_raise && recorded.inline_const_to_value().is_none();
+    let executed = matches!(resid_exec, ResidualExecOutcome::Executed(_));
     let raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
         ResidualExecOutcome::Declined(cause) => {
@@ -11304,8 +11627,7 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
                     symbolic: addr,
                 });
             }
-            fbw_abort_nested_unjournaled_residual(ctx, op_pc, Some(cause))?;
-            fbw_mark_unjournaled_effect(cause);
+            stop_unexecuted_residual(ctx, op_pc, cause, Some(patch_pos))?;
             false
         }
     };
@@ -11314,8 +11636,17 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
         "{caller}: helper raised on a `!can_raise` EI — EffectInfo claim/reality mismatch"
     );
 
+    let lastop = hook_state.lastop;
     if posted {
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, recorded)?;
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, recorded).map_err(
+            |error| {
+                if executed {
+                    error.after_residual_call(next_pc, lastop)
+                } else {
+                    error
+                }
+            },
+        )?;
     } else {
         post_recorded_residual_call(
             ctx,
@@ -11341,6 +11672,8 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
         is_list_wb,
         raised,
         can_raise,
+        executed,
+        lastop,
     })
 }
 
@@ -12575,7 +12908,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         ctx.live_after_jit_pc = op.next_pc;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)
+                .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
         }
         // `metainterp.handle_possible_exception()` —
         // emits `GUARD_EXCEPTION(exc_type)` when the recording-time
@@ -12588,7 +12922,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `COND_CALL_GC_WB` cannot raise (`resoperation.py`).
         if can_raise && !is_list_wb {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc)?;
+                walker_record_guard_exception(ctx, op.pc)
+                    .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
                 // `handle_possible_exception` routes
                 // the raising branch through `finishframe_exception()`
                 // immediately after emitting `GUARD_EXCEPTION`, so the
@@ -12622,7 +12957,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                         residual_call_catch_resume: true,
                         ..GuardCaptureScope::default()
                     },
-                )?;
+                )
+                .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
             }
         }
 
@@ -13970,11 +14306,13 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)
+                .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
         }
         if can_raise && !is_list_wb {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc)?;
+                walker_record_guard_exception(ctx, op.pc)
+                    .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
                 // pyjitpl.py `handle_possible_exception`
                 // routes the raising branch through
                 // `finishframe_exception()` immediately after emitting
@@ -14001,7 +14339,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         residual_call_catch_resume: true,
                         ..GuardCaptureScope::default()
                     },
-                )?;
+                )
+                .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
             }
         }
 
@@ -14182,11 +14521,13 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         let can_raise = recorded_residual.can_raise;
         if emit_guard_not_forced {
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[]);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)
+                .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
         }
         if can_raise && !is_list_wb {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc)?;
+                walker_record_guard_exception(ctx, op.pc)
+                    .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
                 // pyjitpl.py `handle_possible_exception`
                 // routes the raising branch through
                 // `finishframe_exception()` immediately after emitting
@@ -14198,7 +14539,8 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[]);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+                walker_capture_snapshot_for_last_guard(ctx, op.pc)
+                    .map_err(|error| recorded_residual.wrap_after_execute(op.next_pc, error))?;
             }
         }
 
@@ -14409,6 +14751,17 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
     // the same way residual_call does.
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(OpCode::CondCallN, Some(&ei), &allboxes);
+    // `opimpl_conditional_call_ir_v` aborts on `is_symbolic_fnaddr` before
+    // `bh_call_v`. A recorded CondCallN whose funcptr is still a hash
+    // compiles to `blr` of that hash when the condition later holds
+    // (`rewrite.py` CondCallN(1) → CallN). Abort even when this iteration
+    // saw a false condition: the compiled op is the later true path.
+    if let Some(addr) = recorded_symbolic_funcptr_box(ctx, funcptr) {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op.pc,
+            symbolic: addr,
+        });
+    }
     let cond_concrete: Option<bool> = match ctx.trace_ctx.box_value(cond) {
         Some(majit_ir::Value::Int(n)) => Some(n != 0),
         _ => match read_int_reg_concrete(code, op, 0, ctx) {
@@ -14520,6 +14873,12 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
     let recorded = ctx.trace_ctx.record_op_with_descr(opcode, &allboxes, descr);
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(opcode, Some(&ei), &allboxes);
+    if let Some(addr) = recorded_symbolic_funcptr_box(ctx, funcptr) {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op.pc,
+            symbolic: addr,
+        });
+    }
     let should_call = match ctx.trace_ctx.box_value(first) {
         Some(majit_ir::Value::Int(n)) => n == 0,
         Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) => p == 0,

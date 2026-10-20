@@ -4356,6 +4356,46 @@ fn returned_pointer_cast_to_u64_is_not_lowered() {
 }
 
 #[test]
+fn returned_pointer_cast_to_byte_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = raw_ptr(&u8_ty(), "Mut");
+    let body = sink_unstructured(&result, &ptr, vec![assign_scalar_cast(0, 1, &ptr, &result)]);
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn byte_pointer_dest_still_frees_when_callee_does_not_return_the_address() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = raw_ptr(&u8_ty(), "Mut");
+    let body = sink_unstructured(&result, &ptr, vec![]);
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn opaque_dynamic_callee_returning_byte_pointer_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = raw_ptr(&u8_ty(), "Mut");
+    let fp = i64_ty();
+    let mut body = sink_unstructured(&result, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("fp"), &fp));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [assign_to(place(2, &fp), const_use())], "kind": "Regular",
+            "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Dynamic": [{"Copy": place(2, &fp)}, {"regions": []}]},
+                    "args": [{"Move": place(1, &ptr)}], "dest": place(0, &result)},
+                "target": 1, "on_unwind": 2
+            }}}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
 fn returned_pointer_cast_through_a_local_is_not_lowered() {
     let (span, _, _, local) = probe_parts();
     let ptr = raw_ptr(&i64_ty(), "Const");

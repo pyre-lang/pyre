@@ -1932,10 +1932,14 @@ impl<'a> Lowering<'a> {
         } else {
             format!("{}::{leaf}", segments.join("::"))
         };
+        let mut ctor_target = CallTarget::synthetic_transparent_struct_ctor(segments, leaf);
+        if td.is_repr_transparent() {
+            ctor_target = ctor_target.with_repr_transparent();
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_struct_ctor(segments, leaf),
+                target: ctor_target,
                 args: Vec::new(),
                 result_ty: ValueType::Ref(Some(owner)),
             },
@@ -2002,10 +2006,7 @@ impl<'a> Lowering<'a> {
         if let Some(descr) = self.span_raw_scalar_ptr_or_atomic(ty) {
             return Some(descr);
         }
-        let id = self.tyref_adt_def_id(ty)?;
-        let td = self.llbc.type_by_id(id)?;
-        let target = std::env::var("TARGET").unwrap_or_default();
-        let size = td.layout_for_target(self.llbc, &target)?.size?;
+        let size = self.tyref_layout_byte_size(ty)?;
         if size == 0 || size > 8 {
             return None;
         }
@@ -2068,6 +2069,16 @@ impl<'a> Lowering<'a> {
             },
         });
         Ok(loaded)
+    }
+
+    pub(in crate::front::mir) fn tyref_layout_byte_size(&self, ty: &TyRef) -> Option<u64> {
+        let id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        // `layout_for_target` refuses a layout whose field offsets are
+        // still `Deduplicated`. `size_align_for_target` still answers
+        // `size_of` (`DynLike` over `HeldUnion` is 16 bytes).
+        td.size_align_for_target(self.llbc, &target)?.0
     }
 
     pub(in crate::front::mir) fn raw_word_descr(
@@ -2758,17 +2769,11 @@ impl<'a> Lowering<'a> {
             header.and_then(|h| self.instantiated_elem_align_of_var(h, field_name)),
             dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, field_name)),
         )
-        .or_else(|| {
-            dest_ty.and_then(|ty| {
-                (self.pair_slice_kind(ty) == Some(majit_ir::rvec::VecItemKind::Int)
-                    && tyref_slice_elem_is_u8(ty, self.llbc))
-                .then_some(1)
-            })
-        });
+        .or_else(|| dest_ty.and_then(|ty| tyref_slice_elem_is_u8(ty, self.llbc).then_some(1)));
         self.array_field_tail_offset(owner, field_name, instantiated_align)
     }
 
-    fn bytes_block_header_of_chars_ptr(
+    pub(in crate::front::mir) fn bytes_block_header_of_chars_ptr(
         &self,
         bb_id: BlockId,
         chars: &Variable,
@@ -2816,10 +2821,27 @@ impl<'a> Lowering<'a> {
                                     | "cast_int_to_ptr"
                                     | "from_exposed_addr"
                                     | "from_exposed_addr_mut"
+                                    | "r_uint"
+                                    | "intmask"
                             )
                         }) =>
                     {
-                        current = args[0].clone().into_variable();
+                        current = args[0]
+                            .as_variable()
+                            .cloned()
+                            .unwrap_or_else(|| args[0].clone().into_variable());
+                    }
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if args.len() == 2
+                        && segments.last().map(String::as_str) == Some("cast_int_to_ptr") =>
+                    {
+                        let Some(addr) = args[1].as_variable() else {
+                            return None;
+                        };
+                        current = addr.clone();
                     }
                     OpKind::Input {
                         ty: ValueType::Str, ..
@@ -3352,10 +3374,12 @@ impl<'a> Lowering<'a> {
     }
 
     pub(in crate::front::mir) fn is_bytes_block_chars(&self, reg: &RegularCall) -> bool {
-        // Replaces `leaf == "bytes_block_chars"` (and `_mut`): a naked
-        // `&[u8]` return whose first input is a `BytesBlock` pointer and
-        // whose body is `from_raw_parts(chars, same-header length)`.
-        callee_returns_bytes_block_slice_of_block_ptr(reg, self.llbc)
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path().rsplit("::").next() == Some("bytes_block_chars")
+        })
     }
 
     pub(in crate::front::mir) fn is_w_bytes_data(&self, reg: &RegularCall) -> bool {
@@ -3551,10 +3575,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// Window data word is `CCHARP` (int-kind address) on every link.
-    /// A GC fat box is split; a GC header is `rffi.cast(CCHARP, p)`;
-    /// a Signed address is `cast_int_to_ptr(CCHARP, int)` (`lltype.py`
-    /// `ann_cast_int_to_ptr`) so merge does not union `Ptr(Array)` with
-    /// `Integer`.
+    /// A GC fat box is split; a STR / BytesBlock header is chars
+    /// (`rstr.py` `STR`, `llmemory.offsetof(STR, 'chars')`); any other
+    /// GC header is `rffi.cast(CCHARP, p)`; a Signed address is
+    /// `cast_int_to_ptr(CCHARP, int)` (`lltype.py` `ann_cast_int_to_ptr`)
+    /// so merge does not union `Ptr(Array)` with `Integer`.
     pub(in crate::front::mir) fn ensure_window_ccharp(
         &mut self,
         mir_bb: usize,
@@ -3567,6 +3592,11 @@ impl<'a> Lowering<'a> {
         }
         if ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
             return ptr;
+        }
+        if self.var_is_string_header_word(&ptr) {
+            let chars = self.chars_ptr_of_header(mir_bb, ptr, lowlevel_string_chars_byte_offset());
+            let bb_id = self.emit_bb(mir_bb);
+            return emit_cast_int_to_ccharp(&mut self.graph, bb_id, chars);
         }
         if self.var_is_gc_ref_value(&ptr) {
             let bb_id = self.emit_bb(mir_bb);
@@ -4089,6 +4119,9 @@ impl<'a> Lowering<'a> {
         range_is_full: bool,
         checked: bool,
     ) -> Result<(Variable, Variable), LowerError> {
+        // A STR / BytesBlock GCREF is the header (`rstr.py` `STR`). The
+        // window data word is chars (`llmemory.offsetof(STR, 'chars')`).
+        let ptr = self.chars_ptr_if_str_header(mir_bb, ptr);
         if range_is_full {
             return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
         }
@@ -4168,6 +4201,18 @@ impl<'a> Lowering<'a> {
             "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
         ) && args.len() == 2
         {
+            // `header.add(CHARS_OFFSET)` is `direct_arrayitems` of
+            // `STR.chars` (`lltype.py`). The dest is CCHARP plus the
+            // supplied length, including a live prefix below capacity.
+            if let Some(ptr) = self.chars_array_view_of_from_raw_parts_ptr(mir_bb, &args[0]) {
+                return Ok((ptr, args[1].clone()));
+            }
+            if self.var_is_string_header_word(&args[0]) {
+                return Ok((
+                    self.ensure_window_ccharp(mir_bb, args[0].clone()),
+                    args[1].clone(),
+                ));
+            }
             let ptr_ty = arg_tys
                 .first()
                 .and_then(Option::as_ref)
@@ -4175,6 +4220,9 @@ impl<'a> Lowering<'a> {
             let ptr = match ptr_ty {
                 Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
                     self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                }
+                Some(ValueType::Ref(_)) if self.from_raw_parts_ptr_already_chars_view(&args[0]) => {
+                    args[0].clone()
                 }
                 Some(ValueType::Ref(_)) => {
                     let bb_id = self.emit_bb(mir_bb);
@@ -4516,6 +4564,8 @@ impl<'a> Lowering<'a> {
                 pure: false,
             },
         });
+        // `W_BytesObject.data` is `*const BytesBlock` / rstr `STR`.
+        stamp_as_rstr_str(&field);
         field
     }
 
@@ -6217,7 +6267,81 @@ impl<'a> Lowering<'a> {
             .flatten()
             .and_then(|local| peel_copy_and_cast(self.llbc, self.body, local))
             .and_then(|base| self.body.locals.locals.get(base))
-            .is_some_and(|decl| tyref_is_lowlevel_string_header_ptr(&decl.ty, self.llbc))
+            .is_some_and(|decl| {
+                tyref_is_lowlevel_string_header_ptr(&decl.ty, self.llbc)
+                    || tyref_is_bytes_block_ptr(&decl.ty, self.llbc)
+            })
+    }
+
+    /// `dest_local` is the pointer of a later `from_raw_parts{,_mut}` whose
+    /// dest is a host `&[u8]` window or `&mut [u8]` pair (`rstr.py` `STR`
+    /// chars stay a displaced address; live prefix length is not
+    /// `ll_strlen`). A matching-length W1 `&[u8]` (no length shadow) still
+    /// needs the add peelable so RegularCall can recover the header.
+    pub(in crate::front::mir) fn add_dest_feeds_window_from_raw_parts(
+        &self,
+        dest_local: usize,
+    ) -> bool {
+        let forward_blocks = forward_reachable_mask(self.llbc, self.body);
+        for (bb_idx, bb) in self.body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            if !regular_call_is_slice_from_raw_parts(reg, self.llbc) || call.args.len() != 2 {
+                continue;
+            }
+            let PlaceKind::Local(frp_dest) = call.dest.kind else {
+                continue;
+            };
+            let frp_dest = frp_dest as usize;
+            if !self.body.locals.locals.get(frp_dest).is_some_and(|loc| {
+                tyref_is_u8_window(&loc.ty, self.llbc)
+                    || tyref_host_u8_pair_item_kind(&loc.ty, self.llbc).is_some()
+            }) {
+                continue;
+            }
+            let Some(ptr_local) = operand_local(call.args.first()) else {
+                continue;
+            };
+            let peeled = peel_copy_and_cast(self.llbc, self.body, ptr_local).unwrap_or(ptr_local);
+            if peeled == dest_local || ptr_local == dest_local {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `direct_arrayitems` of `rstr.py` `STR.chars` (`lltype.py`): CCHARP
+    /// to the chars array. Header identity is the SSA chase
+    /// [`Self::bytes_block_header_of_chars_ptr`] /
+    /// `ptr_add_chars_offset_header` (`peeled_chars_offset`).
+    pub(in crate::front::mir) fn chars_array_view_of_from_raw_parts_ptr(
+        &mut self,
+        mir_bb: usize,
+        ptr: &Variable,
+    ) -> Option<Variable> {
+        let bb_id = self.emit_bb(mir_bb);
+        let header = self.bytes_block_header_of_chars_ptr(bb_id, ptr)?;
+        Some(self.ensure_window_ccharp(mir_bb, header))
+    }
+
+    /// Bound chars pointer is already `CCHARP` / an integer address of
+    /// `STR.chars`. `cast_ptr_to_int` of `r_uint` is
+    /// `rtype_cast_ptr_to_int` `got Some(Unsigned)`.
+    pub(in crate::front::mir) fn from_raw_parts_ptr_already_chars_view(
+        &self,
+        ptr: &Variable,
+    ) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        ptr.concretetype().as_ref().is_some_and(|ty| {
+            lltype_is_ccharp(ty) || matches!(ty, LowLevelType::Signed | LowLevelType::Unsigned)
+        })
     }
 
     /// Later intercepts in this same `RegularCall` match already lower

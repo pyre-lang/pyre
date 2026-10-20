@@ -496,6 +496,17 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
         };
         let _frame_state_root = crate::trace::InlineFrameStateGuard::enter(&wc.frame_state);
+        // pyjitpl.py `walk_active_trace_refs` over this MIFrame's
+        // `registers_r`. `_setup_bank_guard` is a translated extra-area;
+        // `walk_session_roots` must still visit the same holder, including
+        // before a child CALL pauses the frame.
+        super::vable_ops::bind_paused_caller_regs(
+            session,
+            wc.registers_r,
+            wc.registers_i,
+            wc.registers_f,
+            &wc.frame_state,
+        );
         // #73: seed the walk-level operand-stack box mirror
         // at entry.  The mirror is only enabled when the outer sym owns the
         // virtualizable shadow (the production full-body loop trace) — the
@@ -2272,6 +2283,19 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             callee_parents,
             sub_wc.trace_ctx.get_trace_position()._index,
         );
+        // pyjitpl.py `newframe` then `walk_active_trace_refs` over the
+        // reconstructed callee `MIFrame.registers_r`. `enter` leaves
+        // `live: None`; a helper parks on `helper_live` below, a Python
+        // body parks here.
+        if helper_jitcode_index.is_none() {
+            super::vable_ops::bind_paused_caller_regs(
+                session,
+                sub_wc.registers_r,
+                sub_wc.registers_i,
+                sub_wc.registers_f,
+                &sub_wc.frame_state,
+            );
+        }
         let _helper_live = helper_jitcode_index.map(|idx| {
             super::vable_ops::push_helper_live(
                 session,
@@ -2923,6 +2947,7 @@ mod bridge_seed_tests {
             nargs: 0,
             ctor_tail: false,
             len_tail: false,
+            helper_section: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         };

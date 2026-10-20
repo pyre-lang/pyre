@@ -337,6 +337,7 @@ fn raise_ll_memory_error() -> *mut crate::unicodeobject::Utf8Str {
 /// `descr_add` wraps that payload afterwards (`space.newutf8`).
 /// Length overflow (`len1 + len2`) and `mallocstr` failure raise MemoryError
 /// and return null.
+#[majit_macros::oopspec("stroruni.concat(s1, s2)")]
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_strconcat(
     s1: *mut crate::unicodeobject::Utf8Str,

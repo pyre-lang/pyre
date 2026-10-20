@@ -1147,7 +1147,6 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         // when the C char type is u8. Rust's erased managed-byte-pointer
         // convention belongs to Rust bodies, not foreign declarations;
         // agree with tyref_to_external_lltype's Address / getkind('int').
-        let pair_body = unstructured_if_pair_or_result_pair_slice(fd, llbc, error_carrier);
         let token = if fd.is_extern() && tyref_is_raw_pointer(&fd.signature.output, llbc) {
             Some("i64".to_string())
         } else {
@@ -1157,7 +1156,6 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                 error_carrier,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
-                pair_body.as_ref(),
             )
         };
         let class_root = dont_look_inside_return_class_root(
@@ -2940,6 +2938,15 @@ pub(in crate::front::mir) fn ty_is_raw_address(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
+    // A Rust pointer's lowlevel type comes from the pointee declaration
+    // (`lltype.Ptr` of that struct). `Utf8Str` / `BytesBlock` are rstr
+    // `STR` (`rstr.py` `GcStruct('rpy_string', …)`); `*const Utf8Str`,
+    // `*mut Utf8Str`, and `*const BytesBlock` are `Ptr(STR)`, not a raw
+    // address. The current crate's `GcType` harvest may omit a
+    // cross-crate pointee (`bytes_concat` in the interpreter LLBC).
+    if tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
+        return false;
+    }
     let Some(node) = tyref_node(ty, llbc).and_then(|node| type_node_peel_aliases(node, llbc))
     else {
         return false;
@@ -5021,7 +5028,6 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
                 spec,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
-                None,
             )
             .unwrap_or_else(|| "()".to_string()),
         );
@@ -5055,7 +5061,6 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-    body: Option<&Unstructured>,
 ) -> Option<String> {
     // A `Result<T, PyError>` callee is reached through the residual-call
     // ABI, which hands back the `Ok` payload and routes the error through
@@ -5083,17 +5088,15 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     if raw_scalar_address_value_type(kind_src, llbc).is_some() {
         return Some("i64".to_string());
     }
-    // A pair slice returns its item pointer word; the length goes through
-    // the caller's slot (`ret_len_slot_local`, `SLICE_LEN_SLOT_STORE`).
-    // After `result_exc` projects `Result<T, PyError>` to `T`, a pair
-    // slice `T` is that same pair (`kind_src`). A naked `&[u8]` whose
-    // pointer is a `BytesBlock.chars` projection of the same header's
-    // length is one GC Ref; `arraylen_gc` reads length.
-    if tyref_pair_slice_item_kind(kind_src, llbc)
-        .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
-        && !(tyref_slice_elem_is_u8(kind_src, llbc)
-            && body.is_some_and(|body| body_returns_bytes_block_chars_view(body, llbc)))
-    {
+    // A pair slice of a one-word item returns its item pointer word; the
+    // length goes through the caller's slot (`ret_len_slot_local`,
+    // `SLICE_LEN_SLOT_STORE`). After `result_exc` projects
+    // `Result<T, PyError>` to `T`, a pair slice `T` is that same pair
+    // (`kind_src`). Host `&mut [u8]` is a W2 list (`tyref_is_u8_list`):
+    // `pair_len_shadow` leaves it without a length slot, so FUNC.RESULT
+    // follows the CFG GcRef. A `BytesBlock.chars` view is one STR Ref;
+    // `arraylen_gc` reads length.
+    if tyref_pair_slice_item_kind(kind_src, llbc).is_some() {
         return Some("u64".to_string());
     }
     // A function-return tuple is `model.py SomeTuple` (`rtuple.py`).
@@ -7127,10 +7130,7 @@ pub(in crate::front::mir) fn struct_decls_by_owner(llbc: &Llbc) -> &StructDeclsB
     })
 }
 
-pub(in crate::front::mir) fn type_decl_by_owner_root<'l>(
-    llbc: &'l Llbc,
-    owner: &str,
-) -> Option<&'l TypeDecl> {
+fn type_decl_by_owner_root<'l>(llbc: &'l Llbc, owner: &str) -> Option<&'l TypeDecl> {
     let index = struct_decls_by_owner(llbc);
     let start = index.exact.partition_point(|(k, _)| k.as_str() < owner);
     if let Some((key, pos)) = index.exact.get(start)
@@ -10791,13 +10791,9 @@ pub(in crate::front::mir) fn u8_pair_item_ty(item_ty: &ValueType) -> ValueType {
 }
 
 /// Host `&[u8]` / `&mut [u8]` / `*const [u8]` / `*mut [u8]`, including
-/// `Option` of those. The `(ptr, len)` pair item is `u8`.
+/// `Option` of those. Independent of pair-slice classification: a
+/// BytesBlock-backed `[u8]` view is still this element type.
 pub(in crate::front::mir) fn tyref_slice_elem_is_u8(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_pair_slice_item_kind(ty, llbc) != Some(majit_ir::rvec::VecItemKind::Int) {
-        if tyref_option_pair_slice_item_kind(ty, llbc) != Some(majit_ir::rvec::VecItemKind::Int) {
-            return false;
-        }
-    }
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
         return false;
     };

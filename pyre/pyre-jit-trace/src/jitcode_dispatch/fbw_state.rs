@@ -4250,9 +4250,26 @@ pub(crate) fn fbw_terminate_with_raise<Sym: WalkSym>(
     let payload = (exc, Type::Ref);
     ctx.session.borrow_mut().finish_payload = Some(payload);
     FBW_FINISH_IS_EXCEPTION.with(|c| c.set(true));
-    if let ConcreteValue::Ref(p) = exc_concrete {
+    // `Raise` is null-guarded for GC-rooting. A residual that published
+    // only through `BH_LAST_EXC_VALUE` still has a live exception object;
+    // without this the portal sees `Finish { exit_with_exception: true }`
+    // and an empty concrete, then `ContinueRunningNormally` replays a
+    // spent raise (`pyjitpl.py finishframe_exception` always raises
+    // `ExitFrameWithExceptionRef` after `compile.giveup()`).
+    let concrete = match exc_concrete {
+        ConcreteValue::Ref(p) if !p.is_null() => exc_concrete,
+        _ => {
+            let raw = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+            if raw != 0 {
+                ConcreteValue::Ref(raw as pyre_object::PyObjectRef)
+            } else {
+                exc_concrete
+            }
+        }
+    };
+    if let ConcreteValue::Ref(p) = concrete {
         if !p.is_null() {
-            fbw_finish_raise_set(exc_concrete);
+            fbw_finish_raise_set(concrete);
         }
     }
     payload

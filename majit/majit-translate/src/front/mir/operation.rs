@@ -3287,6 +3287,7 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
                 });
                 let src_ty_owned = operand_tyref(&operand).cloned();
+
                 let v = self.resolve_operand(mir_bb, operand)?;
                 let src_is_pointer = self.pointer_word_vars.contains(&v)
                     || src_is_pointer_from_ty
@@ -4057,10 +4058,13 @@ impl<'a> Lowering<'a> {
                     self.exception_disc_vars.insert(base.id(), info);
                     return Ok((None, base));
                 }
-                // `*p` on a raw address is the enum's bytes, not the
-                // explicit sum shell. Load the host tag and decode it to
-                // the variant index `host_variant_index` returns;
-                // `SwitchInt` on this `Discriminant` compares that index.
+                // A data-carrying enum's host tag word is not the variant
+                // index when rustc niched it. Load that word (raw address
+                // or GC-ref) and decode it to the index `host_variant_index`
+                // returns; `SwitchInt` on this `Discriminant` compares that
+                // index. `jtransform.py` / `flatten.py` switch on the rtyped
+                // integer `exitswitch` produces — value and switchdict keys
+                // stay in one domain.
                 if let Some(decoded) = self.lower_raw_pointer_discriminant(mir_bb, &place)? {
                     return Ok((None, decoded));
                 }
@@ -4337,9 +4341,12 @@ impl<'a> Lowering<'a> {
         Ok(Some(self.resolve_place(mir_bb, (**inner).clone())?))
     }
 
-    /// `Discriminant(*p)` and `Discriminant((*p).field)` when the enum is
-    /// a Raw host layout with a tag. `None` leaves the explicit-shell read.
-    pub(in crate::front::mir) fn lower_raw_pointer_discriminant(
+    /// `Discriminant(*p)` / `Discriminant((*p).field)` on a raw address, and
+    /// `Discriminant` of a GC-ref data-carrying enum. Loads the host tag
+    /// word and decodes it to the variant index `host_variant_index`
+    /// returns. `None` leaves the explicit-shell read (or a later one-word
+    /// Option niche test).
+    fn lower_raw_pointer_discriminant(
         &mut self,
         mir_bb: usize,
         place: &Place,
@@ -4347,7 +4354,7 @@ impl<'a> Lowering<'a> {
         let Some(tag) = self.raw_enum_host_tag(&place.ty) else {
             return Ok(None);
         };
-        let (base, extra_offset) = match &place.kind {
+        let raw = match &place.kind {
             PlaceKind::Projection(inner, ProjectionElem::Atom(elem))
                 if elem == "Deref"
                     && ty_is_raw_address(
@@ -4357,7 +4364,12 @@ impl<'a> Lowering<'a> {
                         &self.raw_alloc_flavor_structs,
                     ) =>
             {
-                (self.resolve_place(mir_bb, (**inner).clone())?, 0u64)
+                let base = self.resolve_place(mir_bb, (**inner).clone())?;
+                let Some(total) = i64::try_from(tag.offset).ok() else {
+                    return Ok(None);
+                };
+                let offset = self.emit_i64(mir_bb, total);
+                self.emit_raw_tag_load(mir_bb, base, offset, (tag.bits / 8) as usize)
             }
             PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
@@ -4365,18 +4377,36 @@ impl<'a> Lowering<'a> {
                         self.struct_field_offset_from_payload(&inner.ty, field_payload)
                     && let Some(addr) = self.raw_deref_address(mir_bb, inner)? =>
             {
-                (addr, field_off)
+                let Some(total) = field_off.checked_add(tag.offset) else {
+                    return Ok(None);
+                };
+                let Some(total) = i64::try_from(total).ok() else {
+                    return Ok(None);
+                };
+                let offset = self.emit_i64(mir_bb, total);
+                self.emit_raw_tag_load(mir_bb, addr, offset, (tag.bits / 8) as usize)
             }
-            _ => return Ok(None),
+            _ => {
+                // One-word Option niches are a null / scalar test on the
+                // payload word, not an aggregate `__discriminant` load.
+                // Those arms run after this helper returns `None`.
+                if self.tyref_is_niche_option_ptr(&place.ty)
+                    || tyref_option_fieldless_niche(&place.ty, self.llbc).is_some()
+                    || option_nonzero_word_kind_deref_receiver(&place.ty, self.llbc).is_some()
+                {
+                    return Ok(None);
+                }
+                // GC-ref or `&Enum`: the host tag sits on that object at
+                // `discriminant_offset`. `CodeLocations` is Copy and not a
+                // GC type, so the match subject is a `Ref` to the value
+                // (`HashMap::get`); the tag load is still a field read of
+                // `__discriminant`, then `emit_host_variant_index` maps a
+                // Niche encoding (tag 0 = Deferred, anything else =
+                // Decoded) to the variant index SwitchInt compares.
+                let base = self.resolve_place(mir_bb, place.clone())?;
+                self.emit_gc_tag_load(mir_bb, base, &place.ty)
+            }
         };
-        let Some(total) = extra_offset.checked_add(tag.offset) else {
-            return Ok(None);
-        };
-        let Some(total) = i64::try_from(total).ok() else {
-            return Ok(None);
-        };
-        let offset = self.emit_i64(mir_bb, total);
-        let raw = self.emit_raw_tag_load(mir_bb, base, offset, (tag.bits / 8) as usize);
         Ok(Some(self.emit_host_variant_index(mir_bb, raw, &tag)))
     }
 
@@ -4428,6 +4458,56 @@ impl<'a> Lowering<'a> {
                 true,
             )
             .expect("BinOp produces a value")
+    }
+
+    /// Host tag word of a pointer-to-enum (GC-ref or `&Enum`). The
+    /// synthetic `__discriminant` field is that word at
+    /// `discriminant_offset`; `getfield_gc_i` / `getfield_raw_i` loads
+    /// it. `emit_host_variant_index` then maps the niche encoding to the
+    /// variant index.
+    fn emit_gc_tag_load(&mut self, mir_bb: usize, base: Variable, ty: &TyRef) -> Variable {
+        let (owner_root, owner_id) = match self.tyref_adt_class_root(ty) {
+            Some(class_root) => {
+                let canon = decl_path_for_tombstone(&class_root, self.tombstoned_leaves);
+                let sid = self.tyref_adt_layout_id(ty).unwrap_or_else(|| {
+                    let bare = majit_ir::descr::strip_instantiation_suffix(&canon);
+                    majit_ir::descr::StructId::from_canonical(bare)
+                });
+                (Some(canon), Some(sid))
+            }
+            None => (None, None),
+        };
+        let disc_owner_gc = container_declared_gc(
+            ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+            &self.raw_alloc_flavor_structs,
+        );
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph
+            .push_op_var(
+                bb_id,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor {
+                        name: "__discriminant".to_string(),
+                        owner_root,
+                        owner_id,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: disc_owner_gc,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("gc tag load produces a value")
     }
 
     /// Zero-extending load of the tag word. `host_variant_index` masks to
@@ -5275,6 +5355,10 @@ impl<'a> Lowering<'a> {
             let res = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            // `op_gc_restore_root` / `GCRefRepr.convert_from_to` yields
+            // `Ptr(STR)` (`rstr.py` `STRPTR`). Same stamp as a same-type
+            // `cast_pointer` (`stamp_as_rstr_str` on the aliased word).
+            stamp_as_rstr_str(&res);
             return Some((
                 crate::model::cast_instance_call_result(root, arg.clone(), ValueType::Str),
                 res,
@@ -6231,6 +6315,21 @@ impl<'a> Lowering<'a> {
         !["core::", "alloc::", "std::"]
             .iter()
             .any(|prefix| field_path.starts_with(prefix))
+    }
+
+    /// LLBC `TypeDecl::is_repr_transparent` of the destination ADT.
+    pub(in crate::front::mir) fn dest_is_repr_transparent(&self, dest_ty: &TyRef) -> bool {
+        let dest = self
+            .tyref_peel_ref_to_pointee(dest_ty)
+            .unwrap_or_else(|| dest_ty.clone());
+        let Some(node) = tyref_node(&dest, self.llbc) else {
+            return false;
+        };
+        let decl_id = adt_node_def_id(node)
+            .or_else(|| strip_ty_wrappers(node, self.llbc).and_then(adt_node_def_id));
+        decl_id
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.is_repr_transparent())
     }
 
     /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
@@ -7317,6 +7416,10 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(concretetype_for_field(&ty));
+                    // `W_BytesObject.data: *const BytesBlock` is `Ptr(STR)`
+                    // from the pointee declaration (`rstr.py` `STR`).
+                    stamp_rstr_str_ptr_from_pointee(&res, &place_ty, self.llbc);
+                    stamp_rstr_str_ptr_from_pointee(&res, &field_ty, self.llbc);
                     let narrow_instance_class = container_is_enum
                         && field_name == "__pos_0"
                         && self.enum_payload_is_nullable_instance_ptr(&place_ty);
@@ -8621,6 +8724,19 @@ impl<'a> Lowering<'a> {
                 transparent: false,
             });
         }
+        // `PyError(ptr)` is one pointer word (`retag_error_carrier`).
+        // `tyref_transparent_inner_value_type` returns None for a
+        // transparent GC handle so the wrapper class is kept; that
+        // would emit Ctor + New + setfield. Projection (`self.0` /
+        // `cast_off_error_carrier`) is identity on the same word, so a
+        // New handle is not the residual dest the next call reads
+        // (`pyjitpl.py` `_record_helper` / `make_result_of_lastop`).
+        if n_operands == 1 && self.ty_is_error_carrier(dest_ty) {
+            return Ok(AggregateShape::Operand {
+                index: 0,
+                transparent: true,
+            });
+        }
         if tyref_transparent_inner_value_type(
             dest_ty,
             self.llbc,
@@ -8723,7 +8839,15 @@ impl<'a> Lowering<'a> {
             // Resolved to a `TypeDeclKind::Struct`, so the value is
             // its field writes and nothing else; `jtransform` may
             // lower the constructor to a bare allocation.
-            CallTarget::synthetic_transparent_struct_ctor(owner_path.clone(), ctor_name.clone())
+            let target = CallTarget::synthetic_transparent_struct_ctor(
+                owner_path.clone(),
+                ctor_name.clone(),
+            );
+            if self.dest_is_repr_transparent(dest_ty) {
+                target.with_repr_transparent()
+            } else {
+                target
+            }
         } else if let Some(tag) = enum_variant_tag {
             // A resolved enum variant records its declaration
             // index so a payload-less variant folded to a

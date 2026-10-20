@@ -5562,6 +5562,7 @@ mod tests {
                     size: 8,
                     align: 8,
                     gckind: majit_translate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    repr_transparent: false,
                     fields: vec![StructFieldLayout {
                         name: "f".into(),
                         offset: 0,

@@ -1768,6 +1768,77 @@ impl syn::parse::Parse for PyreClassAttrs {
     }
 }
 
+/// Word-ABI residual trampolines for `allocate` / `allocate_stable`.
+///
+/// `#[dont_look_inside]` skips a by-value `Self` payload
+/// (`HelperFnAddrSkip::Other`): `helper_arg_from_i64` cannot rebuild
+/// `Self`, and `stringify!(Self)` is not the class name, so a
+/// `module_path!()::allocate` HELPER_FNADDRS row would collide across
+/// every class in the module. This expander knows `#st_name` and emits
+/// one Ref-word trampoline per constructor (`std::ptr::read` of the
+/// payload, then the real allocate), the ABI residual_call_r_r uses.
+fn emit_pyre_class_allocate_word_fnaddrs(st_name: &syn::Ident) -> proc_macro2::TokenStream {
+    let methods = ["allocate", "allocate_stable"];
+    let parts = methods.map(|method| {
+        let trampoline = format_ident!("__majit_call_target_{st_name}_{method}");
+        let ctor = format_ident!("__majit_register_helper_fnaddr_{st_name}_{method}");
+        let method_ident = format_ident!("{method}");
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_snake_case, dead_code)]
+            extern "C" fn #trampoline(payload: i64) -> i64 {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+                    #[linkme(crate = ::majit_ir::linkme)]
+                    #[allow(non_upper_case_globals, unused)]
+                    static __MAJIT_HELPER_FNADDR: ::majit_ir::helper_fnaddr::HelperFnAddr =
+                        ::majit_ir::helper_fnaddr::HelperFnAddr::new(
+                            ::core::concat!(
+                                ::core::module_path!(),
+                                "::",
+                                stringify!(#st_name),
+                                "::",
+                                stringify!(#method_ident),
+                            ),
+                            #trampoline as *const (),
+                            1,
+                            "w>w",
+                        );
+                }
+                ::majit_ir::icf_identity!(::core::concat!(
+                    ::core::module_path!(),
+                    "::",
+                    stringify!(#st_name),
+                    "::",
+                    stringify!(#method_ident),
+                ));
+                let payload = unsafe { ::std::ptr::read(payload as *const #st_name) };
+                #st_name::#method_ident(payload) as usize as i64
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            #[::ctor::ctor(unsafe)]
+            #[allow(non_snake_case)]
+            fn #ctor() {
+                ::majit_ir::helper_fnaddr::register(
+                    ::core::concat!(
+                        ::core::module_path!(),
+                        "::",
+                        stringify!(#st_name),
+                        "::",
+                        stringify!(#method_ident),
+                    ),
+                    #trampoline as *const (),
+                    1,
+                    "w>w",
+                );
+            }
+        }
+    });
+    quote! { #(#parts)* }
+}
+
 fn expand_pyre_class(
     attrs: PyreClassAttrs,
     mut st: ItemStruct,
@@ -2205,6 +2276,8 @@ fn expand_pyre_class(
         (quote! {}, quote! {})
     };
 
+    let allocate_word_fnaddrs = emit_pyre_class_allocate_word_fnaddrs(&st_name);
+
     Ok(quote! {
         #st
 
@@ -2371,6 +2444,8 @@ fn expand_pyre_class(
 
             #allocate_instance_fn
         }
+
+        #allocate_word_fnaddrs
     })
 }
 

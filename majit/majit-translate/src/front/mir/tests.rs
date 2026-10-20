@@ -3246,7 +3246,7 @@ pub(in crate::front::mir) fn window_const_slice_ptr() -> serde_json::Value {
     serde_json::json!({"RawPtr": [window_slice(), "Const"]})
 }
 
-fn window_const_u8_ptr() -> serde_json::Value {
+pub(in crate::front::mir) fn window_const_u8_ptr() -> serde_json::Value {
     serde_json::json!({"RawPtr": [window_u8(), "Const"]})
 }
 
@@ -3275,7 +3275,7 @@ pub(in crate::front::mir) fn window_llbc(
     window_llbc_with_globals(types, funs, Vec::new())
 }
 
-fn window_llbc_with_globals(
+pub(in crate::front::mir) fn window_llbc_with_globals(
     types: Vec<serde_json::Value>,
     funs: Vec<serde_json::Value>,
     globals: Vec<serde_json::Value>,
@@ -14646,7 +14646,7 @@ fn opaque_fun(def_id: u64, path: &[&str]) -> serde_json::Value {
     })
 }
 
-fn chars_offset_global(def_id: u64, leaf: &str) -> serde_json::Value {
+pub(in crate::front::mir) fn chars_offset_global(def_id: u64, leaf: &str) -> serde_json::Value {
     serde_json::json!({
         "def_id": def_id,
         "item_meta": item_meta_json(
@@ -15071,7 +15071,7 @@ fn unique_chars_from_raw_parts_llbc(
             "kind": {"Assign": [
                 dest,
                 {"Use": [
-                    {"Copy": window_place(
+                    {"Read": window_place(
                         serde_json::json!({"Local": chars0_local}),
                         &chars_ptr_ty
                     )},
@@ -15086,7 +15086,7 @@ fn unique_chars_from_raw_parts_llbc(
             "span": window_span(),
             "kind": {"Assign": [
                 window_place(serde_json::json!({"Local": len_local}), &n),
-                {"Use": [{"Copy": place}, "No"]}
+                {"Use": [{"Read": place}, "No"]}
             ]}
         }));
     } else {
@@ -15096,7 +15096,7 @@ fn unique_chars_from_raw_parts_llbc(
             "kind": {"Assign": [
                 window_place(serde_json::json!({"Local": len_local}), &n),
                 {"Use": [
-                    {"Copy": window_place(serde_json::json!({"Local": src}), &n)},
+                    {"Read": window_place(serde_json::json!({"Local": src}), &n)},
                     "No"
                 ]}
             ]}
@@ -15114,11 +15114,9 @@ fn unique_chars_from_raw_parts_llbc(
             "generics": window_empty_generics()
         }},
         "args": [
-            {"Copy": window_place(serde_json::json!({"Local": other_local}), &other_ty)},
-            {"Copy": window_place(serde_json::json!({"Local": len_local}), &n)}
-        ],
-        "dest": window_place(serde_json::json!({"Local": 0}), &dest_ty)
-    }, "target": if split_call { 3 } else { 2 }, "on_unwind": 1}});
+            {"Read": window_place(serde_json::json!({"Local": other_local}), &other_ty)},
+            {"Read": window_place(serde_json::json!({"Local": len_local}), &n)}
+        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &dest_ty), "target": if split_call { 3 } else { 2 }, "on_unwind": 1}});
     let mut body = Vec::new();
     if split_call {
         body.push(serde_json::json!({
@@ -15200,7 +15198,7 @@ fn header_ptr_from_raw_parts_without_offset_llbc(name: &str) -> Llbc {
         "span": window_span(),
         "kind": {"Assign": [
             window_place(serde_json::json!({"Local": 2}), &n),
-            {"Use": [{"Copy": len_place}, "No"]}
+            {"Use": [{"Read": len_place}, "No"]}
         ]}
     })];
     let from_raw = window_opaque_fun(
@@ -15215,11 +15213,9 @@ fn header_ptr_from_raw_parts_without_offset_llbc(name: &str) -> Llbc {
             "generics": window_empty_generics()
         }},
         "args": [
-            {"Copy": window_place(serde_json::json!({"Local": 1}), &header_ptr)},
-            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
-        ],
-        "dest": window_place(serde_json::json!({"Local": 0}), &dest_ty)
-    }, "target": 2, "on_unwind": 1}});
+            {"Read": window_place(serde_json::json!({"Local": 1}), &header_ptr)},
+            {"Read": window_place(serde_json::json!({"Local": 2}), &n)}
+        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &dest_ty), "target": 2, "on_unwind": 1}});
     let caller = serde_json::json!({
         "def_id": 0,
         "item_meta": window_meta(&["fixture", name], true),
@@ -15263,6 +15259,182 @@ fn from_raw_parts_header_ptr_without_offset_is_not_rewritten() {
         !graph_return_aliases_start_input(&graph, 0),
         "header ptr without offset must not alias dest to the header; graph: {graph:#?}"
     );
+}
+
+/// `from_raw_parts{,_mut}(header.add(CHARS_OFFSET), live_len)`: the dest is
+/// `direct_arrayitems` of `STR.chars` (`lltype.py`) plus the supplied live
+/// prefix, not the header itself (`rstr.py` `STR`; live length may be
+/// below capacity).
+fn live_prefix_chars_from_raw_parts_llbc(name: &str, mut_dest: bool) -> Llbc {
+    let offset_n = window_usize();
+    let dest_ty = if mut_dest {
+        window_mut_slice()
+    } else {
+        window_shared_slice()
+    };
+    let u8_ptr = if mut_dest {
+        window_mut_u8_ptr()
+    } else {
+        window_const_u8_ptr()
+    };
+    let add_path: &[&str] = if mut_dest {
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"]
+    } else {
+        &["core", "ptr", "const_ptr", "<Impl>", "add"]
+    };
+    let frp_path: &[&str] = if mut_dest {
+        &["core", "slice", "raw", "from_raw_parts_mut"]
+    } else {
+        &["core", "slice", "raw", "from_raw_parts"]
+    };
+    let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let header_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": window_empty_generics()}
+    });
+    let header_ptr =
+        serde_json::json!({"RawPtr": [header_adt.clone(), if mut_dest { "Mut" } else { "Const" }]});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": isize_t, "attr_info": null},
+            {"name": "length", "ty": offset_n, "attr_info": null}
+        ]},
+        "layout": null
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let add = window_opaque_fun(
+        1,
+        add_path,
+        vec![u8_ptr.clone(), offset_n.clone()],
+        u8_ptr.clone(),
+    );
+    let from_raw = window_opaque_fun(
+        2,
+        frp_path,
+        vec![u8_ptr.clone(), offset_n.clone()],
+        dest_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", name], true),
+        "signature": {"is_unsafe": true, "inputs": [header_ptr, offset_n], "output": dest_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &dest_ty),
+                window_local(1, &header_ptr),
+                window_local(2, &offset_n),
+                window_local(3, &u8_ptr),
+                window_local(4, &u8_ptr)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &u8_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [header_ptr, u8_ptr]}},
+                                {"Move": window_place(serde_json::json!({"Local": 1}), &header_ptr)}
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Move": window_place(serde_json::json!({"Local": 3}), &u8_ptr)},
+                            {"Read": window_place(serde_json::json!({"Global": {
+                                "generics": window_empty_generics(),
+                                "id": 1
+                            }}), &offset_n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 4}), &u8_ptr), "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Move": window_place(serde_json::json!({"Local": 4}), &u8_ptr)},
+                            {"Read": window_place(serde_json::json!({"Local": 2}), &offset_n)}
+                        ]}, "dest": window_place(serde_json::json!({"Local": 0}), &dest_ty), "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    window_llbc_with_globals(
+        vec![utf8],
+        vec![caller, add, from_raw],
+        vec![
+            serde_json::Value::Null,
+            chars_offset_global(1, "LOWLEVEL_STRING_CHARS_OFFSET"),
+        ],
+    )
+}
+
+fn assert_live_prefix_chars_view(graph: &crate::model::FunctionGraph, frp_leaf: &str) {
+    use crate::model::OpKind;
+    assert!(
+        !graph_calls_leaf(graph, frp_leaf),
+        "live-prefix chars view must inline from_raw_parts; graph: {graph:#?}"
+    );
+    assert!(
+        !graph_return_aliases_start_input(graph, 0),
+        "live-prefix dest must not alias to the STR header; graph: {graph:#?}"
+    );
+    let offset = super::lowlevel_string_chars_byte_offset() as i64;
+    let consts: Vec<i64> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstInt(v) => Some(*v),
+            OpKind::ConstUInt(v) => i64::try_from(*v).ok(),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        consts.contains(&offset),
+        "chars view keeps STR.chars offset; consts={consts:?} graph: {graph:#?}"
+    );
+}
+
+#[test]
+fn from_raw_parts_live_prefix_len_is_chars_array_view() {
+    let llbc = live_prefix_chars_from_raw_parts_llbc(
+        "from_raw_parts_live_prefix_len_is_chars_array_view",
+        false,
+    );
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "from_raw_parts_live_prefix_len_is_chars_array_view",
+    )
+    .expect("lower live-prefix from_raw_parts");
+    assert_live_prefix_chars_view(&graph, "from_raw_parts");
+}
+
+#[test]
+fn from_raw_parts_mut_live_prefix_len_is_chars_array_view() {
+    let llbc = live_prefix_chars_from_raw_parts_llbc(
+        "from_raw_parts_mut_live_prefix_len_is_chars_array_view",
+        true,
+    );
+    let graph = crate::test_support::lower_function(
+        &llbc,
+        "from_raw_parts_mut_live_prefix_len_is_chars_array_view",
+    )
+    .expect("lower live-prefix from_raw_parts_mut");
+    assert_live_prefix_chars_view(&graph, "from_raw_parts_mut");
 }
 
 /// A unique address-taken array field is not `direct_arrayitems` of a
@@ -15786,6 +15958,178 @@ fn utf8str_as_u8_add_of_chars_offset_aliases_the_header() {
             .iter()
             .any(|leaf| *leaf == "add"),
         "the header chars add must not residualize; graph={graph:#?}"
+    );
+}
+
+/// `*const BytesBlock as *mut Utf8Str` is dest-Str restore to
+/// `Ptr(STR)` (`type BytesBlock = Utf8Str`). The result carries
+/// `STRPTR`.
+fn bytes_block_as_mut_utf8str_fun() -> Llbc {
+    let utf8_adt = serde_json::json!({
+        "Adt": { "id": 0, "generics": empty_generics() }
+    });
+    let bytes_block_adt = serde_json::json!({
+        "Adt": { "id": 1, "generics": empty_generics() }
+    });
+    let src_ptr = serde_json::json!({ "RawPtr": [bytes_block_adt, "Const"] });
+    let dest_ptr = serde_json::json!({ "RawPtr": [utf8_adt, "Mut"] });
+    let isize_t = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let usize_t = usize_ty();
+    let utf8str = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+            "",
+            true
+        ),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": isize_t, "attr_info": null},
+            {"name": "length", "ty": usize_t, "attr_info": null}
+        ]},
+        "layout": null
+    });
+    let bytes_block = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta_json(
+            &["pyre_object", "bytesobject", "BytesBlock"],
+            "",
+            true
+        ),
+        "kind": {"Alias": { "aliased_ty": {
+            "Adt": { "id": 0, "generics": empty_generics() }
+        }}}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta_json(&["fixture", "cast_bytes_block"], "", true),
+        "signature": {"is_unsafe": true, "inputs": [src_ptr], "output": dest_ptr},
+        "body": {"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": dest_ptr},
+                {"index": 1, "name": "s", "span": span_json(), "ty": src_ptr}
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": dest_ptr},
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [src_ptr, dest_ptr]}},
+                                {"Move": {"kind": {"Local": 1}, "ty": src_ptr}}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }
+            ]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [utf8str, bytes_block],
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes())
+        .expect("BytesBlock as *mut Utf8Str fixture parses")
+}
+
+#[test]
+fn bytes_block_as_mut_utf8str_cast_result_is_strptr() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let llbc = bytes_block_as_mut_utf8str_fun();
+    let src_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "RawPtr": [{ "Adt": { "id": 1, "generics": empty_generics() } }, "Const"]
+    }))
+    .expect("src TyRef");
+    let dest_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "RawPtr": [{ "Adt": { "id": 0, "generics": empty_generics() } }, "Mut"]
+    }))
+    .expect("dest TyRef");
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = super::no_tombstoned_leaves();
+    assert!(
+        super::tyref_raw_ptr_pointee_is_string_value(&src_ty, &llbc),
+        "*const BytesBlock pointee is rstr STR"
+    );
+    assert!(
+        super::tyref_raw_ptr_pointee_is_string_value(&dest_ty, &llbc),
+        "*mut Utf8Str pointee is rstr STR"
+    );
+    let empty_flavor = std::collections::HashSet::<String>::new();
+    assert!(
+        !super::ty_is_raw_address(&src_ty, &llbc, &gc, &empty_flavor),
+        "*const BytesBlock is Ptr(STR), not a raw address"
+    );
+    assert!(
+        matches!(
+            super::tyref_to_value_type_with(&src_ty, &llbc, tomb, &gc, &empty_flavor),
+            crate::model::ValueType::Str
+        ),
+        "*const BytesBlock is ValueType::Str"
+    );
+    assert!(
+        matches!(
+            super::tyref_to_value_type_with(&dest_ty, &llbc, tomb, &gc, &empty_flavor),
+            crate::model::ValueType::Str
+        ),
+        "*mut Utf8Str is ValueType::Str"
+    );
+
+    let graph = super::lower_function(&llbc, "cast_bytes_block")
+        .expect("lower *const BytesBlock as *mut Utf8Str");
+    let start = graph
+        .blocks
+        .iter()
+        .find(|b| b.id == graph.startblock)
+        .expect("startblock");
+    let input = start
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Input { name, ty, .. } if name == "s" => {
+                assert!(
+                    matches!(ty, ValueType::Str),
+                    "Input *const BytesBlock is ValueType::Str"
+                );
+                op.result.clone()
+            }
+            _ => None,
+        })
+        .expect("Input s");
+    assert_eq!(
+        input.concretetype(),
+        Some(STRPTR.clone()),
+        "*const BytesBlock param is Ptr(STR); graph={graph:#?}"
+    );
+    // The returnblock inputarg is a fresh `returnvar_`; the cast
+    // result is the value the startblock link carries.
+    let ret = start
+        .exits
+        .iter()
+        .find(|link| link.target == graph.returnblock)
+        .and_then(|link| link.args.first())
+        .expect("return link arg");
+    let LinkArg::Value(v) = ret else {
+        panic!("return link is a value; graph={graph:#?}");
+    };
+    assert_eq!(
+        v.concretetype(),
+        Some(STRPTR.clone()),
+        "cast result is Ptr(STR); graph={graph:#?}"
     );
 }
 
@@ -25725,9 +26069,8 @@ fn rbuilder_ll_grow_by_ovfchecks_lift_to_add_ovf() {
 /// `bytes_block_chars` is `rstr.py` `ll_chars`: the
 /// `from_raw_parts(chars, length)` view must fold to the managed `STR`
 /// header instead of surviving as an opaque Rust call. Loads the real
-/// pyre-object LLBC, so ignored by default.
+/// pyre-object LLBC.
 #[test]
-#[ignore]
 fn bytes_block_chars_folds_header_length_view() {
     use crate::model::{CallTarget, OpKind};
     let path = concat!(
@@ -25783,7 +26126,7 @@ fn w_bytearray_data_aliases_to_bytes_block_header() {
     use crate::model::{CallTarget, OpKind};
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     );
     let llbc = Llbc::load(path).expect("load pyre-object LLBC");
     let graph = super::lower_function(&llbc, "w_bytearray_data").expect("lower w_bytearray_data");
@@ -25859,52 +26202,6 @@ fn w_bytearray_data_aliases_to_bytes_block_header() {
     );
 }
 
-/// The object-bytes payload intercept is the unique BytesBlock-pointer
-/// field of arg0 (pointer result or chars-view), not a callee-name list.
-/// `w_bytearray_data` uses a live length distinct from the header, and
-/// `bytes_like_data` has two owner ADTs, so neither matches. Loads the
-/// real pyre-object LLBC, so ignored by default.
-#[test]
-#[ignore]
-fn object_bytes_block_field_is_unique_header_field_of_arg0() {
-    use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall};
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
-    );
-    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
-    let classify = |name: &str| {
-        let fd = llbc
-            .local_fn(name)
-            .unwrap_or_else(|| panic!("missing {name}"));
-        let reg = RegularCall {
-            kind: CallKind::Fun(FunId::Regular { id: fd.def_id }),
-            generics: serde_json::Value::Null,
-        };
-        super::callee_returns_object_bytes_block_field(&reg, &llbc)
-    };
-    assert!(
-        classify("w_bytes_data"),
-        "w_bytes_data returns the chars-view of arg0's BytesBlock field"
-    );
-    assert!(
-        classify("w_bytes_block"),
-        "w_bytes_block returns arg0's BytesBlock pointer field"
-    );
-    assert!(
-        !classify("bytes_block_chars"),
-        "bytes_block_chars takes a BytesBlock pointer, not an object"
-    );
-    assert!(
-        !classify("w_bytearray_data"),
-        "w_bytearray_data is a host pair (length_relaxed)"
-    );
-    assert!(
-        !classify("bytes_like_data"),
-        "bytes_like_data has bytes and bytearray arms"
-    );
-}
-
 /// `dict_entries_get_str` passes `key.as_bytes()` (`&str` → STR header
 /// view) to `hash_str_hooked_bytes(&[u8])`, whose naked `&[u8]` is the
 /// host pair. The call site must splice `(chars_ptr, ll_strlen)`.
@@ -25915,7 +26212,7 @@ fn str_as_bytes_to_host_pair_callee_splices_chars_and_strlen() {
     use crate::model::{CallTarget, OpKind};
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     );
     let llbc = Llbc::load(path).expect("load pyre-object LLBC");
     let graph =
@@ -26002,7 +26299,7 @@ fn read_slice_range_index_is_getslice() {
     use crate::model::{CallTarget, OpKind};
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
     let graph = super::lower_function(
@@ -26072,7 +26369,7 @@ fn read_slice_range_index_is_getslice() {
     );
     let object_llbc = Llbc::load(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     ))
     .expect("load pyre-object LLBC");
     let callee =
@@ -26148,7 +26445,7 @@ fn bytesio_read_range_index_is_getslice() {
     use crate::model::{CallTarget, OpKind};
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
     let graph = super::lower_function(
@@ -30492,43 +30789,116 @@ fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
     );
 }
 
-#[test]
-fn option_usize_try_none_returns_enclosing_niche_null() {
-    // `w_list_getitem_inner` does `ll_getitem_index(...)?`.
-    // `front::option_try` is the Rust-idiom lowering of `Try::branch`
-    // → `FromResidual`; closest rtyper analog is a nullable
-    // `SomeInstance` miss (`lltype.nullptr`). The None arm must
-    // return the enclosing `Option<PyObjectRef>` None (C-null via
-    // `push_niche_null`). A leftover `Option<usize>` None recast
-    // onto that return is a heap object on `REF_RETURN`.
-    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
-    let graph =
-        super::lower_function(&llbc, "w_list_getitem_inner").expect("lower w_list_getitem_inner");
-    assert_eq!(
-        count_method_calls(&graph, "branch"),
-        0,
-        "w_list_getitem_inner: residual Try::branch after Option `?` lowering"
+/// `quasiimmut.py make_invalidation_function.invalidation` after #201
+/// deleted the `#[jit_llop]` stand-in: `if is_installed { sweep }`.
+/// `is_installed` is an Acquire load of `QuasiImmutField.ptr`, the same
+/// Atomic load fold `test_mir_atomic_load` uses for a `?` field.
+fn quasi_immut_invalidation_llbc() -> Llbc {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let unit = interior_unit_ty();
+    let field_adt = interior_adt(0);
+    let field_ref = option_shared_ref(field_adt.clone());
+    let ptr_ty = interior_raw_mut(interior_adt(0));
+    let notify = interior_caller(
+        "jit_force_quasi_immutable",
+        1,
+        vec![field_ref.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("field"), &field_ref),
+            interior_local(2, Some("installed"), &bool_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &field_ref))],
+                    interior_place(2, &bool_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {
+                        "Switch": {
+                            "discr": {"Read": interior_place(2, &bool_ty)},
+                            "targets": {"If": [3, 4]}
+                        }
+                    }
+                }),
+            ),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(1, &field_ref))],
+                    interior_place(0, &unit),
+                    4,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_return()),
+        ],
     );
-    assert_eq!(
-        count_method_calls(&graph, "from_residual"),
-        0,
-        "w_list_getitem_inner: residual from_residual after Option `?` lowering"
-    );
-    let has_niche_null = graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => segments.iter().any(|s| s == "null_mut" || s == "null"),
-            OpKind::ConstRefNull => true,
-            _ => false,
-        })
+    let is_installed = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["quasiimmut", "QuasiImmutField", "is_installed"], true),
+        "signature": {"is_unsafe": true, "inputs": [field_ref.clone()], "output": bool_ty},
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        interior_local(0, None, &bool_ty),
+                        interior_local(1, Some("self"), &field_ref),
+                        interior_local(2, Some("ptr"), &ptr_ty)
+                    ]
+                },
+                "body": [interior_bb(
+                    vec![
+                        interior_assign(
+                            interior_place(2, &ptr_ty),
+                            interior_use(interior_field(1, &field_ref, &field_adt, &ptr_ty, 0)),
+                        ),
+                        interior_assign(
+                            interior_place(0, &bool_ty),
+                            serde_json::json!({"BinaryOp": [
+                                "Ne",
+                                interior_copy(interior_place(2, &ptr_ty)),
+                                interior_copy(interior_place(2, &ptr_ty))
+                            ]}),
+                        ),
+                    ],
+                    interior_return(),
+                )]
+            }
+        }
     });
-    assert!(
-        has_niche_null,
-        "w_list_getitem_inner: enclosing Option<PyObjectRef> None must be C-null"
+    let sweep = interior_opaque(
+        2,
+        &["quasiimmut", "sweep_quasi_immut_field"],
+        vec![field_ref],
+        unit,
     );
+    let owner = interior_struct(
+        0,
+        &["quasiimmut", "QuasiImmutField"],
+        &[("ptr", ptr_ty)],
+        8,
+        &[0],
+        false,
+    );
+    llbc_with_types("fixture", vec![owner], vec![notify, is_installed, sweep])
 }
 
 #[test]
@@ -30537,10 +30907,10 @@ fn notify_version_watchers_traces_installed_check() {
     // the installed check (`is_installed`, Acquire load of
     // `QuasiImmutField.ptr`) stays in the trace as `getfield_gc`;
     // only `sweep_quasi_immut_field` is residual.
-    // Native spelling is `ModuleDictStrategy::jit_force_quasi_immutable`
-    // (`warmspot.py rewrite_force_quasi_immutable`).
-    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    // #201 dropped `ModuleDictStrategy::jit_force_quasi_immutable`; the
+    // fixture is that invalidation graph (`warmspot.py
+    // rewrite_force_quasi_immutable`).
+    let llbc = quasi_immut_invalidation_llbc();
     let notify = super::lower_function(&llbc, "jit_force_quasi_immutable")
         .expect("lower jit_force_quasi_immutable");
     let notify_calls: Vec<String> = notify
@@ -30591,9 +30961,9 @@ fn look_inside_unit_signature_stamps_void_result() {
     // void so the codewriter widens the returnblock.
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "_setitem_str_cell_known")
         .expect("lower _setitem_str_cell_known");
     assert_eq!(graph.return_type.as_deref(), Some("()"));

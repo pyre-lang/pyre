@@ -7696,6 +7696,29 @@ pub extern "C" fn compare_slot_jit_abi(a: PyObjectRef, b: PyObjectRef, op: i64) 
     }
 }
 
+/// One-word residual ABI for [`list_concat`].
+///
+/// `PyResult` is sret, so the raw function cannot be a residual-call target.
+/// The callee keeps its graph; this is the address `getfunctionptr` would
+/// have supplied.
+#[inline(never)]
+pub extern "C" fn list_concat_jit_abi(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    match unsafe { list_concat(a, b) } {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
+}
+
+/// One-word residual ABI for [`str_repeat`]. Same sret reason as
+/// [`list_concat_jit_abi`].
+#[inline(never)]
+pub extern "C" fn str_repeat_jit_abi(s: PyObjectRef, n: PyObjectRef) -> PyObjectRef {
+    match unsafe { str_repeat(s, n) } {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
+}
+
 /// Comparison operator enum (mirrors RustPython's ComparisonOperator).
 #[derive(Debug, Clone, Copy)]
 pub enum CompareOp {
