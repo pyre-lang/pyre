@@ -1900,6 +1900,14 @@ fn cast_instance_intrinsic(
         // not a fresh ListDef per projection. `setbinding` then `contains`
         // the same object on reflow (`TLS.no_side_effects_in_union`).
         bk.project_list_spelling_at_position(&root)
+    } else if majit_ir::descr::is_shaped_tuple_name(&root) {
+        // `KwargsDictStrategy.copy` unerase (`kwargsdict.py`): GCREF to
+        // the tuple of two lists. Same projection
+        // `derive_subject_inputcells` uses for a `Tuple<A,B>` parameter
+        // (`Bookkeeper::project_shaped_tuple`). `stable_projected_root`
+        // caches list-bearing tuples so reflow `setbinding` sees the
+        // same ListDefs.
+        bk.stable_projected_root(&root)
     } else {
         // One projection per position (`Bookkeeper.getlistdef`,
         // bookkeeper.py). Reflow setbinding then sees the same ListDefs.
@@ -4016,6 +4024,84 @@ mod tests {
         )
         .expect("a SomeTuple operand passes through");
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn cast_instance_gcref_to_tuple_of_vecs_is_sometuple_and_getitem_is_somelist() {
+        // `KwargsDictStrategy.copy` unerase (`kwargsdict.py`): GCREF
+        // `dstorage` recast to the tuple of two lists, then `dstorage[0]`
+        // (`rtuple.py` `rtype_getitem`). One-word `Vec<*mut PyObject>`
+        // items are `SomeRustVec` (`rust_vec_item_kind_for_spelling`);
+        // a multi-word item (`Vec<String>`) is the SomeList the list
+        // arm of `project_struct_field_type` yields.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{Constant, Hlvalue, Variable};
+        use crate::flowspace::operation::{HLOperation, OpKind};
+
+        let bk = bk();
+        let s_gcref = crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        );
+        assert!(
+            matches!(s_gcref, SomeValue::Ptr(_)),
+            "GCREF source must be SomePtr, got {s_gcref:?}"
+        );
+        let list_root = "Tuple<Vec<String>,Vec<String>>";
+        let s_list_root = bk
+            .immutablevalue(&ConstValue::byte_str(list_root))
+            .expect("list-bearing tuple root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_gcref.clone()), Some(s_list_root)],
+            &no_kwds(),
+        )
+        .expect("GCREF to Tuple<Vec<String>,Vec<String>> unerase must annotate");
+        let SomeValue::Tuple(tuple) = &out else {
+            panic!("GCREF unerase dest must be SomeTuple, got {out:?}");
+        };
+        assert_eq!(tuple.items.len(), 2);
+        assert!(
+            matches!(tuple.items[0], SomeValue::List(_)),
+            "__pos_0 item must already be SomeList, got {:?}",
+            tuple.items[0]
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let mut v_tuple = Variable::named("dstorage");
+        ann.setbinding(&mut v_tuple, out);
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![
+                Hlvalue::Variable(v_tuple),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+            ],
+        );
+        let item = hl.consider(&ann).unwrap().unwrap();
+        assert!(
+            matches!(item, SomeValue::List(_)),
+            "getitem(unerase, 0) must be SomeList, got {item:?}"
+        );
+
+        let kwargs_root = "Tuple<Vec<*mut PyObject>,Vec<*mut PyObject>>";
+        let s_kwargs_root = bk
+            .immutablevalue(&ConstValue::byte_str(kwargs_root))
+            .expect("kwargs tuple root constant");
+        let kwargs = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_gcref), Some(s_kwargs_root)],
+            &no_kwds(),
+        )
+        .expect("GCREF to Tuple<Vec<*mut PyObject>,Vec<*mut PyObject>> unerase must annotate");
+        let SomeValue::Tuple(kwargs_tuple) = &kwargs else {
+            panic!("kwargs unerase dest must be SomeTuple, got {kwargs:?}");
+        };
+        assert!(
+            matches!(kwargs_tuple.items[0], SomeValue::RustVec(_)),
+            "one-word Vec<*mut PyObject> item is SomeRustVec, got {:?}",
+            kwargs_tuple.items[0]
+        );
     }
 
     #[test]

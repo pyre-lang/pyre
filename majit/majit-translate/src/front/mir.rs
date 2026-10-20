@@ -18779,31 +18779,51 @@ impl<'a> Lowering<'a> {
     /// on the result type, so a later `ptr::write` compares owners by
     /// path. A class root that is already qualified, or that carries an
     /// instantiation suffix, stays the result type too.
-    fn instance_narrow_for_type(&self, dest_ty: &TyRef, arg: &Variable) -> Option<OpKind> {
+    ///
+    /// A GCREF source recast onto a tuple or list container is
+    /// `KwargsDictStrategy.copy` unerase (`kwargsdict.py`):
+    /// `lltype.cast_opaque_ptr` from GCREF to the tuple of two lists.
+    /// Aliasing would leave `SomePtr(GCREF)` for a later `dstorage[0]`
+    /// getitem (`rtuple.py` `rtype_getitem`). Named-struct dests keep
+    /// the classdef arm regardless of source.
+    fn instance_narrow_for_type(
+        &self,
+        dest_ty: &TyRef,
+        arg: &Variable,
+        src_root: Option<&str>,
+    ) -> Option<OpKind> {
         // Fieldless enums are ints. A classdef here is the
         // `pair(rtype_eq) (InstanceRepr, IntegerRepr)` wall: the tag
         // compare becomes `eq` of a minted empty instance with `ConstInt`.
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
             return None;
         }
-        let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
-        let result_owner = self
-            .cast_dest_layout_owner(dest_ty)
-            .filter(|owner| {
-                !root.contains("::")
-                    && !root.contains('<')
-                    && owner.rsplit("::").next() == Some(root.as_str())
-            })
-            .unwrap_or_else(|| root.clone());
-        Some(if result_owner == root {
-            crate::model::cast_instance_call(root, arg.clone())
-        } else {
-            crate::model::cast_instance_call_result(
-                root,
-                arg.clone(),
-                ValueType::Ref(Some(result_owner)),
-            )
-        })
+        if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
+            let result_owner = self
+                .cast_dest_layout_owner(dest_ty)
+                .filter(|owner| {
+                    !root.contains("::")
+                        && !root.contains('<')
+                        && owner.rsplit("::").next() == Some(root.as_str())
+                })
+                .unwrap_or_else(|| root.clone());
+            return Some(if result_owner == root {
+                crate::model::cast_instance_call(root, arg.clone())
+            } else {
+                crate::model::cast_instance_call_result(
+                    root,
+                    arg.clone(),
+                    ValueType::Ref(Some(result_owner)),
+                )
+            });
+        }
+        if src_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling) {
+            let node = strip_ty_wrappers(tyref_node(dest_ty, self.llbc)?, self.llbc)?;
+            if let Some(root) = raw_ptr_pointee_container_root(node, self.llbc) {
+                return Some(crate::model::cast_instance_call(root, arg.clone()));
+            }
+        }
+        None
     }
 
     /// Declaration path of `dest_ty`'s struct, reduced the way a
@@ -18880,7 +18900,7 @@ impl<'a> Lowering<'a> {
                     ValueType::Ref(None),
                 )
             } else {
-                let kind = self.instance_narrow_for_type(dest_ty, arg)?;
+                let kind = self.instance_narrow_for_type(dest_ty, arg, src_root)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -27177,12 +27197,24 @@ impl<'a> Lowering<'a> {
                     // the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
-                    if let ValueType::Ref(_) = tyref_to_value_type_with(
-                        &call.dest.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                    ) && let Some(kind) = self.instance_narrow_for_type(&call.dest.ty, &args[0])
+                    let dest_is_ref = matches!(
+                        tyref_to_value_type_with(
+                            &call.dest.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        ),
+                        ValueType::Ref(_)
+                    );
+                    let src_root = first_arg_ty.as_ref().and_then(|ty| {
+                        tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
+                    });
+                    if dest_is_ref
+                        && let Some(kind) = self.instance_narrow_for_type(
+                            &call.dest.ty,
+                            &args[0],
+                            src_root.as_deref(),
+                        )
                     {
                         let array_tail =
                             self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?;
@@ -65829,14 +65861,19 @@ fn raw_ptr_pointee_class_root_with(
     adt_node_class_root_with(strip_ty_wrappers(raw.first()?, llbc)?, llbc, tombstoned)
 }
 
-/// The projected list root of a raw pointer onto a Rust container.
+/// The projected list or tuple root of a raw pointer onto a Rust container.
 ///
 /// RPython keeps pointers to `GcArray` values typed, including null pointers
 /// (`lltype.nullptr(ARRAY)`).  Rust's corresponding owner can be a
 /// `*mut Vec<T>` field, which otherwise enters the annotator as a
 /// classdef-less pointer and cannot union with the `SomeList` produced when
-/// the array is allocated.  Return the same rendered container spelling
-/// `Bookkeeper::project_struct_field_type` consumes at the cast boundary.
+/// the array is allocated.  A `*const (Vec<T>, Vec<T>)` is the kwargs
+/// unerase dest (`KwargsDictStrategy.copy` `unerase` /
+/// `lltype.cast_opaque_ptr`): Charon spells the builtin tuple as `(A,B)`,
+/// while FieldRead owners and `is_shaped_tuple_name` use `Tuple<A,B>`.
+/// Return the same rendered container spelling
+/// `Bookkeeper::project_struct_field_type` / `project_shaped_tuple`
+/// consume at the cast boundary.
 fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let pointee = node
         .as_object()?
@@ -65844,6 +65881,9 @@ fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Opti
         .as_array()?
         .first()
         .and_then(|node| strip_ty_wrappers(node, llbc))?;
+    if let Some(root) = tyref_shaped_tuple_root(&TyRef::Other(pointee.clone()), llbc) {
+        return Some(root);
+    }
     let rendered = charon_type_value_to_ast_string(pointee, llbc, 0);
     (rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") || rendered.starts_with('['))
         .then_some(rendered)
@@ -98456,6 +98496,280 @@ mod tests {
         ));
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!("Unsize")));
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!({"Scalar": []})));
+    }
+
+    /// `*mut GCREFOpaque` and `*const (Vec<*mut PyObject>, Vec<*mut PyObject>)`
+    /// — the kwargs unerase dest (`KwargsDictStrategy.copy` `unerase`).
+    fn kwargs_unerase_ptr_tys() -> (serde_json::Value, serde_json::Value) {
+        let empty_g = empty_generics();
+        let adt = |id: u64| {
+            serde_json::json!({
+                "Adt": {"id": id, "generics": empty_g.clone()}
+            })
+        };
+        let gcref_ptr = serde_json::json!({"RawPtr": [adt(0), "Mut"]});
+        let vec_item = serde_json::json!({"RawPtr": [adt(1), "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {
+                "id": 2,
+                "generics": {
+                    "regions": [],
+                    "types": [vec_item],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let tuple_ty = serde_json::json!({
+            "Adt": {
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [vec_ty.clone(), vec_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let dest_ptr = serde_json::json!({"RawPtr": [tuple_ty, "Const"]});
+        (gcref_ptr, dest_ptr)
+    }
+
+    fn kwargs_unerase_type_decls() -> Vec<serde_json::Value> {
+        vec![
+            type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_struct(1, &["fixture", "PyObject"], vec![]),
+            type_decl_struct(2, &["alloc", "vec", "Vec"], vec![]),
+        ]
+    }
+
+    fn gctype_impl_row(self_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [{
+                    "Value": [self_id, {
+                        "Adt": {
+                            "id": self_id,
+                            "generics": empty_generics()
+                        }
+                    }]
+                }]}
+            }
+        })
+    }
+
+    fn gctype_trait_decl() -> serde_json::Value {
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["majit_gc", "header", "GcType"], "", false)
+        })
+    }
+
+    fn kwargs_unerase_cast_llbc(src_is_gcref: bool) -> Llbc {
+        let (gcref_ptr, dest_ptr) = kwargs_unerase_ptr_tys();
+        let src_ty = if src_is_gcref {
+            gcref_ptr.clone()
+        } else {
+            serde_json::json!({
+                "RawPtr": [{
+                    "Adt": {"id": 1, "generics": empty_generics()}
+                }, "Mut"]
+            })
+        };
+        let span = span_json();
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "unerase"], "", true),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ptr.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ptr.clone()},
+                    {"index": 1, "name": "dstorage", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [src_ty.clone(), dest_ptr.clone()]}},
+                                {"Move": place(1, &src_ty)}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let impls = if src_is_gcref {
+            serde_json::json!([gctype_impl_row(0)])
+        } else {
+            serde_json::json!([gctype_impl_row(1)])
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": kwargs_unerase_type_decls(),
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [gctype_trait_decl()],
+                "trait_impls": impls
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("kwargs unerase fixture parses")
+    }
+
+    #[test]
+    fn raw_ptr_pointee_container_root_names_a_tuple_of_vecs() {
+        let llbc = kwargs_unerase_cast_llbc(true);
+        let (_, dest_ptr) = kwargs_unerase_ptr_tys();
+        let root = super::raw_ptr_pointee_container_root(&dest_ptr, &llbc)
+            .expect("tuple-of-vecs dest must be a container root");
+        assert!(
+            majit_ir::descr::is_shaped_tuple_name(&root),
+            "dest spelling must be Tuple<...>, got {root}"
+        );
+        assert!(
+            root.contains("Vec<") && root.contains("PyObject"),
+            "tuple items must be Vec of PyObject pointers, got {root}"
+        );
+    }
+
+    #[test]
+    fn gcref_cast_to_tuple_of_vecs_emits_cast_instance_marker() {
+        let llbc = kwargs_unerase_cast_llbc(true);
+        let graph = super::lower_function(&llbc, "unerase").expect("lower GCREF unerase");
+        let roots: Vec<&str> = graph_ops(&graph)
+            .iter()
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert!(
+            roots
+                .iter()
+                .any(|root| majit_ir::descr::is_shaped_tuple_name(root)),
+            "GCREF as *const (Vec, Vec) must emit __cast_instance_intrinsic; roots={roots:?}"
+        );
+    }
+
+    #[test]
+    fn non_gcref_cast_to_tuple_of_vecs_aliases() {
+        let llbc = kwargs_unerase_cast_llbc(false);
+        let graph = super::lower_function(&llbc, "unerase").expect("lower PyObject unerase");
+        let roots: Vec<&str> = graph_ops(&graph)
+            .iter()
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert!(
+            roots
+                .iter()
+                .all(|root| !majit_ir::descr::is_shaped_tuple_name(root)),
+            "a non-GCREF source must keep today's alias; roots={roots:?}"
+        );
+    }
+
+    #[test]
+    fn gcref_field_cast_to_tuple_graph_annotates_sometuple_and_pos0_list() {
+        // Synthetic graph, not LLBC-backed: Input(GCREF) then unerase
+        // marker then `__pos_0` FieldRead (`rtuple.py` `rtype_getitem`).
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomeValue;
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+        // Multi-word Vec items project to SomeList. Production kwargs
+        // `Vec<*mut PyObject>` is one-word and projects to SomeRustVec
+        // (`rust_vec_item_kind_for_spelling`); the lowering tests above
+        // keep that spelling.
+        let tuple_root = "Tuple<Vec<String>,Vec<String>>";
+        let mut graph = FunctionGraph::new("kwargs_unerase");
+        let entry = graph.startblock;
+        let dstorage = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "dstorage".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("GCREF".to_string()),
+                },
+                true,
+            )
+            .expect("input");
+        graph.push_inputarg_var(entry, dstorage.clone());
+        let unerased = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call(tuple_root, dstorage),
+                true,
+            )
+            .expect("cast");
+        let item0 = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: unerased,
+                    field: FieldDescriptor::new("__pos_0", Some(tuple_root.to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("pos_0");
+        graph.set_return(entry, Some(item0));
+
+        let marker = graph_ops(&graph)
+            .iter()
+            .find_map(|op| crate::model::cast_instance_root(&op.kind));
+        assert_eq!(marker, Some(tuple_root));
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift unerase graph");
+        crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+        let start = lifted.graph.borrow().startblock.clone();
+        let n_inputs = start.borrow().inputargs.len();
+        let gcref = crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        );
+        let cells: Vec<Option<SomeValue>> = (0..n_inputs).map(|_| Some(gcref.clone())).collect();
+        ann.addpendingblock(&lifted.graph, &start, &cells);
+        ann.complete_pending_blocks()
+            .expect("GCREF unerase then getitem(0) must annotate");
+        let ret = lifted.graph.borrow().getreturnvar();
+        let s_ret = ann.binding(&ret);
+        assert!(
+            matches!(s_ret, SomeValue::List(_)),
+            "__pos_0 of the unerase tuple must annotate SomeList, got {s_ret:?}"
+        );
+    }
+
+    /// Anchor the unerase marker to real `kwargs_storage`. Ignored by
+    /// default (loads pyre-object.ullbc).
+    #[test]
+    #[ignore]
+    fn kwargs_storage_unerase_emits_cast_instance() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load pyre-object.ullbc");
+        let graph = super::lower_function(&llbc, "kwargs_storage").expect("lower kwargs_storage");
+        let roots: Vec<&str> = graph_ops(&graph)
+            .iter()
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert!(
+            roots
+                .iter()
+                .any(|root| majit_ir::descr::is_shaped_tuple_name(root)),
+            "kwargs_storage unerase must emit Tuple<Vec,Vec> marker; roots={roots:?}"
+        );
     }
 
     #[test]
