@@ -4572,9 +4572,16 @@ fn run_perfn_walk<Sym: WalkSym>(
     // plain-portal function entries and loop headers. A bridge starts at its
     // guard resume py_pc, outside that sidecar by construction.
     let is_plain_portal = !ctx.is_bridge_trace;
-    let is_loop_header =
-        !pjc.code_ptr.is_null() && start_pc_is_loop_header(unsafe { &*pjc.code_ptr }, start_pc);
-    let is_entry_green = start_pc == 0 || is_loop_header;
+    let (is_loop_header, code_entry_pc) = if pjc.code_ptr.is_null() {
+        (false, 0)
+    } else {
+        let code = unsafe { &*pjc.code_ptr };
+        (
+            start_pc_is_loop_header(code, start_pc),
+            pyre_interpreter::after_return_generator_index(code),
+        )
+    };
+    let is_entry_green = start_pc == code_entry_pc || is_loop_header;
     let uses_entry_sidecar = is_plain_portal && is_entry_green;
     let sidecar_entry = pjc.merge_entry_for(start_pc);
     let entry_coord = if sym.bridge_walk_entry_pc().is_some() {
@@ -6389,7 +6396,19 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         .abort_permanents
         .iter()
         .copied()
-        .filter(|&pc| pc > merge_point);
+        .filter(|&pc| pc > merge_point)
+        .filter(|&pc| {
+            // `YIELD_VALUE` lowers to `abort_permanent` as the suspension
+            // marker (`codewriter` `Instruction::YieldValue`). That is
+            // `dispatch`'s `except Yield` (`interp_jit.py`), which
+            // `compile_done_with_this_frame`s (`pyjitpl.py`). A scan that
+            // treats it as an unported in-loop opcode declines the
+            // function-entry walk of a generator whose first yield sits in
+            // a loop (a genexpr) before the walk can FINISH.
+            !abort_permanent_owner(w_code, &pjc, pc).is_some_and(|(_, instr)| {
+                matches!(instr, pyre_interpreter::Instruction::YieldValue { .. })
+            })
+        });
 
     // A backward goto closes the loop headed at `merge_point` only when it
     // jumps to that header.  One that jumps further back closes an ENCLOSING

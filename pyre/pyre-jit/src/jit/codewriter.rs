@@ -15938,7 +15938,7 @@ impl CodeWriter {
         // with the runtime translator's exact precedence while the codewriter
         // still owns the marker tables: sparse carry-forward override first,
         // otherwise the derivable resume marker. This is deliberately only
-        // the set of trace-entry greens (function entry and loop headers), not
+        // the set of trace-entry greens (`after_return_generator_index` and loop headers), not
         // a general coordinate inverse.
         //
         // A header this body never lowered does NOT qualify.  `abort_permanent`
@@ -15967,7 +15967,11 @@ impl CodeWriter {
                 .is_some()
             })
             .collect();
-        trace_entry_pcs.push(0);
+        // Function-entry merge is the first pc `execute_frame` / `next_instr`
+        // actually dispatch (`after_return_generator_index`): 0 for ordinary code, the
+        // `POP_TOP` after `RETURN_GENERATOR` for a generator.
+        // `try_function_entry_jit` keys the first resume on `next_instr()`.
+        trace_entry_pcs.push(pyre_interpreter::after_return_generator_index(code));
         trace_entry_pcs.sort_unstable();
         trace_entry_pcs.dedup();
         let resolve_marker = |py_pc: usize| {

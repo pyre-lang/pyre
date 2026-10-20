@@ -5208,7 +5208,7 @@ pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
 /// Returns the stack base index (nlocals + ncells) for the given frame.
 /// This is the number of non-stack slots in the unified locals_cells_stack_w
 /// array: local variables + cell/free variable slots.
-pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
+fn concrete_code_object(frame: usize) -> Option<&'static pyre_interpreter::CodeObject> {
     let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
     let w_code =
         unsafe { *(frame_ptr.add(crate::frame_layout::PYFRAME_PYCODE_OFFSET) as *const *const ()) };
@@ -5225,7 +5225,19 @@ pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
     if raw_code.is_null() {
         return None;
     }
-    let code = unsafe { &*raw_code };
+    Some(unsafe { &*raw_code })
+}
+
+/// First dispatched pc of `frame`'s code (`after_return_generator_index`), or 0 when the
+/// frame has no code object (tests pass a null frame).
+fn concrete_code_entry_pc(frame: usize) -> usize {
+    concrete_code_object(frame)
+        .map(pyre_interpreter::after_return_generator_index)
+        .unwrap_or(0)
+}
+
+pub(crate) fn concrete_nlocals(frame: usize) -> Option<usize> {
+    let code = concrete_code_object(frame)?;
     let nlocals = code.varnames.len();
     let ncells = pyre_interpreter::pyframe::ncells(code);
     Some(nlocals + ncells)
@@ -7360,7 +7372,7 @@ impl PyreSym {
     /// `inline_call.rs`'s `setup_call` port, in the metainterp through
     /// `pyjitpl.rs` `perform_call` — and do NOT call this.
     pub(crate) fn init_symbolic(&mut self, ctx: &mut TraceCtx, concrete_frame: usize) {
-        self.is_function_entry_trace = ctx.header_pc == 0;
+        self.is_function_entry_trace = ctx.header_pc == concrete_code_entry_pc(concrete_frame);
         let nlocals = concrete_nlocals(concrete_frame).unwrap_or(0);
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
