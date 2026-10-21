@@ -794,13 +794,12 @@ pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
         let getter = make_builtin_function_with_arity(
             "pattern",
             |args| {
-                let self_ = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                if unsafe { is_sre_scanner(self_) } {
-                    Ok(unsafe { (*(self_ as *const W_SRE_Scanner)).w_srepat })
-                } else {
-                    Err(crate::PyError::type_error(
-                        "descriptor is for '_sre.SRE_Scanner'",
-                    ))
+                let receiver = args.get(1).copied().filter(|r| !r.is_null());
+                match receiver {
+                    Some(obj) if unsafe { is_sre_scanner(obj) } => {
+                        Ok(unsafe { (*(obj as *const W_SRE_Scanner)).w_srepat })
+                    }
+                    other => crate::gateway::receiver_mismatch("_sre.SRE_Scanner", "pattern", other),
                 }
             },
             2,
@@ -2927,14 +2926,14 @@ fn sre_pattern_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 // ── SRE_Scanner (finditer iterator) ───────────────────────────────────
 
 /// `args[0]` as the typed scanner receiver.
-fn sre_scanner_self(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-    if unsafe { is_sre_scanner(self_) } {
-        Ok(self_)
-    } else {
-        Err(crate::PyError::type_error(
-            "descriptor is for '_sre.SRE_Scanner'",
-        ))
+fn sre_scanner_self(
+    args: &[PyObjectRef],
+    name: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let receiver = args.first().copied().filter(|r| !r.is_null());
+    match receiver {
+        Some(obj) if unsafe { is_sre_scanner(obj) } => Ok(obj),
+        other => crate::gateway::receiver_mismatch("_sre.SRE_Scanner", name, other),
     }
 }
 
@@ -3032,24 +3031,24 @@ pub fn sre_scanner_next(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
 
 /// `iter_w` (interp_sre.py) — returns self.
 fn sre_scanner_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    sre_scanner_self(args)
+    sre_scanner_self(args, "__iter__")
 }
 
 fn sre_scanner_next_w(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = sre_scanner_self(args)?;
+    let self_ = sre_scanner_self(args, "__next__")?;
     sre_scanner_next(self_)
 }
 
 /// `match_w` (interp_sre.py) — anchored match at the current
 /// position; returns None when exhausted instead of raising.
 fn sre_scanner_match(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = sre_scanner_self(args)?;
+    let self_ = sre_scanner_self(args, "match")?;
     Ok(sre_scanner_step(self_, true)?.unwrap_or_else(w_none))
 }
 
 /// `search_w` (interp_sre.py) — search from the current position;
 /// returns None when exhausted instead of raising.
 fn sre_scanner_search(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = sre_scanner_self(args)?;
+    let self_ = sre_scanner_self(args, "search")?;
     Ok(sre_scanner_step(self_, false)?.unwrap_or_else(w_none))
 }

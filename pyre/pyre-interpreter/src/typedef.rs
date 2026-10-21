@@ -2360,6 +2360,9 @@ pub(crate) fn method_owner(type_name: &str) -> Option<&'static crate::gateway::M
         "zip" => pyre_object::functional::is_zip,
         "itertools.count" => pyre_object::interp_itertools::is_count,
         "itertools.repeat" => pyre_object::interp_itertools::is_repeat,
+        // Scanner methods read `W_SRE_Scanner` fields; a foreign receiver is
+        // refused by the gateway before the body runs.
+        "_sre.SRE_Scanner" => pyre_object::interp_sre::is_sre_scanner,
         // `GeneratorIterator`, `Coroutine` and `AsyncGenerator` share one
         // Rust payload, but PyPy gives each its own TypeDef and gateway
         // receiver check.  Keep the predicates kind-specific: accepting any

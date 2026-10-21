@@ -18123,6 +18123,79 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     }
 }
 
+/// `pyjitpl.py put_back_list_of_boxes3`: a first visit that registers
+/// the merge point and continues must write SAME_AS-wrapped reds back
+/// into `MIFrame.registers_r`, so later snapshots do not keep the Const.
+#[test]
+fn jit_merge_point_continue_puts_back_same_as_reds() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x01, 0x00, // gi: len=1, [i0 = next_instr]
+        0x01, 0x00, // gr: len=1, [r0 = pycode]
+        0x00, // gf: len=0
+        0x00, // ri: len=0
+        0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
+        0x00, // rf: len=0
+    ];
+    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    let next_instr = tc.const_int(42);
+    let pycode = tc.const_ref(0x1_0000);
+    let red0 = tc.const_ref(0x2_0000);
+    let red1 = tc.const_ref(0x3_0000);
+    let regs_i = RegisterBank::new([next_instr]);
+    let regs_r = RegisterBank::new([pycode, red0, red1]);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &regs_r,
+        registers_i: &regs_i,
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    wc.trace_ctx.seen_loop_header_for_jdindex = 0;
+    let (first, _) = step(&code, 0, &mut wc).expect("first jit_merge_point must dispatch");
+    assert_eq!(first, DispatchOutcome::Continue);
+    for color in 1..=2 {
+        let box_ = regs_r.get(color).expect("red register present");
+        assert!(
+            !box_.is_constant(),
+            "put_back_list_of_boxes3 must wrap const red at r{color}"
+        );
+    }
+}
+
 /// `reached_loop_header` drops the prepared SAVE_EXCEPTION box with the
 /// heap cache. A gated arrival (no `loop_header` stamp) is not that
 /// call, so the box stays; a stamped crossing consumes it so a later
