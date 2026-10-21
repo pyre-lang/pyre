@@ -2533,8 +2533,11 @@ pub(crate) fn getitem_slot(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         if is_str(obj) {
             return getitem_str(obj, index);
         }
-        if pyre_object::bytesobject::is_bytes_like(obj) {
-            return getitem_bytes_like(obj, index);
+        if pyre_object::bytesobject::is_bytes(obj) {
+            return getitem_bytes(obj, index);
+        }
+        if pyre_object::bytearrayobject::is_bytearray(obj) {
+            return getitem_bytearray(obj, index);
         }
         if is_type(obj) {
             return getitem_type(obj, index);
@@ -3086,19 +3089,65 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
+/// `stringmethods.py _descr_getslice_slowpath`, one of the "helpers for slow
+/// paths, moved out because they contain loops": the loop keeps
+/// `getitem_bytes` itself loop-free, so the codewriter looks inside it.
+/// The position advances only between items, so the final `start + step` is
+/// never computed and a step near `sys.maxsize` does not overflow.
+///
+/// Separate from the bytearray slowpath so a residual graph does not
+/// merge the `rstr.py` STR payload with a `Vec<u8>` list
+/// (`W_BytesObject.descr_getitem` vs `W_BytearrayObject.descr_getitem`).
 #[inline(never)]
-unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+unsafe fn _descr_getslice_slowpath_bytes(
+    obj: PyObjectRef,
+    start: i64,
+    step: i64,
+    sl: i64,
+) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut i = start;
+    for n in 0..sl {
+        result.push(unsafe { pyre_object::bytesobject::w_bytes_getitem(obj, i as usize) });
+        if n + 1 < sl {
+            i += step;
+        }
+    }
+    result
+}
+
+/// `bytearrayobject.py descr_getitem` slice loop, twin of
+/// [`_descr_getslice_slowpath_bytes`].
+#[inline(never)]
+unsafe fn _descr_getslice_slowpath_bytearray(
+    obj: PyObjectRef,
+    start: i64,
+    step: i64,
+    sl: i64,
+) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut i = start;
+    for n in 0..sl {
+        result.push(unsafe { pyre_object::bytearrayobject::w_bytearray_getitem(obj, i as usize) });
+        if n + 1 < sl {
+            i += step;
+        }
+    }
+    result
+}
+
+/// `stringmethods.py W_BytesObject.descr_getitem`.
+#[inline(never)]
+unsafe fn getitem_bytes(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let _obj_roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let index_slot = pyre_object::gc_roots::shadow_stack_len();
     let index = pyre_object::gc_roots::pin_root(index);
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let is_bytes = pyre_object::bytesobject::is_bytes(obj);
     if is_slice(index) {
-        // stringmethods.py / bytearrayobject.py `descr_getitem`: unpack the
-        // slice before reading the sequence length (an `__index__` method may
-        // mutate a bytearray), then use `adjust_indices`' explicit slice
+        // stringmethods.py `descr_getitem`: unpack the slice before reading
+        // the sequence length, then use `adjust_indices`' explicit slice
         // length.  Iterating by that count also avoids overflowing on the
         // final `start + step` for a step near `sys.maxsize`.
         let (rs, rp, st) = crate::sliceobject::slice_unpack(
@@ -3107,39 +3156,31 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             w_slice_get_step(index),
         )?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
-        let (start, _stop, step, slicelength) =
+        let len = pyre_object::bytesobject::w_bytes_len(obj) as i64;
+        let (start, stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-        // `_new(self._value[start:stop])` (stringmethods.py descr_getslice)
-        // runs through `ll_stringslice_startstop` (rstr.py), which
-        // hands the source string back unchanged for `start == 0 and
-        // stop >= len`; `is_w` (bytesobject.py) then reports the whole
-        // slice identical to its operand.  Immutable exact `bytes` only — a
-        // `bytearray` gets a fresh object from `_new` because it is mutable,
-        // and a subclass keeps pointer identity through `is_w`.
-        if step == 1
-            && start == 0
-            && slicelength == len
-            && is_bytes
-            && pyre_object::pyobject::is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE)
-        {
-            return Ok(obj);
-        }
-        let mut result = Vec::new();
-        let mut i = start;
-        for n in 0..slicelength {
-            result.push(pyre_object::bytesobject::bytes_like_getitem(
-                obj, i as usize,
+        // `StringMethods.descr_getitem`: `sl == 0` → `_empty()`;
+        // `step == 1` → `_sliced` → `W_BytesObject(s[start:stop])`,
+        // rtyped to `LLHelpers.ll_stringslice_startstop` (`rstr.py`).
+        // Interpreter: `start == 0 and stop >= len` hands the source
+        // STR back unchanged, so `is_w` (bytesobject.py) reports the
+        // whole slice identical to its operand.
+        if slicelength == 0 {
+            return Ok(pyre_object::bytesobject::w_bytes_empty());
+        } else if step == 1 {
+            let sliced = pyre_object::lowlevel_string::ll_stringslice_startstop(
+                pyre_object::bytesobject::w_bytes_block(obj)
+                    as *mut pyre_object::unicodeobject::Utf8Str,
+                start,
+                stop,
+            );
+            return Ok(pyre_object::bytesobject::w_bytes_from_block(
+                sliced as *const pyre_object::bytesobject::BytesBlock,
             ));
-            if n + 1 < slicelength {
-                i += step;
-            }
-        }
-        return Ok(if is_bytes {
-            pyre_object::bytesobject::w_bytes_from_bytes(&result)
         } else {
-            pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
-        });
+            let result = _descr_getslice_slowpath_bytes(obj, start, step, slicelength);
+            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&result));
+        }
     }
     // `descr_getitem`: getindex_w(index, IndexError, "byte") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
@@ -3167,23 +3208,94 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             }
         }
     } else {
-        let descr = if is_bytes { "byte" } else { "bytearray" };
-        return Err(index_type_error(descr, index));
+        return Err(index_type_error("byte", index));
     };
-    let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
+    let len = pyre_object::bytesobject::w_bytes_len(obj) as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual >= 0 && actual < len {
         return Ok(w_int_new(
-            pyre_object::bytesobject::bytes_like_getitem(obj, actual as usize) as i64,
+            pyre_object::bytesobject::w_bytes_getitem(obj, actual as usize) as i64,
         ));
     }
-    // `bytes_item` names no type in the out-of-range message, unlike
-    // `bytearray_getitem`.
-    if is_bytes {
-        Err(PyError::index_error("index out of range"))
-    } else {
-        Err(PyError::index_error("bytearray index out of range"))
+    // `bytes_item` names no type in the out-of-range message.
+    Err(PyError::index_error("index out of range"))
+}
+
+/// `bytearrayobject.py W_BytearrayObject.descr_getitem`.
+#[inline(never)]
+unsafe fn getitem_bytearray(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let _obj_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let index_slot = pyre_object::gc_roots::shadow_stack_len();
+    let index = pyre_object::gc_roots::pin_root(index);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    if is_slice(index) {
+        // bytearrayobject.py `descr_getitem`: unpack the slice before reading
+        // the sequence length (an `__index__` method may mutate a bytearray),
+        // then use `adjust_indices`' explicit slice length.
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+        let (start, stop, step, slicelength) =
+            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+        // `W_BytearrayObject.descr_getitem`: `sl == 0` → `_empty()`;
+        // `step == 1` → `_new(self._data[start:stop])`; else the
+        // element-loop slowpath.
+        if slicelength == 0 {
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&[]));
+        } else if step == 1 {
+            let data = pyre_object::bytearrayobject::w_bytearray_data(obj);
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                &data[start as usize..stop as usize],
+            ));
+        } else {
+            let result = _descr_getslice_slowpath_bytearray(obj, start, step, slicelength);
+            return Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
+                &result,
+            ));
+        }
     }
+    // `descr_getitem`: getindex_w(index, IndexError, "bytearray") — coercion
+    // inlined for the same rtyper reason as `getitem_list`.
+    let mut obj = obj;
+    let idx = if is_int(index) {
+        w_int_get_value(index)
+    } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
+        let indexed = space_index(index)?;
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let index = pyre_object::gc_roots::shadow_stack_get(index_slot);
+        if is_int(indexed) {
+            w_int_get_value(indexed)
+        } else {
+            match i64::try_from(w_long_get_value(indexed)) {
+                Ok(i) => i,
+                Err(_) => {
+                    return Err(PyError::new(
+                        PyErrorKind::IndexError,
+                        format!(
+                            "cannot fit '{}' into an index-sized integer",
+                            object_functionstr_type_name(index)
+                        ),
+                    ));
+                }
+            }
+        }
+    } else {
+        return Err(index_type_error("bytearray", index));
+    };
+    let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual >= 0 && actual < len {
+        return Ok(w_int_new(
+            pyre_object::bytearrayobject::w_bytearray_getitem(obj, actual as usize) as i64,
+        ));
+    }
+    Err(PyError::index_error("bytearray index out of range"))
 }
 
 #[inline(never)]

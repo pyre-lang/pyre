@@ -61143,7 +61143,8 @@ fn ty_is_raw_address(
     let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
     if !is_borrow
         && let Some(pointee) = one_level_pointer_pointee(node, llbc)
-        && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+        && (declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+            || leaked_host_pointee_node(pointee, llbc, gc_struct_ids))
     {
         return true;
     }
@@ -61237,6 +61238,51 @@ fn raw_ptr_node_is_declared_raw(
         return false;
     };
     declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+        || leaked_host_pointee_node(pointee, llbc, gc_struct_ids)
+}
+
+/// `history.getkind` of `Ptr` whose `TO._gckind == 'raw'` is `"int"`.
+///
+/// `CodeObject` is a leaked host allocation (`Box::into_raw`), not a GC
+/// object. `adt_def_is_raw_storage` rejects it because it holds `Box` /
+/// `String` fields, so a pointer to one would otherwise stay Ref.
+/// The ADT itself is not marked Raw: field reads of a `CodeObject` value
+/// keep their existing owner. Only the pointer word is an address.
+/// `*mut PyObject` / `PyObjectRef` stay Ref (`gc_struct_ids`).
+fn leaked_host_pointee_node(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let Some(node) = strip_ty_indirections(node, llbc) else {
+        return false;
+    };
+    if let Some(def_id) = adt_node_def_id(node) {
+        let Some(td) = llbc.type_by_id(def_id) else {
+            return false;
+        };
+        if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+            return false;
+        }
+        return path_leaf_is_leaked_host_pointee(&td.item_meta.name_path());
+    }
+    let Some(path) = node
+        .as_object()
+        .and_then(|obj| obj.get("Adt"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|adt| adt.get("id"))
+        .and_then(|id| id.get("Path"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    path_leaf_is_leaked_host_pointee(path)
+}
+
+fn path_leaf_is_leaked_host_pointee(path: &str) -> bool {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    leaf == "CodeObject"
 }
 
 fn tyref_to_value_type_with(

@@ -361,8 +361,8 @@ pub unsafe fn w_pytraceback_get_lineno(tb: PyObjectRef) -> Option<i64> {
 /// `space.newint`s.  No writeback: see [`w_pytraceback_get_lineno`].
 ///
 /// `location.py _offset2lineno` is a loop, so `look_inside_graph` refuses
-/// it and `offset2lineno` stays a residual call.  `w_code_addr2line` is
-/// the same residual here (`#[dont_look_inside]` on that helper).
+/// it and stays a residual call.  `w_code_addr2line` is `offset2lineno`,
+/// looked inside; its table walk `pycode::_offset2lineno` is the residual.
 #[inline(never)]
 pub fn descr_get_tb_lineno(tb: PyObjectRef) -> PyObjectRef {
     unsafe {

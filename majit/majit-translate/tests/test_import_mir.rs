@@ -5,7 +5,7 @@ use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, OpKind},
+    model::{CallTarget, OpKind, ValueType},
 };
 
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
@@ -168,45 +168,49 @@ fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
     );
 }
 
-/// `*(&[u8]).as_ptr().add(i)` in `ll_bytes_strcmp`
-/// (`rstr.py` `AbstractStringRepr.ll_strcmp`) is `__string_byte_getitem`
-/// (getitem + ord on the STR), not a `RawLoad`.
+/// `W_BytesObject.descr_lt` compares the two `STR` payloads
+/// (`rstr.py` `LLHelpers.ll_strcmp` / `stroruni.cmp`). The exact-bytes arms
+/// read `&BYTES_TYPE`, and the rtyper declines a graph that reads a static
+/// type object, which leaves a `stroruni.cmp` operand without `Ptr(STR)`.
+/// So the arms call the `W_BytesObject.descr_*` methods, which own the
+/// `ll_strcmp` / `ll_streq` call, and never a slice helper.
 #[test]
-fn bytes_strcmp_reads_u8_slice_as_array() {
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+fn bytes_ordering_leaves_ll_strcmp_to_w_bytes_object_methods() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        &[interpreter_llbc, object_llbc],
         HostStaticAddrs::default(),
         &["descroperation"],
-        &["ll_bytes_strcmp"],
+        &["pin_free_builtin_ord", "compare_slot_rest"],
     )
-    .expect("lower descroperation::ll_bytes_strcmp");
-    let function = program
-        .functions
-        .iter()
-        .find(|f| f.name == "ll_bytes_strcmp")
-        .expect("ll_bytes_strcmp graph");
-    let ops = function
-        .graph()
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .collect::<Vec<_>>();
-    assert!(
-        ops.iter().any(|op| matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.last().map(String::as_str) == Some("__string_byte_getitem")
-        )),
-        "byte slice item is getitem+ord on STR (`__string_byte_getitem`)"
-    );
-    assert!(
-        !ops.iter()
-            .any(|op| matches!(&op.kind, OpKind::RawLoad { .. })),
-        "byte slice item must not be RawLoad"
-    );
+    .expect("lower descroperation bytes-ordering arms");
+    for name in ["pin_free_builtin_ord", "compare_slot_rest"] {
+        let function = program
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} graph"));
+        let ops = function
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect::<Vec<_>>();
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if matches!(
+                    segments.last().map(String::as_str),
+                    Some("jit_ll_strcmp" | "ll_bytes_strcmp" | "w_bytes_data")
+                )
+            )),
+            "{name} must not call jit_ll_strcmp, ll_bytes_strcmp or w_bytes_data"
+        );
+    }
 }
 
 /// `ll_list_obj_capacity` is `len(l.items)` on the resizable list's
@@ -247,5 +251,43 @@ fn list_items_capacity_stays_on_the_items_block() {
         !ops.iter()
             .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. })),
         "the items header is not ll_fixed_length"
+    );
+}
+
+/// `PyCode.code_ptr` is a leaked `CodeObject` address. `history.getkind` of
+/// a `Ptr` whose `TO._gckind == 'raw'` is `"int"`; a generic `*const ()`
+/// rule would also bank `Function.code` / `PyFrame.pycode`.
+#[test]
+fn pycode_code_ptr_is_raw_int_kind() {
+    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
+    let object_llbc = load_llbc(OBJECT_LLBC);
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter_llbc, object_llbc],
+        HostStaticAddrs::default(),
+        &["pycode"],
+        &["w_code_get_ptr"],
+    )
+    .expect("lower pycode::w_code_get_ptr");
+    let spelling = program
+        .struct_fields
+        .field_type("PyCode", "code_ptr")
+        .expect("PyCode.code_ptr harvested");
+    assert!(
+        spelling == "*const CodeObject" || spelling.starts_with("*const CodeObject<"),
+        "PyCode.code_ptr spelling must be *const CodeObject, got {spelling}"
+    );
+    let attrs = program
+        .struct_field_attrs
+        .get("pycode::PyCode")
+        .expect("pycode::PyCode attrs harvested");
+    let kind = attrs
+        .iter()
+        .find(|(name, _)| name == "code_ptr")
+        .map(|(_, ty)| ty)
+        .expect("code_ptr attr");
+    assert_eq!(
+        kind,
+        &ValueType::Int,
+        "history.getkind of raw Ptr is int, spelling {spelling}"
     );
 }

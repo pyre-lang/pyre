@@ -9173,8 +9173,9 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut FunctionGraph,
     ) -> Option<RewriteResult> {
-        // SoU = args[0].concretetype (jtransform.py:2050): the STR vs UNICODE
-        // spelling selects the OS_STR_* vs OS_UNI_* oopspecindex family below.
+        // SoU = args[0].concretetype (jtransform.py `_handle_stroruni_call`):
+        // the STR vs UNICODE spelling selects the OS_STR_* vs OS_UNI_*
+        // oopspecindex family below. Upstream reads only that cell.
         let kind = stroruni_first_arg_kind(args.first()?);
 
         // jtransform.py:2079-2086 — copy_contents lowers to a blackhole op.
@@ -9229,7 +9230,9 @@ impl<'a> Transformer<'a> {
             (_, StrOrUniKind::ByteArray) => return None,
             // else: assert 0 (jtransform.py _handle_stroruni_call).
             (_, StrOrUniKind::Other) => {
-                panic!("args[0].concretetype must be STR or UNICODE")
+                panic!(
+                    "args[0].concretetype must be STR or UNICODE (in {graph_name}, {oopspec_name})"
+                )
             }
             // An unported / unknown stroruni.* spelling: fall through to the
             // residual-call path.

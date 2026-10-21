@@ -33,6 +33,7 @@
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use crate::celldict::StrKey;
+use crate::lowlevel_string::{hash_string_bytes, ll_strhash};
 use crate::unicodeobject::Utf8Str;
 use crate::weakref::Weakref;
 
@@ -246,18 +247,6 @@ fn dead_wref() -> *mut Weakref {
     }
 }
 
-/// `objectmodel._hash_string` over STR `chars`. Empty string is `-1`.
-fn hash_string_bytes(s: &[u8]) -> isize {
-    let Some(&first) = s.first() else {
-        return -1;
-    };
-    let mut x = (first as isize) << 7;
-    for &c in s {
-        x = 1000003isize.wrapping_mul(x) ^ (c as isize);
-    }
-    x ^ (s.len() as isize)
-}
-
 /// `_ll_strhash` digest of `chars` without a STR: zero becomes the rstr
 /// sentinel so it matches a stored `STR.hash`.
 fn hash_chars(bytes: &[u8]) -> isize {
@@ -285,35 +274,6 @@ fn ll_streq_chars(key: StrKey, bytes: &[u8]) -> bool {
             len,
         ) == bytes
     }
-}
-
-/// `LLHelpers._ll_strhash` (`rstr.py`). Zero is the uncomputed memo, so a
-/// real zero digest becomes `29872897` and is stored in `STR.hash`.
-#[majit_macros::dont_look_inside]
-fn _ll_strhash(s: *mut Utf8Str) -> isize {
-    let bytes = unsafe { crate::unicodeobject::utf8_payload_bytes(s) };
-    let mut x = hash_string_bytes(bytes);
-    if x == 0 {
-        x = 29872897;
-    }
-    unsafe { (*s).hash = x };
-    x
-}
-
-/// `LLHelpers.ll_strhash` (`rstr.py`). Null STR hashes as 0; a live STR
-/// answers `s.hash` while it is already memoized.
-///
-/// Upstream is `jit.conditional_call_elidable(s.hash, _ll_strhash, s)`.
-/// This crate has no equivalent annotation on ordinary helpers.
-fn ll_strhash(s: *mut Utf8Str) -> isize {
-    if s.is_null() {
-        return 0;
-    }
-    let cached = unsafe { (*s).hash };
-    if cached != 0 {
-        return cached;
-    }
-    _ll_strhash(s)
 }
 
 /// `LLHelpers.ll_strfasthash` (`rstr.py`). Assumes `STR.hash` is already

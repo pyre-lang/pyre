@@ -788,10 +788,10 @@ pub fn __majit_wrap_struct_unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             && unsafe { bytesobject::is_bytes(w_str) }
             && unsafe { w_bytes_len(w_str) } == 4
         {
-            let b0 = unsafe { jit_w_bytes_getitem(w_str, 0) } as i64;
-            let b1 = unsafe { jit_w_bytes_getitem(w_str, 1) } as i64;
-            let b2 = unsafe { jit_w_bytes_getitem(w_str, 2) } as i64;
-            let b3 = unsafe { jit_w_bytes_getitem(w_str, 3) } as i64;
+            let b0 = unsafe { w_bytes_getitem(w_str, 0) } as i64;
+            let b1 = unsafe { w_bytes_getitem(w_str, 1) } as i64;
+            let b2 = unsafe { w_bytes_getitem(w_str, 2) } as i64;
+            let b3 = unsafe { w_bytes_getitem(w_str, 3) } as i64;
             let v = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
             return Ok(jit_w_tuple1(w_int_new(v as i32 as i64)));
         }

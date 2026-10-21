@@ -5188,9 +5188,10 @@ fn newcomplex_and_lane_getters_are_the_pypy_leaf() {
 #[test]
 fn descr_get_tb_lineno_is_the_pypy_leaf() {
     // pytraceback.py `descr_get_tb_lineno` / `get_lineno`: getfield the
-    // slot, then residual `offset2lineno` (`location.py _offset2lineno`
-    // is a loop `look_inside_graph` refuses). LOAD_ATTR of `tb_lineno`
-    // descends this graph instead of residualising `bh_load_attr_fn`.
+    // slot, then `offset2lineno`, looked inside; its table walk
+    // `location.py _offset2lineno` is a loop `look_inside_graph` refuses,
+    // so it is the residual. LOAD_ATTR of `tb_lineno` descends this graph
+    // instead of residualising `bh_load_attr_fn`.
     let path = "pyre_interpreter::pytraceback::descr_get_tb_lineno";
     let getter = crate::jitcode_runtime::pathed_jitcode(path)
         .expect("descr_get_tb_lineno must be a discovered jitcode");
@@ -5208,13 +5209,23 @@ fn descr_get_tb_lineno_is_the_pypy_leaf() {
         "{path} must read the integer slots; ops={ops:?}"
     );
     assert!(
-        ops.iter().any(|op| *op == "residual_call_ir_i"),
-        "{path} must residualise offset2lineno; ops={ops:?}"
+        ops.iter().any(|op| *op == "inline_call_ir_i"),
+        "{path} must look inside offset2lineno; ops={ops:?}"
     );
     assert!(
         !ops.iter()
             .any(|op| op.contains("call_may_force") || op.contains("getattr")),
         "{path} must not force through getattr; ops={ops:?}"
+    );
+    let addr2line_path = "pyre_interpreter::pycode::w_code_addr2line";
+    let addr2line = crate::jitcode_runtime::pathed_jitcode(addr2line_path)
+        .expect("w_code_addr2line must be a discovered jitcode");
+    let addr2line_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&addr2line.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        addr2line_ops.iter().any(|op| *op == "residual_call_ir_i"),
+        "{addr2line_path} must residualise _offset2lineno; ops={addr2line_ops:?}"
     );
 }
 

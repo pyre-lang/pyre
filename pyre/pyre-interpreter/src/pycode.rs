@@ -540,7 +540,7 @@ pub const _immutable_fields_CodeObject: &str =
 
 /// Python code object wrapper.
 ///
-/// Stores an opaque pointer to the bytecode CodeObject. A top-level body is
+/// Stores a raw pointer to the bytecode `CodeObject`. A top-level body is
 /// `Box::into_raw`'d; a nested body points into that permanently-live owner,
 /// matching PyPy's one recursively-owned `co_consts_w` code graph without
 /// cloning the child graph at each wrapping boundary.
@@ -558,9 +558,11 @@ pub const _immutable_fields_CodeObject: &str =
 #[majit_macros::jit_immutable_fields("w_globals?", "code_ptr")]
 pub struct PyCode {
     pub ob_header: PyObject,
-    /// Opaque pointer to a permanently-live `CodeObject`. Top-level bodies are
-    /// owned via `Box::into_raw`; nested bodies borrow from one of those boxes.
-    pub code_ptr: *const (),
+    /// Permanently-live `CodeObject` address. Top-level bodies are owned via
+    /// `Box::into_raw`; nested bodies borrow from one of those boxes. The
+    /// pointee is a host allocation (`history.getkind` of a `Ptr` whose
+    /// `TO._gckind == 'raw'` is `"int"`), not a GC object.
+    pub code_ptr: *const crate::CodeObject,
     /// `pycode.py self.co_firstlineno = firstlineno`. RustPython's
     /// `CodeObject.first_line_number: Option<OneIndexed>` cannot represent
     /// the zero/negative values accepted by Python 3.14's CodeType
@@ -1325,7 +1327,7 @@ fn w_code_new_owned(
             ob_type: &CODE_TYPE as *const PyType,
             w_class: pyre_object::pyobject::get_instantiate(&CODE_TYPE),
         },
-        code_ptr,
+        code_ptr: code_ptr as *const crate::CodeObject,
         co_firstlineno_raw,
         filename_bytes: std::ptr::null_mut(),
         co_code_bytes: std::ptr::null_mut(),
@@ -1564,7 +1566,7 @@ unsafe fn box_code_constant_inheriting_unit(
     code: *const crate::CodeObject,
     parent: &PyCode,
 ) -> PyObjectRef {
-    let owner = code_unit_owner(parent.code_ptr);
+    let owner = code_unit_owner(parent.code_ptr as *const ());
     let hidden_applevel = parent.hidden_applevel;
     let inherited_filename = if parent.filename_inherits_to_nested
         && unsafe { &*code }.source_path
@@ -3641,7 +3643,7 @@ pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
 /// `obj` must point to a valid `PyCode`.
 #[inline]
 pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
-    unsafe { (*(obj as *const PyCode)).code_ptr }
+    unsafe { (*(obj as *const PyCode)).code_ptr as *const () }
 }
 
 /// `Constants<ConstantData>` is a single-field tuple wrapping `Box<[ConstantData]>`.
@@ -3921,7 +3923,7 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
         );
     }
     if !w_globals.is_null() {
-        let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
+        let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr as *const () };
         register_live_code_wrapper(code_ptr, obj);
         register_w_globals_stamped_code(obj);
     }
@@ -3974,7 +3976,7 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             )
         } {
             Ok(()) => {
-                register_live_code_wrapper(unsafe { (*code).code_ptr }, obj);
+                register_live_code_wrapper(unsafe { (*code).code_ptr as *const () }, obj);
                 register_w_globals_stamped_code(obj);
                 return false;
             }
@@ -3986,7 +3988,10 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     // registry synchronized even on the cache-hit path.
     let obj = roots.get(root_base);
     let w_globals = roots.get(root_base + 1);
-    register_live_code_wrapper(unsafe { (*(obj as *const PyCode)).code_ptr }, obj);
+    register_live_code_wrapper(
+        unsafe { (*(obj as *const PyCode)).code_ptr as *const () },
+        obj,
+    );
     !std::ptr::eq(published, w_globals)
 }
 
@@ -4166,25 +4171,36 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// # Safety
 /// `w_code` must be a live `PyCode`.
 ///
-/// `location.py _offset2lineno` walks the linetable in a loop, so
-/// `look_inside_graph` refuses it and `offset2lineno` is a residual call
-/// from `pytraceback.py get_lineno`.  The memo plus `code_addr2line` here
-/// is that helper; `#[dont_look_inside]` keeps the same residual so the
-/// `descr_get_tb_lineno` descent records getfield + this call, not the
-/// table walk.
-#[majit_macros::dont_look_inside]
+/// This body is `offset2lineno` and is looked inside, so a trace folds the
+/// negative-offset arm to `co_firstlineno`.  The table walk is
+/// [`_offset2lineno`], the residual call.
 pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
     unsafe {
-        let code = w_code_get_ptr(w_code) as *const crate::CodeObject;
-        if code.is_null() {
+        if w_code_get_ptr(w_code).is_null() {
             return -1;
         }
-        // Only the walking arm is worth remembering: `addrq < 0` answers
-        // `co_firstlineno` without touching the table, and an offset outside
-        // `i32` cannot be spelled in the packed pair.
-        let key = match i32::try_from(addrq) {
-            Ok(offset) if offset >= 0 => offset,
-            _ => return code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq),
+        if addrq < 0 {
+            return w_code_firstlineno_raw(w_code);
+        }
+        _offset2lineno(w_code, addrq)
+    }
+}
+
+/// `location.py _offset2lineno`: the linetable walk behind
+/// [`w_code_addr2line`], for `addrq >= 0`.  It loops, so `look_inside_graph`
+/// refuses it upstream; `#[dont_look_inside]` keeps it the same residual call.
+/// The per-code memo of resolved offsets lives here, beside the walk it saves.
+///
+/// # Safety
+/// `w_code` must be a live `PyCode` whose `code_ptr` is not null.
+#[majit_macros::dont_look_inside]
+unsafe fn _offset2lineno(w_code: PyObjectRef, addrq: i64) -> i32 {
+    unsafe {
+        let code = &*(w_code_get_ptr(w_code) as *const crate::CodeObject);
+        let firstlineno = w_code_firstlineno_raw(w_code);
+        // An offset outside `i32` cannot be spelled in the packed pair.
+        let Ok(key) = i32::try_from(addrq) else {
+            return code_addr2line(code, firstlineno, addrq);
         };
         let memo =
             &(*(w_code as *const PyCode)).addr2line_memo[key as usize & (ADDR2LINE_MEMO_WAYS - 1)];
@@ -4192,7 +4208,7 @@ pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
         if (packed >> 32) as i32 == key {
             return packed as i32;
         }
-        let line = code_addr2line(&*code, w_code_firstlineno_raw(w_code), addrq);
+        let line = code_addr2line(code, firstlineno, addrq);
         memo.store(
             ((key as i64) << 32) | (line as u32 as i64),
             std::sync::atomic::Ordering::Relaxed,
@@ -4749,7 +4765,7 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     }
     // Last, so every side table this wrapper owns is already gone when the
     // graph's own bodies are released.
-    detach_code_unit_wrapper(code.code_ptr);
+    detach_code_unit_wrapper(code.code_ptr as *const ());
 }
 
 /// pycode.py `_compute_flatcall`.

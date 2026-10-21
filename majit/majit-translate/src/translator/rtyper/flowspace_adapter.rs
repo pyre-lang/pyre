@@ -5178,7 +5178,7 @@ pub(crate) fn derive_subject_inputcells(
                     continue;
                 }
                 // `BytesBlock` is the low-level owner of Python bytes'
-                // RPython-shaped `STR.chars` storage, not a user-visible
+                // RPython-shaped `STR` storage, not a user-visible
                 // nominal instance.  The MIR front folds
                 // `bytes_block_chars`'s exact `(chars, length)` raw-slice
                 // view back to this header, so seed the header with the same

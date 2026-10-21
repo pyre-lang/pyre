@@ -10159,7 +10159,7 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Descend `baseobjspace::getitem_bytes_like` (`stringmethods.py descr_getitem`).
+/// Descend `baseobjspace::getitem_bytes` (`stringmethods.py descr_getitem`).
 /// The scalar arm is `strgetitem` plus `newint(ord)`.  A missing jitcode
 /// declines to the generic residual.
 fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
@@ -10196,9 +10196,9 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
-        "pyre_interpreter::baseobjspace::getitem_bytes_like",
-    ) else {
+    let Some(jc_arc) =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::baseobjspace::getitem_bytes")
+    else {
         return Ok(None);
     };
     let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
@@ -15045,8 +15045,8 @@ const TRACEBACK_LINENO_DESCENT: HelperDescent = HelperDescent {
 /// `tb.tb_lineno` on a traceback: walk `pytraceback.py descr_get_tb_lineno`.
 ///
 /// The leaf getfields `lineno` / `lasti` / `w_code` and boxes with
-/// `space.newint`, residualising `offset2lineno` (`w_code_addr2line`)
-/// because `location.py _offset2lineno` is a loop `look_inside_graph`
+/// `space.newint`, descending `offset2lineno` (`w_code_addr2line`) and
+/// residualising its `_offset2lineno` table walk, a loop `look_inside_graph`
 /// refuses.  A subclass receiver cannot exist (`traceback` is not a
 /// base); a non-traceback stays on the residual getset.
 pub(crate) fn try_walker_orthodox_traceback_lineno<Sym: WalkSym>(

@@ -12084,6 +12084,14 @@ fn field_metadata(
     }
 }
 
+/// Leaf of a `*const T` / `*mut T` spelling, generics stripped.
+fn pointer_type_leaf(type_str: &str) -> Option<&str> {
+    let rest = type_str
+        .strip_prefix("*const ")
+        .or_else(|| type_str.strip_prefix("*mut "))?;
+    Some(rest.split('<').next().unwrap_or(rest))
+}
+
 /// Leaf of a type spelling that occupies no storage.
 ///
 /// `PhantomData<T>` and `BuildHasherDefault<H>` are `lltype.Void`
@@ -12114,15 +12122,24 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
         ),
-        // `Cell.family` points at a `CellFamily`, which pyre leaks as a plain
-        // Rust allocation rather than a GC object (`nestedscope.rs`), so the
-        // pointee is raw and the word is FLAG_UNSIGNED like the byte pointer
-        // above.
-        "*const CellFamily" | "*mut CellFamily" => (
-            ArrayFlag::Unsigned,
-            majit_ir::value::Type::Int,
-            crate::layout::target_word_size(),
-        ),
+        // `Cell.family` / `PyCode.code_ptr` point at leaked host allocations
+        // (`nestedscope.rs` `CellFamily`, compiler-core `CodeObject`), not GC
+        // objects, so `history.getkind` gives "int" (`TO._gckind == 'raw'`).
+        // The pointees are named because `adt_def_is_raw_storage` refuses
+        // them (they hold `Box` / `String` fields): declaring the ADT raw would
+        // also turn every `CodeObject` field read into `getfield_raw`.
+        // Instantiations (`CodeObject<C>`) share the leaf.
+        s if matches!(
+            pointer_type_leaf(s),
+            Some("CellFamily") | Some("CodeObject")
+        ) =>
+        {
+            (
+                ArrayFlag::Unsigned,
+                majit_ir::value::Type::Int,
+                crate::layout::target_word_size(),
+            )
+        }
         // descr.py get_type_flag: a Ptr whose pointee has `_gckind == 'raw'`
         // is FLAG_UNSIGNED. A one-word-item Vec is
         // `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs rust_vec_lltype`);

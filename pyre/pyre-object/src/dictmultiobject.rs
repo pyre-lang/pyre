@@ -119,7 +119,11 @@ impl BytesKey {
 impl std::hash::Hash for BytesKey {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.as_bytes().hash(state);
+        // `BytesDictStrategy` keys are the STR (`rstr.py`); `ll_strhash`
+        // reads `s.hash` and computes it only while the slot is 0.
+        state.write_isize(crate::lowlevel_string::ll_strhash(
+            self.0 as *mut crate::unicodeobject::Utf8Str,
+        ));
     }
 }
 
@@ -131,13 +135,6 @@ impl PartialEq for BytesKey {
 }
 
 impl Eq for BytesKey {}
-
-impl std::borrow::Borrow<[u8]> for BytesKey {
-    #[inline]
-    fn borrow(&self) -> &[u8] {
-        self.as_bytes()
-    }
-}
 
 impl crate::rordereddict::EntryDummy for BytesKey {
     fn dummy() -> Self {
@@ -1247,9 +1244,8 @@ pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHas
 ///
 /// Digested with FNV-1a rather than `RandomState`, for the reason
 /// [`crate::celldict::ModuleDictEntries`] gives: a translated `str` key carries
-/// `ll_strhash` memoized in its header, and [`BytesKey`] hashes the block's
-/// bytes on each probe (the `hash` slot is not used as an `ll_strhash` cache
-/// here).
+/// `ll_strhash` memoized in its header. [`BytesKey`] writes that cached
+/// digest (`rstr.py` `LLHelpers.ll_strhash` / `STR.hash`) on each probe.
 pub type BytesDictStorage = crate::rordereddict::RDict<BytesKey, PyObjectRef, BytesKeyHash>;
 
 macro_rules! dict_storage_gc_type_id {
@@ -5630,8 +5626,8 @@ pub unsafe fn w_dict_lookup_bytes_strategy(
 ) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
     let entries = w_dict_bytes_storage(obj);
-    let k = crate::w_bytes_data(key);
-    entries.get(k).copied()
+    let k = BytesKey(crate::w_bytes_block(key) as *mut crate::bytesobject::BytesBlock);
+    entries.get(&k).copied()
 }
 
 /// Internal helper: `BytesDictStrategy::delitem` body —
@@ -5643,8 +5639,8 @@ pub unsafe fn w_dict_delitem_bytes_strategy(obj: PyObjectRef, key: PyObjectRef) 
     lock_dict_refs!(_dict_guard, obj, key);
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut BytesDictStorage);
-    let k = crate::w_bytes_data(key);
-    if entries.remove(k).is_some() {
+    let k = BytesKey(crate::w_bytes_block(key) as *mut crate::bytesobject::BytesBlock);
+    if entries.remove(&k).is_some() {
         dict.keys_version = dict.keys_version.wrapping_add(1);
         true
     } else {

@@ -2620,12 +2620,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_w_tuple1",
         pyre_object::tupleobject::jit_w_tuple1,
     );
-    upa2!(
-        &mut entries,
-        "pyre_object::bytesobject::jit_w_bytes_getitem",
-        "pyre_object::jit_w_bytes_getitem",
-        pyre_object::bytesobject::jit_w_bytes_getitem,
-    );
     upa4!(
         &mut entries,
         "pyre_object::unicodeobject::w_str_slice_codepoints",

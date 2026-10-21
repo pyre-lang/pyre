@@ -417,6 +417,10 @@ pub unsafe fn format_int_decimal(
     let n_padding = width - (sign_len + n_digits);
     if n_padding > 0 {
         let pad = crate::lowlevel_string::jit_ll_str_mul(roots.get(base) as *mut Str, n_padding);
+        assert!(
+            !pad.is_null(),
+            "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
+        );
         roots.set(base, pad as PyObjectRef);
         if align == FORMAT_INT_ALIGN_LEFT {
             if sign_len > 0 {

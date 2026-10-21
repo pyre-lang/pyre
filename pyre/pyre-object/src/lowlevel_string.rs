@@ -491,10 +491,9 @@ pub extern "C" fn jit_ll_str_eq_lengthok(
 
 /// `rstr.py LLHelpers.ll_strcmp` — order two rstr `STR` payloads.
 ///
-/// `@jit.elidable` and `@jit.oopspec('stroruni.cmp(s1, s2)')`: the operands
-/// are `STR` payloads, which is what vstring's `opt_call_stroruni_STR_CMP`
-/// reads with `strlen` / `strgetitem`.  `rtype_lt` and its siblings compare
-/// the result against zero.
+/// `@jit.elidable` and `@jit.oopspec('stroruni.cmp(s1, s2)')`. `BytesBlock`
+/// shares the `STR` layout, so the bytes ordering arm uses this helper too.
+#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_strcmp(
     s1: *const crate::unicodeobject::UnicodeValueStorage,
@@ -525,8 +524,11 @@ pub extern "C" fn jit_ll_strcmp(
 /// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
 ///
 /// `times < 0` clamps to 0 (`'0' * -1 == ''`).  `ovfcheck(len * times)` is
-/// MemoryError upstream; abort until that propagation is ported.  The
-/// doubling copy is `ll_str_mul`'s `copy_contents` loop.
+/// MemoryError upstream; abort until that propagation is ported.  A
+/// `s.malloc(size)` the heap refuses answers null, and the caller raises the
+/// MemoryError `mallocstr` raises: a panic here formats its backtrace on a
+/// heap that is already out of memory.  The doubling copy is `ll_str_mul`'s
+/// `copy_contents` loop.
 #[majit_macros::elidable]
 pub extern "C" fn jit_ll_str_mul(
     s: *mut crate::unicodeobject::Utf8Str,
@@ -548,10 +550,9 @@ pub extern "C" fn jit_ll_str_mul(
     let _ = roots.pin_root(s as crate::PyObjectRef);
     // `s.malloc(size)` is `mallocstr`; the doubling copy fills every char.
     let out = mallocstr(size);
-    assert!(
-        out != 0,
-        "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
-    );
+    if out == 0 {
+        return std::ptr::null_mut();
+    }
     let s = roots.get(s_slot) as i64;
     if size == 0 || n == 0 {
         return out as *mut crate::unicodeobject::Utf8Str;
@@ -636,6 +637,55 @@ pub fn ll_stringslice_startstop(
         stop
     };
     _ll_stringslice(s1, start, stop)
+}
+
+/// `objectmodel._hash_string` over STR `chars`. Empty string is `-1`.
+pub(crate) fn hash_string_bytes(s: &[u8]) -> isize {
+    let Some(&first) = s.first() else {
+        return -1;
+    };
+    let mut x = (first as isize) << 7;
+    for &c in s {
+        x = 1000003isize.wrapping_mul(x) ^ (c as isize);
+    }
+    x ^ (s.len() as isize)
+}
+
+/// `STR.hash` viewed atomically: interned and rewrapped payloads can be
+/// hashed from more than one thread (`W_UnicodeObject.hash` uses the same
+/// `from_ptr` shape).
+fn str_hash_slot<'a>(s: *mut crate::unicodeobject::Utf8Str) -> &'a std::sync::atomic::AtomicIsize {
+    unsafe { std::sync::atomic::AtomicIsize::from_ptr(std::ptr::addr_of_mut!((*s).hash)) }
+}
+
+/// `LLHelpers._ll_strhash` (`rstr.py`). Zero is the uncomputed memo, so a
+/// real zero digest becomes `29872897` and is stored in `STR.hash`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn _ll_strhash(s: *mut crate::unicodeobject::Utf8Str) -> isize {
+    let bytes = unsafe { crate::unicodeobject::utf8_payload_bytes(s) };
+    let mut x = hash_string_bytes(bytes);
+    if x == 0 {
+        x = 29872897;
+    }
+    str_hash_slot(s).store(x, std::sync::atomic::Ordering::Relaxed);
+    x
+}
+
+/// `LLHelpers.ll_strhash` (`rstr.py`). Null STR hashes as 0; a live STR
+/// answers `s.hash` while it is already memoized.
+///
+/// Upstream is `jit.conditional_call_elidable(s.hash, _ll_strhash, s)`.
+/// This crate has no equivalent annotation on ordinary helpers.
+pub fn ll_strhash(s: *mut crate::unicodeobject::Utf8Str) -> isize {
+    if s.is_null() {
+        return 0;
+    }
+    let cached = str_hash_slot(s).load(std::sync::atomic::Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    _ll_strhash(s)
 }
 
 /// `Repr.rtype_str` for a rust-heap `String` (`{cap, ptr, len}`).
@@ -825,6 +875,28 @@ mod tests {
         bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(cut as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+
+    #[test]
+    fn ll_strhash_null_empty_and_cache() {
+        assert_eq!(ll_strhash(std::ptr::null_mut()), 0);
+        let empty = bh_alloc_lowlevel_string(0, LOWLEVEL_STR_BASE_SIZE, 1);
+        assert_ne!(empty, 0);
+        let empty = empty as *mut crate::unicodeobject::Utf8Str;
+        assert_eq!(unsafe { (*empty).hash }, 0);
+        assert_eq!(ll_strhash(empty), -1);
+        assert_eq!(unsafe { (*empty).hash }, -1);
+        assert_eq!(ll_strhash(empty), -1);
+        bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+
+        let buf = bh_alloc_lowlevel_string(1, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_write_lowlevel_char(buf, 0, b'a' as i64, 1);
+        let s = buf as *mut crate::unicodeobject::Utf8Str;
+        let first = ll_strhash(s);
+        assert_ne!(first, 0);
+        assert_eq!(unsafe { (*s).hash }, first);
+        assert_eq!(ll_strhash(s), first);
+        bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
     }
 
     #[test]

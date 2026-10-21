@@ -1048,8 +1048,7 @@ unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// [`_float_add`] uses, so `fuse_boxing_alloc` rewrites it to
 /// `new_with_vtable`. [`w_int_new`]'s collector allocation is
 /// [`w_int_gc_alloc`] (`dont_look_inside`); a binop-rewind inline refuses
-/// that residual. The overflow arm stays [`_int_add_ovf`] so the success
-/// trace only guards it.
+/// that residual. The overflow arm is [`_int_add_ovf`].
 #[inline(never)]
 pub(crate) fn _int_add(x: i64, y: i64) -> PyResult {
     let Some(r) = x.checked_add(y) else {
@@ -1064,9 +1063,8 @@ pub(crate) fn _int_add(x: i64, y: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// `_ovf2long` of `descr_add`. Residual so a success trace of [`_int_add`]
-/// does not record `rbigint.add`.
-#[majit_macros::dont_look_inside]
+/// `_ovf2long` of `descr_add`, traced like `ovf2long`: the success trace of
+/// [`_int_add`] only guards the overflow, and a bridge records this arm.
 fn _int_add_ovf(x: i64, y: i64) -> PyResult {
     Ok(w_long_new(bigint_add_int_int(x, y)))
 }
@@ -1098,9 +1096,8 @@ pub(crate) fn _int_sub(x: i64, y: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// `_ovf2long` of `descr_sub`. Residual so a success trace of [`_int_sub`]
-/// does not record `rbigint.sub`.
-#[majit_macros::dont_look_inside]
+/// `_ovf2long` of `descr_sub`, traced like `ovf2long`: the success trace of
+/// [`_int_sub`] only guards the overflow, and a bridge records this arm.
 fn _int_sub_ovf(x: i64, y: i64) -> PyResult {
     Ok(w_long_new(bigint_sub_int_int(x, y)))
 }
@@ -1129,9 +1126,8 @@ pub(crate) fn _int_mul(x: i64, y: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// `_ovf2long` of `descr_mul`. Residual so a success trace of [`_int_mul`]
-/// does not record `rbigint.mul`.
-#[majit_macros::dont_look_inside]
+/// `_ovf2long` of `descr_mul`, traced like `ovf2long`: the success trace of
+/// [`_int_mul`] only guards the overflow, and a bridge records this arm.
 fn _int_mul_ovf(x: i64, y: i64) -> PyResult {
     Ok(w_long_new(bigint_mul_int_int(x, y)))
 }
@@ -2546,11 +2542,42 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             crate::baseobjspace::object_functionstr_type_name(a())
         )));
     };
-    let a_data = pyre_object::bytesobject::bytes_like_data(a()).to_vec();
-    let b_data = pyre_object::bytesobject::bytes_like_data(b_src).to_vec();
+    let b_src_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(b_src);
+    let a = a();
+    let b_src = pyre_object::gc_roots::shadow_stack_get(b_src_slot);
+    // `StringMethods.descr_add` / `W_BytearrayObject.descr_add` are
+    // per type: bytes reads the STR (`self._value`) and joins with
+    // `ll_strconcat`; bytearray reads `self._data`.
+    if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b_src) {
+        let out = pyre_object::lowlevel_string::jit_ll_strconcat(
+            pyre_object::bytesobject::w_bytes_block(a) as *mut pyre_object::unicodeobject::Utf8Str,
+            pyre_object::bytesobject::w_bytes_block(b_src)
+                as *mut pyre_object::unicodeobject::Utf8Str,
+        );
+        return Ok(pyre_object::bytesobject::w_bytes_from_block(
+            out as *const pyre_object::bytesobject::BytesBlock,
+        ));
+    }
+    bytes_concat_mixed(a, b_src)
+}
+
+/// Non-rstr concat: bytearray left, or a buffer right that is not bytes.
+#[inline(never)]
+unsafe fn bytes_concat_mixed(a: PyObjectRef, b_src: PyObjectRef) -> PyResult {
+    let a_data = if pyre_object::bytesobject::is_bytes(a) {
+        pyre_object::bytesobject::w_bytes_data(a).to_vec()
+    } else {
+        pyre_object::bytearrayobject::w_bytearray_data(a).to_vec()
+    };
+    let b_data = if pyre_object::bytesobject::is_bytes(b_src) {
+        pyre_object::bytesobject::w_bytes_data(b_src).to_vec()
+    } else {
+        pyre_object::bytearrayobject::w_bytearray_data(b_src).to_vec()
+    };
     let mut result = a_data;
     result.extend_from_slice(&b_data);
-    Ok(if pyre_object::bytesobject::is_bytes(a()) {
+    Ok(if pyre_object::bytesobject::is_bytes(a) {
         pyre_object::bytesobject::w_bytes_from_bytes(&result)
     } else {
         pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
@@ -2564,14 +2591,48 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let base = pyre_object::gc_roots::pin_roots(&[s, n]);
     let s = || pyre_object::gc_roots::shadow_stack_get(base);
     let count = repeat_count(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
-    let data = pyre_object::bytesobject::bytes_like_data(s()).to_vec();
-    // A count of 1 on exact `bytes` (immutable) returns the receiver unchanged;
-    // a subclass yields a fresh base `bytes`, and mutable `bytearray` copies.
-    if count == 1
-        && pyre_object::pyobject::is_exact_type(s(), &pyre_object::bytesobject::BYTES_TYPE)
-    {
-        return Ok(s());
+    if pyre_object::bytesobject::is_bytes(s()) {
+        bytes_repeat_bytes(s(), count)
+    } else {
+        bytearray_repeat(s(), count)
     }
+}
+
+/// `StringMethods.descr_mul` on bytes: `times == 1` and exact
+/// `W_BytesObject` returns self; else `self._val * times` through
+/// `LLHelpers.ll_str_mul`.
+#[inline(never)]
+unsafe fn bytes_repeat_bytes(s: PyObjectRef, count: usize) -> PyResult {
+    if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE)
+    {
+        return Ok(s);
+    }
+    let n = pyre_object::bytesobject::w_bytes_len(s);
+    let cap = n
+        .checked_mul(count)
+        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
+    if cap > isize::MAX as usize {
+        return Err(PyError::new(
+            PyErrorKind::OverflowError,
+            "repeated bytes are too long",
+        ));
+    }
+    let out = pyre_object::lowlevel_string::jit_ll_str_mul(
+        pyre_object::bytesobject::w_bytes_block(s) as *mut pyre_object::unicodeobject::Utf8Str,
+        count as i64,
+    );
+    if out.is_null() {
+        return Err(crate::builtins::reservation_failed());
+    }
+    Ok(pyre_object::bytesobject::w_bytes_from_block(
+        out as *const pyre_object::bytesobject::BytesBlock,
+    ))
+}
+
+/// `W_BytearrayObject.descr_mul`: copy `self._data * times`.
+#[inline(never)]
+unsafe fn bytearray_repeat(s: PyObjectRef, count: usize) -> PyResult {
+    let data = pyre_object::bytearrayobject::w_bytearray_data(s).to_vec();
     let cap = data
         .len()
         .checked_mul(count)
@@ -2585,18 +2646,12 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     let mut buf: Vec<u8> = Vec::new();
     buf.try_reserve_exact(cap)
         .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
-    // `_PyBytes_Repeat` returns on `len_dest == 0`, so an empty receiver never
-    // walks the count as a trip count.
     if !data.is_empty() {
         for _ in 0..count {
             buf.extend_from_slice(&data);
         }
     }
-    Ok(if pyre_object::bytesobject::is_bytes(s()) {
-        pyre_object::bytesobject::w_bytes_from_bytes(&buf)
-    } else {
-        pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)
-    })
+    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf))
 }
 
 pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
@@ -2866,29 +2921,6 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
     }
 }
 
-/// `rstr.py` `AbstractStringRepr.ll_strcmp`. Bytewise prefix, then
-/// length. Indexing is `ll_getitem_nonneg` (`as_ptr().add`), not
-/// `slice::cmp` / `Vec::index`. No `stroruni.cmp` oopspec: the first
-/// argument is a byte slice, not `Ptr(STR)` / `Ptr(UNICODE)`.
-///
-/// Elidable only for immutable `bytes`/`bytes`. A `bytearray` operand
-/// reaches `W_BytearrayObject._comparison_helper` / `_memcmp`.
-#[majit_macros::elidable]
-fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
-    let cmplen = left.len().min(right.len());
-    let left_p = left.as_ptr();
-    let right_p = right.as_ptr();
-    let mut i = 0usize;
-    while i < cmplen {
-        let diff = unsafe { *left_p.add(i) as isize - *right_p.add(i) as isize };
-        if diff != 0 {
-            return diff;
-        }
-        i += 1;
-    }
-    left.len() as isize - right.len() as isize
-}
-
 #[inline]
 fn reverse_compare_op(op: CompareOp) -> CompareOp {
     match op {
@@ -3063,14 +3095,15 @@ unsafe fn pin_free_builtin_ord(a: PyObjectRef, b: PyObjectRef, op: CompareOp) ->
         });
     }
     if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
-        let diff = ll_bytes_strcmp(bytesobject::w_bytes_data(a), bytesobject::w_bytes_data(b));
+        let a = &*(a as *const bytesobject::W_BytesObject);
+        let b = &*(b as *const bytesobject::W_BytesObject);
         return Some(match op {
-            CompareOp::Lt => diff < 0,
-            CompareOp::Le => diff <= 0,
-            CompareOp::Gt => diff > 0,
-            CompareOp::Ge => diff >= 0,
-            CompareOp::Eq => diff == 0,
-            CompareOp::Ne => diff != 0,
+            CompareOp::Lt => a.descr_lt(b),
+            CompareOp::Le => a.descr_le(b),
+            CompareOp::Gt => a.descr_gt(b),
+            CompareOp::Ge => a.descr_ge(b),
+            CompareOp::Eq => a.descr_eq(b),
+            CompareOp::Ne => a.descr_ne(b),
         });
     }
     if is_exact_type(a, &TUPLE_TYPE) && is_exact_type(b, &TUPLE_TYPE) {
@@ -7166,23 +7199,21 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
         if is_complex_pair(a, b) && matches!(op, CompareOp::Eq | CompareOp::Ne) {
             return complex_richcompare(a, b, op);
         }
-        // bytesobject.py W_BytesObject.descr_eq / _lt / ... — lexicographic
-        // comparison on the raw bytes. Immutable `bytes`/`bytes` keeps the
-        // elidable `ll_bytes_strcmp`. A `bytearray` operand falls through
-        // to the generic `lookup_in_type_where` / `call_function_impl_result`
-        // tail (`descroperation.py` `_make_comparison_impl`), which reaches
+        // bytesobject.py W_BytesObject.descr_eq / _lt / ... on the STR
+        // payloads. A `bytearray` operand falls through to the generic
+        // `lookup_in_type_where` / `call_function_impl_result` tail
+        // (`descroperation.py` `_make_comparison_impl`), which reaches
         // `bytearray_dunder_*` / `W_BytearrayObject.descr_*`.
         if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
-            let da = pyre_object::bytesobject::w_bytes_data(a);
-            let db = pyre_object::bytesobject::w_bytes_data(b);
-            let diff = ll_bytes_strcmp(da, db);
+            let a = &*(a as *const pyre_object::bytesobject::W_BytesObject);
+            let b = &*(b as *const pyre_object::bytesobject::W_BytesObject);
             return Ok(w_bool_from(match op {
-                CompareOp::Lt => diff < 0,
-                CompareOp::Le => diff <= 0,
-                CompareOp::Gt => diff > 0,
-                CompareOp::Ge => diff >= 0,
-                CompareOp::Eq => diff == 0,
-                CompareOp::Ne => diff != 0,
+                CompareOp::Lt => a.descr_lt(b),
+                CompareOp::Le => a.descr_le(b),
+                CompareOp::Gt => a.descr_gt(b),
+                CompareOp::Ge => a.descr_ge(b),
+                CompareOp::Eq => a.descr_eq(b),
+                CompareOp::Ne => a.descr_ne(b),
             }));
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
