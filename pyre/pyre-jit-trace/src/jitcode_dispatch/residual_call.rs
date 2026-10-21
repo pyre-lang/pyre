@@ -2537,8 +2537,20 @@ thread_local! {
 
     /// The frame a live [`LiveLastInstrGuard`] published the executing pc onto,
     /// with the resume coordinate it displaced.
-    static PUBLISHED_LAST_INSTR: std::cell::Cell<Option<(usize, isize)>> =
+    static PUBLISHED_LAST_INSTR: std::cell::Cell<Option<PublishedLastInstr>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// See [`PUBLISHED_LAST_INSTR`].
+#[derive(Clone, Copy)]
+struct PublishedLastInstr {
+    frame: usize,
+    /// What the guard writes back when the residual returns.
+    saved: isize,
+    /// An escape flush committed `saved` as the frame's resume coordinate
+    /// ([`defer_escape_resume_last_instr`]), so the guard writes it back even
+    /// though the frame is heap-authoritative.
+    resume_flushed: bool,
 }
 
 /// Preserve the instruction that raised when a residual-call traceback hook
@@ -2547,8 +2559,13 @@ thread_local! {
 /// resume coordinate to restore after that exception leaves the frame.
 pub(super) fn finalize_published_last_instr(frame: usize, last_instr: isize) {
     PUBLISHED_LAST_INSTR.with(|slot| {
-        if matches!(slot.get(), Some((published, _)) if published == frame) {
-            slot.set(Some((frame, last_instr)));
+        if let Some(published) = slot.get()
+            && published.frame == frame
+        {
+            slot.set(Some(PublishedLastInstr {
+                saved: last_instr,
+                ..published
+            }));
         }
     });
     ESCAPE_FLUSH_UNDO.with(|slot| {
@@ -2580,7 +2597,7 @@ struct LiveLastInstrGuard {
     /// publication cell compares; the object may have moved.
     frame_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
     saved: isize,
-    prev: Option<(usize, isize)>,
+    prev: Option<PublishedLastInstr>,
 }
 
 impl LiveLastInstrGuard {
@@ -2619,7 +2636,13 @@ impl LiveLastInstrGuard {
         // the executing pc as if it were the outer frame's resume coordinate.
         // Same discipline as [`InlineConcreteFrameGuard`] and
         // [`ResidualFrameChainGuard`].
-        let prev = PUBLISHED_LAST_INSTR.with(|slot| slot.replace(Some((frame as usize, saved))));
+        let prev = PUBLISHED_LAST_INSTR.with(|slot| {
+            slot.replace(Some(PublishedLastInstr {
+                frame: frame as usize,
+                saved,
+                resume_flushed: false,
+            }))
+        });
         Some(Self {
             frame,
             frame_root,
@@ -2631,16 +2654,19 @@ impl LiveLastInstrGuard {
 
 impl Drop for LiveLastInstrGuard {
     fn drop(&mut self) {
-        let restore = PUBLISHED_LAST_INSTR.with(|slot| {
+        let (restore, resume_flushed) = PUBLISHED_LAST_INSTR.with(|slot| {
             let current = slot.replace(self.prev);
             current
-                .filter(|(frame, _)| *frame == self.frame as usize)
-                .map_or(self.saved, |(_, saved)| saved)
+                .filter(|published| published.frame == self.frame as usize)
+                .map_or((self.saved, false), |published| {
+                    (published.saved, published.resume_flushed)
+                })
         });
-        // A flush that committed onto this frame wrote the resume coordinate
-        // itself and is authoritative.  Its undo capture holds the value this
-        // guard displaced (see [`capture_escape_flush_undo`]), so a later
-        // commit withdrawal still restores the resume pc rather than the
+        // A flush that committed onto this frame chose the resume coordinate,
+        // and the guard writes it now that the residual has returned
+        // ([`defer_escape_resume_last_instr`]).  Its undo capture holds the
+        // value this guard displaced (see [`capture_escape_flush_undo`]), so a
+        // later commit withdrawal still restores the resume pc rather than the
         // executing one.
         // The test is "did an escape happen on THIS frame", not "did a flush
         // write a resume pc".  Both legs arm the capture and both leave the
@@ -2651,7 +2677,7 @@ impl Drop for LiveLastInstrGuard {
         let flushed = ESCAPE_FLUSH_UNDO.with(|slot| {
             slot.borrow().as_ref().map(|undo| undo.frame) == Some(self.frame as usize)
         });
-        if !flushed {
+        if !flushed || resume_flushed {
             let frame = self
                 .frame_root
                 .as_ref()
@@ -3017,6 +3043,10 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
                 return true;
             }
             capture_escape_flush_undo(expected);
+            let executing_last_instr = PUBLISHED_LAST_INSTR
+                .with(|slot| slot.get())
+                .filter(|published| published.frame == expected)
+                .map(|_| unsafe { (*(expected as *const pyre_interpreter::PyFrame)).last_instr });
             let (latched, flushed) = if let Some(py_pc) = portal_py_pc {
                 let latched = flush_escape_state_with_latched_stack(ctx, expected, py_pc);
                 let flushed =
@@ -3040,6 +3070,9 @@ pub fn flush_active_frame_escape(ctx: &TraceCtx, frame: *mut pyre_interpreter::P
             }
             if flushed {
                 record_escape_flush_image(expected);
+                if let Some(executing) = executing_last_instr {
+                    defer_escape_resume_last_instr(expected, executing);
+                }
                 let kind = if latched {
                     EscapeResumeKind::Exact
                 } else {
@@ -3113,8 +3146,8 @@ fn capture_escape_flush_undo(frame: usize) {
         // resume pc — so capture the value the guard displaced.
         let last_instr = PUBLISHED_LAST_INSTR
             .with(|slot| slot.get())
-            .filter(|(published, _)| *published == frame)
-            .map_or(pf.last_instr, |(_, saved)| saved);
+            .filter(|published| published.frame == frame)
+            .map_or(pf.last_instr, |published| published.saved);
         *slot = Some(EscapeFlushUndo {
             frame,
             frame_root: owner_root_if_gc(frame),
@@ -3425,6 +3458,39 @@ fn record_escape_flush_image(frame: usize) {
         let frame_now = undo.current_frame();
         let pf = unsafe { &*(frame_now as *const pyre_interpreter::PyFrame) };
         undo.flush_image = locals_w!(pf).as_slice().to_vec();
+    });
+}
+
+/// Hand the resume coordinate an escape flush wrote to the
+/// [`LiveLastInstrGuard`] on `frame`, and put the executing pc back for the
+/// rest of the residual.
+///
+/// The flush stores `resume_py_pc - 1` so that `next_instr()` re-enters the
+/// escaping opcode, but the residual that forced the frame is still running
+/// inside that opcode, and a frame reader there (`f_lasti`, `f_lineno`) has to
+/// see the opcode itself.  `virtualizable.py force_now` leaves a tracing-time
+/// virtualizable's fields as they are ("The values in the virtualizable are
+/// always correct during tracing") and only resets `vable_token`, so the
+/// callee keeps reading what the dispatch loop's `last_instr` store left.
+fn defer_escape_resume_last_instr(frame: usize, executing: isize) {
+    let Some(current) =
+        ESCAPE_FLUSH_UNDO.with(|slot| slot.borrow().as_ref().map(EscapeFlushUndo::current_frame))
+    else {
+        return;
+    };
+    let pf = current as *mut pyre_interpreter::PyFrame;
+    let resume = unsafe { (*pf).last_instr };
+    unsafe { (*pf).last_instr = executing };
+    PUBLISHED_LAST_INSTR.with(|slot| {
+        if let Some(published) = slot.get()
+            && published.frame == frame
+        {
+            slot.set(Some(PublishedLastInstr {
+                saved: resume,
+                resume_flushed: true,
+                ..published
+            }));
+        }
     });
 }
 

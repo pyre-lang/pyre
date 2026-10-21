@@ -1019,7 +1019,13 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
             }
             crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, imm);
         }
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        let vable = read_ref_reg_raw(code, op, 0, ctx)?;
+        // Same split as `setfield_vable_via_metainterp`: only the standard
+        // virtualizable folds the write away. `_opimpl_setfield_vable` records
+        // `SETFIELD_GC` for any other box.
+        if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     if obj.is_none() {
