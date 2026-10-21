@@ -5,6 +5,12 @@ pub(crate) fn gk(raw: i64) -> majit_ir::GreenKey {
     majit_ir::GreenKey::new(vec![raw])
 }
 
+/// `PortalGreenKey` whose typed half is [`gk`] and whose hash is `gk(raw).get_uhash()`.
+pub(crate) fn portal_gk(raw: i64) -> crate::pyjitpl::PortalGreenKey {
+    let key = gk(raw);
+    (key.get_uhash(), key)
+}
+
 /// Two-Int key beginning with `first` whose `get_uhash` is `target`.
 ///
 /// Used when the number is a cell key `mint_cell_key` produced, or a

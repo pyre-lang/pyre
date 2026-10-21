@@ -8,7 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use majit_ir::{GreenKey, OpCode, OpRef, Type, Value};
+use majit_ir::{GreenKey, GreenType, OpCode, OpRef, Type, Value};
 use smallvec::SmallVec;
 
 use super::{MIFrame, MIFrameStack};
@@ -3702,8 +3702,15 @@ where
             // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
             // and `enter_portal_frame(jd_no, unique_id)`.
             ctx.adjust_portal_call_depth(1);
-            let greenkey: crate::pyjitpl::PortalGreenKey =
-                (green_pc as u64, Some(GreenKey::new(green_values.clone())));
+            // pyjitpl.py `_opimpl_recursive_call` `boxes3` concatenates I then
+            // R then F; `newframe` uses that one `greenkey` for unique_id and
+            // `portal_trace_positions`.
+            let mut types = Vec::with_capacity(greens_i.len() + greens_r.len() + greens_f.len());
+            types.extend(std::iter::repeat(GreenType::Int).take(greens_i.len()));
+            types.extend(std::iter::repeat(GreenType::Ref).take(greens_r.len()));
+            types.extend(std::iter::repeat(GreenType::Float).take(greens_f.len()));
+            let typed = GreenKey::with_types(green_values.clone(), types);
+            let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
             let unique_id = ctx.unique_id_for_greenkey(jd_index, &greenkey);
             let jd_box = ctx.const_int(jd_index as i64);
             let uid_box = ctx.const_int(unique_id as i64);
@@ -3713,11 +3720,7 @@ where
             // The machine forwards the log half through
             // `portal_trace_push_fn` into MetaInterp.
             if runtime.is_main_portal(jd_index) {
-                ctx.push_portal_trace_event(
-                    jd_index,
-                    Some((green_pc as u64, None)),
-                    ctx.get_trace_position(),
-                );
+                ctx.push_portal_trace_event(jd_index, Some(greenkey), ctx.get_trace_position());
                 portal_frame.portal_trace_logged = true;
             }
             portal_frame.inline_frame = true;

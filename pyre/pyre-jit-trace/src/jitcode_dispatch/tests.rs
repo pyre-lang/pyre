@@ -18039,11 +18039,13 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     // `current_merge_points = [(original_boxes, start)]`
     // (`pyjitpl.py` `_compile_and_run_once`); the first matching header visit closes.
     // Recorder inputargs are the two reds the header live-args carry.
-    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let green_key_typed = crate::driver::make_green_key_typed(0x1_0000 as *const (), 42, false);
+    let green_key = green_key_typed.get_uhash();
     let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    tc.set_green_key_values(green_key_typed.clone());
     tc.seed_compile_and_run_once_merge_point();
     assert!(
-        tc.has_merge_point_with_shape_assert(green_key, 2),
+        tc.has_merge_point_with_shape_assert(&green_key_typed, 2),
         "seed must match header live-arg length so the first visit closes"
     );
     let next_instr = tc.const_int(42); // gi[0] = Python pc
@@ -18221,8 +18223,10 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
         0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
         0x00, // rf: len=0
     ];
-    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let green_key_typed = crate::driver::make_green_key_typed(0x1_0000 as *const (), 42, false);
+    let green_key = green_key_typed.get_uhash();
     let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    tc.set_green_key_values(green_key_typed.clone());
     tc.seed_compile_and_run_once_merge_point();
     let saved = tc.save_exception();
     tc.seed_bridge_exception_resume(saved);
@@ -18408,14 +18412,16 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         0x00, // rf
     ];
     let pycode_ptr = 0x1_0000usize;
-    let green_key = crate::driver::make_green_key(pycode_ptr as *const (), 42, false);
+    let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr as *const (), 42, false);
+    let green_key = green_key_typed.get_uhash();
     // Header live args are the reds only (none on this form). Seed the
     // same empty shape production `_compile_and_run_once` seeds
     // (`pyjitpl.py` `_compile_and_run_once`).
     let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
+    tc.set_green_key_values(green_key_typed.clone());
     tc.seed_compile_and_run_once_merge_point();
     assert!(
-        tc.has_merge_point_with_shape_assert(green_key, 0),
+        tc.has_merge_point_with_shape_assert(&green_key_typed, 0),
         "seed must match header live-arg length so the first visit closes"
     );
     let next_instr = tc.const_int(42);

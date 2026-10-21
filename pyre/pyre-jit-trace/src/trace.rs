@@ -6893,11 +6893,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
         let input_args: Vec<majit_metainterp::GreenBox> = ctx.inputarg_greenboxes();
         ctx.add_merge_point_with_key(
             start_key,
-            Some(crate::driver::make_green_key_typed(
-                w_code,
-                start_pc,
-                is_being_profiled,
-            )),
+            crate::driver::make_green_key_typed(w_code, start_pc, is_being_profiled),
             input_args,
             start_pc,
         );

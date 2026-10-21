@@ -2535,11 +2535,10 @@ pub struct BridgeTraceInfo {
 /// The one bare-hash entry point that does not need a cell,
 /// `trace_next_iteration_hash` (warmstate.py), only moves a counter.
 ///
-/// The typed half is `None` where a producer holds only the number. Note the
-/// two are not required to be equal-and-hashed: the `u64` is a cell key, which
-/// coincides with the bucket hash only until a second cell chains in and is
-/// minted a distinct number.
-pub type PortalGreenKey = (u64, Option<majit_ir::GreenKey>);
+/// The typed half is the green boxes (`pyjitpl.py` `newframe` `greenkey`).
+/// The `u64` is a cell key, which coincides with the bucket hash only until a
+/// second cell chains in and is minted a distinct number.
+pub type PortalGreenKey = (u64, majit_ir::GreenKey);
 
 /// pyjitpl.py `MetaInterp` tracing-session context.
 ///
@@ -6589,19 +6588,20 @@ impl<M: Clone> MetaInterp<M> {
         // (`WarmEnterState::force_start_tracing`); a tracing start without
         // one needs greens.
         let typed_values = match greenargs {
-            Some((values, types)) => Some(majit_ir::GreenKey::from_greenargs(values, types)),
-            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone()),
+            Some((values, types)) => majit_ir::GreenKey::from_greenargs(values, types),
+            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone())
+                .or_else(|| {
+                    let types = self.staticdata.jitdrivers_sd.get(jd_no)?.green_args_spec();
+                    self.warm_state_for_driver(jd_no)
+                        .installed_greenkey(green_key, &types)
+                })
+                .expect(
+                    "a primary trace starts with its greens: pyjitpl.py bound_reached JitCell(*greenargs)",
+                ),
         };
-        let hot = typed_values
-            .as_ref()
-            .map(|key| {
-                self.warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(key)
-            })
-            .unwrap_or_else(|| {
-                self.warm_state_for_driver(jd_no)
-                    .force_start_tracing(green_key)
-            });
+        let hot = self
+            .warm_state_for_driver(jd_no)
+            .force_start_tracing_for_key(&typed_values);
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6611,11 +6611,10 @@ impl<M: Clone> MetaInterp<M> {
                 // finally-clear instead of falling back to the bucket hash.
                 // This is the function-entry twin of on_back_edge_typed's
                 // resolve-once step below (`warmstate.py maybe_compile_and_run`).
-                let green_key = match typed_values.as_ref() {
-                    Some(key) => self.warm_state_for_driver(jd_no).cell_key_for(key),
-                    None => None,
-                }
-                .unwrap_or(green_key);
+                let green_key = self
+                    .warm_state_for_driver(jd_no)
+                    .cell_key_for(&typed_values)
+                    .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
                 // warmstate.py bound_reached / function-entry: MetaInterp(...)
                 // then compile_and_run_once. This arm does not call
@@ -6640,7 +6639,12 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
 
-                let mut ctx = TraceCtx::new(recorder, green_key, self.staticdata.clone());
+                let mut ctx = TraceCtx::with_green_key(
+                    recorder,
+                    green_key,
+                    typed_values.clone(),
+                    self.staticdata.clone(),
+                );
                 ctx.set_root_green_key_raw(green_key_raw);
                 // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
                 ctx.set_trace_limit(self.warm_state_for_driver(jd_no).trace_limit() as usize);
@@ -6662,28 +6666,15 @@ impl<M: Clone> MetaInterp<M> {
                 // stamp leftover compiling onto this function-entry token.
                 self.active_jitdriver_sd = Some(jd_no);
                 // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
-                // `current_merge_points[0]`. The seed below copies
-                // `green_key_values` so `should_force_finish_tracing_for_key`
-                // reads the cell `bound_reached` marked.
-                if let Some(key) = typed_values.clone() {
-                    ctx.set_green_key_values(key);
-                }
+                // `current_merge_points[0]`. The seed copies `green_key_values`
+                // so `should_force_finish_tracing_for_key` reads the cell
+                // `bound_reached` marked.
                 // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
                 // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
-                // matched. The typed door is that cell; the hash read misses it
-                // when the bucket has two owners.
-                let force_finish = match typed_values.as_ref() {
-                    Some(key) => {
-                        self.warm_state_for_driver(jd_no)
-                            .should_force_finish_tracing_for_key(key)
-                            || self
-                                .warm_state_for_driver(jd_no)
-                                .should_force_finish_tracing(green_key)
-                    }
-                    None => self
-                        .warm_state_for_driver(jd_no)
-                        .should_force_finish_tracing(green_key),
-                };
+                // matched.
+                let force_finish = self
+                    .warm_state_for_driver(jd_no)
+                    .should_force_finish_tracing_for_key(&typed_values);
                 // Store the ctx before `initialize_virtualizable`.
                 // `clear_vable_token` can minor-collect, and
                 // `walk_active_trace_refs` only sees `self.tracing`.
@@ -6794,21 +6785,22 @@ impl<M: Clone> MetaInterp<M> {
         // `with_typed_decision_key` overwrites it. `setup_tracing` stores it
         // on the seed merge point so `prepare_trace_segmenting` writes
         // `JC_FORCE_FINISH` on the cell `bound_reached` reads.
-        let typed_values = match green_key_values {
-            Some(key) => Some(key),
-            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone()),
-        };
         let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
-        let hot = typed_values
-            .as_ref()
-            .map(|key| {
-                self.warm_state_for_driver(jd_no)
-                    .force_start_tracing_for_key(key)
-            })
-            .unwrap_or_else(|| {
-                self.warm_state_for_driver(jd_no)
-                    .force_start_tracing(green_key)
-            });
+        let typed_values = match green_key_values {
+            Some(key) => key,
+            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone())
+                .or_else(|| {
+                    let types = self.staticdata.jitdrivers_sd.get(jd_no)?.green_args_spec();
+                    self.warm_state_for_driver(jd_no)
+                        .installed_greenkey(green_key, &types)
+                })
+                .expect(
+                    "a primary trace starts with its greens: pyjitpl.py bound_reached JitCell(*greenargs)",
+                ),
+        };
+        let hot = self
+            .warm_state_for_driver(jd_no)
+            .force_start_tracing_for_key(&typed_values);
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6820,11 +6812,10 @@ impl<M: Clone> MetaInterp<M> {
                 // to `make_green_key(green_key_raw)`, which a minted cell key
                 // does not, so feeding a resolved key back in fails that
                 // assertion on exactly the chained-cell case this supports.
-                let green_key = match typed_values.as_ref() {
-                    Some(key) => self.warm_state_for_driver(jd_no).cell_key_for(key),
-                    None => None,
-                }
-                .unwrap_or(green_key);
+                let green_key = self
+                    .warm_state_for_driver(jd_no)
+                    .cell_key_for(&typed_values)
+                    .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
                 self.setup_tracing(
                     green_key,
@@ -7086,7 +7077,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
-        green_key_values: Option<majit_ir::GreenKey>,
+        green_key_values: majit_ir::GreenKey,
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
@@ -7112,28 +7103,19 @@ impl<M: Clone> MetaInterp<M> {
         // warmstate.py `bound_reached` reads `JC_FORCE_FINISH` off the cell
         // `maybe_compile_and_run` matched. Do it before `green_key_values`
         // moves into the trace. The typed cell is the one
-        // `mark_force_finish_tracing_for_key` wrote; the hash read is the
-        // fallback when this entry has no greens.
+        // `mark_force_finish_tracing_for_key` wrote.
         let jd_no = self
             .elect_active_jitdriver_sd(driver_descriptor.as_ref())
             .unwrap_or(0);
-        let force_finish = match green_key_values.as_ref() {
-            Some(key) => {
-                self.warm_state_for_driver(jd_no)
-                    .should_force_finish_tracing_for_key(key)
-                    || self
-                        .warm_state_for_driver(jd_no)
-                        .should_force_finish_tracing(green_key)
-            }
-            None => self
-                .warm_state_for_driver(jd_no)
-                .should_force_finish_tracing(green_key),
-        };
-        let mut ctx = if let Some(values) = green_key_values {
-            TraceCtx::with_green_key(recorder, green_key, values, self.staticdata.clone())
-        } else {
-            TraceCtx::new(recorder, green_key, self.staticdata.clone())
-        };
+        let force_finish = self
+            .warm_state_for_driver(jd_no)
+            .should_force_finish_tracing_for_key(&green_key_values);
+        let mut ctx = TraceCtx::with_green_key(
+            recorder,
+            green_key,
+            green_key_values,
+            self.staticdata.clone(),
+        );
         ctx.set_root_green_key_raw(green_key_raw);
         // pyjitpl.py:2789 warmrunnerstate.trace_limit — snapshot onto the
         // per-trace context so `is_too_long` can consult it without needing
@@ -8254,18 +8236,9 @@ impl<M: Clone> MetaInterp<M> {
             // reached here as `warm_state_for_driver(huge_fn_jd_no)`.
             //
             // Upstream reaches the cell through `dont_trace_here(greenkey)`
-            // (warmstate.py), which is `ensure_jit_cell_at_key` on the
-            // greens; take the typed form when the log carried one, so the
-            // flag lands on the frame's own cell rather than on whatever heads
-            // its bucket.
-            match huge_fn_key.1.as_ref() {
-                Some(key) => self
-                    .warm_state_for_driver(huge_fn_jd_no)
-                    .disable_noninlinable_function_for_key(key),
-                None => self
-                    .warm_state_for_driver(huge_fn_jd_no)
-                    .disable_noninlinable_function(huge_fn_key.0),
-            }
+            // (warmstate.py), which is `ensure_jit_cell_at_key` on the greens.
+            self.warm_state_for_driver(huge_fn_jd_no)
+                .disable_noninlinable_function_for_key(&huge_fn_key.1);
             // pyjitpl.py `self.aborted_tracing_jitdriver = jd_sd` /
             // `self.aborted_tracing_greenkey = greenkey_of_huge_function` —
             // stashed so `aborted_tracing(reason)` can fire `on_trace_too_long`
@@ -8327,25 +8300,11 @@ impl<M: Clone> MetaInterp<M> {
             self.warm_state_for_driver(jd_no)
                 .trace_next_iteration(outer_key);
             // Both reach their cell through `_ensure_jit_cell_at_key`
-            // (warmstate.py), which is handed the greens — so take the
-            // typed form whenever the merge point carried one. The hash forms
-            // create a cell with no comparekey, which the next typed lookup
-            // cannot see, and `JC_FORCE_FINISH` is never cleared: set on the
-            // wrong cell of a bucket it is permanent.
-            match outer_key_typed.as_ref() {
-                Some(key) => {
-                    self.warm_state_for_driver(jd_no)
-                        .mark_force_finish_tracing_for_key(key);
-                    self.warm_state_for_driver(jd_no)
-                        .disable_noninlinable_function_for_key(key);
-                }
-                None => {
-                    self.warm_state_for_driver(jd_no)
-                        .mark_force_finish_tracing(outer_key);
-                    self.warm_state_for_driver(jd_no)
-                        .disable_noninlinable_function(outer_key);
-                }
-            }
+            // (warmstate.py), which is handed the greens of this merge point.
+            self.warm_state_for_driver(jd_no)
+                .mark_force_finish_tracing_for_key(&outer_key_typed);
+            self.warm_state_for_driver(jd_no)
+                .disable_noninlinable_function_for_key(&outer_key_typed);
         }
         // pyjitpl.py:2825 `if not isinstance(self.resumekey, ResumeFromInterpDescr):`
         // — pyre carries the source token directly via
@@ -10492,10 +10451,9 @@ impl<M: Clone> MetaInterp<M> {
         // (live_arg_boxes, start))` appends the greens the trace is closing
         // WITH, which is the same list the `same_greenkey` scan above
         // compares against. That key is the close, not the trace-start key.
-        let key_typed = ctx
-            .close_green_key()
-            .or_else(|| ctx.green_key_values().cloned());
-        let hash_fallback = key_typed
+        let close = ctx.close_green_key();
+        let start = ctx.green_key_values().cloned();
+        let hash_fallback = close
             .as_ref()
             .map(|k| k.get_uhash())
             .unwrap_or(ctx.green_key);
@@ -10506,12 +10464,25 @@ impl<M: Clone> MetaInterp<M> {
         // back as `mp.green_key` for `compiled_loops`. A bucket hash names
         // a different cell once the bucket is chained.
         let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
-        let key = match key_typed.clone() {
-            Some(typed) => self
-                .warm_state_for_driver(compiling_jd)
-                .resolve_cell_key(typed.get_uhash(), || typed),
-            None => hash_fallback,
-        };
+        let types = self
+            .staticdata
+            .jitdrivers_sd
+            .get(compiling_jd)
+            .map(|jd| jd.green_args_spec())
+            .expect("the driver this trace runs on");
+        let key_typed = close
+            .or(start)
+            .or_else(|| {
+                self.warm_state_for_driver(compiling_jd)
+                    .installed_greenkey(hash_fallback, &types)
+            })
+            .expect(
+                "register_retrace_merge_point: a merge point keeps its greens: \
+                 pyjitpl.py reached_loop_header live_arg_boxes",
+            );
+        let key = self
+            .warm_state_for_driver(compiling_jd)
+            .resolve_cell_key(key_typed.get_uhash(), || key_typed.clone());
         let ctx = self
             .tracing
             .as_mut()
@@ -11074,19 +11045,12 @@ impl<M: Clone> MetaInterp<M> {
             // — the warmstate cell, which rejects an invalidated token.
             // `compiled.live_token()` upgrades the side-table Weak without
             // that filter and disagrees exactly when the cell has lost
-            // its token. Typed lookup still holds the greens; resolve the
+            // its token. The merge point carries the greens; resolve the
             // cell key after the token is found, before optimize/backend.
-            let token = match green_key_typed.as_ref() {
-                Some(typed) => self.get_procedure_token_for_key(typed),
-                None => self.get_procedure_token(mp_green_key),
-            };
-            let Some(token) = token else {
+            let Some(token) = self.get_procedure_token_for_key(&green_key_typed) else {
                 return false;
             };
-            let green_key = match green_key_typed.as_ref() {
-                Some(typed) => self.cell_key_for_typed(compiling_jd, typed),
-                None => mp_green_key,
-            };
+            let green_key = self.cell_key_for_typed(compiling_jd, &green_key_typed);
             (green_key, token)
         };
         let partial = match self.partial_trace.take() {
@@ -18743,19 +18707,15 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py `warmrunnerstate.dont_trace_here(greenboxes)` —
             // upstream is handed the greens, and `dont_trace_here`
             // (warmstate.py) reaches its cell through
-            // `ensure_jit_cell_at_key`. The callee's raw key is in scope here,
-            // so take the typed door: the hash form would file a cell with no
-            // comparekey, and `JC_DONT_TRACE_HERE` set on the wrong cell of a
-            // bucket stops the wrong function from being inlined.
-            match Self::with_typed_decision_key(callee_key, callee_raw, |key| {
+            // `ensure_jit_cell_at_key`.
+            Self::with_typed_decision_key(callee_key, callee_raw, |key| {
                 self.warm_state_for_driver(jd_no)
                     .disable_noninlinable_function_for_key(key);
-            }) {
-                Some(()) => {}
-                None => self
-                    .warm_state_for_driver(jd_no)
-                    .disable_noninlinable_function(callee_key),
-            }
+            })
+            .expect(
+                "warmrunnerstate.dont_trace_here(greenboxes): pyjitpl.py _opimpl_recursive_call \
+                 always has the greens",
+            );
         }
         decision
     }
@@ -20409,9 +20369,8 @@ impl<M: Clone> MetaInterp<M> {
             .jitdrivers_sd
             .get(jd_no)
             .and_then(|jd| jd.get_unique_id)
-            && let Some(typed) = greenkey.1.as_ref()
         {
-            return hook(&typed.values) as u64;
+            return hook(&greenkey.1.values) as u64;
         }
         0
     }
@@ -25038,7 +24997,7 @@ mod portal_resume_rebuild_tests {
 mod metainterp_static_data_tests {
     use super::*;
     use crate::jitcode::{JitCode, JitCodeBuilder};
-    use crate::test_greens::gk;
+    use crate::test_greens::{gk, portal_gk};
     use majit_jitcode::jitcode::JitCode as BuildJitCode;
 
     #[test]
@@ -27065,7 +27024,7 @@ mod metainterp_static_data_tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.aborted_tracing_jitdriver = Some(7);
-        meta.aborted_tracing_greenkey = Some((0xfeed, None));
+        meta.aborted_tracing_greenkey = Some(portal_gk(0xfeed));
         // `on_trace_too_long` and the clear sit inside the merge-points
         // branch of `aborted_tracing` (`pyjitpl.py`).
         meta.pending_abort_has_merge_points = true;
@@ -27727,7 +27686,9 @@ mod metainterp_static_data_tests {
         let _ = meta.warm_state_for_driver(idx1).ensure_cell_for_key(&key);
         meta.warm_state_for_driver(idx1)
             .disable_noninlinable_function_for_key(&key);
-        let decision = meta.should_inline_core(key.get_uhash(), (0, 0), Some((0, 0)));
+        let code_ptr = 0x1e11usize;
+        let pc = 0usize;
+        let decision = meta.should_inline_core(key.get_uhash(), (code_ptr, pc), Some((0, 0)));
         assert!(
             matches!(decision, InlineDecision::ResidualCall),
             "JC_DONT_TRACE_HERE on jitdriver_sd.warmstate refuses inlining"
@@ -29876,12 +29837,12 @@ mod metainterp_static_data_tests {
         jitcode.replace_jitdriver_sd(Some(second_index));
         assert!(meta.is_main_jitcode(&jitcode));
         start_tracing(&mut meta);
-        meta.newframe(std::sync::Arc::new(jitcode), Some((0xa11, None)));
+        meta.newframe(std::sync::Arc::new(jitcode), Some(portal_gk(0xa11)));
         record_ops(&mut meta, 5);
         meta.popframe(true);
         assert_eq!(
             meta.find_biggest_function(),
-            Some((second_index, (0xa11, None)))
+            Some((second_index, portal_gk(0xa11)))
         );
     }
 
@@ -29893,31 +29854,38 @@ mod metainterp_static_data_tests {
         start_tracing(&mut meta);
         let jd_no = jc.jitdriver_sd().expect("recursive portal");
         let start = meta.trace_ctx().expect("tracing").get_trace_position();
-        meta.push_portal_trace_position(jd_no, Some((0xBEEF, None)), start);
+        meta.push_portal_trace_position(jd_no, Some(portal_gk(0xBEEF)), start);
         record_ops(&mut meta, 5);
         let end = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.push_portal_trace_position(jd_no, None, end);
-        assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xBEEF, None))));
+        assert_eq!(
+            meta.find_biggest_function(),
+            Some((jd_no, portal_gk(0xBEEF)))
+        );
 
         // JitCodeMachine forwards into the same MetaInterp log.
         meta.portal_trace_positions = Some(Vec::new());
         let start = meta.trace_ctx().expect("tracing").get_trace_position();
-        meta.tracing
-            .as_ref()
-            .unwrap()
-            .push_portal_trace_event(jd_no, Some((0xCAFE, None)), start);
+        meta.tracing.as_ref().unwrap().push_portal_trace_event(
+            jd_no,
+            Some(portal_gk(0xCAFE)),
+            start,
+        );
         record_ops(&mut meta, 3);
         let end = meta.trace_ctx().expect("tracing").get_trace_position();
         meta.tracing
             .as_ref()
             .unwrap()
             .push_portal_trace_event(jd_no, None, end);
-        assert_eq!(meta.find_biggest_function(), Some((jd_no, (0xCAFE, None))));
+        assert_eq!(
+            meta.find_biggest_function(),
+            Some((jd_no, portal_gk(0xCAFE)))
+        );
 
         // pyjitpl.py `self.portal_trace_positions = None` — after the
         // abort boundary nothing is logged and nothing is found.
         meta.portal_trace_positions = None;
-        meta.push_portal_trace_position(jd_no, Some((0xF00D, None)), end);
+        meta.push_portal_trace_position(jd_no, Some(portal_gk(0xF00D)), end);
         assert_eq!(meta.find_biggest_function(), None);
     }
 
@@ -29976,7 +29944,7 @@ mod metainterp_static_data_tests {
             .get_unique_id = Some(hook);
         start_tracing(&mut meta);
         let typed = majit_ir::GreenKey::new(vec![1, 0, 0xabc]);
-        meta.newframe(jc, Some((0xbadd, Some(typed))));
+        meta.newframe(jc, Some((typed.get_uhash(), typed)));
         let ctx = meta.trace_ctx().expect("tracing");
         ctx.ensure_ops_materialized();
         let op = ctx
@@ -30049,7 +30017,7 @@ mod metainterp_static_data_tests {
         jc.replace_jitdriver_sd(Some(5));
         let jc = std::sync::Arc::new(jc);
 
-        meta.newframe(jc, Some((0xfeed, None)));
+        meta.newframe(jc, Some(portal_gk(0xfeed)));
         meta.popframe(true);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
@@ -30120,7 +30088,7 @@ mod metainterp_static_data_tests {
 
         let typed = majit_ir::GreenKey::new(vec![0xcafe, 0xbeef]);
         let hash = typed.get_uhash();
-        meta.perform_call(jc, &[], Some((hash, Some(typed.clone()))))
+        meta.perform_call(jc, &[], Some((hash, typed.clone())))
             .unwrap_err();
         assert_eq!(
             meta.portal_trace_positions
@@ -30131,7 +30099,7 @@ mod metainterp_static_data_tests {
         );
         let entry = &meta.portal_trace_positions.as_ref().unwrap()[0];
         assert_eq!(entry.0, idx);
-        assert_eq!(entry.1, Some((hash, Some(typed))));
+        assert_eq!(entry.1, Some((hash, typed)));
 
         meta.popframe(true);
         let positions = meta
@@ -30152,7 +30120,7 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
         meta.compile_tracing = meta.tracing.take();
-        meta.newframe(jc, Some((0x4e41, None)));
+        meta.newframe(jc, Some(portal_gk(0x4e41)));
         assert_eq!(
             meta.portal_trace_positions.as_ref().map(Vec::len),
             Some(1),
@@ -30203,7 +30171,7 @@ mod metainterp_static_data_tests {
         );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some((0xbabe, None)))
+        meta.perform_call(jc, &[], Some(portal_gk(0xbabe)))
             .unwrap_err();
         assert!(
             meta.portal_trace_positions
@@ -30316,18 +30284,19 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+        meta.perform_call(jc.clone(), &[], Some(portal_gk(0xa11)))
             .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
+        meta.perform_call(jc, &[], Some(portal_gk(0xb22)))
+            .unwrap_err();
         record_ops(&mut meta, 1);
         meta.popframe(true);
 
         assert_eq!(
             meta.find_biggest_function(),
-            Some((0, (0xa11, None))),
+            Some((0, portal_gk(0xa11))),
             "the larger frame wins even though both have returned"
         );
     }
@@ -30340,15 +30309,16 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+        meta.perform_call(jc.clone(), &[], Some(portal_gk(0xa11)))
             .unwrap_err();
         record_ops(&mut meta, 1);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
+        meta.perform_call(jc, &[], Some(portal_gk(0xb22)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
 
-        assert_eq!(meta.find_biggest_function(), Some((0, (0xb22, None))));
+        assert_eq!(meta.find_biggest_function(), Some((0, portal_gk(0xb22))));
     }
 
     #[test]
@@ -30359,12 +30329,13 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+        meta.perform_call(jc.clone(), &[], Some(portal_gk(0xa11)))
             .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
+        meta.perform_call(jc, &[], Some(portal_gk(0xb22)))
+            .unwrap_err();
         record_ops(&mut meta, 1);
         // Left open, and the recorder retired under it.
         meta.tracing = None;
@@ -30379,12 +30350,13 @@ mod metainterp_static_data_tests {
         // measures an open frame against that live cursor.
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
-        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
+        meta.perform_call(jc, &[], Some(portal_gk(0xb22)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
         meta.compile_tracing = meta.tracing.take();
         assert_eq!(
             meta.find_biggest_function(),
-            Some((0, (0xb22, None))),
+            Some((0, portal_gk(0xb22))),
             "an open frame sizes against compile_tracing when tracing is parked"
         );
         meta.tracing = meta.compile_tracing.take();
@@ -30466,12 +30438,12 @@ mod metainterp_static_data_tests {
             "pyjitpl.py blackhole_if_trace_too_long: current_merge_points is nonempty"
         );
 
-        meta.perform_call(jc, &[], Some((callee_hash, Some(callee.clone()))))
+        meta.perform_call(jc, &[], Some((callee_hash, callee.clone())))
             .unwrap_err();
         record_ops(&mut meta, 8);
         assert_eq!(
             meta.find_biggest_function(),
-            Some((idx, (callee_hash, Some(callee.clone())))),
+            Some((idx, (callee_hash, callee.clone()))),
             "find_biggest_function names the inlined callee, not the portal"
         );
 
@@ -30621,12 +30593,12 @@ mod metainterp_static_data_tests {
             },
         );
 
-        meta.perform_call(jc, &[], Some((names_hash, Some(names.clone()))))
+        meta.perform_call(jc, &[], Some((names_hash, names.clone())))
             .unwrap_err();
         record_ops(&mut meta, 8);
         assert_eq!(
             meta.find_biggest_function(),
-            Some((idx, (names_hash, Some(names.clone())))),
+            Some((idx, (names_hash, names.clone()))),
             "find_biggest_function names the inlined names() frame"
         );
 
@@ -30667,7 +30639,8 @@ mod metainterp_static_data_tests {
             Some(0),
             "the next trace starts from an empty log, not from None"
         );
-        meta.perform_call(jc, &[], Some((0xa11, None))).unwrap_err();
+        meta.perform_call(jc, &[], Some(portal_gk(0xa11)))
+            .unwrap_err();
         assert_eq!(
             meta.portal_trace_positions.as_ref().expect("Some").len(),
             1,
@@ -31731,9 +31704,10 @@ mod tests {
         let live = GcRef(0x96E3_8100);
         let mut meta = MetaInterp::<()>::new(0);
         let ctx = TraceCtx::for_test(1);
+        let cut_key = gk(1);
         let cut = crate::trace_ctx::MergePoint {
-            green_key: 1,
-            green_key_typed: None,
+            green_key: cut_key.get_uhash(),
+            green_key_typed: cut_key,
             position: crate::recorder::TracePosition {
                 _pos: 0,
                 _count: 0,
@@ -31935,8 +31909,8 @@ mod tests {
         trace_ctx
             .current_merge_points
             .push(crate::trace_ctx::MergePoint {
-                green_key: 0,
-                green_key_typed: None,
+                green_key: gk(0).get_uhash(),
+                green_key_typed: gk(0),
                 position,
                 green_boxes: vec![crate::trace_ctx::GreenBox::new(op, Type::Ref)],
                 header_pc: 0,
@@ -36086,7 +36060,7 @@ mod tests {
         // `aborted_tracing` calls `on_abort` only when `current_merge_points`
         // is non-empty (`pyjitpl.py`). A header visit is that list.
         if let Some(ctx) = meta.tracing.as_mut() {
-            ctx.add_merge_point_with_key(green_key.get_uhash(), None, Vec::new(), 0);
+            ctx.add_merge_point_with_key(green_key.get_uhash(), green_key.clone(), Vec::new(), 0);
         }
         meta.abort_trace(false);
         assert_eq!(*trace_abort_count.lock(), 1, "on_trace_abort should fire");
@@ -36317,7 +36291,7 @@ mod tests {
 
         // `on_abort` runs only with merge points (`pyjitpl.py aborted_tracing`).
         if let Some(ctx) = meta.tracing.as_mut() {
-            ctx.add_merge_point_with_key(green_key.get_uhash(), None, Vec::new(), 0);
+            ctx.add_merge_point_with_key(green_key.get_uhash(), green_key.clone(), Vec::new(), 0);
         }
         meta.abort_trace(false);
         {
@@ -36332,7 +36306,12 @@ mod tests {
         }
         if meta.tracing.is_some() {
             if let Some(ctx) = meta.tracing.as_mut() {
-                ctx.add_merge_point_with_key(green_key.get_uhash(), None, Vec::new(), 0);
+                ctx.add_merge_point_with_key(
+                    green_key.get_uhash(),
+                    green_key.clone(),
+                    Vec::new(),
+                    0,
+                );
             }
             meta.abort_trace(true);
             let events = abort_events.lock();

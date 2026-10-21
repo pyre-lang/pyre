@@ -5646,21 +5646,54 @@ impl<S: JitState> JitDriver<S> {
         target_key: u64,
         live_arg_boxes: &[OpRef],
     ) -> bool {
-        let (header_pc, already, key_typed) = {
+        let (header_pc, close, start) = {
             let Some(ctx) = self.meta.trace_ctx() else {
                 return false;
             };
             // pyjitpl.py same_greenkey: the green key is the identity.
             // `header_pc` recorded below is this close's guest pc.
-            let key_typed = ctx
-                .close_green_key()
-                .filter(|key| key.get_uhash() == target_key);
             (
                 ctx.close_header_pc(),
-                ctx.find_merge_point_same_greenkey(target_key, key_typed.as_ref())
-                    .is_some(),
-                key_typed,
+                ctx.close_green_key(),
+                ctx.green_key_values().cloned(),
             )
+        };
+        let named = close
+            .as_ref()
+            .filter(|key| key.get_uhash() == target_key)
+            .cloned()
+            .or_else(|| {
+                start
+                    .as_ref()
+                    .filter(|key| key.get_uhash() == target_key)
+                    .cloned()
+            });
+        let key_typed = named
+            .or_else(|| {
+                let jd_no = self.index().unwrap_or(0);
+                let types = self
+                    .meta
+                    .staticdata
+                    .jitdrivers_sd
+                    .get(jd_no)
+                    .map(|jd| jd.green_args_spec())
+                    .expect("the driver this trace runs on");
+                self.meta
+                    .warm_state_for_driver(jd_no)
+                    .installed_greenkey(target_key, &types)
+            })
+            .or(close)
+            .or(start)
+            .expect(
+                "keep_tracing_after_declined_jump: a merge point keeps its greens: \
+                 pyjitpl.py reached_loop_header live_arg_boxes",
+            );
+        let already = {
+            let Some(ctx) = self.meta.trace_ctx() else {
+                return false;
+            };
+            ctx.find_merge_point_same_greenkey(target_key, Some(&key_typed))
+                .is_some()
         };
         if already {
             return false;
@@ -12801,6 +12834,7 @@ mod tests {
         // retries by ticking. Threshold 100 would stay cold if the back
         // edge only counted.
         let mut driver = JitDriver::<CountingDoorState>::new(100);
+        driver.register_descriptor(JitDriverStaticData::new(vec![("g0", Type::Int)], vec![]));
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = gk(0xD017);
         driver
@@ -14796,11 +14830,7 @@ mod tests {
 
         driver.merge_point(|meta, _sym| {
             let start = meta.trace_ctx().unwrap().get_trace_position();
-            meta.push_portal_trace_position(
-                0,
-                Some((callee.get_uhash(), Some(callee.clone()))),
-                start,
-            );
+            meta.push_portal_trace_position(0, Some((callee.get_uhash(), callee.clone())), start);
             let ctx = meta.tracing.as_mut().unwrap();
             ctx.record_op(
                 majit_ir::OpCode::IntAdd,
@@ -16206,6 +16236,7 @@ mod tests {
     #[test]
     fn a_tmp_callback_only_cell_is_counted_not_entered_at_the_back_edge() {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.register_descriptor(JitDriverStaticData::new(vec![("g0", Type::Int)], vec![]));
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = GreenKey::new(vec![4413]);
         let hash = key.get_uhash();
@@ -16422,6 +16453,18 @@ mod cross_loop_cut_close_tests {
     #[derive(Default)]
     struct CutCloseState;
 
+    /// Driver whose `_green_args_spec` matches `gk_with_uhash` (two Int greens)
+    /// and whose reds match `CutCloseState::extract_live` (one Int).
+    fn cut_close_driver() -> JitDriver<CutCloseState> {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.register_descriptor(JitDriverStaticData::new(
+            vec![("g0", Type::Int), ("g1", Type::Int)],
+            vec![("r0", Type::Int)],
+        ));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+    }
+
     impl JitState for CutCloseState {
         type Meta = ();
         type Sym = ();
@@ -16454,14 +16497,19 @@ mod cross_loop_cut_close_tests {
     /// `inner_greens()`. `cut` routes `compile_loop` through the cross-loop cut
     /// (compile.py:269-270) so the loop is stored under the inner token.
     fn compile_inner_loop(driver: &mut JitDriver<CutCloseState>, key: u64, cut: bool) {
+        let typed = gk_with_uhash(key, 1);
         let _ = driver
             .meta
             .warm_state_for_driver(0)
-            .ensure_cell_for_key(&gk_with_uhash(key, 1));
+            .ensure_cell_for_key(&typed);
         assert!(matches!(
-            driver
-                .meta
-                .force_start_tracing(key, (0, 0), None, None, &[Value::Int(0)]),
+            driver.meta.force_start_tracing(
+                key,
+                (0, 0),
+                Some((&typed.values, &typed.types)),
+                None,
+                &[Value::Int(0)]
+            ),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -16537,8 +16585,7 @@ mod cross_loop_cut_close_tests {
     /// label's bounds unestablished.
     #[test]
     fn interp_origin_close_declines_a_cross_loop_cut_target() {
-        let mut driver = JitDriver::<CutCloseState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut driver = cut_close_driver();
         let inner_key = gk(7031);
         compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
 
@@ -16561,8 +16608,7 @@ mod cross_loop_cut_close_tests {
     /// `raise_if_successful`).
     #[test]
     fn interp_origin_close_takes_a_non_cut_target() {
-        let mut driver = JitDriver::<CutCloseState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut driver = cut_close_driver();
         let inner_key = gk(7051);
         compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ false);
 
@@ -16586,8 +16632,7 @@ mod cross_loop_cut_close_tests {
     /// assertion is a before/after bump rather than an absolute count.
     #[test]
     fn interp_origin_close_into_an_uncompiled_target_is_not_a_declined_attempt() {
-        let mut driver = JitDriver::<CutCloseState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut driver = cut_close_driver();
         // Deliberately never passed to `compile_inner_loop`.
         let never_compiled = 7061u64;
         assert!(
@@ -16651,8 +16696,7 @@ mod cross_loop_cut_close_tests {
     /// apart.
     #[test]
     fn a_declined_close_hands_over_the_pc_that_declined() {
-        let mut driver = JitDriver::<CutCloseState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut driver = cut_close_driver();
         let inner_key = gk(7081);
         compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
 
@@ -16696,8 +16740,7 @@ mod cross_loop_cut_close_tests {
     /// nothing to correct and keeps the pc it was called with.
     #[test]
     fn a_declined_close_without_a_pc_hands_over_nothing() {
-        let mut driver = JitDriver::<CutCloseState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut driver = cut_close_driver();
         let inner_key = gk(7091);
         compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
 
@@ -16720,8 +16763,7 @@ mod cross_loop_cut_close_tests {
     /// at the same key is not judged by its predecessor.
     #[test]
     fn retiring_a_cut_loop_forgets_its_cut_mark() {
-        let mut driver = JitDriver::<CutCloseState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let mut driver = cut_close_driver();
         let inner_key = gk(7041);
         compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
 

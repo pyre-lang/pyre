@@ -10403,11 +10403,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
-                Some(crate::driver::make_green_key_typed(
+                crate::driver::make_green_key_typed(
                     pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
                     0,
                     is_being_profiled,
-                )),
+                ),
             ),
             None,
         );

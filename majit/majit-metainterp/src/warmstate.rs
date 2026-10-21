@@ -1259,6 +1259,24 @@ impl WarmEnterState {
         }
     }
 
+    /// Greens stored on the installed cell named by `cell_key`.
+    ///
+    /// `warmstate.py` `JitCell.__init__` (`make_jitcell_subclass`) keeps the
+    /// greenargs on the cell (`setattr(self, attrname, greenargs[i])`).
+    /// `types` is the driver's `_green_args_spec`. The JitCell class is per
+    /// driver, so the stored greens always match that spec.
+    pub fn installed_greenkey(&self, cell_key: u64, types: &[GreenType]) -> Option<GreenKey> {
+        self.cell_by_key(cell_key).map(|c| {
+            assert_eq!(
+                c.greens.len(),
+                types.len(),
+                "cell greens match the driver's _green_args_spec \
+                 (warmstate.py make_jitcell_subclass)"
+            );
+            GreenKey::with_types(c.greens.to_vec(), types.to_vec())
+        })
+    }
+
     /// Typed-key variant of [`Self::disable_noninlinable_function`]:
     /// installs a cell for `key` if absent (`ensure_jit_cell_at_key`), then
     /// sets `DONT_TRACE_HERE` on the cell whose comparekey matches `key`.
@@ -1846,13 +1864,16 @@ impl WarmEnterState {
     /// Mark a callee as a location that should no longer be inlined into
     /// surrounding traces.
     ///
-    /// The hash form acts on an installed cell only; installing one needs the
-    /// greenkey (`ensure_jit_cell_at_key`), which the `_for_key` twin takes.
+    /// The hash form names an installed cell; installing one needs the
+    /// greenkey (`ensure_jit_cell_at_key(greenkey)`), which the `_for_key`
+    /// twin takes.
     pub fn disable_noninlinable_function(&mut self, callee_key: u64) {
-        if let Some(cell) = self.cell_by_key(callee_key) {
-            cell.flags
-                .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
-        }
+        let cell = self.cell_by_key(callee_key).expect(
+            "disable_noninlinable_function names an installed cell; installing one needs greens, \
+             warmstate.py dont_trace_here ensure_jit_cell_at_key(greenkey) — use the `_for_key` twin",
+        );
+        cell.flags
+            .set(cell.flags.get() | (JcFlags::JC_DONT_TRACE_HERE));
     }
 
     /// `warmstate.py mark_as_being_traced(*greenargs)`, which reaches
@@ -1904,13 +1925,16 @@ impl WarmEnterState {
     /// The next tracing run for this green key should segment instead of
     /// repeatedly aborting once it approaches the trace limit.
     ///
-    /// The hash form acts on an installed cell only; installing one needs the
-    /// greenkey (`ensure_jit_cell_at_key`), which the `_for_key` twin takes.
+    /// The hash form names an installed cell; installing one needs the
+    /// greenkey (`ensure_jit_cell_at_key(greenkey)`), which the `_for_key`
+    /// twin takes.
     pub fn mark_force_finish_tracing(&mut self, cell_key: u64) {
-        if let Some(cell) = self.cell_by_key(cell_key) {
-            cell.flags
-                .set(cell.flags.get() | (JcFlags::JC_FORCE_FINISH));
-        }
+        let cell = self.cell_by_key(cell_key).expect(
+            "mark_force_finish_tracing names an installed cell; installing one needs greens, \
+             warmstate.py mark_force_finish_tracing ensure_jit_cell_at_key(greenkey) — use the `_for_key` twin",
+        );
+        cell.flags
+            .set(cell.flags.get() | (JcFlags::JC_FORCE_FINISH));
     }
 
     /// Typed form of [`Self::mark_force_finish_tracing`].
@@ -2624,7 +2648,7 @@ impl WarmEnterState {
     /// bare-hash writer installs — can never match a typed lookup, so
     /// `ensure_cell_for_key` misses on a key that already has a cell and
     /// chains past it. See
-    /// `one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain`.
+    /// `one_key_through_a_hash_and_a_typed_entry_point_uses_one_cell`.
     ///
     /// So `num_cells` and the occupied-slot count are **already** capable of
     /// disagreeing, and the difference is the count of keys that reached
@@ -4672,22 +4696,15 @@ mod tests {
         );
     }
 
-    /// The set/clear pair for `JC_TRACING` has to agree on which cell it is
-    /// talking about. `mark_as_being_traced_for_key` writes the cell matching
-    /// the key; `clear_tracing_flag` clears the bucket head. When a hash-form
-    /// writer got there first those are different cells, and the clear misses.
-    ///
-    /// This demonstrates the mechanism on a constructed fixture. It does NOT
-    /// establish that production reaches this configuration — that is what the
-    /// `stfe_declined_tracing_stale` counter is for.
+    /// The set/clear pair for `JC_TRACING` agrees on the one cell a green
+    /// key owns. `mark_as_being_traced_for_key` writes that cell;
+    /// `clear_tracing_flag` on the hash key clears the same cell.
     #[test]
     fn a_typed_clear_reaches_the_cell_a_typed_mark_wrote() {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![100, 200]);
         let hash = key.get_uhash();
 
-        // Fixture: a hash-form writer heads the bucket, so a later typed
-        // install chains behind it rather than finding it.
         ws.disable_noninlinable_function_for_key(&key);
 
         ws.mark_as_being_traced_for_key(&key);
@@ -5348,10 +5365,10 @@ mod tests {
     }
 
     /// warmstate.py `dont_trace_here(*greenargs)` — the typed form stores
-    /// `comparekey` (`JitCell(*greenargs)`). The hash form is lookup-only and
-    /// does not install a cell.
+    /// `comparekey` (`JitCell(*greenargs)`). The hash form names that
+    /// installed cell and sets `DONT_TRACE_HERE` on it.
     #[test]
-    fn dont_trace_here_typed_form_stores_a_comparekey_and_the_hash_form_does_not() {
+    fn dont_trace_here_typed_form_installs_and_the_hash_form_flags_the_installed_cell() {
         let key = GreenKey::new(vec![7, 11]);
 
         let mut typed = WarmEnterState::new(100);
@@ -5370,13 +5387,35 @@ mod tests {
         );
 
         let mut hashed = WarmEnterState::new(100);
-        let before = hashed.get_stats().num_cells;
-        assert!(hashed.get_cell(key.get_uhash()).is_none());
-        assert_eq!(
-            hashed.get_stats().num_cells,
-            before,
-            "hash form does not install a cell"
+        hashed.ensure_cell_for_key(&key);
+        hashed.disable_noninlinable_function(key.get_uhash());
+        let hashed_cell = hashed
+            .get_cell(key.get_uhash())
+            .expect("hash form names the installed cell");
+        assert!(
+            hashed_cell
+                .flags
+                .get()
+                .contains(JcFlags::JC_DONT_TRACE_HERE),
+            "hash form on an installed cell sets DONT_TRACE_HERE"
         );
+        assert_eq!(&hashed_cell.greens[..], &key.values[..]);
+    }
+
+    #[test]
+    #[should_panic(expected = "disable_noninlinable_function names an installed cell")]
+    fn hash_form_disable_on_a_missing_key_panics() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![7, 11]);
+        ws.disable_noninlinable_function(key.get_uhash());
+    }
+
+    #[test]
+    #[should_panic(expected = "mark_force_finish_tracing names an installed cell")]
+    fn hash_form_mark_force_finish_on_a_missing_key_panics() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![7, 11]);
+        ws.mark_force_finish_tracing(key.get_uhash());
     }
 
     /// warmstate.py get_jitcell — chain walk distinguishes hash collisions:
@@ -5762,24 +5801,14 @@ mod tests {
         assert_eq!(count, 0, "cached lookups must not invoke make_token");
     }
 
-    /// The hash form is lookup-only: it does not install a cell. One green
-    /// key reached through the typed form owns one cell with a comparekey.
+    /// The hash form names the installed typed cell. One green key reached
+    /// through either form owns one cell with a comparekey.
     #[test]
-    fn a_hash_write_and_a_typed_read_of_one_key_use_different_cells() {
+    fn a_hash_write_and_a_typed_read_of_one_key_use_one_cell() {
         let mut ws = WarmEnterState::new(3);
         let key = GreenKey::new(vec![7, 9]);
         assert_eq!(ws.get_stats().num_cells, 0);
         assert!(ws.get_cell(key.get_uhash()).is_none());
-        assert!(
-            ws.cell_by_key(key.get_uhash()).is_none(),
-            "hash disable on a missing key installs nothing",
-        );
-        assert!(
-            ws.lookup_chain_with_key(&key).is_none(),
-            "hash form does not install a cell",
-        );
-        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
-        assert_eq!(ws.get_stats().num_cells, 0, "hash form does not install");
         ws.ensure_cell_for_key(&key);
         assert_eq!(ws.occupied_buckets(), 1, "one hash, so one bucket");
         assert_eq!(ws.get_stats().num_cells, 1, "typed install is one cell");
@@ -5793,6 +5822,10 @@ mod tests {
             .lookup_chain_with_key(&key)
             .expect("typed install is one cell");
         assert_eq!(&typed_cell.greens[..], &key.values[..]);
+        assert!(
+            typed_cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE),
+            "hash form on an installed cell sets DONT_TRACE_HERE",
+        );
 
         let mut typed = WarmEnterState::new(3);
         let key2 = GreenKey::new(vec![7, 9]);
@@ -6215,10 +6248,10 @@ mod tests {
         );
     }
 
-    /// The hash form is lookup-only. ONE green key through the typed form
-    /// owns one cell; a later hash write does not chain a sibling.
+    /// The hash form flags the installed cell. ONE green key through the
+    /// typed form owns one cell; a later hash write does not chain a sibling.
     #[test]
-    fn one_key_through_a_hash_and_a_typed_entry_point_builds_a_chain() {
+    fn one_key_through_a_hash_and_a_typed_entry_point_uses_one_cell() {
         let mut ws = WarmEnterState::new(100);
         let key = GreenKey::new(vec![100, 200]);
 
@@ -6233,6 +6266,14 @@ mod tests {
             ws.get_stats().num_cells,
             1,
             "hash form does not install a sibling",
+        );
+        assert!(
+            ws.lookup_chain_with_key(&key)
+                .unwrap()
+                .flags
+                .get()
+                .contains(JcFlags::JC_DONT_TRACE_HERE),
+            "hash form on an installed cell sets DONT_TRACE_HERE",
         );
         assert!(
             ws.lookup_chain_with_key(&key)

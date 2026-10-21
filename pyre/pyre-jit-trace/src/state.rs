@@ -3929,17 +3929,9 @@ pub(crate) fn note_root_trace_too_long(
             // greenkey_of_huge_function)` disables through the warmstate of
             // the driver that owns the oversized frame (`huge_fn`'s `jd_no`).
             // Upstream's `dont_trace_here` (warmstate.py) is handed the greens
-            // and reaches its cell through `ensure_jit_cell_at_key`, so take
-            // the typed door when the log carried one. The hash form acts on
-            // an installed cell only.
-            match huge_key.1.as_ref() {
-                Some(key) => meta
-                    .warm_state_for_driver(jd_no)
-                    .disable_noninlinable_function_for_key(key),
-                None => meta
-                    .warm_state_for_driver(jd_no)
-                    .disable_noninlinable_function(huge_key.0),
-            }
+            // and reaches its cell through `ensure_jit_cell_at_key`.
+            meta.warm_state_for_driver(jd_no)
+                .disable_noninlinable_function_for_key(&huge_key.1);
             // pyjitpl.py, read by `aborted_tracing`'s `on_trace_abort`.
             meta.aborted_tracing_jitdriver = Some(jd_no);
             meta.aborted_tracing_greenkey = Some(huge_key);
@@ -3965,22 +3957,11 @@ pub(crate) fn note_root_trace_too_long(
             // pyjitpl.py `warmrunnerstate.JitCell.trace_next_iteration(
             // greenkey)`, again counter-only.
             warm_state.trace_next_iteration(*merge_key);
-            // pyjitpl.py `jd_sd.warmstate.mark_force_finish_tracing(
-            // greenkey)`. `JC_FORCE_FINISH` is never cleared, so setting it on
-            // the wrong cell of a bucket is permanent.
-            match merge_key_typed.as_ref() {
-                Some(key) => warm_state.mark_force_finish_tracing_for_key(key),
-                None => warm_state.mark_force_finish_tracing(*merge_key),
-            }
-            // pyjitpl.py `warmstate.dont_trace_here(greenkey)`, the third
-            // call of the same arm.  Without it the two above ask for the loop
-            // to be re-traced and force-finished while its callers may still
-            // inline it, so the next attempt can rebuild the very trace that
-            // overflowed.
-            match merge_key_typed.as_ref() {
-                Some(key) => warm_state.disable_noninlinable_function_for_key(key),
-                None => warm_state.disable_noninlinable_function(*merge_key),
-            }
+            // pyjitpl.py `jd_sd.warmstate.mark_force_finish_tracing(greenkey)`
+            // and `dont_trace_here(greenkey)` reach the cell through
+            // `ensure_jit_cell_at_key` on this merge point's greens.
+            warm_state.mark_force_finish_tracing_for_key(merge_key_typed);
+            warm_state.disable_noninlinable_function_for_key(merge_key_typed);
         }
         huge_fn
     });
@@ -13247,20 +13228,16 @@ mod tests {
                     snapshot_array_data_len: 0,
                 }
             }
-            meta.push_portal_trace_position(
-                idx1,
-                Some((callee_hash, Some(callee.clone()))),
-                pos(0),
-            );
+            meta.push_portal_trace_position(idx1, Some((callee_hash, callee.clone())), pos(0));
             meta.push_portal_trace_position(idx1, None, pos(10));
             assert_eq!(
                 meta.find_biggest_function(),
-                Some((idx1, (callee_hash, Some(callee.clone())))),
+                Some((idx1, (callee_hash, callee.clone()))),
                 "find_biggest_function names the inlined callee, not the portal"
             );
         }
 
-        note_root_trace_too_long(Some((portal_hash, Some(portal.clone()))), None);
+        note_root_trace_too_long(Some((portal_hash, portal.clone())), None);
 
         {
             let meta = pair.0.meta_interp_mut();
@@ -13353,16 +13330,16 @@ mod tests {
                     snapshot_array_data_len: 0,
                 }
             }
-            meta.push_portal_trace_position(idx0, Some((names_hash, Some(names.clone()))), pos(0));
+            meta.push_portal_trace_position(idx0, Some((names_hash, names.clone())), pos(0));
             meta.push_portal_trace_position(idx0, None, pos(10));
             assert_eq!(
                 meta.find_biggest_function(),
-                Some((idx0, (names_hash, Some(names.clone())))),
+                Some((idx0, (names_hash, names.clone()))),
                 "find_biggest_function names the inlined names() frame"
             );
         }
 
-        note_root_trace_too_long(Some((portal_hash, Some(portal.clone()))), None);
+        note_root_trace_too_long(Some((portal_hash, portal.clone())), None);
 
         {
             let meta = pair.0.meta_interp_mut();
@@ -13423,7 +13400,7 @@ mod tests {
             meta.warm_state_for_driver(idx0)
                 .attach_procedure_to_interp_for_key(&portal, std::sync::Arc::clone(&token));
         }
-        let started = note_inline_subwalk_start((names_hash, Some(names.clone())), None);
+        let started = note_inline_subwalk_start((names_hash, names.clone()), None);
         assert!(
             started.is_some(),
             "note_inline_subwalk_start logs names() through the portal jitcode"
@@ -13438,12 +13415,12 @@ mod tests {
                 .record_same_as(majit_ir::OpRef::const_int(1), Type::Int);
             assert_eq!(
                 meta.find_biggest_function(),
-                Some((0, (names_hash, Some(names.clone())))),
+                Some((0, (names_hash, names.clone()))),
                 "shipped newframe log names the inlined names() frame"
             );
         }
 
-        note_root_trace_too_long(Some((portal_hash, Some(portal.clone()))), None);
+        note_root_trace_too_long(Some((portal_hash, portal.clone())), None);
 
         {
             let meta = pair.0.meta_interp_mut();

@@ -4332,8 +4332,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             .filter(|f| {
                 f.greenkey
                     .as_ref()
-                    .and_then(|(_, key)| key.as_ref())
-                    .is_some_and(|key| *key == green_key)
+                    .is_some_and(|(_, key)| *key == green_key)
             })
             .count()
     });
@@ -4373,7 +4372,7 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     .collect();
                 // `pyjitpl.py newframe`: portal_call_depth, call_ids, ENTER_PORTAL_FRAME.
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
-                    (green_key.get_uhash(), Some(green_key.clone())),
+                    (green_key.get_uhash(), green_key.clone()),
                     Some(index),
                 );
                 let walked = match inline_call::run_sub_jitcode_walk(
@@ -16052,8 +16051,9 @@ fn handle<Sym: WalkSym>(
             // (`PyFrame.get_is_being_profiled`), and gr[0]=pycode
             // (PyCode). The green key is derivable from the op's own
             // greens, and `next_instr` is the SAME Python-pc coordinate the
-            // trace-start seed uses (`trace.rs add_merge_point(make_green_key(
-            // w_code, start_pc))`) — no jitcode-pc/python-pc mismatch.
+            // trace-start seed uses (`trace.rs add_merge_point_with_key` /
+            // `make_green_key_typed(w_code, start_pc)`) — no jitcode-pc/python-pc
+            // mismatch.
             let jdindex = if op.key == "jit_merge_point/iIRFIRF" {
                 let jd_opref = read_int_reg(code, op, 0, ctx)?;
                 match ctx.trace_ctx.concrete_of_opref(jd_opref) {
@@ -16845,16 +16845,8 @@ fn handle<Sym: WalkSym>(
                         majit_metainterp::GreenBox::new(*opref, ty)
                     })
                     .collect();
-                ctx.trace_ctx.add_merge_point_with_key(
-                    key,
-                    Some(crate::driver::make_green_key_typed(
-                        code_ptr,
-                        next_instr,
-                        is_being_profiled,
-                    )),
-                    green_boxes,
-                    next_instr,
-                );
+                ctx.trace_ctx
+                    .add_merge_point_with_key(key, live_typed, green_boxes, next_instr);
                 // pyjitpl.py put_back_list_of_boxes3: reached_loop_header
                 // did not close. Subsequent snapshots and ops must see
                 // the SAME_AS boxes in the red registers they were read

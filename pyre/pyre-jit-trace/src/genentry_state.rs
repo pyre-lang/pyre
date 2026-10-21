@@ -173,25 +173,14 @@ mod tests {
     #[test]
     fn genentry_resolved_cell_key_reads_the_warmstate_it_is_handed() {
         // several_yields CALL_ASSEMBLER and eval.rs genentry_merge_point
-        // resolve on jitdrivers_sd[2].warmstate. A hash-form disable on a
-        // missing key installs nothing; a colliding typed squatter occupies
-        // the bucket so the genentry cell is minted (cell_key != hash).
+        // resolve on jitdrivers_sd[2].warmstate. A colliding typed squatter
+        // occupies the bucket so the genentry cell is minted (cell_key != hash).
         // Portal slot 0 has no such cell, so it still answers the raw hash.
         let portal = WarmEnterState::new(1039);
         let mut jd2 = WarmEnterState::new(1039);
         let pycode = 0x51ED as PyObjectRef;
-        let hash = genentry_green_hash(pycode);
-        assert!(
-            jd2.get_cell(hash).is_none(),
-            "hash form does not install a cell"
-        );
         let typed = genentry_green_key(pycode);
         let hash = typed.get_uhash();
-        jd2.disable_noninlinable_function(hash);
-        assert!(
-            jd2.cell_by_key(hash).is_none(),
-            "hash disable on a missing key installs nothing"
-        );
         // Occupy the production hash with a different key so `typed` mints.
         // Same two-green shape as `genentry_green_key`; the last Int is the
         // xor that makes `get_uhash` agree (`warmstate.py` fold).
