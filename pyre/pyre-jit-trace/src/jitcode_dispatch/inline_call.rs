@@ -2629,7 +2629,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     if super::ec_hook_installed() {
         return Ok(None);
     }
-    let is_being_profiled = ctx.session.borrow().is_being_profiled;
+    let is_being_profiled = live_frame_is_being_profiled(ctx);
     // Only a genuine `call_fn` residual is a candidate — every
     // container/builtin helper carries a distinct tag.
     if runtime_helper != majit_ir::RuntimeHelperKind::CallFn {
@@ -3602,9 +3602,13 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // `PyPyJitDriver.reds = ['frame', 'ec']`). `do_residual_call` records
     // that box. A `ConstPtr` of `getexecutioncontext()` would bake the
     // tracing thread's context into `CALL_MAY_FORCE_R`. Stamp a concrete
-    // shadow on the red when the sub-walk left it empty so the trace-time
+    // shadow on the red when the sub-walk left it without a concrete half
+    // (absent, `Value::Void` or `GcRef::NO_CONCRETE`) so the trace-time
     // executor can run; the recorded operand stays `callee_ec`.
-    if ctx.trace_ctx.concrete_of_opref(callee_ec).is_none() {
+    if !matches!(
+        ctx.trace_ctx.concrete_of_opref(callee_ec),
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+    ) {
         super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
     }
     // `_build_allboxes` order for the portal ABI, which
@@ -7834,7 +7838,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             residual_call::owner_root_if_gc(bound.receiver as usize),
         )
     });
-    let is_being_profiled = ctx.session.borrow().is_being_profiled;
+    let is_being_profiled = live_frame_is_being_profiled(ctx);
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
     // HOPELESS for a `*args` / `**kwargs` / keyword-only callee.  The general
     // `funcrun` path still traces through `_match_signature`, which writes a

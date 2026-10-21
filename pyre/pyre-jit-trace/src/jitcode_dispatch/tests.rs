@@ -1696,6 +1696,11 @@ fn frame_debug_data_accessors_resolve_to_their_own_offsets() {
             crate::descr::frame_debug_data_w_extra_locals_descr(),
             pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET,
         ),
+        (
+            "is_being_profiled",
+            crate::descr::frame_debug_data_is_being_profiled_descr(),
+            std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, is_being_profiled),
+        ),
     ] {
         let field = descr
             .as_field_descr()
@@ -18019,11 +18024,11 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         .expect("`jit_merge_point/cIRFIRF` must be in insns table");
     // cIRFIRF byte layout: jdindex(c) + greens(I gi, R gr, F gf) +
     // reds(I ri, R rr, F rf).  greens = portal jitdriver's
-    // [next_instr(i0), pycode(r0)]; reds = [r1, r2] (loop-carried
+    // [next_instr(i0), is_being_profiled(i1), pycode(r0)]; reds = [r1, r2] (loop-carried
     // refs, e.g. [frame, ec]).
     let code = [
         jmp_byte, 0x00, // c: jdindex
-        0x01, 0x00, // gi: len=1, [i0 = next_instr]
+        0x02, 0x00, 0x01, // gi: len=2, [i0 = next_instr, i1 = is_being_profiled]
         0x01, 0x00, // gr: len=1, [r0 = pycode]
         0x00, // gf: len=0
         0x00, // ri: len=0
@@ -18045,7 +18050,8 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
     let red0 = tc.const_ref(0x2_0000); // rr[0]
     let red1 = tc.const_ref(0x3_0000); // rr[1]
-    let regs_i = vec![next_instr];
+    let is_being_profiled = tc.const_int(0); // gi[1]
+    let regs_i = vec![next_instr, is_being_profiled];
     let regs_r = vec![pycode, red0, red1];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -18133,7 +18139,7 @@ fn jit_merge_point_continue_puts_back_same_as_reds() {
         .expect("`jit_merge_point/cIRFIRF` must be in insns table");
     let code = [
         jmp_byte, 0x00, // c: jdindex
-        0x01, 0x00, // gi: len=1, [i0 = next_instr]
+        0x02, 0x00, 0x01, // gi: len=2, [i0 = next_instr, i1 = is_being_profiled]
         0x01, 0x00, // gr: len=1, [r0 = pycode]
         0x00, // gf: len=0
         0x00, // ri: len=0
@@ -18146,7 +18152,8 @@ fn jit_merge_point_continue_puts_back_same_as_reds() {
     let pycode = tc.const_ref(0x1_0000);
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
-    let regs_i = RegisterBank::new([next_instr]);
+    let is_being_profiled = tc.const_int(0);
+    let regs_i = RegisterBank::new([next_instr, is_being_profiled]);
     let regs_r = RegisterBank::new([pycode, red0, red1]);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -18207,7 +18214,7 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
         .expect("`jit_merge_point/cIRFIRF` must be in insns table");
     let code = [
         jmp_byte, 0x00, // c: jdindex
-        0x01, 0x00, // gi: len=1, [i0 = next_instr]
+        0x02, 0x00, 0x01, // gi: len=2, [i0 = next_instr, i1 = is_being_profiled]
         0x01, 0x00, // gr: len=1, [r0 = pycode]
         0x00, // gf: len=0
         0x00, // ri: len=0
@@ -18223,7 +18230,8 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
     let pycode = tc.const_ref(0x1_0000);
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
-    let regs_i = vec![next_instr];
+    let is_being_profiled = tc.const_int(0); // gi[1]
+    let regs_i = vec![next_instr, is_being_profiled];
     let regs_r = vec![pycode, red0, red1];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -18392,7 +18400,7 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         .expect("`jit_merge_point/iIRFIRF` must be in insns table");
     let code = [
         byte, 0x02, // jdindex is in i2, not the literal value 2
-        0x01, 0x00, // gi: [i0]
+        0x02, 0x00, 0x01, // gi: [i0 = next_instr, i1 = is_being_profiled]
         0x01, 0x00, // gr: [r0]
         0x00, // gf
         0x00, // ri
@@ -18411,10 +18419,10 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         "seed must match header live-arg length so the first visit closes"
     );
     let next_instr = tc.const_int(42);
-    let unused = tc.const_int(99);
+    let is_being_profiled = tc.const_int(0);
     let jdindex = tc.const_int(0);
     let pycode = tc.const_ref(pycode_ptr as i64);
-    let regs_i = [next_instr, unused, jdindex];
+    let regs_i = [next_instr, is_being_profiled, jdindex];
     let regs_r = [pycode];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {

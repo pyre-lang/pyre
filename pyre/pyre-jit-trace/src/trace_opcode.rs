@@ -575,9 +575,11 @@ fn null_vable_dead_array_tail(ctx: &mut TraceCtx, from: usize) {
 /// `pyjitpl.py` `capture_resumedata` saves `frame.pc` before rewriting it for
 /// the snapshot and restores it afterwards. The walker publishes those
 /// scalars into `virtualizable_boxes` because `build_snapshot_vable_vref_boxes`
-/// reads that shadow. Restore is boxes-only (`nosync`): the heap copy stays
-/// whatever `mirror_vable_static_to_boxes` / `_opimpl_setfield_vable`
-/// `synchronize_virtualizable` last wrote.
+/// reads that shadow. The restore is boxes-only (`nosync`). `last_instr` is
+/// published boxes-only too, so its heap copy stays equal to the restored box
+/// (`check_synchronized_virtualizable`). `valuestackdepth` is published to the
+/// live frame as well: `close_loop_args_at` reads the concrete depth, which
+/// the walker otherwise never advances.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SavedVableResumeScalars {
     last_instr: Option<(OpRef, Value)>,

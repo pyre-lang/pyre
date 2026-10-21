@@ -486,6 +486,13 @@ pub struct TraceCtx {
     /// the cross-component flow at dispatch time) can sample the
     /// metainterp's depth counter without holding a back-reference.
     pub portal_call_depth_fn: Option<Box<dyn Fn() -> i32>>,
+    /// pyjitpl.py `MetaInterp.newframe` / `popframe` `portal_call_depth` ± 1
+    /// for a `JitCodeMachine` that cannot borrow `MetaInterp`.
+    pub portal_call_depth_adjust_fn: Option<Box<dyn Fn(i32)>>,
+    /// pyjitpl.py `MetaInterp.unique_id_for_greenkey` for
+    /// `ENTER_PORTAL_FRAME` recorded by the dispatch machine.
+    pub unique_id_for_greenkey_fn:
+        Option<Box<dyn Fn(usize, &crate::pyjitpl::PortalGreenKey) -> u64>>,
     /// pyjitpl.py `self.metainterp.call_ids[-1]` at `debug_merge_point`.
     pub current_call_id_fn: Option<Box<dyn Fn() -> u64>>,
     /// `newframe`/`popframe` log half for a `JitCodeMachine` that cannot
@@ -1100,6 +1107,30 @@ impl TraceCtx {
         if let Some(ref push) = self.portal_trace_push_fn {
             push(jd_no, green_key, pos);
         }
+    }
+
+    /// pyjitpl.py `MetaInterp.portal_call_depth` sample.
+    pub fn portal_call_depth(&self) -> i32 {
+        self.portal_call_depth_fn.as_ref().map(|f| f()).unwrap_or(0)
+    }
+
+    /// pyjitpl.py `MetaInterp.newframe` / `popframe` `portal_call_depth` ± 1.
+    pub fn adjust_portal_call_depth(&self, delta: i32) {
+        if let Some(f) = &self.portal_call_depth_adjust_fn {
+            f(delta);
+        }
+    }
+
+    /// pyjitpl.py `MetaInterp.unique_id_for_greenkey`.
+    pub fn unique_id_for_greenkey(
+        &self,
+        jd_no: usize,
+        greenkey: &crate::pyjitpl::PortalGreenKey,
+    ) -> u64 {
+        self.unique_id_for_greenkey_fn
+            .as_ref()
+            .map(|f| f(jd_no, greenkey))
+            .unwrap_or(0)
     }
 
     /// Install the observer both trace cuts report to (see
@@ -2385,6 +2416,8 @@ impl TraceCtx {
             reads_module_global: false,
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
+            portal_call_depth_adjust_fn: None,
+            unique_id_for_greenkey_fn: None,
             current_call_id_fn: None,
             portal_trace_push_fn: None,
             seen_loop_header_for_jdindex: -1,
@@ -2484,6 +2517,8 @@ impl TraceCtx {
             reads_module_global: false,
             bridge_target_header_pc: None,
             portal_call_depth_fn: None,
+            portal_call_depth_adjust_fn: None,
+            unique_id_for_greenkey_fn: None,
             current_call_id_fn: None,
             portal_trace_push_fn: None,
             seen_loop_header_for_jdindex: -1,

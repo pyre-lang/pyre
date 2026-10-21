@@ -1889,13 +1889,6 @@ pub struct JitDriver<S: JitState> {
     /// This driver's payload for the per-thread `frame_value_count` store,
     /// built once by `register_dispatch_jitcode`. `None` until then.
     state_field_fvc: Option<StateFieldFvcData>,
-    /// One-shot skip for the next [`Self::function_entry_structured`].
-    ///
-    /// An embedder whose loop-header door can already serve the call (CEL
-    /// yields when a sibling loop key is runnable) sets this so the generated
-    /// `ll_portal_runner` prefix does not mint a second artifact for the same
-    /// activation. Taken, not read: a skipped door must not stay skipped.
-    function_entry_suppressed: bool,
     /// `warmstate.py make_entry_point` closure captures.
     portal_entry: PortalEntryCaptures,
     /// Reusable buffers for the compiled-entry argument walk.
@@ -2245,7 +2238,6 @@ impl<S: JitState> JitDriver<S> {
             blackhole_allocator: Some(Box::new(crate::resume::LlmodelBlackholeAllocator)),
             portal_jd_index: None,
             state_field_fvc: None,
-            function_entry_suppressed: false,
             portal_entry: PortalEntryCaptures {
                 confirm_enter_jit_ptr: std::rc::Rc::new(std::cell::Cell::new(None)),
                 jd_index: 0,
@@ -2525,7 +2517,6 @@ impl<S: JitState> JitDriver<S> {
     #[allow(clippy::too_many_arguments)]
     pub fn rebuild_portal_framestack_from_resumedata(
         &mut self,
-        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
         fail_types: &[majit_ir::Type],
@@ -2535,7 +2526,6 @@ impl<S: JitState> JitDriver<S> {
         reader: &mut crate::BridgeVirtualCache<'_>,
     ) -> bool {
         self.meta.rebuild_portal_framestack_from_resumedata(
-            mainjitcode,
             frames,
             fail_values,
             fail_types,
@@ -10079,9 +10069,6 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> FunctionEntryRunner {
-        if std::mem::replace(&mut self.function_entry_suppressed, false) {
-            return FunctionEntryRunner::Run;
-        }
         // `warmspot.py ll_portal_runner` enters once per portal call. A
         // prior call's Finish may leave `back_edge_finish_word` /
         // `single_pass_finish` standing when the runner drained one latch
@@ -10702,15 +10689,6 @@ impl<S: JitState> JitDriver<S> {
             }
             FunctionEntryStep::NotHot => None,
         }
-    }
-
-    /// Skip the next generated function-entry door.
-    ///
-    /// `warmspot.py` has no equivalent: a portal has one runner. An embedder
-    /// that still has a second, loop-header door and cannot yet coexist two
-    /// artifacts for one program uses this to yield that other door.
-    pub fn suppress_function_entry(&mut self) {
-        self.function_entry_suppressed = true;
     }
 
     /// Turn the raw green-key hash a door arrives with into the key that names
@@ -11452,6 +11430,7 @@ impl<S: JitState> JitDriver<S> {
         // bridge tracing runs synchronously within start_bridge_tracing's
         // caller scope, so self.meta outlives the callback.
         let meta_ptr = &self.meta as *const _ as *const ();
+        let depth_ptr = std::ptr::addr_of_mut!(self.meta.portal_call_depth);
         // pyjitpl.py `handle_guard_failure` runs on a MetaInterp whose
         // `jitdriver_sd` is the guard's owning loop's driver. A bridge trace
         // that reaches a loop header (`jit_merge_point` → `compile_loop`)
@@ -11522,8 +11501,7 @@ impl<S: JitState> JitDriver<S> {
         // (`if not any_operation` / `portal_call_depth` /
         // `has_compiled_targets`, pyjitpl.py) is skipped and the
         // close protocol runs. Without it the bridge records a whole extra
-        // iteration before it can close, and the `bridge_entry_merge_pc`
-        // skip-once below sends it past the crossing it was meant to take.
+        // iteration before it can close.
         //
         // The flag is one-shot on both sides: the merge point resets it to
         // -1 (pyjitpl.py) after consuming it, so only the FIRST crossing
@@ -11569,6 +11547,13 @@ impl<S: JitState> JitDriver<S> {
         ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
             let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
             meta.portal_call_depth
+        }));
+        ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta: i32| unsafe {
+            *depth_ptr += delta;
+        }));
+        ctx.unique_id_for_greenkey_fn = Some(Box::new(move |jd_no, greenkey| {
+            let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
+            meta.unique_id_for_greenkey(jd_no, greenkey)
         }));
         // resume.py rebuild_from_resumedata parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.
@@ -11731,7 +11716,7 @@ impl<S: JitState> JitDriver<S> {
             // `rebuild_state_after_failure`'s vable / pending / register
             // fill and runs after those frames exist, matching
             // `synchronize_virtualizable` after the newframe loop.
-            if let Some(mainjitcode) = self.dispatch_jitcode().cloned() {
+            if self.dispatch_jitcode().is_some() {
                 let materialized: Vec<Option<std::sync::Arc<crate::jitcode::JitCode>>> = bfm
                     .frames
                     .iter()
@@ -11747,7 +11732,6 @@ impl<S: JitState> JitDriver<S> {
                 // `self.meta` directly: `reader` borrows this driver's
                 // allocator for the whole rebuild.
                 let rebuilt = self.meta.rebuild_portal_framestack_from_resumedata(
-                    mainjitcode,
                     &bfm.frames,
                     frontend_fail_values,
                     &retrace.fail_types,
@@ -13813,42 +13797,6 @@ mod tests {
             driver.meta.warm_state_for_driver(idx1).trace_eagerness(),
             4,
             "set_trace_eagerness on jd1 writes that driver's WarmEnterState"
-        );
-    }
-
-    #[test]
-    fn suppress_function_entry_skips_the_next_door_only() {
-        let mut driver = JitDriver::<CountingDoorState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
-        driver
-            .meta
-            .warm_state_for_driver(0)
-            .set_function_threshold(1);
-        let hash = 0xB0Du64;
-        let values = [hash as i64];
-        let mut state = CountingDoorState {
-            build_meta_calls: std::cell::Cell::new(0),
-            extract_live_values_calls: std::cell::Cell::new(0),
-            code_ptr: 0,
-        };
-        driver.suppress_function_entry();
-        assert!(
-            driver
-                .function_entry_structured(hash, &values, (GreenSlotInt,), 0, &mut state, &())
-                .is_none()
-        );
-        assert!(
-            !driver.is_tracing(),
-            "a suppressed door must not arm tracing"
-        );
-        assert!(
-            driver
-                .function_entry_structured(hash, &values, (GreenSlotInt,), 0, &mut state, &())
-                .is_none()
-        );
-        assert!(
-            driver.is_tracing(),
-            "suppress is one-shot: the next door must run"
         );
     }
 

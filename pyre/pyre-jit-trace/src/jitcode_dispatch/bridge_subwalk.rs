@@ -418,13 +418,13 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 snapshot_sym: sym_ptr,
 
                 class_of_last_exc_is_const: sym.class_of_last_exc_is_const(),
-                // A guard-failure bridge resumes at the opcode boundary, so
-                // its first `jit_merge_point` crossing at this python-pc is
-                // the same op it is resuming INTO, not a loop crossing. The
-                // merge-point arm skips exactly that first crossing. Seeded
-                // only for bridge walks; a loop compile leaves it `None`.
+                // Top-level bridge walks seed the jitcode start so the
+                // merge-point handler can skip a `jit_merge_point` the walk
+                // resumed into (`generate_guard` default `resumepc` at the
+                // opcode boundary or the pre-merge header diamond). Loop
+                // compiles leave it `None`.
                 bridge_entry_merge_pc: match (trace_ctx.is_bridge_trace, entry_py_pc) {
-                    (true, EntryPyPc::Py(pc)) => Some(pc as usize),
+                    (true, EntryPyPc::Py(_)) => Some(position),
                     _ => None,
                 },
                 ..Default::default()
@@ -1241,7 +1241,8 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         ));
     }
     publish_carrier_header_vsd(ctx, portal_frame_box, target_pc);
-    let is_being_profiled = ctx.session.borrow().is_being_profiled;
+    let is_being_profiled =
+        super::frame_box_is_being_profiled(ctx.trace_ctx, ctx.session, portal_frame_box);
     let w_code = ctx.inline_w_code() as *const ();
     let token_for_rebuild = token.clone();
     match super::inline_call::record_walker_loop_callee_portal_call(
@@ -1456,7 +1457,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
-    let is_being_profiled = session.borrow().is_being_profiled;
+    let is_being_profiled = crate::driver::frame_is_being_profiled(concrete_callee_frame);
 
     // Terminal descrs must be wired on MetaInterpStaticData before the walk can
     // produce a compilable FINISH (mirror `dispatch_perfn_frame`).  The walk

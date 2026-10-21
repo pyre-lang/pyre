@@ -3461,6 +3461,19 @@ static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
                 false,
                 false,
             ),
+            // `pyframe.py FrameDebugData.is_being_profiled`. Mutable:
+            // `executioncontext.py setprofile` writes it on every live
+            // frame. Appended at the tail so existing accessors that
+            // resolve by position keep their slots.
+            (
+                "is_being_profiled",
+                std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, is_being_profiled),
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
         ],
         "FrameDebugData",
         "pyframe::FrameDebugData",
@@ -6826,6 +6839,17 @@ pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
 /// called on it.
 pub fn frame_debug_data_w_f_trace_descr() -> DescrRef {
     frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_F_TRACE_OFFSET)
+}
+
+/// `FrameDebugData.is_being_profiled` — the Int
+/// `pyframe.py PyFrame.get_is_being_profiled` returns when `debugdata`
+/// is non-null. Portal `jit_merge_point` promotes this green
+/// (`jtransform.py promote_greens`).
+pub fn frame_debug_data_is_being_profiled_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(std::mem::offset_of!(
+        pyre_interpreter::pyframe::FrameDebugData,
+        is_being_profiled
+    ))
 }
 
 /// `len(bytes)` returns the byte count.  `bytesobject.py` reads it as

@@ -3115,12 +3115,12 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
 ) -> DispatchError {
     if let Some(callee_code_key) = callee_code_key {
         fbw_deny_hazardous_inline(callee_code_key);
-        // The walk's own profiling green, not the ambient one: `make_green_key`
-        // builds the `u64` key at a site that holds no frame, and a walk-internal
-        // caller names it from `WalkSession`, seeded once per walk from the
-        // concrete frame.  Read before `try_driver_pair` so the session borrow
-        // is released across the driver call.
-        let is_being_profiled = ctx.session.borrow().is_being_profiled;
+        // Function-entry key for a callee named only by its code object:
+        // there is no merge-point operand here, so read the live frame
+        // (`PyFrame.get_is_being_profiled`).  Read before `try_driver_pair`
+        // so the session borrow inside `live_frame_is_being_profiled` is
+        // released across the driver call.
+        let is_being_profiled = live_frame_is_being_profiled(ctx);
         // `fbw_deny_hazardous_inline` writes a thread-local set that only
         // this walker reads, so the deny stayed invisible to the warm
         // state: `dont_trace_here` counted zero on every fixture that
