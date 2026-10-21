@@ -135,6 +135,65 @@ pub fn annotation_to_lltype(
     )))
 }
 
+/// `FuncType.ARGS` of a function pointer target (`Ptr.TO` / resolved
+/// `ForwardReference`).
+fn fn_ptr_func_args(to: &lltype::PtrTarget) -> Option<Vec<lltype::LowLevelType>> {
+    match to {
+        lltype::PtrTarget::Func(ft) => Some(ft.args.clone()),
+        lltype::PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(lltype::LowLevelType::Func(t)) => Some(t.args.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Convert one `SomePtr.call` argument to the example ll value
+/// `_func.call` type-checks.
+///
+/// A `SomeInstance` whose classdef casts to `ARGS[i]`
+/// (`cast_instance_to_base_ptr` / `instance_can_cast_to_fn_ptr_arg`)
+/// is that pointer type's `_defl()`. `s_None` is Void in
+/// `annotation_to_ll_map`; a Ptr slot takes the slot's null pointer
+/// (`_func.call` accepts None for a pointer ARG). A classdef-less
+/// instance at a GC Ptr slot is the same None mapping: `ConstNone`
+/// materialises as `GcRef`, so Option None arrives as
+/// `SomeInstance(classdef=None)` rather than `s_None`.
+fn fn_ptr_arg_llvalue(
+    s_arg: &SomeValue,
+    arg_ty: Option<&lltype::LowLevelType>,
+    info: &str,
+) -> Result<lltype::LowLevelValue, AnnotatorError> {
+    if let Some(arg_ty) = arg_ty {
+        if let SomeValue::Instance(inst) = s_arg
+            && crate::translator::rtyper::rclass::instance_can_cast_to_fn_ptr_arg(inst, arg_ty)
+        {
+            return Ok(arg_ty._defl());
+        }
+        match annotation_to_lltype(s_arg, Some(info)) {
+            Ok(ty) => {
+                if matches!(ty, lltype::LowLevelType::Void)
+                    && matches!(arg_ty, lltype::LowLevelType::Ptr(_))
+                {
+                    return Ok(arg_ty._defl());
+                }
+                Ok(ty._defl())
+            }
+            Err(err) => {
+                if let SomeValue::Instance(inst) = s_arg
+                    && inst.classdef.is_none()
+                    && matches!(arg_ty, lltype::LowLevelType::Ptr(p) if p._needsgc())
+                {
+                    return Ok(arg_ty._defl());
+                }
+                Err(err)
+            }
+        }
+    } else {
+        annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
+    }
+}
+
 /// RPython `lltype_to_annotation(T)` (llannotation.py).
 ///
 /// Upstream falls back to `SomePtr(T)` / `SomeInteriorPtr(T)` for the
@@ -303,10 +362,15 @@ impl SomePtr {
         // that is unbound.  Mirror via per-touch [`arg_at`] so an
         // unannotated slot panics with the call boundary name + slot
         // index at the same iteration upstream would raise.
+        // Instance arguments are converted against `FuncType.ARGS`
+        // (`cast_instance_to_base_ptr`); `annotation_to_lltype` itself
+        // has no instance arm.
+        let func_args = fn_ptr_func_args(&self.ll_ptrtype.TO);
         let llargs = (0..args_s_opt.len())
             .map(|i| {
                 let s_arg = crate::annotator::builtin::arg_at(&args_s_opt, i, "SomePtr.call");
-                annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
+                let arg_ty = func_args.as_ref().and_then(|args| args.get(i));
+                fn_ptr_arg_llvalue(s_arg, arg_ty, info)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let v = self.ll_ptrtype._example().call(&llargs);
@@ -520,10 +584,16 @@ impl SomeInteriorPtr {
         // boundary name + slot index at the same iteration upstream
         // would raise (`unaryop.py simple_call_SomeBuiltin` bind-
         // then-body sequence).
+        let func_args = match &*self.ll_ptrtype.TO {
+            lltype::LowLevelType::Func(ft) => Some(ft.args.clone()),
+            lltype::LowLevelType::Ptr(p) => fn_ptr_func_args(&p.TO),
+            _ => None,
+        };
         let llargs = (0..args_s_opt.len())
             .map(|i| {
                 let s_arg = crate::annotator::builtin::arg_at(&args_s_opt, i, "SomeLLPtr.call");
-                annotation_to_lltype(s_arg, Some(info)).map(|t| t._defl())
+                let arg_ty = func_args.as_ref().and_then(|args| args.get(i));
+                fn_ptr_arg_llvalue(s_arg, arg_ty, info)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let v = self.ll_ptrtype._example().call(&llargs);
@@ -1036,6 +1106,105 @@ mod tests {
             annotation_to_lltype(&s_interior, None).unwrap(),
             lltype::LowLevelType::Ptr(_)
         ));
+    }
+
+    #[test]
+    fn annotation_to_lltype_fn_ptr_arg_accepts_instance() {
+        use crate::annotator::model::SomeInstance;
+        let inst = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        assert!(
+            annotation_to_lltype(&inst, None).is_err(),
+            "a high-level instance is not an lltype outside a fn-ptr call"
+        );
+        let err = annotation_to_lltype(&inst, Some("argument to ll function pointer call"))
+            .expect_err("annotation_to_lltype has no instance arm");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("should return a low-level type"),
+            "upstream annotation_to_lltype rejects a high-level instance"
+        );
+    }
+
+    fn classdef_for_fn_ptr_call_test(
+        name: &str,
+    ) -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+    ) {
+        use crate::annotator::classdesc::ClassDesc;
+        use crate::annotator::description::DescEntry;
+        use crate::flowspace::model::HostObject;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let host = HostObject::new_class(name, vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let DescEntry::Class(class_rc) = &entry else {
+            panic!("expected Class desc for {name}");
+        };
+        let classdef = ClassDesc::getuniqueclassdef(class_rc).unwrap();
+        (ann, classdef)
+    }
+
+    #[test]
+    fn someptr_call_accepts_matching_instance_as_fn_ptr_arg() {
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::model::SomeInstance;
+        let (_ann, classdef) = classdef_for_fn_ptr_call_test("MatchingFnPtrInst");
+        let inst =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let s_ptr = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Func(lltype::FuncType {
+                args: vec![crate::translator::rtyper::rclass::OBJECTPTR.clone()],
+                result: lltype::LowLevelType::Void,
+            }),
+        });
+        let args = ArgumentsForTranslation::new(vec![Some(inst)], None, None);
+        s_ptr
+            .call(&args)
+            .expect("matching instance casts to OBJECTPTR at SomePtr.call");
+    }
+
+    #[test]
+    fn someptr_call_rejects_mismatched_instance_as_fn_ptr_arg() {
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::model::SomeInstance;
+        let (_ann, classdef) = classdef_for_fn_ptr_call_test("MismatchedFnPtrInst");
+        let inst =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+        let unrelated = lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::gc("UnrelatedFnPtrArg", vec![])),
+        }));
+        let s_ptr = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Func(lltype::FuncType {
+                args: vec![unrelated],
+                result: lltype::LowLevelType::Void,
+            }),
+        });
+        let args = ArgumentsForTranslation::new(vec![Some(inst)], None, None);
+        let err = s_ptr
+            .call(&args)
+            .expect_err("mismatched instance is not a cast to ARGS[i]");
+        assert!(
+            err.msg
+                .unwrap_or_default()
+                .contains("should return a low-level type"),
+            "mismatched instance keeps the upstream annotation_to_lltype message"
+        );
+    }
+
+    #[test]
+    fn someptr_call_maps_s_none_to_fn_ptr_ptr_arg() {
+        use crate::annotator::argument::ArgumentsForTranslation;
+        let s_ptr = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Func(lltype::FuncType {
+                args: vec![crate::translator::rtyper::rclass::OBJECTPTR.clone()],
+                result: lltype::LowLevelType::Void,
+            }),
+        });
+        let args = ArgumentsForTranslation::new(vec![Some(s_none())], None, None);
+        s_ptr
+            .call(&args)
+            .expect("s_None is the null pointer constant of a Ptr ARGS slot");
     }
 
     #[test]

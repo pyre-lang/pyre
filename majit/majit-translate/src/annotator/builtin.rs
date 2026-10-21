@@ -568,6 +568,9 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // — note the mixed bare/dotted spellings the census demands.
     analyzer_for(&mut reg, "Vec.new", foreign_container_ctor);
     analyzer_for(&mut reg, "vec.Vec.with_capacity", foreign_container_ctor);
+    analyzer_for(&mut reg, "vec.Vec.deref", foreign_container_ctor);
+    analyzer_for(&mut reg, "Vec.deref", foreign_container_ctor);
+    analyzer_for(&mut reg, "alloc.slice.<Impl>.to_vec", slice_to_vec);
     analyzer_for(&mut reg, "indexmap.IndexMap.new", foreign_container_ctor);
     analyzer_for(&mut reg, "Box.new", foreign_container_ctor);
     // `Box::new_uninit` is the no-arg heap-box twin of `lltype.malloc`.
@@ -629,6 +632,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         &mut reg,
         "objectmodel.keepalive_until_here",
         robjmodel_keepalive_until_here,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_gc.add_memory_pressure",
+        gc_add_memory_pressure,
     );
     analyzer_for(
         &mut reg,
@@ -1357,6 +1365,17 @@ pub fn builtin_list(
     let s_iter = SomeIterator::new(s_iterable.clone(), vec![]);
     let s_item = someiterator_next_stub(bk, &s_iter);
     Ok(SomeValue::List(bk.newlist(&[s_item], None)?))
+}
+
+/// `<[T]>::to_vec(slice)` is `list(slice)` (`builtin.py` `builtin_list`).
+/// A `SomeList` (including `&[T]` / `Slice<T>` / a `Vec::deref` view)
+/// copies through `listdef.offspring`.
+fn slice_to_vec(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    builtin_list(bk, args_s, kwds)
 }
 
 /// Upstream `builtin_zip(s_iterable1, s_iterable2)` (builtin.py).
@@ -2591,41 +2610,38 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
 ///     return SomePtr(ll_ptrtype=PtrT.const)
 /// ```
 ///
-/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`) emits the 2-arg
-/// form with `PtrT` a `ConstValue::LowLevelType` of that array
-/// pointer. `getkind` of a raw `Ptr` is Signed (`history.py`
-/// `TYPE.TO._gckind == 'raw'`). The 1-arg `Int → Ref` lowering still
-/// has no concrete Ptr and keeps the Gc-Opaque placeholder; a gc
-/// opaque would kind as GcRef.
+/// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`) and the adapter's
+/// unary leftover both emit the 2-arg form with `PtrT` a
+/// `ConstValue::LowLevelType`. `getkind` of a raw `Ptr` is Signed
+/// (`history.py` `TYPE.TO._gckind == 'raw'`).
 fn lltype_cast_int_to_ptr(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, OpaqueType, Ptr, SomePtr};
-    if args_s.len() == 2 {
-        let s_ptrt = arg_at(args_s, 0, "lltype.cast_int_to_ptr");
-        if !s_ptrt.is_constant() {
-            return Err(AnnotatorError::new(
-                "ann_cast_int_to_ptr: PtrT is not constant",
-            ));
-        }
-        let Some(ConstValue::LowLevelType(ll)) = s_ptrt.const_() else {
-            return Err(AnnotatorError::new(
-                "ann_cast_int_to_ptr: PtrT.const is not a LowLevelType",
-            ));
-        };
-        let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
-            return Err(AnnotatorError::new(
-                "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
-            ));
-        };
-        return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+    if args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: expected (PtrT, s_int)",
+        ));
     }
-    let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-    let placeholder_ptr = Ptr::from_container_type(LowLevelType::Opaque(Box::new(opaque)))
-        .expect("Opaque container yields a valid Ptr");
-    Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
+    let s_ptrt = arg_at(args_s, 0, "lltype.cast_int_to_ptr");
+    if !s_ptrt.is_constant() {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: PtrT is not constant",
+        ));
+    }
+    let Some(ConstValue::LowLevelType(ll)) = s_ptrt.const_() else {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: PtrT.const is not a LowLevelType",
+        ));
+    };
+    let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
+        return Err(AnnotatorError::new(
+            "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
+        ));
+    };
+    Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())))
 }
 
 /// Upstream `robjmodel_instantiate(s_clspbc, s_nonmovable=None)`
@@ -3047,6 +3063,15 @@ pub fn robjmodel_hlinvoke(
         .getrepr(&s_ret)
         .map_err(|e| AnnotatorError::new(e.to_string()))?;
     Ok(lltype_to_annotation(rresult.lowleveltype().clone()))
+}
+
+/// `rgc.add_memory_pressure` / `gc_add_memory_pressure`. Void.
+fn gc_add_memory_pressure(
+    _bk: &Rc<Bookkeeper>,
+    _args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(s_none())
 }
 
 /// Upstream `robjmodel_keepalive_until_here(*args_s)` (builtin.py).
@@ -3868,6 +3893,62 @@ mod tests {
         let s = SomeValue::List(super::super::model::SomeList::new(listdef));
         let out = builtin_list(&bk, &[Some(s)], &no_kwds()).unwrap();
         assert!(matches!(out, SomeValue::List(_)));
+    }
+
+    #[test]
+    fn slice_to_vec_on_somelist_uses_offspring() {
+        // `<[T]>::to_vec(slice)` is `list(slice)` (`builtin_list`):
+        // a new SomeList whose listdef is the source's offspring.
+        use crate::annotator::model::SomeList;
+        let bk = bk();
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        );
+        let src = SomeValue::List(SomeList::new(listdef));
+        let out = call_builtin(
+            &bk,
+            "alloc.slice.<Impl>.to_vec",
+            &[Some(src.clone())],
+            &no_kwds(),
+        )
+        .expect("to_vec of SomeList annotates");
+        match (src, out) {
+            (SomeValue::List(src_list), SomeValue::List(dst_list)) => {
+                assert!(
+                    !src_list.listdef.same_as(&dst_list.listdef),
+                    "offspring listdef is a new list, not an alias"
+                );
+                let item = dst_list.listdef.read_item(None);
+                assert!(
+                    matches!(item, SomeValue::Integer(ref i) if i.nonneg),
+                    "element annotation is preserved, got {item:?}"
+                );
+            }
+            (src, out) => panic!("expected SomeList → SomeList, got {src:?} → {out:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_to_vec_on_somerustvec_keeps_item_annotation() {
+        use crate::annotator::model::{SomeList, SomeRustVec};
+        let s_vec = SomeValue::RustVec(SomeRustVec::for_kind(majit_ir::rvec::VecItemKind::Int));
+        let out = call_builtin(
+            &bk(),
+            "alloc.slice.<Impl>.to_vec",
+            &[Some(s_vec)],
+            &no_kwds(),
+        )
+        .expect("to_vec of SomeRustVec annotates");
+        let SomeValue::List(SomeList { listdef, .. }) = out else {
+            panic!("expected SomeList, got {out:?}");
+        };
+        assert!(
+            matches!(listdef.read_item(None), SomeValue::Integer(_)),
+            "RustVec leftover keeps the item annotation through list(iter)"
+        );
     }
 
     #[test]
@@ -5107,6 +5188,17 @@ mod tests {
         let added = lltype_direct_ptradd(&bk(), &[Some(out.clone()), Some(s_n)], &no_kwds())
             .expect("ann_direct_ptradd of CArrayPtr");
         assert_eq!(added, out);
+    }
+
+    #[test]
+    fn ann_cast_int_to_ptr_rejects_one_arg() {
+        let s_int = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let err = lltype_cast_int_to_ptr(&bk(), &[Some(s_int)], &no_kwds())
+            .expect_err("ann_cast_int_to_ptr is (PtrT, s_int)");
+        assert!(
+            err.to_string().contains("expected (PtrT, s_int)"),
+            "got {err}"
+        );
     }
 
     #[test]

@@ -80,6 +80,12 @@ impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
 impl ResidualSlot for pyre_object::dictmultiobject::BytesKey {}
 impl ResidualSlot for pyre_object::celldict::StrKey {}
 
+/// `RootScope` is one `usize` (`gc_roots.rs` `root_scope_payload_is_one_word`).
+/// The CALL_KW `_match_signature` walk residual-calls `push_roots`; without a
+/// runtime fnaddr the patcher disarms the build address to 0.
+impl ResidualSlot for pyre_object::gc_roots::RootScope {}
+impl ResidualRet for pyre_object::gc_roots::RootScope {}
+
 /// Word-ABI bridges for the three shadow-stack operations `eval::FrameAnchor`
 /// reaches.  `majit_ir::GcRef` is `#[repr(transparent)]` over one `usize`, so
 /// each of the raw functions is `(usize) -> usize`, `(usize) -> usize` and
@@ -595,6 +601,18 @@ pub mod word_publish {
         }
         fn into_reg(self) -> i64 {
             self.0 as usize as i64
+        }
+    }
+    /// One `usize` (`gc_roots.rs` `root_scope_payload_is_one_word`). Transmute
+    /// so `into_reg` does not run `Drop`, which would rewind the shadow stack.
+    impl WordAbi for pyre_object::gc_roots::RootScope {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            unsafe { std::mem::transmute::<usize, Self>(reg as usize) }
+        }
+        fn into_reg(self) -> i64 {
+            unsafe { std::mem::transmute::<Self, usize>(self) as i64 }
         }
     }
 
@@ -2356,6 +2374,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `PyFrame::nlocals` / `get_current_exception` precedent);
     // `w_type_set_uses_object_setattr` rides a C-ABI bridge that
     // normalises its `bool` argument.
+    pa0!(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots,
+    );
     pa0!(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_len",
@@ -5243,6 +5267,64 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pyframe::PyFrame::clear_references",
         "pyre_interpreter::PyFrame::clear_references",
         crate::pyframe::PyFrame::clear_references,
+    );
+
+    // `signature.py` `find_w_argname` is `@jit.elidable`. `call.py`
+    // `getfunctionptr` publishes the real address so the tracer calls it
+    // and constant-folds the keyword index. Both CallPath spellings, as
+    // for `PyFrame::pop`: `gateway::Signature::find_w_argname` is the
+    // path `_match_signature` records, and `Signature::find_w_argname`
+    // is the 2-segment `CallPath::for_impl_method` form. A missing entry
+    // leaves `symbolic_fnaddr_for_path`.
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::gateway::Signature::find_w_argname",
+        "pyre_interpreter::Signature::find_w_argname",
+        crate::gateway::Signature::find_w_argname,
+    );
+
+    // `_match_signature` residualizes `Option<Vec>` length as one word.
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::argument::option_vec_len",
+        "argument::option_vec_len",
+        crate::argument::option_vec_len,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::argument::arguments_keyword_count",
+        "argument::arguments_keyword_count",
+        crate::argument::arguments_keyword_count,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::gateway::signature_posonlyargcount",
+        "gateway::signature_posonlyargcount",
+        crate::gateway::signature_posonlyargcount,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::gateway::signature_num_argnames",
+        "gateway::signature_num_argnames",
+        crate::gateway::signature_num_argnames,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::gateway::signature_num_kwonlyargnames",
+        "gateway::signature_num_kwonlyargnames",
+        crate::gateway::signature_num_kwonlyargnames,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::gateway::signature_has_vararg",
+        "gateway::signature_has_vararg",
+        crate::gateway::signature_has_vararg,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::gateway::signature_has_kwarg",
+        "gateway::signature_has_kwarg",
+        crate::gateway::signature_has_kwarg,
     );
 
     // `stack_underflow_error` deliberately remains unpublished: its `&str`

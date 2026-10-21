@@ -7431,9 +7431,9 @@ fn set_descr_init_from_peel(
     arguments.parse_into_scope(
         pyre_object::gc_roots::shadow_stack_get(set_obj_slot),
         &mut scope_w,
-        "set.__init__",
+        Wtf8::new("set.__init__"),
         &signature,
-        Some(&defaults),
+        &defaults,
         pyre_object::PY_NULL,
     )?;
     let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7486,9 +7486,9 @@ fn set_descr_init_bind(
     arguments.parse_into_scope(
         pyre_object::gc_roots::shadow_stack_get(set_obj_slot),
         &mut scope_w,
-        "set.__init__",
+        Wtf8::new("set.__init__"),
         &signature,
-        Some(&defaults),
+        &defaults,
         pyre_object::PY_NULL,
     )?;
     let iterable_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -11693,8 +11693,13 @@ fn init_frame_type(ns: PyObjectRef) {
                     if f.is_null() {
                         return Ok(pyre_object::w_str_new_managed("<frame (null)>"));
                     }
+                    // `descr_repr` reads `last_instr`. The getset wrappers
+                    // force that virtualizable; this interp2app is the same
+                    // residual reader.
+                    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+                    crate::executioncontext::jit_force_virtualizable(anchor.live());
                     Ok(pyre_object::w_str_from_wtf8_managed(
-                        unsafe { &*f }.descr_repr(),
+                        unsafe { &*anchor.live() }.descr_repr(),
                     ))
                 },
                 1,
@@ -25763,7 +25768,8 @@ fn object_descr_init_subclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     };
     if args.len() > 1 {
         return refuse(crate::argument::ArgErr::TooManyMethod {
-            signature: crate::gateway::Signature::new(vec!["cls"], None, None, 0, 0),
+            num_args: 1,
+            first_argname: Some("cls"),
             num_defaults: 0,
             given: args.len(),
             kwonly_given: 0,
@@ -25771,7 +25777,7 @@ fn object_descr_init_subclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     }
     if args.is_empty() {
         return refuse(crate::argument::ArgErr::Missing {
-            missing: vec!["cls".to_string()],
+            missing: vec!["cls"],
             positional: true,
         });
     }
@@ -36064,9 +36070,9 @@ fn itertools_constructor_scope_from_args_kwonly(
     arguments.parse_into_scope(
         PY_NULL,
         &mut scope_w,
-        fn_name,
+        Wtf8::new(fn_name),
         &signature,
-        Some(&defaults_w),
+        &defaults_w,
         w_kw_defs,
     )?;
     Ok((pyre_object::gc_roots::shadow_stack_get(cls_slot), scope_w))
@@ -36148,9 +36154,9 @@ fn itertools_constructor_scope_kwonly(
     arguments.parse_into_scope(
         PY_NULL,
         &mut scope_w,
-        fn_name,
+        Wtf8::new(fn_name),
         &signature,
-        Some(&defaults_w),
+        &defaults_w,
         w_kw_defs,
     )?;
     Ok((pyre_object::gc_roots::shadow_stack_get(cls_slot), scope_w))
@@ -37293,6 +37299,7 @@ fn batched_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let exact_slot = pyre_object::gc_roots::publish_roots(&[exact]);
     let values_base = pyre_object::gc_roots::publish_roots(&[iterable, n_obj, strict_obj]);
     pyre_object::gc_roots::normalize_roots(cls_slot, 1 + 1 + 3);
+
     let value =
         |index: usize| unsafe { pyre_object::gc_roots::shadow_stack_get(values_base + index) };
     let n = crate::builtins::space_index_w(value(1))?;

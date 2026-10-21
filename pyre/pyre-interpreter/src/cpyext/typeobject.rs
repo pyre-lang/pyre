@@ -3597,9 +3597,15 @@ fn split_call(args: &[PyObjectRef]) -> (Vec<PyObjectRef>, Vec<(PyObjectRef, PyOb
 fn keyword_pairs_from_arguments(
     args: &crate::argument::Arguments,
 ) -> Result<Vec<(PyObjectRef, PyObjectRef)>, crate::PyError> {
-    let Some(names) = args.keyword_names_w.as_ref() else {
+    if args
+        .keyword_names_w
+        .as_ref()
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
         return Ok(Vec::new());
-    };
+    }
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
     let values = args.keywords_w.as_deref().unwrap_or(&[]);
     let roots = pyre_object::gc_roots::push_roots();
     let names_base = roots.pin_roots(names);

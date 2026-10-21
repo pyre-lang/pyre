@@ -896,19 +896,38 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
             .first(),
         "innermost frame has no parent"
     );
-    let call_jit_pc = need!(parent.call_jitcode_pc, "parent has no call_jitcode_pc");
     let pjc = need!(
         crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32),
         "parent jitcode index unresolved"
     );
+    // `call_pc` is the CALL's jitcode pc. `resume_pc` is `MIFrame.pc`
+    // (`setup_resume_at_op`, the pc half of `read_jitcode_pos_pc`).
+    // `call_jitcode_pc` stays the Rewind arm: a bridge root leaves it unset.
+    // A live inline still resolves `CallFallthrough` through that arm.
+    let call_jit_pc = need!(
+        parent.call_pc.or(parent.call_jitcode_pc),
+        "parent has no call jitcode pc"
+    );
+    let resume_py_pc = if parent.call_jitcode_pc.is_none()
+        && let Some(resume_pc) = parent.resume_pc
+    {
+        need!(
+            resolve_resume_coord_py_pc(
+                parent.jitcode_index,
+                ParentResumeCoord::Backxlat(resume_pc),
+            ),
+            "parent resume py_pc unresolved"
+        ) as usize
+    } else {
+        need!(
+            resolve_parent_resume_py_pc(parent),
+            "parent resume py_pc unresolved"
+        ) as usize
+    };
     if pjc.code_ptr.is_null() {
         latchdbg!("root-parent-stack: parent code_ptr null");
         return None;
     }
-    let resume_py_pc = need!(
-        resolve_parent_resume_py_pc(parent),
-        "parent resume py_pc unresolved"
-    ) as usize;
     let depth = need!(
         crate::liveness::liveness_for(pjc.code_ptr)
             .depth_at_py_pc()
@@ -4453,7 +4472,13 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // deref. Declining it marks the walk unjournaled and
                         // the end flush keeps the legacy loop-entry replay,
                         // which runs the traced iteration's add a second time.
-                        "pin_root" => arg_index == 1 && nargs == 2,
+                        // The free `pin_root(root)` is the same store with
+                        // no `self`; `_match_signature` pins `w_kw_defs`
+                        // which is `PY_NULL` when the callee has no kw-only
+                        // defaults.
+                        "pin_root" => {
+                            (arg_index == 1 && nargs == 2) || (arg_index == 0 && nargs == 1)
+                        }
                         // `rlist.py ll_alloc_and_set(length, init)` writes
                         // `init` into every slot and does not dereference it.
                         // `vec![PY_NULL; n]` lowers to this helper; a NULL

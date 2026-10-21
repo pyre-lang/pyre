@@ -4045,6 +4045,72 @@ impl OptContext {
         pos_ref
     }
 
+    /// Pull the parked extra whose result is `opref`, if any.
+    ///
+    /// `info.py AbstractVirtualPtrInfo.force_box` does `emit_extra(op)`
+    /// then `getlastop()` — the allocation is already in `_newoperations`
+    /// before `_force_elements` emits a SETFIELD that reads it. Pyre's
+    /// pass-level `emit_extra` only queues, so the producer can still sit
+    /// here (or in a drain level) after the virtual flag is cleared.
+    pub(crate) fn take_queued_producer(&mut self, opref: OpRef) -> Option<(usize, majit_ir::OpRc)> {
+        if opref.is_none() || opref.is_constant() {
+            return None;
+        }
+        self.extra_operations_after
+            .iter()
+            .position(|(_, op)| op.pos().get() == opref)
+            .and_then(|at| self.extra_operations_after.remove(at))
+            .or_else(|| {
+                self.extra_pending.iter_mut().rev().find_map(|level| {
+                    level
+                        .iter()
+                        .position(|(_, op)| op.pos().get() == opref)
+                        .and_then(|at| level.remove(at))
+                })
+            })
+    }
+
+    /// `info.py AbstractVirtualPtrInfo.force_box` does `emit_extra(op)`
+    /// of the virtual's own allocation, then `optimizer.getlastop()`.
+    /// Pyre's pass-level `emit_extra` only queues, so a nested malloc
+    /// can still sit here after the virtual flag is cleared; flush it
+    /// before `_force_elements` SETFIELD reads the box.
+    ///
+    /// Only `rop.is_malloc` producers belong in that `getlastop` slot
+    /// (`New` / `NewWithVtable` / `NewArray*` / `Newstr` / `Newunicode`).
+    /// A CALL extra stays queued for `optimizer.py _emit_operation` /
+    /// drain, which still `force_box`es CALL args and runs remaining
+    /// passes (`flush_queued_producer` → `propagate_from_pass_range`).
+    /// `emit_rc` of a stolen CALL skips those passes and drops CALL arity.
+    pub(crate) fn emit_queued_producer(&mut self, opref: OpRef) {
+        debug_assert!(self.in_final_emission);
+        if !self.queued_producer_is_malloc(opref) {
+            return;
+        }
+        let Some((_from_pass, op)) = self.take_queued_producer(opref) else {
+            return;
+        };
+        for i in 0..op.num_args() {
+            self.emit_queued_producer(op.arg(i).to_opref());
+        }
+        self.emit_rc(op);
+    }
+
+    fn queued_producer_is_malloc(&self, opref: OpRef) -> bool {
+        if opref.is_none() || opref.is_constant() {
+            return false;
+        }
+        let malloc_at = |op: &majit_ir::OpRc| op.pos().get() == opref && op.opcode.is_malloc();
+        self.extra_operations_after
+            .iter()
+            .any(|(_, op)| malloc_at(op))
+            || self
+                .extra_pending
+                .iter()
+                .rev()
+                .any(|level| level.iter().any(|(_, op)| malloc_at(op)))
+    }
+
     /// optimizer.py send_extra_operation(op) with `opt=None`:
     /// re-dispatch an operation from `first_optimization` (the head of the
     /// pass chain, pass 0), so every pass — including those BEFORE the caller,

@@ -5017,23 +5017,7 @@ impl Optimizer {
         opref: OpRef,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        if opref.is_none() || opref.is_constant() {
-            return Ok(());
-        }
-        let queued = ctx
-            .extra_operations_after
-            .iter()
-            .position(|(_, op)| op.pos().get() == opref)
-            .and_then(|at| ctx.extra_operations_after.remove(at))
-            .or_else(|| {
-                ctx.extra_pending.iter_mut().rev().find_map(|level| {
-                    level
-                        .iter()
-                        .position(|(_, op)| op.pos().get() == opref)
-                        .and_then(|at| level.remove(at))
-                })
-            });
-        let Some((from_pass, op)) = queued else {
+        let Some((from_pass, op)) = ctx.take_queued_producer(opref) else {
             return Ok(());
         };
         let end_pass = self.extra_operation_end_pass();

@@ -260,7 +260,36 @@ impl Signature {
         }
         scopelen
     }
+}
 
+/// Residual wrappers for `Signature` field reads. The CALL_KW walker
+/// passes a rustc `Signature`; a look-inside getfield uses rtyper offsets.
+#[majit_macros::dont_look_inside]
+pub(crate) fn signature_posonlyargcount(sig: &Signature) -> usize {
+    sig.posonlyargcount
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn signature_num_argnames(sig: &Signature) -> usize {
+    sig.num_argnames()
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn signature_num_kwonlyargnames(sig: &Signature) -> usize {
+    sig.num_kwonlyargnames()
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn signature_has_vararg(sig: &Signature) -> bool {
+    sig.has_vararg()
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn signature_has_kwarg(sig: &Signature) -> bool {
+    sig.has_kwarg()
+}
+
+impl Signature {
     /// pypy/interpreter/signature.py `getallvarnames`:
     /// ```python
     /// def getallvarnames(self):

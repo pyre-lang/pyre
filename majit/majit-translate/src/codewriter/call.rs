@@ -7808,6 +7808,9 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
         // pointer-to-Raw-T result. `getkind` of that pointer is Signed,
         // so the call banks as int; the annotator shell is SomePtr.
         Some(s) if s.starts_with("raw:") && s.len() > 4 => Type::Int,
+        // `fn:<spelling>` is `Ptr(FuncType)` (`get_eval_fn`). Same int bank;
+        // the stub shell is `SomePtr`.
+        Some(s) if s.starts_with("fn:") => Type::Int,
         _ => Type::Ref,
     }
 }
@@ -9645,6 +9648,24 @@ impl CallControl {
         for block in graph.iterblocks() {
             for op in &block.operations {
                 let reason = match &op.kind {
+                    // Same leaf as `analyze_forces_virtualizable`: the rtyped
+                    // graph still names `jit_force_virtualizable` /
+                    // `jit_force_virtual` before
+                    // `jtransform.rewrite_op_jit_force_virtualizable` deletes
+                    // it. `VableForce` is the already-transformed spelling.
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if witness == EffectWitness::ForcesVirtualizable
+                        && segments.last().is_some_and(|leaf| {
+                            matches!(
+                                leaf.as_str(),
+                                "jit_force_virtualizable" | "jit_force_virtual"
+                            )
+                        }) =>
+                    {
+                        Some("forces a virtualizable".to_string())
+                    }
                     OpKind::VableForce { .. } if witness == EffectWitness::ForcesVirtualizable => {
                         Some("forces a virtualizable".to_string())
                     }

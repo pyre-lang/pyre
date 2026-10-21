@@ -2809,26 +2809,12 @@ impl DynasmBackend {
             with_gc_ll_descr(|gc| jitframe_write_barrier(gc, jf_ptr));
         }
 
-        // Each flag is folded into `diag`. A steady run takes the one
-        // false test and does not call into the loggers.
-        if diag && majit_ir::debug::have_debug_prints() {
-            let _s = majit_ir::debug::scope("jit-running");
-            for i in 0..n_args {
-                let raw = unsafe {
-                    crate::llmodel::get_int_value_direct(jf_ptr, Self::input_slot(i)) as i64
-                };
-                let rendered = match args {
-                    EntryWords::Typed(values) => format!("{raw:#018x} ({:?})", values[i]),
-                    EntryWords::Raw(words) => format!("{raw:#018x} ({:?})", words[i]),
-                };
-                majit_ir::debug::debug_print(&format!("  arg[{i}] = {rendered}"));
-            }
-            majit_ir::debug::debug_print(&format!(
-                "execute_token: entry={entry:?} jf_ptr={jf_ptr:?} num_args={} num_slots={num_slots} code_len={}",
-                n_args,
-                compiled.unwrap().buffer.len()
-            ));
-        }
+        // `llmodel.py execute_token` leaves the enter/leave `debug_print`
+        // lines commented out. A `jit-running` section here would fire on
+        // every compiled iteration whenever `have_debug_prints` is set
+        // (`MAJIT_LOG=1` included), and `logger.py log_loop`'s
+        // `jit-log-opt-loop` for a later function would never reach
+        // check.py's shape budget.
 
         if diag && crate::majit_dump_enabled() {
             // Independent debug toggle — MAJIT_DUMP must produce output

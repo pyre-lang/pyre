@@ -1894,7 +1894,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
         return p2_drain_abort();
     }
-
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
     // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
@@ -6253,6 +6252,16 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     };
     abort_permanent_pcs
         .filter(|pc| {
+            // A `YIELD_VALUE` marker is the frame exit, not an unported
+            // opcode: `interp_jit.py` `dispatch` returns the yielded value
+            // and the trace ends in `compile_done_with_this_frame`
+            // (`portal_yield_frame_exit`).  Counting it declines every
+            // generator loop whose body reaches a yield.
+            if abort_permanent_owner(w_code, &pjc, *pc).is_some_and(|(_, instr)| {
+                matches!(instr, pyre_interpreter::Instruction::YieldValue { .. })
+            }) {
+                return false;
+            }
             if *pc < loop_end {
                 return true;
             }

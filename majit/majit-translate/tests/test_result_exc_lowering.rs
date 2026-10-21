@@ -1789,3 +1789,13 @@ fn create_new_dict_ok_or_else_is_lowered() {
     let graph = lower_function(interp(), "create_new_dict").expect("create_new_dict lowers");
     assert_no_ok_or_else(&graph, "create_new_dict");
 }
+
+/// `argument.py _match_signature` returns `ArgErr` or `OperationError`.
+/// pyre keeps those as `MatchOutcome` (`parse_into_scope` catches `ArgErr`).
+/// The carrier rewrite must not demand `From<MatchSignatureError> for PyError`
+/// — that enum is the function's own error arm.
+#[test]
+fn match_signature_lowers_as_its_own_error() {
+    lower_function(interp(), "match_signature")
+        .unwrap_or_else(|err| panic!("match_signature must lower: {err}"));
+}
