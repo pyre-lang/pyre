@@ -1,71 +1,60 @@
-//! `Option::unwrap_or(opt, default)` / `Result::unwrap_or(res, default)` /
-//! `unwrap_or_default` → discriminant value-select.
+//! `Option::unwrap_or(opt, default)` / `Result::unwrap_or(res, default)` →
+//! discriminant value-select.
 //!
 //! ## Positioning
 //!
-//! `core::{option,result}::<Impl>::unwrap_or` / `unwrap_or_default` are
-//! foreign combinators whose bodies are Opaque in the LLBC (Charon cannot
-//! extract `core`), so the caller emits a residual call — an unregistered
-//! callee the rtyper census Skips.  Like [`crate::front::bool_then`] and
-//! unlike [`crate::front::checked_arith`], the combinator's match lives
-//! inside the opaque body: at the call site there is no discriminant switch
-//! to rewrite, only `result = unwrap_or(recv, default)` flowing on.  This
-//! pass *creates* the two-way select the combinator's semantics imply:
+//! `core::{option,result}::<Impl>::unwrap_or` is a foreign combinator whose
+//! body is Opaque in the LLBC (Charon cannot extract `core`), so the caller
+//! emits a residual `unwrap_or` call — an unregistered callee the rtyper
+//! census Skips.  Like [`crate::front::bool_then`] and unlike
+//! [`crate::front::checked_arith`], the combinator's match lives inside the
+//! opaque body: at the call site there is no discriminant switch to rewrite,
+//! only `result = unwrap_or(recv, default)` flowing on.  This pass *creates*
+//! the two-way select the combinator's semantics imply:
 //!
 //! ```text
 //!     result = opt.unwrap_or(default)     // residual `unwrap_or` call
 //! becomes
 //!     if opt.__discriminant == 1 { result = opt.__pos_0 } else { result = default }
-//!
-//!     result = opt.unwrap_or_default()    // residual `unwrap_or_default`
-//! becomes
-//!     if opt.__discriminant == 1 { result = opt.__pos_0 } else { result = T::default() }
 //! ```
 //!
-//! core `Option::unwrap_or_default` is `unwrap_or(Default::default())`; the
-//! None arm is the `if w is None: w = ""` value shape for `Option<String>`.
-//! `unwrap_or`'s candidates are already-computed values; `unwrap_or_default`
-//! emits the niladic `<T as Default>::default` call on the nil arm only.
-//! The graph has no conditional-move primitive, so the select is spelled as
-//! a two-arm diamond (the payload variant reads `recv.__pos_0`, the other
-//! arm forwards `default` or the `default()` result).  The front models
-//! every enum uniformly with an explicit `__discriminant` field (Rust niche
-//! optimisation is a codegen detail below the IR).  The payload variant's
-//! discriminant differs by enum: `Option::Some = 1` (`None = 0`),
-//! `Result::Ok = 0` (`Err = 1`), so `UnwrapOrSite`'s `payload_on_disc_true`
-//! records which `bool(disc)` arm reads `__pos_0`.
+//! Both candidates are already-computed values with no side effects, so a
+//! single-block value-select would be sound — but the graph has no
+//! conditional-move primitive, so the select is spelled as a two-arm diamond
+//! (the payload variant reads `recv.__pos_0`, the other arm forwards
+//! `default`).  The front models every enum uniformly with an explicit
+//! `__discriminant` field (Rust niche optimisation is a codegen detail below
+//! the IR).  The payload variant's discriminant differs by enum: `Option::Some
+//! = 1` (`None = 0`), `Result::Ok = 0` (`Err = 1`), so `UnwrapOrSite`'s
+//! `payload_on_disc_true` records which `bool(disc)` arm reads `__pos_0`.
 //!
 //! ## The rewrite (`rewire_one_unwrap_or_site`)
 //!
-//! Block A holds the residual `unwrap_or` / `unwrap_or_default` call
-//! producing `result` as its last op, closed by `lower_call` with a single
-//! forwarding exit to block B (the continuation consuming `result`).  The
-//! rewrite:
-//! 1. drops the residual call, reads `disc = recv.__discriminant`, and
+//! Block A holds the residual `unwrap_or` call producing `result` as its
+//! last op, closed by `lower_call` with a single forwarding exit to block B
+//! (the continuation consuming `result`).  The rewrite:
+//! 1. drops the `unwrap_or` call, reads `disc = recv.__discriminant`, and
 //!    closes A with a `bool(disc)` branch to two fresh arms;
-//! 2. the payload arm reads `recv.__pos_0`; the other arm forwards `default`
-//!    (`unwrap_or`) or calls `<T as Default>::default()` (`unwrap_or_default`);
+//! 2. the payload arm reads `recv.__pos_0`, the other arm forwards `default`;
 //!    `payload_on_disc_true` picks which is the `bool(disc)`-true arm;
 //! 3. both arms forward to B, reproducing A's original exit args with the
 //!    `result` slot sourced from the arm's payload / default value and every
 //!    other live value threaded through the arm's inputargs.
 //!
 //! It is **fail-safe**: any structural mismatch returns `Err`, the caller
-//! leaves the residual call untouched, and the unregistered combinator
+//! leaves the residual call untouched, and the unregistered `unwrap_or`
 //! callee keeps the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
 use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
-use crate::model::{
-    CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
-};
+use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::unwrap_or(opt, default)` / `Result::unwrap_or(res,
-/// default)` / `unwrap_or_default` call site captured during body lowering
-/// (`front::mir` `recognize_unwrap_or_site`).  The owner strings are resolved
-/// at the recording site where the receiver enum type is in hand; the
-/// post-pass only needs them to spell the `__discriminant` / `__pos_0` field
-/// reads in the synthesized arms.
+/// default)` call site captured during body lowering (`front::mir`
+/// `recognize_unwrap_or_site`).  The owner strings are resolved at the
+/// recording site where the receiver enum type is in hand; the post-pass only
+/// needs them to spell the `__discriminant` / `__pos_0` field reads in the
+/// synthesized arms.
 #[derive(Clone)]
 pub(crate) struct UnwrapOrSite {
     /// The `unwrap_or` call result (the payload `T` value) — locates block A.
@@ -102,16 +91,13 @@ pub(crate) struct UnwrapOrSite {
     /// fieldless enum.  Like the pointer niche, this representation has no
     /// aggregate fields: `Some(e)` is `e` itself and `None` is this tag.
     pub fieldless_none_tag: Option<i64>,
-    /// The niladic `<T as Default>::default` callee for `unwrap_or_default`.
-    /// `None` for `unwrap_or`, whose default is the call's second operand.
-    pub default_call: Option<CallTarget>,
 }
 
-/// Rewrite every recorded `Option::unwrap_or` / `unwrap_or_default` call
-/// site into the discriminant value-select diamond.  Fail-safe: a site
-/// whose block does not fit the residual-call shape is left untouched
-/// (Skip), so a mismatch never regresses a graph the legacy walker already
-/// handled.  Returns the number of sites rewritten.
+/// Rewrite every recorded `Option::unwrap_or` call site into the
+/// discriminant value-select diamond.  Fail-safe: a site whose block does
+/// not fit the residual-call shape is left untouched (Skip), so a mismatch
+/// never regresses a graph the legacy walker already handled.  Returns the
+/// number of sites rewritten.
 pub(crate) fn rewire_unwrap_or_call_sites(
     graph: &mut FunctionGraph,
     sites: &[UnwrapOrSite],
@@ -180,20 +166,12 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             "{name}: unwrap_or call is not the last op of block {a}"
         ));
     };
-    // Capture the receiver.  `unwrap_or` is a 2-arg call (default is the
-    // second operand); `unwrap_or_default` is unary and the nil arm calls
-    // `<T as Default>::default` (core `Option::unwrap_or_default`).
-    let (opt, default_operand) = match (
-        &graph.blocks[a].operations[call_idx].kind,
-        site.default_call.is_some(),
-    ) {
-        (OpKind::Call { args, .. }, false) if args.len() == 2 => {
-            (args[0].clone(), Some(args[1].clone()))
-        }
-        (OpKind::Call { args, .. }, true) if args.len() == 1 => (args[0].clone(), None),
-        (other, _) => {
+    // Capture the receiver `Option` + default operands.
+    let (opt, default) = match &graph.blocks[a].operations[call_idx].kind {
+        OpKind::Call { args, .. } if args.len() == 2 => (args[0].clone(), args[1].clone()),
+        other => {
             return Err(format!(
-                "{name}: unwrap_or producer op is not a matching call: {other:?}"
+                "{name}: unwrap_or producer op is not a 2-arg call: {other:?}"
             ));
         }
     };
@@ -229,20 +207,16 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // All structural validation passed; mutate the graph.
 
     // The payload arm carries `carried` plus `recv` (the base for the
-    // `__pos_0` read); the default arm carries `carried` plus `default` when
-    // that value is the second operand (`unwrap_or`).  `unwrap_or_default`
-    // produces the fallback in the arm, so it threads only `carried`.  The
-    // source-var lists double as the branch link args.  Which arm is the
-    // `bool(disc)`-true (`then`) target is decided below from
-    // `payload_on_disc_true`.
+    // `__pos_0` read); the default arm carries `carried` plus `default` (the
+    // forwarded fallback).  The source-var lists double as the branch link
+    // args.  Which arm is the `bool(disc)`-true (`then`) target is decided
+    // below from `payload_on_disc_true`.
     let mut payload_sources = carried.clone();
     if !payload_sources.contains(&opt) {
         payload_sources.push(opt.clone().into_variable());
     }
     let mut default_sources = carried.clone();
-    if let Some(default) = &default_operand
-        && !default_sources.contains(default)
-    {
+    if !default_sources.contains(&default) {
         default_sources.push(default.clone().into_variable());
     }
     let (payload_bb, payload_inputs) = graph.create_block_with_arg_vars(payload_sources.len());
@@ -290,28 +264,10 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     )?;
     close_goto_mixed(graph, payload_bb, b_target, payload_link_args);
 
-    // Default arm: the joined value is either the second operand
-    // (`unwrap_or`) or the niladic `<T as Default>::default` result
-    // (`unwrap_or_default`; `if w is None: w = ""` for `Option<String>`).
-    let default_raw = if let Some(target) = site.default_call.clone() {
-        let produced = graph.alloc_value_var();
-        graph.block_mut(default_bb).operations.push(SpaceOperation {
-            result: Some(produced.clone()),
-            kind: OpKind::Call {
-                target,
-                args: Vec::new(),
-                result_ty: site.payload_ty.clone(),
-            },
-        });
-        produced
-    } else {
-        let default = default_operand
-            .as_ref()
-            .ok_or_else(|| format!("{name}: unwrap_or default operand missing"))?;
-        map_source(&default_sources, &default_inputs, default)
-            .ok_or_else(|| format!("{name}: default value not threaded into default arm"))?
-    };
-    let default_value = emit_narrow(graph, default_bb, &cast, default_raw);
+    // Default arm: forward `default` (narrowed if the call carried a cast).
+    let default_in_arm = map_source(&default_sources, &default_inputs, &default)
+        .ok_or_else(|| format!("{name}: default value not threaded into default arm"))?;
+    let default_value = emit_narrow(graph, default_bb, &cast, default_in_arm);
     let default_link_args = reproduce_exit_args(
         &saved_exit,
         &out_var,
@@ -445,7 +401,6 @@ mod tests {
             int_null: None,
             niche_null_cast: None,
             fieldless_none_tag: None,
-            default_call: None,
         }
     }
 
@@ -471,27 +426,6 @@ mod tests {
             int_null: None,
             niche_null_cast: None,
             fieldless_none_tag: None,
-            default_call: None,
-        }
-    }
-
-    fn unwrap_or_default_target() -> CallTarget {
-        CallTarget::FunctionPath {
-            segments: ["core", "option", "<Impl>", "unwrap_or_default"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            fun_decl_id: None,
-        }
-    }
-
-    fn string_default_target() -> CallTarget {
-        CallTarget::FunctionPath {
-            segments: ["alloc", "string", "<Impl>", "default"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            fun_decl_id: None,
         }
     }
 
@@ -1003,119 +937,6 @@ mod tests {
                 .operations
                 .iter()
                 .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
-        );
-    }
-
-    /// `Option<String>::unwrap_or_default` is `unwrap_or(Default::default())`
-    /// (core `Option::unwrap_or_default`); the None arm is
-    /// `if w is None: w = ""`.  The rewrite drops the residual combinator
-    /// and emits the niladic default callee on the None arm.
-    #[test]
-    fn rewrite_lifts_unwrap_or_default_to_default_call_on_none_arm() {
-        use crate::model::ExitCase;
-        let mut g = FunctionGraph::new("test_unwrap_or_default");
-        let a = g.startblock;
-        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
-        let result = g
-            .push_op_var(
-                a,
-                OpKind::Call {
-                    target: unwrap_or_default_target(),
-                    args: crate::model::call_args(vec![opt.clone()]),
-                    result_ty: ValueType::Str,
-                },
-                true,
-            )
-            .unwrap();
-        let (b, _b_args) = g.create_block_with_arg_vars(1);
-        g.set_return(b, None);
-        g.set_goto(a, b, vec![result.clone()]);
-
-        let mut site = option_site(result.clone());
-        site.payload_ty = ValueType::Str;
-        site.default_call = Some(string_default_target());
-        let rewritten = rewire_unwrap_or_call_sites(&mut g, &[site]);
-        assert_eq!(rewritten, 1, "the unwrap_or_default site must be rewritten");
-
-        assert!(
-            !g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.last().map(String::as_str) == Some("unwrap_or_default"))
-            }),
-            "residual unwrap_or_default call removed"
-        );
-        assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
-        let mut none_calls_default = false;
-        for link in &g.blocks[a.0].exits {
-            match &link.exitcase {
-                Some(ExitCase::Bool(true)) => {
-                    assert!(
-                        g.blocks[link.target.0].operations.iter().any(|op| {
-                            matches!(
-                                &op.kind,
-                                OpKind::FieldRead { field, .. } if field.name == "__pos_0"
-                            )
-                        }),
-                        "Some arm reads __pos_0"
-                    );
-                }
-                Some(ExitCase::Bool(false)) => {
-                    none_calls_default = g.blocks[link.target.0].operations.iter().any(|op| {
-                        matches!(
-                            &op.kind,
-                            OpKind::Call {
-                                target: CallTarget::FunctionPath { segments, .. },
-                                args,
-                                ..
-                            } if segments.last().map(String::as_str) == Some("default")
-                                && args.is_empty()
-                        )
-                    });
-                }
-                other => panic!("unexpected branch exitcase {other:?}"),
-            }
-        }
-        assert!(
-            none_calls_default,
-            "None arm calls the Default::default callee"
-        );
-    }
-
-    /// A site whose Default resolution failed is not recorded with a
-    /// `default_call`; a 1-arg residual then declines and the call remains.
-    #[test]
-    fn rewrite_declines_unwrap_or_default_without_default_call() {
-        let mut g = FunctionGraph::new("test_unwrap_or_default_unresolved");
-        let a = g.startblock;
-        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
-        let result = g
-            .push_op_var(
-                a,
-                OpKind::Call {
-                    target: unwrap_or_default_target(),
-                    args: crate::model::call_args(vec![opt]),
-                    result_ty: ValueType::Str,
-                },
-                true,
-            )
-            .unwrap();
-        let (b, _) = g.create_block_with_arg_vars(1);
-        g.set_return(b, None);
-        g.set_goto(a, b, vec![result.clone()]);
-
-        let mut site = option_site(result);
-        site.payload_ty = ValueType::Str;
-        assert_eq!(
-            rewire_unwrap_or_call_sites(&mut g, &[site]),
-            0,
-            "an unresolved default_call is not rewritten"
-        );
-        assert!(
-            g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
-                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.last().map(String::as_str) == Some("unwrap_or_default"))
-            }),
-            "residual unwrap_or_default call survives"
         );
     }
 }

@@ -5772,18 +5772,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.layout_accessor_sites,
             );
         }
-        // Plain-error `Result::ok` (`front::result_ok`) — Opaque core
-        // `match self { Ok(x) => Some(x), Err(_) => None }` — splits the
-        // residual `ok` call into a `__discriminant` diamond, the same
-        // value-select `unwrap_or` synthesizes.  Runs before `option_try` so
-        // `i32::try_from(value).ok()?` (`longlong2float.py` `can_encode_int32`)
-        // joins a real Option into the `?` continuation, the multi-pred
-        // Some/None join `option_try` already accepts from `checked_*`.
-        let result_ok_rewritten = if lo.result_ok_sites.is_empty() {
-            0
-        } else {
-            crate::front::result_ok::rewire_result_ok_call_sites(&mut lo.graph, &lo.result_ok_sites)
-        };
         // The `Option` `?` rewrite (`front::option_try`) consumes the same
         // `Try::branch` / `ControlFlow` diamond as `result_exc`, but its break
         // arm returns a freshly-built `None` to this graph's returnblock.  It
@@ -5916,8 +5904,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.saturating_sub_sites,
             )
         };
-        // The `Option::unwrap_or` / `unwrap_or_default` value-select rewrite
-        // (`front::option_unwrap_or`) splits the residual combinator call
+        // The `Option::unwrap_or` value-select rewrite
+        // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
         // block into a `__discriminant` diamond, same post-lowering shape and
         // fail-safe contract as `bool::then`; gate the reachability sweep on
         // an actual rewrite.
@@ -6068,7 +6056,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_call_rewritten > 0
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
-            || result_ok_rewritten > 0
             || option_try_stats.rewritten > 0
             || result_try_stats.rewritten > 0
             || !lo.result_try_sites.is_empty()
@@ -9200,21 +9187,13 @@ struct Lowering<'a> {
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
     slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `Option::unwrap_or(opt, default)` / `unwrap_or_default` call sites
+    /// `Option::unwrap_or(opt, default)` call sites
     /// recorded for the discriminant value-select the
     /// `front::option_unwrap_or` post-pass synthesizes after the body
     /// lowering completes.  Each carries the resolved `Option` owners the
     /// arms' field reads need (see
     /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
     unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
-    /// Plain-error `Result::ok(res)` call sites recorded for the
-    /// discriminant value-select the `front::result_ok` post-pass synthesizes
-    /// (`Ok(x) => Some(x), Err(_) => None`).  Same lifetime as
-    /// `unwrap_or_sites`.  The Layout-only `from_size_align` `.ok()` capture
-    /// keeps priority.  Includes `listobject::int_or_float_encode_int`
-    /// (`i32::try_from(value).ok()?`), the Rust spelling of
-    /// `longlong2float.py` `can_encode_int32`.
-    result_ok_sites: Vec<crate::front::result_ok::ResultOkSite>,
     /// `Option::unwrap(opt)` call sites recorded for the discriminant guard the
     /// `front::option_unwrap` post-pass synthesizes (see
     /// [`crate::front::option_unwrap::UnwrapSite`]).
@@ -10050,7 +10029,6 @@ impl<'a> Lowering<'a> {
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
-            result_ok_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             expect_sites: Vec::new(),
             map_or_sites: Vec::new(),
@@ -24532,7 +24510,7 @@ impl<'a> Lowering<'a> {
         // First argument's MIR-declared type, captured before the
         // operands are consumed — `reflexive_into_alias` compares it
         // against the destination type.
-        let first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
+        let mut first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
@@ -24574,6 +24552,17 @@ impl<'a> Lowering<'a> {
             .args
             .get(1)
             .and_then(|op| const_operand_tyref(op, self.llbc));
+        // Function-item identity of arg #0, captured before `call.args` is
+        // consumed. A `FnOnce::call_once` on a `FnDef` constant (or a
+        // Copy/Move of a `FnDef`-typed local) has no ADT receiver, so
+        // `first_arg_ty` is `None` for the Const form; the FunDecl is the
+        // direct call the generated shim would tail-call.
+        let first_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.first());
+        let first_arg_fn_decl_id = first_arg_fn_decl.map(|fd| fd.def_id);
+        let first_arg_fn_n_inputs = first_arg_fn_decl.map(|fd| fd.signature.inputs.len());
+        // Instantiation generics live on the FnDef, not on the FunDecl.
+        // Unreadable generics decline the unpack below.
+        let first_arg_fn_item = operand_fn_item_call(self.llbc, call.args.first());
         // Function-item identity of arg #1, captured before `call.args` is
         // consumed.  `Option::map(opt, named_fn)` passes a `FnDef` constant
         // (or a Copy/Move of a `FnDef`-typed local); that shape has no
@@ -24724,19 +24713,6 @@ impl<'a> Lowering<'a> {
             (&class, &call.func),
             (CallClass::Dynamic, CallFunc::Dynamic(_))
         );
-        // `unwrap_or_default` needs this RegularCall's Default trait_refs at
-        // the residual-call capture (`default_call_for_take`).  `call.func`
-        // moves into the match below; keep a clone of this one combinator.
-        let unwrap_or_default_reg = match &call.func {
-            CallFunc::Regular(reg)
-                if regular_call_name_path(reg, self.llbc)
-                    .as_deref()
-                    .is_some_and(|p| p.rsplit("::").next() == Some("unwrap_or_default")) =>
-            {
-                Some(reg.clone())
-            }
-            _ => None,
-        };
         let op_kind = match (class, call.func) {
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
                 if let Some(kind) = vec_extend_kind =>
@@ -24798,6 +24774,7 @@ impl<'a> Lowering<'a> {
             }
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
+                let mut reg = reg;
                 // A boundary the consumer declared as one scalar field
                 // store ([`crate::ScalarFieldStore`]).  Emit the
                 // `setfield_gc_<bank>` its body performs instead of
@@ -25677,6 +25654,60 @@ impl<'a> Lowering<'a> {
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
+                }
+                // `CallKind::Trait` `<T as Default>::default` in a copied
+                // generic body (a `Clause` rewritten to `TraitImpl`). The
+                // impl method is often Opaque on a Struct owner, so
+                // `specialized_trait_target` cannot name it; emit the
+                // destination's default instead of residual
+                // `["Default","default"]`. A Fun Regular path
+                // `core::default::Default::default` is the lookalike
+                // that stays residual.
+                if args.is_empty()
+                    && self.is_trait_default_call(&reg)
+                    && let Some(value) = self.emit_default_of_ty(bb_id, &call.dest.ty)
+                {
+                    self.local_var[dest_local] = Some(LocalValue::One(value));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // rustc's `FnOnce`/`Fn`/`FnMut` shim for a function item
+                // unpacks `Args` and tail-calls the `FnDef`. The shim is
+                // Opaque; continue as a Fun Regular call of that FunDecl
+                // so the same std-method lowerings a direct `f(x)` uses
+                // (`<str>::is_empty` → `__len` + `eq 0`) apply. A closure
+                // ADT has no `FnDef` identity and keeps the trait-method
+                // route. An arity mismatch, or a FnDef whose instantiation
+                // generics cannot be read, declines.
+                if self.is_fn_family_call_once(&reg)
+                    && let Some(fn_id) = first_arg_fn_decl_id
+                    && let Some(fn_item) = first_arg_fn_item
+                    && matches!(
+                        &fn_item.kind,
+                        CallKind::Fun(FunId::Regular { id }) if *id == fn_id
+                    )
+                    && fn_item.generics.as_object().is_some()
+                    && args.len() == 2
+                    && let Some(n_inputs) = first_arg_fn_n_inputs
+                    && let Some(payloads) = self.emit_fn_item_call_once_payloads(
+                        bb_id,
+                        &args[1],
+                        second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
+                        n_inputs,
+                    )
+                {
+                    let tuple_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
+                    first_arg_ty = if n_inputs == 0 {
+                        None
+                    } else {
+                        tuple_ty.and_then(|ty| tyref_tuple_element(ty, 0, self.llbc))
+                    };
+                    args = payloads;
+                    // The FnDef's own RegularCall: Fun id plus the
+                    // instantiation generics `fn_def_of_const` reads.
+                    reg = fn_item;
                 }
 
                 if args.len() == 1 && self.is_const_ptr_as_ref(&reg) {
@@ -31625,17 +31656,9 @@ impl<'a> Lowering<'a> {
             && args.len() == 1
             && crate::front::slice_get::is_result_ok_call_target(target)
             && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+            && let Some(site) = self.recognize_from_size_align_ok_site(&call.dest.ty, &result_var)
         {
-            if let Some(site) = self.recognize_from_size_align_ok_site(&call.dest.ty, &result_var) {
-                self.from_size_align_sites.push(site);
-            } else if let Some(site) =
-                self.recognize_result_ok_site(first_arg_ty.as_ref(), &call.dest.ty, &result_var)
-            {
-                // Layout `.ok()` kept priority above.  Remaining plain-error
-                // `Result::ok` (including `int_or_float_encode_int`,
-                // `longlong2float.py` `can_encode_int32`) records here.
-                self.result_ok_sites.push(site);
-            }
+            self.from_size_align_sites.push(site);
         }
         // Capture `Result::expect(res, msg)` results whose payload is `Layout`
         // (the by-value `Layout`) for the `from_size_align` bound-check rewiring
@@ -31844,62 +31867,38 @@ impl<'a> Lowering<'a> {
             self.slice_first_sites.push(site);
         }
         // Capture `Option::unwrap_or(opt, default)` /
-        // `Result::unwrap_or(res, default)` / `unwrap_or_default` sites for
-        // the discriminant value-select `front::option_unwrap_or` synthesizes.
-        // `unwrap_or`'s body is Opaque (foreign `core`), but its receiver is
-        // the enum ADT, so `first_is_self` routes it to a `CallTarget::Method`
-        // (receiver in `args[0]`, default in `args[1]`), NOT a raw
-        // FunctionPath.  Resolving the enum field owners needs the receiver's
-        // type (`first_arg_ty`), in hand here; `recognize_unwrap_or_site`
-        // classifies `Option` vs `Result` (their `Some`=1 / `Ok`=0 payload
-        // tags differ) and records the polarity.  The exception-carrier
-        // Result is recorded as a `CarrierCombinatorSite` instead —
-        // `front::result_exc` fuses that combinator onto `LastException`
-        // (`except OperationError`) rather than a value-select.  A resolution
-        // miss leaves the residual call — an unregistered callee the rtyper
-        // census Skips, so no graph regresses.
-        //
-        // core `Option::unwrap_or_default` is `unwrap_or(Default::default())`;
-        // the None arm is `if w is None: w = ""` for `Option<String>`.  The
-        // unary Method records the same site, then fills `default_call` from
-        // `default_call_for_take` of the payload `T`.  A carrier Result
-        // `unwrap_or_default` is left residual (none exists in the census).
+        // `Result::unwrap_or(res, default)` sites for the discriminant
+        // value-select `front::option_unwrap_or` synthesizes.  `unwrap_or`'s
+        // body is Opaque (foreign `core`), but its receiver is the enum ADT, so
+        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
+        // `args[0]`, default in `args[1]`), NOT a raw FunctionPath.  Resolving
+        // the enum field owners needs the receiver's type (`first_arg_ty`), in
+        // hand here; `recognize_unwrap_or_site` classifies `Option` vs `Result`
+        // (their `Some`=1 / `Ok`=0 payload tags differ) and records the
+        // polarity.  The exception-carrier Result is recorded as a
+        // `CarrierCombinatorSite` instead — `front::result_exc` fuses that
+        // combinator onto `LastException` (`except OperationError`) rather
+        // than a value-select.  A resolution miss leaves the residual call —
+        // an unregistered callee the rtyper census Skips, so no graph
+        // regresses.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
             ..
         } = &op_kind
+            && args.len() == 2
+            && name == "unwrap_or"
         {
-            if args.len() == 2 && name == "unwrap_or" {
-                if let Some(site) = self.recognize_carrier_combinator_site(
-                    first_arg_ty.as_ref(),
-                    &result_var,
-                    crate::front::result_exc::CarrierCatchKind::JoinDefault,
-                ) {
-                    self.carrier_combinator_sites.push(site);
-                } else if let Some(site) =
-                    self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
-                {
-                    self.unwrap_or_sites.push(site);
-                }
-            } else if args.len() == 1 && name == "unwrap_or_default" {
-                if let Some(mut site) =
-                    self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
-                    && let Some(reg) = unwrap_or_default_reg.as_ref()
-                {
-                    let payload_ty = first_arg_ty.as_ref().and_then(|recv| {
-                        let peeled = self.peel_to_option_or_result(recv);
-                        let recv = peeled.as_ref().unwrap_or(recv);
-                        crate::front::result_exc::tyref_option_payload(recv, self.llbc)
-                            .or_else(|| crate::front::result_exc::tyref_result_ok(recv, self.llbc))
-                    });
-                    if let Some(payload_ty) = payload_ty
-                        && let Some(default_call) = self.default_call_for_take(reg, &payload_ty)
-                    {
-                        site.default_call = Some(default_call);
-                        self.unwrap_or_sites.push(site);
-                    }
-                }
+            if let Some(site) = self.recognize_carrier_combinator_site(
+                first_arg_ty.as_ref(),
+                &result_var,
+                crate::front::result_exc::CarrierCatchKind::JoinDefault,
+            ) {
+                self.carrier_combinator_sites.push(site);
+            } else if let Some(site) =
+                self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
+            {
+                self.unwrap_or_sites.push(site);
             }
         }
         // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
@@ -32076,8 +32075,7 @@ impl<'a> Lowering<'a> {
         }
         // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, callable)` sites
         // for the discriminant closure-select `front::option_closure_select`
-        // synthesizes.  All six combinators (`map`/`and_then`/`unwrap_or_else`/
-        // `or_else`/`is_some_and`/`is_none_or`) are Opaque (foreign `core`) with
+        // synthesizes.  All five combinators are Opaque (foreign `core`) with
         // the `Option` ADT receiver, so `first_is_self` routes them to a
         // two-arg `CallTarget::Method` (receiver `args[0]`, callable
         // `args[1]`).  The callable is a closure ADT (`second_arg_ty` →
@@ -32103,9 +32101,6 @@ impl<'a> Lowering<'a> {
                 "is_some_and" => {
                     Some(crate::front::option_closure_select::ClosureCombinator::IsSomeAnd)
                 }
-                "is_none_or" => {
-                    Some(crate::front::option_closure_select::ClosureCombinator::IsNoneOr)
-                }
                 _ => None,
             }
             && let Some(site) = self.recognize_closure_select_site(
@@ -32123,7 +32118,7 @@ impl<'a> Lowering<'a> {
         // Discriminant-switch combinators whose opaque core body is an
         // if/else on the receiver tag (plus `call_once` of a closure
         // argument when there is one).  Option `map`/`and_then`/
-        // `unwrap_or_else`/`or_else`/`is_some_and`/`is_none_or` already have
+        // `unwrap_or_else`/`or_else`/`is_some_and` already have
         // their own capture above; this records the remaining Option/Result
         // methods whose semantics are the same shape.
         if let OpKind::Call {
@@ -36355,6 +36350,100 @@ impl<'a> Lowering<'a> {
             && self.can_emit_default_of_ty(dest_ty)
     }
 
+    /// `CallKind::Trait` naming `Default::default`. Distinct from a Fun
+    /// Regular path `core::default::Default::default` (the lookalike).
+    fn is_trait_default_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Trait(v) = &reg.kind else {
+            return false;
+        };
+        trait_payload_owner(v, self.llbc).is_some_and(|(trait_leaf, method_leaf)| {
+            trait_leaf == "Default" && method_leaf == "default"
+        })
+    }
+
+    /// `CallKind::Trait` naming `FnOnce::call_once` / `Fn::call` /
+    /// `FnMut::call_mut`. The generated shim for a function item.
+    fn is_fn_family_call_once(&self, reg: &RegularCall) -> bool {
+        let CallKind::Trait(v) = &reg.kind else {
+            return false;
+        };
+        trait_payload_owner(v, self.llbc).is_some_and(|(trait_leaf, method_leaf)| {
+            matches!(
+                (trait_leaf.as_str(), method_leaf.as_str()),
+                ("FnOnce", "call_once") | ("Fn", "call") | ("FnMut", "call_mut")
+            )
+        })
+    }
+
+    /// Unpack `FnOnce::Args` into the arguments of the named `FnDef`.
+    /// `n_inputs` is `FunDecl.signature.inputs.len()`. `n_inputs == 0`
+    /// is a niladic item (`Args = ()`); otherwise each `__pos_i` of the
+    /// tuple is one parameter. A tuple whose arity differs from
+    /// `n_inputs` declines.
+    fn emit_fn_item_call_once_payloads(
+        &mut self,
+        bb_id: BlockId,
+        args_tuple: &Variable,
+        args_tuple_ty: Option<&TyRef>,
+        n_inputs: usize,
+    ) -> Option<Vec<Variable>> {
+        let tuple_arity = args_tuple_ty.map(|ty| tyref_tuple_arity(ty, self.llbc));
+        if n_inputs == 0 {
+            if tuple_arity.is_some_and(|n| n != 0) {
+                return None;
+            }
+            return Some(Vec::new());
+        }
+        let tuple_ty = args_tuple_ty?;
+        if tuple_arity != Some(n_inputs) {
+            return None;
+        }
+        let mut payloads = Vec::with_capacity(n_inputs);
+        for idx in 0..n_inputs {
+            payloads.push(self.emit_tuple_nth_field(bb_id, args_tuple, tuple_ty, idx)?);
+        }
+        Some(payloads)
+    }
+
+    /// `tuple.__pos_{idx}` as a typed `FieldRead`, matching the
+    /// `resolve_place` tuple-projection owner (`Tuple{suffix}`).
+    fn emit_tuple_nth_field(
+        &mut self,
+        bb_id: BlockId,
+        tuple: &Variable,
+        tuple_ty: &TyRef,
+        idx: usize,
+    ) -> Option<Variable> {
+        let suffix = tyref_tuple_suffix(tuple_ty, self.llbc);
+        if suffix.is_empty() {
+            return None;
+        }
+        let owner = format!("Tuple{suffix}");
+        let element_ty = tyref_tuple_element(tuple_ty, idx, self.llbc)?;
+        let inline_vec = field_ty_is_inline_vec(&element_ty, self.llbc);
+        let ty = tuple_element_field_value_type(
+            &element_ty,
+            Some(element_ty.clone()),
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple.clone(),
+                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner))
+                    .with_inline_vec(inline_vec),
+                ty,
+                pure: false,
+            },
+        });
+        Some(res)
+    }
+
     /// True when [`Self::emit_default_of_ty`] can build `ty` without a
     /// residual `Default` call. Checked before any op is pushed so a
     /// later unknown element does not leave a half-built tuple in the
@@ -36374,13 +36463,17 @@ impl<'a> Lowering<'a> {
         }
         // A primitive scalar's default is zero. A thin pointer is not
         // accepted: `Box<T>::default` allocates a `T::default()`, not null.
+        // A rust-heap `String` is `{cap, ptr, len}` and is not the empty
+        // rstr `STR` this path emits.
         tyref_default_is_unit(ty, self.llbc)
             || tyref_is_primitive_scalar(ty, self.llbc)
             || tyref_is_vec_value(ty, self.llbc)
+            || tyref_is_string_value(ty, self.llbc)
     }
 
     /// Default of `ty`: primitive scalar zero, unit / `PhantomData`,
-    /// empty `Vec` (`vec::Vec::new` → `newlist` / `ll_newemptylist`), or
+    /// empty `Vec` (`vec::Vec::new` → `newlist` / `ll_newemptylist`),
+    /// empty rstr `STR` (`Wtf8` / `Wtf8Buf` / `str`), or
     /// `TupleRepr.newtuple` of those.
     fn emit_default_of_ty(&mut self, bb_id: BlockId, ty: &TyRef) -> Option<Variable> {
         if tyref_is_tuple(ty, self.llbc) {
@@ -36394,6 +36487,9 @@ impl<'a> Lowering<'a> {
         }
         if tyref_is_vec_value(ty, self.llbc) {
             return Some(self.emit_vec_new(bb_id, ty));
+        }
+        if tyref_is_string_value(ty, self.llbc) {
+            return Some(emit_str_const(&mut self.graph, bb_id, ""));
         }
         None
     }
@@ -39547,59 +39643,6 @@ impl<'a> Lowering<'a> {
             int_null: self.option_niche_int_null(recv_ty),
             niche_null_cast: self.option_niche_null_cast(recv_ty),
             fieldless_none_tag,
-            default_call: None,
-        })
-    }
-
-    /// Resolve a recognized plain-error `Result::ok(res)` call into a
-    /// [`crate::front::result_ok::ResultOkSite`] — the Result enum root + `Ok`
-    /// variant owners for the `__discriminant` / `__pos_0` reads, the payload
-    /// type, and the destination `Option<T>` owners the `Some`/`None`
-    /// aggregates need.  `None` (leaving the residual call) when the receiver
-    /// is not a resolvable Result, or is the exception-carrier Result
-    /// (`tyref_is_result_of_carrier`) owned by `front::result_exc`.  Only
-    /// plain-error Result records, matching [`Self::recognize_unwrap_or_site`].
-    /// `listobject::int_or_float_encode_int` is `i32::try_from(value).ok()?`,
-    /// the Rust spelling of `longlong2float.py` `can_encode_int32`.
-    fn recognize_result_ok_site(
-        &self,
-        recv_ty: Option<&TyRef>,
-        dest_ty: &TyRef,
-        result_var: &Variable,
-    ) -> Option<crate::front::result_ok::ResultOkSite> {
-        let recv_ty = recv_ty?;
-        let peeled = self.peel_to_option_or_result(recv_ty);
-        let recv_ty = peeled.as_ref().unwrap_or(recv_ty);
-        let is_result = crate::front::result_exc::tyref_is_result(recv_ty, self.llbc);
-        let is_carrier = is_result
-            && crate::front::result_exc::tyref_is_result_of_carrier(
-                recv_ty,
-                self.llbc,
-                self.static_addrs.error_carrier,
-            );
-        if !crate::front::result_ok::admits_result_ok_receiver(is_result, is_carrier) {
-            return None;
-        }
-        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
-            return None;
-        }
-        let (enum_owner, payload_owner, _err_owner, payload_ty, _, _) =
-            self.resolve_result_owners(recv_ty)?;
-        let (option_owner, some_owner, _dest_payload_ty) =
-            self.resolve_option_consumer_owners(dest_ty)?;
-        let niche = self.tyref_is_niche_option_ptr(dest_ty);
-        let scalar_niche = !niche && tyref_option_nonzero_scalar(dest_ty, self.llbc);
-        Some(crate::front::result_ok::ResultOkSite {
-            result_var: result_var.clone(),
-            enum_owner,
-            payload_owner,
-            payload_ty,
-            option_owner,
-            some_owner,
-            niche,
-            int_null: self.option_niche_int_null(dest_ty),
-            scalar_niche,
-            niche_null_cast: self.option_niche_null_cast(dest_ty),
         })
     }
 
@@ -41194,8 +41237,8 @@ impl<'a> Lowering<'a> {
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
         // is `Option<T>` and its closure returns that same `Option<T>`;
-        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`/`is_none_or`
-        // closures and dests are both `bool`.
+        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and` closures and
+        // dests are both `bool`.
         let call_result_tyref = match kind {
             ClosureCombinator::Map => {
                 crate::front::result_exc::tyref_option_payload(dest_ty, self.llbc)?
@@ -41203,8 +41246,7 @@ impl<'a> Lowering<'a> {
             ClosureCombinator::AndThen
             | ClosureCombinator::OrElse
             | ClosureCombinator::UnwrapOrElse
-            | ClosureCombinator::IsSomeAnd
-            | ClosureCombinator::IsNoneOr => clone_tyref(dest_ty),
+            | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
         };
         let mut call_result_ty = tyref_to_value_type_with(
             &call_result_tyref,
@@ -50510,11 +50552,18 @@ fn trait_default_method_id(llbc: &Llbc, trait_id: u64, method: u64) -> Option<u6
         .as_u64()
 }
 
+/// The function item a `FnDef` node names, spelled as the `RegularCall`
+/// a direct call to it would carry — Fun id and the instantiation
+/// `generics`. A `RegionBinder` unwraps to `skip_binder`.
+fn regular_call_from_fn_def(fn_def: &serde_json::Value) -> Option<RegularCall> {
+    serde_json::from_value(fn_def.get("skip_binder").unwrap_or(fn_def).clone()).ok()
+}
+
 /// The function item a constant names, spelled as the `RegularCall` a direct
 /// call to it would carry.
 fn fn_def_of_const(llbc: &Llbc, c: &serde_json::Value) -> Option<RegularCall> {
     let kind = llbc.const_expr_kind(c)?;
-    serde_json::from_value::<RegularCall>(kind.get("FnDef")?.clone()).ok()
+    regular_call_from_fn_def(kind.get("FnDef")?)
 }
 
 /// Visit every `FnDef` constant under a statement or operand.
@@ -63091,7 +63140,7 @@ fn tyref_to_value_type_with(
     }
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
-        || tyref_is_option_of_shared_u8_slice(ty, llbc)
+        || tyref_is_option_of_string_family(ty, llbc)
     {
         return ValueType::Str;
     }
@@ -64279,7 +64328,7 @@ fn dont_look_inside_return_is_str(
     let ty = payload.as_ref().unwrap_or(output);
     tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
-        || tyref_is_option_of_shared_u8_slice(ty, llbc)
+        || tyref_is_option_of_string_family(ty, llbc)
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
@@ -64423,7 +64472,7 @@ fn tyref_to_attr_value_type_with(
     }
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
-        || tyref_is_option_of_shared_u8_slice(ty, llbc)
+        || tyref_is_option_of_string_family(ty, llbc)
     {
         return ValueType::Str;
     }
@@ -66251,6 +66300,16 @@ fn tyref_is_option_of_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     })
 }
 
+/// `Option` of an rstr `STR` wrapper or a rust-heap `String`: a nullable
+/// `SomeString`. The `Some` word is the string itself
+/// (`tyref_is_niche_option_ptr`); painting the Option as the payload-enum
+/// class makes a `Some` arm that aliases the base (`__pos_0`) join
+/// `Instance(Option) ∪ String`.
+fn tyref_is_option_of_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
+    crate::front::result_exc::tyref_option_payload(ty, llbc)
+        .is_some_and(|payload| tyref_is_string_family(&payload, llbc))
+}
+
 /// `Vec<u8>` / list-of-chars → shared `&[u8]` is `rstr.py`
 /// `LLHelpers.ll_join_chars` (a copy into a `STR`). Identity when the
 /// source is already that string. `Option<&[u8]>` is the same nullable
@@ -66556,11 +66615,14 @@ fn type_node_is_fn_ptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
         .is_some_and(|obj| obj.get("FnPtr").is_some())
 }
 
-/// FunDecl id of a function-item (`FnDef`) type, after following
+/// The `FnDef` payload of a function-item type, after following
 /// serialization indirections.  `None` for a function pointer (`FnPtr`), a
 /// closure ADT, or any other shape.  Does not peel `Ref` / `RawPtr`: a
 /// function item is passed by value.
-fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) -> Option<u64> {
+fn type_node_fn_def<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
     for _ in 0..24 {
         let obj = node.as_object()?;
         if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
@@ -66575,11 +66637,23 @@ fn type_node_fn_def_fun_id<'l>(mut node: &'l serde_json::Value, llbc: &'l Llbc) 
         }
         // The item's `FnPtr` sits under a `RegionBinder`
         // (`{"FnDef": {"regions": …, "skip_binder": {"kind": …}}}`).
-        let fn_def = obj.get("FnDef")?;
-        let fn_ptr = fn_def.get("skip_binder").unwrap_or(fn_def);
-        return fn_ptr.get("kind")?.get("Fun")?.as_u64();
+        return obj.get("FnDef");
     }
     None
+}
+
+/// FunDecl id of a function-item (`FnDef`) type, after following
+/// serialization indirections.  `None` for a function pointer (`FnPtr`), a
+/// closure ADT, or any other shape.  Does not peel `Ref` / `RawPtr`: a
+/// function item is passed by value.
+fn type_node_fn_def_fun_id<'l>(node: &'l serde_json::Value, llbc: &'l Llbc) -> Option<u64> {
+    let fn_def = type_node_fn_def(node, llbc)?;
+    fn_def
+        .get("skip_binder")
+        .unwrap_or(fn_def)
+        .get("kind")?
+        .get("Fun")?
+        .as_u64()
 }
 
 /// Direct-call `FunctionPath` segments of a `FnDef` type, or `None` when
@@ -66609,17 +66683,36 @@ fn operand_fn_item_segments(llbc: &Llbc, op: Option<&Operand>) -> Option<Vec<Str
 /// shapes [`operand_fn_item_segments`] accepts.
 fn operand_fn_item_decl<'l>(llbc: &'l Llbc, op: Option<&Operand>) -> Option<&'l FunDecl> {
     let fun_id = match op? {
-        Operand::Const(value) => llbc
-            .const_expr_kind(value)?
-            .get("FnDef")?
-            .get("kind")?
-            .get("Fun")?
-            .as_u64()?,
+        Operand::Const(value) => {
+            let kind = llbc.const_expr_kind(value)?;
+            let fn_def = kind.get("FnDef")?;
+            fn_def
+                .get("skip_binder")
+                .unwrap_or(fn_def)
+                .get("kind")?
+                .get("Fun")?
+                .as_u64()?
+        }
         Operand::Copy(p) | Operand::Move(p) => {
             type_node_fn_def_fun_id(tyref_node(&p.ty, llbc)?, llbc)?
         }
     };
     llbc.fn_by_id(fun_id)
+}
+
+/// The function item a combinator's argument names, spelled as the
+/// [`RegularCall`] a direct call to it would carry — Fun id and the
+/// instantiation `generics` on the `FnDef`.  Same operand shapes as
+/// [`operand_fn_item_decl`]: a `FnDef` constant, or a Copy/Move of a
+/// `FnDef`-typed local.  `None` when that node cannot be read as a
+/// `RegularCall`.
+fn operand_fn_item_call(llbc: &Llbc, op: Option<&Operand>) -> Option<RegularCall> {
+    match op? {
+        Operand::Const(value) => fn_def_of_const(llbc, value),
+        Operand::Copy(p) | Operand::Move(p) => {
+            regular_call_from_fn_def(type_node_fn_def(tyref_node(&p.ty, llbc)?, llbc)?)
+        }
+    }
 }
 
 /// The pointee type node of a shared reference `&T` (`{"Ref": [region, ty,
@@ -69184,6 +69277,17 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
         .and_then(serde_json::Value::as_object)
         .map(|adt| tuple_shape_suffix(adt, llbc))
         .unwrap_or_default()
+}
+
+/// Number of type arguments on a Charon `Tuple` Adt, including `()` as 0.
+/// A non-tuple is 0, matching [`tyref_tuple_element`] returning `None` at
+/// index 0.
+fn tyref_tuple_arity(ty: &TyRef, llbc: &Llbc) -> usize {
+    let mut n = 0;
+    while tyref_tuple_element(ty, n, llbc).is_some() {
+        n += 1;
+    }
+    n
 }
 
 /// Element `idx` of a tuple type `ty`, read off its `generics.types`.
@@ -92490,6 +92594,529 @@ mod tests {
         );
     }
 
+    fn std_trait_call_fixture(
+        caller_name: &str,
+        trait_path: &[&str],
+        method: &str,
+        arg_tys: &[serde_json::Value],
+        dest_ty: serde_json::Value,
+        type_decls: Vec<serde_json::Value>,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let mut locals = vec![serde_json::json!({
+            "index": 0,
+            "name": null,
+            "span": span(),
+            "ty": dest_ty.clone()
+        })];
+        for (i, ty) in arg_tys.iter().enumerate() {
+            locals.push(serde_json::json!({
+                "index": i + 1,
+                "name": format!("arg{i}"),
+                "span": span(),
+                "ty": ty
+            }));
+        }
+        let call_args: Vec<serde_json::Value> = arg_tys
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                serde_json::json!({
+                    "Copy": {"kind": {"Local": i + 1}, "ty": ty}
+                })
+            })
+            .collect();
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": arg_tys.to_vec(),
+                "output": dest_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": arg_tys.len(),
+                        "locals": locals
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Trait": [
+                                                        {
+                                                            "kind": "Unknown",
+                                                            "trait_decl_ref": {
+                                                                "skip_binder": {"id": 0}
+                                                            }
+                                                        },
+                                                        0
+                                                    ]},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": call_args,
+                                            "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let trait_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(trait_path, false),
+            "methods": []
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [trait_decl],
+                "trait_impls": [],
+                "assoc_item_names": [{
+                    "types": [],
+                    "methods": [method],
+                    "consts": []
+                }]
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("std trait fixture Llbc parses")
+    }
+
+    #[test]
+    fn trait_default_of_i64_is_zero() {
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let llbc = std_trait_call_fixture(
+            "trait_default_i64",
+            &["core", "default", "Default"],
+            "default",
+            &[],
+            i64_ty,
+            vec![],
+        );
+        let graph =
+            super::lower_function(&llbc, "trait_default_i64").expect("lower Trait Default i64");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "<i64 as Default>::default must become ConstInt(0); ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "Trait Default of i64 must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_default_of_wtf8buf_is_empty_str() {
+        let wtf8buf = serde_json::json!({"Adt": {
+            "id": 0,
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }});
+        let llbc = std_trait_call_fixture(
+            "trait_default_wtf8buf",
+            &["core", "default", "Default"],
+            "default",
+            &[],
+            wtf8buf,
+            vec![code_struct(0, &["rustpython_wtf8", "Wtf8Buf"])],
+        );
+        let graph = super::lower_function(&llbc, "trait_default_wtf8buf")
+            .expect("lower Trait Default Wtf8Buf");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["__str_const", ""]
+            )),
+            "<Wtf8Buf as Default>::default must become __str_const \"\"; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "Trait Default of Wtf8Buf must not residualize; ops={ops:?}"
+        );
+    }
+
+    fn fn_item_call_once_fixture(
+        callee_name: &[&str],
+        n_inputs: usize,
+        tuple_elem_tys: &[serde_json::Value],
+        dest_ty: serde_json::Value,
+    ) -> Llbc {
+        let empty = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        fn_item_call_once_fixture_with(
+            callee_name,
+            n_inputs,
+            tuple_elem_tys,
+            dest_ty,
+            empty,
+            None,
+            false,
+        )
+    }
+
+    fn fn_item_call_once_fixture_with(
+        callee_name: &[&str],
+        n_inputs: usize,
+        tuple_elem_tys: &[serde_json::Value],
+        dest_ty: serde_json::Value,
+        fn_def_generics: serde_json::Value,
+        decl_generics: Option<serde_json::Value>,
+        dont_look_inside: bool,
+    ) -> Llbc {
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| {
+                        if *segment == "<Impl>" {
+                            serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                        } else {
+                            serde_json::json!({"Ident": [segment, 0]})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let callee_inputs: Vec<serde_json::Value> = (0..n_inputs)
+            .map(|i| {
+                tuple_elem_tys
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| str_ty.clone())
+            })
+            .collect();
+        let tuple_ty = serde_json::json!({"Adt": {
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": tuple_elem_tys,
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let fn_ty = serde_json::json!({
+            "FnDef": {
+                "kind": {"Fun": 1},
+                "generics": fn_def_generics.clone()
+            }
+        });
+        let fn_const = serde_json::json!({"Const": [{
+            "FnDef": {
+                "kind": {"Fun": 1},
+                "generics": fn_def_generics.clone()
+            }
+        }, fn_ty]});
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "call_once_fndef"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [tuple_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                            {"index": 1, "name": "args", "span": span, "ty": tuple_ty.clone()}
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span,
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Trait": [
+                                                        {
+                                                            "kind": "Unknown",
+                                                            "trait_decl_ref": {
+                                                                "skip_binder": {"id": 0}
+                                                            }
+                                                        },
+                                                        0
+                                                    ]},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [
+                                                fn_const,
+                                                {"Copy": {"kind": {"Local": 1}, "ty": tuple_ty.clone()}}
+                                            ],
+                                            "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span, "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span, "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let mut callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(callee_name, dont_look_inside),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": callee_inputs,
+                "output": dest_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        if let Some(decl_generics) = decl_generics {
+            callee["generics"] = decl_generics;
+        }
+        let trait_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["core", "ops", "function", "FnOnce"], false),
+            "methods": []
+        });
+        let mut global_decls = Vec::new();
+        if dont_look_inside {
+            let leaf = *callee_name.last().expect("callee leaf");
+            let marker_leaf = format!("_jit_look_inside_{leaf}");
+            global_decls.push(serde_json::json!({
+                "def_id": 0,
+                "item_meta": item_meta(&["fixture", &marker_leaf], true),
+                "global_kind": "NamedConst",
+                "ty": {"Scalar": "Bool"},
+                "value": [{"Bool": false}, {"Scalar": "Bool"}]
+            }));
+        }
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": global_decls,
+                "trait_decls": [trait_decl],
+                "trait_impls": [],
+                "assoc_item_names": [{
+                    "types": [],
+                    "methods": ["call_once"],
+                    "consts": []
+                }]
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("FnDef call_once fixture Llbc parses")
+    }
+
+    #[test]
+    fn fn_item_call_once_of_str_is_empty_is_len_eq_zero() {
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let llbc = fn_item_call_once_fixture(
+            &["core", "str", "<Impl>", "is_empty"],
+            1,
+            &[str_ty],
+            bool_ty,
+        );
+        let graph = super::lower_function(&llbc, "call_once_fndef")
+            .expect("lower FnOnce::call_once of str::is_empty");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["__len"]
+            )),
+            "FnDef call_once of str::is_empty must become __len; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "FnDef call_once of str::is_empty must compare with 0; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq")),
+            "FnDef call_once of str::is_empty must become eq; ops={ops:?}"
+        );
+        let leafs = call_leafs(&ops);
+        assert!(
+            !leafs
+                .iter()
+                .any(|leaf| *leaf == "call_once" || *leaf == "is_empty"),
+            "FnDef call_once of str::is_empty must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn fn_item_call_once_arity_mismatch_stays_residual() {
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let llbc = fn_item_call_once_fixture(
+            &["core", "str", "<Impl>", "is_empty"],
+            1,
+            &[str_ty.clone(), str_ty],
+            bool_ty,
+        );
+        let graph = super::lower_function(&llbc, "call_once_fndef")
+            .expect("lower arity-mismatched FnOnce::call_once");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "call_once"),
+            "FnDef call_once whose Args arity differs from the FunDecl must decline; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["__len"]
+            )),
+            "an arity mismatch must not unpack into str::is_empty; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn fn_item_call_once_keeps_fndef_type_argument() {
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let llbc = fn_item_call_once_fixture_with(
+            &["fixture", "generic_item"],
+            1,
+            &[i64_ty.clone()],
+            i64_ty.clone(),
+            serde_json::json!({
+                "regions": [],
+                "types": [i64_ty],
+                "const_generics": [],
+                "trait_refs": []
+            }),
+            Some(serde_json::json!({
+                "regions": [],
+                "types": [{"index": 0, "name": "T"}],
+                "const_generics": [],
+                "trait_clauses": []
+            })),
+            true,
+        );
+        let graph = super::lower_function(&llbc, "call_once_fndef")
+            .expect("lower FnOnce::call_once of a generic FnDef");
+        let ops = graph_ops(&graph);
+        let leafs = call_leafs(&ops);
+        assert!(
+            leafs
+                .iter()
+                .any(|leaf| leaf.contains("__inst_") && leaf.contains("i64")),
+            "FnDef type argument must stay on the rewritten call; ops={ops:?}"
+        );
+        assert!(
+            !leafs.iter().any(|leaf| *leaf == "call_once"),
+            "a readable generic FnDef must unpack; ops={ops:?}"
+        );
+    }
+
     #[test]
     fn ptr_add_of_bytes_is_unscaled_direct_ptradd() {
         let ptr_ty = serde_json::json!({
@@ -106826,6 +107453,44 @@ mod tests {
         assert!(
             has_is,
             "Option<String> match must contain an identity null-test"
+        );
+    }
+
+    #[test]
+    fn option_of_string_family_paints_as_str() {
+        use crate::model::ValueType;
+        let llbc = llbc_with_types(
+            "fixture",
+            vec![
+                option_enum(0),
+                code_struct(1, &["rustpython_wtf8", "Wtf8"]),
+                code_struct(2, &["alloc", "string", "String"]),
+            ],
+            vec![],
+        );
+        let option_wtf8 = TyRef::Other(option_adt_node(0, adt_node(1)));
+        let option_string = TyRef::Other(option_adt_node(0, adt_node(2)));
+        let string = TyRef::Other(adt_node(2));
+        assert!(
+            matches!(
+                super::tyref_to_value_type(&option_wtf8, &llbc),
+                ValueType::Str
+            ),
+            "Option<Wtf8> is a nullable SomeString"
+        );
+        assert!(
+            matches!(
+                super::tyref_to_value_type(&option_string, &llbc),
+                ValueType::Str
+            ),
+            "Option<String> is a nullable SomeString"
+        );
+        assert!(
+            matches!(
+                super::tyref_to_value_type(&string, &llbc),
+                ValueType::Ref(_)
+            ),
+            "a rust-heap String itself stays Ref"
         );
     }
 

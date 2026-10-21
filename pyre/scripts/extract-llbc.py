@@ -97,6 +97,17 @@ CHARON_CORE_INCLUDE = [
     "core::cmp::impls::_::le",
     "--include",
     "core::cmp::impls::_::lt",
+    # Inherent-impl combinators whose bodies Charon would otherwise leave
+    # Opaque (`front` no longer desugars them). Pattern shape matches
+    # `core::num::_::saturating_add`.
+    "--include",
+    "core::option::_::unwrap_or_default",
+    "--include",
+    "core::result::_::unwrap_or_default",
+    "--include",
+    "core::option::_::is_none_or",
+    "--include",
+    "core::result::_::ok",
 ]
 CHARON_ARGS = [
     "--hide-marker-traits",
