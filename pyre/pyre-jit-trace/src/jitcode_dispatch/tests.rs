@@ -18139,7 +18139,7 @@ fn jit_merge_point_continue_puts_back_same_as_reds() {
         .expect("`jit_merge_point/cIRFIRF` must be in insns table");
     let code = [
         jmp_byte, 0x00, // c: jdindex
-        0x01, 0x00, // gi: len=1, [i0 = next_instr]
+        0x02, 0x00, 0x01, // gi: len=2, [i0 = next_instr, i1 = is_being_profiled]
         0x01, 0x00, // gr: len=1, [r0 = pycode]
         0x00, // gf: len=0
         0x00, // ri: len=0
@@ -18152,7 +18152,8 @@ fn jit_merge_point_continue_puts_back_same_as_reds() {
     let pycode = tc.const_ref(0x1_0000);
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
-    let regs_i = RegisterBank::new([next_instr]);
+    let is_being_profiled = tc.const_int(0);
+    let regs_i = RegisterBank::new([next_instr, is_being_profiled]);
     let regs_r = RegisterBank::new([pycode, red0, red1]);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
