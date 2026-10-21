@@ -20,7 +20,7 @@
 //! This file verifies that the unit tests above keep working when
 //! bundled into the same compilation unit.
 
-use majit_ir::{EffectInfo, ExtraEffect, GreenType, OopSpecIndex, OpCode, Type, Value};
+use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex, OpCode, Type, Value};
 use majit_macros::elidable_cannot_raise;
 use majit_metainterp::{BackEdgeAction, MetaInterp};
 
@@ -31,6 +31,10 @@ use majit_metainterp::{BackEdgeAction, MetaInterp};
 #[elidable_cannot_raise]
 fn elidable_canary_mul(x: i64, y: i64) -> i64 {
     x.wrapping_mul(y) ^ 0x5eed
+}
+
+fn gk(raw: i64) -> majit_ir::GreenKey {
+    majit_ir::GreenKey::new(vec![raw])
 }
 
 #[test]
@@ -62,10 +66,11 @@ fn elidable_canary_traces_to_call_pure_i_when_args_not_all_const() {
     // must seed propagate_exception_descr before the first trace start.
     meta.finish_setup_descrs_for_jitdrivers();
     let live_x: i64 = 7;
+    let key = gk(0);
     let action = meta.force_start_tracing(
-        0,
+        key.get_uhash(),
         (0, 0),
-        Some((&[0], &[GreenType::Int])),
+        Some((&key.values, &key.types)),
         None,
         &[Value::Int(live_x)],
     );
@@ -137,7 +142,14 @@ fn elidable_canary_all_const_args_fold_to_const_and_cut_call() {
 
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
-    let action = meta.force_start_tracing(0, (0, 0), Some((&[0], &[GreenType::Int])), None, &[]);
+    let key = gk(0);
+    let action = meta.force_start_tracing(
+        key.get_uhash(),
+        (0, 0),
+        Some((&key.values, &key.types)),
+        None,
+        &[],
+    );
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);

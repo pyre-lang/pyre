@@ -5859,10 +5859,9 @@ impl TraceCtx {
     /// `key_typed` is the green key `key` is the `JitCell.get_uhash` of
     /// (warmstate.py `def get_uhash(*greenargs)`). It travels with the
     /// hash because the trace-segmenting consumers of this entry
-    /// (`mark_force_finish_tracing`, `disable_noninlinable_function`) reach a
-    /// cell to write flags on, and a cell reached by hash alone is installed
-    /// without a `comparekey` — invisible to every later typed lookup, so the
-    /// header can end up owning a second cell in the same bucket.
+    /// (`mark_force_finish_tracing`, `disable_noninlinable_function`) write
+    /// flags on a cell, and the hash-form methods act on an installed cell
+    /// only (`ensure_jit_cell_at_key(greenkey)` is the `_for_key` twin).
     ///
     /// `key` and `key_typed.get_uhash()` are NOT required to be equal. `key` is
     /// a cell key, which is the bucket hash only while that hash is unclaimed;
@@ -5928,8 +5927,8 @@ impl TraceCtx {
     /// through two accessors: the callers that only move a counter
     /// (`trace_next_iteration`) need the hash, the callers that install flags
     /// on a cell (`mark_force_finish_tracing`, `disable_noninlinable_function`)
-    /// need the typed key, and reading one without the other is what puts a
-    /// comparekey-less cell in the chain.
+    /// need the typed key so the flag lands on the cell `JitCell(*greenargs)`
+    /// installed.
     pub fn current_merge_points_first_green_key_pair(
         &self,
     ) -> Option<(u64, Option<majit_ir::GreenKey>)> {

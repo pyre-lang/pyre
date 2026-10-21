@@ -3930,8 +3930,8 @@ pub(crate) fn note_root_trace_too_long(
             // the driver that owns the oversized frame (`huge_fn`'s `jd_no`).
             // Upstream's `dont_trace_here` (warmstate.py) is handed the greens
             // and reaches its cell through `ensure_jit_cell_at_key`, so take
-            // the typed door when the log carried one — the hash form files a
-            // comparekey-less cell that no later typed lookup can match.
+            // the typed door when the log carried one. The hash form acts on
+            // an installed cell only.
             match huge_key.1.as_ref() {
                 Some(key) => meta
                     .warm_state_for_driver(jd_no)

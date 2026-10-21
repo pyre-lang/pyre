@@ -9,7 +9,7 @@ use crate::state::PyreJitState;
 /// RPython green_key = pypyjit greens `[next_instr, is_being_profiled,
 /// pycode]` (interp_jit.py). The returned u64 is the full
 /// `JitCell.get_uhash` over the typed green tuple (warmstate.py),
-/// so this legacy hash flow and the typed marker-path lookup
+/// so the hash-form lookup and the typed marker-path lookup
 /// (`lookup_chain_with_key`) agree on the same cell.
 #[inline(always)]
 pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -> u64 {
@@ -21,9 +21,9 @@ pub fn make_green_key(code_ptr: *const (), pc: usize, is_being_profiled: bool) -
 ///
 /// A warmstate call that reaches a CELL needs this — `JitCell.comparekey`
 /// (warmstate.py `def comparekey(self, *greenargs2)`) is what picks one
-/// cell out of a bucket, and a cell created from the fold alone is filed
-/// without a comparekey, where no later typed lookup can find it. The u64 form
-/// stays correct for calls that only move a counter.
+/// cell out of a bucket, and every cell is `JitCell(*greenargs)`
+/// (`_ensure_jit_cell_at_key`). The u64 form stays correct for calls that
+/// only move a counter.
 pub fn make_green_key_typed(
     code_ptr: *const (),
     pc: usize,

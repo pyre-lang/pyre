@@ -2888,7 +2888,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let (driver, _) = crate::driver::driver_pair();
     let callee_key = crate::driver::make_green_key_typed(w_code, 0, is_being_profiled);
     // `get_jitcell(*greenargs)` — the token and the later loop attach share
-    // this cell. The hash alone would file a comparekey-less sibling.
+    // this cell (`ensure_jit_cell_at_key(greenkey)`).
     let greenboxes = [
         majit_ir::Value::Int(0),
         majit_ir::Value::Int(is_being_profiled as i64),
