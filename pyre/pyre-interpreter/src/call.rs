@@ -6437,31 +6437,6 @@ fn real_build_class_from(
     )
 }
 
-/// Will the class body of `__build_class__(func, name, *bases, **kwds)` bind
-/// its names in a module-strategy namespace?
-///
-/// `compiling.py build_class` runs the body in whatever `__prepare__` returned
-/// and `descr___prepare__` answers `newdict(module=True)`, so only a metaclass
-/// carrying its own `__prepare__` can land the body somewhere else.
-/// [`real_build_class`] already spells the default-metaclass winner as an
-/// absent `w_metaclass`: no `metaclass=` keyword, and every base a type whose
-/// own class is `type`.  Recognizing exactly that shape answers the question
-/// without running `_update_bases`, `_calculate_metaclass` or `__prepare__` —
-/// none of which a tracing-time question may execute.  Every other shape is
-/// left undecided and answers `false`.
-pub fn build_class_body_namespace_is_module_dict(args: &[PyObjectRef]) -> bool {
-    if args.len() < 2 {
-        return false;
-    }
-    let base_args = &args[2..];
-    let w_type_type = crate::typedef::w_type();
-    base_args.iter().all(|&base| unsafe {
-        // A non-type base reaches `__mro_entries__`, which runs Python and can
-        // replace it; the metaclass set is not knowable from here.
-        pyre_object::is_type(base) && std::ptr::eq((*base).w_class, w_type_type)
-    })
-}
-
 /// `bases` and `w_orig_bases` are borrowed, not owned: the only caller,
 /// `real_build_class`, keeps both pinned for the whole of this call.  They are
 /// nursery-allocated tuples, so the parameter copies go stale as soon as

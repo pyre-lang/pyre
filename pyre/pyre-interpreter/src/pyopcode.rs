@@ -157,41 +157,6 @@ pub fn code_is_self_recursive(code: &CodeObject) -> bool {
     false
 }
 
-/// Whether every `RETURN_VALUE` in `code` returns a constant.
-///
-/// True for a function with no `return <expr>` at all: its implicit
-/// `return None` compiles to `LOAD_COMMON_CONSTANT None; RETURN_VALUE`, and
-/// that is the only return it has.  `CACHE` and `EXTENDED_ARG` units are
-/// transparent, so a cached or extended `LOAD_CONST` still reads as the
-/// producer.
-///
-/// The caller uses this to ask whether a value built in this frame can be
-/// handed back to the frame's caller.  It answers only for the return value:
-/// a store to a global, a cell, or a container the caller reads is an escape
-/// this does not see, so a false answer means "cannot escape *by returning*",
-/// not "cannot escape".
-pub fn code_returns_only_constants(code: &CodeObject) -> bool {
-    let mut previous: Option<Instruction> = None;
-    let mut arg_state = OpArgState::default();
-    for unit in code.instructions.iter().copied() {
-        let (instruction, _) = arg_state.get(unit);
-        match instruction {
-            Instruction::ReturnValue => {
-                if !matches!(
-                    previous,
-                    Some(Instruction::LoadConst { .. } | Instruction::LoadCommonConstant { .. })
-                ) {
-                    return false;
-                }
-            }
-            Instruction::Cache | Instruction::ExtendedArg => continue,
-            _ => {}
-        }
-        previous = Some(instruction);
-    }
-    true
-}
-
 /// pypy/interpreter/pyopcode.py dispatch_bytecode parity.
 ///
 /// Returns the semantic opcode to execute for a dispatch step starting at
