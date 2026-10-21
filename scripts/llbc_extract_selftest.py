@@ -12,13 +12,18 @@ Runs on a synthetic tree in a temp dir: no cargo, no git, well under a second.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import io
 import json
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import redirect_stdout
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -353,6 +358,270 @@ def run_charon_target_dir(engine) -> int:
     return failures
 
 
+def run_llbc_store(engine) -> int:
+    """Content-addressed LLBC store: path, clone, publish, prune, disablement."""
+    failures = 0
+
+    def expect(name, condition):
+        nonlocal failures
+        if condition:
+            print(f"ok   {name}")
+        else:
+            failures += 1
+            print(f"FAIL {name}")
+
+    saved = {
+        key: os.environ.pop(key, None)
+        for key in (
+            "LLBC_STORE",
+            "CI",
+            "PYRE_SHARED_BUILD",
+            "LLBC_STORE_MAX_AGE_DAYS",
+        )
+    }
+    root = pathlib.Path(tempfile.mkdtemp()).resolve()
+    store = pathlib.Path(tempfile.mkdtemp()).resolve()
+    try:
+        fields = {key: f"{key}-v1" for key in engine.STAMP_KEYS}
+        path1 = engine.llbc_store_entry_dir(store, fields)
+        expect(
+            "entry name is source=",
+            path1.name == fields["source"],
+        )
+        expect(
+            "bucket is 32 hex chars",
+            len(path1.parent.name) == 32
+            and all(c in "0123456789abcdef" for c in path1.parent.name),
+        )
+        twin = dict(fields)
+        twin["closure"] = "closure-other"
+        twin["artefacts"] = "artefacts-other"
+        path2 = engine.llbc_store_entry_dir(store, twin)
+        expect("bucket/entry ignore closure= and artefacts=", path1 == path2)
+        moved_source = dict(fields)
+        moved_source["source"] = "source-v2"
+        path_source = engine.llbc_store_entry_dir(store, moved_source)
+        expect(
+            "source= is the entry and stays in the same bucket",
+            path_source.parent == path1.parent and path_source.name == "source-v2",
+        )
+        moved_flags = dict(fields)
+        moved_flags["flags"] = "flags-v2"
+        path_flags = engine.llbc_store_entry_dir(store, moved_flags)
+        expect("flags= moves the bucket", path_flags.parent != path1.parent)
+        expect(
+            "bucket/entry derivation is deterministic",
+            path1 == engine.llbc_store_entry_dir(store, fields),
+        )
+        payload = "\n".join(
+            f"{key}={fields[key]}" for key in engine.STORE_BUCKET_KEYS
+        )
+        expect(
+            "bucket digest matches STORE_BUCKET_KEYS join",
+            path1.parent.name
+            == hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32],
+        )
+        expect(
+            "STORE_BUCKET_KEYS omit closure and artefacts",
+            "closure" not in engine.STORE_BUCKET_KEYS
+            and "artefacts" not in engine.STORE_BUCKET_KEYS
+            and "source" not in engine.STORE_BUCKET_KEYS,
+        )
+
+        src = root / "clone-src.bin"
+        dst = root / "clone-dst.bin"
+        src.write_bytes(b"clone-payload-bytes")
+        engine.clone_file(src, dst)
+        expect("clone_file copies bytes", dst.read_bytes() == src.read_bytes())
+        expect(
+            "clone_file uses a distinct inode",
+            src.stat().st_ino != dst.stat().st_ino,
+        )
+
+        dest_dir = root / "out"
+        dest_dir.mkdir()
+        artefact = dest_dir / "probe.ullbc"
+        readfiles = dest_dir / "probe.ullbc.readfiles"
+        fingerprint = dest_dir / "probe.ullbc.fingerprint"
+        provenance = dest_dir / "probe.ullbc.provenance"
+        artefact.write_bytes(b"ULLBC-v1")
+        readfiles.write_text("src/lib.rs\n")
+        fingerprint.write_text("crate=probe\n")
+        provenance.write_text("crate=probe\n")
+        pub_fields = dict(fields)
+        pub_fields["crate"] = "probe"
+        pub_fields["source"] = "abc" * 8
+        sources = [artefact, readfiles, fingerprint, provenance]
+        entry = engine.publish_llbc_store_entry(store, pub_fields, sources)
+        expect("publish creates the entry dir", entry.is_dir())
+        expect(
+            "publish clones the artefact",
+            (entry / "probe.ullbc").read_bytes() == b"ULLBC-v1",
+        )
+        expect("publish writes last-used", (entry / "last-used").is_file())
+        leftover = list(entry.parent.glob("*.tmp-*"))
+        expect("publish leaves no tmp dir", leftover == [])
+
+        marker = entry / "last-used"
+        past = time.time() - 1000
+        os.utime(marker, (past, past))
+        artefact.write_bytes(b"ULLBC-v2-should-not-land")
+        again = engine.publish_llbc_store_entry(store, pub_fields, sources)
+        expect("second publish returns the existing entry", again == entry)
+        expect(
+            "publish does not overwrite an existing entry",
+            (entry / "probe.ullbc").read_bytes() == b"ULLBC-v1",
+        )
+        expect(
+            "existing publish only touches last-used",
+            marker.stat().st_mtime > past + 500,
+        )
+
+        now = time.time()
+        old_fields = dict(fields)
+        old_fields["crate"] = "probe"
+        old_fields["source"] = "old" * 8
+        new_fields = dict(fields)
+        new_fields["crate"] = "probe"
+        new_fields["source"] = "new" * 8
+        stale_fields = dict(fields)
+        stale_fields["platform"] = "goneplat"
+        stale_fields["crate"] = "gonecrate"
+        stale_fields["source"] = "stale" * 5
+        old_entry = engine.publish_llbc_store_entry(store, old_fields, sources)
+        new_entry = engine.publish_llbc_store_entry(store, new_fields, sources)
+        stale_entry = engine.publish_llbc_store_entry(store, stale_fields, sources)
+        os.utime(old_entry / "last-used", (now - 15 * 86400, now - 15 * 86400))
+        os.utime(new_entry / "last-used", (now - 1 * 86400, now - 1 * 86400))
+        os.utime(stale_entry / "last-used", (now - 15 * 86400, now - 15 * 86400))
+        tmp_dir = (
+            store
+            / fields["platform"]
+            / "probe"
+            / "deadbucket"
+            / "tmpentry.tmp-1-dead"
+        )
+        tmp_dir.mkdir(parents=True)
+        (tmp_dir / "junk").write_bytes(b"x" * 8)
+        os.utime(tmp_dir, (now - 2 * 86400, now - 2 * 86400))
+
+        engine.prune_llbc_store(store, max_age_days=14)
+        expect("prune removes a 15-day-old entry", not old_entry.exists())
+        expect("prune keeps a 1-day-old entry", new_entry.is_dir())
+        expect("prune removes an old .tmp- dir", not tmp_dir.exists())
+        expect(
+            "prune removes empty parents of a stale platform",
+            not (store / "goneplat").exists(),
+        )
+        expect(
+            "prune removes the empty tmp bucket",
+            not (store / fields["platform"] / "probe" / "deadbucket").exists(),
+        )
+
+        marker_prune = store / ".last-prune"
+        marker_prune.touch()
+        # Recreate a 15-day-old entry under a fresh crate so the 24 h gate
+        # has something it would delete if it ran.
+        gate_fields = dict(fields)
+        gate_fields["crate"] = "gatecrate"
+        gate_fields["source"] = "gate" * 8
+        gate_entry = engine.publish_llbc_store_entry(store, gate_fields, sources)
+        os.utime(gate_entry / "last-used", (now - 15 * 86400, now - 15 * 86400))
+        ran = engine.maybe_prune_llbc_store(store)
+        expect("fresh .last-prune skips the 24 h prune", ran is False)
+        expect("24 h gate leaves the old entry", gate_entry.is_dir())
+        os.utime(marker_prune, (now - 25 * 3600, now - 25 * 3600))
+        ran = engine.maybe_prune_llbc_store(store)
+        expect("stale .last-prune runs prune", ran is True)
+        expect("periodic prune removes the old entry", not gate_entry.exists())
+        expect(
+            "periodic prune refreshes .last-prune",
+            marker_prune.stat().st_mtime > now - 60,
+        )
+
+        os.environ["LLBC_STORE"] = "off"
+        path, msg = engine.llbc_store_dir(root)
+        expect(
+            "LLBC_STORE=off disables the store",
+            path is None and "disabled" in msg and "off" in msg,
+        )
+        os.environ["LLBC_STORE"] = "0"
+        path, msg = engine.llbc_store_dir(root)
+        expect(
+            "LLBC_STORE=0 disables the store",
+            path is None and "disabled" in msg,
+        )
+        os.environ["LLBC_STORE"] = ""
+        path, msg = engine.llbc_store_dir(root)
+        expect(
+            "empty LLBC_STORE disables the store",
+            path is None and "disabled" in msg,
+        )
+        os.environ.pop("LLBC_STORE", None)
+        os.environ["CI"] = "1"
+        path, msg = engine.llbc_store_dir(root)
+        expect(
+            "CI=1 disables the store by default",
+            path is None and "disabled" in msg and "CI" in msg,
+        )
+        os.environ["LLBC_STORE"] = str(store)
+        path, msg = engine.llbc_store_dir(root)
+        expect(
+            "explicit LLBC_STORE path wins over CI",
+            path == store and "disabled" not in msg,
+        )
+        os.environ.pop("LLBC_STORE", None)
+        os.environ.pop("CI", None)
+        path, msg = engine.llbc_store_dir(root)
+        expect(
+            "default store is <shared>/llbc-store",
+            path == engine.shared_build_dir(root) / "llbc-store",
+        )
+
+        dest = root / "probe.ullbc"
+        dest.write_bytes(b"x")
+        dest.with_suffix(dest.suffix + ".provenance").write_text(
+            "crate=probe\n"
+            "head_before=aaa\n"
+            "head_after=aaa\n"
+            "started=t0\n"
+            "dirty_status=ok\n"
+            "dirty_before=0\n"
+            "dirty_in_closure=0\n"
+            "dirty_outside=0\n"
+            "dirty_omitted=0\n"
+            "imported_from=/tmp/llbc-entry\n"
+            "imported_at=2026-01-01T00:00:00\n"
+        )
+        parsed, dirty = engine.parse_provenance(
+            dest.with_suffix(dest.suffix + ".provenance").read_text()
+        )
+        expect(
+            "parse_provenance keeps imported_from",
+            parsed.get("imported_from") == "/tmp/llbc-entry"
+            and parsed.get("imported_at") == "2026-01-01T00:00:00"
+            and dirty == [],
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            engine.report_provenance(dest)
+        rendered = buf.getvalue()
+        expect(
+            "report_provenance displays the import",
+            "imported from /tmp/llbc-entry" in rendered
+            and "2026-01-01T00:00:00" in rendered,
+        )
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(store, ignore_errors=True)
+    return failures
+
+
 def main() -> None:
     engine = load_engine()
     failures = (
@@ -362,6 +631,7 @@ def main() -> None:
         + run_stamp_skip(engine)
         + run_child_dirs_whose_rs_mention(engine)
         + run_charon_target_dir(engine)
+        + run_llbc_store(engine)
     )
     if failures:
         raise SystemExit(f"llbc_extract_selftest: {failures} failed")

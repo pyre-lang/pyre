@@ -104,6 +104,10 @@ PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepa
 - `extract-llbc.py` **skips** a crate whose source fingerprint is unchanged;
   `--force` / `LLBC_FORCE_REEXTRACT=1` overrides. `pyre-interpreter.ullbc` is
   ~300 MB and takes minutes.
+- Worktrees share a content-addressed LLBC store (`<shared>/llbc-store`, or
+  `LLBC_STORE`) and import a matching artefact via clone/reflink instead of
+  re-running Charon. `LLBC_STORE=off` disables it; `--prune-store` drops unused
+  entries.
 - **A Linux container never extracts into the host's `build/llbc`.** Mount a
   per-container directory over `/workspace/pyre/build/llbc` at `container run`
   (see `/apple-container`, step 2).

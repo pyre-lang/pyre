@@ -782,9 +782,17 @@ def readfiles_path(eng: Engine, crate: str) -> Path:
     return output.with_suffix(output.suffix + ".readfiles")
 
 
-def load_readfiles(eng: Engine, crate: str) -> set[Path] | None:
-    """Read a persisted artefact read set, or request the wide fallback."""
-    path = readfiles_path(eng, crate)
+def load_readfiles(
+    eng: Engine, crate: str, path: Path | None = None
+) -> set[Path] | None:
+    """Read a persisted artefact read set, or request the wide fallback.
+
+    `path` overrides the worktree sidecar. Store import hashes this tree
+    against another checkout's recorded read set, so the walk must not
+    silently pick up whatever `.readfiles` sits beside this worktree's
+    artefact.
+    """
+    path = readfiles_path(eng, crate) if path is None else path
     if not path.is_file():
         return None
     result: set[Path] = set()
@@ -841,7 +849,12 @@ def forget_collected_inputs() -> None:
 
 
 def _collect_inputs(
-    eng: Engine, crates: list[str], cargo_features: str, *, derived: bool = False
+    eng: Engine,
+    crates: list[str],
+    cargo_features: str,
+    *,
+    derived: bool = False,
+    readfiles_override: Path | None = None,
 ) -> tuple[list[Path], list[Path]]:
     """Split the fingerprint's inputs by which channel can carry them.
 
@@ -880,6 +893,9 @@ def _collect_inputs(
     the SPEC TABLE, which the crate names stand for: `run_cli` builds one
     Engine from a driver's specs and nothing edits them afterwards.
     `forget_collected_inputs` is how a caller that moved the tree says so.
+    The optional `readfiles_override` is part of the key so a store import
+    that hashes against another entry's read set cannot reuse a walk that
+    used this worktree's sidecar.
     """
     key = (
         str(eng.root),
@@ -890,6 +906,7 @@ def _collect_inputs(
         tuple(crates),
         cargo_features,
         derived,
+        None if readfiles_override is None else str(readfiles_override),
     )
     if key in _inputs_cache:
         return _inputs_cache[key]
@@ -908,7 +925,7 @@ def _collect_inputs(
     for crate in crates:
         spec = eng.spec(crate)
         if derived:
-            readfiles = load_readfiles(eng, crate)
+            readfiles = load_readfiles(eng, crate, path=readfiles_override)
             if readfiles is None:
                 return _collect_inputs(eng, crates, cargo_features, derived=False)
             direct_files.update(readfiles)
@@ -1051,11 +1068,25 @@ def _collect_inputs(
     return result
 
 
-def fingerprint_inputs(eng: Engine, crates: list[str], cargo_features: str) -> list[Path]:
+def fingerprint_inputs(
+    eng: Engine,
+    crates: list[str],
+    cargo_features: str,
+    *,
+    readfiles_override: Path | None = None,
+) -> list[Path]:
     """Artefact-derived repo-relative inputs hashed into `source=`."""
     combined: set[Path] = set()
     for crate in crates:
-        combined.update(_collect_inputs(eng, [crate], cargo_features, derived=True)[0])
+        combined.update(
+            _collect_inputs(
+                eng,
+                [crate],
+                cargo_features,
+                derived=True,
+                readfiles_override=readfiles_override,
+            )[0]
+        )
     return sorted(combined, key=lambda path: path.as_posix())
 
 
@@ -1400,10 +1431,21 @@ def _repo_fingerprint(
     return digest.hexdigest()
 
 
-def source_fingerprint(eng: Engine, crates: list[str], cargo_features: str) -> str:
+def source_fingerprint(
+    eng: Engine,
+    crates: list[str],
+    cargo_features: str,
+    *,
+    readfiles_override: Path | None = None,
+) -> str:
     """Hash the artefact-declared read set and mandatory generated-code inputs."""
     return _repo_fingerprint(
-        eng, crates, cargo_features, fingerprint_inputs(eng, crates, cargo_features)
+        eng,
+        crates,
+        cargo_features,
+        fingerprint_inputs(
+            eng, crates, cargo_features, readfiles_override=readfiles_override
+        ),
     )
 
 
@@ -1460,10 +1502,20 @@ def prepend_msvc_link(env: dict[str, str]) -> None:
         )
 
 
+def shared_build_dir(root: Path) -> Path:
+    """Machine-wide cache root: Charon install, its cargo target, the LLBC store.
+
+    `PYRE_SHARED_BUILD` relocates the whole tree; otherwise it sits beside the
+    checkout so sibling worktrees share one store. Callers that already
+    specialised this (an explicit `CHARON_TARGET_DIR`, an explicit
+    `LLBC_STORE`) still win over the default.
+    """
+    return Path(os.environ.get("PYRE_SHARED_BUILD", root.parent / ".pyre-build"))
+
+
 def charon_paths(charon_root: Path) -> tuple[str, Path, Path]:
     platform_key, charon_exe = platform_info()
-    repo_parent = charon_root.parent
-    shared = Path(os.environ.get("PYRE_SHARED_BUILD", repo_parent / ".pyre-build"))
+    shared = shared_build_dir(charon_root)
     pin = install_charon()
     version = os.environ.get("CHARON_VERSION", pin.CHARON_VERSION_DEFAULT)
     charon_dest = Path(
@@ -1490,8 +1542,7 @@ def charon_cargo_target_dir(root: Path) -> Path:
     """
     if value := os.environ.get("CHARON_TARGET_DIR"):
         return Path(value)
-    repo_parent = root.parent
-    shared = Path(os.environ.get("PYRE_SHARED_BUILD", repo_parent / ".pyre-build"))
+    shared = shared_build_dir(root)
     key = hashlib.sha256(os.fsencode(root.resolve())).hexdigest()[:16]
     return shared / "charon-target" / key
 
@@ -1720,6 +1771,383 @@ def stamp_skip_ok(recorded_text: str, expected: str) -> tuple[bool, bool]:
     else:
         closure_moved = recorded.get("closure") != want_closure
     return gates_match, closure_moved
+
+
+# Fields hashed into the store bucket. `source=` is the entry name, not the
+# bucket: two worktrees with the same extraction configuration but different
+# artefact-declared read sets must not collide. `closure=` and `artefacts=`
+# are omitted on purpose — the former is a residual detector, the latter
+# hashes bytes that include Charon's `dest_file` absolute path, which differs
+# per checkout even when the translated crate does not.
+STORE_BUCKET_KEYS = (
+    "crate",
+    "platform",
+    "charon",
+    "fingerprint_schema",
+    "extraction_abi",
+    "features",
+    "flags",
+    "charon_flags",
+    "layout_targets",
+    "layout_flags",
+    "layout_rustflags",
+    "external",
+)
+
+
+def llbc_store_max_age_days() -> int:
+    raw = os.environ.get("LLBC_STORE_MAX_AGE_DAYS")
+    if raw:
+        return int(raw)
+    return 14
+
+
+def llbc_store_dir(root: Path) -> tuple[Path | None, str]:
+    """`(store path or None, one-line status)`.
+
+    `LLBC_STORE` set to a path always wins, including under CI. The tokens
+    `off`, `0`, and the empty string disable it. CI disables the default
+    path so hosted runners do not share a cache they never reuse; an
+    explicit path is how a job that wants the store opts in.
+    """
+    if "LLBC_STORE" in os.environ:
+        raw = os.environ["LLBC_STORE"]
+        if raw in ("off", "0", ""):
+            reason = "LLBC_STORE empty" if raw == "" else f"LLBC_STORE={raw}"
+            return None, f"llbc store: disabled ({reason})"
+        store = Path(raw)
+        return store, f"llbc store: {store}"
+    if os.environ.get("CI"):
+        return None, "llbc store: disabled (CI)"
+    store = shared_build_dir(root) / "llbc-store"
+    return store, f"llbc store: {store}"
+
+
+def llbc_store_bucket(fields: dict[str, str]) -> str:
+    payload = "\n".join(f"{key}={fields[key]}" for key in STORE_BUCKET_KEYS)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def llbc_store_entry_dir(store: Path, fields: dict[str, str]) -> Path:
+    return (
+        store
+        / fields["platform"]
+        / fields["crate"]
+        / llbc_store_bucket(fields)
+        / fields["source"]
+    )
+
+
+def clone_file(src: Path, dst: Path) -> None:
+    """Copy `src` onto `dst`, cloning/reflinking when the filesystem allows it.
+
+    Never hardlink. Charon rewrites `--dest-file` in place on the next
+    extraction; a shared inode would corrupt the store entry the clone
+    was meant to preserve.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f".{dst.name}.clone-{os.getpid()}-{os.urandom(4).hex()}")
+    try:
+        cloned = False
+        system = platform.system()
+        try:
+            if system == "Darwin":
+                subprocess.run(
+                    ["cp", "-c", str(src), str(tmp)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                cloned = True
+            elif system == "Linux":
+                subprocess.run(
+                    ["cp", "--reflink=auto", str(src), str(tmp)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                cloned = True
+        except (OSError, subprocess.CalledProcessError):
+            cloned = False
+        if not cloned:
+            tmp.unlink(missing_ok=True)
+            shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def touch_llbc_store_entry(entry: Path) -> None:
+    marker = entry / "last-used"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
+def llbc_store_payload_files(
+    eng: Engine, spec: CrateSpec, dest_dir: Path
+) -> list[Path]:
+    dest = dest_dir / spec.output_name
+    names = [spec.output_name]
+    names += [spec.layout_sidecar_name(t) for t in crate_layout_targets(eng, spec)]
+    files = [dest_dir / name for name in names]
+    files.append(dest.with_suffix(dest.suffix + ".readfiles"))
+    files.append(dest.with_suffix(dest.suffix + ".fingerprint"))
+    files.append(dest.with_suffix(dest.suffix + ".provenance"))
+    return files
+
+
+def publish_llbc_store_entry(
+    store: Path, fields: dict[str, str], sources: list[Path]
+) -> Path:
+    """Copy `sources` into the store entry for `fields`. Returns the entry path.
+
+    Materialises under `<entry>.tmp-<pid>-<rand>` and `os.rename`s into
+    place. An existing entry is left unchanged; only `last-used` is touched.
+    """
+    entry = llbc_store_entry_dir(store, fields)
+    if entry.exists():
+        touch_llbc_store_entry(entry)
+        return entry
+    present = [Path(path) for path in sources if Path(path).is_file()]
+    if not present:
+        raise FileNotFoundError("llbc store publish: no artefact files to copy")
+    bucket = entry.parent
+    bucket.mkdir(parents=True, exist_ok=True)
+    tmp = bucket / f"{entry.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}"
+    try:
+        tmp.mkdir()
+        for src in present:
+            clone_file(src, tmp / src.name)
+        (tmp / "last-used").touch()
+        try:
+            os.rename(tmp, entry)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if entry.exists():
+                touch_llbc_store_entry(entry)
+                return entry
+            raise
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return entry
+
+
+def _llbc_store_entry_used_at(entry: Path) -> float:
+    marker = entry / "last-used"
+    try:
+        return (marker if marker.is_file() else entry).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _llbc_store_dir_size(path: Path) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def iter_llbc_store_entries(bucket: Path) -> list[Path]:
+    if not bucket.is_dir():
+        return []
+    entries = [
+        child
+        for child in bucket.iterdir()
+        if child.is_dir() and ".tmp-" not in child.name
+    ]
+    entries.sort(key=_llbc_store_entry_used_at, reverse=True)
+    return entries
+
+
+def prune_llbc_store(store: Path, *, max_age_days: int) -> None:
+    """Drop unused store entries, leftover tmp dirs, then empty parents."""
+    if not store.is_dir():
+        print("llbc store: pruned 0 entries, 0 bytes")
+        return
+    now = time.time()
+    entry_cutoff = now - max_age_days * 86400
+    tmp_cutoff = now - 86400
+    removed = 0
+    total = 0
+    for child in sorted(store.glob("*/*/*/*")):
+        if not child.is_dir():
+            continue
+        is_tmp = ".tmp-" in child.name
+        try:
+            if is_tmp:
+                used = child.stat().st_mtime
+                cutoff = tmp_cutoff
+            else:
+                used = _llbc_store_entry_used_at(child)
+                cutoff = entry_cutoff
+        except OSError:
+            continue
+        if used >= cutoff:
+            continue
+        size = _llbc_store_dir_size(child)
+        shutil.rmtree(child, ignore_errors=True)
+        removed += 1
+        total += size
+        print(f"llbc store: pruned {child.relative_to(store)} ({size} bytes)")
+    for dirpath, _, _ in os.walk(store, topdown=False):
+        path = Path(dirpath)
+        if path == store:
+            continue
+        try:
+            next(path.iterdir())
+        except StopIteration:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+        except OSError:
+            pass
+    print(f"llbc store: pruned {removed} entries, {total} bytes")
+
+
+def maybe_prune_llbc_store(store: Path) -> bool:
+    """Run a default-age prune when `.last-prune` is missing or older than 24 h.
+
+    Returns True if prune ran.
+    """
+    if not store.is_dir():
+        return False
+    marker = store / ".last-prune"
+    now = time.time()
+    try:
+        if marker.is_file() and now - marker.stat().st_mtime < 24 * 3600:
+            return False
+    except OSError:
+        pass
+    prune_llbc_store(store, max_age_days=llbc_store_max_age_days())
+    marker.touch()
+    return True
+
+
+def _llbc_store_on_skip(
+    store: Path,
+    eng: Engine,
+    spec: CrateSpec,
+    dest_dir: Path,
+    stamp_path: Path,
+) -> None:
+    recorded = parse_stamp(stamp_path.read_text(encoding="utf-8", errors="replace"))
+    entry = llbc_store_entry_dir(store, recorded)
+    if entry.exists():
+        touch_llbc_store_entry(entry)
+        return
+    publish_llbc_store_entry(
+        store, recorded, llbc_store_payload_files(eng, spec, dest_dir)
+    )
+
+
+def import_from_llbc_store(
+    eng: Engine,
+    *,
+    store: Path,
+    spec: CrateSpec,
+    crate: str,
+    dest_dir: Path,
+    dest: Path,
+    stamp: str,
+    stamp_path: Path,
+    readfiles: Path,
+    cargo_features: str,
+    platform_key: str,
+    charon_stamp: str,
+    flags: list[str],
+    charon_flags: list[str],
+    layout_flags: list[str],
+) -> bool:
+    """Clone a matching store entry into `dest_dir`. True if the crate is done."""
+    fields = parse_stamp(stamp)
+    bucket = llbc_store_entry_dir(store, fields).parent
+    layout_targets = crate_layout_targets(eng, spec)
+    names = [spec.output_name]
+    names += [spec.layout_sidecar_name(t) for t in layout_targets]
+    for entry in iter_llbc_store_entries(bucket):
+        entry_readfiles = entry / readfiles.name
+        if not entry_readfiles.is_file():
+            continue
+        digest = source_fingerprint(
+            eng, [crate], cargo_features, readfiles_override=entry_readfiles
+        )
+        if digest != entry.name:
+            continue
+        for name in names:
+            src = entry / name
+            if not src.is_file():
+                raise FileNotFoundError(f"llbc store entry missing {name}: {entry}")
+            clone_file(src, dest_dir / name)
+        clone_file(entry_readfiles, readfiles)
+        forget_collected_inputs()
+        current_stamp = stamp_for(
+            eng,
+            crate=crate,
+            platform_key=platform_key,
+            charon_stamp=charon_stamp,
+            cargo_features=cargo_features,
+            flags=flags,
+            charon_flags=charon_flags,
+            layout_targets=layout_targets,
+            layout_flags=layout_flags,
+            artefacts=artefacts_fingerprint(eng, spec, dest_dir),
+        )
+        stored_path = entry / stamp_path.name
+        stored = parse_stamp(
+            stored_path.read_text(encoding="utf-8", errors="replace")
+            if stored_path.is_file()
+            else ""
+        )
+        want = parse_stamp(current_stamp)
+        mismatched = [
+            key
+            for key in STAMP_GATE_KEYS
+            if key != "artefacts" and stored.get(key) != want.get(key)
+        ]
+        if mismatched:
+            invalidate_fingerprint(stamp_path, readfiles)
+            forget_collected_inputs()
+            details = ", ".join(
+                f"{key}: stored={stored.get(key)!r} now={want.get(key)!r}"
+                for key in mismatched
+            )
+            print(
+                f"    llbc store entry {entry} does not match this tree"
+                f" ({details}); extracting"
+            )
+            return False
+        with stamp_path.open("w", encoding="utf-8", newline="\n") as output:
+            output.write(current_stamp + "\n")
+        provenance_path = dest.with_suffix(dest.suffix + ".provenance")
+        entry_provenance = entry / provenance_path.name
+        text = ""
+        if entry_provenance.is_file():
+            text = entry_provenance.read_text(encoding="utf-8", errors="replace")
+            if text and not text.endswith("\n"):
+                text += "\n"
+        imported_at = datetime.datetime.now().isoformat(timespec="seconds")
+        text += f"imported_from={entry}\nimported_at={imported_at}\n"
+        provenance_path.write_text(text, encoding="utf-8")
+        touch_llbc_store_entry(entry)
+        print(f"=== imported {crate} from llbc store ({entry}) ===")
+        return True
+    return False
+
+
+def prune_store_cli(eng: Engine, args: argparse.Namespace) -> None:
+    store, status = llbc_store_dir(eng.root)
+    print(status)
+    if store is not None:
+        prune_llbc_store(store, max_age_days=args.store_max_age_days)
 
 
 def file_mtime(path: Path) -> str:
@@ -2022,6 +2450,11 @@ def report_provenance(dest: Path) -> None:
         # commit the tree sat on. What a straddle costs is the ability to name
         # ONE tree this artefact came from.
         print(f"    WARNING: built across a commit: {before} -> {after}")
+    if "imported_from" in fields or "imported_at" in fields:
+        print(
+            f"    imported from {fields.get('imported_from', '?')} at"
+            f" {fields.get('imported_at', '?')}"
+        )
     status = fields.get("dirty_status", "?")
     if status != "ok":
         print(f"    dirty state at build time: {status} — neither clean nor known")
@@ -2377,6 +2810,8 @@ def layout_passes_in_parallel() -> bool:
 def extract(eng: Engine, args: argparse.Namespace) -> None:
     cargo_features = eng.cargo_features
     platform_key, charon_dest, charon_bin = charon_paths(eng.charon_root)
+    store, store_status = llbc_store_dir(eng.root)
+    print(store_status)
 
     if not charon_bin.exists():
         raise SystemExit(
@@ -2530,7 +2965,41 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             # the artefact, and the artefact is the one the previous run built:
             # re-stamping it with the current HEAD would claim this checkout produced
             # bytes it did not.
+            if store is not None:
+                try:
+                    _llbc_store_on_skip(store, eng, spec, dest_dir, stamp_path)
+                except Exception as exc:
+                    print(
+                        f"warn: llbc store: skip record failed for {crate}: {exc}",
+                        file=sys.stderr,
+                    )
             continue
+
+        if store is not None and not args.force:
+            try:
+                if import_from_llbc_store(
+                    eng,
+                    store=store,
+                    spec=spec,
+                    crate=crate,
+                    dest_dir=dest_dir,
+                    dest=dest,
+                    stamp=stamp,
+                    stamp_path=stamp_path,
+                    readfiles=readfiles,
+                    cargo_features=cargo_features,
+                    platform_key=platform_key,
+                    charon_stamp=charon_stamp,
+                    flags=flags,
+                    charon_flags=charon_flags,
+                    layout_flags=layout_flags,
+                ):
+                    continue
+            except Exception as exc:
+                print(
+                    f"warn: llbc store: import failed for {crate}: {exc}",
+                    file=sys.stderr,
+                )
 
         # The stamp certifies the exact artefact bytes from the previous
         # successful extraction. This run may replace those bytes before any
@@ -2889,6 +3358,18 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             f"    wrote {dest} ({dest.stat().st_size} bytes),"
             f" stamped in {time.monotonic() - phase_started:.0f} s"
         )
+        if store is not None:
+            try:
+                publish_llbc_store_entry(
+                    store,
+                    parse_stamp(current_stamp),
+                    llbc_store_payload_files(eng, spec, dest_dir),
+                )
+            except Exception as exc:
+                print(
+                    f"warn: llbc store: publish failed for {crate}: {exc}",
+                    file=sys.stderr,
+                )
 
     print()
     if unstamped:
@@ -2898,6 +3379,11 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             + ".\n  Those artefacts are written but deliberately unstamped."
             "\n  Re-run with --force once the tree is quiet."
         )
+    if store is not None:
+        try:
+            maybe_prune_llbc_store(store)
+        except Exception as exc:
+            print(f"warn: llbc store prune failed: {exc}", file=sys.stderr)
     print(f"all extractions complete. artefacts under: {dest_dir}")
 
 
@@ -3643,6 +4129,18 @@ def run_cli(
     )
     modes.add_argument("--list-inputs", action="store_true")
     modes.add_argument(
+        "--prune-store",
+        action="store_true",
+        help="remove unused LLBC store entries; never extracts",
+    )
+    parser.add_argument(
+        "--store-max-age-days",
+        type=int,
+        default=None,
+        help="with --prune-store: drop entries unused longer than N days "
+        "(default LLBC_STORE_MAX_AGE_DAYS or 14)",
+    )
+    modes.add_argument(
         "--check",
         action="store_true",
         help="compare the existing artefacts against the tree and exit nonzero "
@@ -3764,6 +4262,11 @@ def run_cli(
         return
     if args.check:
         check(eng, args)
+        return
+    if args.prune_store:
+        if args.store_max_age_days is None:
+            args.store_max_age_days = llbc_store_max_age_days()
+        prune_store_cli(eng, args)
         return
     extract(eng, args)
 

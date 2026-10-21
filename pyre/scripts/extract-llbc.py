@@ -323,7 +323,12 @@ def main() -> None:
     # `pyre-interpreter.ullbc`.  Scan one item record at a time (the JSON is a
     # single ~GB line, so line iteration or json.load is not viable) and refuse
     # any runtime artefact that translated a native item body.
-    modes_without_an_artefact = {"--fingerprint", "--list-inputs", "--self-test"}
+    modes_without_an_artefact = {
+        "--fingerprint",
+        "--list-inputs",
+        "--self-test",
+        "--prune-store",
+    }
     if not modes_without_an_artefact.intersection(sys.argv[1:]):
         requested = [arg for arg in sys.argv[1:] if not arg.startswith("-")]
         # `crates` is the set `run_cli` was just asked to extract. Falling
