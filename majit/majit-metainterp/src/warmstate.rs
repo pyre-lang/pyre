@@ -221,9 +221,10 @@ impl BaseJitCell {
     ///     return True
     /// ```
     ///
-    /// `types` is the caller's driver spec (`jitdriver_sd._green_args_spec`),
-    /// used only to pick `equal_whatever`'s TYPE. There is no types
-    /// comparison: every caller has already checked `cell.jitdriver_sd`
+    /// `types` is the driver's `GreenSpec::TYPES` on the door path
+    /// (`jitdriver_sd._green_args_spec`), used only to pick
+    /// `equal_whatever`'s TYPE. There is no types comparison: every
+    /// caller has already checked `cell.jitdriver_sd`
     /// (`isinstance(cell, JitCell)`).
     #[inline(always)]
     pub fn comparekey(&self, greenargs: &[i64], types: &[GreenType]) -> bool {
@@ -231,18 +232,18 @@ impl BaseJitCell {
         let Some(greens) = self.greens.as_deref() else {
             return false;
         };
-        if greens.len() != greenargs.len() {
+        if greens.len() != types.len() {
             return false;
         }
         if self.retained_greens.is_empty() {
-            for i in 0..greens.len() {
+            for i in 0..types.len() {
                 if !majit_ir::equal_whatever(types[i], greens[i], greenargs[i]) {
                     return false;
                 }
             }
             return true;
         }
-        for i in 0..greens.len() {
+        for i in 0..types.len() {
             let item1 = self.retained_greens.current_value(i, greens[i]);
             if !majit_ir::equal_whatever(types[i], item1, greenargs[i]) {
                 return false;
