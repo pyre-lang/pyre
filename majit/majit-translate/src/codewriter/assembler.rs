@@ -4787,7 +4787,9 @@ fn bh_field_spec_from_parts(
         index_in_parent,
         // Built from an owner name and a field name, with no layout in reach:
         // there is nothing here to declare with, so the rebuilding side falls
-        // back to the name.
+        // back to the name. Acquire is the same: no source descr to copy a
+        // stored stamp from, and the name predicate still answers for quasi
+        // `w_globals`.
         is_class_word: None,
         load_is_acquire: false,
     }
@@ -5477,6 +5479,7 @@ fn fielddescrof(
     };
     let mut is_immutable = false;
     let mut is_quasi_immutable = false;
+    let mut load_is_acquire = false;
     // `None` until a lookup arm actually resolves a slot. The minted descr still
     // carries `0` for the unresolved case (`unwrap_or(0)` at the bottom), so the
     // emitted `BhDescr::Field` is unchanged; what the `Option` adds is that the
@@ -5536,6 +5539,7 @@ fn fielddescrof(
                 is_immutable = spec.is_immutable;
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = Some(spec.index_in_parent);
+                load_is_acquire = spec.load_is_acquire;
                 layout_resolved = true;
             }
             BhFieldLookup::Layout(layout_field) => {
@@ -5558,6 +5562,7 @@ fn fielddescrof(
                     is_immutable = spec.is_immutable;
                     is_quasi_immutable = spec.is_quasi_immutable;
                     index_in_parent = Some(spec.index_in_parent);
+                    load_is_acquire = spec.load_is_acquire;
                     found_parent_field = true;
                 } else {
                     offset = layout_field.offset;
@@ -5770,6 +5775,9 @@ fn fielddescrof(
         field_flag = flag;
         is_field_signed = false;
         field_key = format!("{field_key}{suffix}");
+        // `.buf` / `.len` / fat-pointer words are a new layout, not the
+        // parent field whose stored Acquire stamp was copied above.
+        load_is_acquire = false;
     }
     // A rustc vtable slot does not change. `descr.is_always_pure()` lets
     // the walker fold `getfield_raw_i` of `method_*` off a Const vtable
@@ -5782,6 +5790,7 @@ fn fielddescrof(
         field_type = majit_ir::value::Type::Int;
         field_flag = majit_ir::descr::ArrayFlag::Unsigned;
         is_field_signed = false;
+        load_is_acquire = false;
     }
     crate::jitcode::BhDescr::Field {
         offset,
@@ -5798,7 +5807,7 @@ fn fielddescrof(
         parent: parent.map(std::sync::Arc::new),
         name: field_key,
         owner: canonical_owner.unwrap_or_default(),
-        load_is_acquire: false,
+        load_is_acquire,
     }
 }
 
@@ -5879,6 +5888,8 @@ fn raw_carray_descrof(
         array_type_id: Some(format!("majit::raw_carray_{prefix}{}", itemsize * 8)),
         interior_fields: Vec::new(),
         is_gc_managed: false,
+        // `cpu.arraydescrof(rffi.CArray(T))` for `rewrite_op_raw_store`: a
+        // new CArray of primitives, not an Acquire Atomic* view.
         load_is_acquire: false,
     }
 }
@@ -5980,7 +5991,9 @@ fn arraydescrof(
                 .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned()),
             interior_fields: super::jitcode::bh_interior_field_specs_from_array_descr(array_descr),
             is_gc_managed: array_descr.is_gc_managed(),
-            load_is_acquire: false,
+            // `descr.py get_array_descr` returns the cached descr for the
+            // same ARRAY; carry every attribute of the source descr.
+            load_is_acquire: array_descr.load_is_acquire(),
         };
     }
 
@@ -6061,6 +6074,9 @@ fn arraydescrof(
         // Shape-only fallback is for GC arrays; the raw `pool_arrays`
         // base is minted only via `add_ptr_array_descr`.
         is_gc_managed: true,
+        // Minted from a ValueType / type string. Acquire is a producer
+        // stamp on an existing descr (`ArrayDescr::load_is_acquire`),
+        // which this path does not have.
         load_is_acquire: false,
     }
 }
@@ -6114,6 +6130,8 @@ fn vable_arraydescrof(
         // Virtualizable frame array slots are GC-managed frame fields;
         // `ArrayPtrInfo.make_guards` emits GUARD_GC_TYPE from this identity.
         is_gc_managed: true,
+        // `cpu.arraydescrof(GcArray(OBJECTPTR))` for a vable frame array,
+        // not an Acquire Atomic* view.
         load_is_acquire: false,
     }
 }
@@ -6957,6 +6975,40 @@ mod tests {
         assert_eq!(wrapped_tid, gc_type_id);
         assert_eq!(wrapped_key, type_id);
         assert_eq!(wrapped_id.as_deref(), Some(id));
+    }
+
+    /// `descr.py get_array_descr` returns the cached descr for the same
+    /// ARRAY. Rebuilding `BhDescr::Array` from that descr must keep the
+    /// Acquire stamp (`ArrayDescr::load_is_acquire`).
+    #[test]
+    fn arraydescrof_rebuild_keeps_acquire_from_source_descr() {
+        use crate::call::CallControl;
+        use majit_ir::descr::{ArrayFlag, LLType, SimpleArrayDescr, gc_cache, path_hash};
+        use majit_ir::value::Type;
+        use std::sync::Arc;
+
+        let array_type_id = "[majit_test_acquire_roundtrip::AtomicU64]";
+        let key = path_hash(array_type_id);
+        let mut ad = SimpleArrayDescr::with_flag(u32::MAX, 0, 8, 0, Type::Int, ArrayFlag::Unsigned)
+            .with_load_is_acquire(true);
+        ad.set_cache_key(key);
+        gc_cache()
+            .lock()
+            .force_register_keyed_array(LLType::Array(key), Arc::new(ad));
+
+        let cc = CallControl::new();
+        let descr = arraydescrof(
+            &crate::model::ValueType::Int,
+            &Some(array_type_id.to_string()),
+            None,
+            Some(&cc),
+        );
+        match descr {
+            crate::jitcode::BhDescr::Array {
+                load_is_acquire, ..
+            } => assert!(load_is_acquire),
+            other => panic!("arraydescrof must mint a BhDescr::Array, got {other:?}"),
+        }
     }
 
     #[test]

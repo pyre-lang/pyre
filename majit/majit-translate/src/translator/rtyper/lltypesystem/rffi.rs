@@ -20,11 +20,13 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, Array, FixedSizeArray, FuncType, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType,
-    Ptr, PtrTarget, Struct, functionptr_with_external_name, malloc,
+    Ptr, PtrTarget, Struct, functionptr_with_external_name, malloc, typeOf,
 };
-use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, struct_lltype_from_strptr};
+use crate::translator::rtyper::lltypesystem::rstr::{
+    STRPTR, chars_array_ptr_lltype_from_strptr, struct_lltype_from_strptr,
+};
 use crate::translator::rtyper::rtyper::{
-    constant_with_lltype, exception_args, helper_pygraph_from_graph, variable_with_lltype,
+    constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
 };
 
 pub use majit_jitcode::rffi::{
@@ -549,20 +551,18 @@ pub static TEST_RAW_ADDR_KEEP_ALIVE: LazyLock<Mutex<HashMap<String, LowLevelType
 /// lldata = llstr(string)
 /// data_start = (cast_ptr_to_adr(lldata) + offsetof(STR, 'chars')
 ///               + itemoffsetof(STR.chars, 0))
-/// return cast(CCHARP, data_start)
+/// data_start = cast(CCHARP, data_start)
+/// data_start[len(string)] = '\x00'
+/// return data_start
 /// ```
 ///
 /// `rgc.must_split_gc_address_space` (`SplitAddrSpaceEntry`) is a
-/// translation-time constant; pyre's MiniMark default is False, so the
-/// first buf return is folded. `_get_raw_address_buf_from_string` is
-/// not synthesised: its cache key is `objectmodel.compute_unique_id`
-/// and it calls `str2charp` plus `FinalizerQueue.register_finalizer`,
-/// which sit outside rffi/rgc helpers. The inner `if rgc.can_move`
-/// after `move_out_of_nursery` is kept as a second `gc_can_move`; its
-/// True arm (`return _get_raw_address_buf_from_string(string)`) is
-/// closed as an unreachable abort (`RaiseImplicit(AssertionError)`,
-/// the panicking-abort / `rtyper/debug.py ll_assert` shape) because
-/// that helper is not ported.
+/// translation-time constant; MiniMark is False, so the first buf
+/// return is folded. `@jit.dont_look_inside` is `_jit_look_inside_ =
+/// Some(false)`. The inner `if rgc.can_move` after
+/// `move_out_of_nursery` `direct_call`s `_get_raw_address_buf_from_string`
+/// as a graph-less residual (`functionptr_with_external_name`, the
+/// `llexternal` sibling). The NUL is `setarrayitem` on `STR.chars`.
 pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
     name: &str,
 ) -> Result<PyGraph, TyperError> {
@@ -582,6 +582,7 @@ pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
     let offsetof_chars = llmemory::offsetof(&str_struct, "chars").map_err(TyperError::message)?;
     let itemoffset_chars =
         llmemory::itemoffsetof(&chars_array_ty, 0).map_err(TyperError::message)?;
+    let chars_ptr_ty = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
 
     let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
     let push = |block: &BlockRef, op: &str, args: Vec<Hlvalue>, result: Variable| {
@@ -617,6 +618,8 @@ pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
     let moveblock = Block::shared(vec![Hlvalue::Variable(s_moved.clone())]);
     let s_imm = variable_with_lltype("s", STRPTR.clone());
     let addrblock = Block::shared(vec![Hlvalue::Variable(s_imm.clone())]);
+    let s_buf = variable_with_lltype("s", STRPTR.clone());
+    let bufblock = Block::shared(vec![Hlvalue::Variable(s_buf.clone())]);
 
     let can_move = variable_with_lltype("can_move", LowLevelType::Bool);
     push(
@@ -648,16 +651,44 @@ pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
         vec![Hlvalue::Variable(s2.clone())],
         can_move2.clone(),
     );
-    let abort_args = exception_args("AssertionError")?;
     switch_bool(
         &moveblock,
         can_move2,
-        abort_args,
-        graph.exceptblock.clone(),
+        vec![Hlvalue::Variable(s2.clone())],
+        bufblock.clone(),
         vec![Hlvalue::Variable(s2)],
         addrblock.clone(),
     );
 
+    let buf_funcptr = functionptr_with_external_name(
+        FuncType {
+            args: vec![STRPTR.clone()],
+            result: (*CCHARP).clone(),
+        },
+        "_get_raw_address_buf_from_string",
+        Some("_get_raw_address_buf_from_string".to_string()),
+    );
+    let buf_funcptr_lltype = LowLevelType::Ptr(Box::new(typeOf(&buf_funcptr)));
+    let buf_result = variable_with_lltype("result", (*CCHARP).clone());
+    push(
+        &bufblock,
+        "direct_call",
+        vec![
+            constant_with_lltype(ConstValue::LLPtr(Box::new(buf_funcptr)), buf_funcptr_lltype),
+            Hlvalue::Variable(s_buf),
+        ],
+        buf_result.clone(),
+    );
+    bufblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(buf_result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let s_imm_chars = s_imm.clone();
     let adr = variable_with_lltype("adr", LowLevelType::Address);
     push(
         &addrblock,
@@ -698,6 +729,34 @@ pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
         vec![Hlvalue::Variable(adr2)],
         data_start.clone(),
     );
+    let chars = variable_with_lltype("chars", chars_ptr_ty);
+    push(
+        &addrblock,
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(s_imm_chars),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        chars.clone(),
+    );
+    let strlen = variable_with_lltype("length", LowLevelType::Signed);
+    push(
+        &addrblock,
+        "getarraysize",
+        vec![Hlvalue::Variable(chars.clone())],
+        strlen.clone(),
+    );
+    let set_nul = variable_with_lltype("set_nul", LowLevelType::Void);
+    push(
+        &addrblock,
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(chars),
+            Hlvalue::Variable(strlen),
+            constant_with_lltype(ConstValue::ByteStr(vec![0]), LowLevelType::Char),
+        ],
+        set_nul,
+    );
     addrblock.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(data_start)],
@@ -707,10 +766,11 @@ pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    func._jit_look_inside_ = Some(false);
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -728,10 +788,6 @@ pub struct _StrFinalizerQueue {
 /// RPython `_fq_addr_from_string = _StrFinalizerQueue()` (`rffi.py`).
 pub static _fq_addr_from_string: LazyLock<Mutex<_StrFinalizerQueue>> =
     LazyLock::new(|| Mutex::new(_StrFinalizerQueue::default()));
-
-pub fn _get_raw_address_buf_from_string() -> Result<(), TyperError> {
-    Err(deferred("_get_raw_address_buf_from_string"))
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(non_snake_case)]
@@ -849,8 +905,13 @@ mod tests {
             build_ll_get_raw_address_of_string_helper_graph("ll_get_raw_address_of_string")
                 .expect("build_ll_get_raw_address_of_string_helper_graph");
         assert_eq!(helper.func.name, "ll_get_raw_address_of_string");
+        assert_eq!(helper.func._jit_look_inside_, Some(false));
         let inner = helper.graph.borrow();
         assert_eq!(inner.name, "ll_get_raw_address_of_string");
+        assert_eq!(
+            inner.func.as_ref().and_then(|f| f._jit_look_inside_),
+            Some(false)
+        );
         let startblock = inner.startblock.borrow();
         assert_eq!(startblock.inputargs.len(), 1);
         let Hlvalue::Variable(v) = &startblock.inputargs[0] else {
@@ -907,37 +968,26 @@ mod tests {
                 vec!["gc_move_out_of_nursery", "gc_can_move"],
                 "moveblock must keep the second gc_can_move: {move_ops:?}"
             );
-            let assert_err = crate::flowspace::model::HOST_ENV
-                .lookup_builtin("AssertionError")
-                .expect("HOST_ENV AssertionError");
-            let mut saw_abort = false;
+            let mut saw_buf = false;
             let mut saw_addr = false;
+            let mut saw_except = false;
             for link in &mb.exits {
                 let lb = link.borrow();
                 let target = lb.target.as_ref().expect("link.target");
+                if std::rc::Rc::ptr_eq(target, &inner.exceptblock) {
+                    saw_except = true;
+                }
                 let exitcase_is_true = matches!(
                     lb.exitcase,
                     Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
                 );
-                if std::rc::Rc::ptr_eq(target, &inner.exceptblock) {
-                    assert!(
-                        exitcase_is_true,
-                        "abort arm must be the True branch of the second gc_can_move"
-                    );
-                    assert!(
-                        matches!(
-                            lb.args.first(),
-                            Some(Some(Hlvalue::Constant(c)))
-                                if matches!(
-                                    &c.value,
-                                    ConstValue::HostObject(h) if h == &assert_err
-                                )
-                        ),
-                        "abort arm must RaiseImplicit(AssertionError): {:?}",
-                        lb.args
-                    );
-                    saw_abort = true;
-                } else if !exitcase_is_true {
+                if exitcase_is_true {
+                    saw_buf = target
+                        .borrow()
+                        .operations
+                        .iter()
+                        .any(|op| op.opname == "direct_call");
+                } else {
                     saw_addr = target
                         .borrow()
                         .operations
@@ -946,8 +996,12 @@ mod tests {
                 }
             }
             assert!(
-                saw_abort,
-                "second gc_can_move True arm must abort to exceptblock"
+                !saw_except,
+                "second gc_can_move True arm must not raise AssertionError"
+            );
+            assert!(
+                saw_buf,
+                "second gc_can_move True arm must direct_call _get_raw_address_buf_from_string"
             );
             assert!(
                 saw_addr,
@@ -969,8 +1023,69 @@ mod tests {
             "cast_adr_to_ptr missing: {opnames:?}"
         );
         assert!(
-            !opnames.iter().any(|n| n.contains("direct_call")),
-            "buf helper must not be called: {opnames:?}"
+            opnames.iter().any(|n| n == "direct_call"),
+            "buf helper direct_call missing: {opnames:?}"
+        );
+        assert!(
+            opnames.iter().any(|n| n == "setarrayitem"),
+            "NUL setarrayitem missing: {opnames:?}"
+        );
+
+        let addrblock = inner
+            .iterblocks()
+            .into_iter()
+            .find(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .any(|op| op.opname == "cast_ptr_to_adr")
+            })
+            .expect("addrblock with cast_ptr_to_adr");
+        {
+            let ab = addrblock.borrow();
+            let addr_ops: Vec<&str> = ab.operations.iter().map(|op| op.opname.as_str()).collect();
+            assert_eq!(
+                addr_ops,
+                vec![
+                    "cast_ptr_to_adr",
+                    "adr_add",
+                    "adr_add",
+                    "cast_adr_to_ptr",
+                    "getsubstruct",
+                    "getarraysize",
+                    "setarrayitem",
+                ],
+                "addrblock must write NUL via setarrayitem on STR.chars: {addr_ops:?}"
+            );
+            let set = ab
+                .operations
+                .iter()
+                .find(|op| op.opname == "setarrayitem")
+                .expect("setarrayitem");
+            assert_eq!(set.args.len(), 3);
+            match &set.args[2] {
+                Hlvalue::Constant(c) => {
+                    assert_eq!(c.value, ConstValue::ByteStr(vec![0]));
+                    assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Char));
+                }
+                other => panic!("NUL must be a Char constant, got {other:?}"),
+            }
+        }
+
+        let mut saw_except_link = false;
+        for block in inner.iterblocks() {
+            for link in &block.borrow().exits {
+                if let Some(target) = &link.borrow().target
+                    && std::rc::Rc::ptr_eq(target, &inner.exceptblock)
+                {
+                    saw_except_link = true;
+                }
+            }
+        }
+        assert!(
+            !saw_except_link,
+            "helper graph must not link to exceptblock"
         );
 
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {

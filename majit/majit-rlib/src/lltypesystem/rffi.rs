@@ -11,7 +11,13 @@
 //! `rffi.CCHARP` / `llmemory.Address`; [`super::llmemory::GCREF`] is the
 //! erased managed object.
 
+use parking_lot::Mutex;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use super::rstr::{STR_CHARS_OFFSET, StrHeader, str_as_bytes};
+use crate::rffi::str2charp;
 
 /// Alignment of every block [`raw_malloc_varsize_char`] returns, and the
 /// header word [`raw_free`] reads the size back from.
@@ -88,6 +94,71 @@ pub fn raw_write_f64(data: usize, value: f64) {
     unsafe { (data as *mut f64).write(value) }
 }
 
+/// `_StrFinalizerQueue` (`rffi.py`). `raw_copies` is the process-global
+/// `{unique_id: CCHARP}` dict. Addresses are stored as `usize` so the
+/// dict is `Send` (`CCHARP` is a raw pointer).
+#[allow(non_snake_case)]
+struct _StrFinalizerQueue {
+    raw_copies: HashMap<usize, usize>,
+}
+
+/// `_fq_addr_from_string = _StrFinalizerQueue()` (`rffi.py`).
+#[allow(non_upper_case_globals, non_snake_case)]
+static _fq_addr_from_string: LazyLock<Mutex<_StrFinalizerQueue>> = LazyLock::new(|| {
+    Mutex::new(_StrFinalizerQueue {
+        raw_copies: HashMap::new(),
+    })
+});
+
+/// `_get_raw_address_buf_from_string` (`rffi.py`). Cache key is
+/// `objectmodel.compute_unique_id` via `majit_gc::gc_id_or_identityhash`.
+/// Returns `CCHARP` (`*mut u8`).
+///
+/// `_StrFinalizerQueue.register_finalizer` is not called:
+/// `gc_register_finalizer` assigns `fq_index` sequentially from 0
+/// (`register_finalizer` asserts `fq_index <= handlers.len()`), so a raw
+/// queue cannot pick an independent index. `_StrFinalizerQueue.finalizer_trigger`
+/// is therefore not installed; `raw_copies` live until process exit.
+#[allow(non_snake_case)]
+#[majit_macros::dont_look_inside]
+pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
+    let key = majit_gc::gc_id_or_identityhash(string as usize);
+    let mut fq = _fq_addr_from_string.lock();
+    if let Some(&ptr) = fq.raw_copies.get(&key) {
+        return ptr as *mut u8;
+    }
+    let ptr = unsafe { str2charp(str_as_bytes(string as *const u8), false) };
+    fq.raw_copies.insert(key, ptr as usize);
+    ptr
+}
+
+/// `rffi.get_raw_address_of_string` (`rffi.py`), the translated branch.
+///
+/// `rgc.must_split_gc_address_space` is a translation-time constant False
+/// (MiniMark; the translator graph in `rffi.rs` already folds it).
+/// `rgc.can_move` → `majit_gc::can_move`; `rgc.move_out_of_nursery` →
+/// `majit_gc::gc_move_out_of_nursery`. A still-moving string after the
+/// nursery copy returns `_get_raw_address_buf_from_string`.
+/// Returns `CCHARP` (`*mut u8`).
+#[majit_macros::dont_look_inside]
+pub fn get_raw_address_of_string(string: *mut u8) -> *mut u8 {
+    let mut string = string;
+    let gcref = majit_ir::GcRef(string as usize);
+    if majit_gc::can_move(gcref) {
+        let moved = majit_gc::gc_move_out_of_nursery(gcref);
+        string = moved.0 as *mut u8;
+        if majit_gc::can_move(moved) {
+            return _get_raw_address_buf_from_string(string);
+        }
+    }
+    let data_start = unsafe { string.add(STR_CHARS_OFFSET) };
+    let len = unsafe { (*string.cast::<StrHeader>()).length };
+    unsafe {
+        *data_start.add(len) = 0;
+    }
+    data_start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +179,68 @@ mod tests {
         let empty = raw_malloc_varsize_char(0);
         assert_ne!(empty, 0);
         raw_free(empty);
+    }
+
+    fn alloc_fake_str(text: &[u8], extra_fill: u8) -> Vec<usize> {
+        let nbytes = STR_CHARS_OFFSET + text.len() + 1;
+        let nwords = (nbytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut words = vec![0usize; nwords];
+        let ptr = words.as_mut_ptr() as *mut u8;
+        unsafe {
+            let strp = ptr.cast::<StrHeader>();
+            (*strp).hash = 0;
+            (*strp).length = text.len();
+            std::ptr::copy_nonoverlapping(text.as_ptr(), ptr.add(STR_CHARS_OFFSET), text.len());
+            *ptr.add(STR_CHARS_OFFSET + text.len()) = extra_fill;
+        }
+        words
+    }
+
+    /// No GC backend: `can_move` is false, so the address-arithmetic path
+    /// returns the chars start and writes the extra NUL.
+    #[test]
+    fn get_raw_address_of_string_non_nursery_writes_nul() {
+        let text = b"hello";
+        let mut storage = alloc_fake_str(text, 0xFF);
+        let ptr = storage.as_mut_ptr() as *mut u8;
+        let result = get_raw_address_of_string(ptr);
+        unsafe {
+            assert_eq!(result, ptr.add(STR_CHARS_OFFSET));
+            assert_eq!(std::slice::from_raw_parts(result, text.len()), text);
+            assert_eq!(*result.add(text.len()), 0);
+        }
+    }
+
+    #[test]
+    fn get_raw_address_buf_from_string_copies_and_caches() {
+        let text = b"cache-me";
+        let mut storage = alloc_fake_str(text, 0xFF);
+        let ptr = storage.as_mut_ptr() as *mut u8;
+        let first = _get_raw_address_buf_from_string(ptr);
+        let second = _get_raw_address_buf_from_string(ptr);
+        assert_eq!(first, second);
+        unsafe {
+            assert_ne!(first, ptr.add(STR_CHARS_OFFSET));
+            assert_eq!(std::slice::from_raw_parts(first, text.len()), text);
+            assert_eq!(*first.add(text.len()), 0);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn get_raw_address_helpers_are_published() {
+        let module = module_path!().trim_end_matches("::tests");
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        for leaf in [
+            "get_raw_address_of_string",
+            "_get_raw_address_buf_from_string",
+        ] {
+            let path = format!("{module}::{leaf}");
+            assert!(
+                published.contains(&path.as_str()),
+                "{path} is not published"
+            );
+        }
     }
 }

@@ -11,8 +11,10 @@
 //!
 //! [`lower_graph`] is the convergence transducer: it consumes such a
 //! `crate::flowspace::model::FunctionGraph` and emits an equivalent
-//! `crate::model::FunctionGraph` (rich `OpKind`), which then re-enters the
-//! EXISTING flatten/regalloc/assembler tail unchanged
+//! `crate::model::FunctionGraph` (rich `OpKind`). Leftover `Call` from
+//! `direct_call` (this transducer has no CallControl) is classified by
+//! `Transformer.rewrite_op_direct_call` (`jtransform.py`) before the
+//! shared flatten/regalloc/assembler tail
 //! (`CodeWriter::finalize_rewritten_graph_to_jitcode`).  This is the port of
 //! `jtransform.py`'s `_rewrite_ops[op.opname]` dispatch
 //! (`jtransform.py`), reading each `Variable.concretetype` directly (the
@@ -216,6 +218,9 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
     if let Some(func) = &graph.func {
         if func._jit_unroll_safe_ {
             out.func.unroll_safe = true;
+        }
+        if func._elidable_function_ {
+            out.func.elidable = true;
         }
         if let Some(look) = func._jit_look_inside_ {
             out.func.jit_look_inside = Some(look);
@@ -475,6 +480,44 @@ fn transduce_op(
         // the variables live at the marker from control-flow liveness.
         "keepalive" => {
             out.push_op_var(block, OpKind::Live, false);
+        }
+        // `jtransform.py Transformer.rewrite_op_jit_record_exact_value`:
+        // int → `record_exact_value_i`, ref → `record_exact_value_r`.
+        // Void result, same `push_op_var(..., false)` shape as `keepalive`
+        // / `copystrcontent`.
+        "jit_record_exact_value" => {
+            let kind0 = hlvalue_getkind(&op.args[0]);
+            let kind1 = hlvalue_getkind(&op.args[1]);
+            let opname = if kind0 == crate::model::ConcreteType::Signed {
+                assert_eq!(
+                    kind1,
+                    crate::model::ConcreteType::Signed,
+                    "record_exact_value int pair"
+                );
+                "record_exact_value_i"
+            } else {
+                assert_eq!(
+                    kind0,
+                    crate::model::ConcreteType::GcRef,
+                    "record_exact_value ref pair"
+                );
+                assert_eq!(
+                    kind1,
+                    crate::model::ConcreteType::GcRef,
+                    "record_exact_value ref pair"
+                );
+                "record_exact_value_r"
+            };
+            let arg0 = materialize(out, block, &op.args[0]);
+            let arg1 = materialize(out, block, &op.args[1]);
+            out.push_op_var(
+                block,
+                OpKind::LoweredBlackholeOp {
+                    opname: opname.to_string(),
+                    args: vec![arg0, arg1],
+                },
+                false,
+            );
         }
         // `getfield(s, "field")` → `FieldRead`.  The field name is a Void
         // `ByteStr` constant (`void_field_const`); the owning struct identity
@@ -747,6 +790,10 @@ fn transduce_op(
             let target = crate::model::CallTarget::function_path(
                 callee.split("::").filter(|s| !s.is_empty()),
             );
+            // `ll_get_raw_address_of_string` is a FunctionPath Call. This
+            // transducer has no CallControl; `rewrite_op_direct_call`
+            // mints the `dont_look_inside` residual before `guess_call_kind`
+            // (`codewriter::get_raw_address`).
             let args: Vec<FVar> = op.args[1..]
                 .iter()
                 .map(|a| materialize(out, block, a))
@@ -890,6 +937,20 @@ fn hlvalue_as_var(hlv: &Hlvalue) -> Option<FVar> {
         Hlvalue::Variable(v) => Some(v.clone()),
         Hlvalue::Constant(_) => None,
     }
+}
+
+/// `history.py getkind` of a flowspace operand's `concretetype`.
+fn hlvalue_getkind(hlv: &Hlvalue) -> crate::model::ConcreteType {
+    let ty = match hlv {
+        Hlvalue::Variable(v) => v
+            .concretetype()
+            .expect("jit_record_exact_value operand has concretetype"),
+        Hlvalue::Constant(c) => c
+            .concretetype
+            .clone()
+            .expect("jit_record_exact_value constant operand has concretetype"),
+    };
+    crate::model::getkind(&ty)
 }
 
 /// Expect an `Hlvalue` to be a `Variable` (the position is always a Variable
@@ -1202,6 +1263,57 @@ mod tests {
         // `getarrayitem`, `setarrayitem`.
         assert_eq!(const_ints, 3);
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// `jtransform.py rewrite_op_jit_record_exact_value`:
+    /// `jit_record_exact_value(int_lt_result, Constant(True))` →
+    /// `record_exact_value_i`.
+    #[test]
+    fn lower_graph_lowers_jit_record_exact_value_int_to_record_exact_value_i() {
+        let cond = variable_with_lltype("cond", LowLevelType::Bool);
+        let start = Block::shared(vec![Hlvalue::Variable(cond.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "ll_record_exact_value_int",
+            start.clone(),
+            Hlvalue::Variable(cond.clone()),
+        );
+        let void_res = variable_with_lltype("v", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_record_exact_value",
+            vec![Hlvalue::Variable(cond.clone()), bool_const(true)],
+            Hlvalue::Variable(void_res),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(cond.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::ConstBool(true))),
+            "Constant(True) materialises as ConstBool: {ops:?}"
+        );
+        let rec = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "record_exact_value_i"
+                )
+            })
+            .unwrap_or_else(|| panic!("expected record_exact_value_i, got {ops:?}"));
+        assert!(rec.result.is_none(), "record_exact_value_i is void");
+        let OpKind::LoweredBlackholeOp { args, .. } = &rec.kind else {
+            unreachable!();
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], cond);
     }
 
     /// The integer fragment in `LLHelpers.ll_int2hex` is not the all-binary
@@ -2104,5 +2216,35 @@ mod tests {
                 "isconstant"
             ])]
         );
+    }
+
+    /// `rlib/jit.py elidable` stamps `func._elidable_function_`; Spine B
+    /// copies it onto `FuncEffects.elidable` for `call.py getcalldescr`.
+    #[test]
+    fn lower_graph_copies_elidable_function_for_ll_find_char() {
+        let value = variable_with_lltype("value", LowLevelType::Signed);
+        let startblock = Block::shared(vec![Hlvalue::Variable(value.clone())]);
+        let mut graph = FlowGraph::with_return_var(
+            "ll_find_char",
+            startblock.clone(),
+            Hlvalue::Variable(value.clone()),
+        );
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(value)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let mut func = GraphFunc::new(
+            "ll_find_char",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func._elidable_function_ = true;
+        graph.func = Some(func);
+
+        let model = lower_graph(&graph);
+        assert!(model.func.elidable);
     }
 }
