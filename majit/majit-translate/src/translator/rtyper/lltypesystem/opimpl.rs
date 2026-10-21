@@ -587,11 +587,13 @@ fn uint_const(n: u64) -> ConstValue {
 }
 
 /// `rarithmetic.is_valid_int` is range-based: it accepts `r_uint`
-/// values inside the signed machine range (`-maxint-1 <= r <= maxint`).
+/// values inside the signed machine range (`-maxint-1 <= r <= maxint`)
+/// and `bool` (as 0/1).
 fn valid_int(value: &ConstValue) -> Option<i64> {
     match value {
         ConstValue::Int(n) => Some(*n),
         ConstValue::UInt(n) if *n <= i64::MAX as u64 => Some(*n as i64),
+        ConstValue::Bool(b) => Some(i64::from(*b)),
         _ => None,
     }
 }
@@ -665,20 +667,7 @@ pub fn op_uint_xor(args: &[ConstValue]) -> Option<ConstValue> {
 /// machine range. Negative `y` raises ValueError upstream → no fold;
 /// `y >= 64` truncates to 0 in u64 space.
 pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
-    match args {
-        [ConstValue::UInt(a), b] => {
-            let b = valid_int(b)?;
-            if b < 0 {
-                return None;
-            }
-            if b >= u64::BITS as i64 {
-                Some(uint_const(0))
-            } else {
-                Some(uint_const(a.wrapping_shl(b as u32)))
-            }
-        }
-        _ => None,
-    }
+    uint_shift(args, valid_int, false)
 }
 
 /// RPython `op_uint_rshift` (`opimpl.py`) — logical right
@@ -687,19 +676,32 @@ pub fn op_uint_lshift(args: &[ConstValue]) -> Option<ConstValue> {
 /// `r_uint` counts in the signed machine range. `y >= 64`
 /// collapses to 0.
 pub fn op_uint_rshift(args: &[ConstValue]) -> Option<ConstValue> {
-    match args {
-        [ConstValue::UInt(a), b] => {
-            let b = valid_int(b)?;
-            if b < 0 {
-                return None;
-            }
-            if b >= u64::BITS as i64 {
-                Some(uint_const(0))
-            } else {
-                Some(uint_const(a >> (b as u32)))
-            }
-        }
-        _ => None,
+    uint_shift(args, valid_int, true)
+}
+
+/// Shared body of the `uint` / `ullong` shifts: `x` must be `r_uint`
+/// and `count` validates `y` (`is_valid_int` for `uint`,
+/// `isinstance(y, int)` for `ullong`). A negative count raises
+/// ValueError upstream, so it does not fold; a count of 64 or more
+/// shifts every bit out.
+fn uint_shift(
+    args: &[ConstValue],
+    count: fn(&ConstValue) -> Option<i64>,
+    right: bool,
+) -> Option<ConstValue> {
+    let [ConstValue::UInt(a), b] = args else {
+        return None;
+    };
+    let b = count(b)?;
+    if b < 0 {
+        return None;
+    }
+    if b >= u64::BITS as i64 {
+        Some(uint_const(0))
+    } else if right {
+        Some(uint_const(a >> (b as u32)))
+    } else {
+        Some(uint_const(a.wrapping_shl(b as u32)))
     }
 }
 
@@ -778,14 +780,25 @@ pub fn op_ullong_xor(args: &[ConstValue]) -> Option<ConstValue> {
     op_uint_xor(args)
 }
 
+/// Count for `op_ullong_lshift` / `op_ullong_rshift`:
+/// `isinstance(y, int)` (`opimpl.py op_ullong_lshift`). A bool
+/// passes; an `r_uint` does not.
+fn ullong_shift_count(value: &ConstValue) -> Option<i64> {
+    match value {
+        ConstValue::Int(n) => Some(*n),
+        ConstValue::Bool(b) => Some(i64::from(*b)),
+        _ => None,
+    }
+}
+
 /// RPython `op_ullong_lshift` (`opimpl.py`).
 pub fn op_ullong_lshift(args: &[ConstValue]) -> Option<ConstValue> {
-    op_uint_lshift(args)
+    uint_shift(args, ullong_shift_count, false)
 }
 
 /// RPython `op_ullong_rshift` (`opimpl.py`).
 pub fn op_ullong_rshift(args: &[ConstValue]) -> Option<ConstValue> {
-    op_uint_rshift(args)
+    uint_shift(args, ullong_shift_count, true)
 }
 
 pub fn op_ullong_lt(args: &[ConstValue]) -> Option<ConstValue> {
@@ -2064,6 +2077,9 @@ mod tests {
         // `rarithmetic.is_valid_int` accepts `r_uint` in signed range.
         assert_eq!(op_uint_lshift(&[u(1), u(1)]), Some(u(2)));
         assert_eq!(op_uint_rshift(&[u(4), u(1)]), Some(u(2)));
+        // `rarithmetic.is_valid_int` accepts bool as 0/1.
+        assert_eq!(op_uint_lshift(&[u(1), b(true)]), Some(u(2)));
+        assert_eq!(op_uint_rshift(&[u(4), b(true)]), Some(u(2)));
         assert_eq!(op_cast_int_to_uint(&[u(1)]), Some(u(1)));
         // `r_uint` above `maxint` fails `is_valid_int`.
         assert_eq!(op_uint_lshift(&[u(1), u(i64::MAX as u64 + 1)]), None);
@@ -2084,6 +2100,13 @@ mod tests {
             op_ullong_rshift(&[u(u64::MAX), i(1)]),
             Some(u(0x7FFFFFFFFFFFFFFF))
         );
+        // `op_ullong_lshift` / `op_ullong_rshift`: `isinstance(y, int)`
+        // — bool passes, `r_uint` does not.
+        assert_eq!(op_ullong_lshift(&[u(1), i(1)]), Some(u(2)));
+        assert_eq!(op_ullong_lshift(&[u(1), b(true)]), Some(u(2)));
+        assert_eq!(op_ullong_lshift(&[u(1), u(1)]), None);
+        assert_eq!(op_ullong_rshift(&[u(4), b(true)]), Some(u(2)));
+        assert_eq!(op_ullong_rshift(&[u(4), u(1)]), None);
     }
 
     #[test]
