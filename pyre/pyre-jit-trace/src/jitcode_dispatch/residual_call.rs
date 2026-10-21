@@ -10110,7 +10110,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     let (mut r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
     let descr_offset = 1 + i_width + r_width;
     let descr_index = decode_descr_index(code, op, descr_offset);
-    let mut descr = read_descr(code, op, descr_offset, ctx)?;
+    let descr = read_descr(code, op, descr_offset, ctx)?;
     let original_call_descr =
         descr
             .as_call_descr()
@@ -10154,7 +10154,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     argbox_types.extend(std::iter::repeat(Type::Int).take(i_args.len()));
     argboxes.extend_from_slice(&r_args);
     argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
-    let mut allboxes = build_allboxes(
+    let allboxes = build_allboxes(
         funcptr,
         &argboxes,
         &argbox_types,

@@ -1359,7 +1359,7 @@ fn real_main() {
     // crate's ctor.
     #[cfg(feature = "pyre-module")]
     pyre_module::register();
-    let mut fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
+    let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
     // This build script is the host, so it reads the linkme slice. The
     // wasm guest fills the same set from constructors. A missing row
     // here means the build-dep was dropped and every moved builtin

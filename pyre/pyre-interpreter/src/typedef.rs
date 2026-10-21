@@ -6653,16 +6653,6 @@ fn init_range_type(ns: PyObjectRef) {
 /// CPython 3.14's Argument Clinic signature shared by the functional iterator
 /// `tp_new` wrappers. PyPy's GatewayCache likewise attaches the generated text
 /// signature after constructing the builtin carrier.
-fn make_functional_new_descr(
-    function: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
-) -> PyObjectRef {
-    let descr = make_new_descr(function);
-    unsafe {
-        crate::function::fset_func_text_signature(descr, w_str_new("($type, *args, **kwargs)"))
-    };
-    descr
-}
-
 fn make_functional_new_descr_passthrough1(
     function: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
     func_args: crate::gateway::BuiltinCodePassThroughFn1,

@@ -7510,19 +7510,6 @@ pub fn residual_call(
     pyre_interpreter::baseobjspace::call_function(callable, args)
 }
 
-/// rlib/jit.py `set_user_param` — apply a JIT-parameter string
-/// (`"name=value,…"`, `"off"`, or `"default"`) to the warmstate. Shared by
-/// the Python-level `set_param` positional-string branch and the `PYRE_JIT`
-/// env lever (the translation-time `--jit STR` option's analog) so both
-/// parse identically. `Err(())` signals a malformed string (rlib/jit.py
-/// ValueError).
-fn apply_jit_param_string(
-    ws: &mut majit_metainterp::warmstate::WarmEnterState,
-    text: &str,
-) -> Result<(), ()> {
-    majit_metainterp::jit::set_user_param(ws, text).map_err(|_| ())
-}
-
 /// interp_jit.py:258 — `@dont_look_inside`
 ///
 /// Mark all current machine code objects as ready to release.

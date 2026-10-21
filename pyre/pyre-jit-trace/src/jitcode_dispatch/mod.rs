@@ -442,21 +442,6 @@ impl<'a> RawDescrPool<'a> {
         }
     }
 
-    /// The callee body `inline_callee_name` names: same index convention,
-    /// the `JitCode` itself.  Global slots are `ALL_JITCODES` indices;
-    /// a per-fn slot is that pool's `RuntimeBhDescr::JitCode`.
-    pub(crate) fn inline_callee_jitcode(
-        self,
-        jitcode_index: usize,
-    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
-        match self {
-            Self::Global => crate::jitcode_runtime::get_runtime_jitcode_by_index(jitcode_index),
-            Self::PerFn(descrs) => descrs
-                .get(jitcode_index)
-                .and_then(|descr| descr.as_jitcode_owned()),
-        }
-    }
-
     fn runtime_jitcode_at(
         self,
         idx: usize,
