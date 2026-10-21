@@ -1641,7 +1641,9 @@ fn eval_loop_converts_bytecode_corruption_before_raising() {
             };
             if segments.last().map(String::as_str) != Some("from")
                 || !segments.iter().any(|seg| seg == "PyError")
-                || !segments.iter().any(|seg| seg.starts_with("<Impl#"))
+                || !segments
+                    .iter()
+                    .any(|seg| seg.starts_with("<impl ") && seg.ends_with('>'))
             {
                 continue;
             }

@@ -776,7 +776,7 @@ fn lazy_graph_source(
 /// the parity guard against silent cross-crate name-tail collisions.
 /// Same-name re-registration (e.g. a function reachable through more
 /// than one well-known crate alias) is treated as idempotent.
-/// `graph` is shared, not copied, across the ~`4 + 2 * local_crate_roots`
+/// `graph` is shared, not copied, across the ~`4 + 2 * alias crate roots`
 /// spellings [`free_function_alias_paths`] produces for one funcobj —
 /// `bookkeeper.getdesc` binds every alias to the same graph object, and a
 /// per-alias deep copy of `FunctionGraph.blocks` multiplied the whole
@@ -895,6 +895,22 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
                 alias_segs.iter().copied(),
             ));
         }
+    }
+    // A harvested foreign FunDecl registers the crate-qualified spelling
+    // of that callable only (`Bookkeeper.getdesc`). Harvesting one `core`
+    // body does not prefix every free function with `core::`.
+    let harvest = if source_module.is_empty() || name_already_prefixed {
+        name.to_string()
+    } else {
+        format!("{source_module}::{name}")
+    };
+    for (crate_root, stripped) in crate::local_crates::foreign_body_callables() {
+        if stripped != harvest {
+            continue;
+        }
+        let mut alias_segs = vec![crate_root.as_str()];
+        alias_segs.extend(harvest.split("::"));
+        paths.push(crate::parse::CallPath::from_segments(alias_segs));
     }
     paths
 }
@@ -1758,12 +1774,13 @@ fn analyze_pipeline_from_module_paths(
             free_function_graphs[index] = Some(graph.clone());
             // Free function: register under every canonical alias
             // spelling computed by `free_function_alias_paths` — bare
-            // segments, `crate::` prefix, three pyre-crate prefixes,
-            // and the same set re-prefixed with `func.module_path`
-            // (the file's crate-stripped module path).  The hint
-            // registration loop below uses the same helper so call
-            // sites that hit a module-qualified spelling find both the
-            // graph and its elidable/loopinvariant/oopspec hints.
+            // segments, `crate::` prefix, local-crate prefixes,
+            // harvested foreign-body crate prefixes, and the same set
+            // re-prefixed with `func.module_path` (the file's
+            // crate-stripped module path).  The hint registration loop
+            // below uses the same helper so call sites that hit a
+            // module-qualified spelling find both the graph and its
+            // elidable/loopinvariant/oopspec hints.
             for path in free_function_alias_paths(&func.name, &func.module_path) {
                 register_function_graph_alias(
                     &mut canonical_function_graphs,
@@ -2077,14 +2094,24 @@ fn analyze_pipeline_from_module_paths(
     // function pointer, distinguishing same-named methods from distinct trait
     // impls. The string-keyed Rust registry needs that identity explicitly:
     // `impl From<bool> for Dynamic` and `impl From<FnPtr> for Dynamic` both
-    // otherwise collapse onto `[types, dynamic, Dynamic, from]`. Charon's
-    // trait-impl id is already carried on the SemanticFunction; register the
-    // exact path that `front::mir::blanket_into_devirt` emits.
+    // otherwise collapse onto `[types, dynamic, Dynamic, from]`. The impl's
+    // trait ref and Self type is already carried on the SemanticFunction;
+    // register the exact path that `front::mir::blanket_into_devirt` emits.
     for func in &program.functions {
-        let (Some(owner), Some(impl_id)) = (&func.self_ty_root, func.trait_impl_id) else {
+        let Some(identity) = func.trait_impl_identity.as_deref() else {
             continue;
         };
-        let path = crate::parse::CallPath::for_trait_impl_method(owner, impl_id, &func.name);
+        // ADT `Self` uses `self_ty_root`. Primitive `Self` (`PartialOrd`
+        // for `char` / `i64`) has no TypeDecl; `spec_segments` keys that
+        // graph on `module_path` plus this identity.
+        let owner = match &func.self_ty_root {
+            Some(owner) => owner.as_str(),
+            None if !func.module_path.is_empty() => func.module_path.as_str(),
+            None => continue,
+        };
+        let path = crate::parse::CallPath::from_segments(
+            crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),
+        );
         let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &[]);
         if func.hints.is_empty() {
             call_control.register_function_graph(path, graph);
@@ -2535,9 +2562,9 @@ fn analyze_pipeline_from_module_paths(
                 owner.as_str(),
                 func.name.as_str(),
             ])];
-            if let Some(impl_id) = func.trait_impl_id {
-                paths.push(crate::parse::CallPath::for_trait_impl_method(
-                    owner, impl_id, &func.name,
+            if let Some(identity) = func.trait_impl_identity.as_deref() {
+                paths.push(crate::parse::CallPath::from_segments(
+                    crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),
                 ));
             }
             paths
@@ -4707,6 +4734,36 @@ mod portal_driver_tests {
             )
             .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod free_function_alias_paths_tests {
+    use super::*;
+    use crate::parse::CallPath;
+
+    #[test]
+    fn free_function_alias_paths_prefixes_harvested_foreign_body_crate() {
+        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
+            let paths = free_function_alias_paths("div_ceil", "num::<Impl>");
+            let expected = CallPath::from_segments(["core", "num", "<Impl>", "div_ceil"]);
+            let stripped = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
+            assert!(
+                paths.iter().any(|p| p == &expected),
+                "callsite spelling must be a registered alias: {paths:?}"
+            );
+            assert!(
+                paths.iter().any(|p| p == &stripped),
+                "crate-stripped harvest spelling must remain: {paths:?}"
+            );
+            let opaque = free_function_alias_paths("transmute", "mem");
+            assert!(
+                !opaque
+                    .iter()
+                    .any(|p| p.segments.first().map(String::as_str) == Some("core")),
+                "an Opaque FunDecl must not gain a harvested crate prefix: {opaque:?}"
+            );
+        });
     }
 }
 

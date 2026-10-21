@@ -835,11 +835,16 @@ impl SomeStringBuilder {
     }
 
     /// `method_append(self, s_str)` (rstring.py) → `s_None`.
+    /// `AbstractStringBuilderRepr.rtype_method_append` also accepts
+    /// `SomeUnicodeCodePoint` (`ll_append_char`).
     pub fn method_append(&self, s_str: &SomeValue) -> SomeValue {
         assert!(
             matches!(
                 s_str,
-                SomeValue::None_(_) | SomeValue::String(_) | SomeValue::Char(_)
+                SomeValue::None_(_)
+                    | SomeValue::String(_)
+                    | SomeValue::Char(_)
+                    | SomeValue::UnicodeCodePoint(_)
             ),
             "StringBuilder.append expects str / char"
         );
@@ -5800,6 +5805,14 @@ mod tests {
         }
         assert!(matches!(
             b.method_append(&SomeValue::String(SomeString::new(false, false))),
+            SomeValue::None_(_)
+        ));
+        // `AbstractStringBuilderRepr.rtype_method_append` accepts
+        // `SomeUnicodeCodePoint` as the char arm (`ll_append_char`).
+        assert!(matches!(
+            b.method_append(&SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(
+                false
+            ))),
             SomeValue::None_(_)
         ));
         assert!(matches!(b.method_getlength(), SomeValue::Integer(_)));

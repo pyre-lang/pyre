@@ -353,10 +353,32 @@ pub(crate) fn semantic_function_dedup_key(f: &crate::front::semantic::SemanticFu
     } else {
         format!("{}::{}", f.module_path, f.name)
     };
-    match f.self_ty_root.as_deref() {
+    let path = match f.self_ty_root.as_deref() {
         Some(owner) => format!("{path}@{owner}"),
         None => path,
+    };
+    // `CallControl.graphs_from` / `Bookkeeper.getdesc` keys on the
+    // function object. A non-ADT `Self` (`cmp::impls::<Impl>::le` for
+    // `char` vs `i64`) shares `{module_path}::{name}`; the impl's trait
+    // ref and Self type is that identity across LLBC artifacts.
+    match f.trait_impl_identity.as_deref() {
+        Some(identity) => format!("{path}::<impl {identity}>"),
+        None => path,
     }
+}
+
+/// Call-path segments for one concrete trait-impl method, keyed by the
+/// impl's trait-ref + Self identity rather than the extraction-local
+/// impl index (`Bookkeeper.getdesc`).
+pub(crate) fn trait_impl_identity_path(module: &str, identity: &str, leaf: &str) -> Vec<String> {
+    let mut segments: Vec<String> = if module.is_empty() {
+        Vec::new()
+    } else {
+        module.split("::").map(str::to_string).collect()
+    };
+    segments.push(format!("<impl {identity}>"));
+    segments.push(leaf.to_string());
+    segments
 }
 
 pub(crate) fn absorb_semantic_program(
@@ -509,14 +531,17 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
     }
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
-    // `module_path`, and `name`.  Without `self_ty_root`, two distinct
-    // impl methods would collide on a shared `{module_path}::{name}`:
-    // both `impl FrameDebugData { fn new(...) }` and `impl PyFrame {
-    // fn new(...) }` land under `module_path = "pyframe::<Impl>"`
-    // (the Impl NameSeg renders as `<Impl>`), so without the owner in
-    // the key the second would be silently dropped.  Falls back to the
-    // bare `{module_path}::{name}` shape (or just `name`) for entries
-    // that have no `self_ty_root`.
+    // `trait_impl_id` (Charon's function-object identity for a trait
+    // impl), `module_path`, and `name`.  Without `self_ty_root`, two
+    // distinct impl methods would collide on a shared
+    // `{module_path}::{name}`: both `impl FrameDebugData { fn new(...) }`
+    // and `impl PyFrame { fn new(...) }` land under
+    // `module_path = "pyframe::<Impl>"` (the Impl NameSeg renders as
+    // `<Impl>`), so without the owner in the key the second would be
+    // silently dropped.  Without `trait_impl_id`, every
+    // `cmp::impls::<Impl>::le` width collapses the same way.  Falls
+    // back to the bare `{module_path}::{name}` shape (or just `name`)
+    // for entries that have neither.
     let mut seen_function_keys = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
@@ -1786,6 +1811,7 @@ impl<'l> CrateLowering<'l> {
         if !self.admit_decl(fd, module_filter, function_filter) {
             return None;
         }
+        note_body_crate_root(fd);
         if self.declare_llexternal(fd) {
             return None;
         }
@@ -1825,6 +1851,16 @@ impl<'l> CrateLowering<'l> {
             return false;
         }
         if !should_lower_function(function_filter, &name) {
+            return false;
+        }
+        // `rlib/jit.py` `ConditionalCallEntry` is an ExtRegistry object, not
+        // a graph (`HOST_ENV` `jit_conditional_call`). Harvesting the
+        // residual `conditional_call*` FunDecl makes every instantiation
+        // share one `FunctionGraph` whose `mergeinputargs` slot=1 unions
+        // distinct fn-ptr `Ptr` TOs. `isconstant` is also HOST_ENV and
+        // stays admitted. Recognition is the callable's real path
+        // (`majit_rlib::jit::<leaf>` / local-crate-stripped `jit::<leaf>`).
+        if fun_decl_is_jit_conditional_call(fd) {
             return false;
         }
         let fn_path = decl_fn_path(&module_path, &name);
@@ -2441,12 +2477,67 @@ pub(crate) enum DeclBuildError {
 /// `lib.rs`'s `register_function_graph_alias` walks
 /// `{bare, crate::*, pyre_*::*}` correctly and the portal lookup in
 /// `register_configured_jitdrivers` (`["eval_loop_jit"]`) resolves.
+fn fun_decl_name_path_is_host_env(fd: &FunDecl) -> bool {
+    let path = fd.item_meta.name_path();
+    let segments: Vec<String> = path
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    if crate::flowspace::model::host_env_callable(&segments).is_some() {
+        return true;
+    }
+    let dotted: Vec<String> = path
+        .replace("::", ".")
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    crate::flowspace::model::host_env_callable(&dotted).is_some()
+}
+
 fn decl_module_path_and_name(fd: &FunDecl) -> (String, String) {
     let stripped = strip_crate_prefix(&fd.item_meta.name_path());
     match stripped.rsplit_once("::") {
         Some((module, leaf)) => (module.to_string(), leaf.to_string()),
         None => (String::new(), stripped),
     }
+}
+
+/// `rlib/jit.py` `ConditionalCallEntry` named by the FunDecl's real
+/// path (`majit_rlib::jit::<leaf>`), or the local-crate-stripped
+/// `jit::<leaf>` when `majit_rlib` is a seeded local crate.
+fn fun_decl_is_jit_conditional_call(fd: &FunDecl) -> bool {
+    let segs: Vec<String> = fd
+        .item_meta
+        .name_path()
+        .split("::")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    crate::flowspace::model::is_jit_conditional_call_path(&segs)
+        || crate::local_crates::strip_alias_crate_prefix(&segs)
+            .as_deref()
+            .is_some_and(crate::flowspace::model::is_jit_conditional_call_path)
+}
+
+/// Harvest the crate root of a FunDecl whose body is present so
+/// `free_function_alias_paths` / `canonical_dedup_key` treat a foreign
+/// Transparent FunDecl the same way they treat a local one
+/// (`bookkeeper.py` `Bookkeeper.getdesc` → `description.py`
+/// `FunctionDesc.getuniquegraph` / `cachedgraph` → `translator.py`
+/// `TranslationContext.buildflowgraph`). An Opaque FunDecl is
+/// `extfunc.py` / `lloperation.py` and stays residual.
+pub(crate) fn note_body_crate_root(fd: &FunDecl) {
+    if !fd.has_unstructured_body() {
+        return;
+    }
+    let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
+        return;
+    };
+    crate::local_crates::note_foreign_body_crate_root(root);
+    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    crate::local_crates::note_foreign_body_callable(root, &stripped);
 }
 
 fn decl_fn_path(module_path: &str, name: &str) -> String {
@@ -2466,6 +2557,7 @@ pub(crate) struct SemanticFunctionHeader {
     return_type: Option<String>,
     self_ty_root: Option<String>,
     trait_impl_id: Option<u64>,
+    trait_impl_identity: Option<String>,
     fun_decl_id: u64,
     module_path: String,
     hints: Vec<String>,
@@ -2497,17 +2589,25 @@ impl SemanticFunctionHeader {
     ) -> Self {
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
         let trait_impl_id = trait_impl_id_for_fundecl(fd);
+        let trait_impl_identity =
+            trait_impl_id.and_then(|id| crate::front::clause_spec::render_trait_impl(llbc, id));
         let fn_path = if module_path.is_empty() {
             name.clone()
         } else {
             format!("{module_path}::{name}")
         };
-        let source_identity = match (&self_ty_root, trait_impl_id) {
-            (Some(owner), Some(impl_id)) => {
-                format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}")
+        let source_identity = match (&self_ty_root, &trait_impl_identity) {
+            (Some(owner), Some(identity)) => {
+                format!("{module_path}::{owner}::<impl {identity}>::{name}")
             }
             (Some(owner), None) => format!("{module_path}::{owner}::{name}"),
-            _ => fn_path.clone(),
+            // `CallControl.graphs_from` / `Bookkeeper.getdesc` keys on the
+            // function object. A non-ADT `Self` still has a trait-impl
+            // identity (trait ref + Self type); keep it in the graph key
+            // so two `cmp::impls::<Impl>::le` bodies do not share one
+            // `FunctionDesc`.
+            (None, Some(identity)) => format!("{fn_path}::<impl {identity}>"),
+            (None, None) => fn_path.clone(),
         };
         // Trait-impl methods carry the trait leaf so registration calls
         // `register_trait_method`. Inherent impls leave `trait_root` empty.
@@ -2607,6 +2707,7 @@ impl SemanticFunctionHeader {
             return_type,
             self_ty_root,
             trait_impl_id,
+            trait_impl_identity,
             fun_decl_id: fd.def_id,
             module_path,
             hints,
@@ -2672,6 +2773,7 @@ impl SemanticFunctionHeader {
             return_type: self.return_type,
             self_ty_root: self.self_ty_root,
             trait_impl_id: self.trait_impl_id,
+            trait_impl_identity: self.trait_impl_identity,
             fun_decl_id: Some(self.fun_decl_id),
             module_path: self.module_path,
             hints: self.hints,
@@ -5230,6 +5332,13 @@ pub(crate) fn graph_name_of(llbc: &Llbc, fd: &FunDecl) -> String {
 /// copy.
 fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
     let args = fd.item_meta.instantiation()?;
+    // A HOST_ENV residual (`rlib/jit.py ConditionalCallEntry`) is one
+    // ExtRegistry object. Spec-suffixing a Charon instance makes
+    // Layer-1 miss the declined template and Layer-3b miss the builtin
+    // leaf, so `FunctionDesc.pycall` walks the unique template graph.
+    if fun_decl_name_path_is_host_env(fd) {
+        return None;
+    }
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
         let sibling = fd.item_meta.name.first().is_some_and(|seg| {
             matches!(seg, NameSeg::Ident { ident: (root, _) }
@@ -5781,20 +5890,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // header.  In-place `same_as`; no new blocks.
         let _from_raw_parts_rewritten =
             crate::front::from_raw_parts::rewire_from_raw_parts_sites(&mut lo.graph);
-        // Word-sized `saturating_add` clamp (`front::saturating_add`) splits
-        // the residual call into `sum = a + b; if uint_lt(sum, a) { Unsigned
-        // max } else { sum }`.  `int_add` is its own op, so the sites live on
-        // `saturating_add_sites`, not `saturating_sub_sites`.  No new
-        // unreachable blocks (both arms forward to the original
-        // continuation), so the sweep gate below does not need the count.
-        let _saturating_add_rewritten = if lo.saturating_add_sites.is_empty() {
-            0
-        } else {
-            crate::front::saturating_add::rewire_saturating_add_call_sites(
-                &mut lo.graph,
-                &lo.saturating_add_sites,
-            )
-        };
         // Word-sized `saturating_mul` clamp (`front::saturating_mul`) splits
         // the residual call into `lo = a * b; hi = uint_mul_high(a, b); if
         // ne(hi, 0) { MAX } else { lo }`.  Same fail-safe as add.
@@ -5806,14 +5901,26 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.saturating_mul_sites,
             )
         };
-        // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
-        // the residual `saturating_sub` call block into an `if a < b { 0 } else
-        // { a - b }` diamond, same post-lowering shape and fail-safe contract as
-        // `slice_first`; gate the reachability sweep on an actual rewrite.
+        // `core::intrinsics::saturating_{add,sub}` clamp
+        // (`front::saturating_intrinsic`) splits the residual Call into
+        // the unsigned floor / signed `*_ovf` diamond. Same post-lowering
+        // contract as `saturating_mul` / `bool::then`: an in-lowering
+        // split would replace the Call's goto to the MIR `target` with
+        // edges to fresh non-MIR arms, so `lower_framestate` would
+        // `stub_dead_block` the continuation (`flowcontext.py`
+        // `make_next_block` unions only the just-closed exits).
+        let saturating_add_rewritten = if lo.saturating_add_sites.is_empty() {
+            0
+        } else {
+            crate::front::saturating_intrinsic::rewire_saturating_add_call_sites(
+                &mut lo.graph,
+                &lo.saturating_add_sites,
+            )
+        };
         let saturating_sub_rewritten = if lo.saturating_sub_sites.is_empty() {
             0
         } else {
-            crate::front::saturating_sub::rewire_saturating_sub_call_sites(
+            crate::front::saturating_intrinsic::rewire_saturating_sub_call_sites(
                 &mut lo.graph,
                 &lo.saturating_sub_sites,
             )
@@ -5935,35 +6042,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
             crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
         }
-        // The `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold
-        // (`front::range_contains`) splices the residual `contains` call
-        // in place with `int_between` (two comparisons when the
-        // `int_between` contract cannot be proved) and removes the paired
-        // construction — residual `RangeInclusive::new`, or the exclusive
-        // `Range { start, end }` ctor + FieldWrites — in its predecessor
-        // block.  It threads the construction bounds into the `contains`
-        // block via `ensure_variable_at_block` (touching predecessor link
-        // args / inputargs only — no fresh blocks, no detached edges).
-        // Removing the cross-block producer leaves its threaded range
-        // value dangling on the predecessor link arg, so a rewrite MUST
-        // be followed by `prune_dead_phis` to reclaim the dead threaded
-        // range inputarg / link args (the folded predicate never reads
-        // them) — run it unconditionally on any rewrite rather than
-        // relying on the gated sweep in `simplify_lowered_graph`.
-        // Fail-safe: a structural mismatch leaves BOTH residual calls
-        // (rtyper Skip) and touches nothing.
-        let range_contains_rewritten = if lo.range_contains_sites.is_empty() {
-            0
-        } else {
-            crate::front::range_contains::rewire_range_contains_call_sites(
-                &mut lo.graph,
-                &lo.range_inclusive_new_sites,
-                &lo.range_contains_sites,
-            )
-        };
-        if range_contains_rewritten > 0 {
-            crate::model::prune_dead_phis(&mut lo.graph);
-        }
         // A scoped scalar callee can `return` an `Option<Result<T, PyError>>::Some`
         // payload it did not build. [`lower_result_exc_returns`] rewrites `Ok`/`Err`
         // ctors and tail-forwarded calls, so that aggregate stays `Ref` and
@@ -6005,6 +6083,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
             || slice_is_ascii_rewritten > 0
+            || saturating_add_rewritten > 0
             || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
@@ -9084,25 +9163,18 @@ struct Lowering<'a> {
     /// `front::slice_ascii` post-pass applies after body lowering (see
     /// [`crate::front::slice_ascii::SliceIsAsciiSite`]).
     slice_is_ascii_sites: Vec<crate::front::slice_ascii::SliceIsAsciiSite>,
-    /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
-    /// diamond (`if a < b { 0 } else { a - b }`) the
-    /// `front::saturating_sub` post-pass synthesizes after body lowering (see
-    /// [`crate::front::saturating_sub::SaturatingSubSite`]).
-    saturating_sub_sites: Vec<crate::front::saturating_sub::SaturatingSubSite>,
-    /// Word-sized `{usize,u64}::saturating_add(a, b)` call sites. `int_add`
-    /// is a separate op from `int_sub`, so these are not stored on
-    /// `saturating_sub_sites`.
-    saturating_add_sites: Vec<crate::front::saturating_add::SaturatingAddSite>,
     /// Word-sized `{u64,usize}::saturating_mul(a, b)` call results recorded
     /// for the unsigned high-word clamp diamond `front::saturating_mul`
     /// synthesizes after body lowering.
     saturating_mul_sites: Vec<Variable>,
-    /// `RangeInclusive::new(lo, hi)` and exclusive int-`Range { start, end }`
-    /// construction sites recorded for the
-    /// `(a..=b).contains(&x)` / `(a..b).contains(&x)` fold the
-    /// `front::range_contains` post-pass synthesizes (see
-    /// [`crate::front::range_contains::RangeInclusiveNewSite`]).
-    range_inclusive_new_sites: Vec<crate::front::range_contains::RangeInclusiveNewSite>,
+    /// `core::intrinsics::saturating_add` sites recorded for the clamp
+    /// diamond `front::saturating_intrinsic` synthesizes after body
+    /// lowering (same post-pass as `saturating_mul`).
+    saturating_add_sites: Vec<crate::front::saturating_intrinsic::SaturatingAddSite>,
+    /// `core::intrinsics::saturating_sub` sites recorded for the clamp
+    /// diamond `front::saturating_intrinsic` synthesizes after body
+    /// lowering (same post-pass as `saturating_mul`).
+    saturating_sub_sites: Vec<crate::front::saturating_intrinsic::SaturatingSubSite>,
     /// Exclusive int-`Range { start, end }` aggregates (`for _ in a..b`)
     /// recorded for the `range()` + list-iter divert the
     /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
@@ -9121,10 +9193,6 @@ struct Lowering<'a> {
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
     slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `RangeInclusive::contains` / `Range::contains` call sites paired
-    /// with the construction sites above by the `front::range_contains`
-    /// post-pass (see [`crate::front::range_contains::RangeContainsSite`]).
-    range_contains_sites: Vec<crate::front::range_contains::RangeContainsSite>,
     /// `Option::unwrap_or(opt, default)` call sites recorded for the
     /// discriminant value-select the `front::option_unwrap_or` post-pass
     /// synthesizes after the body lowering completes.  Each carries the
@@ -9288,7 +9356,10 @@ fn pygraph_initial_block(
         // `Ref(None)` makes `FUNC.ARGS` disagree with that caller.
         // A raw pointer to a wider scalar is `int` (`getkind` of a raw
         // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
-        // reference to `*mut u8`. See [`tyref_scalar_pointee_value_type`].
+        // reference to `*mut u8`. A nested `Ref` of a primitive (`&&i64`,
+        // `PartialOrd<&B> for &A`) is the same scalar. See
+        // [`tyref_scalar_pointee_value_type`] /
+        // [`tyref_nested_ref_to_scalar_value_type`].
         //
         // An `indirectcalltarget` trait impl keeps ZST `&self` as Ref
         // (RPython `DictStrategy` instance / `history.getkind` of a Gc
@@ -9361,7 +9432,10 @@ fn pygraph_initial_block(
                 // A `Vec` of one-word items is `Int`-colored (its header
                 // address); carry its spelling so
                 // `derive_subject_inputcells` seeds the `SomeRustVec`.
-                _ => tyref_fn_ptr_input_class_root(&local.ty, llbc)
+                // `char` is the same Int bank (`getkind` of UniChar);
+                // carry `"char"` so the adapter seeds `SomeUnicodeCodePoint`.
+                _ => tyref_char_class_root(&local.ty, llbc)
+                    .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
                     .or_else(|| {
                         tyref_rust_vec_item_kind(&local.ty, llbc)
                             .map(|_| tyref_to_ast_string(&local.ty, llbc))
@@ -9614,7 +9688,10 @@ impl<'a> Lowering<'a> {
                     // A `Vec` of one-word items is `Int`-colored (its header
                     // address); carry its spelling so
                     // `derive_subject_inputcells` seeds the `SomeRustVec`.
-                    _ => tyref_fn_ptr_input_class_root(&local.ty, llbc)
+                    // `char` is the same Int bank (`getkind` of UniChar);
+                    // carry `"char"` so the adapter seeds `SomeUnicodeCodePoint`.
+                    _ => tyref_char_class_root(&local.ty, llbc)
+                        .or_else(|| tyref_fn_ptr_input_class_root(&local.ty, llbc))
                         .or_else(|| {
                             tyref_rust_vec_item_kind(&local.ty, llbc)
                                 .map(|_| tyref_to_ast_string(&local.ty, llbc))
@@ -9948,15 +10025,13 @@ impl<'a> Lowering<'a> {
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
             slice_is_ascii_sites: Vec::new(),
-            saturating_sub_sites: Vec::new(),
-            saturating_add_sites: Vec::new(),
             saturating_mul_sites: Vec::new(),
-            range_inclusive_new_sites: Vec::new(),
+            saturating_add_sites: Vec::new(),
+            saturating_sub_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
             slice_index_rangefrom_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
-            range_contains_sites: Vec::new(),
             unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             expect_sites: Vec::new(),
@@ -14598,9 +14673,13 @@ impl<'a> Lowering<'a> {
                     // this re-type): `rtype_intmask` coerces to `lltype.Signed`
                     // — identity on the i64 carrier — so the value is unchanged
                     // and the result re-types Signed.  Resolves via the Layer-3
-                    // `as char` is `chr`: a character, not the signed word
-                    // `intmask` would leave. StringBuilder.append accepts
-                    // that character and rejects the integer.
+                    // `HOST_ENV.import_module(rpython.rlib.rarithmetic)
+                    // .module_get(intmask)` path (`flowspace_adapter.rs`).
+                    // Rust `as char` is `builtin_unichr` → `SomeUnicodeCodePoint`
+                    // (`IntegerRepr.rtype_unichr`); `builtin_chr` is the
+                    // byte-char (`SomeChar`) path.  Reserved `__majit_unichr`
+                    // like `__majit_range`: a bare `["unichr"]` binds the
+                    // leaf-keyed `ctypeprim::unichr` host.
                     if tyref_is_char(dest_ty, self.llbc) {
                         let res = self
                             .graph
@@ -14608,7 +14687,7 @@ impl<'a> Lowering<'a> {
                         return Ok((
                             Some(OpKind::Call {
                                 target: CallTarget::FunctionPath {
-                                    segments: vec!["chr".to_string()],
+                                    segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
                                     fun_decl_id: None,
                                 },
                                 args: crate::model::call_args(vec![arg]),
@@ -14617,8 +14696,6 @@ impl<'a> Lowering<'a> {
                             res,
                         ));
                     }
-                    // `HOST_ENV.import_module(rpython.rlib.rarithmetic)
-                    // .module_get(intmask)` path (`flowspace_adapter.rs`).
                     if matches!(src_attr, Some(ValueType::Unsigned))
                         && matches!(
                             tyref_to_attr_value_type_with(
@@ -15379,9 +15456,10 @@ impl<'a> Lowering<'a> {
                             &arg_vars,
                             &pair_lens,
                         );
-                        // Capture an exclusive int-`Range { start, end }` aggregate
-                        // (`for _ in a..b`) so `front::range_iter` can divert it to
-                        // the orthodox `range()` builtin + list-iter — the
+                        // Capture an exclusive int `Range` aggregate
+                        // (`for _ in a..b`) so `front::range_iter`
+                        // can divert it to the orthodox `range()` builtin +
+                        // list-iter (`builtin.builtin_range`) — the
                         // `next`-diamond then folds the loop, instead of the
                         // union-failing shared `core.ops.range.Range` classdef.  Only
                         // int/uint element ranges are recorded; the divert itself is
@@ -15413,24 +15491,6 @@ impl<'a> Lowering<'a> {
                                     end: arg_vars[1].clone(),
                                 },
                             );
-                            // Word-sized signed exclusive `(a..b).contains(&x)`
-                            // — the same I64/Isize gate as RangeInclusive.
-                            // Captured here because exclusive Range is a
-                            // struct aggregate, not a `new` call.  The
-                            // contains post-pass pairs this with
-                            // `Range::contains` and is consumer-gated, so
-                            // a for-loop / slice-index range stays the
-                            // ordinary ctor + FieldWrite path.
-                            if tyref_is_int_range(dest_ty, self.llbc) {
-                                self.range_inclusive_new_sites.push(
-                                    crate::front::range_contains::RangeInclusiveNewSite {
-                                        result_var: res.clone(),
-                                        lo: arg_vars[0].clone(),
-                                        hi: arg_vars[1].clone(),
-                                        exclusive: true,
-                                    },
-                                );
-                            }
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
                             && ctor
@@ -18467,7 +18527,7 @@ impl<'a> Lowering<'a> {
         reg: &RegularCall,
         args: &[Variable],
     ) -> Result<CallTarget, LowerError> {
-        let (segments, method_hint) = self.call_target_segments(mir_bb, reg)?;
+        let (segments, method_hint) = self.call_target_segments(mir_bb, reg, None)?;
         let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
         let receiver_is_pair = fun_decl_id
             .and_then(|id| self.llbc.fn_by_id(id))
@@ -21311,10 +21371,9 @@ impl<'a> Lowering<'a> {
                 //
                 // RPython constants are live host values at translation
                 // time (`const_eval_init_body`); un-promote the range back
-                // into the caller as the inline `new(lo, hi)` the
-                // `(a..=b).contains(&x)` fold (`front::range_contains`)
-                // already consumes. PyPy's `isinstance(ct, W_CTypePrimitive)`
-                // on a promoted ctype is a constant-folded class check
+                // into the caller as the inline `new(lo, hi)`. PyPy's
+                // `isinstance(ct, W_CTypePrimitive)` on a promoted ctype
+                // is a constant-folded class check
                 // (`ctypeprim.W_CTypePrimitive`); a helper with a graph is
                 // `guess_call_kind` → `'regular'` (`call.py`) → `inline_call`.
                 if let Some((lo, hi)) = promoted_int_range_inclusive_bounds(self.llbc, id)
@@ -21997,29 +22056,26 @@ impl<'a> Lowering<'a> {
                     &name_path,
                     self.tombstoned_leaves,
                 ));
-                // `0..8` is `Range<i32>`. An unsuffixed `Range` is one class,
-                // so `start` unions `Int` with a classdef-less pointer.
-                // `Entry<K, V>` is one extracted body. An unsuffixed `Entry`
-                // unions `key` across `ObjectKey` and `String`.
-                let type_leaf = if name_path == "core::ops::range::Range"
-                    || name_path.ends_with("::rordereddict_entries::Entry")
-                {
-                    head_adt
-                        .and_then(|h| {
-                            let args = render_adt_type_args(h, self.llbc, 0);
-                            (!args.is_empty()
-                                && args.iter().all(|a| type_arg_splits_per_instantiation(a)))
-                            .then(|| format!("{type_leaf}<{}>", args.join(",")))
-                        })
-                        .unwrap_or(type_leaf)
-                } else {
-                    type_leaf
-                };
+                // A generic struct in a harvested foreign-body crate is
+                // one class per instantiation (`bookkeeper.py`
+                // `getuniqueclassdef`); `Entry<K, V>` is the local-crate
+                // split. An unsuffixed template unions scalar fields
+                // across instantiations.
+                //
+                // The aggregate head is often a bare type_id (same as the
+                // enum arm below). Prefer the destination place's
+                // TypeDeclRef when the head has no type arguments.
+                let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
+                let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
+                let type_leaf = inst_adt
+                    .and_then(|h| struct_instantiation_suffix(&name_path, h, self.llbc))
+                    .map(|suffix| majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix))
+                    .unwrap_or(type_leaf);
                 Some((
                     owner_path,
                     type_leaf,
                     field_rows,
-                    concrete_adt_struct_id(template, head_adt, self.llbc),
+                    concrete_adt_struct_id(template, inst_adt, self.llbc),
                     true,
                     None,
                 ))
@@ -22043,10 +22099,7 @@ impl<'a> Lowering<'a> {
                 // rather than intern the bare template (`Option::Some`)
                 // and union every payload onto one `__pos_0`.
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
-                let inst_adt = match head_adt {
-                    Some(h) if !render_adt_type_args(h, self.llbc, 0).is_empty() => Some(h),
-                    _ => dest_adt.or(head_adt),
-                };
+                let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
                 let suffix = inst_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
                 let leaf = match suffix {
                     Some(suffix) => majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix),
@@ -22085,9 +22138,9 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// `true` when the `AggregateKind::Adt` head constructs a
-    /// `core::ops::range::Range` whose element type is an integer that fits a
-    /// machine word (anything but `i128` / `u128`) — the `for _ in a..b` int-range
+    /// True when the `AggregateKind::Adt` head constructs a
+    /// `core::ops::range::Range` whose element type is an integer that
+    /// fits a machine word (anything but `i128` / `u128`) — the int-range
     /// shape `front::range_iter` diverts to the orthodox `range()` builtin.
     /// The element is read from the head's `generics.types[0]` (present even
     /// when the bounds are literal consts); a non-int element, a non-object
@@ -22276,7 +22329,7 @@ impl<'a> Lowering<'a> {
             };
             match adt_head_instantiation_suffix(head, self.llbc) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
-                None => match entry_struct_instantiation_suffix(&name_path, head, self.llbc) {
+                None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
                     Some(suffix) => {
                         majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix)
                     }
@@ -22463,8 +22516,6 @@ impl<'a> Lowering<'a> {
 
     /// Emit the inline `RangeInclusive::new(lo, hi)` a promoted
     /// `(a..=b)` constant becomes once its AnonConst init is folded.
-    /// Records a [`crate::front::range_contains::RangeInclusiveNewSite`]
-    /// so the post-pass can pair it with `contains` and remove `new`.
     fn emit_promoted_int_range_inclusive(
         &mut self,
         mir_bb: usize,
@@ -22492,8 +22543,7 @@ impl<'a> Lowering<'a> {
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         // Owner-qualified associated-function spelling
         // `unspecialized_fun_segments` emits for `RangeInclusive::new`
-        // (`ops::range::RangeInclusive::new`). The fold matches the
-        // `["range", "RangeInclusive", "new"]` tail.
+        // (`ops::range::RangeInclusive::new`).
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::Call {
@@ -22507,13 +22557,6 @@ impl<'a> Lowering<'a> {
                 ),
             },
         });
-        self.range_inclusive_new_sites
-            .push(crate::front::range_contains::RangeInclusiveNewSite {
-                result_var: res.clone(),
-                lo: lo_v,
-                hi: hi_v,
-                exclusive: false,
-            });
         res
     }
 
@@ -24831,6 +24874,29 @@ impl<'a> Lowering<'a> {
                             _ => {}
                         }
                     }
+                }
+                // `core::intrinsics::saturating_add` / `saturating_sub`
+                // (`rint.py` `rtype_add_ovf` / `rtype_sub_ovf` for signed).
+                if args.len() == 2
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && matches!(
+                        fd.item_meta.name_path().as_str(),
+                        "core::intrinsics::saturating_add" | "core::intrinsics::saturating_sub"
+                    )
+                {
+                    return self.emit_saturating_intrinsic(
+                        mir_bb,
+                        dest_local,
+                        target,
+                        args[0].clone(),
+                        args[1].clone(),
+                        &call.dest.ty,
+                        fd.item_meta
+                            .name_path()
+                            .as_str()
+                            .ends_with("saturating_add"),
+                    );
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py); the rtyper folds the surviving
@@ -28346,7 +28412,8 @@ impl<'a> Lowering<'a> {
                 // and any `.field` projection on it panics at
                 // `unaryop.rs` (lib test
                 // `generic_handler_graphs_keep_symbolic_fnaddr_surface`).
-                let (segments, method_hint) = self.call_target_segments(mir_bb, &reg)?;
+                let (segments, method_hint) =
+                    self.call_target_segments(mir_bb, &reg, first_arg_ty.as_ref())?;
                 let original_segments = segments.clone();
                 let original_method_hint = method_hint.clone();
                 // A shared `&[u8]` is `STR`. `list(str)` yields `Char`;
@@ -31110,27 +31177,6 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
-        // Word-sized `{u64,usize}::saturating_add`.  Narrow unsigned
-        // saturating add is not a word carry (`u32::MAX + 1` does not wrap
-        // in the word bank), so the dest atom is required here — the same
-        // width gate as unsigned `checked_add`.  `int_add` is recorded on
-        // its own site list; the sub pass never sees these producers.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_add"])
-            && self
-                .tyref_literal_uint_atom(&call.dest.ty)
-                .is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom)
-        {
-            self.saturating_add_sites
-                .push(crate::front::saturating_add::SaturatingAddSite {
-                    result_var: result_var.clone(),
-                });
-        }
         // Word-sized `{u64,usize}::saturating_mul`.  Narrow unsigned
         // saturating mul is not a word high-word test (`u32::MAX *
         // u32::MAX` fits in u64), so the dest atom is required here —
@@ -31401,114 +31447,6 @@ impl<'a> Lowering<'a> {
             self.annotate_slice_first_site(&mut site, &arg_locals, first_arg_ty.as_ref(), None);
             site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_first_sites.push(site);
-        }
-        // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
-        // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
-        // foreign leaf (its `Self` is a primitive integer, so `lower_call`
-        // keeps the raw `FunctionPath` segments), residualized as an
-        // unregistered callee the rtyper census Skips.  Restricted to unsigned
-        // receivers (every observed site is `usize`/`u16`/`u32`): the clamp
-        // floors at zero via `a < b`; a signed `saturating_sub` floors at
-        // `TYPE_MIN` (a different diamond) and stays residual.  A resolution
-        // miss leaves the residual call.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["num", "<Impl>", "saturating_sub"])
-            && let Some(site) = self.recognize_saturating_sub_site(&call.dest.ty, &result_var)
-        {
-            self.saturating_sub_sites.push(site);
-        }
-        // Capture `RangeInclusive::new(lo, hi)` sites for the
-        // `(a..=b).contains(&x)` fold `front::range_contains` synthesizes.
-        // `new` is an inherent-impl associated function whose owner
-        // resolves to the opaque `RangeInclusive` ADT, so `lower_call`
-        // emits it as a 2-arg FunctionPath whose segments end
-        // `["range", "RangeInclusive", "new"]` (the owner-qualified
-        // spelling, like `bigint::BigInt::div_rem`).  The int element gate
-        // reads the destination `RangeInclusive`'s type argument
-        // (`call.dest.ty`), which is present even when the bounds are
-        // literal constants — the common `(0..=255)` shape passes
-        // `Operand::Const` bounds, so gating the operand types instead
-        // would miss them.  A float / narrower-width range never records a
-        // site and declines cleanly (both calls stay residual, census
-        // Skip).  The op is still emitted normally; the post-pass removes
-        // it once the paired `contains` folds.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["range", "RangeInclusive", "new"])
-            && tyref_is_int_range_inclusive(&call.dest.ty, self.llbc)
-        {
-            self.range_inclusive_new_sites.push(
-                crate::front::range_contains::RangeInclusiveNewSite {
-                    result_var: result_var.clone(),
-                    lo: args[0].clone().into_variable(),
-                    hi: args[1].clone().into_variable(),
-                    exclusive: false,
-                },
-            );
-        }
-        // Capture `RangeInclusive::contains(&self, &x)` sites for the same
-        // fold.  Its `&RangeInclusive` receiver is an opaque foreign ADT
-        // whose impl-owner resolution routes it as a 2-arg FunctionPath
-        // (receiver `args[0]`, value `args[1]`) ending
-        // `["range", "RangeInclusive", "contains"]`, NOT a
-        // `CallTarget::Method`.  Gate on the receiver operand type
-        // (`first_arg_ty`) resolving to the opaque `RangeInclusive` ADT
-        // over an int element so a same-named `contains` on any other type
-        // — or a float range — is never recorded; the post-pass pairs each
-        // recorded site with its producing `new` and declines on any
-        // structural mismatch.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["range", "RangeInclusive", "contains"])
-            && first_arg_ty
-                .as_ref()
-                .is_some_and(|t| tyref_is_int_range_inclusive(t, self.llbc))
-        {
-            self.range_contains_sites
-                .push(crate::front::range_contains::RangeContainsSite {
-                    result_var: result_var.clone(),
-                });
-        }
-        // Capture `Range::contains(&self, &x)` for the exclusive
-        // `(a..b).contains(&x)` fold.  Exclusive Range is a struct ADT,
-        // so `first_is_self` routes the call as a 2-arg
-        // `CallTarget::Method { name: "contains" }` (receiver `args[0]`,
-        // value `args[1]`).  A FunctionPath spelling ending
-        // `["range", "Range", "contains"]` is recorded too.  Gate on the
-        // receiver resolving to `Range` over I64/Isize — the same
-        // element types as RangeInclusive — so a float range, a
-        // narrower-width range, and a same-named `contains` on any other
-        // type are never recorded.
-        if let OpKind::Call { target, args, .. } = &op_kind
-            && args.len() == 2
-            && match target {
-                CallTarget::Method { name, .. } => name == "contains",
-                CallTarget::FunctionPath { segments, .. } => {
-                    fmt_path_ends_with(segments, &["range", "Range", "contains"])
-                }
-                _ => false,
-            }
-            && first_arg_ty
-                .as_ref()
-                .is_some_and(|t| tyref_is_int_range(t, self.llbc))
-        {
-            self.range_contains_sites
-                .push(crate::front::range_contains::RangeContainsSite {
-                    result_var: result_var.clone(),
-                });
         }
         // Capture `Option::unwrap_or(opt, default)` /
         // `Result::unwrap_or(res, default)` sites for the discriminant
@@ -31874,6 +31812,15 @@ impl<'a> Lowering<'a> {
         if !crate::front::clause_spec::decl_is_generic(fd) {
             return None;
         }
+        // A HOST_ENV ExtRegistry object is one builtin. Naming each
+        // instantiation `leaf__inst_<types>` crate-strips to a prefix
+        // `HOST_ENV.import_module` does not carry (`["jit", leaf]`), so
+        // Layer-3b misses and Layer-1 / leaf-match walk the unique
+        // template. Keep the unspecialized path (`enqueue_spec` already
+        // refuses a host builtin).
+        if self.callee_is_host_builtin(fd) {
+            return None;
+        }
         let path = fd.item_meta.name_path();
         if !self.dont_look_inside.contains(&strip_crate_prefix(&path)) {
             return None;
@@ -31896,14 +31843,17 @@ impl<'a> Lowering<'a> {
 
     /// Impl method named by a `TraitImpl` trait ref, specialized when that
     /// impl's own clauses are concrete. A `Clause` ref returns `None` so
-    /// the call keeps the trait-declaration path.
+    /// the call keeps the trait-declaration path, unless the receiver
+    /// type is a known ADT ([`trait_method_on_known_receiver`]).
+    ///
+    /// `description.py` `ClassDesc.lookup` / `MethodDesc`: rustc has
+    /// already selected the impl, so the call is that impl's graph.
+    /// Specialization (`FunctionDesc.cachedgraph`) is only queued from
+    /// a spec body; a non-spec caller still names the impl method.
     fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
     ) -> Option<(Vec<String>, Option<(String, String)>)> {
-        if !self.spec_body {
-            return None;
-        }
         let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
         let fd = self.llbc.fn_by_id(fn_id)?;
         // No unstructured body: keep the ordinary `CallKind::Trait` route.
@@ -31917,11 +31867,12 @@ impl<'a> Lowering<'a> {
         }
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next().unwrap_or("fn");
-        let segments = spec_segments(self.llbc, fd, leaf);
-        if let Some(segments) = self.enqueue_spec(fd, &generics) {
-            return Some((segments, None));
+        if self.spec_body {
+            if let Some(segments) = self.enqueue_spec(fd, &generics) {
+                return Some((segments, None));
+            }
         }
-        Some((segments, None))
+        Some((spec_segments(self.llbc, fd, leaf), None))
     }
 
     /// Impl path of a zero-arg method whose declaration has no body.
@@ -32005,18 +31956,8 @@ impl<'a> Lowering<'a> {
     /// dotted path (`name_path` with `::` rewritten to `.`).
     fn callee_is_host_builtin(&self, fd: &FunDecl) -> bool {
         let (segments, _) = self.unspecialized_fun_segments(fd);
-        if crate::flowspace::model::host_env_callable(&segments).is_some() {
-            return true;
-        }
-        let dotted: Vec<String> = fd
-            .item_meta
-            .name_path()
-            .replace("::", ".")
-            .split('.')
-            .filter(|segment| !segment.is_empty())
-            .map(str::to_string)
-            .collect();
-        crate::flowspace::model::host_env_callable(&dotted).is_some()
+        crate::flowspace::model::host_env_callable(&segments).is_some()
+            || fun_decl_name_path_is_host_env(fd)
     }
 
     /// Segments and method hint `call_target_segments` emits for a direct
@@ -32084,6 +32025,7 @@ impl<'a> Lowering<'a> {
         &self,
         mir_bb: usize,
         reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
     ) -> Result<(Vec<String>, Option<(String, String)>), LowerError> {
         match &reg.kind {
             CallKind::Fun(FunId::Regular { id }) => self
@@ -32161,6 +32103,24 @@ impl<'a> Lowering<'a> {
             CallKind::Trait(v) => {
                 if let Some(target) = self.specialized_trait_target(v) {
                     return Ok(target);
+                }
+                // `description.py` `ClassDesc.lookup` / `MethodDesc`: a
+                // `Clause` ref still names the impl once the receiver
+                // ADT is known. rustc selected that impl; there is no
+                // runtime dispatch.
+                if let Some((fn_id, segments, impl_generics)) =
+                    trait_method_on_known_receiver(first_arg_ty, v, self.llbc)
+                {
+                    if self.spec_body
+                        && let Some(fd) = self.llbc.fn_by_id(fn_id)
+                    {
+                        let combined =
+                            merge_impl_and_method_generics(&impl_generics, &reg.generics);
+                        if let Some(spec) = self.enqueue_spec(fd, &combined) {
+                            return Ok((spec, None));
+                        }
+                    }
+                    return Ok((segments, None));
                 }
                 if let Some((trait_leaf, method_leaf)) = trait_payload_owner(v, self.llbc) {
                     Ok((vec![trait_leaf, method_leaf], None))
@@ -32295,9 +32255,8 @@ impl<'a> Lowering<'a> {
                 // (`Option::unwrap_or`) whose folds key on
                 // `CallTarget::Method`. A Struct owner is minted as a
                 // field-only class (`Range<i64>` has start/end); route as
-                // FunctionPath so `front::range_contains` can fold
-                // `Range::contains` the same way `RangeInclusive::contains`
-                // folds (its owner is Opaque).
+                // FunctionPath so `Range::contains` reaches the graph of its
+                // Charon-included body (`Bookkeeper.getdesc`).
                 if !fd.has_unstructured_body() && matches!(td.kind, TypeDeclKind::Struct(_)) {
                     return None;
                 }
@@ -35372,7 +35331,7 @@ impl<'a> Lowering<'a> {
         reg: &RegularCall,
         dest_ty: &TyRef,
     ) -> bool {
-        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
+        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg, None) else {
             return false;
         };
         if emitted.last().map(String::as_str) != Some("default") {
@@ -35389,7 +35348,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn is_slice_iter_copied(&self, mir_bb: usize, reg: &RegularCall) -> bool {
-        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
+        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg, None) else {
             return false;
         };
         emitted.as_slice() == ["slice", "iter", "Iter", "copied"]
@@ -36858,6 +36817,98 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// `core::intrinsics::saturating_add` / `saturating_sub`
+    /// (`lloperation.py` `LL_OPERATIONS`; signed clamp via `rint.py`
+    /// `rtype_add_ovf` / `rtype_sub_ovf`). Emit a residual intrinsic Call
+    /// and record the site for the post-lowering clamp rewrite.
+    ///
+    /// The rewrite must not run here. `lower_framestate` unions only the
+    /// just-closed exits (`flowcontext.py` `make_next_block`). Splitting
+    /// the Call's goto onto fresh non-MIR diamond arms leaves the MIR
+    /// `target` with an empty entry state, so Pass 1 `stub_dead_block`s
+    /// it (`set_raise("mir-dead")`) and the wrapper becomes a raise-only
+    /// stub. `bool::then` / `saturating_mul` already rewrite after the
+    /// body lowers; this follows that contract.
+    fn emit_saturating_intrinsic(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        lhs: crate::flowspace::model::Variable,
+        rhs: crate::flowspace::model::Variable,
+        dest_ty: &TyRef,
+        is_add: bool,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        let leaf = if is_add {
+            "saturating_add"
+        } else {
+            "saturating_sub"
+        };
+        let result_ty = if self.tyref_literal_uint_atom(dest_ty).is_some() {
+            ValueType::Unsigned
+        } else {
+            ValueType::Int
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![lhs, rhs]),
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res.clone()));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+
+        let signed = self
+            .tyref_literal_int_atom(dest_ty)
+            .is_some_and(crate::front::checked_arith::is_ovf_width_int_atom);
+        let uint_atom = self.tyref_literal_uint_atom(dest_ty);
+        let word_sized =
+            uint_atom.is_some_and(crate::front::checked_arith_uint::is_word_sized_uint_atom);
+        if is_add {
+            let unsigned_max = if signed || word_sized {
+                None
+            } else {
+                uint_atom.and_then(|atom| {
+                    crate::front::saturating_intrinsic::unsigned_atom_max(
+                        atom,
+                        crate::layout::target_word_size(),
+                    )
+                })
+            };
+            if signed || word_sized || unsigned_max.is_some() {
+                self.saturating_add_sites.push(
+                    crate::front::saturating_intrinsic::SaturatingAddSite {
+                        result_var: res,
+                        signed,
+                        unsigned_max,
+                    },
+                );
+            }
+        } else {
+            let unsigned_ok = uint_atom.is_some_and(|atom| atom != "U128");
+            if signed || unsigned_ok {
+                self.saturating_sub_sites.push(
+                    crate::front::saturating_intrinsic::SaturatingSubSite {
+                        result_var: res,
+                        signed,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the host call
     /// `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` accept.
     /// `normalize_unary_op_name` rejects a unary op of either name.
@@ -37079,7 +37130,10 @@ impl<'a> Lowering<'a> {
             })?;
             let fd = self.llbc.fn_by_id(fn_id)?;
             let (owner, method) = impl_method_owner_for_fundecl(self.llbc, fd)?;
-            let path = crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method);
+            let identity = crate::front::clause_spec::render_trait_impl(self.llbc, impl_id)?;
+            let path = crate::parse::CallPath::from_segments(trait_impl_identity_path(
+                &owner, &identity, &method,
+            ));
             return Some(IntoDevirt::Target(path.segments));
         }
         None
@@ -38038,22 +38092,6 @@ impl<'a> Lowering<'a> {
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
             payload_narrow_root,
-        })
-    }
-
-    /// Resolve a recognized `{uN}::saturating_sub(a, b)` call into a
-    /// [`crate::front::saturating_sub::SaturatingSubSite`].  Gated on an
-    /// **unsigned** result type (`saturating_sub` returns the receiver `uN`):
-    /// the unsigned clamp floors at zero via `a < b`.  A signed `saturating_sub`
-    /// floors at `TYPE_MIN` (a different diamond) and is left residual (`None`).
-    fn recognize_saturating_sub_site(
-        &self,
-        dest_ty: &TyRef,
-        result_var: &Variable,
-    ) -> Option<crate::front::saturating_sub::SaturatingSubSite> {
-        self.tyref_literal_uint_atom(dest_ty)?;
-        Some(crate::front::saturating_sub::SaturatingSubSite {
-            result_var: result_var.clone(),
         })
     }
 
@@ -42845,7 +42883,7 @@ impl<'a> Lowering<'a> {
             Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                 &name_path, &suffix,
             )),
-            None => match entry_struct_instantiation_suffix(&name_path, adt, self.llbc) {
+            None => match struct_instantiation_suffix(&name_path, adt, self.llbc) {
                 Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                     &name_path, &suffix,
                 )),
@@ -46313,14 +46351,24 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
         return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
     }
-    // Same key `free_function_alias_paths` registers: the module portion
-    // of `name_path` is one segment when it contains `<Impl>`, not a
-    // split of that token.
     let stripped = strip_crate_prefix(&fd.item_meta.name_path());
     let module = stripped
         .rsplit_once("::")
         .map(|(module, _)| module)
         .unwrap_or("");
+    // Primitive `Self` (`impl PartialOrd<char> for char`): no ADT owner,
+    // so `name_path` is `cmp::impls::<Impl>::le` for every width.
+    // `CallControl.graphs_from` keeps one graph per function object;
+    // the impl's trait ref and Self type is that identity.
+    if let Some(impl_id) = trait_impl_id_for_fundecl(fd)
+        && let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id)
+        && !module.is_empty()
+    {
+        return trait_impl_identity_path(module, &identity, leaf);
+    }
+    // Same key `free_function_alias_paths` registers: the module portion
+    // of `name_path` is one segment when it contains `<Impl>`, not a
+    // split of that token.
     let mut segments: Vec<String> = if module.is_empty() {
         Vec::new()
     } else {
@@ -46330,20 +46378,21 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     segments
 }
 
-/// The `CallPath` `lib.rs` registers for this FunDecl: crate-stripped
-/// free-function path, or `for_impl_method(owner, leaf)` for an impl
-/// method (`register_trait_method` / inherent registration). A trait-impl
-/// id is local to one LLBC and is not part of this key.
+/// The `CallPath` `lib.rs` registers for this FunDecl: the same
+/// segments [`spec_segments`] emits, so a Fun call and a Trait call
+/// that resolve to this declaration share one registry key.
 fn registered_path_for_fun_decl(llbc: &Llbc, fd: &FunDecl) -> crate::parse::CallPath {
-    if let Some(leaf) = instance_leaf(llbc, fd) {
-        return crate::parse::CallPath::from_segments(spec_segments(llbc, fd, &leaf));
-    }
-    if let Some((owner, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
-        crate::parse::CallPath::for_impl_method(&owner, &leaf)
-    } else {
-        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
-        crate::parse::CallPath::from_segments(stripped.split("::").filter(|s| !s.is_empty()))
-    }
+    let leaf = match instance_leaf(llbc, fd) {
+        Some(leaf) => leaf,
+        None => fd
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("fn")
+            .to_string(),
+    };
+    crate::parse::CallPath::from_segments(spec_segments(llbc, fd, &leaf))
 }
 
 /// True for the root-stack publication helper.  Both the free function and
@@ -54735,7 +54784,10 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
         // Non-ADT `Self` has no TypeDecl and no `CallTarget::Method`
         // owner.  `is_null` is not registered here: the front lowers
         // `<*const T>::is_null` / `<*mut T>::is_null` to `is_`
-        // (`is_raw_ptr_is_null`) instead of a method key.
+        // (`is_raw_ptr_is_null`) instead of a method key. A primitive
+        // trait impl (`PartialOrd<char> for char`) is distinguished by
+        // `spec_segments` via the impl's trait-ref identity, not by minting a
+        // `self_ty_root` that would rewrite `bool::then` / `f64::from`.
         None => return None,
     };
     if owner_qualified.is_empty() {
@@ -54769,6 +54821,363 @@ fn trait_default_call_segments(
     let mut segments: Vec<String> = owner.split("::").map(str::to_string).collect();
     segments.push(leaf);
     Some(segments)
+}
+
+fn tyref_as_json(ty: &TyRef) -> serde_json::Value {
+    match ty {
+        TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
+        TyRef::Inline { value: (id, body) } => serde_json::json!({ "Value": [id, body] }),
+        TyRef::Other(body) => body.clone(),
+    }
+}
+
+fn depth0_typevar_index(node: &serde_json::Value) -> Option<usize> {
+    let var = node.get("TypeVar")?;
+    if let Some(bound) = var.get("Bound").and_then(serde_json::Value::as_array) {
+        if bound.first()?.as_u64()? != 0 {
+            return None;
+        }
+        return Some(bound.get(1)?.as_u64()? as usize);
+    }
+    var.get("Free")
+        .and_then(serde_json::Value::as_u64)
+        .map(|index| index as usize)
+}
+
+fn ref_inner_and_kind(r: &serde_json::Value) -> (Option<&serde_json::Value>, Option<&str>) {
+    if let Some(arr) = r.as_array() {
+        (arr.get(1), arr.get(2).and_then(serde_json::Value::as_str))
+    } else if let Some(obj) = r.as_object() {
+        (
+            obj.get("ty"),
+            obj.get("kind").and_then(serde_json::Value::as_str),
+        )
+    } else {
+        (None, None)
+    }
+}
+
+fn json_ref_kind_is_mut(kind: Option<&str>) -> bool {
+    kind.is_some_and(|k| k.eq_ignore_ascii_case("Mut"))
+}
+
+/// Unify `pattern` (method first input after impl TypeVars) against the
+/// call receiver. Shared vs Mut vs owned wrappers stay distinct:
+/// `strip_ty_wrappers` would over-peel `&&T`. `ClassDesc.lookup`.
+fn unify_receiver_ty(
+    pattern: &serde_json::Value,
+    actual: &serde_json::Value,
+    subst: &mut Vec<Option<serde_json::Value>>,
+    llbc: &Llbc,
+) -> bool {
+    let Some(pattern) = strip_ty_indirections(pattern, llbc) else {
+        return false;
+    };
+    let Some(actual) = strip_ty_indirections(actual, llbc) else {
+        return false;
+    };
+    if let Some(index) = depth0_typevar_index(pattern) {
+        if index >= subst.len() {
+            subst.resize(index + 1, None);
+        }
+        match &subst[index] {
+            Some(bound) => {
+                let bound = bound.clone();
+                let Some(bound) = strip_ty_indirections(&bound, llbc) else {
+                    return false;
+                };
+                bound == actual
+            }
+            None => {
+                subst[index] = Some(actual.clone());
+                true
+            }
+        }
+    } else if let (Some(pref), Some(aref)) = (pattern.get("Ref"), actual.get("Ref")) {
+        let (pty, pkind) = ref_inner_and_kind(pref);
+        let (aty, akind) = ref_inner_and_kind(aref);
+        if json_ref_kind_is_mut(pkind) != json_ref_kind_is_mut(akind) {
+            return false;
+        }
+        match (pty, aty) {
+            (Some(pty), Some(aty)) => unify_receiver_ty(pty, aty, subst, llbc),
+            _ => false,
+        }
+    } else if pattern.get("Ref").is_some() || actual.get("Ref").is_some() {
+        false
+    } else if let (Some(ps), Some(as_)) = (pattern.get("Scalar"), actual.get("Scalar")) {
+        charon_literal_to_ast_string(ps) == charon_literal_to_ast_string(as_)
+    } else if pattern.get("Scalar").is_some() || actual.get("Scalar").is_some() {
+        false
+    } else if let (Some(pa), Some(aa)) = (
+        pattern.get("Adt").and_then(serde_json::Value::as_object),
+        actual.get("Adt").and_then(serde_json::Value::as_object),
+    ) {
+        match (type_decl_ref_adt_id(pa), type_decl_ref_adt_id(aa)) {
+            (Some(pid), Some(aid)) => {
+                if pid != aid && !same_nominal_adt(llbc, pid, aid) {
+                    return false;
+                }
+            }
+            (None, None) => {
+                if pa.get("builtin") != aa.get("builtin") {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        if !unify_const_generic_lists(
+            pa.get("generics")
+                .and_then(|g| g.get("const_generics"))
+                .and_then(serde_json::Value::as_array),
+            aa.get("generics")
+                .and_then(|g| g.get("const_generics"))
+                .and_then(serde_json::Value::as_array),
+        ) {
+            return false;
+        }
+        unify_generic_type_lists(
+            pa.get("generics")
+                .and_then(|g| g.get("types"))
+                .and_then(serde_json::Value::as_array),
+            aa.get("generics")
+                .and_then(|g| g.get("types"))
+                .and_then(serde_json::Value::as_array),
+            subst,
+            llbc,
+        )
+    } else {
+        pattern == actual
+    }
+}
+
+fn unify_const_generic_lists(
+    pattern: Option<&Vec<serde_json::Value>>,
+    actual: Option<&Vec<serde_json::Value>>,
+) -> bool {
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let pattern = pattern.unwrap_or(&empty);
+    let actual = actual.unwrap_or(&empty);
+    if pattern.len() != actual.len() {
+        return false;
+    }
+    pattern
+        .iter()
+        .zip(actual.iter())
+        .all(|(pattern, actual)| pattern == actual || const_generic_is_var(pattern))
+}
+
+fn const_generic_is_var(value: &serde_json::Value) -> bool {
+    value.get("Var").is_some() || value.get("ConstVar").is_some() || value.get("TypeVar").is_some()
+}
+
+fn unify_generic_type_lists(
+    pattern: Option<&Vec<serde_json::Value>>,
+    actual: Option<&Vec<serde_json::Value>>,
+    subst: &mut Vec<Option<serde_json::Value>>,
+    llbc: &Llbc,
+) -> bool {
+    let empty: Vec<serde_json::Value> = Vec::new();
+    let pattern = pattern.unwrap_or(&empty);
+    let actual = actual.unwrap_or(&empty);
+    if pattern.len() != actual.len() {
+        return false;
+    }
+    pattern
+        .iter()
+        .zip(actual.iter())
+        .all(|(p, a)| unify_receiver_ty(p, a, subst, llbc))
+}
+
+fn types_equal_after_subst(
+    pattern: &serde_json::Value,
+    actual: &serde_json::Value,
+    subst: &[Option<serde_json::Value>],
+    llbc: &Llbc,
+) -> bool {
+    let mut pattern = pattern.clone();
+    let types: Vec<serde_json::Value> = subst
+        .iter()
+        .map(|bound| bound.clone().unwrap_or(serde_json::Value::Null))
+        .collect();
+    crate::front::clause_spec::substitute_type_vars(&mut pattern, llbc, &types, &[]);
+    unify_receiver_ty(&pattern, actual, &mut Vec::new(), llbc)
+}
+
+fn trait_generic_args_match(
+    impl_trait: &serde_json::Value,
+    call_types: Option<&Vec<serde_json::Value>>,
+    subst: &[Option<serde_json::Value>],
+    llbc: &Llbc,
+) -> bool {
+    let Some(impl_types) = impl_trait
+        .pointer("/generics/types")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return call_types.is_none_or(|types| types.is_empty());
+    };
+    let Some(call_types) = call_types else {
+        return true;
+    };
+    if call_types.is_empty() {
+        return true;
+    }
+    let impl_slice: &[serde_json::Value] = if call_types.len() + 1 == impl_types.len() {
+        &impl_types[1..]
+    } else if call_types.len() == impl_types.len() {
+        impl_types
+    } else {
+        return false;
+    };
+    impl_slice
+        .iter()
+        .zip(call_types.iter())
+        .all(|(pattern, actual)| types_equal_after_subst(pattern, actual, subst, llbc))
+}
+
+fn reconstructed_impl_generics(
+    subst: &[Option<serde_json::Value>],
+    row: &serde_json::Value,
+    recv: &serde_json::Value,
+) -> serde_json::Value {
+    let types: Vec<serde_json::Value> = subst
+        .iter()
+        .map(|bound| {
+            bound
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"TypeVar": {"Bound": [0, 0]}}))
+        })
+        .collect();
+    let const_generics = adt_const_generics(recv);
+    let trait_refs = row
+        .pointer("/generics/trait_refs")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    serde_json::json!({
+        "types": types,
+        "const_generics": const_generics,
+        "trait_refs": trait_refs,
+    })
+}
+
+fn adt_const_generics(ty: &serde_json::Value) -> serde_json::Value {
+    let mut node = ty;
+    for _ in 0..8 {
+        if let Some(r) = node.get("Ref") {
+            let inner = r.as_array().and_then(|a| a.get(1)).or_else(|| r.get("ty"));
+            if let Some(inner) = inner {
+                node = inner;
+                continue;
+            }
+        }
+        break;
+    }
+    node.pointer("/Adt/generics/const_generics")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]))
+}
+
+fn merge_impl_and_method_generics(
+    impl_generics: &serde_json::Value,
+    method_generics: &serde_json::Value,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for key in ["types", "const_generics", "trait_refs"] {
+        let mut items = impl_generics
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(more) = method_generics
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+        {
+            items.extend(more.iter().cloned());
+        }
+        out.insert(key.to_string(), serde_json::Value::Array(items));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Unique impl of `trait_id` whose method first input unifies with the
+/// call receiver, including reference wrappers and trait generic args.
+/// Zero or several matches stay unresolved (`ClassDesc.lookup`).
+fn trait_impl_match_for_receiver(
+    first_arg_ty: &TyRef,
+    payload: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<(u64, u64, serde_json::Value)> {
+    let recv = tyref_as_json(first_arg_ty);
+    let arr = payload.as_array()?;
+    let trait_id = trait_ref_decl_id(arr.first()?, llbc)?;
+    let method_idx = arr.get(1)?.as_u64()?;
+    let call_types = traitref_unwrap(arr.first()?, llbc, 0)
+        .and_then(|resolved| resolved.pointer("/trait_decl_ref/skip_binder/generics/types"))
+        .and_then(serde_json::Value::as_array);
+    let mut found = None;
+    for (i, row) in llbc.trait_impls_raw().iter().enumerate() {
+        if row.is_null() {
+            continue;
+        }
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        if impl_trait.get("id").and_then(serde_json::Value::as_u64) != Some(trait_id) {
+            continue;
+        }
+        let impl_id = i as u64;
+        let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
+            .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
+        else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(fn_id) else {
+            continue;
+        };
+        let Some(first_input) = fd.signature.inputs.first() else {
+            continue;
+        };
+        let pattern = tyref_as_json(first_input);
+        let mut subst = Vec::new();
+        if !unify_receiver_ty(&pattern, &recv, &mut subst, llbc) {
+            continue;
+        }
+        if !trait_generic_args_match(impl_trait, call_types, &subst, llbc) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some((
+            impl_id,
+            fn_id,
+            reconstructed_impl_generics(&subst, row, &recv),
+        ));
+    }
+    found
+}
+
+/// Impl (or trait-default) FunDecl a `CallKind::Trait` names when the
+/// receiver unifies with exactly one impl method. `description.py`
+/// `ClassDesc.lookup`: the method is looked up on that class; a missing
+/// override inherits the default. Returns the FunDecl id, the path
+/// `spec_segments` would register, and the impl generics reconstructed
+/// from that unification (`FunctionDesc.cachedgraph` / `specialize`).
+/// `None` when no unique impl matches, or the method has no body.
+fn trait_method_on_known_receiver(
+    first_arg_ty: Option<&TyRef>,
+    payload: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<(u64, Vec<String>, serde_json::Value)> {
+    let ty = first_arg_ty?;
+    let (_, fn_id, impl_generics) = trait_impl_match_for_receiver(ty, payload, llbc)?;
+    let fd = llbc.fn_by_id(fn_id)?;
+    if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+        return None;
+    }
+    let path = fd.item_meta.name_path();
+    let leaf = path.rsplit("::").next().unwrap_or("fn");
+    Some((fn_id, spec_segments(llbc, fd, leaf), impl_generics))
 }
 
 /// The std alias an inherent `impl Atomic<T>` block's methods are spelled
@@ -55059,6 +55468,70 @@ fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType>
         return Some(ValueType::Int);
     }
     Some(pointee_vt)
+}
+
+/// Nested `Ref` of a primitive (`&&i64`, `&&&f64`).
+///
+/// [`tyref_scalar_pointee_value_type`] peels one pointer and returns
+/// `None` for a pointer to a pointer, which is correct for call-result
+/// banking (`iterator_payload_element` of `&[&i64]`). A declared
+/// parameter of `PartialOrd<&B> for &A` is `&&T`; the caller already
+/// aliases `&T` to the scalar (`history.py` `getkind`). Used only by
+/// [`input_param_value_type`].
+fn tyref_nested_ref_to_scalar_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let mut node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let mut refs = 0u8;
+    loop {
+        let obj = node.as_object()?;
+        let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) else {
+            return None;
+        };
+        node = strip_ty_indirections(arr.get(1)?, llbc)?;
+        refs = refs.saturating_add(1);
+        if refs > 24 {
+            return None;
+        }
+        let Some(prim) = tyref_primitive_node(node, llbc) else {
+            continue;
+        };
+        if refs < 2 {
+            return None;
+        }
+        let scalar = prim.as_object()?.get("Scalar")?;
+        let pointee_vt = scalar_value_type(scalar)?;
+        return matches!(
+            pointee_vt,
+            ValueType::Int
+                | ValueType::Unsigned
+                | ValueType::Bool
+                | ValueType::Float
+                | ValueType::SingleFloat
+        )
+        .then_some(pointee_vt);
+    }
+}
+
+/// `char` / `&char` / `&&char` stay `ValueType::Int` (`getkind` of
+/// UniChar is `'int'`), while the annotator cell is
+/// `SomeUnicodeCodePoint`. Carry `"char"` so
+/// `derive_subject_inputcells` seeds that cell.
+fn tyref_char_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let mut node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+            node = strip_ty_indirections(arr.get(1)?, llbc)?;
+            continue;
+        }
+        let scalar = obj.get("Scalar")?;
+        let is_char = match scalar {
+            serde_json::Value::String(s) => s == "Char",
+            serde_json::Value::Object(map) => map.contains_key("Char"),
+            _ => false,
+        };
+        return is_char.then(|| "char".to_string());
+    }
+    None
 }
 
 /// `&[T]` / `&mut [T]` whose element is a GC pointer, not a raw address.
@@ -58631,14 +59104,31 @@ pub(crate) fn collect_marked_class_ctor_stubs_from_llbc(
 /// `["GcAllocOutcome", "from_hook"]`.
 ///
 /// `Range::contains` on the extracted `Range` Struct is not harvested:
-/// `front::range_contains` folds the int half-open site to compares
-/// (the isqrt gateway's `0 < n < 2**53`-style checks), and a structural
-/// mismatch leaves the unregistered FunctionPath (census Skip).  A
+/// its Charon-included body is the graph the FunctionPath resolves to,
+/// and a bodyless one leaves the unregistered FunctionPath (census
+/// Skip).  A
 /// result type that cannot be modeled (`allocated_or_abort`'s RawPtr) is
 /// still declined by [`foreign_opaque_method_result_valuetype`].  A
 /// zero-arg method on an opaque owner (`Default::default`) has no
 /// `self`; it is harvested with the opaque-owner methods because
 /// `opaque_nullary_impl_target` emits that path.
+///
+/// A bodyless trait-impl method on a Struct owner is harvested too
+/// (`Iterator::next` after CHARON includes `RangeInclusive`). Including
+/// the TypeDecl makes the owner a Struct, so the Opaque-owner arm no
+/// longer fires, while `impl_method_owner` still declines the Method
+/// hint (`!has_unstructured_body && Struct`) and the call stays a
+/// FunctionPath (`Bookkeeper.getdesc`). Inherent bodyless methods on a
+/// Struct (`Range::contains`) stay unharvested.
+///
+/// A GlobalInitializer FunDecl is not a call target (`admit_decl`).
+/// `Place::Global` folds a compile-time constant from the Charon
+/// initializer (`flowcontext.py` `find_global` `const(value)`); otherwise
+/// the read stays the unregistered residual (`extfunc.py`
+/// `register_external` requires a real function). An Opaque import of a
+/// local-crate free function is the same residual when this artefact has
+/// no body; `register_external` is non-overwriting, so a graph the
+/// defining crate lowered still wins.
 #[cfg(any(test, feature = "mir-frontend"))]
 pub(crate) fn collect_foreign_opaque_method_externals(
     llbc: &Llbc,
@@ -58653,58 +59143,99 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         if fd.is_global_initializer().is_some() {
             continue;
         }
-        // Owner must be an impl-block item.  `impl_method_owner_for_fundecl`
-        // resolves the owner's qualified name; the two arms below pick
-        // which impl items become residuals.
-        let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) else {
-            continue;
-        };
-        let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
-            continue;
-        };
-        let Some(owner_td) = llbc.type_by_id(owner_def_id) else {
-            continue;
-        };
-        let self_receiver = first_input_is_adt_free(llbc, fd, owner_def_id);
-        let opaque_owner =
-            matches!(owner_td.kind, TypeDeclKind::Opaque) || owner_td.published_struct_copy;
-        // Method on a foreign opaque ADT with `self`
-        // (`<BigInt as Add>::add`), including a published struct copy of
-        // that opaque import.  Mirrors the gate `impl_method_owner`
-        // applies before declining the Method hint.  A zero-arg method
-        // (`Default::default`) has no `self`; `opaque_nullary_impl_target`
-        // emits this same path from a specialized caller.
-        let opaque_method = opaque_owner && (self_receiver || fd.signature.inputs.is_empty());
-        // Bodyless foreign associated fn (`GcAllocOutcome::from_hook`):
-        // unextracted crate, so the FunDecl has no body while the owner
-        // TypeDecl is a full Enum.  Not a `self` method — that keeps the
-        // Opaque-owner BigInt path on the arm above.
-        let foreign_assoc_fn =
-            !fd.item_meta.is_local && !fd.has_unstructured_body() && !self_receiver;
-        if !opaque_method && !foreign_assoc_fn {
+        if let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+            let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
+                continue;
+            };
+            let Some(owner_td) = llbc.type_by_id(owner_def_id) else {
+                continue;
+            };
+            let self_receiver = first_input_is_adt_free(llbc, fd, owner_def_id);
+            let opaque_owner =
+                matches!(owner_td.kind, TypeDeclKind::Opaque) || owner_td.published_struct_copy;
+            let opaque_method = opaque_owner && (self_receiver || fd.signature.inputs.is_empty());
+            let foreign_assoc_fn =
+                !fd.item_meta.is_local && !fd.has_unstructured_body() && !self_receiver;
+            // Bodyless trait-impl method whose owner TypeDecl was
+            // included as a Struct (`RangeInclusive::next`). Inherent
+            // `Range::contains` has no trait-impl id and stays out.
+            let bodyless_trait_impl_method = !fd.item_meta.is_local
+                && !fd.has_unstructured_body()
+                && self_receiver
+                && trait_impl_id_for_fundecl(fd).is_some();
+            if !opaque_method && !foreign_assoc_fn && !bodyless_trait_impl_method {
+                continue;
+            }
+            let Some(result_ty) =
+                foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)
+            else {
+                continue;
+            };
+            let mut segments: Vec<String> =
+                owner_qualified.split("::").map(str::to_string).collect();
+            segments.push(leaf);
+            out.push((
+                segments,
+                Signature::new(fundecl_stub_argnames(fd), None, None),
+                result_ty,
+            ));
             continue;
         }
-        // Faithful result shell read from the LLBC output signature; a
-        // result type that cannot be modeled (Option / fieldless enum /
-        // tuple / reference / non-opaque struct) declines the method.
-        let Some(result_ty) = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)
-        else {
-            continue;
-        };
-        let mut segments: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
-        segments.push(leaf);
-        let body = fd.unstructured();
-        let argnames: Vec<String> = (0..fd.signature.inputs.len())
-            .map(|i| {
-                body.as_ref()
-                    .and_then(|u| u.locals.locals.get(i + 1))
-                    .and_then(|l| l.name.clone())
-                    .unwrap_or_else(|| format!("arg{i}"))
-            })
-            .collect();
-        out.push((segments, Signature::new(argnames, None, None), result_ty));
+        if let Some(row) = local_crate_opaque_import_external(llbc, fd) {
+            out.push(row);
+        }
     }
     out
+}
+
+#[cfg(any(test, feature = "mir-frontend"))]
+fn fundecl_stub_argnames(fd: &FunDecl) -> Vec<String> {
+    let body = fd.unstructured();
+    (0..fd.signature.inputs.len())
+        .map(|i| {
+            body.as_ref()
+                .and_then(|u| u.locals.locals.get(i + 1))
+                .and_then(|l| l.name.clone())
+                .unwrap_or_else(|| format!("arg{i}"))
+        })
+        .collect()
+}
+
+/// Opaque import of a free function defined in another extracted crate.
+/// The callsite keeps the crate-qualified spelling
+/// (`CallControl.guess_call_kind`); a graph the defining crate lowered
+/// still wins at register time (`extfunc.py` `register_external`).
+#[cfg(any(test, feature = "mir-frontend"))]
+fn local_crate_opaque_import_external(
+    llbc: &Llbc,
+    fd: &FunDecl,
+) -> Option<(
+    Vec<String>,
+    crate::flowspace::argument::Signature,
+    ValueType,
+)> {
+    use crate::flowspace::argument::Signature;
+    if fd.has_unstructured_body() || fd.item_meta.is_local {
+        return None;
+    }
+    let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
+        return None;
+    };
+    if !crate::local_crates::is_local_crate_root(root) {
+        return None;
+    }
+    let result_ty = foreign_opaque_method_result_valuetype(&fd.signature.output, llbc)?;
+    let segments: Vec<String> = fd
+        .item_meta
+        .name_path()
+        .split("::")
+        .map(str::to_string)
+        .collect();
+    Some((
+        segments,
+        Signature::new(fundecl_stub_argnames(fd), None, None),
+        result_ty,
+    ))
 }
 
 /// Resolve the impl-owner ADT `def_id` of an impl-block method `fd`
@@ -58741,11 +59272,13 @@ fn first_input_is_adt_free(llbc: &Llbc, fd: &FunDecl, adt_def_id: u64) -> bool {
 
 /// Faithful result `ValueType` for a residualized foreign-opaque method,
 /// or `None` to decline (see [`collect_foreign_opaque_method_externals`]).
-/// A scalar literal output keeps its `ValueType`; an opaque-ADT output
-/// projects to `Ref(None)`; a payload-carrying enum keeps
-/// `Ref(Some(root))` so the residual intern's the enum-base ClassDef;
-/// every other shape (`Option`, fieldless enum, tuple, reference,
-/// non-opaque struct) is declined.
+/// A scalar literal output keeps its `ValueType`; `()` is `Void`
+/// (`history.py` `getkind`, `Vec::set_len` / `Vec::resize`); an
+/// opaque-ADT output projects to `Ref(None)`; a payload-carrying enum
+/// keeps `Ref(Some(root))` when `tyref_to_value_type` painted a class
+/// root (`unaryop.py` `SomeInstance.getattr` needs `self.classdef`).
+/// A payload enum with no class root is declined. A fieldless enum,
+/// tuple, reference, or non-opaque struct is declined.
 fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     // A reference return (`&T`) is not the owned residual result the
     // stub models; decline.
@@ -58757,6 +59290,10 @@ fn foreign_opaque_method_result_valuetype(output: &TyRef, llbc: &Llbc) -> Option
         vt @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
             Some(vt)
         }
+        // `()` is `lltype.Void`. FOREIGN_STDLIB already residualizes
+        // `Vec::set_len` this way; an Opaque-owner `Vec::resize` is the
+        // same `extfunc.py` `register_external(..., None)` shell.
+        ValueType::Void => Some(ValueType::Void),
         // A `Ref` projection covers every non-scalar ADT shape (`BigInt`,
         // `Option<i64>`, tuples, payload enums, …).  Accept it when:
         //
@@ -58796,19 +59333,17 @@ fn output_adt_def_id_free(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
 }
 
 /// Free-function version of [`Lowering::resolve_impl_owner_adt_def_id`].
-fn resolve_impl_owner_adt_def_id_free(
-    llbc: &Llbc,
-    impl_payload: &serde_json::Value,
-) -> Option<u64> {
+fn impl_payload_self_ty<'a>(
+    llbc: &'a Llbc,
+    impl_payload: &'a serde_json::Value,
+) -> Option<&'a serde_json::Value> {
     let obj = impl_payload.as_object()?;
     if let Some(ty) = obj.get("Ty") {
-        let sb = ty.as_object()?.get("skip_binder")?;
-        return resolve_tyexpr_to_adt_def_id_free(llbc, sb);
+        return ty.as_object()?.get("skip_binder");
     }
     if let Some(trait_impl_id) = obj.get("Trait").and_then(serde_json::Value::as_u64) {
-        let trait_impls = llbc.trait_impls_raw();
-        let ti = trait_impls.get(trait_impl_id as usize)?;
-        let first_ty = ti
+        let ti = llbc.trait_impls_raw().get(trait_impl_id as usize)?;
+        return ti
             .as_object()?
             .get("impl_trait")?
             .as_object()?
@@ -58816,10 +59351,16 @@ fn resolve_impl_owner_adt_def_id_free(
             .as_object()?
             .get("types")?
             .as_array()?
-            .first()?;
-        return resolve_tyexpr_to_adt_def_id_free(llbc, first_ty);
+            .first();
     }
     None
+}
+
+fn resolve_impl_owner_adt_def_id_free(
+    llbc: &Llbc,
+    impl_payload: &serde_json::Value,
+) -> Option<u64> {
+    resolve_tyexpr_to_adt_def_id_free(llbc, impl_payload_self_ty(llbc, impl_payload)?)
 }
 
 /// When `fd` is a trait-impl method (i.e. its NameSeg's penultimate
@@ -58932,7 +59473,8 @@ fn fundecl_keeps_zst_self(
 /// Declared-parameter ValueType, matching [`pygraph_initial_block`] /
 /// [`Lowering::new`]. A ZST `&self` on an `indirectcalltarget` trait impl
 /// stays `Ref`; a named empty-ADT ZST stays an instance of its empty class;
-/// every other void-ZST parameter is `Void`.
+/// every other void-ZST parameter is `Void`. A nested `Ref` of a primitive
+/// (`&&i64`) is the scalar, matching one-level `&i64` (`history.py` `getkind`).
 fn input_param_value_type(
     ty: ValueType,
     local_ty: &TyRef,
@@ -58952,6 +59494,7 @@ fn input_param_value_type(
         }
     } else if matches!(ty, ValueType::Ref(None))
         && let Some(scalar) = tyref_scalar_pointee_value_type(local_ty, llbc)
+            .or_else(|| tyref_nested_ref_to_scalar_value_type(local_ty, llbc))
     {
         scalar
     } else {
@@ -58963,7 +59506,7 @@ fn input_param_value_type(
 ///
 /// `impl From<T> for U` stores `[U, T]` on `impl_trait.generics.types`,
 /// the same order `blanket_into_devirt` reads off a `U: From<T>`
-/// obligation. The call path is the one `for_trait_impl_method`
+/// obligation. The call path is the one `trait_impl_identity_path`
 /// registers, so `from` stays a `FunctionPath` (it is an associated
 /// function; a `CallTarget::Method` would bind the argument as the
 /// receiver). Zero matches and several matches both decline: raising
@@ -59035,7 +59578,14 @@ fn from_impl_conversion(
             let Some(impl_id) = trait_impl_id_for_fundecl(fd) else {
                 continue;
             };
-            let path = crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method_name);
+            let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id) else {
+                continue;
+            };
+            let path = crate::parse::CallPath::from_segments(trait_impl_identity_path(
+                &owner,
+                &identity,
+                &method_name,
+            ));
             let pass_payload = fd.signature.inputs.first().is_some_and(|ty| {
                 !tyref_is_void_zst(ty, llbc)
                     || tyref_keeps_empty_class_instance(ty, llbc, no_tombstoned_leaves())
@@ -62099,72 +62649,16 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
         })
 }
 
-/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// `adt_path` whose sole element type is a word-sized signed integer
-/// (`I64` / `Isize`).  `require_opaque` is the RangeInclusive extraction
-/// shape; exclusive `Range` is a struct ADT and must not require it.
-fn tyref_is_word_signed_range_adt(
-    ty: &TyRef,
-    llbc: &Llbc,
-    adt_path: &str,
-    require_opaque: bool,
-) -> bool {
-    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
-        return false;
-    };
-    let Some(adt) = node
-        .as_object()
-        .and_then(|m| m.get("Adt"))
-        .and_then(|v| v.as_object())
-    else {
-        return false;
-    };
-    let is_range = adt_node_def_id(node)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            (!require_opaque || matches!(td.kind, TypeDeclKind::Opaque))
-                && td.item_meta.name_path() == adt_path
-        });
-    if !is_range {
-        return false;
-    }
-    let elem = type_decl_ref_generics(adt, llbc)
-        .and_then(|g| g.as_object())
-        .and_then(|g| g.get("types"))
-        .and_then(|t| t.as_array())
-        .and_then(|t| t.first())
-        .and_then(|n| strip_ty_wrappers(n, llbc));
-    matches!(
-        elem.and_then(|e| e.as_object())
-            .and_then(|m| m.get("Scalar"))
-            .and_then(|l| l.get("Integer"))
-            .and_then(|l| l.get("Signed"))
-            .and_then(serde_json::Value::as_str),
-        Some("I64" | "Isize")
-    )
-}
-
-/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
-/// the foreign opaque `core::ops::range::RangeInclusive` ADT whose sole
-/// element type is a word-sized signed integer (`I64` / `Isize`).  Gates
-/// both the `new` and the `contains` recording of the
-/// `(a..=b).contains(&x)` fold so a same-named `contains` on any other
-/// type — and a float / narrower-width range — is never folded to
-/// integer compares.  The element type is read from the ADT reference's
-/// `generics.types[0]`, so it is available even when the `new` bounds are
-/// literal constants (whose operand types the front does not carry);
-/// float ranges decline cleanly (both calls stay residual, census Skip).
+/// True when `ty` (after `&`/`&mut`/`*` wrappers) is
+/// `core::ops::range::RangeInclusive`. Gates the AnonConst un-promote
+/// of a promoted `(a..=b)` so a same-named static of any other type
+/// stays a Global read.
 fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", true)
-}
-
-/// True when `ty` resolves to exclusive `core::ops::range::Range` over
-/// `I64` / `Isize` — the same integer element gate as
-/// [`tyref_is_int_range_inclusive`].  Exclusive Range is a struct ADT
-/// (not Opaque).  Float exclusive ranges decline the same way inclusive
-/// float ranges do.
-fn tyref_is_int_range(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::Range", false)
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path() == "core::ops::range::RangeInclusive")
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -62756,10 +63250,18 @@ fn tyref_ref_param_class_root(
     if majit_ir::descr::is_list_container_spelling(&spelling) {
         return Some(spelling);
     }
+    // A Charon builtin Tuple TypeDecl leaf is `"Tuple"`; that token is
+    // not a shaped name (`is_shaped_tuple_name` excludes it) and would
+    // intern a classdef-less `SomeInstance`. Prefer the per-shape
+    // `Tuple<A,B>` root so `derive_subject_inputcells` seeds `SomeTuple`
+    // (`rtuple.py` `TupleRepr`, `binaryop.py` `getitem((tup1, int2))`).
+    // A closure `call_once` `tupled_args` is this param (`FnOnce::Args`).
+    if let Some(root) = tyref_shaped_tuple_root(ty, llbc) {
+        return Some(root);
+    }
     tyref_input_class_root(ty, llbc, tombstoned)
         .or_else(|| tyref_strips_to_str(ty, llbc).then(|| "str".to_string()))
         .or_else(|| tyref_generic_trait_bound_root(ty, llbc, generics))
-        .or_else(|| tyref_shaped_tuple_root(ty, llbc))
 }
 
 /// The inner [`ValueType`] of a `core::sync::atomic::Atomic<T>`
@@ -63829,7 +64331,14 @@ fn adt_node_class_root_leaf(
             let split = adt_head_instantiation_suffix(adt, llbc).is_some();
             let pointer_niche = types
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
-            if !unary || !split || pointer_niche {
+            // A generic struct in a harvested foreign-body crate is one
+            // class per instantiation (`bookkeeper.py` `getuniqueclassdef`).
+            // Local-crate structs stay unsuffixed (closures). The
+            // container family above stays excluded; Opaque TypeDecls
+            // are not `Struct` and do not match.
+            let foreign_struct =
+                foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
+            if !foreign_struct && (!unary || !split || pointer_niche) {
                 return None;
             }
         }
@@ -63871,7 +64380,7 @@ fn adt_node_class_root_leaf(
     if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
         return Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix));
     }
-    if let Some(suffix) = entry_struct_instantiation_suffix(&name, adt, llbc) {
+    if let Some(suffix) = struct_instantiation_suffix(&name, adt, llbc) {
         return Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix));
     }
     Some(leaf)
@@ -63887,6 +64396,56 @@ fn entry_struct_instantiation_suffix(
     if !name_path.ends_with("::rordereddict_entries::Entry") {
         return None;
     }
+    split_struct_instantiation_suffix(adt, llbc)
+}
+
+/// `<T>` suffix for a generic struct whose path is in a harvested
+/// foreign-body crate. RPython has no generic classes: each
+/// monomorphization is its own class (`bookkeeper.py` `getuniqueclassdef`).
+/// Local-crate structs are not split (prepass4: seeding every suffixed
+/// root added closure failures).
+///
+/// Scalar type args (`RangeInclusive<u8>` vs `<i64>`) change field
+/// layout and split. Named-ADT args (`CodeObject<ConstantData>`) are
+/// the omitted-default spelling of one class and stay unsuffixed.
+fn foreign_body_generic_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    let crate_root = name_path.split("::").next().unwrap_or(name_path);
+    if !crate::local_crates::is_foreign_body_crate_root(crate_root) {
+        return None;
+    }
+    let def_id = type_decl_ref_adt_id(adt)?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let type_args = render_adt_type_args(adt, llbc, 0);
+    if type_args.is_empty()
+        || !type_args
+            .iter()
+            .any(|a| super::semantic::type_arg_is_scalar_layout(a))
+    {
+        return None;
+    }
+    split_struct_instantiation_suffix(adt, llbc)
+}
+
+fn struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    entry_struct_instantiation_suffix(name_path, adt, llbc)
+        .or_else(|| foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc))
+}
+
+fn split_struct_instantiation_suffix(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
     let type_args = render_adt_type_args(adt, llbc, 0);
     if type_args.is_empty()
         || !type_args
@@ -67160,7 +67719,51 @@ fn enum_payload_instance_class_root(
 ///     `<>` suffix.
 fn type_arg_splits_per_instantiation(arg: &str) -> bool {
     const DEFERRED: &[&str] = &["f32", "()", ""];
-    !DEFERRED.contains(&arg)
+    if DEFERRED.contains(&arg) {
+        return false;
+    }
+    // Unsubstituted parameters are not an instantiation.
+    // `RangeInclusive::new` keeps `types: [TypeVar]` on the Aggregate
+    // head; splitting on that interned one class for every spec.
+    if arg.starts_with("TypeVar") || arg.starts_with("??") {
+        return false;
+    }
+    true
+}
+
+/// True when `arg` names a fully substituted type: no `TypeVar` / `??`
+/// anywhere, nested arguments included. Distinct from
+/// [`type_arg_splits_per_instantiation`]: `()` and `f32` are concrete
+/// (`Bookkeeper.getuniqueclassdef`) and still do not split.
+fn type_arg_is_concrete(arg: &str) -> bool {
+    !arg.contains("TypeVar") && !arg.contains("??")
+}
+
+fn adt_type_args_are_concrete(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> bool {
+    render_adt_type_args(adt, llbc, 0)
+        .iter()
+        .all(|arg| type_arg_is_concrete(arg))
+}
+
+/// Prefer a destination TypeDeclRef whose arguments are fully
+/// substituted (`Result<(), E>` is concrete even though `()` does not
+/// split), then a concrete head, then the head. A still-open `TypeVar`
+/// is not concrete (`RangeInclusive::new` Aggregate generics).
+/// `Bookkeeper.getuniqueclassdef`.
+fn concrete_instantiation_adt<'a>(
+    head_adt: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    dest_adt: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    llbc: &Llbc,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let concrete = |adt: Option<&'a serde_json::Map<String, serde_json::Value>>| {
+        adt.filter(|h| adt_type_args_are_concrete(h, llbc))
+    };
+    concrete(dest_adt)
+        .or_else(|| concrete(head_adt))
+        .or(head_adt)
 }
 
 /// `<…>` spelling for an enum instantiation, or `None` when no type
@@ -70657,6 +71260,9 @@ fn scalar_to_const_value(v: &serde_json::Value, llbc: &Llbc) -> Option<ConstValu
         return scalar_to_const_value(&serde_json::json!({"Scalar": int}), llbc);
     }
     // `{Scalar: {Signed|Unsigned|Isize|Usize: [ty, value]}}`
+    // Charon also emits `{Scalar: {Char: ["Char", "97"]}}` for a `char`
+    // SwitchInt arm; `AbstractUniCharRepr.convert_const` wants a length-1
+    // unicode, not the code-point integer.
     if let Some(scalar) = obj.get("Scalar").and_then(Value::as_object) {
         for (k, payload) in scalar {
             let arr = payload.as_array()?;
@@ -70664,14 +71270,25 @@ fn scalar_to_const_value(v: &serde_json::Value, llbc: &Llbc) -> Option<ConstValu
                 continue;
             }
             return Some(match k.as_str() {
+                "Char" => {
+                    let n = u32::try_from(scalar_value_to_i64(&arr[1])?).ok()?;
+                    ConstValue::UniStr(char::from_u32(n)?.to_string())
+                }
                 "Unsigned" | "Usize" => ConstValue::UInt(scalar_value_to_u64(&arr[1])?),
                 _ => ConstValue::Int(scalar_value_to_i64(&arr[1])?),
             });
         }
     }
     // `{Char: "c"}` — character matched as a SwitchInt arm.
+    // `AbstractUniCharRepr.convert_const` (`rstr.py`) accepts a length-1
+    // unicode; the UniChar register bank is still `getkind == 'int'`.
     if let Some(c) = obj.get("Char").and_then(Value::as_str) {
-        return Some(ConstValue::Int(c.chars().next()? as i64));
+        let mut chars = c.chars();
+        let ch = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        return Some(ConstValue::UniStr(ch.to_string()));
     }
     // `{Bool: true}` — boolean matched as a SwitchInt arm.
     if let Some(b) = obj.get("Bool").and_then(Value::as_bool) {
@@ -78172,14 +78789,14 @@ mod tests {
         int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
         json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
         primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
-        scalar_replace_named_struct_aggregates, shaped_array_parts, simplify_lowered_graph,
-        static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
+        scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
+        simplify_lowered_graph, static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
         tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
         tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-        tyref_shaped_tuple_root, tyref_to_attr_value_type,
+        tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type,
         tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
     };
-    use crate::flowspace::model::Variable;
+    use crate::flowspace::model::{ConstValue, Variable};
     use crate::model::{
         CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
         VecFieldPart,
@@ -78386,6 +79003,113 @@ mod tests {
             serde_json::json!({"Ref": ["Erased", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]}),
         )
         .unwrap()
+    }
+
+    fn shared_of(pointee: serde_json::Value) -> TyRef {
+        TyRef::Other(serde_json::json!({"Ref": ["Erased", pointee, "Shared"]}))
+    }
+
+    /// `PartialOrd<&B> for &A` formals are `&&T`. One-level
+    /// `tyref_scalar_pointee_value_type` declines a pointer-to-pointer;
+    /// `input_param_value_type` peels to the scalar so mergeinputargs
+    /// sees Integer ∪ Integer (or Float ∪ Float).
+    #[test]
+    fn input_param_peels_nested_ref_of_primitive_to_the_scalar() {
+        use crate::model::ValueType;
+        let llbc = fixture_llbc();
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+        let char_ty = serde_json::json!({"Scalar": "Char"});
+        let one = shared_of(i64_ty.clone());
+        let two = shared_of(serde_json::json!({"Ref": ["Erased", i64_ty.clone(), "Shared"]}));
+        let two_f64 = shared_of(serde_json::json!({"Ref": ["Erased", f64_ty, "Shared"]}));
+        let two_char = shared_of(serde_json::json!({"Ref": ["Erased", char_ty, "Shared"]}));
+        let range = shared_of(serde_json::json!({"Adt": {"id": 0}}));
+        let no_tombstones = std::collections::HashSet::new();
+        assert_eq!(
+            super::input_param_value_type(
+                ValueType::Ref(None),
+                &one,
+                &llbc,
+                false,
+                false,
+                &no_tombstones
+            ),
+            ValueType::Int
+        );
+        assert_eq!(
+            super::input_param_value_type(
+                ValueType::Ref(None),
+                &two,
+                &llbc,
+                false,
+                false,
+                &no_tombstones
+            ),
+            ValueType::Int
+        );
+        assert_eq!(
+            super::input_param_value_type(
+                ValueType::Ref(None),
+                &two_f64,
+                &llbc,
+                false,
+                false,
+                &no_tombstones
+            ),
+            ValueType::Float
+        );
+        assert_eq!(
+            super::input_param_value_type(
+                ValueType::Ref(None),
+                &two_char,
+                &llbc,
+                false,
+                false,
+                &no_tombstones
+            ),
+            ValueType::Int
+        );
+        assert_eq!(
+            super::input_param_value_type(
+                ValueType::Ref(None),
+                &range,
+                &llbc,
+                false,
+                false,
+                &no_tombstones
+            ),
+            ValueType::Ref(None),
+            "&Range stays a reference"
+        );
+        assert_eq!(
+            super::tyref_scalar_pointee_value_type(&two, &llbc),
+            None,
+            "call-result banking still declines &&i64"
+        );
+    }
+
+    #[test]
+    fn tyref_char_class_root_follows_nested_refs() {
+        let llbc = fixture_llbc();
+        let char_ty = serde_json::json!({"Scalar": "Char"});
+        let by_value = TyRef::Other(char_ty.clone());
+        let one = shared_of(char_ty.clone());
+        let two = shared_of(serde_json::json!({"Ref": ["Erased", char_ty, "Shared"]}));
+        let i64 = TyRef::Other(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}}));
+        assert_eq!(
+            super::tyref_char_class_root(&by_value, &llbc).as_deref(),
+            Some("char")
+        );
+        assert_eq!(
+            super::tyref_char_class_root(&one, &llbc).as_deref(),
+            Some("char")
+        );
+        assert_eq!(
+            super::tyref_char_class_root(&two, &llbc).as_deref(),
+            Some("char")
+        );
+        assert_eq!(super::tyref_char_class_root(&i64, &llbc), None);
     }
 
     /// A specialized copy's leaf matches its template's tail.
@@ -80790,22 +81514,143 @@ mod tests {
             tyref_shaped_tuple_root(&by_value, &llbc),
             Some(owner.clone())
         );
-        assert_eq!(tyref_shaped_tuple_root(&borrowed, &llbc), Some(owner));
+        assert_eq!(
+            tyref_shaped_tuple_root(&borrowed, &llbc),
+            Some(owner.clone())
+        );
         let unit = TyRef::Other(serde_json::json!({
             "Adt": { "id": 0, "builtin": "Tuple", "generics": { "types": [] } }
         }));
         assert_eq!(tyref_shaped_tuple_root(&unit, &llbc), None);
         let int = TyRef::Other(serde_json::json!({ "Scalar": { "Integer": { "Signed": "I64" } } }));
         assert_eq!(tyref_shaped_tuple_root(&int, &llbc), None);
+        // The TypeDecl leaf of a builtin Tuple is `"Tuple"`. Input
+        // class_root must keep the shaped name so `call_once` args
+        // seed `SomeTuple` (`rtuple.py` `TupleRepr`).
+        assert_eq!(
+            tyref_ref_param_class_root(&by_value, &llbc, no_tombstoned_leaves(), None),
+            Some(owner)
+        );
+
+        // A `call_once` `tupled_args` is a hash-consed 1-tuple of `fn`.
+        // The TypeDecl leaf is still `"Tuple"`; the Input class_root
+        // must be the shaped `Tuple<fn(...)>` so `getitem(0)` is
+        // `SomePtr` (`binaryop.py` `getitem((tup1, int2))`).
+        let fn_tuple = r#"{
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Builtin": [{"Tuple": 1}, 0]}],
+                        "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": false
+                    },
+                    "kind": {"Struct": []}
+                }, {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["majit_gc", 0]}, {"Ident": ["header", 0]}, {"Ident": ["GCREFOpaque", 0]}],
+                        "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": false
+                    },
+                    "kind": "Opaque"
+                }],
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["call_once", 0]}],
+                        "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [{"Value": [3456, {"Adt": {
+                            "id": 0,
+                            "builtin": "Tuple",
+                            "generics": {
+                                "regions": [],
+                                "types": [{"Value": [287, {"FnPtr": {
+                                    "regions": [],
+                                    "skip_binder": {
+                                        "is_unsafe": false,
+                                        "abi": "Rust",
+                                        "is_variadic": false,
+                                        "inputs": [
+                                            {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+                                            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+                                        ],
+                                        "output": {"RawPtr": [
+                                            {"Adt": {"id": 1, "generics": {
+                                                "regions": [], "types": [],
+                                                "const_generics": [], "trait_refs": []
+                                            }, "builtin": null}},
+                                            "Mut"
+                                        ]}
+                                    }
+                                }}]}],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }}]}],
+                        "output": {"Scalar": "Bool"}
+                    },
+                    "body": "Opaque"
+                }],
+                "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        }"#;
+        let fn_llbc =
+            Llbc::from_slice(fn_tuple.as_bytes()).expect("fn-pointer tuple fixture Llbc parses");
+        let tupled = TyRef::Dedup { id: 3456 };
+        let shaped = tyref_shaped_tuple_root(&tupled, &fn_llbc)
+            .expect("dedup Tuple<fn> must have a shaped root");
+        assert!(
+            majit_ir::descr::is_shaped_tuple_name(&shaped),
+            "shaped root must not be the bare Tuple leaf: {shaped}"
+        );
+        assert!(
+            shaped.contains("fn("),
+            "shaped root must name the fn payload: {shaped}"
+        );
+        assert_eq!(
+            tyref_ref_param_class_root(&tupled, &fn_llbc, no_tombstoned_leaves(), None),
+            Some(shaped)
+        );
     }
 
     #[test]
     fn decode_char_literal_is_its_int_code_point() {
+        let llbc = empty_llbc();
         for (lit, code) in [(">", 0x3e_i64), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
             let json = serde_json::json!({ "Char": lit });
             assert!(
                 matches!(decode_literal(&json), Ok(DecodedConst::Int(n)) if n == code),
                 "char literal {lit:?} decodes to Int({code})",
+            );
+            // SwitchInt arms rtype through `AbstractUniCharRepr.convert_const`.
+            assert!(
+                matches!(
+                    scalar_to_const_value(&json, &llbc),
+                    Some(ConstValue::UniStr(ref s)) if s == lit
+                ),
+                "char SwitchInt arm {lit:?} is a length-1 UniStr",
+            );
+            let scalar = serde_json::json!({ "Scalar": { "Char": ["Char", code.to_string()] } });
+            assert!(
+                matches!(
+                    scalar_to_const_value(&scalar, &llbc),
+                    Some(ConstValue::UniStr(ref s)) if s == lit
+                ),
+                "Scalar Char code point {code} is a length-1 UniStr",
             );
         }
         assert!(
@@ -81395,6 +82240,186 @@ mod tests {
         for p in ["f32", "()", ""] {
             assert!(!type_arg_splits_per_instantiation(p), "{p} must not split");
         }
+        for p in [
+            "TypeVar",
+            "TypeVar#0",
+            "??TypeVar#0",
+            "??unresolved_dedup#5",
+        ] {
+            assert!(
+                !type_arg_splits_per_instantiation(p),
+                "{p} is not a concrete instantiation"
+            );
+        }
+        use super::type_arg_is_concrete;
+        assert!(type_arg_is_concrete("()"));
+        assert!(type_arg_is_concrete("f32"));
+        assert!(type_arg_is_concrete("i64"));
+        assert!(type_arg_is_concrete("Result<(), PyError>"));
+        assert!(!type_arg_is_concrete("TypeVar#0"));
+        assert!(!type_arg_is_concrete("Result<TypeVar, E>"));
+        assert!(!type_arg_is_concrete("??TypeVar#0"));
+    }
+
+    #[test]
+    fn range_inclusive_known_receiver_paints_instantiation_class() {
+        // `bookkeeper.py` `getuniqueclassdef`: a known RangeInclusive<i64>
+        // receiver is that instantiation's class, not a classdef-less
+        // `Ref(None)`. `start_bound` then getattr's `start` on it.
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let name: Vec<serde_json::Value> = ["core", "ops", "range", "RangeInclusive"]
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        let range_inc = serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Struct": [
+                {"name": "start", "ty": i64_ty.clone()},
+                {"name": "end", "ty": i64_ty.clone()},
+                {"name": "exhausted", "ty": {"Scalar": "Bool"}}
+            ]}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [range_inc],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let node = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "builtin": null,
+                "generics": {
+                    "regions": [],
+                    "types": [i64_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        crate::local_crates::with_foreign_body_crate_root("core", || {
+            assert_eq!(
+                super::adt_node_class_root_leaf(&node, &llbc, super::no_tombstoned_leaves()),
+                Some("RangeInclusive<i64>".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn range_inclusive_self_after_subst_paints_instantiation_class() {
+        // Product `start_bound` encodes `&self` as Dedup → Ref → Adt
+        // whose type arg is Dedup → TypeVar. `substitute_type_vars`
+        // copies those wrappers; the painted class is then
+        // `RangeInclusive<i64>` (`bookkeeper.py` `getuniqueclassdef`).
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let name: Vec<serde_json::Value> = ["core", "ops", "range", "RangeInclusive"]
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        let tvar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+        let adt = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [{"Value": [5, tvar]}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let self_ty = serde_json::json!({
+            "Ref": [{"Static": null}, {"Value": [40, adt]}, "Shared"]
+        });
+        let range_inc = serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Struct": [
+                {"name": "start", "ty": {"TypeVar": {"Bound": [0, 0]}}},
+                {"name": "end", "ty": {"TypeVar": {"Bound": [0, 0]}}},
+                {"name": "exhausted", "ty": {"Scalar": "Bool"}}
+            ]}
+        });
+        let body = serde_json::json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": {"Scalar": "Bool"}},
+                        {"index": 1, "name": "self", "span": span, "ty": {"Value": [1, self_ty]}}
+                    ]
+                },
+                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+            }
+        });
+        let file = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "type_decls": [range_inc],
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["start_bound", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": false
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [{"Deduplicated": 1}],
+                        "output": {"Scalar": "Bool"}
+                    },
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let fd = llbc.fn_by_id(0).expect("start_bound");
+        let copied =
+            crate::front::clause_spec::substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[])
+                .expect("substituted start_bound body");
+        let self_ty = &copied.locals.locals[1].ty;
+        crate::local_crates::with_foreign_body_crate_root("core", || {
+            assert_eq!(
+                super::tyref_ref_param_class_root(
+                    self_ty,
+                    &llbc,
+                    super::no_tombstoned_leaves(),
+                    None
+                ),
+                Some("RangeInclusive<i64>".to_string())
+            );
+        });
     }
 
     #[test]
@@ -85664,229 +86689,109 @@ mod tests {
         );
     }
 
-    /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
-    /// its int census callers — `setitem_bytearray` / `byte_w`
-    /// (`(0..=255)`) and `c_int_w` (`(i32::MIN as i64..=i32::MAX as
-    /// i64)`, whose casts lower to `ConstInt` bounds).  All three have
-    /// constant bounds with `lo <= hi`, so for each both residual range
-    /// calls (`RangeInclusive::new` / `contains`) must be gone and an
-    /// `int_between` op present.  Ignored
-    /// by default (loads the real LLBC); run with `cargo test -p
-    /// majit-translate --lib range_contains_fold_real -- --ignored
-    /// --nocapture`.
+    /// The real `RangeBounds::contains` body is the caller of the two
+    /// comparisons (`start <= x && x < end` via `le`/`lt`). `int_between` is
+    /// not emitted: RPython only has that llop because source calls
+    /// `rarithmetic.int_between` (`rint.py`). Ignored by default (loads
+    /// the real LLBC); run with `cargo test -p majit-translate --lib
+    /// range_contains_real_body -- --ignored --nocapture`.
     #[test]
     #[ignore]
-    fn range_contains_fold_real_int_census_sites() {
+    fn range_contains_real_body_carries_le_lt() {
         use crate::model::{CallTarget, OpKind};
 
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
+        let ctx = super::LowerContext::new(&llbc);
 
-        for fname in ["setitem_bytearray", "byte_w", "c_int_w"] {
-            let graph = super::lower_function(&llbc, fname)
-                .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
-
-            // Calls whose FunctionPath ends `["range", "RangeInclusive",
-            // "new"|"contains"]` (the owner-resolved spelling `lower_call`
-            // emits) and the native compare binops the fold produces.
-            let range_call = |leaf: &str| {
-                graph
-                    .blocks
-                    .iter()
-                    .flat_map(|b| b.operations.iter())
-                    .filter(|op| {
-                        matches!(
-                            &op.kind,
-                            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                                if super::fmt_path_ends_with(
-                                    segments,
-                                    &["range", "RangeInclusive", leaf],
-                                )
-                        )
-                    })
-                    .count()
-            };
-            let int_between = graph
-                .blocks
-                .iter()
-                .flat_map(|b| b.operations.iter())
-                .filter(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::LoweredBlackholeOp { opname, args }
-                            if opname == "int_between" && args.len() == 3
-                    )
-                })
-                .count();
-
-            assert_eq!(
-                range_call("new"),
-                0,
-                "{fname}: residual RangeInclusive::new removed"
-            );
-            assert_eq!(
-                range_call("contains"),
-                0,
-                "{fname}: residual contains removed"
-            );
-            assert!(
-                int_between >= 1,
-                "{fname}: int_between(lo, x, hi + 1) emitted"
-            );
+        let mut bounds_contains = None;
+        let mut range_contains = None;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let p = fd.item_meta.name_path();
+            if !p.ends_with("::contains") || !p.contains("ops::range") {
+                continue;
+            }
+            if p.contains("RangeBounds") {
+                bounds_contains = Some(fd);
+            } else if p.contains("RangeInclusive") {
+                continue;
+            } else if p.contains("Range") {
+                range_contains = Some(fd);
+            }
         }
-    }
+        let bounds_fd = bounds_contains.expect("RangeBounds::contains FunDecl with a body");
+        let bounds_graph = super::lower_fun_decl(&ctx, bounds_fd)
+            .unwrap_or_else(|e| panic!("lower RangeBounds::contains: {e:?}"));
 
-    /// The float range in `complex_pow` (`descroperation.rs`,
-    /// `(-100.0..=100.0)`) is out of the int-only fold's scope: the
-    /// element gate rejects the `F64` type, so BOTH residual range calls
-    /// survive (the graph census-Skips as before — no regression, no
-    /// float→int miscompile).  Ignored by default (loads the real LLBC).
-    #[test]
-    #[ignore]
-    fn range_contains_fold_real_declines_float_range() {
-        use crate::model::{CallTarget, OpKind};
-
-        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "complex_pow").expect("lower complex_pow");
-
-        let range_call = |leaf: &str| {
-            graph
-                .blocks
-                .iter()
-                .flat_map(|b| b.operations.iter())
-                .filter(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                            if super::fmt_path_ends_with(
-                                segments,
-                                &["range", "RangeInclusive", leaf],
-                            )
-                    )
-                })
-                .count()
-        };
-        assert!(
-            range_call("new") >= 1,
-            "float range constructor stays residual (fold out of scope)"
+        let mut leaves: Vec<String> = Vec::new();
+        let mut binops: Vec<String> = Vec::new();
+        let mut int_between = 0usize;
+        for op in bounds_graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    if let Some(leaf) = segments.last() {
+                        leaves.push(leaf.clone());
+                    }
+                }
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => leaves.push(name.clone()),
+                OpKind::BinOp { op, .. } => binops.push(op.clone()),
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "int_between" => {
+                    int_between += 1;
+                }
+                _ => {}
+            }
+        }
+        eprintln!(
+            "RangeBounds::contains path={} leaves={leaves:?} binops={binops:?} int_between={int_between}",
+            bounds_fd.item_meta.name_path()
         );
-        assert!(
-            range_call("contains") >= 1,
-            "float range contains stays residual (fold out of scope)"
-        );
-    }
+        assert_eq!(int_between, 0, "body must not emit int_between");
+        let has = |name: &str| leaves.iter().any(|l| l == name) || binops.iter().any(|b| b == name);
+        assert!(has("start_bound"), "missing start_bound: {leaves:?}");
+        assert!(has("end_bound"), "missing end_bound: {leaves:?}");
+        assert!(has("le"), "missing le: leaves={leaves:?} binops={binops:?}");
+        assert!(has("lt"), "missing lt: leaves={leaves:?} binops={binops:?}");
 
-    /// Exclusive `(1..EXACT_FLOAT_INT).contains(&n)` in
-    /// `__majit_wrap_math_isqrt` (pyre-module) folds to
-    /// `int_between(1, n, 1<<53)`.  Ignored by default (loads the real
-    /// module LLBC); run with `cargo test -p majit-translate --lib
-    /// range_contains_fold_real -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn range_contains_fold_real_exclusive_int_isqrt() {
-        use crate::model::{CallTarget, OpKind};
-
-        let path = crate::runtime_names::artifacts::MODULE_ULLBC;
-        let llbc = Llbc::load(path).expect("load real module LLBC");
-        let graph = super::lower_function(&llbc, "__majit_wrap_math_isqrt")
-            .unwrap_or_else(|e| panic!("lower __majit_wrap_math_isqrt: {e:?}"));
-
-        let range_call = |leaf: &str| {
-            graph
-                .blocks
-                .iter()
-                .flat_map(|b| b.operations.iter())
-                .filter(|op| match &op.kind {
+        if let Some(range_fd) = range_contains {
+            let range_graph = super::lower_fun_decl(&ctx, range_fd)
+                .unwrap_or_else(|e| panic!("lower Range::contains: {e:?}"));
+            let mut range_leaves: Vec<String> = Vec::new();
+            let mut range_between = 0usize;
+            for op in range_graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+                match &op.kind {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } => super::fmt_path_ends_with(segments, &["range", "Range", leaf]),
+                    } => {
+                        if let Some(leaf) = segments.last() {
+                            range_leaves.push(leaf.clone());
+                        }
+                    }
                     OpKind::Call {
                         target: CallTarget::Method { name, .. },
                         ..
-                    } => leaf == "contains" && name == "contains",
-                    _ => false,
-                })
-                .count()
-        };
-        let int_between = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::LoweredBlackholeOp { opname, args }
-                        if opname == "int_between" && args.len() == 3
-                )
-            })
-            .count();
-
-        assert_eq!(
-            range_call("contains"),
-            0,
-            "__majit_wrap_math_isqrt: residual Range::contains removed"
-        );
-        assert!(
-            int_between >= 1,
-            "__majit_wrap_math_isqrt: int_between(1, n, 1<<53) emitted"
-        );
-    }
-
-    /// Exclusive float `Range<f64>::contains` is out of the int-only
-    /// fold's scope, the same element gate as RangeInclusive float.
-    /// `__majit_wrap_math_asin` is `(-1.0..=1.0)` (inclusive float) and
-    /// stays residual; no exclusive float Range is rewritten to integer
-    /// compares.  Ignored by default (loads the real module LLBC).
-    #[test]
-    #[ignore]
-    fn range_contains_fold_real_declines_float_exclusive_range() {
-        use crate::model::{CallTarget, OpKind};
-
-        let path = crate::runtime_names::artifacts::MODULE_ULLBC;
-        let llbc = Llbc::load(path).expect("load real module LLBC");
-        let graph = super::lower_function(&llbc, "__majit_wrap_math_asin")
-            .unwrap_or_else(|e| panic!("lower __majit_wrap_math_asin: {e:?}"));
-
-        let exclusive_contains = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                        if super::fmt_path_ends_with(
-                            segments,
-                            &["range", "Range", "contains"],
-                        )
-                )
-            })
-            .count();
-        let inclusive_contains = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                        if super::fmt_path_ends_with(
-                            segments,
-                            &["range", "RangeInclusive", "contains"],
-                        )
-                )
-            })
-            .count();
-        assert_eq!(
-            exclusive_contains, 0,
-            "asin has no exclusive Range::contains (float pin is RangeInclusive)"
-        );
-        assert!(
-            inclusive_contains >= 1,
-            "float RangeInclusive::contains stays residual (fold out of scope)"
-        );
+                    } => range_leaves.push(name.clone()),
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "int_between" => {
+                        range_between += 1;
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!(
+                "Range::contains path={} leaves={range_leaves:?} int_between={range_between}",
+                range_fd.item_meta.name_path()
+            );
+            assert_eq!(range_between, 0);
+        }
     }
 
     /// `formatting::char_arg` narrows its BigInt to `u32`, not `i64`.  The
@@ -87839,6 +88744,256 @@ mod tests {
         assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
     }
 
+    #[test]
+    fn trait_method_on_known_receiver_names_the_impl_graph() {
+        // `description.py` `ClassDesc.lookup`: RangeBounds::start_bound
+        // on a Range receiver is that impl's graph, not the trait path.
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            })
+        };
+        let range_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": {"types": []}}
+        });
+        let range_td = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["core", "ops", "range", "Range"]),
+            "kind": {"Struct": []}
+        });
+        let start_bound = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["core", "ops", "range", "Range", "start_bound"]),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [{"Ref": [null, range_adt.clone(), "Shared"]}],
+                "output": {"Tuple": []}
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 1, "locals": []},
+                "body": []
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [range_td],
+                "fun_decls": [null, start_bound],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["core", "ops", "range", "RangeBounds"]),
+                    "methods": [{"skip_binder": {"name": "start_bound"}}]
+                }],
+                "trait_impls": [{
+                    "impl_trait": {"id": 0, "generics": {"types": [range_adt.clone()]}},
+                    "methods": [{
+                        "kind": {"TraitMethod": [0, 0]},
+                        "skip_binder": {"id": 1}
+                    }]
+                }]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let recv = TyRef::Other(serde_json::json!({
+            "Ref": [null, range_adt, "Shared"]
+        }));
+        let payload = serde_json::json!([
+            {
+                "kind": {"Clause": {"Bound": [0, 0]}},
+                "trait_decl_ref": {"skip_binder": {"id": 0}}
+            },
+            0
+        ]);
+        let got = super::trait_method_on_known_receiver(Some(&recv), &payload, &llbc);
+        assert_eq!(
+            got.map(|(_, segs, _)| segs),
+            Some(vec![
+                "ops".to_string(),
+                "range".to_string(),
+                "Range".to_string(),
+                "start_bound".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn unify_receiver_ty_bound_var_equals_actual_without_recursing() {
+        // A bound TypeVar is compared with `actual` after
+        // `strip_ty_indirections`. Recursing through subst on a
+        // self-binding (`subst[0] = TypeVar(0)`) would loop.
+        let llbc = empty_llbc();
+        let tv0 = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+        let mut subst = vec![Some(tv0.clone())];
+        assert!(!super::unify_receiver_ty(&tv0, &i64_ty, &mut subst, &llbc));
+        let mut subst = vec![Some(i64_ty.clone())];
+        assert!(super::unify_receiver_ty(&tv0, &i64_ty, &mut subst, &llbc));
+        let mut subst = vec![Some(i64_ty.clone())];
+        assert!(!super::unify_receiver_ty(&tv0, &f64_ty, &mut subst, &llbc));
+    }
+
+    #[test]
+    fn unify_receiver_ty_distinguishes_adt_const_generics() {
+        // `Buffer<4>` must not match `Buffer<8>`. Reconstructed
+        // const generics come from the receiver, not the impl row.
+        let llbc = empty_llbc();
+        let cg = |n: &str| {
+            serde_json::json!([
+                {"Integer": {"Unsigned": ["Usize", n]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ])
+        };
+        let buf = |n: &str| {
+            serde_json::json!({
+                "Adt": {
+                    "id": 0,
+                    "generics": {"types": [], "const_generics": cg(n)}
+                }
+            })
+        };
+        let buf4 = buf("4");
+        let buf8 = buf("8");
+        let mut subst = Vec::new();
+        assert!(super::unify_receiver_ty(&buf4, &buf4, &mut subst, &llbc));
+        assert!(!super::unify_receiver_ty(&buf4, &buf8, &mut subst, &llbc));
+        let recv = serde_json::json!({"Ref": [null, buf4.clone(), "Shared"]});
+        let row = serde_json::json!({
+            "generics": {
+                "const_generics": [{"Var": 0}],
+                "trait_refs": []
+            }
+        });
+        let got = super::reconstructed_impl_generics(&[], &row, &recv);
+        assert_eq!(got["const_generics"], cg("4"));
+    }
+
+    #[test]
+    fn spec_segments_distinguishes_scalar_trait_impls() {
+        // `CallControl.graphs_from`: `impl PartialOrd<char> for char` and
+        // `impl PartialOrd<i64> for i64` are distinct function objects.
+        // `name_path` is `cmp::impls::<Impl>::le` for both; the impl's
+        // trait ref and Self type is the identity (`Bookkeeper.getdesc`).
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+        let meta = |name: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            })
+        };
+        let char_ty = serde_json::json!({"Scalar": "Char"});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let le_fd = |def_id: u64, impl_id: u64| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(vec![
+                    ident("core"),
+                    ident("cmp"),
+                    ident("impls"),
+                    serde_json::json!({"Impl": {"Trait": impl_id}}),
+                    ident("le"),
+                ]),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [{"Scalar": "Bool"}],
+                    "output": {"Scalar": "Bool"}
+                },
+                "body": {"Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 2, "locals": []},
+                    "body": []
+                }}
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [null, le_fd(1, 0), le_fd(2, 1)],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("core"), ident("cmp"), ident("PartialOrd")]),
+                    "methods": [{"skip_binder": {"name": "le"}}]
+                }],
+                "trait_impls": [
+                    {"impl_trait": {"id": 0, "generics": {"types": [char_ty.clone(), char_ty.clone()]}}, "methods": []},
+                    {"impl_trait": {"id": 0, "generics": {"types": [i64_ty.clone(), i64_ty.clone()]}}, "methods": []}
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let char_le = llbc.fn_by_id(1).expect("char le");
+        let i64_le = llbc.fn_by_id(2).expect("i64 le");
+        assert_eq!(super::impl_method_owner_for_fundecl(&llbc, char_le), None);
+        assert_eq!(super::impl_method_owner_for_fundecl(&llbc, i64_le), None);
+        let char_path = super::spec_segments(&llbc, char_le, "le");
+        let i64_path = super::spec_segments(&llbc, i64_le, "le");
+        let char_identity = crate::front::clause_spec::render_trait_impl(&llbc, 0)
+            .expect("char PartialOrd identity");
+        let i64_identity = crate::front::clause_spec::render_trait_impl(&llbc, 1)
+            .expect("i64 PartialOrd identity");
+        assert_ne!(char_identity, i64_identity);
+        assert_eq!(
+            char_path,
+            super::trait_impl_identity_path("cmp::impls::<Impl>", &char_identity, "le")
+        );
+        assert_eq!(
+            i64_path,
+            super::trait_impl_identity_path("cmp::impls::<Impl>", &i64_identity, "le")
+        );
+        assert_ne!(char_path, i64_path);
+        assert_eq!(
+            super::registered_path_for_fun_decl(&llbc, char_le).segments,
+            char_path
+        );
+        assert_eq!(
+            super::registered_path_for_fun_decl(&llbc, i64_le).segments,
+            i64_path
+        );
+        let mut char_fn = crate::front::semantic::SemanticFunction::with_empty_graph(
+            "le", "le", None, None, None,
+        );
+        char_fn.module_path = "cmp::impls::<Impl>".to_string();
+        char_fn.trait_impl_id = Some(0);
+        char_fn.trait_impl_identity = Some(char_identity.clone());
+        let mut i64_fn = crate::front::semantic::SemanticFunction::with_empty_graph(
+            "le", "le", None, None, None,
+        );
+        i64_fn.module_path = "cmp::impls::<Impl>".to_string();
+        i64_fn.trait_impl_id = Some(1);
+        i64_fn.trait_impl_identity = Some(i64_identity.clone());
+        assert_ne!(
+            super::semantic_function_dedup_key(&char_fn),
+            super::semantic_function_dedup_key(&i64_fn)
+        );
+        let mut char_other_artifact = char_fn.clone();
+        char_other_artifact.trait_impl_id = Some(12);
+        assert_eq!(
+            super::semantic_function_dedup_key(&char_fn),
+            super::semantic_function_dedup_key(&char_other_artifact)
+        );
+    }
+
     /// Two one-call graphs sharing a synthetic `core::intrinsics::transmute`
     /// declaration.  The first has the portal's scalar-to-fieldless-enum
     /// shape; the second is an equal-size register-bank crossing.
@@ -88322,9 +89477,8 @@ mod tests {
 
     #[test]
     fn range_contains_is_not_harvested_as_function_path() {
-        // Int `Range::contains` folds through `front::range_contains`; the
-        // FunctionPath harvest arm that residualized it is gone.  A
-        // structural mismatch leaves the unregistered call (census Skip).
+        // A bodyless `Range::contains` is not harvested as an opaque
+        // external; the FunctionPath stays unregistered (census Skip).
         let llbc = range_contains_fixture();
         let harvested = super::collect_foreign_opaque_method_externals(&llbc);
         assert!(
@@ -88338,9 +89492,8 @@ mod tests {
     #[test]
     fn range_contains_lowers_as_method() {
         // Exclusive `Range` is a struct ADT whose FunDecl is Opaque.
-        // `impl_method_owner` declines the Method hint for that shape so
-        // `front::range_contains` can fold `Range::contains` the same way
-        // `RangeInclusive::contains` folds (its owner is Opaque).
+        // `impl_method_owner` declines the Method hint for that shape, so
+        // the call is a FunctionPath (`Bookkeeper.getdesc`).
         let llbc = range_contains_fixture();
         let graph = super::lower_function(&llbc, "range_contains").expect("lower Range::contains");
         let ops = graph_ops(&graph);
@@ -96657,6 +97810,119 @@ mod tests {
         );
     }
 
+    fn range_inclusive_struct(def_id: u64) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["ops", 0]},
+                    {"Ident": ["range", 0]},
+                    {"Ident": ["RangeInclusive", 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Struct": [
+                {"name": "start", "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null},
+                {"name": "end", "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null},
+                {"name": "exhausted", "ty": {"Scalar": "Bool"}, "attr_info": null}
+            ]}
+        })
+    }
+
+    #[test]
+    fn resolve_aggregate_adt_range_inclusive_uses_dest_ty_when_head_is_bare_id() {
+        let llbc = llbc_with_types("fixture", vec![range_inclusive_struct(0)], vec![]);
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let accum = super::AccumulatorFacts::build(&llbc, &body);
+        let tombstoned = std::collections::HashSet::new();
+        let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let lowering = super::Lowering::new(
+            &llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &tombstoned,
+            &gc_struct_ids_llbc,
+            &accum,
+            &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+            false,
+            false,
+        )
+        .unwrap();
+        crate::local_crates::with_foreign_body_crate_root("core", || {
+            let kind = serde_json::json!({"Adt": [0]});
+            let dest = |ty: serde_json::Value| {
+                TyRef::Other(serde_json::json!({
+                    "Value": [7, option_adt_node(0, ty)]
+                }))
+            };
+            let leaf_of = |ty: serde_json::Value| {
+                let (_, leaf, _, _, _, _) = lowering
+                    .resolve_aggregate_adt(&kind, Some(&dest(ty)))
+                    .expect("RangeInclusive constructor");
+                leaf
+            };
+            let i64_leaf = leaf_of(option_int_arg(true));
+            let char_leaf = leaf_of(serde_json::json!({"Scalar": "Char"}));
+            assert_eq!(i64_leaf, "RangeInclusive<i64>");
+            assert_eq!(char_leaf, "RangeInclusive<char>");
+            assert_ne!(
+                i64_leaf, char_leaf,
+                "a bare type_id head must not intern both instantiations as RangeInclusive"
+            );
+            let (_, bare_leaf, _, _, _, _) = lowering
+                .resolve_aggregate_adt(&kind, None)
+                .expect("presence check without dest_ty still resolves the ADT");
+            assert_eq!(
+                bare_leaf, "RangeInclusive",
+                "without a dest_ty the presence check may keep the unsuffixed leaf"
+            );
+            // Product `new` spells the Aggregate head as a TypeDeclRef whose
+            // `types` are still `TypeVar`. That is nonempty, so a "has any
+            // type args" test interned `RangeInclusive<TypeVar#0>` for every
+            // spec and unioned `start`. Prefer dest_ty when the head is not
+            // concrete (`bookkeeper.py` `getuniqueclassdef`).
+            let kind_tvar = serde_json::json!({"Adt": [{
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                },
+                "builtin": null
+            }, null, null]});
+            let leaf_tvar = |ty: serde_json::Value| {
+                let (_, leaf, _, _, _, _) = lowering
+                    .resolve_aggregate_adt(&kind_tvar, Some(&dest(ty)))
+                    .expect("RangeInclusive constructor with TypeVar head");
+                leaf
+            };
+            assert_eq!(leaf_tvar(option_int_arg(true)), "RangeInclusive<i64>");
+            assert_eq!(
+                leaf_tvar(serde_json::json!({"Scalar": "Char"})),
+                "RangeInclusive<char>"
+            );
+        });
+    }
+
     #[test]
     fn option_integer_instantiations_paint_distinct_class_roots() {
         // A returned `Option<usize>` annotates as that class, not the
@@ -100983,10 +102249,12 @@ mod tests {
 
     /// Real-LLBC anchor for the unsigned `saturating_sub` clamp diamond:
     /// `generic_alias_class_getitem`'s arg-count error path computes
-    /// `args.len().saturating_sub(1)`.  After the `front::saturating_sub`
-    /// post-pass there must be no residual `["num","<Impl>","saturating_sub"]`
-    /// call and at least one `lt` guard + one `sub` (the `if a < b { 0 } else
-    /// { a - b }` diamond).  `#[ignore]`d (loads the ~440MB real LLBC); run with
+    /// `args.len().saturating_sub(1)`.  `core::intrinsics::saturating_sub`
+    /// (`rint.py` `rtype_sub_ovf` for signed; unsigned floors at zero) is
+    /// mapped in `lower_call`.  There must be no residual
+    /// `["num","<Impl>","saturating_sub"]` call and at least one `lt` guard
+    /// + one `sub` (the `if a < b { 0 } else { a - b }` diamond).  `#[ignore]`d
+    /// (loads the ~440MB real LLBC); run with
     /// `cargo test -p majit-translate --lib saturating_sub_generic_alias_real
     /// -- --ignored`.
     #[test]
@@ -101029,6 +102297,65 @@ mod tests {
             lt_guards >= 1 && subs >= 1,
             "generic_alias_class_getitem: expected the a<b guard and the a-b subtraction \
              (lt={lt_guards}, sub={subs})"
+        );
+    }
+
+    /// Real-LLBC anchor for the unsigned `saturating_sub` wrapper itself.
+    /// In-lowering rewrite of `core::intrinsics::saturating_sub` replaced
+    /// the Call's goto with non-MIR diamond arms, so `lower_framestate`
+    /// `stub_dead_block`'d the Return continuation (`flowcontext.py`
+    /// `make_next_block`) and the wrapper became a raise-only stub. The
+    /// clamp rewrite now runs after the body lowers (`bool::then` /
+    /// `saturating_mul`); the usize wrapper must keep the `lt`/`sub`
+    /// diamond and must not close startblock onto exceptblock.
+    /// `#[ignore]`d (loads the object LLBC); run with
+    /// `cargo test -p majit-translate --lib saturating_sub_wrapper_diamond_real
+    /// -- --ignored`.
+    #[test]
+    #[ignore]
+    fn saturating_sub_wrapper_diamond_real() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load object LLBC");
+        let context = super::LowerContext::new(&llbc);
+        let mut saw = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if fd.item_meta.name_path() != "core::num::<Impl>::saturating_sub" {
+                continue;
+            }
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let graph = super::lower_fun_decl(&context, fd)
+                .expect("lower core::num::<Impl>::saturating_sub");
+            let start = &graph.blocks[graph.startblock.0];
+            assert!(
+                !(start.exits.len() == 1 && start.exits[0].target == graph.exceptblock),
+                "{}: startblock is a raise-only stub (framestate stub_dead_block of the Return continuation)",
+                graph.name
+            );
+            let lt_guards = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "lt"))
+                .count();
+            let subs = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub"))
+                .count();
+            assert!(
+                lt_guards >= 1 && subs >= 1,
+                "{}: expected the unsigned clamp diamond (lt={lt_guards}, sub={subs})",
+                graph.name
+            );
+            saw += 1;
+        }
+        assert!(
+            saw >= 1,
+            "object LLBC: expected at least one unstructured core::num::<Impl>::saturating_sub"
         );
     }
 

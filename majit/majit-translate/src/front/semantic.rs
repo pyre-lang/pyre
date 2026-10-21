@@ -54,10 +54,14 @@ pub struct SemanticFunction {
     /// Used to construct the full CallPath for return_type registration.
     pub self_ty_root: Option<String>,
     /// Charon's concrete trait-impl identity when this function comes from an
-    /// `Impl { Trait: id }` name segment. RPython `CallControl.graphs_from`
-    /// obtains the graph from the function object; the Rust port uses this id
-    /// to keep same-named impl methods distinct in `CallPath`.
+    /// `Impl { Trait: id }` name segment. Intra-LLBC readers
+    /// (`blanket_into_devirt`) keep the extraction-local id; cross-artifact
+    /// keys use [`Self::trait_impl_identity`].
     pub trait_impl_id: Option<u64>,
+    /// Trait-impl identity spelled from the impl's trait ref and Self type
+    /// (`item_meta` / `impl_trait` + Self). `Bookkeeper.getdesc` keys by the
+    /// callable; an extraction-local impl index is not that identity.
+    pub trait_impl_identity: Option<String>,
     /// Charon `FunDecl.def_id` of the declaration this function was
     /// lowered from. Threaded onto `FunctionGraph` so `CallControl`
     /// resolves a call site by decl identity rather than a name suffix.
@@ -148,6 +152,7 @@ impl SemanticFunction {
             return_type: None,
             self_ty_root,
             trait_impl_id: None,
+            trait_impl_identity: None,
             fun_decl_id: None,
             module_path: String::new(),
             hints: Vec::new(),
@@ -228,6 +233,109 @@ impl<'de> Deserialize<'de> for FieldRow {
             }),
         }
     }
+}
+
+/// Drop a leading local or foreign crate root so intern spellings
+/// (`ops::range::RangeInclusive`) match harvested keys
+/// (`core::ops::range::RangeInclusive`). `bookkeeper.py`
+/// `getuniqueclassdef` keys by the class object, not the import prefix.
+pub(crate) fn crate_relative_struct_path(path: &str) -> &str {
+    match path.split_once("::") {
+        Some((root, rest))
+            if crate::local_crates::is_foreign_body_crate_root(root)
+                || crate::local_crates::is_local_crate_root(root) =>
+        {
+            rest
+        }
+        _ => path,
+    }
+}
+
+/// First balanced `<…>` group, including brackets. A trailing enum
+/// variant (`Result<T>::Ok`) is excluded.
+fn generic_args_span(name: &str) -> Option<&str> {
+    let start = name.find('<')?;
+    let mut depth = 0usize;
+    for (offset, byte) in name.as_bytes()[start..].iter().copied().enumerate() {
+        match byte {
+            b'<' => depth += 1,
+            b'>' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&name[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_comma_args(inner: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start: usize = 0;
+    for (i, b) in inner.bytes().enumerate() {
+        match b {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                let segment = inner[start..i].trim();
+                if !segment.is_empty() {
+                    out.push(segment);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+/// Type arguments of the first `<…>` group (`CodeObject<ConstantData>` →
+/// `["ConstantData"]`, `RangeInclusive<u8>` → `["u8"]`).
+pub(crate) fn instantiation_type_args(name: &str) -> Vec<&str> {
+    let Some(span) = generic_args_span(name) else {
+        return Vec::new();
+    };
+    split_comma_args(&span[1..span.len() - 1])
+}
+
+/// True when `arg` is a scalar that changes a struct field's int/float
+/// layout (`RangeInclusive<u8>` vs `<i64>`). Named ADTs (`ConstantData`)
+/// are one class with the omitted-default spelling
+/// (`bookkeeper.py` `getuniqueclassdef`).
+pub(crate) fn type_arg_is_scalar_layout(arg: &str) -> bool {
+    matches!(
+        arg.trim().rsplit("::").next().unwrap_or(arg.trim()),
+        "bool"
+            | "char"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
+}
+
+/// True when any type argument of `name` is a scalar-layout primitive.
+pub(crate) fn instantiation_has_scalar_layout_arg(name: &str) -> bool {
+    instantiation_type_args(name)
+        .iter()
+        .any(|arg| type_arg_is_scalar_layout(arg))
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -641,6 +749,60 @@ impl StructFieldRegistry {
         self.fields.get(key).map(Vec::as_slice)
     }
 
+    /// True when a harvested TypeDecl path for `owner` starts with a
+    /// foreign-body crate root (`local_crates::is_foreign_body_crate_root`).
+    /// A generic struct in that crate is its own class per instantiation
+    /// (`bookkeeper.py` `getuniqueclassdef`); local-crate structs stay
+    /// unsuffixed so closures are not seeded from template rows.
+    ///
+    /// Intern spellings are often crate-stripped (`ops::range::RangeInclusive`
+    /// after `core::` is dropped). Those no longer start with the harvested
+    /// crate root; match them against registry keys that still do.
+    pub(crate) fn owner_in_foreign_body_crate(&self, owner: &str) -> bool {
+        let stripped = majit_ir::descr::strip_generic_args(owner);
+        let crate_root = stripped.split("::").next().unwrap_or(stripped.as_ref());
+        if crate::local_crates::is_foreign_body_crate_root(crate_root) {
+            return true;
+        }
+        let leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
+        if leaf == crate_root {
+            self.ensure_field_path_index();
+            let index = self.field_path_index.borrow();
+            let Some(index) = index.as_ref() else {
+                return false;
+            };
+            let Some(bucket) = index.by_last.get(leaf) else {
+                return false;
+            };
+            return bucket.iter().any(|key| {
+                let crate_root = key.split("::").next().unwrap_or(key.as_str());
+                crate::local_crates::is_foreign_body_crate_root(crate_root)
+            });
+        }
+        let tail = crate_relative_struct_path(stripped.as_ref());
+        self.fields.keys().any(|k| {
+            let ks = majit_ir::descr::strip_generic_args(k);
+            let root = ks.split("::").next().unwrap_or(ks.as_ref());
+            crate::local_crates::is_foreign_body_crate_root(root)
+                && crate_relative_struct_path(ks.as_ref()) == tail
+        })
+    }
+
+    /// True when a harvested field row is the same struct template as
+    /// `stripped` (`bookkeeper.py` `getuniqueclassdef` by class object).
+    /// Crate-stripped intern spellings (`bytecode::CodeObject`) match a
+    /// harvested `rustpython_compiler_core::bytecode::CodeObject`.
+    pub(crate) fn covers_stripped_template(&self, stripped: &str) -> bool {
+        let stripped_canon = majit_ir::descr::canonical_struct_name(stripped);
+        let stripped_rel = crate_relative_struct_path(stripped);
+        self.fields.keys().any(|k| {
+            let ks = majit_ir::descr::strip_generic_args(k);
+            ks.as_ref() == stripped
+                || majit_ir::descr::canonical_struct_name(ks.as_ref()) == stripped_canon
+                || crate_relative_struct_path(ks.as_ref()) == stripped_rel
+        })
+    }
+
     fn unique_suffix_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
         // Two path-suffix-related keys share their last `::` segment, so
         // the bucket is the full candidate set. More than one match is
@@ -1024,6 +1186,26 @@ mod tests {
     /// `remove` then `insert` of a different key restores `len`. The suffix
     /// lookup has to observe the new row.
     #[test]
+    fn named_adt_instantiation_does_not_split_and_scalar_does() {
+        assert_eq!(
+            instantiation_type_args("bytecode::CodeObject<ConstantData>"),
+            ["ConstantData"]
+        );
+        assert_eq!(
+            instantiation_type_args("ops::range::RangeInclusive<u8>"),
+            ["u8"]
+        );
+        assert!(!instantiation_has_scalar_layout_arg(
+            "bytecode::CodeObject<ConstantData>"
+        ));
+        assert!(instantiation_has_scalar_layout_arg(
+            "ops::range::RangeInclusive<u8>"
+        ));
+        assert!(type_arg_is_scalar_layout("i64"));
+        assert!(!type_arg_is_scalar_layout("ConstantData"));
+    }
+
+    #[test]
     fn field_path_index_rebuilds_after_same_len_key_replacement() {
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(
@@ -1077,6 +1259,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             trait_impl_id: None,
+            trait_impl_identity: None,
             fun_decl_id: None,
             module_path: String::new(),
             hints: Vec::new(),

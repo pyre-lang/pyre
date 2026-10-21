@@ -2047,20 +2047,13 @@ pub(crate) fn non_arm_skip_category(msg: &str) -> Option<&'static str> {
 /// The registry dedupe key of `path` (see
 /// [`populate_call_registry_from_call_graphs`]).
 fn canonical_dedup_key(path: &crate::parse::CallPath) -> Vec<String> {
-    let mut segs: Vec<String> = path.segments.to_vec();
-    if segs
-        .first()
-        .map(|s| s == "crate" || crate::local_crates::is_local_crate_root(s))
-        .unwrap_or(false)
-    {
-        segs.remove(0);
-    }
-    segs
+    crate::local_crates::strip_alias_crate_prefix(&path.segments)
+        .unwrap_or_else(|| path.segments.to_vec())
 }
 
 /// Why a funcobj under the canonical path `canonical_strip` gets no
 /// registry entry: its callsites resolve elsewhere.
-fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
+pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'static str> {
     // `pyre_object::lltype::malloc[_typed/_stable]` are GC allocation intrinsics,
     // recognised as host builtins (annotator `malloc_typed_alloc`, HOST_ENV
     // `pyre_object.lltype` module). Their real bodies enter the host
@@ -2219,24 +2212,33 @@ const SKIP_VARSIZE_GC_HEADER_ALLOC: &str = "skip-varsize-gc-header-alloc";
 /// `conditional_call_elidable1`. `canonical_dedup_key` strips the crate
 /// root only when `majit_rlib` is a seeded local crate, so both
 /// `["jit", leaf]` and `["majit_rlib", "jit", leaf]` name the same
-/// HOST_ENV / `BUILTIN_ANALYZERS` entry.
+/// HOST_ENV / `BUILTIN_ANALYZERS` entry (`rlib/jit.py`
+/// `ConditionalCallEntry`). A Charon instance / residual-inst /
+/// generic-args spelling of the same leaf is still that ExtRegistry
+/// object (`template_callable_leaf`). A bare leaf is some other
+/// function of that name; decline that alias from
+/// `FunctionGraph.source_identity`, not from `graph.name`.
 fn is_jit_conditional_call_residual(canonical_strip: &[String]) -> bool {
-    let leaf = match canonical_strip {
-        [crate_name, module, leaf] if crate_name == "majit_rlib" && module == "jit" => {
-            leaf.as_str()
-        }
-        [module, leaf] if module == "jit" => leaf.as_str(),
-        _ => return false,
-    };
-    matches!(
-        leaf,
-        "conditional_call0"
-            | "conditional_call1"
-            | "conditional_call2"
-            | "conditional_call3"
-            | "conditional_call4"
-            | "conditional_call_elidable1"
-    )
+    crate::flowspace::model::is_jit_conditional_call_path(canonical_strip)
+}
+
+/// Decline a graph whose source callable is `ConditionalCallEntry`,
+/// including a bare-leaf alias whose `source_identity` is the real
+/// `majit_rlib::jit::<leaf>` / `jit::<leaf>` path.
+fn registration_decline_graph_origin(graph: &LegacyGraph) -> Option<&'static str> {
+    let identity = graph.source_identity.as_deref()?;
+    let segs: Vec<String> = identity
+        .split("::")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if segs.is_empty() {
+        return None;
+    }
+    registration_decline(&segs).or_else(|| {
+        crate::local_crates::strip_alias_crate_prefix(&segs)
+            .and_then(|stripped| registration_decline(&stripped))
+    })
 }
 
 /// Residual `majit_gc::header::alloc_varsize_with_gc_header_immortal*` /
@@ -2436,7 +2438,8 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     //
     // The dedupe key strips a leading crate-prefix segment so the alias
     // spellings registered by `lib.rs` for each free function (`[mod, foo]`,
-    // `[crate, mod, foo]`, and `[loaded_crate, mod, foo]`) collapse to a
+    // `[crate, mod, foo]`, `[loaded_crate, mod, foo]`, and a harvested
+    // foreign-body crate such as `[core, mod, foo]`) collapse to a
     // single canonical entry `[mod, foo]`. Stripping only `crate` (the
     // previous heuristic) left the external crate-name aliases as distinct canonical
     // entries with distinct `Rc<FunctionEntry>` HostObjects, and
@@ -2466,6 +2469,19 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // carrying the indirection.
     let mut by_canonical_path: HashMap<Vec<String>, FunctionPathKey> = HashMap::new();
     for (path, graph) in function_graphs.iter_declared() {
+        let canonical_strip = canonical_dedup_key(&path);
+        // Decline before the declared-funcobj skip: a clause-spec header
+        // (`GraphStore::declare`, `declared = true`) is still
+        // `ConditionalCallEntry`, and `describe_declared_funcobj` is too
+        // late once `translate_op` Layer-1 has already baked a
+        // `UserFunction` HostObject. `rlib/jit.py` ExtRegistry, not a
+        // `FunctionDesc`.
+        if let Some(reason) = registration_decline(&canonical_strip)
+            .or_else(|| registration_decline_graph_origin(graph.as_ref()))
+        {
+            crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
+            continue;
+        }
         // A funcobj the front end declared gets its entry on first lookup
         // (`describe_declared_funcobj`).
         if function_graphs.declared_funcobj(&path).is_some() {
@@ -2480,11 +2496,6 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             continue;
         }
         let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
-        let canonical_strip = canonical_dedup_key(&path);
-        if let Some(reason) = registration_decline(&canonical_strip) {
-            crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
-            continue;
-        }
         let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
@@ -2686,7 +2697,9 @@ fn describe_declared_funcobj(
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
     let path = crate::parse::CallPath::from_segments(key.segments().iter().cloned());
     let graph = store.declared_funcobj(&path)?;
-    if let Some(reason) = registration_decline(&canonical_dedup_key(&path)) {
+    if let Some(reason) = registration_decline(&canonical_dedup_key(&path))
+        .or_else(|| registration_decline_graph_origin(graph.as_ref()))
+    {
         crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
         return None;
     }
@@ -5859,6 +5872,34 @@ mod tests {
                 Some(SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY),
                 "majit_rlib::jit::{leaf}"
             );
+            assert_eq!(
+                registration_decline(&[leaf.into()]),
+                None,
+                "bare leaf {leaf} is not ConditionalCallEntry"
+            );
+            assert_eq!(
+                registration_decline(&["helpers".into(), leaf.into()]),
+                None,
+                "helpers::{leaf} is not ConditionalCallEntry"
+            );
+            let spec = format!("{leaf}__spec_deadbeefdeadbeef");
+            assert_eq!(
+                registration_decline(&["jit".into(), spec.clone()]),
+                Some(SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY),
+                "spec leaf {spec}"
+            );
+            let inst = format!("{leaf}__inst_PyObjectRef_i64_bool");
+            assert_eq!(
+                registration_decline(&[inst.clone()]),
+                None,
+                "inst leaf {inst} without a jit path is not ConditionalCallEntry"
+            );
+            let generic = format!("{leaf}::<A, B, C>");
+            assert_eq!(
+                registration_decline(&["majit_rlib".into(), "jit".into(), generic.clone()]),
+                Some(SKIP_JIT_CONDITIONAL_CALL_EXTREGISTRY),
+                "generic leaf {generic}"
+            );
         }
         assert_eq!(
             registration_decline(&["jit".into(), "we_are_jitted".into()]),
@@ -5893,7 +5934,63 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("HOST_ENV must resolve majit_rlib.jit.{leaf}"));
             assert!(crate::annotator::builtin::is_registered(host.qualname()));
+            let spec_host = crate::flowspace::model::host_env_callable(&[
+                "majit_rlib".to_string(),
+                "jit".to_string(),
+                format!("{leaf}__spec_deadbeefdeadbeef"),
+            ])
+            .unwrap_or_else(|| panic!("HOST_ENV must resolve spec spelling of {leaf}"));
+            assert_eq!(spec_host.qualname(), host.qualname());
         }
+    }
+
+    /// Production clause specializations `GraphStore::declare` the header
+    /// (`declared = true`). Populate used to `continue` before
+    /// `registration_decline`, so Layer-1 still minted a `FunctionDesc`
+    /// of the empty residual and `mergeinputargs` unioned distinct fn-ptr
+    /// TOs. Decline the declared header too; HOST_ENV stays the callable.
+    #[test]
+    fn conditional_call_declared_funcobj_is_declined_and_host_env_wins() {
+        let leaf = "conditional_call3";
+        let path = crate::parse::CallPath::from_segments(["majit_rlib", "jit", leaf]);
+        let mut header = LegacyGraph::new(leaf);
+        let inputs = (0..5).map(|_| header.alloc_value_var()).collect::<Vec<_>>();
+        header.block_mut(header.startblock).inputargs = inputs;
+        header.set_return(header.startblock, None);
+        let header = std::rc::Rc::new(header);
+        let built = header.clone();
+        let graph = crate::model::LazyGraph::deferred(header, move || {
+            Some(crate::model::FunctionGraph::clone(&built))
+        });
+        let decls = crate::codewriter::call::FuncObjDeclarations::default();
+        decls.push(crate::codewriter::call::DeclaredFuncObj {
+            path: path.clone(),
+            graph,
+            transform: crate::codewriter::call::GraphTransform::default(),
+        });
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.use_declarations(decls);
+        assert!(
+            graphs.declared_funcobj(&path).is_some(),
+            "fixture must be a declared funcobj, not GraphStore::insert"
+        );
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let key = FunctionPathKey::from_segments(["majit_rlib", "jit", leaf]);
+        assert!(
+            registry.lookup(&key).is_none(),
+            "declared residual header must not become a FunctionDesc"
+        );
+        let host = crate::flowspace::model::host_env_callable(
+            &["majit_rlib", "jit", leaf]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .expect("HOST_ENV must resolve majit_rlib.jit.conditional_call3");
+        assert!(crate::annotator::builtin::is_registered(host.qualname()));
     }
 
     /// Residual `majit_gc::header` varsize immortal allocators are

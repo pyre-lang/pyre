@@ -117,6 +117,9 @@ pub(crate) mod shims {
     pub(crate) const CAST_INSTANCE: &str = "__cast_instance_intrinsic";
     pub(crate) const CAST_ADDRESS: &str = "__cast_address_intrinsic";
     pub(crate) const RANGE: &str = "__majit_range";
+    /// Rust `as char` → `builtin_unichr`.  Reserved like `RANGE`: a bare
+    /// `["unichr"]` binds `ctypeprim::unichr` in the leaf-keyed registry.
+    pub(crate) const UNICHR: &str = "__majit_unichr";
     /// `enumerate(lst)`: the front respells `lst.iter().enumerate()` as
     /// `iter(__majit_enumerate(lst))`.
     pub(crate) const ENUMERATE: &str = "__majit_enumerate";

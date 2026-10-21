@@ -63,8 +63,8 @@ use std::sync::{Arc, LazyLock};
 use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
 use super::description::ClassAttrFamily;
 use super::model::{
-    AnnotatorError, DescKind, KnownType, SomeInteger, SomeObject, SomeString, SomeTuple, SomeValue,
-    union,
+    AnnotatorError, DescKind, KnownType, SomeChar, SomeInteger, SomeObject, SomeString, SomeTuple,
+    SomeUnicodeCodePoint, SomeValue, union,
 };
 use crate::flowspace::model::{
     ConstValue, Constant, HOST_ENV, HostGetAttrError, HostObject, host_getattr,
@@ -227,6 +227,14 @@ enum ForceAnnotation {
         knowntype: KnownType,
     },
     Bool,
+    /// `SomeChar` (`model.py`). Python byte-char FORCE rows.
+    Char {
+        no_nul: bool,
+    },
+    /// Rust `char` is a Unicode scalar (`SomeUnicodeCodePoint`, UniChar).
+    UnicodeCodePoint {
+        no_nul: bool,
+    },
     Float,
     SingleFloat,
     String {
@@ -254,6 +262,12 @@ impl ForceAnnotation {
                 knowntype: i.base.knowntype,
             }),
             SomeValue::Bool(_) => Some(ForceAnnotation::Bool),
+            SomeValue::Char(c) => Some(ForceAnnotation::Char {
+                no_nul: c.inner.no_nul,
+            }),
+            SomeValue::UnicodeCodePoint(c) => Some(ForceAnnotation::UnicodeCodePoint {
+                no_nul: c.inner.no_nul,
+            }),
             SomeValue::Float(_) => Some(ForceAnnotation::Float),
             SomeValue::SingleFloat(_) => Some(ForceAnnotation::SingleFloat),
             SomeValue::String(s) => Some(ForceAnnotation::String {
@@ -293,6 +307,10 @@ impl ForceAnnotation {
                 knowntypedata: None,
             }),
             ForceAnnotation::Bool => super::model::s_bool(),
+            ForceAnnotation::Char { no_nul } => SomeValue::Char(SomeChar::new(*no_nul)),
+            ForceAnnotation::UnicodeCodePoint { no_nul } => {
+                SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(*no_nul))
+            }
             ForceAnnotation::Float => SomeValue::Float(super::model::SomeFloat::new()),
             ForceAnnotation::SingleFloat => {
                 SomeValue::SingleFloat(super::model::SomeSingleFloat::new())
@@ -428,6 +446,9 @@ fn someshell_from_primitive_layout(ty: &str) -> Option<SomeValue> {
         "f32" => Some(SomeValue::SingleFloat(super::model::SomeSingleFloat::new())),
         "f64" => Some(SomeValue::Float(super::model::SomeFloat::new())),
         "bool" => Some(super::model::s_bool()),
+        "char" => Some(SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(
+            false,
+        ))),
         _ => None,
     }
 }
@@ -3590,6 +3611,24 @@ mod tests {
     fn attribute_init_rejects_dunder_class() {
         let result = std::panic::catch_unwind(|| Attribute::new("__class__"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn layout_char_seeds_somechar_not_integer() {
+        register_struct_fields_with_layout(
+            "force_test_char_layout::Fmt",
+            &[("fmtchar".into(), crate::model::ValueType::Int)],
+            Some(&[("fmtchar".into(), "char".into())]),
+        );
+        let entry = forced_attributes_for("force_test_char_layout::Fmt")
+            .expect("FORCE row for force_test_char_layout::Fmt");
+        match entry.get("fmtchar") {
+            Some(SomeValue::UnicodeCodePoint(c)) => assert!(
+                !c.inner.no_nul,
+                "layout char must seed SomeUnicodeCodePoint::new(false), got no_nul"
+            ),
+            other => panic!("expected SomeUnicodeCodePoint, got {other:?}"),
+        }
     }
 
     #[test]

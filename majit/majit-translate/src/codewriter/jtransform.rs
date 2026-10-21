@@ -8279,11 +8279,7 @@ impl<'a> Transformer<'a> {
             && let Some(result_base) = owner.strip_suffix(&format!("::{name}"))
             && let Some(cc) = self.callcontrol.as_deref()
         {
-            let base_leaf = result_base.rsplit("::").next().unwrap_or(result_base);
-            let variants = cc
-                .enum_variant_by_discriminant()
-                .get(result_base)
-                .or_else(|| cc.enum_variant_by_discriminant().get(base_leaf));
+            let variants = enum_variants_for_ctor_base(cc, result_base);
             let tag = variants.and_then(|variants| {
                 variants
                     .iter()
@@ -12436,6 +12432,23 @@ fn sum_variant_ctor(target: &CallTarget) -> Option<SumVariantCtor> {
         tag,
         carries_payload: leaf != "None",
     })
+}
+
+/// Discriminant table for a (possibly instantiated) enum ctor owner.
+///
+/// `CallControl.enum_variant_by_discriminant` is keyed by the TypeDecl
+/// `name_path` (`core::ops::range::Bound`); a per-instantiation result
+/// owner (`core::ops::range::Bound<i64>`) drops its `<…>` and looks up
+/// that exact spelling. `Transformer.rewrite_op_setfield` derives the
+/// field owner from the concrete type the same way. Walking `::`
+/// ancestors would bind a different type's table.
+fn enum_variants_for_ctor_base<'a>(
+    cc: &'a crate::call::CallControl,
+    result_base: &str,
+) -> Option<&'a std::collections::HashMap<i64, String>> {
+    let map = cc.enum_variant_by_discriminant();
+    let stripped = majit_ir::descr::strip_generic_args(result_base);
+    map.get(stripped.as_ref())
 }
 
 /// `jtransform.py Transformer.optimize_goto_if_not` — fuse a
@@ -24480,6 +24493,89 @@ mod tests {
                 && field.owner_root.as_deref()
                     == Some("core::result::Result<i64,PyError>")
                 && value.value == crate::flowspace::model::ConstValue::Int(1)
+        ));
+    }
+
+    /// A harvested core enum variant whose result owner keeps the
+    /// instantiation suffix (`Bound<i64>::Included`). The discriminant
+    /// table is keyed by the template root (`Bound`);
+    /// `enum_variants_for_ctor_base` must strip that suffix the same way
+    /// `Bookkeeper::enum_variant_narrowing_knowntypedata` does, or the
+    /// ctor residualises as a symbolic fnaddr.
+    #[test]
+    fn niladic_instantiated_enum_variant_lowers_to_new_and_tag_store() {
+        let mut cc = crate::call::CallControl::new();
+        let mut by_discr = std::collections::HashMap::new();
+        by_discr.insert(0, "Included".to_string());
+        by_discr.insert(1, "Excluded".to_string());
+        by_discr.insert(2, "Unbounded".to_string());
+        let mut map = std::collections::HashMap::new();
+        map.insert("core::ops::range::Bound".to_string(), by_discr.clone());
+        map.insert("Bound".to_string(), by_discr);
+        cc.set_enum_variant_by_discriminant(map);
+
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "core::ops::range::Bound::Included".to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("bound_included_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let owner = "core::ops::range::Bound<i64>::Included".to_string();
+        let target = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec![
+                "core".to_string(),
+                "ops".to_string(),
+                "range".to_string(),
+                "Bound<i64>".to_string(),
+            ],
+            "Included",
+            0,
+        );
+        let result_ty = ValueType::Ref(Some(owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "bound_included_malloc",
+            &mut graph,
+        ) else {
+            panic!("niladic Bound variant must lower to malloc + tag store");
+        };
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(
+            &ops[0],
+            SpaceOperation {
+                result: Some(result),
+                kind: OpKind::New { owner: allocated },
+            } if result == &result_var && allocated == &owner
+        ));
+        assert!(matches!(
+            &ops[1].kind,
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: crate::model::LinkArg::Const(value),
+                ty: ValueType::Int,
+            } if base == &result_var
+                && field.name == "__discriminant"
+                && field.owner_root.as_deref()
+                    == Some("core::ops::range::Bound<i64>")
+                && value.value == crate::flowspace::model::ConstValue::Int(0)
         ));
     }
 

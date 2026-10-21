@@ -363,6 +363,17 @@ fn signed_switch_key(value: &ConstValue) -> Option<i64> {
         ConstValue::Int(value) => Some(*value),
         ConstValue::UInt(value) => Some(*value as i64),
         ConstValue::Bool(value) => Some(i64::from(*value)),
+        // `lltype.cast_primitive(Signed, llexitcase)`: Char and UniChar
+        // go through `ord` before the Signed cast.
+        ConstValue::UniStr(s) => {
+            let mut chars = s.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            Some(i64::from(u32::from(c)))
+        }
+        ConstValue::ByteStr(bytes) if bytes.len() == 1 => Some(i64::from(bytes[0])),
         _ => None,
     }
 }
@@ -2010,6 +2021,47 @@ mod tests {
             )),
             "switch keys must come from sorted link.llexitcase, not flow-level exitcase: {:?}",
             flat.insns
+        );
+
+        // UniChar llexitcase is the unicode string `convert_const` stored;
+        // `cast_primitive(Signed, …)` keys the switch by `ord`.
+        let mut graph_u = FunctionGraph::new("switch_unichar_llexitcase");
+        let entry_u = graph_u.startblock;
+        let cond_u = graph_u
+            .push_op_var(entry_u, OpKind::ConstInt(1), true)
+            .unwrap();
+        let case_y = graph_u.create_block();
+        let case_x = graph_u.create_block();
+        graph_u.set_return(case_y, None);
+        graph_u.set_return(case_x, None);
+        graph_u.set_control_flow_metadata(
+            entry_u,
+            Some(ExitSwitch::Value(cond_u)),
+            vec![
+                Link::new_mixed(
+                    Vec::new(),
+                    case_y,
+                    Some(ExitCase::Const(ConstValue::UniStr("y".into()))),
+                )
+                .with_llexitcase(ConstValue::UniStr("y".into())),
+                Link::new_mixed(
+                    Vec::new(),
+                    case_x,
+                    Some(ExitCase::Const(ConstValue::UniStr("x".into()))),
+                )
+                .with_llexitcase(ConstValue::UniStr("x".into())),
+            ],
+        );
+        let mut regallocs_u = identity_regallocs(&graph_u, 8);
+        let flat_u = flatten_graph(&graph_u, &mut regallocs_u);
+        assert!(
+            flat_u.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::Switch { targets, .. }
+                    if targets.iter().map(|(key, _)| *key).collect::<Vec<_>>() == vec![120, 121]
+            )),
+            "UniChar switch keys must be ord() of the unichar llexitcase: {:?}",
+            flat_u.insns
         );
     }
 

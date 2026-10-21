@@ -3307,6 +3307,7 @@ pub fn translate_op(
                     // `enumerate(lst)` and resolves the same way.
                     let builtin = match segments.as_slice() {
                         [leaf] if leaf == crate::runtime_names::shims::RANGE => Some("range"),
+                        [leaf] if leaf == crate::runtime_names::shims::UNICHR => Some("unichr"),
                         [leaf] if leaf == crate::runtime_names::shims::ENUMERATE => {
                             Some("enumerate")
                         }
@@ -3835,45 +3836,58 @@ pub fn translate_op(
                     //
                     // 3c. Unknown prefix — `TyperError` (caller must
                     //     register the path or import the prefix).
-                    let callable_host = if let Some(entry) = call_registry.lookup(&key) {
-                        entry.host_object.clone()
-                    } else if let Some(host) = flowspace_model::host_env_callable(segments) {
-                        // Branch 3b — builtin leaf or fully-qualified inline
-                        // path. The PRE-EXISTING-ADAPTATION is item `3b.` of
-                        // this arm's Layer 3 resolution-order list.
-                        host
-                    } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
-                        // Fuzzy leaf-match is the last registry fallback.
-                        // Exact registry entries and HOST_ENV
-                        // module paths must win first so external
-                        // stubs such as `BigInt::from`, `Vec::new`, and
-                        // `Box::new` cannot be captured by an unrelated
-                        // user function with the same leaf.
-                        //
-                        // This is the resting point for the former
-                        // caller-scoped `use`-import resolution: MIR callsites
-                        // carry the fully-qualified crate-relative path, so the
-                        // exact `lookup(&key)` above is the primary binder and
-                        // no per-caller import scope is needed to disambiguate.
-                        // The leaf-scan itself is wrong-bind-safe —
-                        // `lookup_with_leaf_match` returns `Some` only when the
-                        // same-leaf matches converge on a single `host_object`
-                        // identity, otherwise `None` falls through to the hard
-                        // error below.
-                        entry.host_object.clone()
-                    } else {
-                        return Err(TyperError::message(format!(
-                            "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
+                    let callable_host =
+                        if crate::translator::rtyper::cutover::registration_decline(segments)
+                            .is_some()
+                            && let Some(host) = flowspace_model::host_env_callable(segments)
+                        {
+                            // ExtRegistry residual (`rlib/jit.py`
+                            // `ConditionalCallEntry`, `copy_nonoverlapping`,
+                            // `malloc_raw`, …). A leftover `FunctionEntry` must
+                            // not beat Layer-3b: `FunctionDesc.pycall` would
+                            // walk the harvested body. `allocate` ctor stubs
+                            // are declined and have no HOST_ENV callable, so
+                            // they still resolve through the registry.
+                            host
+                        } else if let Some(entry) = call_registry.lookup(&key) {
+                            entry.host_object.clone()
+                        } else if let Some(host) = flowspace_model::host_env_callable(segments) {
+                            // Branch 3b — builtin leaf or fully-qualified inline
+                            // path. The PRE-EXISTING-ADAPTATION is item `3b.` of
+                            // this arm's Layer 3 resolution-order list.
+                            host
+                        } else if let Some(entry) = call_registry.lookup_with_leaf_match(&key) {
+                            // Fuzzy leaf-match is the last registry fallback.
+                            // Exact registry entries and HOST_ENV
+                            // module paths must win first so external
+                            // stubs such as `BigInt::from`, `Vec::new`, and
+                            // `Box::new` cannot be captured by an unrelated
+                            // user function with the same leaf.
+                            //
+                            // This is the resting point for the former
+                            // caller-scoped `use`-import resolution: MIR callsites
+                            // carry the fully-qualified crate-relative path, so the
+                            // exact `lookup(&key)` above is the primary binder and
+                            // no per-caller import scope is needed to disambiguate.
+                            // The leaf-scan itself is wrong-bind-safe —
+                            // `lookup_with_leaf_match` returns `Some` only when the
+                            // same-leaf matches converge on a single `host_object`
+                            // identity, otherwise `None` falls through to the hard
+                            // error below.
+                            entry.host_object.clone()
+                        } else {
+                            return Err(TyperError::message(format!(
+                                "translate_op: OpKind::Call::FunctionPath {{ segments: {:?} }} \
                              not registered in CallRegistry, not in HOST_ENV \
                              `__builtin__`, and not a known module-qualified host attribute — \
                              the production builder (a SemanticProgram walker, or a test \
                              fixture building the registry directly) must register the path \
                              with its parameter Signature before specialize_legacy_graph \
                              consults the rtyper. Result slot = {}",
-                            segments,
-                            fmt_op_result(op),
-                        )));
-                    };
+                                segments,
+                                fmt_op_result(op),
+                            )));
+                        };
                     let callable =
                         Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
@@ -4282,11 +4296,10 @@ pub fn translate_op(
             fmt_op_result(op),
         ))),
 
-        // `(lo..=hi).contains(&x)` lowered by `front::range_contains`.
-        // `int_between(n, m, p)` is the llop `n <= m < p`.  It is not a
-        // flowspace operator, so it is carried through under its llop
-        // name; `flowin` binds the bool result and `translate_operation`
-        // emits the same llop.
+        // `int_between(n, m, p)` is the llop `n <= m < p`
+        // (`rarithmetic.int_between`).  It is not a flowspace operator, so
+        // it is carried through under its llop name; `flowin` binds the
+        // bool result and `translate_operation` emits the same llop.
         OpKind::LoweredBlackholeOp { opname, args }
             if opname == "int_between" && args.len() == 3 =>
         {
@@ -5102,6 +5115,14 @@ pub(crate) fn derive_subject_inputcells(
                 cells.push(s_fn);
                 continue;
             }
+            // Rust `char` is a Unicode scalar (`SomeUnicodeCodePoint`,
+            // `rstr.py` UniChar). `getkind` of that repr is still `'int'`.
+            if class_root.as_deref() == Some("char") {
+                cells.push(crate::annotator::model::SomeValue::UnicodeCodePoint(
+                    crate::annotator::model::SomeUnicodeCodePoint::new(false),
+                ));
+                continue;
+            }
             // A list-typed param (`Vec<T>`, `&[T]`, Charon `Slice<T>`) is
             // the annotator's list model regardless of the Input's
             // register bank: a one-word item slice can arrive as `Int`
@@ -5214,11 +5235,23 @@ pub(crate) fn derive_subject_inputcells(
                         .cloned()
                         .unwrap_or_else(|| root.clone());
                     let root = &root;
+                    // `lookup_fields` drops a `<…>` suffix and reads the
+                    // harvested template rows. A `RangeInclusive<i64>`
+                    // receiver is that instantiation's class
+                    // (`bookkeeper.py` `getuniqueclassdef`); exact-key
+                    // `fields.contains_key` misses every split struct
+                    // whose harvest registered only the unsuffixed decl.
+                    // `instantiate_field_spelling` then fills `??TypeVar`.
+                    // Template-row fallback is the same split-struct set
+                    // as `struct_instantiation_suffix` (Entry, plus a
+                    // generic struct in a harvested foreign-body crate).
+                    // A broad `field_rows` knownness seeds every suffixed
+                    // closure / Option and union-fails their `call_once`.
                     let known = bk
                         .struct_fields
                         .borrow()
                         .as_ref()
-                        .is_some_and(|reg| reg.fields.contains_key(root))
+                        .is_some_and(|reg| split_struct_template_rows_known(reg, root))
                         // A `MutRef<T>` cell is a synthetic one-field class with no
                         // struct-field rows, interned by qualname like its constructor.
                         || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
@@ -5278,9 +5311,11 @@ pub(crate) fn derive_subject_inputcells(
                         let guard = bk.struct_fields.borrow();
                         let raw_known = guard
                             .as_ref()
-                            .is_some_and(|reg| reg.fields.contains_key(root));
+                            .is_some_and(|reg| split_struct_template_rows_known(reg, root));
                         let canon_known = canon.as_ref().is_some_and(|c| {
-                            guard.as_ref().is_some_and(|reg| reg.fields.contains_key(c))
+                            guard
+                                .as_ref()
+                                .is_some_and(|reg| split_struct_template_rows_known(reg, c))
                         });
                         (raw_known, canon_known)
                     }
@@ -5354,6 +5389,24 @@ pub(crate) fn derive_subject_inputcells(
         }
     }
     Ok(cells)
+}
+
+/// Exact registry key, or template rows of a split struct whose harvest
+/// registered only the unsuffixed decl (the same set as
+/// `struct_instantiation_suffix`: Entry, plus a generic struct in a
+/// harvested foreign-body crate).
+fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, root: &str) -> bool {
+    if reg.fields.contains_key(root) {
+        return true;
+    }
+    if reg.field_rows(root).is_none() {
+        return false;
+    }
+    if reg.owner_in_foreign_body_crate(root) {
+        return true;
+    }
+    let stripped = majit_ir::descr::strip_instantiation_suffix(root);
+    stripped.ends_with("::rordereddict_entries::Entry") || stripped == "Entry"
 }
 
 /// `remove_dead_blocks` (`translator/simplify.py`) — the set of blocks
@@ -7033,6 +7086,131 @@ mod tests {
             .as_ref()
             .expect("source class_root must replace the classdef-less legacy shell");
         assert_eq!(classdef.borrow().name, "PyObject");
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_suffixed_range_from_template_rows() {
+        // Harvest registers the extracted `RangeInclusive` decl. A spec
+        // graph paints `RangeInclusive<i64>` (`getuniqueclassdef`). The
+        // template rows plus `instantiate_field_spelling` are that class.
+        let mut graph = LegacyGraph::new("start_bound");
+        let entry = graph.startblock;
+        let recv = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("RangeInclusive<i64>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, recv);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        let rows = vec![
+            ("start".to_string(), "??TypeVar#0".to_string()),
+            ("end".to_string(), "??TypeVar#0".to_string()),
+            ("exhausted".to_string(), "bool".to_string()),
+        ];
+        fields
+            .fields
+            .insert("core::ops::range::RangeInclusive".to_string(), rows.clone());
+        fields.fields.insert("RangeInclusive".to_string(), rows);
+        bk.set_struct_fields(Rc::new(fields));
+
+        crate::local_crates::with_foreign_body_crate_root("core", || {
+            let cells = derive_subject_inputcells(&graph, Some(&bk))
+                .expect("suffixed RangeInclusive must seed from template rows");
+            let SomeValue::Instance(value) = &cells[0] else {
+                panic!(
+                    "RangeInclusive<i64> must seed SomeInstance, got {:?}",
+                    cells[0]
+                )
+            };
+            let classdef = value
+                .classdef
+                .as_ref()
+                .expect("template field_rows must intern RangeInclusive<i64>");
+            let start = classdef
+                .borrow()
+                .attrs
+                .get("start")
+                .expect("start attr projected")
+                .s_value
+                .clone();
+            assert!(
+                matches!(start, SomeValue::Integer(_)),
+                "??TypeVar#0 on RangeInclusive<i64> must become i64, got {start:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_char_int_input_as_somechar() {
+        let mut graph = LegacyGraph::new("new");
+        let entry = graph.startblock;
+        let start = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "start".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("char".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, start);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("char Int input must seed SomeUnicodeCodePoint");
+        assert!(
+            matches!(cells[0], SomeValue::UnicodeCodePoint(_)),
+            "char class_root on Int must seed SomeUnicodeCodePoint, got {:?}",
+            cells[0]
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_does_not_seed_suffixed_nonsplit_from_template_rows() {
+        // Broad `field_rows` knownness seeded every suffixed root whose
+        // template had rows (closures, Option) and union-failed their
+        // `call_once`. Only the split-struct set reads template rows.
+        let mut graph = LegacyGraph::new("call_once");
+        let entry = graph.startblock;
+        let recv = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("Foo<i64>".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, recv);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "Foo".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("Foo<i64> still seeds a Ref shell");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!("Foo<i64> must seed SomeInstance, got {:?}", cells[0])
+        };
+        assert!(
+            value.classdef.is_none(),
+            "nonsplit template rows must not intern Foo<i64>"
+        );
     }
 
     #[test]
@@ -10223,10 +10401,10 @@ mod tests {
         }
     }
 
-    /// Layer-1 `call_registry.lookup` beats HOST_ENV. A registered
-    /// residual body is the callable; the `majit_rlib.jit.conditional_call*`
-    /// builtin is not consulted. `registration_decline` exists so populate
-    /// never leaves that body in the registry.
+    /// ExtRegistry residual: populate declines the harvested body so
+    /// Layer-3b `HOST_ENV` is the callable (`rlib/jit.py`
+    /// `ConditionalCallEntry`). A leftover `FunctionEntry` must not beat
+    /// that builtin.
     #[test]
     fn conditional_call_registered_body_beats_host_env() {
         use crate::codewriter::call::GraphStore;
@@ -10286,6 +10464,67 @@ mod tests {
         );
         let translated =
             translate_op(&op, &value_map, &registry).expect("declined helper uses HOST_ENV");
+        let Hlvalue::Constant(callable) = &translated[0].args[0] else {
+            panic!("callable constant required");
+        };
+        assert_eq!(callable.value, ConstValue::HostObject(host));
+    }
+
+    /// A leftover `FunctionEntry` (Layer-1 would otherwise win) must not
+    /// beat `ConditionalCallEntry`. `allocate` ctor stubs stay on the
+    /// registry: they are declined and have no HOST_ENV callable.
+    #[test]
+    fn conditional_call_leftover_function_entry_loses_to_host_env() {
+        use crate::flowspace::argument::Signature;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+
+        let segments = vec![
+            "majit_rlib".to_string(),
+            "jit".to_string(),
+            "conditional_call3".to_string(),
+        ];
+        let mut caller = LegacyGraph::new("caller");
+        let vars = mint_vars(&mut caller, 6);
+        let value_map: HashMap<Variable, Hlvalue> = vars
+            .iter()
+            .map(|v| (v.clone(), Hlvalue::Variable(Variable::new())))
+            .collect();
+        let op = SpaceOperation {
+            result: Some(vars[5].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: segments.clone(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vars[..5].iter().cloned()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let registry = empty_call_registry();
+        registry.get_or_register(
+            FunctionPathKey::from_segments(segments.clone()),
+            Signature::new(
+                vec![
+                    "cond".to_string(),
+                    "function".to_string(),
+                    "a".to_string(),
+                    "b".to_string(),
+                    "c".to_string(),
+                ],
+                None,
+                None,
+            ),
+        );
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments(segments.clone()))
+                .is_some(),
+            "fixture plants a leftover FunctionEntry"
+        );
+        let host = crate::flowspace::model::host_env_callable(&segments)
+            .expect("majit_rlib.jit.conditional_call3 is a HOST_ENV builtin");
+        let translated =
+            translate_op(&op, &value_map, &registry).expect("leftover FunctionEntry loses");
         let Hlvalue::Constant(callable) = &translated[0].args[0] else {
             panic!("callable constant required");
         };
