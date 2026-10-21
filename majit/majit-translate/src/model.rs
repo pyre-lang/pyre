@@ -331,6 +331,40 @@ pub fn fn_const_segments(target: &CallTarget) -> Option<&[String]> {
     }
 }
 
+/// `true` iff `kind` is `front::mir`'s synthetic string-literal
+/// define-op (`Call(["__str_const", <text>])`, `mir.rs`).
+/// Upstream flowspace carries a string literal as a bare
+/// `Constant('text')` SSA value, so the pre-pass
+/// ([`legacy_const_define_hlvalue`]) folds the op to that Constant and
+/// [`translate_op`] emits nothing; a Constant is not an operation and
+/// raises nothing, so [`op_canraise`] is false — same contract as the
+/// unit-variant ctor elision above.
+pub fn is_str_const_define(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if args.is_empty() && segments.len() == 2 && segments[0] == "__str_const"
+    )
+}
+
+/// A zero-argument `core::ptr::null_mut()` / `core::ptr::null()` call.
+///
+/// `lltype.nullptr(T)`; `rbuiltin.py` `rtype_const_result` turns it into
+/// a Constant. No side effect. F1 (`op_is_side_effect_free`) uses this;
+/// flowspace `CanRemove` / `CanRemoveBuiltins` do not remove the `simple_call`.
+pub fn is_core_ptr_null_call(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call { target, args, .. } if args.is_empty() => {
+            let name = target.to_string();
+            name == "core::ptr::null_mut" || name == "core::ptr::null"
+        }
+        _ => false,
+    }
+}
+
 impl CallTarget {
     pub fn method(name: impl Into<String>, receiver_root: Option<String>) -> Self {
         Self::Method {

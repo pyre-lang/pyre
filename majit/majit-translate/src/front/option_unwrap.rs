@@ -255,7 +255,7 @@ fn rewire_one_unwrap_site(
     close_goto_mixed(graph, payload_bb, b_target, payload_link_args);
 
     // The non-payload arm raises: `unwrap` panics on `None` / `Err`.
-    graph.set_raise_implicit(failure_bb, "unwrap on non-payload variant");
+    raise_implicit_non_payload(graph, failure_bb);
 
     // A: drop the residual `unwrap` call, read the discriminant, branch on it.
     // The receiver construction ops stay as A's tail. `Option::Some = 1`, so
@@ -336,6 +336,15 @@ fn rewire_one_unwrap_site(
         );
     }
     Ok(())
+}
+
+/// Implicit `AssertionError` raise for a non-payload arm (`None` / `Err`).
+///
+/// [`FunctionGraph::set_raise_implicit`]; pruned by `simplify.py`
+/// `remove_assertion_errors`. Shared with carrier `Result::expect` /
+/// `unwrap` (`front::result_exc`; `core` `Result::expect`).
+pub(crate) fn raise_implicit_non_payload(graph: &mut FunctionGraph, block: crate::model::BlockId) {
+    graph.set_raise_implicit(block, "unwrap on non-payload variant");
 }
 
 #[cfg(test)]

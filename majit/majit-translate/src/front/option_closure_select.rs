@@ -19,16 +19,19 @@
 //!     unwrap_or_else(opt, f): Some(x) => x            None => f()
 //!     or_else(opt, f):        Some(x) => Some(x)      None => f()
 //!     is_some_and(opt, f):    Some(x) => f(x)         None => false
+//!     is_none_or(opt, f):     Some(x) => f(x)         None => true
 //! ```
 //!
-//! `map`/`and_then`/`is_some_and` run the callable on the `Some` payload;
-//! `unwrap_or_else` and `or_else` run their niladic callable on the `None` arm
-//! instead.  On `Some`, `unwrap_or_else` forwards the payload directly while
-//! `or_else` forwards the whole receiver `Option` unchanged (no `__pos_0`
-//! read).  `map` wraps the call result back into `Some`, and both
-//! `map`/`and_then` build a fresh `None` on the empty arm; `unwrap_or_else`
-//! returns a bare `T`, `or_else` an `Option<T>`, and `is_some_and` a bare
-//! `bool` whose `None` arm is the constant `false` (no callable, no `Option`).
+//! `map`/`and_then`/`is_some_and`/`is_none_or` run the callable on the `Some`
+//! payload; `unwrap_or_else` and `or_else` run their niladic callable on the
+//! `None` arm instead.  On `Some`, `unwrap_or_else` forwards the payload
+//! directly while `or_else` forwards the whole receiver `Option` unchanged
+//! (no `__pos_0` read).  `map` wraps the call result back into `Some`, and
+//! both `map`/`and_then` build a fresh `None` on the empty arm;
+//! `unwrap_or_else` returns a bare `T`, `or_else` an `Option<T>`, and
+//! `is_some_and`/`is_none_or` a bare `bool` whose `None` arm is the constant
+//! `false` / `true` (no callable, no `Option`).  Core `Option::is_none_or`
+//! is the `W_StringIO._init_newline` shape `newline is None or newline == ""`.
 //! Everything else — locating the residual call, absorbing the trailing
 //! `*mut <registered ADT>` narrowing cast, threading the live values through
 //! the arms, and closing the `bool(disc)` branch — is the
@@ -60,6 +63,10 @@ pub(crate) enum ClosureCombinator {
     OrElse,
     /// `Some(x) => f(x)`, `None => false` where `f(x) -> bool`.
     IsSomeAnd,
+    /// `Some(x) => f(x)`, `None => true` where `f(x) -> bool`.
+    /// Core `Option::is_none_or`; `W_StringIO._init_newline` is
+    /// `newline is None or newline == ""`.
+    IsNoneOr,
 }
 
 /// A recognized `Option::map`/`and_then`/`unwrap_or_else(opt, callable)`
@@ -267,12 +274,13 @@ fn rewire_one_closure_select_site(
         }
     }
 
-    // `map`/`and_then`/`is_some_and` run the callable on the `Some` arm (so a
-    // closure env is needed there), while `unwrap_or_else`/`or_else` run theirs
-    // on the `None` arm instead.  A function item has no env: the arm calls
-    // the named function directly.  The `Some` arm always needs `opt` — to
-    // read `opt.__pos_0` (`map`/`and_then`/`unwrap_or_else`/`is_some_and`) or
-    // to forward the receiver unchanged (`or_else`).  Thread each arm exactly
+    // `map`/`and_then`/`is_some_and`/`is_none_or` run the callable on the
+    // `Some` arm (so a closure env is needed there), while
+    // `unwrap_or_else`/`or_else` run theirs on the `None` arm instead.  A
+    // function item has no env: the arm calls the named function directly.
+    // The `Some` arm always needs `opt` — to read `opt.__pos_0`
+    // (`map`/`and_then`/`unwrap_or_else`/`is_some_and`/`is_none_or`) or to
+    // forward the receiver unchanged (`or_else`).  Thread each arm exactly
     // the sources it consumes.
     let is_fn_item = site.fn_item_segments.is_some();
     let closure_on_some = !matches!(
@@ -306,8 +314,11 @@ fn rewire_one_closure_select_site(
             then_bb,
             then_inputs.clone(),
         ),
-        // `map`/`and_then`/`is_some_and` run the callable on the payload.
-        ClosureCombinator::Map | ClosureCombinator::AndThen | ClosureCombinator::IsSomeAnd => {
+        // `map`/`and_then`/`is_some_and`/`is_none_or` run the callable on the payload.
+        ClosureCombinator::Map
+        | ClosureCombinator::AndThen
+        | ClosureCombinator::IsSomeAnd
+        | ClosureCombinator::IsNoneOr => {
             let payload = read_some_payload(graph, then_bb, opt_in_then, site);
             let env_in_then = if is_fn_item {
                 None
@@ -369,7 +380,7 @@ fn rewire_one_closure_select_site(
                     }
                 }
                 // `and_then`'s closure already returns `Option<U>`;
-                // `is_some_and`'s already returns the `bool`.
+                // `is_some_and`/`is_none_or` already return the `bool`.
                 _ => call_result,
             };
             (value, finish_bb, finish_inputs)
@@ -422,14 +433,20 @@ fn rewire_one_closure_select_site(
                 )
             }
         }
-        // `is_some_and` yields the constant `false` — no closure, no `Option`.
-        ClosureCombinator::IsSomeAnd => {
-            let false_var = graph.alloc_value_var();
+        // `is_some_and` yields constant `false`; core `Option::is_none_or`
+        // yields constant `true` (`W_StringIO._init_newline`:
+        // `newline is None or newline == ""`).  No closure, no `Option`.
+        ClosureCombinator::IsSomeAnd | ClosureCombinator::IsNoneOr => {
+            let none_const = match site.kind {
+                ClosureCombinator::IsNoneOr => 1,
+                _ => 0,
+            };
+            let const_var = graph.alloc_value_var();
             graph.block_mut(else_bb).operations.push(SpaceOperation {
-                result: Some(false_var.clone()),
-                kind: OpKind::ConstInt(0),
+                result: Some(const_var.clone()),
+                kind: OpKind::ConstInt(none_const),
             });
-            (false_var, else_bb, else_inputs.clone())
+            (const_var, else_bb, else_inputs.clone())
         }
         // `unwrap_or_else`/`or_else` run their niladic callable and forward its
         // result (`T` for `unwrap_or_else`, `Option<T>` for `or_else`).
@@ -642,8 +659,8 @@ pub(crate) fn emit_callable(
 
 /// Emit `f(x)` / `f()` in `block` as a direct `Call(FunctionPath)` — the
 /// same op an ordinary free-function call site lowers to.  `arg` is the
-/// payload for `map`/`and_then`/`is_some_and`, or `None` for a niladic
-/// `unwrap_or_else`/`or_else`.
+/// payload for `map`/`and_then`/`is_some_and`/`is_none_or`, or `None` for a
+/// niladic `unwrap_or_else`/`or_else`.
 fn emit_fn_item_call(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -1306,6 +1323,43 @@ mod tests {
             count_const_int(&g, 0),
             2,
             "the None arm yields a fresh constant false"
+        );
+        assert_eq!(g.blocks[a].exits.len(), 2, "A branches to Some/None arms");
+    }
+
+    #[test]
+    fn is_none_or_calls_on_some_and_true_on_none() {
+        let (g, a) = build_and_rewrite(ClosureCombinator::IsNoneOr, "is_none_or");
+        assert!(
+            residual_gone(&g, "is_none_or"),
+            "residual is_none_or call removed"
+        );
+        // The Some arm reads the payload and calls the predicate once.
+        assert_eq!(
+            count_calls(
+                &g,
+                |t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")
+            ),
+            1,
+            "the Some arm calls the predicate once"
+        );
+        assert_eq!(
+            count_field_reads(&g, "__pos_0"),
+            1,
+            "the Some arm reads the payload"
+        );
+        // The None arm is the constant true — no Option is built, no closure runs.
+        let ctors = count_calls(
+            &g,
+            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
+        );
+        assert_eq!(ctors, 0, "is_none_or builds no Option");
+        // The synthesized `true` is a fresh `ConstInt(1)` in the None arm.
+        // Block A has no other `ConstInt(1)`.
+        assert_eq!(
+            count_const_int(&g, 1),
+            1,
+            "the None arm yields a fresh constant true"
         );
         assert_eq!(g.blocks[a].exits.len(), 2, "A branches to Some/None arms");
     }
