@@ -1478,7 +1478,7 @@ pub struct PyFrame {
     /// local variable advanced by `next_instr += 2` after the opcode read.
     /// pyre packs the same information into `last_instr` plus the
     /// `next_instr()` accessor below, which returns `last_instr + 1` once
-    /// a frame has dispatched, and `after_return_generator_index` (or 0)
+    /// a frame has dispatched, and `after_return_generator_index`
     /// while `last_instr` is still `-1`.  `set_last_instr_from_next_instr`
     /// is the inverse setter, and the JIT vable shadow `vable_last_instr`
     /// mirrors the same field. The `±1` arithmetic on either side of the
@@ -3697,14 +3697,14 @@ pub fn __majit_wrap_descr_typecheck_fget_f_lasti(
         let code = frame.code();
         let owner = frame.get_generator();
         let index = match crate::pycode::after_return_generator_index(code) {
-            Some(after_return_generator) => (!owner.is_null()).then(|| {
+            0 => Some(crate::pycode::first_traceable_index(code)),
+            after_return_generator => (!owner.is_null()).then(|| {
                 if unsafe { pyre_object::generator::w_generator_is_started(owner) } {
                     crate::pycode::first_traceable_index(code)
                 } else {
                     after_return_generator
                 }
             }),
-            None => Some(crate::pycode::first_traceable_index(code)),
         };
         match index {
             Some(index) if index < code.instructions.len() => index as i64,
@@ -6737,10 +6737,10 @@ impl PyFrame {
     /// traceback entry for this frame, which `_PyFrame_IsIncomplete` keeps out
     /// of tracebacks until it reaches `_co_firsttraceable`.
     pub fn run_generator_prologue(&mut self) -> Result<(), crate::PyError> {
-        let Some(after_return_generator) = crate::pycode::after_return_generator_index(self.code())
-        else {
+        let after_return_generator = crate::pycode::after_return_generator_index(self.code());
+        if after_return_generator == 0 {
             return Ok(());
-        };
+        }
         let code = unsafe { &*pyframe_get_pycode(self) };
         let mut pc = 0usize;
         while pc < after_return_generator {
@@ -6830,7 +6830,7 @@ impl PyFrame {
     pub fn next_instr(&self) -> usize {
         let last = self.last_instr;
         if last < 0 {
-            crate::pycode::after_return_generator_index(self.code()).unwrap_or(0)
+            crate::pycode::after_return_generator_index(self.code())
         } else {
             last as usize + 1
         }

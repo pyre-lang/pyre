@@ -2271,9 +2271,10 @@ pub fn handle_exception_with_context(
         // record it so `tb_lasti` / `tb_lineno` match.  Regular frames
         // keep the `-1` sentinel (`offset2lineno` answers "no line").
         let last_instruction = if frame.last_instr < 0 {
-            crate::pycode::after_return_generator_index(frame.code())
-                .map(|i| i as i64)
-                .unwrap_or(frame.last_instr as i64)
+            match crate::pycode::after_return_generator_index(frame.code()) {
+                0 => frame.last_instr as i64,
+                index => index as i64,
+            }
         } else {
             frame.last_instr as i64
         };

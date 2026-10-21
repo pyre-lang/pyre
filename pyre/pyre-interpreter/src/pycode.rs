@@ -4282,19 +4282,26 @@ pub fn first_traceable_index(code: &crate::CodeObject) -> usize {
 /// on the next one.  The index is not a constant: a closure generator's
 /// `COPY_FREE_VARS` precedes `RETURN_GENERATOR` and shifts it along.
 ///
-/// `None` for a code object with no `RETURN_GENERATOR`, which is every code
-/// object that is not a generator, coroutine or async generator.
-pub fn after_return_generator_index(code: &crate::CodeObject) -> Option<usize> {
+/// `0` for a code object with no `RETURN_GENERATOR`, which is every code
+/// object that is not a generator, coroutine or async generator; a frame of
+/// one starts at index 0.  A found index is at least 1.
+///
+/// The scan reads only opcode families, which specialization keeps, so the
+/// answer is a function of the code object: `@jit.elidable`, like
+/// [`crate::pyframe::npure_cellvars`].  `PyFrame::next_instr` calls it on
+/// every dispatch of a frame that has not run an instruction yet.
+#[majit_macros::elidable_cannot_raise]
+pub fn after_return_generator_index(code: &crate::CodeObject) -> usize {
     use crate::bytecode::Instruction;
 
     let mut index = 0;
     while let Some(op) = base_op(code, index) {
         if matches!(op, Instruction::ReturnGenerator) {
-            return Some(index + 1);
+            return index + 1;
         }
         index += 1;
     }
-    None
+    0
 }
 
 /// Whether the instruction at `pc` may be reported to a trace function as the
