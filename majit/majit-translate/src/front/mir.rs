@@ -65257,6 +65257,54 @@ fn tyref_input_class_root(
     }
 }
 
+/// Instantiation class of a split-eligible core enum used as a `Ref`
+/// parameter (`bookkeeper.py` `getuniqueclassdef(cls)`).
+///
+/// [`adt_node_class_root_leaf`] paints only unary split-eligible core
+/// enums (`Option<i64>`): a call result of that class recasts to it,
+/// and the `?` rewrite peels that recast. Binary core enums (`Result`,
+/// `ControlFlow`) stay classdef-less as a *value*: painting them recasts
+/// `Try::branch` / `Result`-returning calls onto the exception link
+/// (`simplify.py` "raising operation result cannot flow into exception
+/// link"). A parameter has no such recast — the Input `class_root` is
+/// the annotator seed (`derive_subject_inputcells` →
+/// `getuniqueclassdef_for_struct_root`) — and a constructor of the same
+/// instantiation already interned that classdef with `__discriminant`
+/// (`rclass.py` `getclsfield`). Without this seed the formal is
+/// `SomeInstance { classdef: None }` and `getattr __discriminant` walls.
+///
+/// A pointer-niche Option (`Option<*mut T>`) is the null word on both
+/// the value and the parameter path. Vec/Box stay on their annotator
+/// models (`adt_head_instantiation_suffix` is enum-only).
+fn tyref_split_core_enum_param_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    let def_id = adt_node_def_id(node)?;
+    let name = llbc.type_by_id(def_id)?.item_meta.name_path();
+    if !matches!(
+        name.split("::").next().unwrap_or(&name),
+        "core" | "std" | "alloc"
+    ) {
+        return None;
+    }
+    let types = type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())?;
+    if types.len() == 1 && types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)) {
+        return None;
+    }
+    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let mut leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+    if tombstoned.contains(&leaf) {
+        leaf = tombstoned_owner_spelling(&name, &leaf, tombstoned);
+    }
+    Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix))
+}
+
 /// `OpKind::Input.class_root` for a `Ref`-typed parameter.
 ///
 /// A list-typed param (`Vec<T>`, `&[T]`, Charon builtin `Slice<T>`) is
@@ -65286,6 +65334,7 @@ fn tyref_ref_param_class_root(
     tyref_input_class_root(ty, llbc, tombstoned)
         .or_else(|| tyref_strips_to_str(ty, llbc).then(|| "str".to_string()))
         .or_else(|| tyref_generic_trait_bound_root(ty, llbc, generics))
+        .or_else(|| tyref_split_core_enum_param_root(ty, llbc, tombstoned))
 }
 
 /// The inner [`ValueType`] of a `core::sync::atomic::Atomic<T>`
@@ -102446,13 +102495,21 @@ mod tests {
         })
     }
 
+    fn raw_mut_u8_arg() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [
+            {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+            "Mut"
+        ]})
+    }
+
     #[test]
     fn result_integer_instantiations_paint_distinct_class_roots() {
         // `Result::ok` / `unwrap_or_default` match on the interned tagged
         // struct (`InstanceRepr.rtype_getattr` `__discriminant`, rclass.py).
         // Each instantiation is its own class (`bookkeeper.py`
         // `getuniqueclassdef(cls)`), so `__pos_0` does not union i32 with
-        // Layout / String.
+        // Layout / String. A Result parameter seeds the same class
+        // (`tyref_ref_param_class_root`).
         let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![]);
         let dest = |ok: serde_json::Value, err: serde_json::Value| {
             TyRef::Other(serde_json::json!({
@@ -102462,8 +102519,10 @@ mod tests {
         let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
         let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
         let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
-        let i32_u8 = super::tyref_to_value_type(&dest(i32_ty, u8_ty.clone()), &llbc);
-        let usize_u8 = super::tyref_to_value_type(&dest(usize_ty, u8_ty), &llbc);
+        let i32_dest = dest(i32_ty, u8_ty.clone());
+        let usize_dest = dest(usize_ty, u8_ty);
+        let i32_u8 = super::tyref_to_value_type(&i32_dest, &llbc);
+        let usize_u8 = super::tyref_to_value_type(&usize_dest, &llbc);
         assert_eq!(
             i32_u8,
             crate::model::ValueType::Ref(Some("Result<i32,u8>".into()))
@@ -102473,6 +102532,123 @@ mod tests {
             crate::model::ValueType::Ref(Some("Result<usize,u8>".into()))
         );
         assert_ne!(i32_u8, usize_u8);
+        assert_eq!(
+            super::tyref_ref_param_class_root(
+                &i32_dest,
+                &llbc,
+                super::no_tombstoned_leaves(),
+                None
+            ),
+            Some("Result<i32,u8>".into())
+        );
+        assert_eq!(
+            super::tyref_ref_param_class_root(
+                &usize_dest,
+                &llbc,
+                super::no_tombstoned_leaves(),
+                None
+            ),
+            Some("Result<usize,u8>".into())
+        );
+    }
+
+    #[test]
+    fn result_with_pointer_like_err_still_paints_class_root() {
+        // Result keeps its tag even when `E` is pointer-like
+        // (`adt_node_class_root_leaf`). The parameter carries the same
+        // interned class (`bookkeeper.py` `getuniqueclassdef`).
+        let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![]);
+        let node = result_adt_node(0, option_int_arg(true), raw_mut_u8_arg());
+        let ty = TyRef::Other(node);
+        let painted = super::tyref_to_value_type(&ty, &llbc);
+        match &painted {
+            crate::model::ValueType::Ref(Some(root)) => {
+                assert!(
+                    root.starts_with("Result<") && root.contains("i64"),
+                    "Result<i64, *mut u8> must intern as a Result class, got {root:?}"
+                );
+            }
+            other => panic!("expected Ref(Some(Result<...>)), got {other:?}"),
+        }
+        let root =
+            super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None);
+        assert!(
+            root.as_deref()
+                .is_some_and(|r| r.starts_with("Result<") && r.contains("i64")),
+            "Result<i64, *mut u8> param must intern as a Result class, got {root:?}"
+        );
+    }
+
+    #[test]
+    fn option_of_raw_pointer_stays_classdef_less() {
+        // `Option<*mut u8>` is the null-word niche, not an enum class.
+        let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+        let node = option_adt_node(0, raw_mut_u8_arg());
+        assert_eq!(
+            super::adt_node_class_root_with(&node, &llbc, super::no_tombstoned_leaves()),
+            None
+        );
+        let ty = TyRef::Other(node);
+        assert_eq!(
+            super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None),
+            None
+        );
+    }
+
+    fn control_flow_enum(def_id: u64) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["ops", 0]},
+                    {"Ident": ["control_flow", 0]},
+                    {"Ident": ["ControlFlow", 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Enum": [
+                {
+                    "name": "Continue",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                },
+                {
+                    "name": "Break",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                }
+            ]}
+        })
+    }
+
+    #[test]
+    fn control_flow_stays_classdef_less() {
+        // The `Try::branch` residual is not an interned enum class as a
+        // value. Painting it recasts the branch result onto the exception
+        // link. A ControlFlow *parameter* still takes the split-enum
+        // Input seed (`tyref_split_core_enum_param_root`).
+        let llbc = llbc_with_types("fixture", vec![control_flow_enum(0)], vec![]);
+        let node = result_adt_node(0, option_int_arg(true), option_int_arg(true));
+        assert_eq!(
+            super::adt_node_class_root_with(&node, &llbc, super::no_tombstoned_leaves()),
+            None
+        );
+        let ty = TyRef::Other(node);
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            crate::model::ValueType::Ref(None)
+        );
+        assert_eq!(
+            super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None),
+            Some("ControlFlow<i64,i64>".into())
+        );
     }
 
     fn option_i64_ty() -> serde_json::Value {
