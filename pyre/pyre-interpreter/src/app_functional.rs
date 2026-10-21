@@ -58,7 +58,14 @@ fn wrap_as_builtin_function(func: PyObjectRef) -> PyObjectRef {
         payload.ob.ob_type = &crate::BUILTIN_FUNCTION_TYPE as *const _;
         payload.ob.w_class = pyre_object::pyobject::get_instantiate(&crate::BUILTIN_FUNCTION_TYPE);
         payload.can_change_code = false;
-        payload.mutate_slots = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+        // `ptr::read` copied the source's watchers; overwrite without dropping
+        // them so the source keeps its own `mutate_<name>` instances.
+        for slot in crate::QuasiImmutSlot::ALL {
+            std::ptr::write(
+                payload.mutate_field_mut(slot),
+                pyre_object::quasiimmut::QuasiImmutField::new(),
+            );
+        }
         // BuiltinFunction.typedef has no instance dict (`hasdict=false`);
         // a copied Function dict would leak `__code__` / `__defaults__`
         // / `__globals__` as hasattr-true instance attributes.

@@ -68221,10 +68221,9 @@ fn tyref_to_field_layout_string(
         // leaves `Atomic<*mut T>` out because the inner value is a pointer;
         // the field walk must still see a pointer spelling, or
         // `is_known_struct` treats the atomic as a by-value struct and drops
-        // `instantiate`.  Spell the actual pointer type: `Function.mutate_slots`
-        // is an `AtomicPtr` over a raw (non-GC) struct, and an erased
-        // `*mut PyObject` would make the annotator's field projection answer
-        // `Instance(PyObject)` for it.
+        // `instantiate`.  Spell the actual pointer type: an `AtomicPtr` over a
+        // raw (non-GC) struct, and an erased `*mut PyObject` would make the
+        // annotator's field projection answer `Instance(PyObject)` for it.
         return tyref_atomic_arg(ty, llbc)
             .and_then(|arg| serde_json::from_value::<TyRef>(arg.clone()).ok())
             .map(|arg| tyref_to_ast_string(&arg, llbc))
