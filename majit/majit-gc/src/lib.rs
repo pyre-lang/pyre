@@ -4633,7 +4633,7 @@ pub fn gc_object_finalizer_pending(addr: usize) -> bool {
 /// incminimark.py `set_max_heap_size` — the `PYPY_GC_MAX` limit, set from
 /// inside a running process instead of read once at startup.  `0` is
 /// unbounded.
-pub fn gc_set_max_heap_size(size: usize) {
+pub fn gc_set_max_heap_size(size: i64) {
     gc_sync::gc_op(|gc| gc.set_max_heap_size(size));
 }
 
