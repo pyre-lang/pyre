@@ -171,6 +171,9 @@ impl RdPayload {
     pub fn rd_consts_arc(&self) -> Option<Arc<SharedConstPool>> {
         unsafe { (*self.rd_consts.get()).clone() }
     }
+    pub fn rd_consts_pool(&self) -> Option<&SharedConstPool> {
+        unsafe { (*self.rd_consts.get()).as_deref() }
+    }
     pub fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         unsafe { *self.rd_consts.get() = value.map(SharedConstPool::new) }
     }

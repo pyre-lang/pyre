@@ -65,7 +65,7 @@ thread_local! {
     /// seed and read, flaking alias resolution. The roots belong to one
     /// invocation, so scoping them to the invocation's thread is exact — the
     /// same TLS adaptation of a PyPy GIL-singleton as
-    /// `jitdriver.rs::BACK_EDGE_BH_BUILDER`.
+    /// `generated::all_jitcodes`.
     static REGISTERED: RefCell<CrateAliasRoots> = const { RefCell::new(CrateAliasRoots::new()) };
 }
 

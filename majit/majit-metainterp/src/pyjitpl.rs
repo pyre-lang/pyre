@@ -3610,7 +3610,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         fn visit_pool(
-            pool: Option<&Arc<majit_ir::SharedConstPool>>,
+            pool: Option<&majit_ir::SharedConstPool>,
             generation: u64,
             is_minor: bool,
             visitor: &mut dyn FnMut(&mut GcRef),
@@ -3680,16 +3680,16 @@ impl<M: Clone> MetaInterp<M> {
                             .descr
                             .as_ref()
                             .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_arc());
-                        visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
+                            .and_then(|fd| fd.rd_consts_pool());
+                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
                     }
                     for layout in trace.terminal_exit_layouts.values_mut() {
                         let descr_pool = layout
                             .descr
                             .as_ref()
                             .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_arc());
-                        visit_pool(descr_pool.as_ref(), generation, is_minor, &mut visitor);
+                            .and_then(|fd| fd.rd_consts_pool());
+                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
                     }
                 }
                 // `compile.py:ResumeGuardDescr._attrs_` traces `rd_consts` on
@@ -3734,8 +3734,8 @@ impl<M: Clone> MetaInterp<M> {
                     };
                     for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
                         let mut visit_descr = |descr: &dyn majit_ir::Descr| {
-                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_arc());
-                            visit_pool(pool.as_ref(), generation, is_minor, &mut visitor);
+                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
+                            visit_pool(pool, generation, is_minor, &mut visitor);
                         };
                         if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
                             for cell in store.iter() {
@@ -4310,7 +4310,9 @@ impl<M: Clone> MetaInterp<M> {
         };
         *tally += 1;
         crate::guard_census_record(green_key, trace_id, fail_index);
-        self.staticdata.log_guard_failure(fail_index);
+        // logger.py has no per-fail IndexMap; jitprof.py counts
+        // Counters.OPS / ABORT_* as integers. The integer
+        // `stats.guard_failures` tally above is the port of that.
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, fail_index, 0);
         }
@@ -22983,9 +22985,11 @@ pub struct DispatchArrayDescrKey {
 }
 
 /// Shared `all_liveness` bytes. Cloning the handle shares the lock.
-/// [`Self::set`] publishes a new `Arc<[u8]>`; [`Self::snapshot_arc`] clones
-/// that `Arc` (`pyjitpl.py` `self.liveness_info = "".join(asm.all_liveness)`).
-/// A holder that snapshots again after `set` sees the appended records.
+/// [`Self::set`] publishes a new `Arc<[u8]>`. [`Self::read`] borrows the
+/// current table (`pyjitpl.py` `self.liveness_info` is a string field).
+/// [`Self::snapshot_arc`] clones the inner `Arc` for a caller that keeps
+/// the table after this lock is dropped. A holder that reads again after
+/// `set` sees the appended records.
 #[derive(Clone, Debug)]
 pub struct SharedLiveness {
     bytes: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<[u8]>>>,
@@ -23008,6 +23012,18 @@ impl SharedLiveness {
 
     pub fn len(&self) -> usize {
         self.bytes.read().len()
+    }
+
+    /// Current bytes, borrowed for the duration of the guard.
+    ///
+    /// `pyjitpl.py` `MetaInterpStaticData.liveness_info` is a string
+    /// field (`finish_setup` assigns `"".join(asm.all_liveness)`).
+    /// `resume.py` `ResumeDataDirectReader._prepare_next_section` passes
+    /// `self.metainterp_sd.liveness_info` to `enumerate_vars` in place.
+    /// [`Self::snapshot_arc`] clones the inner `Arc` for callers that
+    /// keep the table after this lock is dropped.
+    pub(crate) fn read(&self) -> parking_lot::MappedRwLockReadGuard<'_, [u8]> {
+        parking_lot::RwLockReadGuard::map(self.bytes.read(), |bytes| bytes.as_ref())
     }
 
     /// Current bytes. `Arc` clone, not a copy of the buffer.
@@ -23045,6 +23061,90 @@ impl PartialEq<[u8]> for SharedLiveness {
 impl PartialEq<&[u8]> for SharedLiveness {
     fn eq(&self, other: &&[u8]) -> bool {
         self.snapshot_arc().as_ref() == *other
+    }
+}
+
+/// `pyjitpl.py` `MetaInterpStaticData.blackholeinterpbuilder`.
+///
+/// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
+/// `blackhole.py` `resume_in_blackhole` / `blackhole_from_resumedata` take
+/// that one builder. `acquire_interp` mutates `blackholeinterps` under the
+/// GIL; the mutex is that serialisation. The builder holds raw CPU pointers
+/// and is not Send; every access goes through the lock, which is how the
+/// single GIL object is shared on a free-threaded build.
+pub struct SharedBlackholeInterpBuilder {
+    inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
+}
+
+impl Default for SharedBlackholeInterpBuilder {
+    fn default() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(crate::blackhole::BlackholeInterpBuilder::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for SharedBlackholeInterpBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBlackholeInterpBuilder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedBlackholeInterpBuilder {
+    /// `BlackholeInterpBuilder(codewriter, self)`. Pyre's assembler insns
+    /// are not the blackhole dispatch table; the constructor body is
+    /// [`crate::blackhole::build_inline_call_only_bh_builder`].
+    fn install_wired(&mut self) {
+        *self.inner.get_mut() = crate::blackhole::build_inline_call_only_bh_builder(&[]);
+    }
+
+    /// `resume_in_blackhole` reads `metainterp_sd.blackholeinterpbuilder`
+    /// as a field pointer. Callers clone `MetaInterp.staticdata` first
+    /// (`convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`)
+    /// so the guard does not borrow `MetaInterp` and resume writeback can
+    /// still take `&mut MetaInterp` while the builder is held.
+    ///
+    /// Upstream never holds the builder across a resume: `acquire_interp`
+    /// pops `blackholeinterps` or builds a new `BlackholeInterpreter`, so a
+    /// resume nested inside another resume's residual call gets fresh
+    /// interpreters off the same builder. Here the outer resume holds the
+    /// builder for its whole run, so a nested resume on this thread (or one
+    /// on another thread) gets a freshly wired builder instead of blocking
+    /// on the lock: the same fresh-interpreter outcome.
+    pub fn lock(&self) -> BlackholeInterpBuilderGuard<'_> {
+        match self.inner.try_lock() {
+            Some(guard) => BlackholeInterpBuilderGuard::Shared(guard),
+            None => BlackholeInterpBuilderGuard::Nested(Box::new(
+                crate::blackhole::build_inline_call_only_bh_builder(&[]),
+            )),
+        }
+    }
+}
+
+/// [`SharedBlackholeInterpBuilder::lock`]: the one builder, or a fresh one
+/// for a resume that runs while the one builder is held.
+pub enum BlackholeInterpBuilderGuard<'a> {
+    Shared(parking_lot::MutexGuard<'a, crate::blackhole::BlackholeInterpBuilder>),
+    Nested(Box<crate::blackhole::BlackholeInterpBuilder>),
+}
+
+impl std::ops::Deref for BlackholeInterpBuilderGuard<'_> {
+    type Target = crate::blackhole::BlackholeInterpBuilder;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(guard) => guard,
+            Self::Nested(builder) => builder,
+        }
+    }
+}
+
+impl std::ops::DerefMut for BlackholeInterpBuilderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Shared(guard) => guard,
+            Self::Nested(builder) => builder,
+        }
     }
 }
 
@@ -23157,6 +23257,10 @@ pub struct MetaInterpStaticData {
     /// `greenfield_info`, neither of which this projection reads.
     pub(crate) bh_jitdrivers_sd:
         std::sync::OnceLock<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
+    /// pyjitpl.py `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`
+    /// (`finish_setup`). `blackhole.py` `resume_in_blackhole` takes
+    /// `metainterp_sd.blackholeinterpbuilder`.
+    pub blackholeinterpbuilder: SharedBlackholeInterpBuilder,
     /// pyjitpl.py:1314 / 2267 `metainterp_sd.virtualref_info` — shared
     /// `VirtualRefInfo` descriptor block.  Per-process singleton:
     /// descriptor indices for the `virtual_token` / `forced` fields and
@@ -23406,13 +23510,6 @@ impl MetaInterpStaticData {
         }
     }
 
-    /// Log a guard failure. No-op without a logger.
-    pub fn log_guard_failure(&self, guard_index: u32) {
-        if let Some(log) = self.jitlog.lock().as_mut() {
-            log.log_guard_failure(guard_index);
-        }
-    }
-
     /// rjitlog.py `JitLogger.trace_aborted`. No-op without a logger.
     pub fn log_trace_aborted(&self) {
         if let Some(log) = self.jitlog.lock().as_mut() {
@@ -23460,6 +23557,11 @@ impl MetaInterpStaticData {
             op_void_return: -1,
             ..Self::default()
         };
+        // `pyjitpl.py` `finish_setup`:
+        // `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`.
+        // State-field JIT never calls `finish_setup`; construct here so
+        // `resume_in_blackhole` always has the one builder.
+        sd.blackholeinterpbuilder.install_wired();
         crate::compile::make_and_attach_done_descrs(&mut [&mut sd]);
         sd
     }
@@ -23587,12 +23689,9 @@ impl MetaInterpStaticData {
     ) {
         // pyjitpl.py:2257-2258
         //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
-        // TODO: pyre's `BlackholeInterpBuilder`
-        // (`setup_insns` in `blackhole.rs`) is wired piecewise from
-        // per-jitdriver bring-up rather than a single constructor call
-        // — bringing the constructor-form back here cascades into a
-        // refactor of `BlackholeInterpBuilder`'s allocator and
-        // exceeds the current scope.
+        // Pyre's assembler insns are not the blackhole dispatch table;
+        // the constructor body is `build_inline_call_only_bh_builder`.
+        self.blackholeinterpbuilder.install_wired();
 
         let asm = codewriter.assembler();
         // pyjitpl.py `self.setup_insns(asm.insns)`
@@ -30617,6 +30716,18 @@ mod tests {
     use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
     use parking_lot::Mutex;
     use std::sync::{Arc, OnceLock};
+
+    /// A resume that starts while another resume holds
+    /// `metainterp_sd.blackholeinterpbuilder` (a residual call re-entering
+    /// the driver) must not block on it.
+    #[test]
+    fn blackholeinterpbuilder_held_gives_a_nested_resume_a_fresh_builder() {
+        let sd = MetaInterpStaticData::new();
+        let outer = sd.blackholeinterpbuilder.lock();
+        let nested = sd.blackholeinterpbuilder.lock();
+        assert!(matches!(outer, BlackholeInterpBuilderGuard::Shared(_)));
+        assert!(matches!(nested, BlackholeInterpBuilderGuard::Nested(_)));
+    }
 
     /// Producer-bound `Operand` for an op-arg / fail-arg `OpRef`, oparser-faithful
     /// (`rpython/jit/tool/oparser.py`): a position-only ResOp / InputArg ref

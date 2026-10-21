@@ -240,13 +240,15 @@ struct BlackholeCpuRef(*const (dyn majit_backend::Backend + 'static));
 
 impl BlackholeCpuRef {
     /// Erase the borrow lifetime without manufacturing a long-lived Rust
-    /// reference.  The builder is leased only while its owning MetaInterp CPU
-    /// is alive; every dereference is tied to the interpreter borrow below.
+    /// reference.  The builder lives on `metainterp_sd` while its owning
+    /// MetaInterp CPU is alive; every dereference is tied to the interpreter
+    /// borrow below.
     fn new(cpu: &dyn majit_backend::Backend) -> Self {
         let ptr = cpu as *const dyn majit_backend::Backend;
         // SAFETY: raw trait-object pointers carry a lifetime bound only at the
         // type level. `BlackholeInterpBuilder::set_cpu` documents and enforces
-        // the owner relationship at each production lease.
+        // the owner relationship for the `metainterp_sd.blackholeinterpbuilder`
+        // held across one resume.
         Self(unsafe {
             std::mem::transmute::<
                 *const dyn majit_backend::Backend,
@@ -257,7 +259,7 @@ impl BlackholeCpuRef {
 
     fn get(&self) -> &dyn majit_backend::Backend {
         // SAFETY: callers can obtain this only through a live builder/interp
-        // whose active lease is nested inside the CPU owner's lifetime.
+        // nested inside the CPU owner's lifetime.
         unsafe { &*self.0 }
     }
 }
@@ -2777,8 +2779,9 @@ impl BlackholeInterpBuilder {
 
     /// Bind the exact CPU owned by the MetaInterp that produced the trace.
     /// The caller must keep that CPU alive and at a stable address for the
-    /// builder's active lease; pooled interpreters are refreshed on acquire
-    /// only when this pointer actually changes.
+    /// duration of the resume that holds `metainterp_sd.blackholeinterpbuilder`;
+    /// pooled interpreters are refreshed on acquire only when this pointer
+    /// actually changes.
     pub fn set_cpu(&mut self, cpu: &dyn majit_backend::Backend) {
         let new = BlackholeCpuRef::new(cpu);
         let new_ptr = new.0 as *const dyn majit_backend::Backend as *const ();

@@ -3674,6 +3674,9 @@ impl FailDescr for ResumeAtPositionDescr {
     fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
     }
+    fn rd_consts_pool(&self) -> Option<&majit_ir::SharedConstPool> {
+        self.inner.payload.rd_consts_pool()
+    }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)
     }
@@ -4076,6 +4079,9 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
     }
+    fn rd_consts_pool(&self) -> Option<&majit_ir::SharedConstPool> {
+        self.inner.payload.rd_consts_pool()
+    }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)
     }
@@ -4324,6 +4330,9 @@ impl FailDescr for ResumeGuardExcDescr {
     }
     fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
+    }
+    fn rd_consts_pool(&self) -> Option<&majit_ir::SharedConstPool> {
+        self.inner.payload.rd_consts_pool()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)
@@ -4756,6 +4765,11 @@ impl FailDescr for ResumeGuardCopiedDescr {
             .as_fail_descr()
             .and_then(|fd| fd.rd_consts_arc())
     }
+    fn rd_consts_pool(&self) -> Option<&majit_ir::SharedConstPool> {
+        self.prev()
+            .as_fail_descr()
+            .and_then(|fd| fd.rd_consts_pool())
+    }
     fn set_rd_consts(&self, _value: Option<Vec<Const>>) {
         panic!(
             "set_rd_consts invoked on a ResumeGuardCopiedDescr — \
@@ -5080,6 +5094,9 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     }
     fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.rd_consts_arc()
+    }
+    fn rd_consts_pool(&self) -> Option<&majit_ir::SharedConstPool> {
+        self.inner.rd_consts_pool()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.set_rd_consts(value)
@@ -5534,6 +5551,9 @@ impl FailDescr for CompileLoopVersionDescr {
     }
     fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.inner.payload.rd_consts_arc()
+    }
+    fn rd_consts_pool(&self) -> Option<&majit_ir::SharedConstPool> {
+        self.inner.payload.rd_consts_pool()
     }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.inner.payload.set_rd_consts(value)

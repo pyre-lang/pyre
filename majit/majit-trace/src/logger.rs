@@ -55,8 +55,6 @@ pub struct Logger {
     aborted: u64,
     /// Number of bridges compiled from guard failures.
     bridges_compiled: u64,
-    /// Guard failure counts, keyed by guard index.
-    guard_failures: IndexMap<u32, u64>,
     /// Loop entry counts, keyed by green key hash.
     loop_entries: IndexMap<u64, u64>,
     /// Whether to print the summary on drop.
@@ -71,7 +69,6 @@ impl Logger {
             compiled: Vec::new(),
             aborted: 0,
             bridges_compiled: 0,
-            guard_failures: IndexMap::new(),
             loop_entries: IndexMap::new(),
             print_on_drop,
         }
@@ -110,11 +107,6 @@ impl Logger {
         self.aborted += 1;
     }
 
-    /// Record a guard failure for the given guard index.
-    pub fn log_guard_failure(&mut self, guard_index: u32) {
-        *self.guard_failures.entry(guard_index).or_default() += 1;
-    }
-
     /// Record a loop entry for the given green key.
     pub fn log_loop_entry(&mut self, green_key: u64) {
         *self.loop_entries.entry(green_key).or_default() += 1;
@@ -140,11 +132,6 @@ impl Logger {
         self.aborted
     }
 
-    /// Total guard failures across all guards.
-    pub fn total_guard_failures(&self) -> u64 {
-        self.guard_failures.values().sum()
-    }
-
     /// Total operations recorded across all compiled traces (before optimization).
     pub fn total_ops_before(&self) -> usize {
         self.compiled.iter().map(|r| r.ops_before_opt).sum()
@@ -168,11 +155,6 @@ impl Logger {
     /// Get the compiled trace records.
     pub fn compiled_traces(&self) -> &[TraceRecord] {
         &self.compiled
-    }
-
-    /// Get guard failure counts.
-    pub fn guard_failure_counts(&self) -> &IndexMap<u32, u64> {
-        &self.guard_failures
     }
 
     /// Get loop entry counts.
@@ -203,7 +185,6 @@ Traces aborted: {}
 Traces bridged: {}
 Total ops recorded: {}
 Total ops after opt: {} ({:.0}% reduction)
-Guard failures: {}
 Optimization time: {:.1}ms
 Compilation time: {:.1}ms",
             self.traces_compiled(),
@@ -212,7 +193,6 @@ Compilation time: {:.1}ms",
             total_before,
             total_after,
             reduction_pct,
-            self.total_guard_failures(),
             opt_ms,
             compile_ms,
         )
@@ -264,7 +244,6 @@ mod tests {
         let log = Logger::new(false);
         assert_eq!(log.traces_compiled(), 0);
         assert_eq!(log.traces_aborted(), 0);
-        assert_eq!(log.total_guard_failures(), 0);
         assert_eq!(log.total_ops_before(), 0);
         assert_eq!(log.total_ops_after(), 0);
     }
@@ -295,17 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn test_jitlog_guard_failures() {
-        let mut log = Logger::new(false);
-        log.log_guard_failure(0);
-        log.log_guard_failure(0);
-        log.log_guard_failure(1);
-        assert_eq!(log.total_guard_failures(), 3);
-        assert_eq!(*log.guard_failure_counts().get(&0).unwrap(), 2);
-        assert_eq!(*log.guard_failure_counts().get(&1).unwrap(), 1);
-    }
-
-    #[test]
     fn test_jitlog_loop_entries() {
         let mut log = Logger::new(false);
         log.log_loop_entry(100);
@@ -333,15 +301,12 @@ mod tests {
             Duration::from_millis(3),
         );
         log.log_abort();
-        log.log_guard_failure(0);
-        log.log_guard_failure(1);
 
         let summary = log.summary();
         assert!(summary.contains("Traces compiled: 2"));
         assert!(summary.contains("Traces aborted: 1"));
         assert!(summary.contains("Total ops recorded: 150"));
         assert!(summary.contains("Total ops after opt: 85"));
-        assert!(summary.contains("Guard failures: 2"));
         assert!(summary.contains("Compilation time:"));
     }
 
@@ -441,21 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_failures_per_guard() {
-        // Guard failure tracking — per-guard counts like profiler.counters
-        let mut log = Logger::new(false);
-        log.log_guard_failure(0);
-        log.log_guard_failure(0);
-        log.log_guard_failure(0);
-        log.log_guard_failure(1);
-        log.log_guard_failure(2);
-        assert_eq!(log.total_guard_failures(), 5);
-        assert_eq!(*log.guard_failure_counts().get(&0).unwrap(), 3);
-        assert_eq!(*log.guard_failure_counts().get(&1).unwrap(), 1);
-        assert_eq!(*log.guard_failure_counts().get(&2).unwrap(), 1);
-    }
-
-    #[test]
     fn test_compilation_timing() {
         // Parity with profiler.times: compilation and optimization timing
         let mut log = Logger::new(false);
@@ -515,9 +465,6 @@ mod tests {
         );
         log.log_abort();
         log.log_abort();
-        log.log_guard_failure(0);
-        log.log_guard_failure(0);
-        log.log_guard_failure(1);
 
         let summary = log.summary();
         assert!(summary.contains("Traces compiled: 2"));
@@ -525,7 +472,6 @@ mod tests {
         assert!(summary.contains("Total ops recorded: 300"));
         assert!(summary.contains("Total ops after opt: 150"));
         assert!(summary.contains("50% reduction"));
-        assert!(summary.contains("Guard failures: 3"));
         assert!(summary.contains("Optimization time:"));
         assert!(summary.contains("Compilation time:"));
     }

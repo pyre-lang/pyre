@@ -2934,7 +2934,14 @@ impl WarmEnterState {
         // only when it is this driver's JitCell (`isinstance(cell, JitCell)`
         // in `JitCell.get_jitcell`); every driver files into the one
         // `jitcounter.celltable`.
-        if let Some(cell) = self.lookup_chain(hash)
+        //
+        // `counter.py JitCounter.lookup_chain` is a table-slot load
+        // (`return self.celltable[self._get_index(hash)]`).
+        // `warmstate.py maybe_compile_and_run` keeps that pointer
+        // (`cell = jitcounter.lookup_chain(hash)`). The owned `Rc`
+        // that [`Self::lookup_chain`] clones is for callers that store
+        // the cell; this arm only reads flags and upgrades the token.
+        if let Some(cell) = self.counter.lookup_chain(hash)
             && cell.next.borrow().is_none()
             && cell.cell_bucket.get() == hash
             && cell.jitdriver_sd == self.jitdriver_sd

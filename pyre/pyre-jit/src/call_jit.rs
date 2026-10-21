@@ -2790,7 +2790,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // the list `blackhole.py` `resume_in_blackhole` passes
     // (`MetaInterpStaticData.jitcodes` from `CodeWriter.make_jitcodes`).
     // `novable` only means this stream has no vable section.
-    let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
+    let resolve_jitcode = |jitcode_index: i32,
+                           pc: i32|
+     -> Option<resume::ResolvedJitCode<'static>> {
         if pc < 0 {
             if majit_gc::diag_p92_trace_io() {
                 eprintln!("P92_RESOLVE fail index={jitcode_index} pc={pc} why=pc_negative");

@@ -2,58 +2,6 @@ use majit_backend::{Backend, ExitValueSourceLayout};
 
 use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
-thread_local! {
-    /// Per-thread pool for the structured back-edge blackhole resume.
-    /// `build_inline_call_only_bh_builder` wires ~100 string-keyed insns and
-    /// their handlers — a fixed dispatch table independent of any trace — so
-    /// rebuilding it on every guard failure is pure waste (the dominant
-    /// per-deopt cost). Built once, lent via [`BackEdgeBhBuilder`], and
-    /// re-pooled on drop, mirroring `call_jit.rs`'s `BH_BUILDER_RD`.
-    /// The slot holds a `Box` so a lease moves one pointer rather than the
-    /// builder itself (`warmspot.py` keeps one `BlackholeInterpBuilder` and
-    /// `blackhole.py resume_in_blackhole` reaches it through
-    /// `metainterp_sd.blackholeinterpbuilder`).
-    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<Box<crate::blackhole::BlackholeInterpBuilder>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// RAII lease of the thread-local back-edge blackhole builder. Takes the
-/// pooled `Box` out for the duration of one resume and returns it on drop,
-/// so every early `return` in the resume path re-pools it. If the slot is
-/// empty — first use, or a re-entrant resume already holds it — a fresh
-/// builder is constructed; the surplus is simply dropped when re-pooling.
-struct BackEdgeBhBuilder(Option<Box<crate::blackhole::BlackholeInterpBuilder>>);
-
-impl BackEdgeBhBuilder {
-    fn lease() -> Self {
-        let builder = BACK_EDGE_BH_BUILDER
-            .with(|c| c.borrow_mut().take())
-            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder(&[])));
-        Self(Some(builder))
-    }
-}
-
-impl Drop for BackEdgeBhBuilder {
-    fn drop(&mut self) {
-        if let Some(builder) = self.0.take() {
-            BACK_EDGE_BH_BUILDER.with(|c| *c.borrow_mut() = Some(builder));
-        }
-    }
-}
-
-impl std::ops::Deref for BackEdgeBhBuilder {
-    type Target = crate::blackhole::BlackholeInterpBuilder;
-    fn deref(&self) -> &Self::Target {
-        self.0.as_deref().expect("builder leased")
-    }
-}
-
-impl std::ops::DerefMut for BackEdgeBhBuilder {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_deref_mut().expect("builder leased")
-    }
-}
-
 /// Terminal state from a single-frame tracing-abort blackhole run.
 ///
 /// The terminal interpreter is kept logically alive by moving out its three
@@ -262,7 +210,7 @@ pub fn drive_single_frame_blackhole(
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
 
-    let mut builder = BackEdgeBhBuilder::lease();
+    let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
     builder.set_cpu(cpu);
     builder.setup_cached_control_opcodes(
         metainterp_sd.op_live,
@@ -3298,9 +3246,9 @@ impl<S: JitState> JitDriver<S> {
             }
         }
 
-        let mut bh_builder = BackEdgeBhBuilder::lease();
+        let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
+        let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
         bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
-        let staticdata = &self.meta.staticdata;
         let outcome = drive_multi_frame_blackhole(
             &mut bh_builder,
             framestack,
@@ -3311,7 +3259,7 @@ impl<S: JitState> JitDriver<S> {
             // `[.. ; virt]` array starts at 0 and a heap virtualizable reaches
             // here with a null vinfo, so the base is never read.
             0,
-            staticdata,
+            staticdata.as_ref(),
             last_exc_value,
             raising_exception,
             None,
@@ -7932,7 +7880,11 @@ impl<S: JitState> JitDriver<S> {
             // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
             // the values match the metainterp's actual byte
             // assignments.
-            let mut bh_builder = BackEdgeBhBuilder::lease();
+            // `convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`
+            // then `metainterp_sd.blackholeinterpbuilder`. Clone the Arc so
+            // the lock does not borrow `self.meta`.
+            let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
+            let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
             bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
             bh_builder.setup_cached_control_opcodes(
                 self.meta_interp().staticdata.op_live,
@@ -7943,14 +7895,12 @@ impl<S: JitState> JitDriver<S> {
             // per resumed frame, and every frame that still has a caller
             // takes `bhimpl_jit_merge_point`'s recursive-portal branch
             // (blackhole.py), which indexes `jitdrivers_sd`
-            // directly.  The lease is thread-local and carries whatever
-            // the previous resume left on it, so seed the table here
-            // instead of depending on that.
+            // directly. Seed the table from this staticdata; the builder
+            // is the one `finish_setup` installed.
             let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
             if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                 bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
             }
-            let all_liveness = self.meta_interp().staticdata.liveness_info.snapshot_arc();
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
             // jitframe is re-read through `ShadowRoot`; an off-heap
@@ -7969,30 +7919,40 @@ impl<S: JitState> JitDriver<S> {
                     majit_backend::FailArgSource::Slice(&fallback_raw)
                 }
             };
-            let bh = crate::resume::blackhole_from_resumedata(
-                &mut bh_builder,
-                jitcodes,
-                rd_numb.as_slice(),
-                rd_consts_slice,
-                &all_liveness,
-                fail_args,
-                rd_virtuals_slice,
-                Some(rd_pendingfields), // rd_guard_pendingfields
-                Some(
-                    &self.meta_interp().staticdata.virtualref_info as &dyn crate::resume::VRefInfo,
-                ),
-                // Pass the registered vinfo so the vable section of the
-                // resume stream is consumed (avoids a stream desync when
-                // the trace carries virtualizable array boxes).
-                self.meta
-                    .virtualizable_info()
-                    .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
-                None, // ginfo
-                all_virtuals,
-                allocator,
-                Some(rd_numb),
-            );
-            let (mut bh, vable_ptr) = bh;
+            // `pyjitpl.py` `MetaInterpStaticData.liveness_info` is a
+            // string field (`finish_setup` assigns
+            // `"".join(asm.all_liveness)`). `resume.py`
+            // `blackhole_from_resumedata` builds
+            // `ResumeDataDirectReader(metainterp_sd, ...)` and
+            // `_prepare_next_section` passes
+            // `self.metainterp_sd.liveness_info` to `enumerate_vars`
+            // in place. The decode borrows that table; it does not
+            // take a copy. Drop the guard before `resume_mainloop`
+            // so this method can take `&mut self` again.
+            let (mut bh, vable_ptr) = {
+                let all_liveness = self.meta.staticdata.liveness_info.read();
+                crate::resume::blackhole_from_resumedata(
+                    &mut bh_builder,
+                    jitcodes,
+                    rd_numb.as_slice(),
+                    rd_consts_slice,
+                    &all_liveness,
+                    fail_args,
+                    rd_virtuals_slice,
+                    Some(rd_pendingfields), // rd_guard_pendingfields
+                    Some(&self.meta.staticdata.virtualref_info as &dyn crate::resume::VRefInfo),
+                    // Pass the registered vinfo so the vable section of the
+                    // resume stream is consumed (avoids a stream desync when
+                    // the trace carries virtualizable array boxes).
+                    self.meta
+                        .virtualizable_info()
+                        .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
+                    None, // ginfo
+                    all_virtuals,
+                    allocator,
+                    Some(rd_numb),
+                )
+            };
             {
                 // Thread the state-field register layout onto the dispatch
                 // frame (chain tail) so the `state_field` handlers map a
@@ -8199,6 +8159,8 @@ impl<S: JitState> JitDriver<S> {
                                 &bh.registers_f[float_base..],
                             );
                         } else {
+                            // Same string-field read as the decode above.
+                            let all_liveness = self.meta.staticdata.liveness_info.read();
                             writeback_live_state_scalars_from_blackhole(
                                 state,
                                 &layout,

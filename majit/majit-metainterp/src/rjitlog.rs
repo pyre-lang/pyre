@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, Op, OpCode, Type, Value};
@@ -71,8 +72,16 @@ static JITLOG: Mutex<JitLogState> = Mutex::new(JitLogState {
     get_location: None,
 });
 
+/// `rjitlog.c jitlog_ready`. `jitlog_enabled` is a load of this flag,
+/// not a lock of the writer state.
+static JITLOG_READY: AtomicBool = AtomicBool::new(false);
+
 fn lock() -> std::sync::MutexGuard<'static, JitLogState> {
     JITLOG.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn set_ready(ready: bool) {
+    JITLOG_READY.store(ready, Ordering::Relaxed);
 }
 
 /// `rjitlog.c jitlog_try_init_using_env`.
@@ -85,10 +94,14 @@ pub fn jitlog_try_init_using_env() {
     }
     let mut state = lock();
     if state.file.is_some() {
+        set_ready(true);
         return;
     }
     match File::create(&path) {
-        Ok(file) => state.file = Some(file),
+        Ok(file) => {
+            state.file = Some(file);
+            set_ready(true);
+        }
         Err(err) => eprintln!("could not open '{}': {err}", path.to_string_lossy()),
     }
 }
@@ -123,9 +136,9 @@ fn assemble_header() -> Vec<u8> {
     content
 }
 
-/// `rjitlog.c jitlog_enabled`.
+/// `rjitlog.c jitlog_enabled`: `return jitlog_ready`.
 pub fn jitlog_enabled() -> bool {
-    lock().file.is_some()
+    JITLOG_READY.load(Ordering::Relaxed)
 }
 
 /// `rjitlog.py JitLogger.start_new_trace`. Increments even when disabled.
@@ -175,6 +188,11 @@ pub fn install_backend_hooks() {
 /// `rjitlog.py redirect_assembler`.
 pub fn redirect_assembler(old_id: u64, new_id: u64, asm_adr: u64) {
     install_backend_hooks();
+    // `rjitlog.py redirect_assembler` writes through `jitlog_write_marked`,
+    // which returns when `!jitlog_ready`.
+    if !jitlog_enabled() {
+        return;
+    }
     let mut state = lock();
     if state.file.is_none() {
         return;
@@ -187,6 +205,10 @@ pub fn redirect_assembler(old_id: u64, new_id: u64, asm_adr: u64) {
 
 /// `rjitlog.py JitLogger.log_patch_guard`.
 pub fn log_patch_guard(descr_number: u64, addr: u64) {
+    // `rjitlog.py JitLogger.log_patch_guard`: `if not jitlog_enabled(): return`
+    if !jitlog_enabled() {
+        return;
+    }
     let mut state = lock();
     if state.file.is_none() {
         return;
@@ -198,6 +220,11 @@ pub fn log_patch_guard(descr_number: u64, addr: u64) {
 
 /// `rjitlog.py tmp_callback`.
 pub fn tmp_callback(token_id: u64, token_number: u64) {
+    // `rjitlog.py tmp_callback` writes through `jitlog_write_marked`
+    // (`rjitlog.c`: `if (!jitlog_ready) { return; }`).
+    if !jitlog_enabled() {
+        return;
+    }
     let mut state = lock();
     if state.file.is_none() {
         return;
@@ -209,6 +236,10 @@ pub fn tmp_callback(token_id: u64, token_number: u64) {
 
 /// `rjitlog.py JitLogger.trace_aborted`.
 pub fn trace_aborted(tid: u64) {
+    // `rjitlog.py JitLogger.trace_aborted`: `if not jitlog_enabled(): return`
+    if !jitlog_enabled() {
+        return;
+    }
     let mut state = lock();
     if state.file.is_none() {
         return;
@@ -232,6 +263,10 @@ where
     A: Borrow<InputArg>,
     O: Borrow<Op>,
 {
+    // `rjitlog.py JitLogger.log_trace`: `if not jitlog_enabled(): return EMPTY_TRACE_LOG`
+    if !jitlog_enabled() {
+        return;
+    }
     let mut state = lock();
     if state.file.is_none() {
         return;

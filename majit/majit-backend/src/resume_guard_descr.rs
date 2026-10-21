@@ -443,6 +443,9 @@ impl FailDescr for ResumeGuardDescr {
     fn rd_consts_arc(&self) -> Option<Arc<majit_ir::SharedConstPool>> {
         self.payload.rd_consts_arc()
     }
+    fn rd_consts_pool(&self) -> Option<&majit_ir::SharedConstPool> {
+        self.payload.rd_consts_pool()
+    }
     fn set_rd_consts(&self, value: Option<Vec<Const>>) {
         self.payload.set_rd_consts(value)
     }

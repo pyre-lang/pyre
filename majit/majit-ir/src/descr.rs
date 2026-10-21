@@ -4979,6 +4979,13 @@ pub trait FailDescr: Descr {
         None
     }
 
+    /// The walked `rd_consts` field, not a clone.
+    /// `compile.py` `ResumeGuardDescr._attrs_` traces `rd_consts` as an
+    /// ordinary MiniMark field; a walk reads that field in place.
+    fn rd_consts_pool(&self) -> Option<&crate::SharedConstPool> {
+        None
+    }
+
     fn set_rd_consts(&self, _value: Option<Vec<Const>>) {
         panic!(
             "set_rd_consts invoked on a FailDescr that does not carry \
