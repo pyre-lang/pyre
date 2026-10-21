@@ -34833,7 +34833,17 @@ impl<'a> Lowering<'a> {
                     }
                     return Ok((segments, None));
                 }
-                if let Some((trait_leaf, method_leaf)) = trait_payload_owner(v, self.llbc) {
+                if let Some((trait_path, method_leaf)) = trait_payload_path_and_method(v, self.llbc)
+                {
+                    // `extract_trait_impls` registers default bodies under
+                    // `[<Trait leaf>, <method>]`. The residual path keeps
+                    // that two-segment shape; recognizers compare the full
+                    // Charon path separately.
+                    let trait_leaf = trait_path
+                        .rsplit("::")
+                        .next()
+                        .unwrap_or(trait_path.as_str())
+                        .to_string();
                     Ok((vec![trait_leaf, method_leaf], None))
                 } else {
                     let label = trait_call_label(v);
@@ -39660,27 +39670,29 @@ impl<'a> Lowering<'a> {
             && self.can_emit_default_of_ty(dest_ty)
     }
 
-    /// `CallKind::Trait` naming `Default::default`. Distinct from a Fun
-    /// Regular path `core::default::Default::default` (the lookalike).
+    /// `CallKind::Trait` naming `core::default::Default::default`. Distinct
+    /// from a Fun Regular path of the same spelling (the lookalike).
     fn is_trait_default_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Trait(v) = &reg.kind else {
             return false;
         };
-        trait_payload_owner(v, self.llbc).is_some_and(|(trait_leaf, method_leaf)| {
-            trait_leaf == "Default" && method_leaf == "default"
+        trait_payload_path_and_method(v, self.llbc).is_some_and(|(trait_path, method_leaf)| {
+            trait_path == "core::default::Default" && method_leaf == "default"
         })
     }
 
-    /// `CallKind::Trait` naming `FnOnce::call_once` / `Fn::call` /
-    /// `FnMut::call_mut`. The generated shim for a function item.
+    /// `CallKind::Trait` naming `core::ops::function::FnOnce::call_once` /
+    /// `Fn::call` / `FnMut::call_mut`. The generated shim for a function item.
     fn is_fn_family_call_once(&self, reg: &RegularCall) -> bool {
         let CallKind::Trait(v) = &reg.kind else {
             return false;
         };
-        trait_payload_owner(v, self.llbc).is_some_and(|(trait_leaf, method_leaf)| {
+        trait_payload_path_and_method(v, self.llbc).is_some_and(|(trait_path, method_leaf)| {
             matches!(
-                (trait_leaf.as_str(), method_leaf.as_str()),
-                ("FnOnce", "call_once") | ("Fn", "call") | ("FnMut", "call_mut")
+                (trait_path.as_str(), method_leaf.as_str()),
+                ("core::ops::function::FnOnce", "call_once")
+                    | ("core::ops::function::Fn", "call")
+                    | ("core::ops::function::FnMut", "call_mut")
             )
         })
     }
@@ -51805,8 +51817,8 @@ fn call_is_result_try_branch(func: &CallFunc, llbc: &Llbc) -> bool {
     let CallKind::Trait(payload) = &reg.kind else {
         return false;
     };
-    trait_payload_owner(payload, llbc).is_some_and(|(trait_leaf, method)| {
-        method == "branch" && (trait_leaf == "Try" || trait_leaf == "result")
+    trait_payload_path_and_method(payload, llbc).is_some_and(|(trait_path, method)| {
+        method == "branch" && trait_path == "core::ops::try_trait::Try"
     })
 }
 
@@ -51994,7 +52006,8 @@ fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
     match kind {
         CallKind::Fun(FunId::Regular { id }) => Some(*id),
         // The payload is `[trait_ref, method_idx]` and does not carry a
-        // fun-decl id. Callers that need the method use `trait_payload_owner`.
+        // fun-decl id. Callers that need the method use
+        // `trait_payload_path_and_method`.
         CallKind::Trait(_) => None,
         _ => None,
     }
@@ -74987,7 +75000,7 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
     if !trait_ref_is_dyn(payload.first()?, llbc) {
         return None;
     }
-    let (trait_leaf, method_leaf) = trait_payload_owner(value, llbc)?;
+    let (trait_path, method_leaf) = trait_payload_path_and_method(value, llbc)?;
     let decl_id = trait_ref_decl_id(payload.first()?, llbc)?;
     // A `--monomorphize` trait declaration carries no method rows, so there
     // is no signature to read. The receiver is then guaranteed by the
@@ -75003,13 +75016,16 @@ fn abstract_trait_call_target(reg: &RegularCall, llbc: &Llbc) -> Option<(String,
             return None;
         }
     }
+    let default_method_path = format!("{trait_path}::{method_leaf}");
     let has_body = llbc.iter_local_fns().any(|fd| {
         let path = fd.item_meta.name_path();
-        path.ends_with(&format!("::{trait_leaf}::{method_leaf}")) && fd.has_unstructured_body()
+        (path == default_method_path || path.ends_with(&format!("::{default_method_path}")))
+            && fd.has_unstructured_body()
     });
     if has_body {
         return None;
     }
+    let trait_leaf = trait_path.rsplit("::").next()?.to_string();
     Some((trait_leaf, method_leaf))
 }
 
@@ -75083,16 +75099,16 @@ fn trait_call_label(v: &serde_json::Value) -> String {
     "unknown".to_string()
 }
 
-/// `(trait leaf, method leaf)` from `CallKind::Trait([trait_ref, method_idx])`.
-fn trait_payload_owner(v: &serde_json::Value, llbc: &Llbc) -> Option<(String, String)> {
+/// `(full trait name path, method leaf)` from
+/// `CallKind::Trait([trait_ref, method_idx])`.
+fn trait_payload_path_and_method(v: &serde_json::Value, llbc: &Llbc) -> Option<(String, String)> {
     let arr = v.as_array()?;
     let decl_id = trait_ref_decl_id(arr.first()?, llbc)?;
     let method_leaf = llbc
         .trait_method_name(decl_id, arr.get(1)?.as_u64()?)?
         .to_string();
-    let path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
-    let trait_leaf = path.rsplit("::").next()?.to_string();
-    Some((trait_leaf, method_leaf))
+    let trait_path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
+    Some((trait_path, method_leaf))
 }
 
 /// `Vec<T>` as trait `Clone::clone` → the `list` builtin
@@ -75111,10 +75127,10 @@ fn specialized_trait_clone_list_target(
     tyref_vec_clone_is_ll_copy(&self_ty, llbc).then(|| (vec!["list".to_string()], None))
 }
 
-/// `CallKind::Trait` payload of `Clone::clone`.
+/// `CallKind::Trait` payload of `core::clone::Clone::clone`.
 fn is_trait_clone_clone(v: &serde_json::Value, llbc: &Llbc) -> bool {
-    if let Some((trait_leaf, method_leaf)) = trait_payload_owner(v, llbc)
-        && trait_leaf == "Clone"
+    if let Some((trait_path, method_leaf)) = trait_payload_path_and_method(v, llbc)
+        && trait_path == "core::clone::Clone"
         && method_leaf == "clone"
     {
         return true;
@@ -104527,6 +104543,30 @@ mod tests {
     }
 
     #[test]
+    fn user_trait_named_default_is_not_integer_zero() {
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let llbc = std_trait_call_fixture(
+            "user_trait_default_i64",
+            &["pyre_test", "Default"],
+            "default",
+            &[],
+            i64_ty,
+            vec![],
+        );
+        let graph = super::lower_function(&llbc, "user_trait_default_i64")
+            .expect("lower user-defined Default");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "a user-defined Default must not become integer zero; ops={ops:?}"
+        );
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "a user-defined Default stays a residual trait call; ops={ops:?}"
+        );
+    }
+
+    #[test]
     fn trait_default_of_wtf8buf_is_empty_str() {
         let wtf8buf = serde_json::json!({"Adt": {
             "id": 0,
@@ -104579,6 +104619,7 @@ mod tests {
             empty,
             None,
             false,
+            &["core", "ops", "function", "FnOnce"],
         )
     }
 
@@ -104590,6 +104631,7 @@ mod tests {
         fn_def_generics: serde_json::Value,
         decl_generics: Option<serde_json::Value>,
         dont_look_inside: bool,
+        trait_path: &[&str],
     ) -> Llbc {
         let span = serde_json::json!({
             "data": {
@@ -104739,7 +104781,7 @@ mod tests {
         }
         let trait_decl = serde_json::json!({
             "def_id": 0,
-            "item_meta": item_meta(&["core", "ops", "function", "FnOnce"], false),
+            "item_meta": item_meta(trait_path, false),
             "methods": []
         });
         let mut global_decls = Vec::new();
@@ -104865,6 +104907,7 @@ mod tests {
                 "trait_clauses": []
             })),
             true,
+            &["core", "ops", "function", "FnOnce"],
         );
         let graph = super::lower_function(&llbc, "call_once_fndef")
             .expect("lower FnOnce::call_once of a generic FnDef");
@@ -104879,6 +104922,45 @@ mod tests {
         assert!(
             !leafs.iter().any(|leaf| *leaf == "call_once"),
             "a readable generic FnDef must unpack; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn user_trait_named_fn_once_is_not_retargeted() {
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let empty = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let llbc = fn_item_call_once_fixture_with(
+            &["core", "str", "<Impl>", "is_empty"],
+            1,
+            &[str_ty],
+            bool_ty,
+            empty,
+            None,
+            false,
+            &["pyre_test", "FnOnce"],
+        );
+        let graph = super::lower_function(&llbc, "call_once_fndef")
+            .expect("lower user-defined FnOnce::call_once");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "call_once"),
+            "a user-defined FnOnce must not retarget to the FnDef; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["__len"]
+            )),
+            "a user-defined FnOnce must not unpack into str::is_empty; ops={ops:?}"
         );
     }
 
