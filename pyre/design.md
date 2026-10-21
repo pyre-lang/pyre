@@ -680,8 +680,9 @@ blockers and retired zero folds. On 2026-09-25 the same shape retired every
 arm pins its domain before the C call and then calls one unboxed leaf, so the
 generic builtin descent walks it. A fast arm may not test the C result and
 fall back to the slow path, because the slow path has no executable address
-once that call has run; `frexp` stays folded because its two boxes need a root
-bracket, which does not lower in a walked body. On 2026-09-26 the `str`
+once that call has run. `frexp` followed on 2026-10-20: its gateway roots the
+mantissa box across the exponent box with `with_roots!` and packs them with
+`wraptuple2`, the shape `integer_divmod_pair` already descends. On 2026-09-26 the `str`
 `startswith`/`endswith` folds followed `find`/`rfind`/`count`: each
 gateway's fast arm now runs before the arity and keyword checks, whose kwargs
 scan did not lower and had kept the descent declining, and calls one elidable

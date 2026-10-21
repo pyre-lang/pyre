@@ -2546,16 +2546,14 @@ def synth_ungated_jitstats(path):
 
 def synth_spec_folds(path):
     """Read an optional list of trace-time folds a fixture must make fire:
-        # pyre-check: spec-folds=builtin_zip,zip_two_tuple_iters
+        # pyre-check: spec-folds=setslice,newlist
 
     A throughput ceiling cannot gate one fold out of several. The legs of a
     multi-fold fixture sum into one number, so retiring the least valuable one
     moves that number by less than the span the same fixture reads across the
     runners (`PERF_GATE_FLOOR_DIVISOR` records how wide that is). A jit-stats
-    baseline covers only part of the set: of the eight folds
-    `unspecialized_long_math_zip_paths` names, suppressing either zip fold
-    moves `bridges_compiled` and `guard_failures`, and suppressing any of the
-    other six alone moves no gated counter at all.
+    baseline covers only part of the set: suppressing one fold of a
+    multi-fold fixture can move no gated counter at all.
 
     So this gates coverage instead, which is exact and the same on every host:
     each named fold has to fire at least once. That is the failure the other

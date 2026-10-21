@@ -101,10 +101,7 @@ pyre_interpreter::py_module! {
         ns = install(ns, "floor", m::__majit_wrap_math_floor);
         ns = install(ns, "ceil", m::__majit_wrap_math_ceil);
         ns = install(ns, "trunc", m::__majit_wrap_math_trunc);
-        // `frexp` stays on the walker fold `math_frexp`: its gateway would
-        // root the mantissa box across the exponent box, and a root bracket
-        // does not lower in a walked body.
-        ns = install(ns, "frexp", m::frexp);
+        ns = install(ns, "frexp", m::__majit_wrap_math_frexp);
         ns = install(ns, "isqrt", m::__majit_wrap_math_isqrt);
         // Optional base, or keyword tolerances: not a fixed arity-1 builtin.
         pyre_interpreter::__pyre_store!(

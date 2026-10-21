@@ -1,11 +1,15 @@
 # pyre-check: jitstats-band=guard_failures=1
 # `guard_failures` / `bridges_compiled` follow the minor-collection schedule
-# (`counter.py` `decay_all_counters`, every 32 minors). At PYPY_GC_NURSERY
-# 2MB..16MB (check.py pins 4MB) this file reads loops=109 bridges=122
-# guard_failures=25253 loops_aborted=19, every abort a `force_qmut` (the
-# oracle reports `abort: force quasi-immut` 25). 256K/1M compile a different
-# set. The extra `RAISE_WARM` trips through `boom` push the last fail=2 hop
-# past `trace_eagerness` (200 / `increment_trace_eagerness`).
+# (`counter.py` `decay_all_counters`, every 32 minors), and so does the split
+# between compiled loops and `force_qmut` aborts: the module loop's global
+# stores invalidate it, and whether a retrace starts on an iteration that
+# stores is schedule-dependent. The oracle moves too: `abort: force
+# quasi-immut` reads 17..29 across PYPY_GC_NURSERY 1MB..8MB. Under check.py's
+# environment N is chosen so that dynasm and cranelift both read loops=110
+# bridges=131 loops_aborted=25 guard_failures=27423 at the 4MB pin and at
+# 6MB; N=64000 and N=68000 split the backends at the pin by one loop. The
+# extra `RAISE_WARM` trips through `boom` push the last fail=2 hop past
+# `trace_eagerness` (200 / `increment_trace_eagerness`).
 # A frame whose residual call raises must still run its own `finally`, and must
 # contribute exactly one traceback node.
 #
@@ -26,7 +30,7 @@
 # unsupported and the abort has to be adopted rather than retraced.
 import sys
 
-N = 64000
+N = 60000
 RAISE_WARM = 50
 _cur = [None]
 

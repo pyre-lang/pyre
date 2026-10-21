@@ -1,16 +1,8 @@
-# pyre-check: spec-folds=zip_two_tuple_iters,math_frexp
 # pyre-check: requires-modules=math
-# Throughput gate for the hand-written folds this file still fires: `zip`
-# over two tuples (positional and `strict=True`), and `math.frexp`.
-# `bigint ** int` is the descended `long_pow` body and `math.ldexp` the
-# descended `math` gateway.
-#
-# Which folds a leg fires is a census question, not a reading of the source:
-# `PYRE_FBW_SPEC_CENSUS=1` prints `fold=<label> consulted=N fired=N` per label.
-# This fixture claimed eight and delivered seven for as long as `builtin_zip`
-# read its `call_kw` operands in the wrong order -- consulted once per run and
-# declined every time, so the leg written for it gated nothing.  Read the
-# census, not the leg names, before trusting the `spec-folds` coverage claim.
+# Throughput over paths that have no hand fold: `zip` over two tuples
+# (positional and `strict=True`), whose step `W_Zip.next_w` stays a residual
+# call, `bigint ** int` through the descended `long_pow` body, and the
+# descended `math.frexp` / `math.ldexp` gateways.
 #
 # Every result is reduced to an integer checksum: the float legs go through
 # `int(round(x * 1e6))` so the comparison cannot turn into a float-formatting
@@ -25,8 +17,7 @@ try:
 except ImportError:
     pass
 
-# Each leg only needs to compile and make its declared fold fire; the census
-# carries the performance-sensitive signal directly.
+# Each leg only needs to compile; the throughput ceiling gates the sum.
 N_ZIP = 10000
 N_ZIP_STRICT = 10000
 N_CMP = 100000

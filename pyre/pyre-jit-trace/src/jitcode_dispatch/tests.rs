@@ -5370,60 +5370,6 @@ fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
 }
 
 #[test]
-fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
-    // `functional.py` `W_Zip.next_w` arity two, specialised to
-    // `W_FastTupleIterObject.descr_next` over `W_TupleObject`. The product
-    // is `w_specialised_tuple_oo_new` (`fuse_boxing_alloc` → `new_with_vtable`).
-    let zip = crate::jitcode_runtime::pathed_jitcode(
-        "pyre_interpreter::baseobjspace::zip_two_tuple_next",
-    )
-    .expect("zip_two_tuple_next must be a discovered jitcode");
-    let _body = zip
-        .try_body()
-        .expect("zip_two_tuple_next body must be assembled");
-    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&zip.code)
-        .map(|op| op.opname)
-        .collect();
-    assert_eq!(zip.calldescr().arg_classes, "r", "ops={ops:?}");
-    assert_eq!(zip.calldescr().result_type, 'r', "ops={ops:?}");
-    // The item load is `tuple_exact_item`: `wrappeditems` is `[*]`, so the
-    // read is `getarrayitem_gc_r_pure`, not a residual `w_tuple_getitem`.
-    let item =
-        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::baseobjspace::tuple_exact_item")
-            .expect("tuple_exact_item must be a discovered jitcode");
-    let item_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&item.code)
-        .map(|op| op.opname)
-        .collect();
-    assert!(
-        item_ops.iter().any(|op| *op == "getarrayitem_gc_r_pure"),
-        "tuple item load must be a pure getarrayitem; ops={item_ops:?}"
-    );
-    assert!(
-        !item_ops.iter().any(|op| op.contains("residual")),
-        "tuple_exact_item must not residualise the load; ops={item_ops:?}"
-    );
-    let oo = crate::jitcode_runtime::pathed_jitcode(
-        "pyre_object::specialisedtupleobject::w_specialised_tuple_oo_new",
-    )
-    .expect("w_specialised_tuple_oo_new must be a discovered jitcode");
-    let oo_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&oo.code)
-        .map(|op| op.opname)
-        .collect();
-    assert!(
-        oo_ops.iter().any(|op| *op == "new_with_vtable"),
-        "the pair must box via new_with_vtable; ops={oo_ops:?}"
-    );
-    assert!(
-        !oo_ops.iter().any(|op| op.contains("residual")),
-        "w_specialised_tuple_oo_new must not residualise malloc; ops={oo_ops:?}"
-    );
-    assert!(
-        !(ops.len() == 1 && ops[0].contains("residual")),
-        "zip_two_tuple_next collapsed to one residual; ops={ops:?}"
-    );
-}
-
-#[test]
 fn specialised_tuple_ii_new_jitcode_is_new_with_vtable() {
     // `makespecialisedtuple2` `Cls_ii` (`specialisedtupleobject.py`).
     // `fuse_boxing_alloc` rewrites `malloc_typed_managed` to

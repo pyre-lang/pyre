@@ -560,6 +560,18 @@ pub(crate) struct MirrorStackImage {
     /// `last_instr = py_pc - 1` coordinate the codewriter stores for it.
     pub(crate) py_pc: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
+    /// The virtualizable's `valuestackdepth` (absolute) at the latch.  A walk
+    /// that stops inside an opcode may already have run that opcode's
+    /// `emit_popvalue_ref!`; the MIFrame resumes past it, so the frame must
+    /// carry the popped depth, as `synchronize_virtualizable` leaves it after
+    /// every `opimpl_setfield_vable`.  `None` publishes the entry depth.
+    pub(crate) valuestackdepth: Option<usize>,
+    /// The virtualizable's `last_instr` at the latch: the opcode's own pc, or
+    /// one of its cache words once it has advanced over them.  The walk stops
+    /// inside the opcode after those stores and the MIFrame resumes past them,
+    /// so a callee reading `f_lasti` must see them.  `None` publishes the entry
+    /// coordinate.
+    pub(crate) last_instr: Option<isize>,
 }
 
 pub(crate) struct LatchedSingleFrameBlackhole {
@@ -632,6 +644,8 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
                 vable_frame,
                 mirror.py_pc,
                 &mirror.slots,
+                mirror.valuestackdepth,
+                mirror.last_instr,
             )
             .is_some()
     })
@@ -817,10 +831,36 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
             }
         }
     }
+    let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
     Some(MirrorStackImage {
         py_pc: ctx.vstack_cur_pypc as usize,
         slots,
+        valuestackdepth,
+        last_instr,
     })
+}
+
+/// The portal virtualizable's `valuestackdepth` and `last_instr` as the trace
+/// holds them at the latch.  `opimpl_setfield_vable` (`pyjitpl.py`) calls
+/// `synchronize_virtualizable()` after every write, so the frame
+/// `convert_and_run_from_pyjitpl` copies already carries them.
+fn latched_vable_scalars<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> (Option<usize>, Option<isize>) {
+    let vable_int = |name: &str| {
+        ctx.trace_ctx
+            .virtualizable_info()
+            .and_then(|info| info.static_field_index_by_name(name))
+            .and_then(|idx| ctx.trace_ctx.virtualizable_entry_at(idx))
+            .and_then(|(_, value)| match value {
+                majit_ir::Value::Int(value) => Some(value),
+                _ => None,
+            })
+    };
+    let valuestackdepth =
+        vable_int("valuestackdepth").and_then(|depth| usize::try_from(depth).ok());
+    let last_instr = vable_int("last_instr").and_then(|pc| isize::try_from(pc).ok());
+    (valuestackdepth, last_instr)
 }
 
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
@@ -931,6 +971,8 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     Some(MirrorStackImage {
         py_pc: resume_py_pc,
         slots,
+        valuestackdepth: None,
+        last_instr: None,
     })
 }
 
@@ -993,7 +1035,13 @@ fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
             }
         }
     }
-    Some(MirrorStackImage { py_pc, slots })
+    let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
+    Some(MirrorStackImage {
+        py_pc,
+        slots,
+        valuestackdepth,
+        last_instr,
+    })
 }
 
 /// Portal `MIFrame` sitting at the CALL that entered a root helper.
@@ -9434,16 +9482,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_str_call(ctx, code, op, &r_args, dst)?.is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::MathFrexp, || {
-            try_walker_specialize_math_frexp(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

@@ -427,7 +427,6 @@ pub fn register() {
             gc_types: module_gc_types,
             immortal_w_class_only_descriptors: all_immortal_w_class_only_descriptors,
             libffi_cif_shape: hook_libffi_cif_shape,
-            math_builtin_name: module::math::interp_math::math_builtin_name,
             gc_initialize: hook_gc_initialize,
             init_array_type: module::array::init_array_type,
             array_w_getitem: module::array::array_w_getitem,

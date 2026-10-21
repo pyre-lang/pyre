@@ -1087,3 +1087,35 @@ fn do_call_erases_the_n1_incoming_elem_bracket() {
         "n==1 get(base) must rewrite to getarrayitem of args_w"
     );
 }
+
+/// `isinstance` (`abstract_isinstance_w`) pins `obj` and `classinfo` across
+/// the `__instancecheck__` lookup and call. Its brackets must erase, or the
+/// `isinstance` gateway descent stops at a residual `push_roots`.
+#[test]
+fn isinstance_bracket_is_scalar_replaced() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "baseobjspace::isinstance");
+    for leaf in [
+        "push_roots",
+        "pin_roots",
+        "pin_root",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "isinstance still calls {leaf} after the bracket was scalar-replaced"
+        );
+    }
+}

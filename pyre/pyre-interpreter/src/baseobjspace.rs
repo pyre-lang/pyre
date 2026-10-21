@@ -1549,27 +1549,29 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // `p_recursive_isinstance_w` fall-through below; that slot is the one
         // that calls back into `p_recursive_isinstance_type_w`, so the two
         // paths agree.
-        let _isinstance_roots = pyre_object::gc_roots::push_roots();
-        let isinstance_base = pyre_object::gc_roots::pin_roots(&[obj, classinfo]);
-        let obj = || pyre_object::gc_roots::shadow_stack_get(isinstance_base);
-        let classinfo = || pyre_object::gc_roots::shadow_stack_get(isinstance_base + 1);
-        if let Some(cls_type) = crate::typedef::r#type(classinfo())
+        //
+        // Both operands are published before either is normalized, and the
+        // slots are read back as `base + <literal>` through the scope, with
+        // no closure over the base, so the codewriter erases the bracket and
+        // the builtin's gateway descends this body.
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[obj, classinfo]);
+        if let Some(cls_type) = crate::typedef::r#type(roots.get(base + 1))
             && let Some(check) = lookup_in_type(cls_type.as_ptr(), "__instancecheck__")
         {
             // abstractinst.py:122 `space.get_and_call_function(w_check,
             // w_klass_or_tuple, w_obj)` — bind the descriptor to
-            // `classinfo` before calling with `obj`.
-            let check_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(check);
+            // `classinfo` before calling with `obj`. Nothing between the
+            // lookup and the call collects, so `check` needs no slot.
             let result = get_and_call_function(
-                pyre_object::gc_roots::shadow_stack_get(check_slot),
-                classinfo(),
+                check,
+                roots.get(base + 1),
                 cls_type.as_ptr(),
-                &[obj()],
+                &[roots.get(base)],
             )?;
             return is_true(result);
         }
-        p_recursive_isinstance_w(obj(), classinfo())
+        p_recursive_isinstance_w(roots.get(base), roots.get(base + 1))
     }
 }
 

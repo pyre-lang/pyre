@@ -742,8 +742,6 @@ pub struct OptionalModuleHooks {
     /// # Safety
     /// The address must be a block `_cffi_backend` built.
     pub libffi_cif_shape: unsafe fn(usize) -> Option<LibffiCifShape>,
-    /// The name of the canonical `math` builtin a callable is, if any.
-    pub math_builtin_name: fn(PyObjectRef) -> Option<&'static str>,
     /// `interp_gc.py`'s app-level hook object, installed once when the
     /// execution context binds the shared action flag.
     pub gc_initialize: fn(PyObjectRef, &mut (dyn crate::executioncontext::ActionFlagOps + 'static)),
