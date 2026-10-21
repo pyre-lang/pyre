@@ -22454,7 +22454,10 @@ pub fn sort_list_without_key_native(list: PyObjectRef, reverse: bool) -> bool {
         if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
             return true;
         }
-        pyre_object::listobject::w_list_sort_strings(list, reverse)
+        if sort_bytes_list_storage(list, reverse) {
+            return true;
+        }
+        sort_ascii_list_storage(list, reverse)
     }
 }
 
@@ -22512,7 +22515,10 @@ pub fn sort_list_in_place(
             if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
                 return Ok(());
             }
-            if pyre_object::listobject::w_list_sort_strings(list, reverse) {
+            if sort_bytes_list_storage(list, reverse) {
+                return Ok(());
+            }
+            if sort_ascii_list_storage(list, reverse) {
                 return Ok(());
             }
         }
@@ -22607,6 +22613,48 @@ unsafe fn sort_float_list_storage(list: PyObjectRef, reverse: bool) -> bool {
     true
 }
 
+/// `BytesListStrategy.sort` / `StringSort` (`listobject.py` / `miscutils.py`).
+///
+/// `StringSort(l, len(l))` over the unerased bytes storage. `StringSort.lt`
+/// is `a < b` — `object_array::ll_chars_strcmp` over `bytes_block_chars`.
+/// Comparisons allocate nothing, so nothing collects during the sort.
+/// `sorter.sort()` then `l.reverse()` when `reverse` (`BytesListStrategy.sort`).
+#[inline(never)]
+unsafe fn sort_bytes_list_storage(list: PyObjectRef, reverse: bool) -> bool {
+    if !pyre_object::listobject::w_list_uses_bytes_storage(list) {
+        return false;
+    }
+    let mut storage = BytesListStorage {
+        list: &mut *(list as *mut pyre_object::listobject::W_ListObject),
+    };
+    crate::listsort::sort_storage(&mut storage, &mut StringLt).unwrap_or_else(|_| unreachable!());
+    if reverse {
+        crate::listsort::reverse_storage(&mut storage);
+    }
+    true
+}
+
+/// `AsciiListStrategy.sort` / `StringSort` (`listobject.py` / `miscutils.py`).
+///
+/// Same `StringSort` as bytes, over the unerased ascii `STR` storage, through
+/// `list.ascii_getitem` / `list.ascii_setitem`. Comparisons allocate nothing,
+/// so nothing collects during the sort. `sorter.sort()` then `l.reverse()`
+/// when `reverse` (`AsciiListStrategy.sort`).
+#[inline(never)]
+unsafe fn sort_ascii_list_storage(list: PyObjectRef, reverse: bool) -> bool {
+    if !pyre_object::listobject::w_list_uses_ascii_storage(list) {
+        return false;
+    }
+    let mut storage = AsciiListStorage {
+        list: &mut *(list as *mut pyre_object::listobject::W_ListObject),
+    };
+    crate::listsort::sort_storage(&mut storage, &mut StringLt).unwrap_or_else(|_| unreachable!());
+    if reverse {
+        crate::listsort::reverse_storage(&mut storage);
+    }
+    true
+}
+
 /// Unerased Integer-strategy storage `TimSort.list`.
 ///
 /// `getitem` / `setitem` / `len` are `ll_list_int_{getitem,setitem}_fast` /
@@ -22653,6 +22701,63 @@ impl crate::listsort::SortStorage<f64> for FloatListStorage<'_> {
     #[inline(always)]
     fn setitem(&mut self, index: usize, value: f64) {
         float_list_storage_setitem(self.list, index, value)
+    }
+}
+
+/// Unerased Bytes-strategy storage `TimSort.list`.
+///
+/// `getitem` / `setitem` / `len` are `ll_list_bytes_{getitem,setitem}_fast` /
+/// `ll_list_bytes_length` (`list.bytes_getitem` / `list.bytes_setitem` /
+/// `list.bytes_len`).
+struct BytesListStorage<'a> {
+    list: &'a mut pyre_object::listobject::W_ListObject,
+}
+
+impl crate::listsort::SortStorage<*const pyre_object::bytesobject::BytesBlock>
+    for BytesListStorage<'_>
+{
+    #[inline(always)]
+    fn len(&self) -> usize {
+        bytes_list_storage_len(self.list)
+    }
+
+    #[inline(always)]
+    fn getitem(&self, index: usize) -> *const pyre_object::bytesobject::BytesBlock {
+        bytes_list_storage_getitem(self.list, index)
+    }
+
+    #[inline(always)]
+    fn setitem(&mut self, index: usize, value: *const pyre_object::bytesobject::BytesBlock) {
+        bytes_list_storage_setitem(self.list, index, value)
+    }
+}
+
+/// Unerased Ascii-strategy storage `TimSort.list`, the STR twin of
+/// [`BytesListStorage`].
+struct AsciiListStorage<'a> {
+    list: &'a mut pyre_object::listobject::W_ListObject,
+}
+
+impl crate::listsort::SortStorage<*const pyre_object::unicodeobject::UnicodeValueStorage>
+    for AsciiListStorage<'_>
+{
+    #[inline(always)]
+    fn len(&self) -> usize {
+        ascii_list_storage_len(self.list)
+    }
+
+    #[inline(always)]
+    fn getitem(&self, index: usize) -> *const pyre_object::unicodeobject::UnicodeValueStorage {
+        ascii_list_storage_getitem(self.list, index)
+    }
+
+    #[inline(always)]
+    fn setitem(
+        &mut self,
+        index: usize,
+        value: *const pyre_object::unicodeobject::UnicodeValueStorage,
+    ) {
+        ascii_list_storage_setitem(self.list, index, value)
     }
 }
 
@@ -22704,6 +22809,60 @@ fn float_list_storage_setitem(
     pyre_object::listobject::ll_list_float_setitem_fast(list, index, item);
 }
 
+/// `list.bytes_len` (`ll_list_bytes_length`).
+#[inline(always)]
+fn bytes_list_storage_len(list: &pyre_object::listobject::W_ListObject) -> usize {
+    pyre_object::listobject::ll_list_bytes_length(list)
+}
+
+/// `list.bytes_getitem` (`ll_list_bytes_getitem_fast`) — `TimSort`'s
+/// `self.list[i]` on Bytes storage.
+#[inline(always)]
+fn bytes_list_storage_getitem(
+    list: &pyre_object::listobject::W_ListObject,
+    index: usize,
+) -> *const pyre_object::bytesobject::BytesBlock {
+    pyre_object::listobject::ll_list_bytes_getitem_fast(list, index)
+}
+
+/// `list.bytes_setitem` (`ll_list_bytes_setitem_fast`) — `TimSort`'s
+/// `self.list[i] = x` on Bytes storage. Indexed `write_barrier_from_array`.
+#[inline(always)]
+fn bytes_list_storage_setitem(
+    list: &mut pyre_object::listobject::W_ListObject,
+    index: usize,
+    item: *const pyre_object::bytesobject::BytesBlock,
+) {
+    pyre_object::listobject::ll_list_bytes_setitem_fast(list, index, item);
+}
+
+/// `list.ascii_len` (`ll_list_ascii_length`).
+#[inline(always)]
+fn ascii_list_storage_len(list: &pyre_object::listobject::W_ListObject) -> usize {
+    pyre_object::listobject::ll_list_ascii_length(list)
+}
+
+/// `list.ascii_getitem` (`ll_list_ascii_getitem_fast`) — `TimSort`'s
+/// `self.list[i]` on Ascii storage.
+#[inline(always)]
+fn ascii_list_storage_getitem(
+    list: &pyre_object::listobject::W_ListObject,
+    index: usize,
+) -> *const pyre_object::unicodeobject::UnicodeValueStorage {
+    pyre_object::listobject::ll_list_ascii_getitem_fast(list, index)
+}
+
+/// `list.ascii_setitem` (`ll_list_ascii_setitem_fast`) — `TimSort`'s
+/// `self.list[i] = x` on Ascii storage. Indexed `write_barrier_from_array`.
+#[inline(always)]
+fn ascii_list_storage_setitem(
+    list: &mut pyre_object::listobject::W_ListObject,
+    index: usize,
+    item: *const pyre_object::unicodeobject::UnicodeValueStorage,
+) {
+    pyre_object::listobject::ll_list_ascii_setitem_fast(list, index, item);
+}
+
 /// `IntegerListStrategy.sort` / `FloatListStrategy.sort` on the unwrapped
 /// storage.
 ///
@@ -22744,6 +22903,29 @@ impl crate::listsort::SortLt<f64> for ScalarLt {
     #[inline(always)]
     fn lt(&mut self, a: f64, b: f64) -> Result<bool, crate::PyError> {
         Ok(a < b)
+    }
+}
+
+/// `miscutils.py StringSort.lt` — `a < b` on the erased payloads.
+///
+/// `BytesBlock` and `UnicodeValueStorage` are the same STR, so one `lt`
+/// covers Bytes and Ascii. `object_array::ll_chars_strcmp` over
+/// `bytes_block_chars` / `utf8_payload_bytes`. Comparisons allocate nothing.
+struct StringLt;
+
+impl crate::listsort::SortLt<*const pyre_object::bytesobject::BytesBlock> for StringLt {
+    #[inline(always)]
+    fn lt(
+        &mut self,
+        a: *const pyre_object::bytesobject::BytesBlock,
+        b: *const pyre_object::bytesobject::BytesBlock,
+    ) -> Result<bool, crate::PyError> {
+        // Ascii storage is the same STR; `utf8_payload_bytes` reads the same
+        // chars array `bytes_block_chars` does.
+        Ok(pyre_object::listobject::string_sort_chars_cmp(
+            unsafe { pyre_object::bytesobject::bytes_block_chars(a) },
+            unsafe { pyre_object::bytesobject::bytes_block_chars(b) },
+        ) < 0)
     }
 }
 
@@ -28294,6 +28476,60 @@ mod tests {
         assert!(is_builtin_getattr_function(lookup("getattr")));
         assert!(is_builtin_hasattr_function(lookup("hasattr")));
         assert!(is_builtin_issubclass_function(lookup("issubclass")));
+    }
+
+    #[test]
+    fn ascii_strategy_mutations_and_sort_stay_unwrapped() {
+        let list = pyre_object::w_list_new(vec![
+            pyre_object::w_str_new("c"),
+            pyre_object::w_str_new("a"),
+        ]);
+        let donor = pyre_object::w_list_new(vec![pyre_object::w_str_new("b")]);
+        unsafe {
+            pyre_object::listobject::w_list_insert(list, 1, pyre_object::w_str_new("d"));
+            assert_eq!(
+                (*(list as *const pyre_object::listobject::W_ListObject)).strategy,
+                pyre_object::listobject::ListStrategy::Ascii
+            );
+            pyre_object::listobject::w_list_delslice(list, 1, 2);
+            pyre_object::listobject::w_list_setslice(list, 1, 1, donor).unwrap();
+            assert!(sort_ascii_list_storage(list, false));
+            assert_eq!(
+                pyre_object::w_str_get_wtf8(
+                    pyre_object::listobject::w_list_getitem(list, 0).unwrap()
+                ),
+                "a"
+            );
+            assert_eq!(
+                pyre_object::w_str_get_wtf8(
+                    pyre_object::listobject::w_list_getitem(list, 1).unwrap()
+                ),
+                "b"
+            );
+            assert_eq!(
+                pyre_object::w_str_get_wtf8(
+                    pyre_object::listobject::w_list_getitem(list, 2).unwrap()
+                ),
+                "c"
+            );
+            pyre_object::listobject::w_list_reverse(list);
+            assert_eq!(
+                pyre_object::w_str_get_wtf8(pyre_object::listobject::w_list_pop(list, 0).unwrap()),
+                "c"
+            );
+            assert_eq!(
+                (*(list as *const pyre_object::listobject::W_ListObject)).strategy,
+                pyre_object::listobject::ListStrategy::Ascii
+            );
+
+            let empty = pyre_object::w_list_new(Vec::new());
+            pyre_object::listobject::w_list_setslice(empty, 0, 0, list).unwrap();
+            assert_eq!(
+                (*(empty as *const pyre_object::listobject::W_ListObject)).strategy,
+                pyre_object::listobject::ListStrategy::Ascii
+            );
+            assert_eq!(pyre_object::listobject::w_list_len(empty), 2);
+        }
     }
 
     #[test]
