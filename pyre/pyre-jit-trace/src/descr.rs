@@ -2348,10 +2348,13 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// so the fold stays behind `record_quasiimmut_field` + `GUARD_NOT_INVALIDATED`
 /// exactly as `jtransform.py:895-903` sequences it.
 ///
-/// The write half these descriptors depend on is `function_notify_quasi_immut`
-/// (pyre-interpreter `function.rs`), called immediately before every store to
-/// one of the nine — RPython gets it from the rtyper rewriting writes to a `?`
-/// field, pyre spells it out.  `f.__defaults__ = ...` / `f.__code__ = ...`
+/// The write half these descriptors depend on is
+/// `Function::jit_force_quasi_immutable("mutate_<name>")`, called immediately
+/// before every store to one of the nine; it is the native shape
+/// `warmspot.py rewrite_force_quasi_immutable` leaves, and the codewriter
+/// turns it back into the `jit_force_quasi_immutable` llop
+/// (`jtransform.py rewrite_op_jit_force_quasi_immutable`) for traces.
+/// `f.__defaults__ = ...` / `f.__code__ = ...`
 /// therefore runs `QuasiImmut::invalidate()` and retires every loop that
 /// folded the field, which is the termination guarantee a value guard cannot
 /// give: a guard that can no longer pass is re-derived by the next trace

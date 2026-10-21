@@ -2141,6 +2141,44 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
+            // `jit_force_quasi_immutable(v_inst, descr1)` — a register or
+            // pooled `r` constant followed by one fielddescr. The blackhole
+            // counterpart `bhimpl_jit_force_quasi_immutable` expects
+            // argcodes `rd`.
+            OpKind::JitForceQuasiImmutable { base, mutate_field } => {
+                match base {
+                    crate::model::LinkArg::Value(var) => {
+                        let (reg, kc) = self.lookup_reg_with_kind_var(var, regallocs);
+                        state.code.push(reg);
+                        argcodes.push(kc);
+                    }
+                    crate::model::LinkArg::Const(c) => {
+                        let kind = crate::flatten::constant_kind(c);
+                        assert!(
+                            kind == 'r',
+                            "jit_force_quasi_immutable const base must be Ref, got {kind:?} — graph {:?}",
+                            self.current_graph_name,
+                        );
+                        let byte = self.emit_const(&c.value, kind, state, callcontrol);
+                        state.code.push(byte);
+                        argcodes.push('r');
+                    }
+                }
+                let descr_idx = self.emit_ready_descr(fielddescrof(
+                    mutate_field,
+                    &crate::model::ValueType::Unknown,
+                    callcontrol,
+                    true,
+                ));
+                state.code.push((descr_idx & 0xFF) as u8);
+                state.code.push((descr_idx >> 8) as u8);
+                argcodes.push('d');
+                let opname = op_kind_to_opname(&op.kind);
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::FieldWrite {
                 base,
                 value,
@@ -3489,6 +3527,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::ConditionalCallValue { .. } => "ConditionalCallValue",
                 OpKind::RecordKnownResult { .. } => "RecordKnownResult",
                 OpKind::RecordQuasiImmutField { .. } => "RecordQuasiImmutField",
+                OpKind::JitForceQuasiImmutable { .. } => "JitForceQuasiImmutable",
                 OpKind::Live => "Live",
                 OpKind::JitMergePoint { .. } => "JitMergePoint",
                 OpKind::LoopHeader { .. } => "LoopHeader",
@@ -6410,6 +6449,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::IndirectCall { .. } => "indirect_call".into(),
         // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
+        OpKind::JitForceQuasiImmutable { .. } => "jit_force_quasi_immutable".into(),
         OpKind::Abort { .. } => "abort".into(),
         OpKind::NewTuple { .. } => "newtuple".into(),
         // High-level `newlist(item0, …, itemN)` does not exist as a jitcode
@@ -9370,6 +9410,118 @@ mod tests {
             field_descr_names.contains(&"value") && field_descr_names.contains(&"mutate_value"),
             "expected Field descrs for `value` + `mutate_value`, got {:?}",
             field_descr_names
+        );
+    }
+
+    /// `OpKind::JitForceQuasiImmutable` must lower to a single opcode
+    /// keyed `jit_force_quasi_immutable/rd`, with one `BhDescr::Field`
+    /// for the mutate field — `blackhole.py bhimpl_jit_force_quasi_immutable`.
+    #[test]
+    fn assembles_jit_force_quasi_immutable_rd() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("force_qmut");
+        let base_var = push_input_var(&mut graph, "func", ValueType::Ref(None));
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::JitForceQuasiImmutable {
+                base: LinkArg::Value(base_var.clone()),
+                mutate_field: FieldDescriptor::new("mutate_code", Some("Function".to_string())),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::GcRef);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        let key_count = asm
+            .insns
+            .keys()
+            .filter(|k| k.starts_with("jit_force_quasi_immutable/"))
+            .count();
+        assert_eq!(
+            key_count,
+            1,
+            "expected exactly one jit_force_quasi_immutable/* key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("jit_force_quasi_immutable/rd"),
+            "expected key jit_force_quasi_immutable/rd, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let descrs = asm.snapshot_descrs();
+        let field_descr_names: Vec<&str> = descrs
+            .iter()
+            .filter_map(|d| match d {
+                crate::jitcode::BhDescr::Field { name, owner, .. } if owner == "Function" => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            field_descr_names.contains(&"mutate_code"),
+            "expected Field descr for `mutate_code`, got {:?}",
+            field_descr_names
+        );
+    }
+
+    /// A Constant ref `base` still keys `jit_force_quasi_immutable/rd`
+    /// (`assembler.py` `emit_const` pools the `r` operand).
+    #[test]
+    fn assembles_jit_force_quasi_immutable_rd_const_base() {
+        use crate::flatten::flatten_graph;
+        use crate::flowspace::model::Constant;
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
+
+        let LowLevelType::Ptr(objectptr) = crate::translator::rtyper::rclass::OBJECTPTR.clone()
+        else {
+            unreachable!()
+        };
+        let null = lltype::nullptr(objectptr.TO.clone().into()).expect("null OBJECTPTR");
+        let mut graph = FunctionGraph::new("force_qmut_const");
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::JitForceQuasiImmutable {
+                base: LinkArg::Const(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null)),
+                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                )),
+                mutate_field: FieldDescriptor::new("mutate_code", Some("Function".to_string())),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        let key_count = asm
+            .insns
+            .keys()
+            .filter(|k| k.starts_with("jit_force_quasi_immutable/"))
+            .count();
+        assert_eq!(
+            key_count,
+            1,
+            "expected exactly one jit_force_quasi_immutable/* key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("jit_force_quasi_immutable/rd"),
+            "expected key jit_force_quasi_immutable/rd, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
         );
     }
 

@@ -1351,7 +1351,7 @@ pub(crate) fn helper_too_long_result<Sym: WalkSym>(
 /// before the residual operation it protects, so `resume_pc` is the same
 /// next-to-run position.  Inline aborts capture the whole framestack; root
 /// aborts retain the operand stack for `flush_qmut_abort_state`.
-fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
+pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
 ) {

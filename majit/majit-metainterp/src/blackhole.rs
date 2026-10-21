@@ -11649,6 +11649,13 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "record_quasiimmut_field/rdd",
             majit_jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD,
         ),
+        // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
+        // `jit_force_quasi_immutable(v_inst, descr1)`. Argcodes `rd`;
+        // `bhimpl_jit_force_quasi_immutable` is already wired below.
+        (
+            "jit_force_quasi_immutable/rd",
+            majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }

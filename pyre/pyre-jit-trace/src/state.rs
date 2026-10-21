@@ -4468,6 +4468,33 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     result
 }
 
+/// `pyjitpl.py` `MIFrame.execute_with_descr(rop.GETFIELD_GC_R, descr, box)`.
+///
+/// Records and executes the load without consulting or populating the
+/// heapcache. `opimpl_getfield_gc_r` / `_opimpl_getfield_gc_any_pureornot`
+/// both read and write the cache; `opimpl_jit_force_quasi_immutable`
+/// must not, because a null cached here can be served stale after
+/// `record_quasiimmut_field` installs a watcher.
+pub(crate) fn execute_getfield_gc_r_uncached(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    descr: DescrRef,
+) -> OpRef {
+    ctx.profiler()
+        .count_ops(OpCode::GetfieldGcR, majit_metainterp::counters::OPS);
+    ctx.profiler().count_ops(
+        OpCode::GetfieldGcR,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
+    let mutatebox = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[obj], descr.clone());
+    let live_value = concrete_gc_ptr(ctx, obj)
+        .and_then(|struct_ptr| ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Ref));
+    if let Some(live_value) = live_value {
+        ctx.set_opref_concrete(mutatebox, live_value);
+    }
+    mutatebox
+}
+
 fn descr_field_name(descr: &DescrRef) -> &str {
     descr
         .as_field_descr()

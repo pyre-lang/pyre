@@ -286,6 +286,14 @@ impl QuasiImmutField {
         qmut.invalidate();
     }
 
+    /// `quasiimmut.py make_invalidation_function` —
+    /// `if getattr(p, mutatefieldname): _invalidate_now(p)`.
+    pub fn invalidate_if_installed(&self) {
+        if self.is_installed() {
+            self.invalidate();
+        }
+    }
+
     /// Unlink, sweep, then run `store`, all under this field's lock.
     /// Sweeping first means `GUARD_NOT_INVALIDATED` is already patched
     /// when the new value is published; the lock keeps

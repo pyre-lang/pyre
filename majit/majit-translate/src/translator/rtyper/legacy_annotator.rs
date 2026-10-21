@@ -400,6 +400,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         | OpKind::RecordKnownResult { .. }
         // jtransform.py — `record_quasiimmut_field` has no result.
         | OpKind::RecordQuasiImmutField { .. }
+        | OpKind::JitForceQuasiImmutable { .. }
         // jtransform.py:1707,1718 — jit_merge_point / loop_header have no
         // result; upstream emits them with `op1 = SpaceOperation(..., None)`.
         | OpKind::JitMergePoint { .. }

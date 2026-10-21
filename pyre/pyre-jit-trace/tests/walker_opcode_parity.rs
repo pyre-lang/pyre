@@ -306,6 +306,9 @@ const PYRE_ONLY: &[&str] = &[
     // walk records it here. The blackhole handler is the no-op
     // `bhimpl_record_quasiimmut_field`.
     "record_quasiimmut_field/rdd",
+    // `pyjitpl.py opimpl_jit_force_quasi_immutable`. Majit's tracer has
+    // no arm; the production walk records it here.
+    "jit_force_quasi_immutable/rd",
     // Constant-index string read (`pyjitpl.py opimpl_strgetitem`). Majit's
     // `BC_STRLEN` / `BC_STRGETITEM` arms decode the register-index shapes
     // only.
