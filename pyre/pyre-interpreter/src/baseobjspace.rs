@@ -3174,6 +3174,11 @@ unsafe fn getitem_bytes(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
                 start,
                 stop,
             );
+            // A `mallocstr` the heap refuses answers null; `s.malloc`
+            // raises MemoryError.
+            if sliced.is_null() {
+                return Err(crate::builtins::reservation_failed());
+            }
             return Ok(pyre_object::bytesobject::w_bytes_from_block(
                 sliced as *const pyre_object::bytesobject::BytesBlock,
             ));

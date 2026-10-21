@@ -5,7 +5,7 @@ use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, OpKind, ValueType},
+    model::{CallTarget, OpKind},
 };
 
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
@@ -251,43 +251,5 @@ fn list_items_capacity_stays_on_the_items_block() {
         !ops.iter()
             .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. })),
         "the items header is not ll_fixed_length"
-    );
-}
-
-/// `PyCode.code_ptr` is a leaked `CodeObject` address. `history.getkind` of
-/// a `Ptr` whose `TO._gckind == 'raw'` is `"int"`; a generic `*const ()`
-/// rule would also bank `Function.code` / `PyFrame.pycode`.
-#[test]
-fn pycode_code_ptr_is_raw_int_kind() {
-    let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
-    let object_llbc = load_llbc(OBJECT_LLBC);
-    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[interpreter_llbc, object_llbc],
-        HostStaticAddrs::default(),
-        &["pycode"],
-        &["w_code_get_ptr"],
-    )
-    .expect("lower pycode::w_code_get_ptr");
-    let spelling = program
-        .struct_fields
-        .field_type("PyCode", "code_ptr")
-        .expect("PyCode.code_ptr harvested");
-    assert!(
-        spelling == "*const CodeObject" || spelling.starts_with("*const CodeObject<"),
-        "PyCode.code_ptr spelling must be *const CodeObject, got {spelling}"
-    );
-    let attrs = program
-        .struct_field_attrs
-        .get("pycode::PyCode")
-        .expect("pycode::PyCode attrs harvested");
-    let kind = attrs
-        .iter()
-        .find(|(name, _)| name == "code_ptr")
-        .map(|(_, ty)| ty)
-        .expect("code_ptr attr");
-    assert_eq!(
-        kind,
-        &ValueType::Int,
-        "history.getkind of raw Ptr is int, spelling {spelling}"
     );
 }

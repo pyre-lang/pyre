@@ -825,33 +825,6 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     obj
 }
 
-/// FNV-1a over the key bytes, the digest the type-lookup method cache already
-/// uses. The default SipHash charges every attribute-name lookup a full
-/// siphash24 of the name — 10 of the top-of-stack samples in a profile of
-/// `exception_subclass_attrs`, reached through
-/// `type_descr_call_impl` -> `lookup_in_type_where`.
-#[derive(Default)]
-pub struct Fnv1aHasher(u64);
-
-impl std::hash::Hasher for Fnv1aHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let mut h = if self.0 == 0 {
-            0xcbf2_9ce4_8422_2325
-        } else {
-            self.0
-        };
-        for b in bytes {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self.0 = h;
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
 /// Process-global string intern table.
 ///
 /// `baseobjspace.py interned_strings = make_weak_value_dictionary(self, str, W_Root)`,

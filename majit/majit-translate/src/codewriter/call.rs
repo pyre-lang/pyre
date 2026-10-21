@@ -18444,15 +18444,19 @@ mod tests {
         assert_eq!(size, crate::layout::target_word_size());
     }
 
+    /// `Cell.family` / `PyCode.code_ptr` point at leaked host allocations;
+    /// `history.getkind` of a raw `Ptr` is "int".
     #[test]
-    fn raw_cell_family_pointer_is_int_banked() {
+    fn raw_host_pointee_pointer_is_int_banked() {
         use majit_ir::descr::ArrayFlag;
         use majit_ir::value::Type;
 
-        let (flag, field_type, size) = get_type_flag("*const CellFamily");
-        assert_eq!(flag, ArrayFlag::Unsigned);
-        assert_eq!(field_type, Type::Int);
-        assert_eq!(size, crate::layout::target_word_size());
+        for spelling in ["*const CellFamily", "*const CodeObject"] {
+            let (flag, field_type, size) = get_type_flag(spelling);
+            assert_eq!(flag, ArrayFlag::Unsigned, "{spelling}");
+            assert_eq!(field_type, Type::Int, "{spelling}");
+            assert_eq!(size, crate::layout::target_word_size(), "{spelling}");
+        }
     }
 
     /// A one-word-item Vec field is `Ptr(Struct(raw) "RustVec")`

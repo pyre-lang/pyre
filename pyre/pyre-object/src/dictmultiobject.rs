@@ -121,9 +121,9 @@ impl std::hash::Hash for BytesKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // `BytesDictStrategy` keys are the STR (`rstr.py`); `ll_strhash`
         // reads `s.hash` and computes it only while the slot is 0.
-        state.write_isize(crate::lowlevel_string::ll_strhash(
+        state.write_i64(crate::lowlevel_string::ll_strhash(
             self.0 as *mut crate::unicodeobject::Utf8Str,
-        ));
+        ) as i64);
     }
 }
 
@@ -1236,16 +1236,16 @@ impl std::hash::Hasher for IntKeyHasher {
 /// (`dictmultiobject.py`).
 pub type IntKeyHash = std::hash::BuildHasherDefault<IntKeyHasher>;
 /// See [`BytesDictStorage`].
-pub type BytesKeyHash = std::hash::BuildHasherDefault<crate::unicodeobject::Fnv1aHasher>;
+pub type BytesKeyHash = ObjectKeyBuildHasher;
 pub type IntDictStorage = crate::rordereddict::RDict<i64, PyObjectRef, IntKeyHash>;
 /// `BytesDictStrategy` backing — erased `Dict[str, W_Root]`
 /// (`dictmultiobject.py`). `unerase` yields [`BytesKey`], the block the
 /// wrapped `bytes` object holds.
 ///
-/// Digested with FNV-1a rather than `RandomState`, for the reason
-/// [`crate::celldict::ModuleDictEntries`] gives: a translated `str` key carries
-/// `ll_strhash` memoized in its header. [`BytesKey`] writes that cached
-/// digest (`rstr.py` `LLHelpers.ll_strhash` / `STR.hash`) on each probe.
+/// [`BytesKey`] writes `ll_strhash`, the digest memoized in the STR header
+/// (`rstr.py` `LLHelpers.ll_strhash` / `STR.hash`), and [`BytesKeyHash`]
+/// hands it to the table unchanged, the way `ll_dict_lookup` takes
+/// `d.keyhash(key)` (`rordereddict.py`).
 pub type BytesDictStorage = crate::rordereddict::RDict<BytesKey, PyObjectRef, BytesKeyHash>;
 
 macro_rules! dict_storage_gc_type_id {

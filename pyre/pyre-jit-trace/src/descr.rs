@@ -6931,6 +6931,7 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let int_field = |key, offset, size, signed, immutable| {
         (key, offset, size, Type::Int, signed, immutable, false)
     };
+    let watchers = std::mem::offset_of!(PyCode, w_globals_watchers);
     build_object_descr_group_with_def_path(
         std::mem::size_of::<PyCode>(),
         pyre_interpreter::pycode::W_CODE_GC_TYPE_ID,
@@ -7037,6 +7038,12 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             word_ref("w_name", std::mem::offset_of!(PyCode, w_name), false, false),
+            // The translator's `get_type_flag` banks an inline `[T; N]` as
+            // one field of T's flag and N times its size, and the EffectInfo
+            // write set of `_offset2lineno` names this field, so the runtime
+            // descr is that same single field. Listing `item0`..`item3`
+            // (`FixedSizeArray`'s fields) needs the codewriter to lower a
+            // variable `memo[i]` per item first.
             int_field(
                 "addr2line_memo",
                 std::mem::offset_of!(PyCode, addr2line_memo),
@@ -7051,11 +7058,16 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::offset_of!(PyCode, loop_header_info),
                 false,
             ),
-            int_field(
-                "w_globals_watchers",
-                std::mem::offset_of!(PyCode, w_globals_watchers),
-                std::mem::size_of::<pyre_object::quasiimmut::QuasiImmutField>(),
+            // Inlined `QuasiImmutField`: two raw host pointers
+            // (`get_type_flag` FLAG_UNSIGNED).
+            word_int(
+                "w_globals_watchers.ptr",
+                watchers + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
                 false,
+            ),
+            word_int(
+                "w_globals_watchers.lock",
+                watchers + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET,
                 false,
             ),
             int_field(
@@ -9334,7 +9346,8 @@ mod tests {
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize
         );
         // Inherited `PyObject.w_class` occupies `all_fielddescrs[0]`, then
-        // every `PyCode` payload field in declaration order.
+        // every `PyCode` payload field in declaration order, the inlined
+        // `QuasiImmutField` as its leaves (`heaptracker.all_fielddescrs`).
         let names: Vec<&str> = size
             .all_fielddescrs()
             .iter()
@@ -9363,7 +9376,8 @@ mod tests {
                 "PyCode.w_name",
                 "PyCode.addr2line_memo",
                 "PyCode.loop_header_info",
-                "PyCode.w_globals_watchers",
+                "PyCode.w_globals_watchers.ptr",
+                "PyCode.w_globals_watchers.lock",
                 "PyCode.jit_shape",
             ]
         );

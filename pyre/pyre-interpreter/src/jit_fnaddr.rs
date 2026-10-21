@@ -4431,6 +4431,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_str_mul",
         pyre_object::lowlevel_string::jit_ll_str_mul,
     );
+    cpa2!(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_char_mul",
+        "pyre_object::jit_ll_char_mul",
+        pyre_object::lowlevel_string::jit_ll_char_mul,
+    );
     pa3!(
         &mut entries,
         "pyre_object::lowlevel_string::_ll_stringslice",

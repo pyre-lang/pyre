@@ -181,6 +181,12 @@ pub struct QuasiImmutField {
     lock: AtomicPtr<parking_lot::Mutex<()>>,
 }
 
+/// Byte offsets of the two words of [`QuasiImmutField`]. A descr group that
+/// lists an embedding struct's fields recurses into this inlined STRUCT
+/// (`heaptracker.py all_fielddescrs`).
+pub const QUASIIMMUT_FIELD_PTR_OFFSET: usize = std::mem::offset_of!(QuasiImmutField, ptr);
+pub const QUASIIMMUT_FIELD_LOCK_OFFSET: usize = std::mem::offset_of!(QuasiImmutField, lock);
+
 impl Default for QuasiImmutField {
     fn default() -> Self {
         Self::new()

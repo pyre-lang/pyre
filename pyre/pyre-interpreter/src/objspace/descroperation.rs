@@ -2598,16 +2598,24 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     }
 }
 
-/// `StringMethods.descr_mul` on bytes: `times == 1` and exact
-/// `W_BytesObject` returns self; else `self._val * times` through
+/// `StringMethods.descr_mul` on bytes: `times <= 0` is `_empty()`;
+/// `times == 1` and exact `W_BytesObject` returns self; one char goes
+/// through `LLHelpers.ll_char_mul`, else `self._val * times` through
 /// `LLHelpers.ll_str_mul`.
 #[inline(never)]
 unsafe fn bytes_repeat_bytes(s: PyObjectRef, count: usize) -> PyResult {
+    if count == 0 {
+        return Ok(pyre_object::bytesobject::w_bytes_empty());
+    }
     if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE)
     {
         return Ok(s);
     }
     let n = pyre_object::bytesobject::w_bytes_len(s);
+    // [3.15-spec] `ll_str_mul` turns the `ovfcheck` into MemoryError;
+    // 3.15 `bytes_repeat` raises OverflowError("repeated bytes are too
+    // long") (measured: `b'ab' * sys.maxsize` on v3.15.0t). The check runs
+    // before the `@jit.elidable` helper and leaves it unchanged.
     let cap = n
         .checked_mul(count)
         .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
@@ -2617,10 +2625,17 @@ unsafe fn bytes_repeat_bytes(s: PyObjectRef, count: usize) -> PyResult {
             "repeated bytes are too long",
         ));
     }
-    let out = pyre_object::lowlevel_string::jit_ll_str_mul(
-        pyre_object::bytesobject::w_bytes_block(s) as *mut pyre_object::unicodeobject::Utf8Str,
-        count as i64,
-    );
+    let out = if n == 1 {
+        pyre_object::lowlevel_string::jit_ll_char_mul(
+            pyre_object::bytesobject::w_bytes_getitem(s, 0) as i64,
+            count as i64,
+        )
+    } else {
+        pyre_object::lowlevel_string::jit_ll_str_mul(
+            pyre_object::bytesobject::w_bytes_block(s) as *mut pyre_object::unicodeobject::Utf8Str,
+            count as i64,
+        )
+    };
     if out.is_null() {
         return Err(crate::builtins::reservation_failed());
     }
@@ -2633,19 +2648,16 @@ unsafe fn bytes_repeat_bytes(s: PyObjectRef, count: usize) -> PyResult {
 #[inline(never)]
 unsafe fn bytearray_repeat(s: PyObjectRef, count: usize) -> PyResult {
     let data = pyre_object::bytearrayobject::w_bytearray_data(s).to_vec();
+    // `self._data * times` is `ll_mul` (`rlist.py`), whose `ovfcheck`
+    // raises MemoryError; 3.15 `bytearray_repeat` raises MemoryError too.
     let cap = data
         .len()
         .checked_mul(count)
-        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
-    if cap > isize::MAX as usize {
-        return Err(PyError::new(
-            PyErrorKind::OverflowError,
-            "repeated bytes are too long",
-        ));
-    }
+        .filter(|&cap| cap <= isize::MAX as usize)
+        .ok_or_else(crate::builtins::reservation_failed)?;
     let mut buf: Vec<u8> = Vec::new();
     buf.try_reserve_exact(cap)
-        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+        .map_err(|_| crate::builtins::reservation_failed())?;
     if !data.is_empty() {
         for _ in 0..count {
             buf.extend_from_slice(&data);
@@ -2854,11 +2866,21 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
     if count == 1 {
         return Ok(());
     }
+    // `self._data *= times` is `ll_inplace_mul` (`rlist.py`), whose
+    // `ovfcheck` raises MemoryError; 3.15 `bytearray_irepeat` raises
+    // MemoryError too.
     let new_size = len
         .checked_mul(count)
-        .ok_or_else(|| PyError::new(PyErrorKind::OverflowError, "repeated bytes are too long"))?;
+        .filter(|&size| size <= isize::MAX as usize)
+        .ok_or_else(crate::builtins::reservation_failed)?;
     // Only an actual length change touches the buffer size; an exported buffer
-    // blocks it.
+    // blocks it.  [3.15-spec] `descr_inplace_mul` calls `_check_exports`
+    // before the repeat, so an exported bytearray raises BufferError for
+    // `*= 1` and `*= sys.maxsize` alike; `bytearray_irepeat_lock_held` returns
+    // early for a count of 1, raises MemoryError for the size first, and
+    // reaches `_canresize` only through a `bytearray_resize_lock_held` that
+    // changes the size (v3.15.0 source; measured on v3.15.0t: `*= 1` keeps
+    // `b'ab'`, `*= 2` BufferError, `*= sys.maxsize` MemoryError).
     if new_size != len {
         crate::builtins::bytearray_check_exports(ba)?;
     }
@@ -2873,7 +2895,7 @@ pub(crate) unsafe fn bytearray_inplace_repeat(
     let snapshot = pyre_object::bytearrayobject::w_bytearray_data(ba).to_vec();
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(ba);
     vec.try_reserve_exact(new_size - len)
-        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+        .map_err(|_| crate::builtins::reservation_failed())?;
     for _ in 1..count {
         vec.extend_from_slice(&snapshot);
     }

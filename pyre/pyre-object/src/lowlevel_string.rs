@@ -542,9 +542,16 @@ pub extern "C" fn jit_ll_str_mul(
         times = 0;
     }
     let n = bh_lowlevel_string_len(s);
-    let size = n
-        .checked_mul(times as usize)
-        .expect("ll_str_mul length overflow; MemoryError propagation is not ported yet");
+    // `ovfcheck(len(s.chars) * times)` raises MemoryError; the null answer
+    // is that error, as for a refused `mallocstr`.  The check is on the
+    // target's signed word, so a product past `isize::MAX` fails on wasm32 too.
+    let Some(size) = isize::try_from(times)
+        .ok()
+        .and_then(|times| (n as isize).checked_mul(times))
+        .map(|size| size as usize)
+    else {
+        return std::ptr::null_mut();
+    };
     let roots = crate::gc_roots::push_roots();
     let s_slot = roots.base();
     let _ = roots.pin_root(s as crate::PyObjectRef);
@@ -569,6 +576,31 @@ pub extern "C" fn jit_ll_str_mul(
         }
     }
     out as *mut crate::unicodeobject::Utf8Str
+}
+
+/// `rstr.py LLHelpers.ll_char_mul` — `@jit.elidable` on a `Char`.
+///
+/// `times < 0` clamps to 0. A `mallocstr` the heap refuses answers null, and
+/// the caller raises MemoryError, as [`jit_ll_str_mul`] does.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_char_mul(ch: i64, mut times: i64) -> *mut crate::unicodeobject::Utf8Str {
+    if times < 0 {
+        times = 0;
+    }
+    let newstr = mallocstr(times as usize);
+    if newstr == 0 {
+        return std::ptr::null_mut();
+    }
+    let mut j = 0;
+    while j < times as usize {
+        unsafe {
+            (newstr as *mut u8)
+                .add(LOWLEVEL_STRING_CHARS_OFFSET + j)
+                .write(ch as u8);
+        }
+        j += 1;
+    }
+    newstr as *mut crate::unicodeobject::Utf8Str
 }
 
 /// `rstr.py LLHelpers._ll_stringslice` — `@jit.elidable` +
@@ -947,6 +979,8 @@ mod tests {
         assert_eq!(bh_lowlevel_string_len(empty as i64), 0);
         let also_empty = jit_ll_str_mul(one, -1);
         assert_eq!(bh_lowlevel_string_len(also_empty as i64), 0);
+        // `ovfcheck(len * times)` fails: the MemoryError answer is null.
+        assert!(jit_ll_str_mul(four, i64::MAX).is_null());
         bh_free_lowlevel_string(one as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(four as i64, LOWLEVEL_STR_BASE_SIZE, 1);
         bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
