@@ -27874,7 +27874,9 @@ mod metainterp_static_data_tests {
         // entering driver's WarmEnterState. Production portal lookup is
         // `JitDriver::index()`; leftover `active_jitdriver_sd` is the last
         // traced driver.
-        let mut meta = MetaInterp::<()>::new(0);
+        // Threshold must be nonzero: `maybe_compile_and_run` returns at once
+        // when `increment_threshold == 0` ("jit is off").
+        let mut meta = MetaInterp::<()>::new(1);
         extern "C" fn portal_runner_helper() -> i64 {
             0
         }
@@ -30393,7 +30395,9 @@ mod metainterp_static_data_tests {
         use crate::warmstate::JcFlags;
         use majit_ir::{GreenKey, Type};
 
-        let mut meta = MetaInterp::<()>::new(0);
+        // Threshold must be nonzero: `maybe_compile_and_run` returns at once
+        // when `increment_threshold == 0` ("jit is off").
+        let mut meta = MetaInterp::<()>::new(1);
         extern "C" fn portal_runner_helper() -> i64 {
             0
         }
@@ -30529,7 +30533,9 @@ mod metainterp_static_data_tests {
     fn blackhole_if_trace_too_long_names_shaped_abort_keeps_portal_compilable() {
         use majit_ir::{GreenKey, Type};
 
-        let mut meta = MetaInterp::<()>::new(0);
+        // Threshold must be nonzero: `maybe_compile_and_run` returns at once
+        // when `increment_threshold == 0` ("jit is off").
+        let mut meta = MetaInterp::<()>::new(1);
         extern "C" fn portal_runner_helper() -> i64 {
             0
         }
