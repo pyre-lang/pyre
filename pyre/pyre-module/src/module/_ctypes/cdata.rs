@@ -612,12 +612,19 @@ fn init_simplecdata_type(ns: PyObjectRef) {
     pyre_interpreter::__pyre_store!(
         ns,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(simplecdata_new)
+        pyre_interpreter::typedef::make_new_descr_passthrough1(
+            simplecdata_new,
+            simplecdata_new_args,
+        )
     );
     pyre_interpreter::__pyre_store!(
         ns,
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", simplecdata_init)
+        pyre_interpreter::make_builtin_function_passthrough1(
+            "__init__",
+            simplecdata_init,
+            simplecdata_init_args,
+        )
     );
     // A scalar `out` parameter hands back the value rather than the box; one
     // whose type is a user subclass hands back the instance, because the
@@ -768,6 +775,22 @@ fn simplecdata_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
     new_simplecdata_obj(cls, &tc, None)
 }
 
+/// Keyword path: pyre does not read `args` or `args.keywords` (`let _ = args`)
+/// and returns a zeroed instance.  That matches `GenericPyCData_new` /
+/// `generic_pycdata_new`, which take `args` and `kwds` and leave both unread
+/// (`v3.15.1` `Modules/_ctypes/_ctypes.c`).  The stored value is decided in
+/// `Simple_init`.  PyPy `_SimpleCData.__init__(self, value=DEFAULT_VALUE)` is
+/// the binder for `value=`; no `@jit`/`_immutable_` on `_SimpleCData.__init__`.
+/// [3.15-spec] measured python3.15t (v3.15.1, free-threaded): ctypes.c_int(value=3).value
+/// -> 0; ctypes.c_int(bogus=3).value -> 0
+fn simplecdata_new_args(
+    w_type: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let _ = args;
+    simplecdata_new(&[w_type])
+}
+
 /// `Simple_init(self, value=...)`.
 ///
 /// Storing the value here rather than in `__new__` is what makes `__init__` on
@@ -777,8 +800,8 @@ fn simplecdata_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
 /// what leaves the buffer zeroed for a subclass whose own `__init__` does not
 /// delegate.
 ///
-/// `PyArg_UnpackTuple` takes one optional positional and no keyword at all, so
-/// `c_int(value=3)` stores nothing and `c_int(1, 2)` is a `TypeError`.
+/// `PyArg_UnpackTuple` takes one optional positional (`c_int(1, 2)` is
+/// TypeError).  Keywords stay on `simplecdata_init_args`.
 fn simplecdata_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let Some(&obj) = args.first() else {
         return Err(pyre_interpreter::PyError::type_error(
@@ -796,6 +819,26 @@ fn simplecdata_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
         set_simple_value(obj, value)?;
     }
     Ok(pyre_object::w_none())
+}
+
+/// Keyword path: pyre forwards only positionals into `simplecdata_init` and
+/// leaves `args.keywords` unused, matching `Simple_init` (`PyArg_UnpackTuple`
+/// on the positional tuple; the `kw` parameter is unread; `v3.15.1`
+/// `Modules/_ctypes/_ctypes.c`).  `c_int(1, value=3)` therefore stores the
+/// positional 1, and `x.__init__(value=5)` stores nothing.  PyPy
+/// `_SimpleCData.__init__(self, value=DEFAULT_VALUE)` binds `value=`
+/// (`c_int(1, value=3)` TypeError "got multiple values for argument 'value'";
+/// `c_int(bogus=3)` TypeError "unexpected keyword argument 'bogus'";
+/// `__init__(value=5)` stores 5).  No `@jit`/`_immutable_` on
+/// `_SimpleCData.__init__`.
+/// [3.15-spec] measured python3.15t (v3.15.1, free-threaded): ctypes.c_int(1, value=3).value
+/// -> 1; x = c_int(); x.__init__(value=5); x.value -> 0
+fn simplecdata_init_args(
+    self_: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let flat = pyre_interpreter::builtins::passthrough1_positional_slice(self_, args);
+    simplecdata_init(&flat)
 }
 
 /// Build a fresh `_SimpleCData` instance of `cls` with type code `tc`,
@@ -1288,6 +1331,11 @@ fn struct_pep3118_format(mut cls: PyObjectRef) -> String {
     format
 }
 
+/// Snapshot of a CData instance's buffer bytes — the source of `_copy_to`.
+pub(super) fn cdata_buffer_copy(obj: PyObjectRef) -> Option<Vec<u8>> {
+    cdata_bytes(obj).map(|b| b.to_vec())
+}
+
 /// Overwrite `bytes` at view-relative offset `off`.
 pub(super) fn cdata_write(mut obj: PyObjectRef, off: usize, bytes: &[u8]) {
     if let Some(mut ba) = pyre_object::with_roots!(obj => cdata_buffer(obj)) {
@@ -1314,7 +1362,9 @@ pub(super) fn cdata_write(mut obj: PyObjectRef, off: usize, bytes: &[u8]) {
 // ── sub-views, keepalive, and the cdata-instance predicate ─────────────
 
 /// Whether `obj` owns its buffer (a root object, not a sub-view or external
-/// view) — the precondition for `resize`.
+/// view) — `CFuncPtr._needs_free` / `_b_needsfree_`, and the precondition
+/// for `resize`.  True once [`new_cdata_obj_from_bytes`] stores `"_b_"`
+/// without `"_b_base_"` / `"_baddr_"`; false after [`release_owned_buffer`].
 pub(super) fn owns_buffer(obj: PyObjectRef) -> bool {
     let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
@@ -1322,6 +1372,19 @@ pub(super) fn owns_buffer(obj: PyObjectRef) -> bool {
     }
     let has = |k: &str| unsafe { pyre_object::w_dict_getitem_str(d, k) }.is_some();
     has(CDATA_BUFFER_KEY) && !has(BBASE_KEY) && !has(BADDR_KEY)
+}
+
+/// `CFuncPtr.__del__`: `_buffer.free(); self._buffer = None` — drop the owned
+/// backing buffer so the instance has no buffer.
+pub(super) fn release_owned_buffer(obj: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = _roots.pin_roots(&[obj]);
+    let d = pyre_interpreter::baseobjspace::getdict_native(_roots.get(obj_slot));
+    if d.is_null() {
+        return;
+    }
+    let d = pyre_object::gc_roots::pin_root(d);
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, CDATA_BUFFER_KEY) };
 }
 
 /// Whether `obj` is an instance of the common `_CData` base, matching PyPy's
@@ -1488,40 +1551,95 @@ pub(super) fn make_at_address(
     inst
 }
 
-/// The object a simple-code write has to retain for the bytes it stored.
+/// The object a field or item write has to retain for the bytes it stored.
 ///
 /// `"O"` writes the word `pyobj_container` hands back, and the container holds
 /// only a weakref where it can.  CPython's `O_set` returns the actual referent
 /// for `PyCData_set` to keep, including when the input was another `py_object`;
 /// retaining that wrapper would not retain the slot it copied.  `None` needs no
 /// entry because PyPy's `GlobalPyobjContainer.add` already stores it strongly
-/// and CPython leaves the destination's `_objects` unset.  Other CData values
-/// keep the existing behavior: the write copied their buffer out and left no
-/// other owner.
-pub(super) fn value_for_keep(tc: &str, value: PyObjectRef, stored: &[u8]) -> Option<PyObjectRef> {
+/// and CPython leaves the destination's `_objects` unset.
+///
+/// Every other arm follows PyPy `Field.__set__` / `Array.__setitem__` /
+/// `_Pointer.__setitem__` through `ensure_objects`: a Pointer-typed field
+/// storing an Array keeps the array; a `_SimpleCData` instance contributes its
+/// existing `_objects` (`_SimpleCData._ensure_objects`) and never creates one;
+/// a composite sub-view (`_b_base_` set, PyPy `_index`) yields the existing
+/// dictionary or nothing (`_CData._ensure_objects`); any other composite
+/// creates the empty dictionary `objects_for_keep` would.  A non-CData value
+/// contributes nothing.
+pub(super) fn value_for_keep(
+    tc: &str,
+    value: PyObjectRef,
+    stored: &[u8],
+    keep_array_for_pointer_field: bool,
+) -> Option<PyObjectRef> {
     if tc == "O" {
         let referent = pyobj_container_get(cfield::read_pointer_from_buffer(stored))?;
         return (!unsafe { pyre_object::is_none(referent) }).then_some(referent);
     }
-    is_cdata_instance(value).then_some(value)
+    if keep_array_for_pointer_field {
+        return Some(value);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::pin_roots(&[value]);
+    if !is_cdata_instance(pyre_object::gc_roots::shadow_stack_get(slot)) {
+        return None;
+    }
+    let value = pyre_object::gc_roots::shadow_stack_get(slot);
+    if is_simplecdata_instance(value) {
+        return peek_objects(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
+    let value = pyre_object::gc_roots::shadow_stack_get(slot);
+    if has_b_base(value) {
+        return peek_objects(pyre_object::gc_roots::shadow_stack_get(slot));
+    }
+    Some(objects_for_keep(pyre_object::gc_roots::shadow_stack_get(
+        slot,
+    )))
 }
 
-/// Keep `obj` alive for the lifetime of the buffer that `anchor` views, by
-/// storing it under `key` in the ultimate root's `"_objects_"` dict.
-pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    // Walk `_b_base_` up to the owning root.
+/// Existing `"_objects_"` entry, or `None` when absent.  Never creates one.
+fn peek_objects(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return None;
+    }
+    match unsafe { pyre_object::w_dict_getitem_str(d, OBJECTS_KEY) } {
+        Some(objects) if !objects.is_null() && !unsafe { pyre_object::is_none(objects) } => {
+            Some(objects)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `obj` is a sub-view (`_b_base_` set), PyPy `_CData._ensure_objects`
+/// testing `'_index' in __dict__`.
+fn has_b_base(obj: PyObjectRef) -> bool {
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
+    if d.is_null() {
+        return false;
+    }
+    match unsafe { pyre_object::w_dict_getitem_str(d, BBASE_KEY) } {
+        Some(base) if !base.is_null() && !unsafe { pyre_object::is_none(base) } => true,
+        _ => false,
+    }
+}
+
+/// `basics.py store_reference`: walk `_b_index_` / `_b_base_` from `anchor`
+/// to the owning root, joining `base_key` with each index.  Pins `anchor`
+/// and every parent on the current shadow stack and returns that root's slot
+/// plus the composite key.
+fn store_reference_target(anchor: PyObjectRef, base_key: &str) -> Option<(usize, String)> {
     let _ = pyre_object::gc_roots::pin_root(anchor);
     let mut root;
     let mut root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let mut composite_key = key.to_string();
+    let mut composite_key = base_key.to_string();
     loop {
         root = pyre_object::gc_roots::shadow_stack_get(root_slot);
         let d = pyre_interpreter::baseobjspace::getdict_native(root);
         if d.is_null() {
-            return;
+            return None;
         }
         if let Some(index) = unsafe { pyre_object::w_dict_getitem_str(d, BINDEX_KEY) }
             && unsafe { pyre_object::is_int(index) }
@@ -1538,7 +1656,19 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
             _ => break,
         }
     }
-    root = pyre_object::gc_roots::shadow_stack_get(root_slot);
+    Some((root_slot, composite_key))
+}
+
+/// Keep `obj` alive for the lifetime of the buffer that `anchor` views, by
+/// storing it under `key` in the ultimate root's `"_objects_"` dict.
+pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let Some((root_slot, composite_key)) = store_reference_target(anchor, key) else {
+        return;
+    };
+    let mut root = pyre_object::gc_roots::shadow_stack_get(root_slot);
     let mut d = pyre_interpreter::baseobjspace::getdict_native(root);
     // An existing keepalive dictionary is reused; any other holder is replaced,
     // and a `bytes` one drops its keepalive count on the way out.
@@ -1616,33 +1746,64 @@ fn keep_alive(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(anchor);
-    let mut root;
-    let mut root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    loop {
-        root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-        let d = pyre_interpreter::baseobjspace::getdict_native(root);
-        if d.is_null() {
-            return;
-        }
-        match unsafe { pyre_object::w_dict_getitem_str(d, BBASE_KEY) } {
-            Some(base) if !base.is_null() && !unsafe { pyre_object::is_none(base) } => {
-                root = base;
-                let _ = pyre_object::gc_roots::pin_root(root);
-                root_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            }
-            _ => break,
-        }
-    }
-    root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-    let d = pyre_interpreter::baseobjspace::getdict_native(root);
+    let Some((root_slot, composite_key)) = store_reference_target(anchor, key) else {
+        return;
+    };
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(root_slot),
+    );
     if !d.is_null() {
         // Read the holder back only after the dictionary lookup: that lookup can
         // materialise the dict view and collect, which would leave an earlier
         // read holding a pre-move word.
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        unsafe { pyre_object::w_dict_setitem_str(d, &format!("_keep_{key}"), obj) };
+        unsafe { pyre_object::w_dict_setitem_str(d, &format!("_keep_{composite_key}"), obj) };
     }
+}
+
+/// The NUL-terminated copy a simple `c_char_p` / `c_wchar_p` retains under
+/// `_keep_{composite}` (`encode_value_into` with key `"0"`, then
+/// `store_reference`).  PyPy `_setvalue` for `tp == 'z'` stores that buffer
+/// on `_objects` as `CArgObject`; pyre's observable `_objects` is the original
+/// bytes/str, so a destination that copies the pointer word (`same_type_bytes`)
+/// has to keep this holder too.
+fn simple_keep_owner(src: PyObjectRef) -> Option<PyObjectRef> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let src = pyre_object::gc_roots::pin_root(src);
+    let src_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if !is_simplecdata_instance(src) {
+        return None;
+    }
+    let Some((root_slot, composite_key)) =
+        store_reference_target(pyre_object::gc_roots::shadow_stack_get(src_slot), "0")
+    else {
+        return None;
+    };
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(root_slot),
+    );
+    if d.is_null() {
+        return None;
+    }
+    match unsafe { pyre_object::w_dict_getitem_str(d, &format!("_keep_{composite_key}")) } {
+        Some(owner) if !owner.is_null() && !unsafe { pyre_object::is_none(owner) } => Some(owner),
+        _ => None,
+    }
+}
+
+/// `c_char_p`/`c_wchar_p` pointer words address the `_keep_0` copy, not the
+/// original bytes/str `value_for_keep` peeks.  Copy that holder onto `dest`.
+pub(super) fn keep_charp_owner(tc: &str, dest: PyObjectRef, key: &str, value: PyObjectRef) {
+    if !matches!(tc, "z" | "Z") {
+        return;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(&[dest, value]);
+    let Some(owner) = simple_keep_owner(_roots.get(base + 1)) else {
+        return;
+    };
+    let owner_slot = _roots.pin_roots(&[owner]);
+    keep_alive(_roots.get(base), key, _roots.get(owner_slot));
 }
 
 /// Make `result` share the source root's `_objects` dictionary, matching

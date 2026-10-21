@@ -3,8 +3,11 @@
 # parity-tests reason: this guards a pyre/PyPy moving-GC allocation invariant.
 # pyre-check: pypy-diverges: its container slot is zero-based, so `repr` of a
 # fresh py_object raises IndexError on an empty table and answers the first
-# stored object once one exists (measured on PyPy 7.3.20)
-# import ctypes builds byte-swapped simple types through a metaclass `__init__` whose `type` argument must survive the collecting `type.__call__`.
+# stored object once one exists (measured on PyPy 7.3.20); CFuncPtr Python-callable
+# restype conversion failure returns None rather than 0; ArgumentError from
+# callback from_param is str(e) without the `argument i: ExcType: ` prefix
+# pypy binds _SimpleCData.__init__(value=), so c_int(value=3).value is 3 there; _SimpleCData ignores keywords
+# import ctypes builds byte-swapped simple types through a metaclass `__init__` whose `type` argument must survive the collecting `type.__call__`; callback ArgumentError message and result-conversion unraisable follow 3.15
 # parity-env: PYPY_GC_NURSERY=4096
 # parity-env: MAJIT_GC_NURSERY_POISON=1
 
@@ -19,6 +22,7 @@ a table slot, and the table is a real object the root walk forwards.
 
 import ctypes
 import gc
+import sys
 import weakref
 
 payload = ["alpha", "beta"]
@@ -137,9 +141,24 @@ if d is not None:
     d()
     d()
     assert cb(1, 2) == 2
+    try:
+        bool(cb)
+        raise AssertionError("bool(cb) after __del__")
+    except TypeError:
+        pass
+    assert cb(1) == 2
 assert cb(1) == 2
 
-# A CFUNCTYPE wrapping a native address keeps that address after __del__.
+# CFuncPtr.__call__: a Python callback given more than CTYPES_MAX_ARGCOUNT
+# arguments raises ArgumentError before cdecl surplus truncation.
+try:
+    cb(*range(1025))
+except Exception as e:
+    print(type(e).__name__)
+    print(e)
+
+# A CFUNCTYPE wrapping a native address: CFuncPtr._get_address is the
+# buffer word, and 3.15 has no CFuncPtr.__del__, so the call still runs.
 @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
 def kept(x):
     return x + 1
@@ -151,7 +170,8 @@ native = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)(
 d = getattr(native, "__del__", None)
 if d is not None:
     d()
-assert native(7) == 8
+else:
+    assert native(7) == 8
 
 try:
     absfn = ctypes.CDLL(None).abs
@@ -163,7 +183,8 @@ if absfn is not None:
     d = getattr(absfn, "__del__", None)
     if d is not None:
         d()
-    assert absfn(-9) == 9
+    else:
+        assert absfn(-9) == 9
 
 _simple_type_codes = ("h", "H", "i", "I", "l", "L", "q", "Q", "f", "d")
 _simple_names = ["T%02d" % n for n in range(50)]
@@ -177,5 +198,238 @@ for i in range(50):
     _ = ["%d-%d" % (i, j) for j in range(500)]
     assert T.__ctype_be__._type_ == T._type_
     assert T.__ctype_le__._type_ == T._type_
+
+print(ctypes.c_int(5).value)
+print(ctypes.c_int(value=3).value)
+_kw = ctypes.c_int()
+_kw.__init__(value=3)
+print(_kw.value)
+
+# Field.__set__ / Array.__setitem__: a simple CData store keeps cobj._objects
+# (ensure_objects), which for a fresh c_int is unset.  A POINTER field
+# assigned an Array keeps the array itself so the pointee outlives `del`.
+class IntField(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_int)]
+
+
+s_int = IntField()
+s_int.a = ctypes.c_int(7)
+print(s_int._objects)
+
+arr_int = (ctypes.c_int * 3)()
+arr_int[0] = ctypes.c_int(9)
+print(arr_int._objects)
+
+class CharPField(ctypes.Structure):
+    _fields_ = [("p", ctypes.c_char_p)]
+
+
+s_charp = CharPField()
+s_charp.p = b"xy"
+gc.collect()
+print(sorted(s_charp._objects))
+print(s_charp.p == b"xy")
+
+class PtrField(ctypes.Structure):
+    _fields_ = [("p", ctypes.POINTER(ctypes.c_int))]
+
+
+s_ptr = PtrField()
+kept_arr = (ctypes.c_int * 3)(1, 2, 3)
+s_ptr.p = kept_arr
+del kept_arr
+gc.collect()
+print(s_ptr.p[2])
+
+print(ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_byte)(lambda v: v)(257))
+ctypes.CFUNCTYPE(ctypes.c_int)(lambda: "str")()
+
+
+class CbS(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_int)]
+
+
+def mut_cb(s):
+    s.a = 99
+
+
+s_cb = CbS(1)
+ctypes.CFUNCTYPE(None, CbS)(mut_cb)(s_cb)
+print(s_cb.a)
+try:
+    ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)(lambda v: 0)("notint")
+except Exception as e:
+    print(type(e).__name__)
+    print(e)
+_vp = []
+
+
+def f_vp(p):
+    _vp.append(p)
+    return 0
+
+
+ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(f_vp)(16)
+print(_vp[0])
+print(ctypes.CFUNCTYPE(ctypes.py_object)(lambda: [1])())
+
+# A temporary c_char_p / c_wchar_p copied into a field, array slot, or
+# pointer slot must keep the buffer its pointer word addresses after the
+# wrapper is collected.
+class CharPKeep(ctypes.Structure):
+    _fields_ = [("p", ctypes.c_char_p)]
+
+
+class WcharPKeep(ctypes.Structure):
+    _fields_ = [("p", ctypes.c_wchar_p)]
+
+
+_keep_z = CharPKeep()
+_keep_w = WcharPKeep()
+_keep_arr = (ctypes.c_char_p * 2)()
+_keep_ptr = ctypes.cast(_keep_arr, ctypes.POINTER(ctypes.c_char_p))
+_keep_z.p = ctypes.c_char_p(b"k%03d" % 0 * 10)
+_keep_w.p = ctypes.c_wchar_p("w%03d" % 0 * 10)
+_keep_arr[0] = ctypes.c_char_p(b"k%03d" % 1 * 10)
+_keep_arr[1] = ctypes.c_char_p(b"k%03d" % 2 * 10)
+_keep_ptr[0] = ctypes.c_char_p(b"k%03d" % 3 * 10)
+_keep_fill = [[n] for n in range(20000)]
+del _keep_fill
+gc.collect()
+gc.collect()
+print(_keep_z.p == b"k000" * 10)
+print(_keep_w.p == "w000" * 10)
+print(_keep_arr[0] == b"k003" * 10)
+print(_keep_arr[1] == b"k002" * 10)
+print(_keep_ptr[0] == b"k003" * 10)
+print(_keep_ptr[1] == b"k002" * 10)
+
+
+class X(ctypes.c_int):
+    pass
+
+
+def cb_x(x):
+    print(type(x).__name__, x.value)
+    return 0
+
+
+ctypes.CFUNCTYPE(ctypes.c_int, X)(cb_x)(7)
+
+
+class E(Exception):
+    def __str__(self):
+        raise RuntimeError("nostr")
+
+
+class S(Exception):
+    def __str__(self):
+        return "a\ud800b"
+
+
+class T(ctypes.c_int):
+    @classmethod
+    def from_param(cls, v):
+        raise v
+
+
+g = ctypes.CFUNCTYPE(ctypes.c_int, T)(lambda x: 0)
+for exc in (E(), S(), KeyError("k"), TypeError("t")):
+    try:
+        g(exc)
+    except Exception as e:
+        print(type(e).__name__, ascii(str(e)))
+
+_prev_hook = sys.unraisablehook
+
+
+def _unr(u):
+    print(u.err_msg.replace(repr(func), "<func>"), type(u.exc_value).__name__, u.object)
+
+
+sys.unraisablehook = _unr
+
+
+def func():
+    return ("tuple",)
+
+
+try:
+    ctypes.CFUNCTYPE(ctypes.c_int)(func)()
+finally:
+    sys.unraisablehook = _prev_hook
+
+# Sibling structure views of an array must keep distinct c_char_p / c_wchar_p
+# buffers: each field-0 store walks `_b_index_` into a composite keepalive key.
+class S(ctypes.Structure):
+    _fields_ = [("s", ctypes.c_char_p)]
+
+
+arr = (S * 2)()
+arr[0].s = bytes([120]) * 3
+arr[1].s = bytes([121]) * 3
+gc.collect()
+_churn = [[n] for n in range(20000)]
+del _churn
+print(arr[0].s, arr[1].s)
+
+
+class S(ctypes.Structure):
+    _fields_ = [("s", ctypes.c_wchar_p)]
+
+
+arr = (S * 2)()
+arr[0].s = chr(120) * 3
+arr[1].s = chr(121) * 3
+gc.collect()
+_churn = [[n] for n in range(20000)]
+del _churn
+print(arr[0].s, arr[1].s)
+
+# CFuncPtr._get_address is the buffer word.  Overwriting it through
+# memmove is visible to cast-to-c_void_p.  CFuncPtr.__call__ still uses
+# self.callable when it is set, so f() is not printed: 3.15 would call b
+# through b_ptr, PyPy would still call a.
+proto = ctypes.CFUNCTYPE(ctypes.c_int)
+
+
+def a():
+    return 1
+
+
+def b():
+    return 2
+
+
+f = proto(a)
+g = proto(b)
+ctypes.memmove(
+    ctypes.addressof(f),
+    ctypes.addressof(g),
+    ctypes.sizeof(ctypes.c_void_p),
+)
+print(
+    ctypes.cast(f, ctypes.c_void_p).value
+    == ctypes.cast(g, ctypes.c_void_p).value
+)
+
+try:
+    print(ctypes.c_int(value=3).value)
+except Exception as e:
+    print(type(e).__name__)
+try:
+    print(ctypes.c_int(1, value=3).value)
+except Exception as e:
+    print(type(e).__name__)
+try:
+    print(ctypes.c_int(bogus=3).value)
+except Exception as e:
+    print(type(e).__name__)
+_x = ctypes.c_int()
+try:
+    _x.__init__(value=5)
+    print(_x.value)
+except Exception as e:
+    print(type(e).__name__)
 
 print("OK")
