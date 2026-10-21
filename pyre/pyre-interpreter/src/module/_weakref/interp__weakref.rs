@@ -1115,13 +1115,23 @@ fn is_w_weakref(obj: PyObjectRef) -> bool {
     unsafe { crate::baseobjspace::isinstance_w(obj, weakref_type()) }
 }
 
-/// PyPy `app_weakref._remove_dead_weakref`, backed by
-/// `W_DictMultiObject.nondescr_delitem_if_value_is`.
-///
-/// The lookup and deletion operate on the intrinsic dict backing so dict
-/// subclass hooks are bypassed.  Rechecking pointer identity immediately
-/// before deletion preserves the upstream atomic "delete only this weakref"
-/// contract if key comparison mutates the dictionary.
+/// pyre accepts a dict subclass (`isinstance_dict_w`; clinic
+/// `dct: object(subclass_of='&PyDict_Type')`) and deletes through the dict
+/// storage (`resolve_dict_backing` then `dict_delitem_if_value_is`) without
+/// calling subclass `__getitem__` / `__delitem__`, so a hooked `__getitem__`
+/// that raises `KeyError("hooked")` still loses the dead-weakref key.
+/// PyPy `app_weakref._remove_dead_weakref` does `wr = d[key]` then
+/// `delitem_if_value_is`; a raising override is caught as KeyError and the
+/// entry stays.  No `@jit`/`_immutable_` on `app_weakref._remove_dead_weakref`.
+/// `_weakref__remove_dead_weakref_impl` calls `_PyDict_DelItemIf` with
+/// `is_dead_weakref` (`v3.15.1` `Modules/_weakref.c` / `Objects/dictobject.c`).
+/// A non-dict mapping is TypeError here; PyPy `app_weakref._remove_dead_weakref`
+/// accepts any mapping and does `d[key]`.
+/// [3.15-spec] measured python3.15t (v3.15.1, free-threaded): class D(dict) with
+/// __getitem__ raising KeyError("hooked"); dict.__setitem__(d, 'k', dead_ref);
+/// _remove_dead_weakref(d, 'k'); 'k' in d -> False.
+/// _remove_dead_weakref(M(), 'k') for a non-dict mapping M -> TypeError:
+/// _remove_dead_weakref() argument 1 must be dict, not M
 pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let dict = args
         .first()
@@ -1131,7 +1141,7 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
         .get(1)
         .copied()
         .ok_or_else(|| PyError::type_error("_remove_dead_weakref() missing key argument"))?;
-    if !unsafe { pyre_object::is_dict(dict) } {
+    if !unsafe { crate::baseobjspace::isinstance_dict_w(dict) } {
         return Err(PyError::type_error(format!(
             "_remove_dead_weakref() argument 1 must be dict, not {}",
             crate::type_methods::clinic_arg_type_name(dict),

@@ -1,5 +1,6 @@
 # CPython-suite gap: weakref tests omit this PyPy lifeline across moving collection.
 # parity-tests reason: this targets PyPy/pyre weakref ownership in the moving GC.
+# pyre-check: pypy-diverges: `_remove_dead_weakref` on a dict subclass whose `__getitem__` raises KeyError leaves the entry (`app_weakref._remove_dead_weakref` does `d[key]`); 3.15 deletes via `_PyDict_DelItemIf` without calling it
 #
 # make_weakref_descr_lifeline:
 # no CPython test pins make_weakref_descr _lifeline_ on these interp types. typedef.py
@@ -203,4 +204,49 @@ def weakref_ref_subclass_layout():
     collect()
     assert key not in values
 weakref_ref_subclass_layout()
+
+
+def remove_dead_weakref_dict_subclass():
+    """A dict subclass holding a dead weakref is accepted; the key is deleted.
+
+    `__getitem__` must not raise: `app_weakref._remove_dead_weakref` does
+    `d[key]`, so a raising override would make pypy3 print a different line.
+    """
+    from _weakref import _remove_dead_weakref
+
+    class SubDict(dict):
+        def __getitem__(self, key):
+            return dict.__getitem__(self, key)
+
+    d = SubDict()
+    item = Target()
+    d["k"] = weakref.ref(item)
+    del item
+    gc.collect()
+    _remove_dead_weakref(d, "k")
+    print("remove_dead_subclass_key_gone", "k" not in d)
+
+
+remove_dead_weakref_dict_subclass()
+
+
+def remove_dead_weakref_hooked_getitem():
+    from _weakref import _remove_dead_weakref
+
+    class D(dict):
+        def __getitem__(self, key):
+            raise KeyError("hooked")
+
+    d = D()
+    item = Target()
+    r = weakref.ref(item)
+    dict.__setitem__(d, "k", r)
+    del item
+    gc.collect()
+    _remove_dead_weakref(d, "k")
+    print("k" in d)
+    assert "k" not in d
+
+
+remove_dead_weakref_hooked_getitem()
 print("OK")
