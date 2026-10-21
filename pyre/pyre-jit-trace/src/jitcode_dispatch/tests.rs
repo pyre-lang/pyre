@@ -4582,6 +4582,109 @@ fn record_exact_class_records_the_hint_with_both_operands() {
 }
 
 #[test]
+fn record_exact_value_i_records_when_box_is_not_constant() {
+    // `pyjitpl.py _record_exact_value`: non-Const box + Const const_box
+    // records RECORD_EXACT_VALUE_I with both operands.
+    let byte = *insns_opname_to_byte()
+        .get("record_exact_value_i/ii")
+        .expect("`record_exact_value_i/ii` must be in insns table");
+    let code = [byte, 0x00, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let box_ = dummy_int_add_box(&mut tc);
+    let const_box = tc.const_int(1);
+    let mut regs_i = [box_, const_box];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("`record_exact_value_i/ii` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3, "`ii` consumes two register bytes");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RecordExactValueI);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![box_, const_box],
+    );
+}
+
+#[test]
+fn record_exact_value_i_is_a_noop_when_both_constants_match() {
+    let byte = *insns_opname_to_byte()
+        .get("record_exact_value_i/ii")
+        .expect("`record_exact_value_i/ii` must be in insns table");
+    let code = [byte, 0x00, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let box_ = tc.const_int(1);
+    let const_box = tc.const_int(1);
+    let mut regs_i = [box_, const_box];
+    let ops_before = tc.num_ops();
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("`record_exact_value_i/ii` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3, "`ii` consumes two register bytes");
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "matching constants record nothing"
+    );
+}
+
+#[test]
+fn record_exact_value_i_aborts_bad_loop_when_constants_differ() {
+    let byte = *insns_opname_to_byte()
+        .get("record_exact_value_i/ii")
+        .expect("`record_exact_value_i/ii` must be in insns table");
+    let code = [byte, 0x00, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let box_ = tc.const_int(1);
+    let const_box = tc.const_int(0);
+    let mut regs_i = [box_, const_box];
+    let ops_before = tc.num_ops();
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
+        .expect("`record_exact_value_i/ii` must dispatch");
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SwitchToBlackhole {
+            reason: majit_metainterp::counters::ABORT_BAD_LOOP,
+            raising_exception: false,
+        },
+    );
+    assert_eq!(next_pc, 3, "`ii` consumes two register bytes");
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "the aborting case records no RECORD_EXACT_VALUE_I"
+    );
+}
+
+#[test]
+fn record_exact_value_r_records_when_box_is_not_constant() {
+    let byte = *insns_opname_to_byte()
+        .get("record_exact_value_r/rr")
+        .expect("`record_exact_value_r/rr` must be in insns table");
+    let code = [byte, 0x00, 0x01];
+    let mut tc = fresh_trace_ctx();
+    let box_ = dummy_ptr_eq_box(&mut tc);
+    let const_box = tc.const_null();
+    let mut regs_r = [box_, const_box];
+    let mut concrete_r = [ConcreteValue::Null, ConcreteValue::Null];
+    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("`record_exact_value_r/rr` must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 3, "`rr` consumes two register bytes");
+    let last = tc.ops().last().expect("recorded op must exist");
+    assert_eq!(last.opcode, majit_ir::OpCode::RecordExactValueR);
+    assert_eq!(
+        last.getarglist()
+            .iter()
+            .map(|a| a.to_opref())
+            .collect::<Vec<_>>(),
+        vec![box_, const_box],
+    );
+}
+
+#[test]
 fn switch_id_jumps_to_target_or_falls_through() {
     let switch_byte = *insns_opname_to_byte()
         .get("switch/id")

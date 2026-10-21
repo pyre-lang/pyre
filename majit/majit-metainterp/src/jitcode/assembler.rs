@@ -4094,6 +4094,22 @@ impl JitCodeBuilder {
         self.push_reg_u8(cls, "record_exact_class cls");
     }
 
+    /// pyjitpl.py opimpl_record_exact_value_i: record that `src` equals
+    /// `const_src`. Argcodes `ii`.
+    pub fn record_exact_value_i(&mut self, src: u16, const_src: u16) {
+        self.write_insn("record_exact_value_i/ii");
+        self.push_reg_u8(src, "record_exact_value_i box");
+        self.push_reg_u8(const_src, "record_exact_value_i const");
+    }
+
+    /// pyjitpl.py opimpl_record_exact_value_r: record that `src` equals
+    /// `const_src`. Argcodes `rr`.
+    pub fn record_exact_value_r(&mut self, src: u16, const_src: u16) {
+        self.write_insn("record_exact_value_r/rr");
+        self.push_reg_u8(src, "record_exact_value_r box");
+        self.push_reg_u8(const_src, "record_exact_value_r const");
+    }
+
     /// pyjitpl.py opimpl_ref_guard_value: promote ref register to constant.
     pub fn ref_guard_value(&mut self, src: u16) {
         self.touch_ref_reg(src);
@@ -7310,7 +7326,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 array_type_id: lhs_array_type_id,
                 interior_fields: lhs_interior_fields,
                 is_gc_managed: lhs_is_gc_managed,
-                load_is_acquire: false,
+                load_is_acquire: lhs_acq,
             },
             CanonicalBhDescr::Array {
                 base_size: rhs_base_size,
@@ -7326,7 +7342,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 array_type_id: rhs_array_type_id,
                 interior_fields: rhs_interior_fields,
                 is_gc_managed: rhs_is_gc_managed,
-                load_is_acquire: false,
+                load_is_acquire: rhs_acq,
             },
         ) => {
             // `ei_index` is intentionally NOT part of the identity
@@ -7356,6 +7372,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 && lhs_array_type_id == rhs_array_type_id
                 && lhs_interior_fields == rhs_interior_fields
                 && lhs_is_gc_managed == rhs_is_gc_managed
+                && lhs_acq == rhs_acq
         }
         // `Call` falls through `_ => false`: call descrs are not
         // deduplicated. See `add_call_descr`.
@@ -7757,6 +7774,7 @@ mod tests {
                     virtualizable: false,
                     index_in_parent: i,
                     is_class_word: Some(false),
+                    load_is_acquire: false,
                 },
             )
             .collect();
@@ -9034,5 +9052,36 @@ mod tests {
         let a = builder.add_gc_varsize_array_descr(8, 0, 8, false, true, 1, 22);
         let b = builder.add_gc_varsize_array_descr(8, 0, 8, false, true, 1, 23);
         assert_ne!(a, b);
+    }
+
+    /// `assembler.py` `emit_const` interns a repeated descr object into one
+    /// pool slot. `load_is_acquire` is part of that identity
+    /// (`descr.py` `get_array_descr`).
+    #[test]
+    fn acquire_array_descrs_intern_into_one_pool_slot() {
+        fn array(load_is_acquire: bool) -> CanonicalBhDescr {
+            CanonicalBhDescr::Array {
+                base_size: 0,
+                itemsize: 8,
+                len_offset: None,
+                type_id: 0,
+                gc_type_id: 0,
+                item_type: majit_ir::value::Type::Int,
+                is_array_of_pointers: false,
+                is_array_of_structs: false,
+                is_item_signed: false,
+                ei_index: u32::MAX,
+                array_type_id: Some("majit::raw_carray_u64_w7_assembler_acquire".into()),
+                interior_fields: Vec::new(),
+                is_gc_managed: false,
+                load_is_acquire,
+            }
+        }
+        let mut builder = JitCodeBuilder::new();
+        let first = builder.add_array_descr(array(true));
+        let again = builder.add_array_descr(array(true));
+        assert_eq!(first, again);
+        let plain = builder.add_array_descr(array(false));
+        assert_ne!(first, plain);
     }
 }

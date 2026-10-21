@@ -6795,6 +6795,7 @@ mod tests {
                 flag: majit_ir::ArrayFlag::Signed,
                 virtualizable: false,
                 index_in_parent: 0,
+                load_is_acquire: false,
             }],
         );
         let field_descr = field_group.field_descrs[0].clone() as DescrRef;
@@ -6888,6 +6889,7 @@ mod tests {
                     flag: majit_ir::ArrayFlag::Signed,
                     virtualizable: false,
                     index_in_parent: 0,
+                    load_is_acquire: false,
                 },
                 majit_ir::descr::SimpleFieldDescrSpec {
                     is_class_word: Some(false),
@@ -6902,6 +6904,7 @@ mod tests {
                     flag: majit_ir::ArrayFlag::Signed,
                     virtualizable: false,
                     index_in_parent: 1,
+                    load_is_acquire: false,
                 },
             ],
         );

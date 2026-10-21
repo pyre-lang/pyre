@@ -260,7 +260,9 @@ const MAJIT_ONLY: &[&str] = &[
     // this file exists to make visible. The three raw-array keys
     // (`getarrayitem_raw_{i,f}`, `setarrayitem_raw_f`) left when the
     // walker gained the arms `pyjitpl.py` `opimpl_getarrayitem_raw_{i,f}`
-    // / `opimpl_setarrayitem_raw_f` already named.
+    // / `opimpl_setarrayitem_raw_f` already named. `record_exact_value_i/ii`
+    // / `record_exact_value_r/rr` left when the walker gained
+    // `pyjitpl.py opimpl_record_exact_value_{i,r}` / `_record_exact_value`.
     "arraybase_vable/rdd>i",
     "goto_if_exception_mismatch/iL",
     "newlist_clear/idddd>r",

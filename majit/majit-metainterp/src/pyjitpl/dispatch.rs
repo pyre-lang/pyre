@@ -167,6 +167,7 @@ fn field_spec_from_bh(
         flag: f.field_flag,
         virtualizable: false,
         index_in_parent: f.index_in_parent,
+        load_is_acquire: f.load_is_acquire,
     }
 }
 
@@ -290,6 +291,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
             owner,
             is_immutable,
             is_quasi_immutable,
+            load_is_acquire,
             ..
         } => {
             // descr.py get_field_descr keys cache[STRUCT][fieldname] by the
@@ -407,6 +409,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                     flag: *field_flag,
                                     virtualizable: false,
                                     index_in_parent: slot,
+                                    load_is_acquire: *load_is_acquire,
                                 });
                                 specs.len() - 1
                             });
@@ -488,7 +491,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             ),
                             false,
                             *index_in_parent,
-                            false,
+                            *load_is_acquire,
                         );
                         return (*offset, fd as majit_ir::DescrRef);
                     }
@@ -548,6 +551,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             // Same floor as the sibling arm above: the spec type
                             // has no way to say "no slot was claimed".
                             index_in_parent: index_in_parent.unwrap_or(0),
+                            load_is_acquire: *load_is_acquire,
                         };
                         let group = majit_ir::descr::make_simple_descr_group_with_flags(
                             u32::MAX,
@@ -595,7 +599,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         ),
                         false,
                         *index_in_parent,
-                        false,
+                        *load_is_acquire,
                     );
                     return (*offset, fd as majit_ir::DescrRef);
                 }
@@ -639,13 +643,17 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
             }
             (
                 *offset,
-                majit_ir::descr::make_field_descr_with_immutability(
-                    *offset,
-                    *field_size,
-                    *field_type,
-                    *field_flag,
-                    *is_immutable,
-                ),
+                Arc::new(
+                    majit_ir::descr::SimpleFieldDescr::new(
+                        0,
+                        *offset,
+                        *field_size,
+                        *field_type,
+                        *is_immutable,
+                    )
+                    .with_flag(*field_flag)
+                    .with_load_is_acquire(*load_is_acquire),
+                ) as majit_ir::DescrRef,
             )
         }
         other => panic!("getfield_gc/setfield_gc: descr is not a Field: {other:?}"),
@@ -745,6 +753,7 @@ pub fn residual_write_effect_info(
                         flag,
                         virtualizable: false,
                         index_in_parent: idx,
+                        load_is_acquire: false,
                     }
                 },
             )
@@ -6437,6 +6446,74 @@ mod tests {
         );
     }
 
+    /// `descr.py` `get_field_descr` keeps one descr object per
+    /// `(STRUCT, fieldname)`. The Acquire stamp is part of that mint, so two
+    /// reconstructions of the same acquire field share the Arc.
+    #[test]
+    fn field_descr_ref_from_bh_preserves_acquire_identity() {
+        const TID: u64 = 0xAC01_F1E1_D15C_0001;
+        let mut descr = field_descr_with_parent("acq", TID, 16, 0xAA);
+        match &mut descr {
+            crate::blackhole::BhDescr::Field {
+                load_is_acquire,
+                parent: Some(parent),
+                ..
+            } => {
+                *load_is_acquire = true;
+                std::sync::Arc::make_mut(parent).all_fielddescrs[0].load_is_acquire = true;
+            }
+            other => panic!("expected Field descr, got {other:?}"),
+        }
+        let first = field_descr_ref_from_bh(&descr).1;
+        let again = field_descr_ref_from_bh(&descr).1;
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        assert!(
+            first
+                .as_field_descr()
+                .expect("FieldDescr")
+                .stored_load_is_acquire()
+        );
+    }
+
+    /// A Size descr whose `all_fielddescrs` row is stamped acquire reconstructs
+    /// that field acquire (`descr.py` `get_field_descr` / `init_size_descr`).
+    #[test]
+    fn size_descr_all_fielddescrs_preserves_acquire() {
+        const TID: u64 = 0xAC01_F1E1_D15C_0002;
+        let spec = majit_jitcode::jitcode::BhFieldSpec {
+            index: 0,
+            field_key: "acq".to_string(),
+            name: "acq".to_string(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: majit_ir::descr::ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            is_class_word: None,
+            load_is_acquire: true,
+        };
+        let size = crate::blackhole::BhDescr::Size {
+            size: 16,
+            type_id: TID,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: vec![spec],
+            is_gc_managed: true,
+        };
+        let sd = size_descr_ref_from_bh(&size);
+        let field = sd
+            .as_size_descr()
+            .expect("SizeDescr")
+            .all_fielddescrs()
+            .first()
+            .expect("acquire field")
+            .clone();
+        assert!(field.stored_load_is_acquire());
+    }
+
     /// A `BhDescr::Field` naming `field` of a parent that carries a flattened
     /// one-entry field list and the `type_id` given.
     fn field_descr_with_parent(
@@ -6598,6 +6675,7 @@ mod tests {
                 flag: ArrayFlag::Unsigned,
                 virtualizable: false,
                 index_in_parent: i,
+                load_is_acquire: false,
             });
         }
         specs.push(SimpleFieldDescrSpec {
@@ -6613,6 +6691,7 @@ mod tests {
             flag: ArrayFlag::Unsigned,
             virtualizable: false,
             index_in_parent: FLAGS_INDEX,
+            load_is_acquire: false,
         });
         let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
@@ -10609,6 +10688,37 @@ mod tests {
         builder.getfield_gc_i(1, 0, 8, 0, "payload");
         let ops = traced_opcodes(&[], &builder.finish(), &[]);
         assert!(ops.contains(&OpCode::GetfieldGcI));
+    }
+
+    #[test]
+    fn record_exact_value_i_records_the_const() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(1, 1);
+        builder.record_exact_value_i(0, 1);
+        let jitcode = builder.finish();
+        let mut ctx = context_with_liveness(&[majit_ir::Type::Int], &Default::default());
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 0)],
+        );
+        assert!(matches!(action, TraceAction::Continue));
+        let recorder = ctx.into_recorder();
+        let op = recorder
+            .ops()
+            .iter()
+            .find(|op| op.opcode == OpCode::RecordExactValueI)
+            .expect("RecordExactValueI recorded");
+        assert!(!op.arg(0).is_constant(), "box is the live input arg");
+        assert_eq!(
+            op.arg(1).const_int(),
+            Some(1),
+            "const_box is ConstInt(True)"
+        );
     }
 
     fn switch_return_jitcode() -> (JitCode, majit_jitcode::codewriter::assembler::Assembler) {
