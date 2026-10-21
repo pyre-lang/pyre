@@ -4366,7 +4366,7 @@ fn rewrite_op_indices(origin: &CarrierOrigin, inspect: &UnwrapOrInspect) -> Vec<
 /// unwrap_or recast, and dead-result ops that `canremove` would drop
 /// (`simplify.py` `transform_dead_op_vars_in_blocks` once the combinator
 /// is gone). A dead-result op joins the set only when
-/// [`op_is_side_effect_free`] holds and it is not the block's
+/// [`op_is_removable`] holds and it is not the block's
 /// `raising_op` (`flowspace/model.py` `Block.raising_op`; `canremove`'s
 /// `op is not block.raising_op`). The `expect` panic-message `__str_const`
 /// in `append_left` is that last class. The catch-path default (`null_mut`
@@ -4399,7 +4399,7 @@ fn combinator_deleted_ops(
             // `operations[-1]` when `canraise`.
             let is_raising_op = body.canraise() && idx + 1 == body.operations.len();
             let op = &body.operations[idx];
-            if !op_is_side_effect_free(&op.kind) || is_raising_op {
+            if !op_is_removable(&op.kind) || is_raising_op {
                 continue;
             }
             let Some(result) = op.result.as_ref() else {
@@ -4500,27 +4500,27 @@ fn skipped_block_on_edge(
     origin.hops.iter().any(|hop| hop.block == block) || block == inspect.u
 }
 
-/// Whether skipping `kind` on a LastException edge is a side-effect-free
-/// omission. F1 asks "may this op be NOT executed on this path"; that is
-/// not flowspace dead-op removal.
+/// Whether `kind` may be deleted or skipped on a LastException edge.
+/// F1 asks "may this op be NOT executed on this path"; that is not
+/// flowspace dead-op removal of a live result.
 ///
-/// Distinct from [`crate::inline::can_remove_op`] (`simplify.py` `CanRemove`
-/// / `CanRemoveBuiltins`): those never remove a `simple_call` to a builtin
-/// such as `cast_pointer` or `nullptr`. Those calls fold only after rtyping
-/// (`lloperation.py` `canfold`; `rbuiltin.py` `rtype_const_result` for
-/// `lltype.nullptr`; backendopt).
+/// The base is [`crate::inline::can_remove_op`] (`simplify.py` `CanRemove`).
+/// Three extra arms cover frontend materialisations that `CanRemove` /
+/// `CanRemoveBuiltins` never remove as a `simple_call`: those calls fold
+/// only after rtyping (`lloperation.py` `canfold`; `rbuiltin.py`
+/// `rtype_const_result` for `lltype.nullptr`; backendopt).
 ///
 /// `__str_const` is `front::mir`'s materialisation of a string literal
 /// (`Call(["__str_const", text])`). Upstream that value is a bare
 /// `Constant` (`flowspace/model.py` `Constant`), not an operation.
-fn op_is_side_effect_free(kind: &OpKind) -> bool {
-    crate::inline::is_pure_op(kind)
+fn op_is_removable(kind: &OpKind) -> bool {
+    crate::inline::can_remove_op(kind)
         || crate::model::cast_instance_root(kind).is_some()
         || crate::model::is_core_ptr_null_call(kind)
         || crate::model::is_str_const_define(kind)
 }
 
-/// F1 — skipped ops on a LastException edge must be side-effect-free and
+/// F1 — skipped ops on a LastException edge must be removable and
 /// dead on that path. Ops the rewrite consumes ([`combinator_deleted_ops`])
 /// are excluded before this check.
 fn assert_skipped_ops_sound(
@@ -4538,9 +4538,9 @@ fn assert_skipped_ops_sound(
     };
     for &(block, idx) in skipped {
         let op = &graph.blocks[block].operations[idx];
-        if !op_is_side_effect_free(&op.kind) {
+        if !op_is_removable(&op.kind) {
             return Err(format!(
-                "{name}: skipped op in block {block} is not side-effect-free ({})",
+                "{name}: skipped op in block {block} is not removable ({})",
                 truncated_kind(&op.kind)
             ));
         }
@@ -14884,7 +14884,7 @@ mod result_unwrap_or_tests {
             result_ty: ValueType::Ref(None),
         };
         assert!(
-            op_is_side_effect_free(&msg_kind),
+            op_is_removable(&msg_kind),
             "append_left expect message is a flowspace Constant"
         );
         assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
@@ -14977,6 +14977,85 @@ mod result_unwrap_or_tests {
     }
 
     #[test]
+    fn f1_expect_getslice_message_is_not_removable() {
+        // `msg = lst[i:j]; r.expect(msg)` — `getslice` is `pure=True` in
+        // `operation.py` but absent from `simplify.py` `CanRemove` because
+        // `lloperation.py` `getslice` `canraise`. Deletion/bypass uses
+        // removability, so combinator_deleted_ops keeps the dead GetSlice
+        // and assert_skipped_ops_sound rejects skipping it.
+        let mut graph = FunctionGraph::new("carrier_expect_getslice_msg");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["pop_left"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("pop_left");
+        let (u, u_args) = graph.create_block_with_arg_vars(1);
+        let msg_kind = OpKind::GetSlice { args: Vec::new() };
+        assert!(
+            !op_is_removable(&msg_kind),
+            "getslice canraise, so CanRemove excludes it"
+        );
+        let msg = graph.push_op_var(u, msg_kind, true).expect("msg");
+        let w = graph
+            .push_op_var(
+                u,
+                OpKind::Call {
+                    target: CallTarget::method("expect", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![u_args[0].clone(), msg]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("expect");
+        let (c, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(c, None);
+        graph.set_goto(u, c, vec![w.clone()]);
+        graph.set_goto(a, u, vec![r]);
+        let site = CarrierCombinatorSite {
+            result_var: w,
+            payload_ty: ValueType::Ref(None),
+            catch: CarrierCatchKind::RaiseImplicit,
+        };
+        let inspect = inspect_unwrap_or_block(&graph, &site).expect("inspect");
+        let origin = find_carrier_origin(&graph, inspect.u, &inspect.recv).expect("origin");
+        let deleted = combinator_deleted_ops(&graph, &origin, &inspect);
+        let getslice_idx = graph.blocks[inspect.u]
+            .operations
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::GetSlice { .. }))
+            .expect("GetSlice");
+        assert!(
+            !deleted.contains(&(inspect.u, getslice_idx)),
+            "combinator_deleted_ops keeps a dead GetSlice feeding only the expect message"
+        );
+        let skipped = skipped_ops_on_edge(&graph, &origin, &inspect, true);
+        let remaining: Vec<(usize, usize)> = skipped
+            .into_iter()
+            .filter(|op| !deleted.iter().any(|d| d == op))
+            .collect();
+        assert!(
+            remaining.contains(&(inspect.u, getslice_idx)),
+            "GetSlice remains among skipped ops"
+        );
+        let err = assert_skipped_ops_sound(&graph, &origin, &inspect, &remaining, true, &deleted)
+            .expect_err("skipped GetSlice is not removable");
+        assert!(
+            err.contains("not removable"),
+            "assert_skipped_ops_sound names removability: {err}"
+        );
+        let before = graph.clone();
+        assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 0);
+        assert_eq!(graph, before);
+    }
+
+    #[test]
     fn f1_expect_constant_message_is_deleted() {
         // `r.expect("trimright on non-empty deque")` — `__str_const` is a
         // `model.py` `Constant`, so combinator_deleted_ops may remove it.
@@ -15000,7 +15079,7 @@ mod result_unwrap_or_tests {
             result_ty: ValueType::Ref(None),
         };
         assert!(
-            op_is_side_effect_free(&msg_kind),
+            op_is_removable(&msg_kind),
             "trimright expect message is a flowspace Constant"
         );
         let msg = graph.push_op_var(u, msg_kind, true).expect("msg");
@@ -15265,7 +15344,7 @@ mod result_unwrap_or_tests {
         // ThroughHops: hop materialises default with `__cast_instance_intrinsic`
         // (`lloperation.py` `cast_pointer` / `canfold`). The normal
         // LastException edge skips that hop; F1 allows it because the cast
-        // is side-effect-free and the result only feeds the default.
+        // is removable and the result only feeds the default.
         let mut graph = FunctionGraph::new("f1_dead_cast_default");
         let a = graph.startblock;
         let r = graph
@@ -15314,7 +15393,7 @@ mod result_unwrap_or_tests {
             .find(|op| crate::model::cast_instance_root(&op.kind).is_some())
             .map(|op| op.kind.clone())
             .expect("cast");
-        assert!(op_is_side_effect_free(&cast_kind));
+        assert!(op_is_removable(&cast_kind));
         assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
         assert!(!has_unwrap_or(&graph));
         assert_link_arities(&graph);
@@ -15367,7 +15446,7 @@ mod result_unwrap_or_tests {
             payload_ty: ValueType::Ref(None),
             catch: CarrierCatchKind::JoinDefault,
         };
-        assert!(op_is_side_effect_free(&core_ptr_null_mut()));
+        assert!(op_is_removable(&core_ptr_null_mut()));
         assert_eq!(rewire_carrier_combinator_sites(&mut graph, &[site]), 1);
         assert!(!has_unwrap_or(&graph));
         assert_link_arities(&graph);
@@ -15386,7 +15465,7 @@ mod result_unwrap_or_tests {
             args: Vec::new(),
             result_ty: ValueType::Int,
         };
-        assert!(!op_is_side_effect_free(&residual));
+        assert!(!op_is_removable(&residual));
         let mut graph = FunctionGraph::new("f1_residual_call");
         let a = graph.startblock;
         let r = graph

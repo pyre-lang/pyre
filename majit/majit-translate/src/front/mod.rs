@@ -98,7 +98,6 @@ pub(crate) mod rbigint_call;
 pub(crate) mod result_as_ref;
 pub(crate) mod result_exc;
 pub(crate) mod result_map_err;
-pub(crate) mod result_ok;
 pub(crate) mod rfloat_call;
 pub(crate) mod saturating_intrinsic;
 pub(crate) mod saturating_mul;

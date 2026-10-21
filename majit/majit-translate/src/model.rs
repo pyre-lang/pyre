@@ -353,7 +353,7 @@ pub fn is_str_const_define(kind: &OpKind) -> bool {
 /// A zero-argument `core::ptr::null_mut()` / `core::ptr::null()` call.
 ///
 /// `lltype.nullptr(T)`; `rbuiltin.py` `rtype_const_result` turns it into
-/// a Constant. No side effect. F1 (`op_is_side_effect_free`) uses this;
+/// a Constant. No side effect. F1 (`op_is_removable`) uses this;
 /// flowspace `CanRemove` / `CanRemoveBuiltins` do not remove the `simple_call`.
 pub fn is_core_ptr_null_call(kind: &OpKind) -> bool {
     match kind {
