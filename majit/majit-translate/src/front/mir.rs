@@ -1637,45 +1637,11 @@ impl CrateLoweringState {
         // identical `{module_path}::{name}` path.
         let harvested =
             crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
-        let mut dont_look_inside: std::collections::HashSet<String> = harvested
+        let dont_look_inside: std::collections::HashSet<String> = harvested
             .iter()
             .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
             .map(|(path, _)| path.clone())
             .collect();
-        // `function_quasi_immut_field` loads `mutate_slots` with `Acquire`.
-        // That ordering is not an erasable alias, so the body cannot be a
-        // graph yet. The caller is one null check plus `invalidate()`; the
-        // residual call performs the real acquire.
-        // Keys are `strip_crate_prefix(name_path)`: the crate segment is
-        // not part of the hint set.
-        for path in [
-            "function::function_notify_quasi_immut",
-            // `OPTIONAL_MODULE_HOOKS` has no static-address lane, so the
-            // body emits that static as a nullary call. The residual runs
-            // `OnceLock::get`.
-            "importing::optional_module_hooks",
-            // `llmodel.py` `_store_exception`: `JIT_EXC_RAISER` is a
-            // OnceLock with no static-address lane, same as
-            // `optional_module_hooks`. The residual runs `OnceLock::get`.
-            "runtime_ops::jit_publish_exception",
-            // Residual ABI also writes `BH_LAST_EXC_VALUE` (`rthread.py`
-            // tlref). The residual runs that TLS store.
-            "runtime_ops::jit_publish_residual_error",
-            // `external_buffer_view` is an Acquire load of a multi-word
-            // aggregate. This caller returns one exception-bridge word.
-            "typedef::buffer_as_bytes_like",
-            // `majit_gc::header` varsize immortal helpers (`malloc_varsize`
-            // + `init_gc_object_immortal`). Stamp here so the dispatcher
-            // does not look inside; `collect_policy_opaque` still harvests
-            // only LLBC hints, so HOST_ENV keeps Layer-3b.
-            "header::alloc_varsize_with_gc_header_immortal",
-            "header::alloc_varsize_with_gc_header_immortal_zeroed",
-            "header::alloc_varsize_with_gc_header_immortal_zeroed_flag",
-            "header::dealloc_varsize_with_gc_header",
-            "header::varsize_immortal_layout",
-        ] {
-            dont_look_inside.insert(path.to_string());
-        }
         // `#[majit_macros::elidable]` callees (`llbc_hints.rs` maps the
         // `_elidable_function_` marker → `"elidable"`): the codewriter's
         // elidable effect already lowers the callsite to CALL_PURE and never

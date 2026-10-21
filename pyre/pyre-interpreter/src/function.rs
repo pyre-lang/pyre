@@ -360,8 +360,14 @@ pub unsafe fn function_current_qmut_instance(
 /// every loop that folded this field. Runs BEFORE the store, the way
 /// `typeobject.rs w_type_set_version_tag` calls its notify first.
 ///
+/// `function_quasi_immut_field` loads `mutate_slots` with `Acquire`. That
+/// ordering is not an erasable alias, so the body cannot be a graph yet. The
+/// caller is one null check plus `invalidate()`; the residual call performs
+/// the real acquire.
+///
 /// # Safety
 /// `obj` must be null or point at a live `PyObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn function_notify_quasi_immut(obj: PyObjectRef, slot: QuasiImmutSlot) {
     if let Some(field) = unsafe { function_quasi_immut_field(obj, slot) } {
         field.invalidate();

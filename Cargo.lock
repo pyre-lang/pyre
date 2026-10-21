@@ -2007,9 +2007,11 @@ name = "majit-gc"
 version = "0.0.2"
 dependencies = [
  "bitflags 2.13.0",
+ "ctor",
  "indexmap",
  "libc",
  "majit-ir",
+ "majit-macros",
  "parking_lot",
  "region",
  "rustc-hash",

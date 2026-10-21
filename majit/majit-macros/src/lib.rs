@@ -875,35 +875,36 @@ fn is_pointer_alias(ty: &Type) -> bool {
 
 /// `Option<T>` whose `T` is one Ref-word pointer (`PyObjectRef`, `*mut X`,
 /// `*const X` with a thin pointee). `None` is the null word and `Some(p)` is
-/// `p`. `Option<i64>`, `Option<bool>`, `Option<&T>`, `Option<GcRef>` and an
-/// `Option` of a fat pointer stay ordinary returns.
-fn nullable_pointer_option(ty: &Type) -> bool {
+/// `p`. Applies to both arguments and returns. `Option<i64>`, `Option<bool>`,
+/// `Option<&T>`, `Option<GcRef>` and an `Option` of a fat pointer stay
+/// ordinary words the trampoline does not rebuild.
+fn nullable_pointer_option_inner(ty: &Type) -> Option<&Type> {
     let Type::Path(type_path) = ty else {
-        return false;
+        return None;
     };
     if type_path.qself.is_some() {
-        return false;
+        return None;
     }
-    let Some(segment) = type_path.path.segments.last() else {
-        return false;
-    };
+    let segment = type_path.path.segments.last()?;
     if segment.ident != "Option" {
-        return false;
+        return None;
     }
     let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-        return false;
+        return None;
     };
     let mut types = args.args.iter().filter_map(|arg| match arg {
         syn::GenericArgument::Type(inner) => Some(inner),
         _ => None,
     });
-    let Some(inner) = types.next() else {
-        return false;
-    };
+    let inner = types.next()?;
     if types.next().is_some() {
-        return false;
+        return None;
     }
-    is_raw_pointer_type(inner) && !is_fat_pointer_arg(inner)
+    (is_raw_pointer_type(inner) && !is_fat_pointer_arg(inner)).then_some(inner)
+}
+
+fn nullable_pointer_option(ty: &Type) -> bool {
+    nullable_pointer_option_inner(ty).is_some()
 }
 
 fn path_type_last_ident(ty: &Type) -> Option<&Ident> {
@@ -930,13 +931,14 @@ fn path_type_last_ident(ty: &Type) -> Option<&Ident> {
 /// two-word Rust reference.  When `T` is one machine word ([`pair_slice_param`]),
 /// the trampoline accepts the pointer word and the length word as two adjacent
 /// `i64`s and rebuilds the slice, so [`trampoline_skip_reason`] does not report
-/// [`HelperFnAddrSkip::FatPointerArg`] for that parameter.  An object-pointer
-/// slice (`&[PyObjectRef]`, `&[*mut PyObject]`) is not [`pair_slice_param`].
-/// A shared `&str` or `&Wtf8` (any path whose last segment is `Wtf8`) is one
-/// `Ref` word rebuilt by [`rstr_arg_from_i64`], so it is not a fat-pointer
-/// argument either.  `&mut str`, `&Path`, `&[u8]`, an object-pointer slice,
-/// a raw pointer to `str`, `Wtf8`, or a slice, and `&dyn Trait` stay
-/// fat-pointer arguments.
+/// [`HelperFnAddrSkip::FatPointerArg`] for that parameter.  A shared object-
+/// pointer slice (`&[PyObjectRef]`, `&[*mut PyObject]`, `&[*const PyObject]`)
+/// is [`object_gcarray_param`]: one length-prefixed object-array `Ref` word,
+/// rebuilt by [`majit_ir::helper_fnaddr::object_gcarray_slice`].  A shared
+/// `&str` or `&Wtf8` (any path whose last segment is `Wtf8`) is one `Ref`
+/// word rebuilt by [`rstr_arg_from_i64`], so it is not a fat-pointer argument
+/// either.  `&mut str`, `&Path`, `&[u8]`, `&mut [PyObjectRef]`, a raw pointer
+/// to `str`, `Wtf8`, or a slice, and `&dyn Trait` stay fat-pointer arguments.
 fn is_wide_pointee(ty: &Type) -> bool {
     if matches!(ty, Type::Slice(_) | Type::TraitObject(_)) {
         return true;
@@ -1058,6 +1060,8 @@ fn helper_call_kind_for_return(output: &ReturnType) -> HelperCallKind {
 /// and [`emit_helper_call_target_fn`] turns `__majit_arg_{i}` plus the
 /// adjacent `__majit_arg_{i}_len` back into the slice: length 0 is `&[]` or
 /// `&mut []`, and a positive length is `from_raw_parts` / `from_raw_parts_mut`.
+/// A shared object-GcArray slice ([`object_gcarray_param`]) is one `Ref` word
+/// rebuilt here via [`majit_ir::helper_fnaddr::object_gcarray_slice`].
 fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::TokenStream> {
     if is_gc_ref_type(ty) {
         return Some(quote! { #ty((#arg_ident) as usize) });
@@ -1079,6 +1083,21 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
         } else {
             Some(quote! { unsafe { &*((#arg_ident) as usize as *const #elem) } })
         };
+    }
+    if let Some(item) = object_gcarray_param(ty) {
+        return Some(quote! {
+            unsafe { ::majit_ir::helper_fnaddr::object_gcarray_slice::<#item>(#arg_ident) }
+        });
+    }
+    if let Some(inner) = nullable_pointer_option_inner(ty) {
+        let inner_conv = helper_arg_from_i64(arg_ident, inner)?;
+        return Some(quote! {
+            if (#arg_ident) == 0 {
+                None
+            } else {
+                Some(#inner_conv)
+            }
+        });
     }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
@@ -1127,8 +1146,8 @@ fn is_fat_pointer_arg(ty: &Type) -> bool {
 /// The item is one of: a path whose last segment is `GcRef`, a thin raw
 /// pointer `*const X` / `*mut X` (or a one-word pointer alias), or
 /// `i64` / `u64` / `isize` / `usize`. `PyObjectRef` and `*mut PyObject`
-/// / `*const PyObject` are the length-prefixed object array, one word,
-/// so they are not pair items.
+/// / `*const PyObject` are the length-prefixed object array, one word
+/// ([`object_gcarray_param`] for a shared slice), so they are not pair items.
 /// Returns the item type and whether the slice is mutable.
 fn pair_slice_param(ty: &Type) -> Option<(&Type, bool)> {
     let Type::Reference(reference) = ty else {
@@ -1150,6 +1169,25 @@ fn is_object_pointer_item(ty: &Type) -> bool {
         return false;
     };
     path_type_last_ident(&ptr.elem).is_some_and(|id| id == "PyObject")
+}
+
+/// Shared `&[T]` whose item is an object pointer ([`is_object_pointer_item`]).
+///
+/// The codewriter passes this as one `Ref` word: the address of a
+/// length-prefixed object `GcArray`. `&mut [PyObjectRef]` is the pair view of
+/// a `Vec` buffer and stays [`HelperFnAddrSkip::FatPointerArg`].
+fn object_gcarray_param(ty: &Type) -> Option<&Type> {
+    let Type::Reference(reference) = ty else {
+        return None;
+    };
+    if reference.mutability.is_some() {
+        return None;
+    }
+    let Type::Slice(slice) = reference.elem.as_ref() else {
+        return None;
+    };
+    let item = slice.elem.as_ref();
+    is_object_pointer_item(item).then_some(item)
 }
 
 fn is_pair_slice_item(ty: &Type) -> bool {
@@ -1197,11 +1235,13 @@ fn pair_slice_expr(
 }
 
 /// ABI words of `inputs`.  A pair-slice parameter is two words (pointer, length).
+/// A shared object-GcArray slice ([`object_gcarray_param`]) is one `Ref` word.
 fn helper_abi_words(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>) -> u8 {
     inputs
         .iter()
         .map(|arg| match arg {
             FnArg::Typed(pat_type) if pair_slice_param(&pat_type.ty).is_some() => 2u8,
+            FnArg::Typed(pat_type) if object_gcarray_param(&pat_type.ty).is_some() => 1u8,
             _ => 1u8,
         })
         .sum()
@@ -1307,12 +1347,14 @@ fn wrap_result_exc_call(
 /// A pair-slice parameter ([`pair_slice_param`]) is not
 /// [`HelperFnAddrSkip::FatPointerArg`]: its pointer and length are two `i64`
 /// words.  A shared `&str` or `&Wtf8` is one `Ref` word, same as
-/// `PyObjectRef` / `GcRef`.  `&[PyObjectRef]` and `&[*mut PyObject]` stay
-/// fat-pointer arguments: that slice is one length-prefixed object-array
-/// word, and `from_raw_parts` would not rebuild it.  Every other fat
-/// pointer (`&mut str`, `&Path`, `&[u8]`, `&[u32]`, `&[f64]`, `*const str`,
-/// `*const [T]`, `&dyn Trait`, a slice of any other item) still skips as
-/// `FatPointerArg`.  A return of `&str` or `&Wtf8` still skips.
+/// `PyObjectRef` / `GcRef`.  A shared object-pointer slice (`&[PyObjectRef]`,
+/// `&[*mut PyObject]`, `&[*const PyObject]`) is [`object_gcarray_param`]: one
+/// length-prefixed object-array word, rebuilt by
+/// [`majit_ir::helper_fnaddr::object_gcarray_slice`].  `&mut [PyObjectRef]`
+/// stays a fat-pointer argument (the pair view of a `Vec` buffer).  Every
+/// other fat pointer (`&mut str`, `&Path`, `&[u8]`, `&[u32]`, `&[f64]`,
+/// `*const str`, `*const [T]`, `&dyn Trait`, a slice of any other item)
+/// still skips as `FatPointerArg`.  A return of `&str` or `&Wtf8` still skips.
 fn trampoline_skip_reason(
     func: &ItemFn,
     attr_name: &str,
@@ -1324,6 +1366,7 @@ fn trampoline_skip_reason(
     for arg in &func.sig.inputs {
         if let FnArg::Typed(pat_type) = arg
             && pair_slice_param(&pat_type.ty).is_none()
+            && object_gcarray_param(&pat_type.ty).is_none()
             && !is_shared_rstr_ref(&pat_type.ty)
             && is_fat_pointer_arg(&pat_type.ty)
         {
@@ -4966,12 +5009,21 @@ mod tests {
             skip("fn f(xs: &[u8]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
+        assert_eq!(skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(xs: &[*mut PyObject]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(a: Option<PyObjectRef>) -> i64 { 0 }"), None);
         assert_eq!(
-            skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"),
-            Some(HelperFnAddrSkip::FatPointerArg)
+            skip("fn f(a: Option<&u8>) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
         );
         assert_eq!(
-            skip("fn f(xs: &[*mut PyObject]) -> i64 { 0 }"),
+            skip(
+                "fn f(a: &[PyObjectRef], n: &str, k: i64) -> Result<PyObjectRef, PyError> { loop {} }"
+            ),
+            None
+        );
+        assert_eq!(
+            skip("fn f(a: &mut [PyObjectRef]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(skip("fn f(xs: &[*mut u8]) -> i64 { 0 }"), None);
@@ -5090,6 +5142,40 @@ mod tests {
             "{ret_text}"
         );
         assert!(ret_text.contains("raw_malloc_varsize_char"), "{ret_text}");
+    }
+
+    #[test]
+    fn object_gcarray_trampoline_is_one_ref_word() {
+        let func = parse_fn("fn f(xs: &[PyObjectRef]) -> i64 { 0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains("fn __majit_call_target_f (__majit_arg_0 : i64) -> i64"),
+            "{text}"
+        );
+        assert!(text.contains("as * const () , 1"), "{text}");
+        assert!(
+            text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice"),
+            "{text}"
+        );
+        assert!(!text.contains("__majit_arg_0_len"), "{text}");
+    }
+
+    #[test]
+    fn nullable_pointer_option_arg_rebuilds_none_from_zero() {
+        let func = parse_fn("fn f(a: Option<PyObjectRef>) -> i64 { 0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(text.contains("if (__majit_arg_0) == 0"), "{text}");
+        assert!(text.contains("None"), "{text}");
+        assert!(text.contains("Some"), "{text}");
+        assert!(text.contains("as * const () , 1"), "{text}");
     }
 
     #[test]

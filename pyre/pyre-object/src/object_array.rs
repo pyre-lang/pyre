@@ -179,6 +179,11 @@ pub const ITEMS_BLOCK_TOKEN: ArrayToken = ArrayToken {
     len_offset: ITEMS_BLOCK_LEN_OFFSET,
 };
 
+// `majit_ir::helper_fnaddr::object_gcarray_slice` reads this layout.
+const _: () = assert!(
+    ITEMS_BLOCK_LEN_OFFSET == 0 && ITEMS_BLOCK_ITEMS_OFFSET == std::mem::size_of::<usize>()
+);
+
 /// Return the items base pointer (i.e. `&items[0]`) of an
 /// `ItemsBlock`. Null-safe: returns a null `*mut PyObjectRef` if the
 /// block itself is null, so callers can treat a null items pointer as

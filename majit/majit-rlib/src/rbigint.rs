@@ -4365,7 +4365,7 @@ pub fn bits_in_digit(mut d: Digit) -> i64 {
 }
 
 /// rbigint.py `bit_length_int`.
-#[majit_macros::jit_elidable]
+#[majit_macros::elidable]
 pub fn bit_length_int(mut value: i64) -> i64 {
     let mut count;
     if value < 0 {
