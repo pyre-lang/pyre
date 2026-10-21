@@ -418,13 +418,13 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 snapshot_sym: sym_ptr,
 
                 class_of_last_exc_is_const: sym.class_of_last_exc_is_const(),
-                // A guard-failure bridge resumes at the opcode boundary, so
-                // its first `jit_merge_point` crossing at this python-pc is
-                // the same op it is resuming INTO, not a loop crossing. The
-                // merge-point arm skips exactly that first crossing. Seeded
-                // only for bridge walks; a loop compile leaves it `None`.
+                // Top-level bridge walks seed the jitcode start so the
+                // merge-point handler can skip a `jit_merge_point` the walk
+                // resumed into (`generate_guard` default `resumepc` at the
+                // opcode boundary or the pre-merge header diamond). Loop
+                // compiles leave it `None`.
                 bridge_entry_merge_pc: match (trace_ctx.is_bridge_trace, entry_py_pc) {
-                    (true, EntryPyPc::Py(pc)) => Some(pc as usize),
+                    (true, EntryPyPc::Py(_)) => Some(position),
                     _ => None,
                 },
                 ..Default::default()

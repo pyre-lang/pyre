@@ -2164,20 +2164,14 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// This is shared logically across recursive MIFrame walks; catch routing
     /// writes the proven-class state back into the caller's copy.
     pub class_of_last_exc_is_const: bool,
-    /// Python-pc of a guard-failure bridge walk's own resume coordinate.
-    /// `Some` only on the top-level walk of a bridge trace, `None` otherwise
-    /// (loop compiles and sub-walks).
-    ///
-    /// `generate_guard(resumepc=orgpc)` (`pyjitpl.py`) places a
-    /// guard's resume coordinate INSIDE the guarded opcode's implementation,
-    /// strictly past the dispatch-top `jit_merge_point`, so an RPython MIFrame
-    /// resumed from a guard never re-crosses the loop-header merge point at
-    /// position zero. Pyre's bridge walker instead resumes at the opcode
-    /// BOUNDARY and would re-cross the header immediately with an empty body,
-    /// closing a 0-progress no-op bridge. The merge-point arm consumes this
-    /// (via `take()`) to skip exactly the first crossing that lands on the
-    /// bridge's own resume coordinate, restoring the RPython positional
-    /// semantics.
+    /// JitCode pc a top-level bridge walk started at. The merge-point handler
+    /// skips one `jit_merge_point` when this is strictly before the marker and
+    /// `next_instr` matches the walk's Python pc: the walk resumed into that
+    /// header (`generate_guard` default `resumepc` at an opcode-boundary or
+    /// pre-merge diamond / `int_guard_value` / `ref_guard_value`), so that
+    /// crossing is not a loop close. A walk that already entered past the
+    /// marker (`jtransform.py handle_jit_marker__jit_merge_point` op2 `-live-`)
+    /// leaves this greater than the marker pc and takes the crossing.
     pub bridge_entry_merge_pc: Option<usize>,
     /// Set for the sub-walk that resumes a suspended generator body in place of
     /// the `jit_next` residual a `FOR_ITER` over it would otherwise leave.
@@ -2830,8 +2824,10 @@ pub enum DispatchOutcome {
 /// takes every execution back to the interpreter, and the FINISH behind it
 /// exists only to give the segment a terminator.
 ///
-/// `mp_opcode_pc` is the merge-point op's jitcode pc (the guard's resume
-/// coordinate); `mp_green_pc` is the Python pc it names.
+/// `mp_opcode_pc` is the merge-point op's jitcode pc; the guard's resume
+/// coordinate is the following `-live-` (`jtransform.py
+/// handle_jit_marker__jit_merge_point` op2). `mp_green_pc` is the Python pc
+/// the merge point names.
 fn create_segmented_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     mp_opcode_pc: usize,
@@ -2856,8 +2852,17 @@ fn create_segmented_trace<Sym: WalkSym>(
     // value, and `bhimpl_jit_merge_point`'s ContinueRunningNormally resumes
     // the loop header one slot deeper than `depth_at_py_pc` there.  Same
     // post-step reconcile as `blackhole_if_trace_too_long`.
-    reconcile_vstack_to_resume_pc(ctx, mp_opcode_pc);
-    if !latch_abort_blackhole(ctx, mp_opcode_pc, "segment-cut") {
+    // The portal merge-point cut resumes at op2 `-live-` after the marker
+    // (`pyjitpl.py generate_guard` `after_residual_call=True`); a synthesized
+    // per-opcode DMP stays at `mp_opcode_pc` unless that floor contains a
+    // `jit_merge_point`.
+    let latch_pc = if synthesized_python_opcode_boundary {
+        segmented_python_opcode_resume_pc(ctx, mp_opcode_pc)
+    } else {
+        segmented_merge_point_resume_pc(ctx, mp_opcode_pc)
+    };
+    reconcile_vstack_to_resume_pc(ctx, latch_pc);
+    if !latch_abort_blackhole(ctx, latch_pc, "segment-cut") {
         census_record("SegmentTrace::LatchRefused");
         return Ok(None);
     }
@@ -2876,14 +2881,15 @@ fn create_segmented_trace<Sym: WalkSym>(
         census_record("SegmentTrace::MirrorStackRefused");
         return Ok(None);
     }
-    // pyjitpl.py `generate_guard(rop.GUARD_ALWAYS_FAILS)`. The resume
-    // position is the merge-point op, whose preceding `-live-` marker names the
-    // boxes the blackhole resumes with.
+    // pyjitpl.py `generate_guard(rop.GUARD_ALWAYS_FAILS)`: `after_residual_call`
+    // is true, so `get_list_of_active_boxes` snapshots `self.pc` after the
+    // `jit_merge_point` handler has decoded the op — the following `-live-`
+    // (`jtransform.py handle_jit_marker__jit_merge_point` op2).
     ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[], 0);
     let snapshot = if synthesized_python_opcode_boundary {
         walker_capture_segmented_python_opcode_guard(ctx, mp_opcode_pc)
     } else {
-        walker_capture_snapshot_for_last_guard(ctx, mp_opcode_pc)
+        walker_capture_segmented_merge_point_guard(ctx, mp_opcode_pc)
     };
     if let Err(error) = snapshot {
         let cause = error.variant_name();
@@ -16154,9 +16160,10 @@ fn handle<Sym: WalkSym>(
             // and aborting forever.
             //
             // The cut belongs at a merge point and nowhere else: the guard it
-            // records resumes through the `-live-` marker that precedes every
-            // `jit_merge_point` op, which an arbitrary mid-walk position has no
-            // counterpart for.
+            // records resumes at the `-live-` that follows `jit_merge_point`
+            // (`jtransform.py handle_jit_marker__jit_merge_point` op2;
+            // `pyjitpl.py generate_guard` `after_residual_call=True`), which
+            // an arbitrary mid-walk position has no counterpart for.
             //
             // Top-level only. Upstream reaches this from an inlined frame too,
             // but a sub-walk's outcome is consumed by
@@ -16399,35 +16406,29 @@ fn handle<Sym: WalkSym>(
             // loop-header + close protocol (`pyjitpl/dispatch.rs`).
             // The `c` form's jdindex is the leading literal byte; the `i`
             // form was resolved through its Int-bank operand above.
-            // pyjitpl.py capture_resumedata: a guard's resume coordinate
-            // (`resumepc=orgpc`) lies INSIDE the guarded opcode's
-            // implementation, past the dispatch-top `jit_merge_point`, so an
-            // RPython MIFrame resumed from a guard never re-crosses the
-            // loop-header merge point at position zero. The walker resumes a
-            // bridge at the opcode BOUNDARY, so its first crossing at the
-            // resume coordinate is the same op it is resuming INTO — not a
-            // loop crossing. Skip exactly once. `take()` clears on the first
-            // crossing regardless of pc, so a mid-body-resume bridge whose
-            // first crossing is a DIFFERENT header is unaffected.
             // pyjitpl.py `_handle_guard_failure` pre-arms the flag
             // when the source guard is a `ResumeAtPositionDescr` — the descr
             // `inline_short_preamble` stamps onto the guards it replays
-            // (unroll.py:337 / :409). Those guards sit at the target loop's
-            // entry, so the bridge grown from one has to close at its very
-            // first merge point rather than record another iteration first.
-            // Arming here rather than at the bridge setup keeps the flag equal
-            // to the `jdindex` the assert below compares against.
+            // (`unroll.py` `OptUnroll._jump_to_existing_trace`). Those guards
+            // sit at the target loop's entry, so the bridge grown from one has
+            // to close at its very first merge point rather than record another
+            // iteration first. Arming here rather than at the bridge setup
+            // keeps the flag equal to the `jdindex` the assert below compares
+            // against.
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
                 && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
             {
                 ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
                 ctx.trace_ctx.seen_loop_header_jit_pc = None;
             }
-            if ctx.is_top_level
-                && ctx.trace_ctx.seen_loop_header_for_jdindex < 0
-                && ctx.fbw_mode.bridge_entry_merge_pc.take() == Some(next_instr)
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
+            if ctx.is_top_level && ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
+                if let Some(entry_jit) = ctx.fbw_mode.bridge_entry_merge_pc.take() {
+                    if matches!(ctx.entry_py_pc,
+                        EntryPyPc::Py(py) if py as usize == next_instr && entry_jit < op.pc)
+                    {
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                }
             }
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py `if not any_operation: return`.

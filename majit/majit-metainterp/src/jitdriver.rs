@@ -11501,8 +11501,7 @@ impl<S: JitState> JitDriver<S> {
         // (`if not any_operation` / `portal_call_depth` /
         // `has_compiled_targets`, pyjitpl.py) is skipped and the
         // close protocol runs. Without it the bridge records a whole extra
-        // iteration before it can close, and the `bridge_entry_merge_pc`
-        // skip-once below sends it past the crossing it was meant to take.
+        // iteration before it can close.
         //
         // The flag is one-shot on both sides: the merge point resets it to
         // -1 (pyjitpl.py) after consuming it, so only the FIRST crossing

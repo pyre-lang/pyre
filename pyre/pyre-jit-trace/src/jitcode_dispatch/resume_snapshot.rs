@@ -154,6 +154,63 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
     walker_capture_snapshot_for_last_guard_scoped(ctx, op_pc, GuardCaptureScope::default())
 }
 
+/// `jit_merge_point` inside the Python-opcode floor that contains `jit_pc`.
+///
+/// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
+/// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
+fn jit_merge_point_pc_in_containing_floor(
+    payload: &crate::PyJitCode,
+    jit_pc: usize,
+) -> Option<usize> {
+    let (floor_start, _) = crate::pyjitcode::floor_segment_for_jitcode_pc(
+        &payload.metadata.py_floor_by_jit_pc,
+        jit_pc,
+    )?;
+    let region_end = payload
+        .metadata
+        .py_floor_by_jit_pc
+        .iter()
+        .find(|&&(off, _)| off as usize > floor_start)
+        .map(|&(off, _)| off as usize)
+        .unwrap_or(payload.jitcode.code.len());
+    let mut pc = floor_start;
+    while pc < region_end {
+        let op = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
+        if op.key.starts_with("jit_merge_point") {
+            return Some(op.pc);
+        }
+        if op.next_pc <= pc {
+            break;
+        }
+        pc = op.next_pc;
+    }
+    None
+}
+
+/// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise
+/// `op.next_pc` (`jtransform.py handle_jit_marker__jit_merge_point`).
+fn resume_pc_past_merge_point(payload: &crate::PyJitCode, merge_pc: usize) -> Option<usize> {
+    trailing_live_marker(payload, merge_pc).or_else(|| {
+        crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), merge_pc)
+            .map(|op| op.next_pc)
+    })
+}
+
+/// Resume pc for a synthesized per-opcode cut: op2 `-live-` after a
+/// same-floor `jit_merge_point` (`pyjitpl.py generate_guard`
+/// `after_residual_call=True`), else the cut itself.
+pub(crate) fn segmented_python_opcode_resume_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> usize {
+    walked_snapshot_jitcode(ctx)
+        .and_then(|jc| {
+            jit_merge_point_pc_in_containing_floor(&jc.payload, op_pc)
+                .and_then(|merge_pc| resume_pc_past_merge_point(&jc.payload, merge_pc))
+        })
+        .unwrap_or(op_pc)
+}
+
 /// Capture the `GUARD_ALWAYS_FAILS` used by a synthesized per-Python-opcode
 /// debug merge point.
 ///
@@ -163,11 +220,63 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 /// Pyre's per-CodeObject JitCode has no such marker. Its synthesized DMP is
 /// already sitting at the first operation of that Python opcode, so applying
 /// the generic `GUARD_ALWAYS_FAILS` advance would skip the opcode entirely.
+/// A loop-header floor still contains the portal `jit_merge_point`; resume at
+/// that marker's op2 `-live-` so the blackhole does not re-enter the preamble.
 pub(crate) fn walker_capture_segmented_python_opcode_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
+    let resume_pc = segmented_python_opcode_resume_pc(ctx, op_pc);
+    if resume_pc != op_pc {
+        return walker_capture_snapshot_for_last_guard_impl(
+            ctx,
+            op_pc,
+            false,
+            GuardCaptureScope {
+                carried_resume_jit_pc: Some(resume_pc),
+                liveness_jit_pc: Some(resume_pc),
+                ..GuardCaptureScope::default()
+            },
+        );
+    }
     walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, false, GuardCaptureScope::default())
+}
+
+/// JitCode pc the segmented merge-point guard resumes at: the `-live-`
+/// immediately after `jit_merge_point` (`jtransform.py
+/// handle_jit_marker__jit_merge_point` op2). Falls back to the first byte
+/// after the merge op when that marker is missing.
+pub(crate) fn segmented_merge_point_resume_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    merge_pc: usize,
+) -> usize {
+    walked_snapshot_jitcode(ctx)
+        .and_then(|jc| resume_pc_past_merge_point(&jc.payload, merge_pc))
+        .unwrap_or(merge_pc)
+}
+
+/// Capture the `GUARD_ALWAYS_FAILS` recorded at a portal `jit_merge_point`.
+///
+/// `pyjitpl.py generate_guard` with `after_residual_call=True` snapshots
+/// `self.pc` after the merge-point handler has decoded the op
+/// (`jtransform.py handle_jit_marker__jit_merge_point` op2 `-live-`). Carry
+/// that following marker verbatim so the bridge walk enters at
+/// `MIFrame.setup_resume_at_op`'s stored pc.
+pub(crate) fn walker_capture_segmented_merge_point_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    merge_pc: usize,
+) -> Result<(), DispatchError> {
+    let resume_pc = segmented_merge_point_resume_pc(ctx, merge_pc);
+    walker_capture_snapshot_for_last_guard_impl(
+        ctx,
+        merge_pc,
+        false,
+        GuardCaptureScope {
+            carried_resume_jit_pc: Some(resume_pc),
+            liveness_jit_pc: Some(resume_pc),
+            ..GuardCaptureScope::default()
+        },
+    )
 }
 
 pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
