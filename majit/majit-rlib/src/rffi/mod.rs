@@ -337,10 +337,11 @@ mod tests {
         let with_cloexec = expected | libc::FD_CLOEXEC;
         assert_eq!(unsafe { fcntl_int(fds[0], libc::F_SETFD, with_cloexec) }, 0);
         assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, with_cloexec);
-        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         crate::rposix::set_saved_errno(0);
-        assert!(unsafe { fcntl_int(fds[0], libc::F_GETFD, 0) } < 0);
+        // -1 is never a live fd; concurrent tests can reuse a just-closed number.
+        assert!(unsafe { fcntl_int(-1, libc::F_GETFD, 0) } < 0);
         assert_eq!(crate::rposix::get_saved_errno(), libc::EBADF);
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         unsafe { libc::close(fds[1]) };
     }
 
