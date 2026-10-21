@@ -39,6 +39,11 @@ mod ffi {
 
 use ffi::SIZE_OF_FFI_ARG;
 
+/// `ccallback.py W_ExternPython.handle_applevel_exception` extra_line on the
+/// second `OperationError.write_unraisable` from `onerror` / `convert_result`.
+const ONERROR_SECONDARY_EXTRA_LINE: &str =
+    "\nDuring the call to 'onerror', another exception occurred:\n\n";
+
 /// Raw state owned by one callback.  Keeping it out of [`W_CData`] leaves the
 /// common cdata layout unchanged; the callback flavor stores this block's
 /// address in its otherwise-unused `length` slot.
@@ -417,7 +422,13 @@ fn handle_applevel_exception(
                 error.reload(&roots, error_slot);
                 let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
                 conversion_error.reload(&roots, conversion_error_slot);
-                print_onerror_exception(conversion_error);
+                conversion_error.write_unraisable_with_traceback(
+                    pyre_object::w_none(),
+                    rustpython_wtf8::Wtf8::new(""),
+                    pyre_object::PY_NULL,
+                    true,
+                    ONERROR_SECONDARY_EXTRA_LINE,
+                );
             }
         }
         Ok(_) => {}
@@ -427,53 +438,15 @@ fn handle_applevel_exception(
             error.reload(&roots, error_slot);
             let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
             onerror_error.reload(&roots, onerror_error_slot);
-            print_onerror_exception(onerror_error);
+            onerror_error.write_unraisable_with_traceback(
+                pyre_object::w_none(),
+                rustpython_wtf8::Wtf8::new(""),
+                pyre_object::PY_NULL,
+                true,
+                ONERROR_SECONDARY_EXTRA_LINE,
+            );
         }
     }
-}
-
-fn print_onerror_exception(mut error: PyError) {
-    let roots = pyre_object::gc_roots::push_roots();
-    let error_slot = error.pin(&roots);
-    let w_value = error
-        .normalize_exception(pyre_object::w_none())
-        .unwrap_or_else(|_| {
-            error.reload(&roots, error_slot);
-            error.to_exc_object()
-        });
-    let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_value);
-    let w_type = pyre_interpreter::baseobjspace::exception_getclass(roots.get(value_slot));
-    let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_type);
-    error.reload(&roots, error_slot);
-    let mut w_tb = error.get_traceback();
-    if w_tb.is_null() {
-        w_tb = pyre_object::w_none();
-    }
-    let tb_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(w_tb);
-    // `errors.c format_unraisable_v` installs the traceback on the exception
-    // before the hook sees it.
-    if !unsafe { pyre_object::is_none(roots.get(tb_slot)) }
-        && unsafe { pyre_object::is_exception(roots.get(value_slot)) }
-    {
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_traceback(
-                roots.get(value_slot),
-                roots.get(tb_slot),
-            )
-        };
-    }
-    PyError::write_unraisable_default(
-        pyre_object::w_none(),
-        roots.get(type_slot),
-        roots.get(value_slot),
-        roots.get(tb_slot),
-        rustpython_wtf8::Wtf8::new(""),
-        pyre_object::w_none(),
-        "\nDuring the call to 'onerror', another exception occurred:\n\n",
-    );
 }
 
 unsafe fn do_invoke(w_callback: PyObjectRef, ll_res: *mut u8, ll_args: *mut *mut libc::c_void) {

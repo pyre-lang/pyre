@@ -345,12 +345,19 @@ impl LlexternalInput {
             Tri::Bool(value) => value,
             Tri::Auto => !self.sandboxsafe && !self.nowrapper,
         };
+        // rffi.py llexternal: random_effects_on_gcobjs='auto' becomes
+        // invoke_around_handlers or has_callback, decided here because every
+        // input is a literal.
+        let random_effects = match self.random_effects {
+            Tri::Bool(value) => value,
+            Tri::Auto => invoke || has_callback,
+        };
         let save_err_value = rffi_flag(&self.save_err);
         let save_err_nonzero = save_err_value.unwrap_or(1) != 0;
         let register_funcptr = invoke && self.macro_path.is_none() && self.natural_arity == -1;
 
         let name = &self.name;
-        let deriv = self.derivation_consts(has_callback);
+        let deriv = self.derivation_consts(has_callback, invoke, random_effects);
         let eci = self.compilation_info.as_ref().map(|eci| {
             // One module declares several externals (`fcntl_int`, `fcntl_str`,
             // …) that share an ECI. A fixed const name collides; the name is
@@ -363,7 +370,16 @@ impl LlexternalInput {
         });
 
         let real = match self.expand_real(invoke, save_err_value, save_err_nonzero) {
-            Ok(tokens) => tokens,
+            Ok(tokens) => {
+                // The funcptr-valued marker names the graphless leaf the
+                // real wrapper calls. The stub has no `__rffi_fp_*` extern
+                // (`expand_stub`), so this rides with `expand_real`.
+                let marker = self.random_effects_funcptr_marker(random_effects);
+                quote! {
+                    #tokens
+                    #marker
+                }
+            }
             Err(tokens) => return tokens,
         };
         // `sandboxsafe = true` keeps one shape in every feature combination so
@@ -424,11 +440,17 @@ impl LlexternalInput {
         let result = &self.result;
         let call_expr = self.call_expr(&arg_names);
         let save_err = &self.save_err;
+        // `rffi.py llexternal` closes the wrapper over `save_err`, so its
+        // graph reads a Constant, not a global.
+        let (save_err_const, save_err_assert) = match save_err_value {
+            Some(lit) => (
+                quote! { #lit },
+                quote! { const _: () = assert!(#lit == #save_err); },
+            ),
+            None => (quote! { #save_err }, quote! {}),
+        };
 
-        let (around_attr, around_assert) = if invoke
-            && self.macro_path.is_none()
-            && self.natural_arity == -1
-        {
+        let around_attr = if invoke && self.macro_path.is_none() && self.natural_arity == -1 {
             let Some(lit) = save_err_value else {
                 return Err(syn::Error::new_spanned(
                         &self.save_err,
@@ -438,36 +460,33 @@ impl LlexternalInput {
             };
             let fp = self.funcptr_path();
             let abi = self.extern_abi();
-            (
-                quote! { #[::majit_macros::call_aroundstate_target(funcptr = #fp, save_err = #lit, abi = #abi)] },
-                quote! { const _: () = assert!(#lit == #save_err); },
-            )
+            quote! { #[::majit_macros::call_aroundstate_target(funcptr = #fp, save_err = #lit, abi = #abi)] }
         } else {
-            (quote! {}, quote! {})
+            quote! {}
         };
 
         let body = if invoke {
             quote! {
                 // `rgil.release` / `rgil.acquire`: `before_external_block` also leaves the STW RUNNING census.
                 let __guard = ::majit_gc::gc_sync::before_external_block();
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_before(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_before(#save_err_const);
                 }
                 let __res = unsafe { #call_expr };
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_after(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_after(#save_err_const);
                 }
                 drop(__guard);
                 __res
             }
         } else {
             quote! {
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_before(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_before(#save_err_const);
                 }
                 let __res = unsafe { #call_expr };
-                if #save_err != 0 {
-                    ::majit_rlib::rposix::_errno_after(#save_err);
+                if #save_err_const != 0 {
+                    ::majit_rlib::rposix::_errno_after(#save_err_const);
                 }
                 __res
             }
@@ -508,7 +527,7 @@ impl LlexternalInput {
             let ccall_fnaddr = self.ccall_fnaddr_registration();
             let identity = crate::icf_identity_tokens(&call_name);
             Ok(quote! {
-                #around_assert
+                #save_err_assert
                 #funcptr
                 #funcptr_fnaddr
                 #ccall_fnaddr
@@ -603,7 +622,12 @@ impl LlexternalInput {
         }
     }
 
-    fn derivation_consts(&self, has_callback: bool) -> TokenStream {
+    fn derivation_consts(
+        &self,
+        has_callback: bool,
+        invoke: bool,
+        random_effects: bool,
+    ) -> TokenStream {
         let name = &self.name;
         let sandbox = format_ident!("_SANDBOXSAFE_{}", name);
         let nowrap = format_ident!("_NOWRAPPER_{}", name);
@@ -616,16 +640,6 @@ impl LlexternalInput {
         let nowrap_v = self.nowrapper;
         let elidable_v = self.elidable;
         let callback_v = has_callback;
-        let around_v = match self.releasegil {
-            Tri::Bool(value) => quote! { #value },
-            // releasegil='auto' → not sandboxsafe and not _nowrapper
-            Tri::Auto => quote! { !#sandbox && !#nowrap },
-        };
-        let effects_v = match self.random_effects {
-            Tri::Bool(value) => quote! { #value },
-            // random_effects_on_gcobjs='auto' → invoke_around_handlers or has_callback
-            Tri::Auto => quote! { #around || #callback },
-        };
         let conv_expr = if let Some(conv) = &self.calling_conv {
             quote! { #conv }
         } else if self.nowrapper {
@@ -640,6 +654,7 @@ impl LlexternalInput {
                 }
             }
         };
+        let effects_marker = self.random_effects_presence_marker(random_effects, &effects);
         quote! {
             #[allow(dead_code, non_upper_case_globals)]
             const #sandbox: bool = #sandbox_v;
@@ -652,13 +667,52 @@ impl LlexternalInput {
             #[allow(dead_code, non_upper_case_globals)]
             const #around: bool = {
                 let _ = #conv;
-                #around_v
+                #invoke
             };
             #[allow(dead_code, non_upper_case_globals)]
             const #elidable: bool = #elidable_v;
-            #[allow(dead_code, non_upper_case_globals)]
-            const #effects: bool = #effects_v;
+            #effects_marker
             const _: () = assert!(!(#elidable && #effects));
+        }
+    }
+
+    /// `_RANDOM_EFFECTS_ON_GCOBJS_{name}` from the same bool that gates the
+    /// funcptr marker. The marker itself is emitted with the real wrapper.
+    fn random_effects_presence_marker(&self, random_effects: bool, effects: &Ident) -> TokenStream {
+        quote! {
+            #[allow(dead_code, non_upper_case_globals)]
+            const #effects: bool = #random_effects;
+        }
+    }
+
+    /// Graphless leaf the wrapper calls: `__rffi_fp_{name}`, `{name}` when
+    /// `_nowrapper`, the `macro = <path>` target when `macro` is given.
+    fn graphless_leaf(&self) -> TokenStream {
+        if let Some(path) = &self.macro_path {
+            quote! { #path }
+        } else if self.nowrapper {
+            let name = &self.name;
+            quote! { #name }
+        } else {
+            let fp = format_ident!("__rffi_fp_{}", self.name);
+            quote! { #fp }
+        }
+    }
+
+    /// `rffi.py llexternal` stores `random_effects_on_gcobjs` on the graphless
+    /// C functionptr. Named after the llexternal `{name}`; the initializer is
+    /// that leaf as a raw pointer so a variadic or `macro =` target typechecks.
+    fn random_effects_funcptr_marker(&self, random_effects: bool) -> TokenStream {
+        if !random_effects {
+            return quote! {};
+        }
+        let vis = &self.vis;
+        let marker = format_ident!("_random_effects_on_gcobjs_{}", self.name);
+        let leaf = self.graphless_leaf();
+        quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            #vis const #marker: *const () = #leaf as *const ();
         }
     }
 
@@ -1118,3 +1172,32 @@ const ECI_FIELDS: &[&str] = &[
     "link_files",
     "testonly_libraries",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expand(input: &str) -> String {
+        expand_llexternal(input.parse().unwrap())
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn releasegil_emits_funcptr_valued_marker() {
+        let out = expand(r#"c_foo = "foo", [i32], i32"#);
+        assert!(out.contains("_random_effects_on_gcobjs_c_foo"), "{out}");
+        assert!(out.contains("__rffi_fp_c_foo as * const ()"), "{out}");
+        assert!(out.contains("_RANDOM_EFFECTS_ON_GCOBJS_c_foo"), "{out}");
+        let no_gil = expand(
+            r#"c_memcpy = "memcpy", [*mut u8, *const u8, usize], *mut u8, releasegil = false"#,
+        );
+        assert!(!no_gil.contains("_random_effects_on_gcobjs_"), "{no_gil}");
+        let foreign = expand(r#"c_stat = "stat", [i32], i32, macro = libc::stat"#);
+        assert!(
+            foreign.contains("_random_effects_on_gcobjs_c_stat"),
+            "{foreign}"
+        );
+        assert!(foreign.contains("libc :: stat as * const ()"), "{foreign}");
+    }
+}

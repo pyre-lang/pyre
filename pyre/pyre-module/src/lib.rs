@@ -672,6 +672,10 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             "jit_ffi_call_impl_singlefloat",
             jit_libffi::jit_ffi_call_impl_singlefloat
         );
+        libffi_fnaddr!(
+            "do_ffi_call_singlefloat",
+            jit_libffi::do_ffi_call_singlefloat
+        );
         libffi_fnaddr!("jit_ffi_call_impl_void", jit_libffi::jit_ffi_call_impl_void);
         libffi_fnaddr!("jit_ffi_call_impl_any", jit_libffi::jit_ffi_call_impl_any);
         single(

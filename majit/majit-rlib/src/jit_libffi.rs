@@ -432,11 +432,14 @@ mod imp {
         unsafe { (target as *mut LONGLONG).write(result) };
     }
 
-    /// `jit_libffi.py _do_ffi_call_singlefloat`.
+    /// `jit_libffi.py _do_ffi_call_singlefloat` — a separate function in
+    /// case the backend does not support singlefloats: its `f32` local keeps
+    /// the codewriter out of it (`policy.py contains_unsupported_variable_type`)
+    /// and a trace calls it residually.
     ///
     /// # Safety
     /// As [`jit_ffi_call`].
-    unsafe fn do_ffi_call_singlefloat(
+    pub unsafe fn do_ffi_call_singlefloat(
         cif_description: usize,
         func_addr: usize,
         exchange_buffer: usize,
@@ -445,7 +448,7 @@ mod imp {
             unsafe { jit_ffi_call_impl_singlefloat(cif_description, func_addr, exchange_buffer) };
         let target =
             llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
-        unsafe { (target as *mut f32).write(result as f32) };
+        unsafe { (target as *mut f32).write(result) };
     }
 
     /// `jit_libffi.py jit_ffi_call_impl_int` — reads back a complete
@@ -506,11 +509,11 @@ mod imp {
         cif_description: usize,
         func_addr: usize,
         exchange_buffer: usize,
-    ) -> f64 {
+    ) -> f32 {
         unsafe { jit_ffi_call_impl_any(cif_description, func_addr, exchange_buffer) };
         let resultdata =
             llrffi::raw_ptradd(exchange_buffer, unsafe { exchange_result(cif_description) });
-        unsafe { f64::from((resultdata as *const f32).read()) }
+        unsafe { (resultdata as *const f32).read() }
     }
 
     /// `jit_libffi.py jit_ffi_call_impl_void`.

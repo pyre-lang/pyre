@@ -3,7 +3,8 @@
 //! `_jit_look_inside_<NAME>`, `_jit_loop_invariant_<NAME>`,
 //! `_jit_unroll_safe_<NAME>`, `_not_rpython_<NAME>`, `oopspec_<NAME>`,
 //! `_gctransformer_hint_close_stack_<NAME>`,
-//! `_call_aroundstate_target_<NAME>`).
+//! `_call_aroundstate_target_<NAME>`,
+//! `_random_effects_on_gcobjs_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -19,7 +20,7 @@
 
 use majit_charon_reader::{
     Llbc,
-    ullbc::{GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind},
+    ullbc::{FunDecl, GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind},
 };
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -178,6 +179,21 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     fn_path,
                     &format!("aroundstate_target:{save_err}:{identity}"),
                 );
+                continue;
+            }
+            // rffi.py llexternal stores `random_effects_on_gcobjs` on the
+            // graphless C functionptr (`effectinfo.py RandomEffectsAnalyzer`).
+            // The marker initializer is that funcptr (`*const ()`); harvest
+            // the FunDecl the same way `_call_aroundstate_target_` does.
+            if leaf.starts_with("_random_effects_on_gcobjs_") {
+                let fd = decode_random_effects_fun_decl(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "_random_effects_on_gcobjs_ marker `{path}` has an \
+                         undecodable initializer; the macro emits a funcptr, \
+                         so this signals a Charon encoding change"
+                    )
+                });
+                push_hint(&mut out, gc_effects_call_path_key(fd), "gc_effects");
                 continue;
             }
             // `#[specialize_argtype(N, …)]` emits the body-local
@@ -492,6 +508,60 @@ fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Walk the marker const's initializer body, the same `Call` `value`
+/// `marker_init_fun_id` names. `_call_aroundstate_target_` and
+/// `_random_effects_on_gcobjs_` both store a funcptr there.
+fn visit_marker_init_rvalues(llbc: &Llbc, gd: &GlobalDecl, mut visit: impl FnMut(&Rvalue)) -> bool {
+    let Some(init_id) = marker_init_fun_id(gd) else {
+        return false;
+    };
+    let Some(body) = llbc.fn_by_id(init_id).and_then(|fd| fd.unstructured()) else {
+        return false;
+    };
+    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            visit(&rvalue);
+        }
+    }
+    true
+}
+
+/// FunDecl the marker initializer names. Reuses the aroundstate `FnDef`
+/// walk (`collect_aroundstate_rvalue` / `const_fn_def_regular_id`).
+fn decode_random_effects_fun_decl<'a>(llbc: &'a Llbc, gd: &GlobalDecl) -> Option<&'a FunDecl> {
+    let mut fn_id = None;
+    let mut save_err = None;
+    if !visit_marker_init_rvalues(llbc, gd, |rvalue| {
+        collect_aroundstate_rvalue(llbc, rvalue, &mut fn_id, &mut save_err);
+    }) {
+        return None;
+    }
+    llbc.fn_by_id(fn_id?)
+}
+
+/// CallPath key `analyze_random_effects` / `external_funcobj` /
+/// `mark_external_gc_effects` look a direct call up by.
+///
+/// `unspecialized_fun_segments` splits `name_path()` on `::`; `target_to_path`
+/// keeps those segments. A local majit_rlib FunDecl is stored crate-stripped
+/// so `apply_harvested_funcobj_hints` / `free_function_alias_paths` register
+/// the module-relative key; a foreign `libc::…` FunDecl keeps the crate.
+fn gc_effects_call_path_key(fd: &FunDecl) -> String {
+    let path = fd.item_meta.name_path();
+    if fd.item_meta.is_local {
+        strip_crate_prefix(&path)
+    } else {
+        path
+    }
+}
+
 /// `_call_aroundstate_target_<fn>` initializer: `(funcptr, save_err: i64)`.
 ///
 /// Charon lowers the tuple as an `Aggregate` (or a single const) whose
@@ -502,22 +572,12 @@ fn decode_str_const(llbc: &Llbc, value: &serde_json::Value) -> Option<String> {
 /// either spelling. `None` means the initializer is present but not that
 /// shape — the caller panics.
 fn decode_aroundstate_marker(llbc: &Llbc, gd: &GlobalDecl) -> Option<(String, i64)> {
-    // Named consts point at their initializer by a `Call` inside `value`.
-    let init_id = marker_init_fun_id(gd)?;
-    let body = llbc.fn_by_id(init_id)?.unstructured()?;
     let mut fn_id: Option<u64> = None;
     let mut save_err: Option<i64> = None;
-    let forward_blocks = crate::front::mir::forward_reachable_mask(llbc, &body);
-    for (bb_idx, block) in body.body.iter().enumerate() {
-        if !forward_blocks[bb_idx] {
-            continue;
-        }
-        for stmt in &block.statements {
-            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind() else {
-                continue;
-            };
-            collect_aroundstate_rvalue(llbc, &rvalue, &mut fn_id, &mut save_err);
-        }
+    if !visit_marker_init_rvalues(llbc, gd, |rvalue| {
+        collect_aroundstate_rvalue(llbc, rvalue, &mut fn_id, &mut save_err);
+    }) {
+        return None;
     }
     let save_err = save_err?;
     let fd = llbc.fn_by_id(fn_id?)?;

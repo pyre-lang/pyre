@@ -2952,7 +2952,7 @@ impl PyError {
         where_desc: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
     ) {
-        self.write_unraisable_with_traceback(space, where_desc, w_object, false);
+        self.write_unraisable_with_traceback(space, where_desc, w_object, false, "");
     }
 
     /// `error.py OperationError.write_unraisable`, including the
@@ -2964,6 +2964,7 @@ impl PyError {
         where_desc: &rustpython_wtf8::Wtf8,
         mut w_object: PyObjectRef,
         with_traceback: bool,
+        extra_line: &str,
     ) {
         let roots = pyre_object::gc_roots::push_roots();
         let self_slot = self.pin(&roots);
@@ -3006,9 +3007,6 @@ impl PyError {
         } else {
             crate::display::wtf8_format!("Exception ignored in: ", where_desc)
         };
-        // vm.py UnraisableHookArgs also carries `extra_line`; pyre's hook-args
-        // structseq targets the 5-field shape, so only the default printer
-        // receives the Rust-side extra line.
         let mut hook_fields = pyre_object::gc_roots::RootedItems::new();
         hook_fields.push(w_type);
         hook_fields.push(w_value);
@@ -3021,11 +3019,16 @@ impl PyError {
         } else {
             pyre_object::w_str_from_wtf8_managed(first_line.clone())
         });
+        // `error.py OperationError.write_unraisable` `info_w` sixth value:
+        // `vm.py UnraisableHookArgs.extra_line`. The managed str mint is an
+        // allocation; earlier fields stay pinned in `hook_fields`.
+        hook_fields.push(pyre_object::w_str_new_managed(extra_line));
         let live = hook_fields.take();
         let mut hook_args = pyre_object::with_roots!(space, w_object, w_tb, w_type, w_value =>
-            crate::_structseq::new_instance(
+            crate::_structseq::new_instance_with_extra(
                 unraisable_hook_args_type(),
                 vec![live[0], live[1], live[2], live[4], live[3]],
+                vec![("extra_line", live[5])],
             )
         );
         if let Some(sys_mod) = crate::importing::get_interpreter_sys_module()
@@ -3080,13 +3083,21 @@ impl PyError {
                         w_tb,
                         &first_line,
                         w_object,
-                        "",
+                        extra_line,
                     );
                     return;
                 }
             }
         }
-        Self::write_unraisable_default(space, w_type, w_value, w_tb, &first_line, w_object, "");
+        Self::write_unraisable_default(
+            space,
+            w_type,
+            w_value,
+            w_tb,
+            &first_line,
+            w_object,
+            extra_line,
+        );
     }
 
     /// `PySys_WriteStderr` -- one line of a report, on `sys.stderr` when there
@@ -3192,7 +3203,6 @@ impl PyError {
         // is no header and the exception is the first line. `extra_line`
         // (`error.py write_unraisable_default`) takes the place of the final
         // newline, and with it an empty message reads "Exception ignored in".
-        let write = |piece: &[u8]| Self::write_bytes_to_file(_roots.get(file_slot), piece);
         let w_object = _roots.get(object_slot);
         let has_object = !w_object.is_null() && !unsafe { pyre_object::is_none(w_object) };
         let end = if extra_line.is_empty() {
@@ -3202,16 +3212,19 @@ impl PyError {
         };
         if has_object {
             let lead = if first_line.is_empty() {
-                write(b"Exception ignored in: ")
+                Self::write_bytes_to_file(_roots.get(file_slot), b"Exception ignored in: ")
             } else {
-                write(first_line.as_bytes()) && write(b": ")
+                Self::write_bytes_to_file(_roots.get(file_slot), first_line.as_bytes())
+                    && Self::write_bytes_to_file(_roots.get(file_slot), b": ")
             };
             if !lead {
                 return;
             }
             let objrepr = unsafe { crate::display::py_repr_wtf8(_roots.get(object_slot)) }
                 .unwrap_or_else(|_| Wtf8Buf::from_string("<object repr() failed>".to_string()));
-            if !write(objrepr.as_bytes()) || !write(end.as_bytes()) {
+            if !Self::write_bytes_to_file(_roots.get(file_slot), objrepr.as_bytes())
+                || !Self::write_bytes_to_file(_roots.get(file_slot), end.as_bytes())
+            {
                 return;
             }
         } else if !first_line.is_empty() || !extra_line.is_empty() {
@@ -3220,7 +3233,9 @@ impl PyError {
             } else {
                 first_line.as_bytes()
             };
-            if !write(msg) || !write(format!(":{end}").as_bytes()) {
+            if !Self::write_bytes_to_file(_roots.get(file_slot), msg)
+                || !Self::write_bytes_to_file(_roots.get(file_slot), format!(":{end}").as_bytes())
+            {
                 return;
             }
         }
@@ -3448,7 +3463,7 @@ fn wrap_pos(num: i64) -> PyObjectRef {
 fn unraisable_hook_args_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq(
+        crate::_structseq::make_struct_seq_with_extra(
             "sys.UnraisableHookArgs",
             &[
                 "exc_type",
@@ -3457,6 +3472,7 @@ fn unraisable_hook_args_type() -> PyObjectRef {
                 "err_msg",
                 "object",
             ],
+            &["extra_line"],
         )
     })
 }

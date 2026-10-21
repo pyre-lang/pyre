@@ -8,6 +8,7 @@ Declares the pyre crate table and delegates to the neutral engine in
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -46,7 +47,9 @@ CHARON_BODY_SHAPE_ARGS = ["--reconstruct-panic-calls", "--inline-anon-consts"]
 # `--no-typecheck` was tried beside it and made the pass slower.
 # `--include libc::_` translates the libc items an extracted crate reaches,
 # including const initializers. A foreign NamedConst otherwise stays
-# Opaque, so the named-const harvest has no literal.
+# Opaque, so the named-const harvest has no literal. `majit_jitcode::rffi`
+# holds the `rffi.py` `RFFI_*` flags `rposix._errno_before` /
+# `_errno_after` test, module globals the flow space folds upstream.
 # Charon name-matcher `--include` of `core` methods whose bodies would
 # otherwise stay `opacity: Foreign` / `body: "Opaque"`. Pattern shape
 # matches `libc::_`: `item::_` is subitems only. Inherent-impl methods
@@ -100,8 +103,32 @@ CHARON_ARGS = [
     *CHARON_BODY_SHAPE_ARGS,
     "--include",
     "libc::_",
+    "--include",
+    "majit_jitcode::rffi::_",
     *CHARON_CORE_INCLUDE,
 ]
+
+
+def _majit_rlib_cargo_args() -> list[str]:
+    """Features pyre-interpreter enables on majit-rlib for this `CARGO_FEATURES`.
+
+    `node.py new_funcnode` substitutes `rsandbox.get_sandbox_stub` only when
+    `db.sandbox`. majit-rlib's `host_env` is not a default; the interpreter's
+    default `host_env` enables `majit-rlib/host_env`. `dynasm` is a
+    pyre-interpreter / pyre-jit feature majit-rlib does not have, so
+    `{features}` is not passed through. `layout_cargo_args` stays unset:
+    wasm32 reuses these flags, matching the interpreter layout pass that
+    already compiles `majit-rlib/host_env`.
+    """
+    names = {
+        f.strip()
+        for f in os.environ.get("CARGO_FEATURES", "dynasm").split(",")
+        if f.strip()
+    }
+    if "sandbox" in names:
+        return ["--features", "sandbox"]
+    return ["--features", "host_env"]
+
 
 # `pyre-native` is the stable native/backend boundary.  Charon follows local
 # workspace dependencies by default, so merely moving an implementation into
@@ -185,6 +212,7 @@ SPECS: dict[str, CrateSpec] = {
         crate_dir=ROOT / "majit" / "majit-rlib",
         output_name="majit-rlib.ullbc",
         charon_args=CHARON_ARGS,
+        cargo_args=_majit_rlib_cargo_args(),
     ),
     "pyre-object": CrateSpec(
         name="pyre-object",

@@ -194,7 +194,9 @@ fn get_attr_elidable(lib: &W_LibObject, w_attr: PyObjectRef) -> Result<PyObjectR
     let attr = pyre_object::with_roots!(w_attr => pyre_interpreter::baseobjspace::text_w(w_attr))?;
     match unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(lib.dict_w, attr) } {
         Some(w_value) => Ok(w_value),
-        None => Err(PyError::key_error_with_key(w_attr)),
+        // `self.dict_w[attr]` raises an interp-level `KeyError`; both callers
+        // catch it and go to `_build_attr`, so no app-level `repr` is built.
+        None => Err(PyError::key_error(attr)),
     }
 }
 
