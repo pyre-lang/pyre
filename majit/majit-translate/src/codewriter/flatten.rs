@@ -872,6 +872,16 @@ impl<'a> GraphFlattener<'a> {
                     live_values: Vec::new(),
                 });
             }
+            crate::model::OpKind::ConstNone | crate::model::OpKind::ConstRefAddr(_)
+                if op.result.as_ref().is_some_and(|result| {
+                    FunctionGraph::concretetype_of(result) == crate::model::ConcreteType::Void
+                }) =>
+            {
+                // flatten.py insert_renamings: `v.concretetype is not
+                // lltype.Void`. serialize_op omits `-> result` when
+                // getkind is void; a Void constant has no
+                // `assembler.py emit_const` bank.
+            }
             _ => {
                 self.emitline(FlatOp::op(op.clone()));
             }

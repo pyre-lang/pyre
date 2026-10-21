@@ -19912,6 +19912,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
+        // resume.py `rebuild_from_resumedata`: `newframe` +
+        // `setup_resume_at_op` + `consume_boxes`.
         self.consume_portal_resume_boxes(
             frames,
             fail_values,
@@ -19921,6 +19923,50 @@ impl<M: Clone> MetaInterp<M> {
             resume_op_live,
             reader,
         )
+    }
+
+    /// `pyjitpl.py MIFrame.make_result_of_lastop` recovers the result
+    /// register from the caller's bytecode at return
+    /// (`ord(self.bytecode[self.pc-1])`). Pyre's walker writes that
+    /// slot through the callee's `return_*` instead, so a matching
+    /// `BC_INLINE_CALL` is copied onto the rebuilt frames before
+    /// `interpret` (`trace_bridge_via_interpret`).
+    ///
+    /// `setup_resume_at_op` stores `pc` and leaves `code_cursor` at 0
+    /// (`MIFrame::new`). `interpret` walks `code_cursor`.
+    ///
+    /// A pair that is not a matching `BC_INLINE_CALL` is left unwired.
+    /// `bridge_from_guard_resume_position` still declines those errors
+    /// for the standalone jitcode walk.
+    pub fn wire_rebuilt_inline_framestack(&mut self) {
+        let n = self.framestack.frames.len();
+        for i in 0..n {
+            let pc = self.framestack.frames[i].pc;
+            self.framestack.frames[i].code_cursor = pc;
+        }
+        for depth in 1..n {
+            let caller_pc = self.framestack.frames[depth - 1].pc;
+            let caller_jc = std::sync::Arc::clone(&self.framestack.frames[depth - 1].jitcode);
+            let callee_jc = std::sync::Arc::clone(&self.framestack.frames[depth].jitcode);
+            let Ok(site) = caller_jc.inline_resume_site_for(caller_pc, &callee_jc) else {
+                continue;
+            };
+            let (caller, rest) = self.framestack.frames.split_at_mut(depth);
+            let caller = &mut caller[depth - 1];
+            let callee = &mut rest[0];
+            callee.inline_frame = true;
+            callee.return_i = site.return_i;
+            callee.return_r = site.return_r;
+            callee.return_f = site.return_f;
+            let (argcode, dst) = match site.result_slot() {
+                Some((crate::jitcode::JitArgKind::Int, dst)) => (b'i', Some(dst)),
+                Some((crate::jitcode::JitArgKind::Ref, dst)) => (b'r', Some(dst)),
+                Some((crate::jitcode::JitArgKind::Float, dst)) => (b'f', Some(dst)),
+                None => (b'v', None),
+            };
+            caller._result_argcode = argcode;
+            caller.result_arg_index = dst;
+        }
     }
 
     /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's

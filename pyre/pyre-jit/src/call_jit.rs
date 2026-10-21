@@ -3704,7 +3704,14 @@ pub(crate) fn bridge_source_identity_from_descr(
 pub enum BridgeResolution {
     /// Bridge attached — caller re-enters compiled code
     /// (`ContinueRunningNormally`).  The legacy `true` return.
+    /// The pypyjit arm re-enters through the live frame.
     CompiledContinue,
+    /// Generatorentry `ContinueRunningNormally`: concrete merge-point
+    /// args (`pycode`, `gen`, `w_arg`) the walk closed on.
+    /// `pyjitpl.py compile_trace` / `raise_continue_running_normally`
+    /// (`live_arg_boxes`) then `warmspot.py handle_jitexception`
+    /// `portal_ptr(*args)`.
+    CompiledContinueLive(Vec<majit_ir::Value>),
     /// Resume the region in the blackhole interpreter
     /// (`SwitchToBlackhole`).  The legacy `false` return.
     ResumeBlackhole,
@@ -3825,7 +3832,10 @@ pub fn trace_and_compile_from_bridge(
     // the descr Arc and derives `(green_key, trace_id, fail_index)`
     // itself.
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    frame: &mut PyFrame,
+    // Virtualizable live object for `pypyjit`. `None` when the failing
+    // loop's `jitdriver_sd.virtualizable_info` is None
+    // (`resume.py consume_vref_and_vable_boxes`).
+    frame: Option<&mut PyFrame>,
     raw_values: &[i64],
     exit_layout: &majit_metainterp::CompiledExitLayout,
     // `cpu.grab_exc_value(deadframe)` (llmodel.py): the pending
@@ -3868,44 +3878,32 @@ pub fn trace_and_compile_from_bridge(
         }
     }
 
-    {
+    let Some((green_key, trace_id, fail_index)) = bridge_compile_preflight(descr_arc) else {
+        return BridgeResolution::ResumeBlackhole;
+    };
+    // compile.py `_trace_and_compile_from_bridge`: `jitdriver_sd` is the
+    // failing loop's `rd_loop_token.outermost_jitdriver_sd`.
+    let jd_index = failing_loop_jitdriver_index(descr_arc);
+    let has_vinfo = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.clear_last_compiled_artifact_token();
+        jd_index.and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
+    };
+    if has_vinfo == Some(false) {
+        if jd_index != Some(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize) {
+            return BridgeResolution::ResumeBlackhole;
+        }
+        return trace_bridge_via_interpret(
+            descr_arc, green_key, trace_id, fail_index, raw_values, guard_exc,
+        );
+    }
+    if bridge_bail_stage() == 1 {
+        return BridgeResolution::ResumeBlackhole;
     }
 
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
 
-    // compile.py `ResumeGuardForcedDescr.handle_fail`: "Failures of
-    // a GUARD_NOT_FORCED are never compiled, but always just blackholed."
-    // A bridge walked from one force flavor (pure force, live call result)
-    // would also be entered for forced-and-raised failures whose call result
-    // is NULL — its result-class guard then dereferences NULL.
-    if descr_arc.is_guard_forced() {
-        return BridgeResolution::ResumeBlackhole;
-    }
-    // compile.py `must_compile() and not stack_almost_full()`: this is
-    // pyre's own guard-failure entry, so the diagnostic that suppresses bridge
-    // recording has to be read here as well as in the jitdriver's paths.
-    if majit_metainterp::no_bridge_enabled() {
-        return BridgeResolution::ResumeBlackhole;
-    }
-    let Some((green_key, trace_id, fail_index)) = bridge_source_identity_from_descr(descr_arc)
-    else {
-        // compile.py `_trace_and_compile_from_bridge` raises
-        // `compile.giveup()` when `loop_token` is None (memmgr-evicted).
-        // Pyre signals the same outcome by returning `false`, dropping
-        // the caller into `resume_in_blackhole` (pyjitpl.py:711).
-        return BridgeResolution::ResumeBlackhole;
-    };
-    // `MAJIT_MAX_BRIDGES` counts bridges actually attempted, so it is spent
-    // after the bails above rather than alongside `no_bridge_enabled`.
-    if !majit_metainterp::bridge_fuel_take() {
-        return BridgeResolution::ResumeBlackhole;
-    }
-    if bridge_bail_stage() == 1 {
-        return BridgeResolution::ResumeBlackhole;
-    }
+    let frame = frame.expect("pypyjit bridge holds the virtualizable PyFrame");
 
     let info = {
         let (_, info) = crate::eval::driver_pair();
@@ -4584,6 +4582,610 @@ pub fn trace_and_compile_from_bridge(
     bridge_resolution_from_bool(adopted_walk_end_state)
 }
 
+/// compile.py `ResumeGuardForcedDescr.handle_fail` / `giveup` / `no_bridge`
+/// / `MAJIT_MAX_BRIDGES`. Shared by every jitdriver.
+fn bridge_compile_preflight(
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+) -> Option<(u64, u64, u32)> {
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.clear_last_compiled_artifact_token();
+    }
+    if descr_arc.is_guard_forced() {
+        return None;
+    }
+    if majit_metainterp::no_bridge_enabled() {
+        return None;
+    }
+    let identity = bridge_source_identity_from_descr(descr_arc)?;
+    if !majit_metainterp::bridge_fuel_take() {
+        return None;
+    }
+    Some(identity)
+}
+
+fn failing_loop_jitdriver_index(descr_arc: &std::sync::Arc<dyn majit_ir::Descr>) -> Option<usize> {
+    descr_arc
+        .as_fail_descr()
+        .and_then(majit_backend::descr_owning_jct)
+        .and_then(|token| token.outermost_jitdriver_index)
+}
+
+/// Portal-frame merge-point boxes after `rebuild_from_resumedata`.
+/// `consume_boxes` fills resume-PC liveness, so the merge-point banks
+/// (`green_r` pycode, `red_r` gen / w_arg) may be empty or reused.
+struct GenentryPortalBoxes {
+    pycode_op: Option<majit_ir::OpRef>,
+    w_gen: Option<majit_ir::OpRef>,
+    w_arg: Option<majit_ir::OpRef>,
+}
+
+fn genentry_boxes_from_rebuilt_portal(
+    mainjitcode: &majit_metainterp::JitCode,
+    portal_pc: usize,
+) -> Option<GenentryPortalBoxes> {
+    if portal_pc + 2 >= mainjitcode.code.len() {
+        return None;
+    }
+    let banks = majit_metainterp::decode_jit_merge_point_banks(&mainjitcode.code, portal_pc);
+    let (driver, _) = crate::eval::driver_pair();
+    let meta = driver.meta_interp();
+    let frame = meta
+        .framestack
+        .frames
+        .iter()
+        .find(|frame| frame.jitcode.try_index() == mainjitcode.try_index())?;
+    let pycode_op = banks
+        .green_r
+        .first()
+        .and_then(|&reg| frame.ref_regs.get(reg).copied().flatten());
+    let w_gen = banks
+        .red_r
+        .first()
+        .and_then(|&reg| frame.ref_regs.get(reg).copied().flatten());
+    let w_arg = banks
+        .red_r
+        .get(1)
+        .and_then(|&reg| frame.ref_regs.get(reg).copied().flatten());
+    Some(GenentryPortalBoxes {
+        pycode_op,
+        w_gen,
+        w_arg,
+    })
+}
+
+fn portal_red_jump_args(
+    mainjitcode: &majit_metainterp::JitCode,
+    portal_pc: usize,
+) -> Option<Vec<majit_ir::OpRef>> {
+    let boxes = genentry_boxes_from_rebuilt_portal(mainjitcode, portal_pc)?;
+    Some(vec![boxes.w_gen?, boxes.w_arg?])
+}
+
+fn framestack_ref_ops() -> Vec<majit_ir::OpRef> {
+    let (driver, _) = crate::eval::driver_pair();
+    let meta = driver.meta_interp();
+    meta.framestack
+        .frames
+        .iter()
+        .flat_map(|frame| frame.ref_regs.iter().copied().flatten())
+        .collect()
+}
+
+fn generator_op_in_framestack() -> Option<majit_ir::OpRef> {
+    framestack_ref_ops()
+        .into_iter()
+        .find(|&op| concrete_ref_of(op).is_some_and(is_live_generator))
+}
+
+fn generator_from_failargs(
+    raw_values: &[i64],
+    fail_types: &[majit_ir::Type],
+) -> Option<PyObjectRef> {
+    raw_values
+        .iter()
+        .zip(fail_types.iter())
+        .find_map(|(&word, ty)| {
+            if *ty != majit_ir::Type::Ref {
+                return None;
+            }
+            let ptr = word as PyObjectRef;
+            is_live_generator(ptr).then_some(ptr)
+        })
+}
+
+fn pycode_of_generator(w_gen: PyObjectRef) -> Option<PyObjectRef> {
+    let pycode = unsafe { pyre_object::generator::w_generator_get_pycode(w_gen) };
+    is_live_code(pycode).then_some(pycode)
+}
+
+fn value_as_ref(value: &majit_ir::Value) -> Option<PyObjectRef> {
+    match value {
+        majit_ir::Value::Ref(majit_ir::GcRef(ptr)) if *ptr != 0 => Some(*ptr as PyObjectRef),
+        _ => None,
+    }
+}
+
+fn live_heap_ref(ptr: PyObjectRef) -> Option<PyObjectRef> {
+    if ptr.is_null() || (ptr as usize) < 0x1000 || !majit_gc::gc_owns_object(ptr as usize) {
+        None
+    } else {
+        Some(ptr)
+    }
+}
+
+fn plausible_pyobject(ptr: PyObjectRef) -> Option<PyObjectRef> {
+    if ptr.is_null() || (ptr as usize) < 0x1000 {
+        None
+    } else {
+        Some(ptr)
+    }
+}
+
+fn concrete_ref_of(op: majit_ir::OpRef) -> Option<PyObjectRef> {
+    let (driver, _) = crate::eval::driver_pair();
+    driver
+        .meta_interp_mut()
+        .trace_ctx()
+        .and_then(|ctx| ctx.concrete_of_opref(op))
+        .as_ref()
+        .and_then(value_as_ref)
+        .and_then(live_heap_ref)
+}
+
+fn is_live_code(ptr: PyObjectRef) -> bool {
+    live_heap_ref(ptr).is_some_and(|p| unsafe { pyre_interpreter::pycode::is_code(p) })
+}
+
+fn is_live_generator(ptr: PyObjectRef) -> bool {
+    live_heap_ref(ptr).is_some_and(|p| unsafe { pyre_object::generator::is_generator(p) })
+}
+
+/// Concrete merge-point args (`pycode`, `gen`, `w_arg`) of a compiled
+/// generatorentry bridge, read off the jump args before the session is
+/// cleared. Missing concretes → `None` (caller resumes in the blackhole).
+fn live_merge_point_args(
+    jump_args: &[majit_ir::OpRef],
+    pycode: PyObjectRef,
+) -> Option<Vec<majit_ir::Value>> {
+    if !is_live_code(pycode) || jump_args.len() < 2 {
+        return None;
+    }
+    let (driver, _) = crate::eval::driver_pair();
+    let ctx = driver.meta_interp_mut().trace_ctx()?;
+    let mut live = Vec::with_capacity(1 + jump_args.len());
+    live.push(majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize)));
+    for (i, &op) in jump_args.iter().enumerate() {
+        match ctx.concrete_of_opref(op) {
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) if ptr != 0 => {
+                let ptr = ptr as PyObjectRef;
+                if i == 0 && !is_live_generator(ptr) {
+                    return None;
+                }
+                if i != 0 && plausible_pyobject(ptr).is_none() {
+                    return None;
+                }
+                live.push(majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            }
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0))) if i == 1 => {
+                live.push(majit_ir::Value::Ref(majit_ir::GcRef(
+                    pyre_object::w_none() as usize
+                )));
+            }
+            _ => return None,
+        }
+    }
+    Some(live)
+}
+
+/// Reds (`gen`, `w_arg`) of a generatorentry `ContinueRunningNormally`
+/// payload, for `run_compiled_generatorentry` re-entry.
+pub(crate) fn genentry_continue_reds(
+    live_args: &[majit_ir::Value],
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    let w_gen = value_as_ref(live_args.get(1)?)?;
+    if !is_live_generator(w_gen) {
+        return None;
+    }
+    let w_arg = match live_args.get(2) {
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) if *ptr != 0 => {
+            plausible_pyobject(*ptr as PyObjectRef)?
+        }
+        Some(_) => pyre_object::w_none(),
+        None => return None,
+    };
+    Some((w_gen, w_arg))
+}
+
+/// `jitexc.py ContinueRunningNormally` / `warmspot.py handle_jitexception`
+/// for `generatorentry_driver`: `portal_ptr(pycode, gen, w_arg)`.
+fn continue_generatorentry_portal(
+    live_args: &[majit_ir::Value],
+) -> Option<Result<PyObjectRef, pyre_interpreter::error::PyError>> {
+    let pycode = value_as_ref(live_args.first()?)?;
+    let w_gen = value_as_ref(live_args.get(1)?)?;
+    if !is_live_code(pycode) || !is_live_generator(w_gen) {
+        return None;
+    }
+    let w_arg = match live_args.get(2) {
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) if *ptr != 0 => {
+            plausible_pyobject(*ptr as PyObjectRef)?
+        }
+        _ => pyre_object::w_none(),
+    };
+    let _pycode_root = majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(pycode as usize));
+    let _gen_root = majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(w_gen as usize));
+    let _arg_root = majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(w_arg as usize));
+    Some(pyre_interpreter::generatorentry_portal(
+        pycode, w_gen, w_arg,
+    ))
+}
+
+fn abort_active_bridge_trace() {
+    let (driver, _) = crate::eval::driver_pair();
+    if driver.is_tracing() {
+        driver.meta_interp_mut().abort_trace(false);
+    }
+}
+
+/// `compile.py _trace_and_compile_from_bridge` + `pyjitpl.py
+/// MetaInterp.handle_guard_failure` for a driver whose
+/// `virtualizable_info is None`. Frames come from resume data;
+/// `interpret` runs `GenEntrySym` on `jd.mainjitcode`.
+fn trace_bridge_via_interpret(
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    raw_values: &[i64],
+    guard_exc: i64,
+) -> BridgeResolution {
+    // `cpu.grab_exc_value(deadframe)` parked so `_prepare_exception_resumption`
+    // / `prepare_resume_from_failure` read `GUARD_EXC_VALUE` the way the
+    // pypyjit path does (`handle_fail` / `jit_ca_handle_guard_failure`).
+    // A non-object word (a leftover `jf_guard_exc` on a non-exception
+    // guard) is not parked: the extra-root walker would treat it as a
+    // PyObject. `jitdriver.rs` skips a zero cell for the same reason.
+    let _guard_exc_root = (guard_exc != 0 && majit_gc::gc_owns_object(guard_exc as usize))
+        .then(|| majit_metainterp::blackhole::GuardExcRoot::park(guard_exc));
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver
+            .meta_interp()
+            .bridge_was_compiled(green_key, trace_id, fail_index)
+        {
+            return BridgeResolution::ResumeBlackhole;
+        }
+    }
+
+    let _plain = pyre_interpreter::call::force_plain_eval();
+    let jd_index = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize;
+
+    let retrace = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().handle_guard_failure(
+            descr_arc.clone(),
+            green_key,
+            trace_id,
+            fail_index,
+            raw_values,
+        )
+    };
+    let Some(retrace) = retrace else {
+        return BridgeResolution::ResumeBlackhole;
+    };
+
+    let Some(storage) = retrace.storage.clone() else {
+        abort_active_bridge_trace();
+        return BridgeResolution::ResumeBlackhole;
+    };
+    use majit_ir::FailDescr;
+    let Some(rd_numb) = storage.rd_numb() else {
+        abort_active_bridge_trace();
+        return BridgeResolution::ResumeBlackhole;
+    };
+    let rd_consts = storage.rd_consts().unwrap_or(&[]);
+    let cb = pyre_jit_trace::state::frame_value_count_at;
+    // resume.py consume_vref_and_vable_boxes: vinfo is None →
+    // virtualizable_boxes = None. rebuild_from_numbering still consumes the
+    // vable_len word (0 for generatorentry).
+    let (num_failargs, _vable_values, vref_values, frames) =
+        majit_ir::resumedata::rebuild_from_numbering(
+            rd_numb,
+            rd_consts,
+            &retrace.fail_types,
+            Some(&cb),
+            storage.rd_virtuals().map_or(0, <[_]>::len),
+        );
+    let resume_result = majit_metainterp::ResumeDataResult {
+        frames,
+        virtualizable_boxes: Vec::new(),
+        virtualref_values: vref_values,
+        storage: Some(storage.clone()),
+        num_failargs,
+        fail_arg_types: retrace.fail_types.clone(),
+    };
+
+    let Some(mainjitcode) = ({
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp().mainjitcode_of(jd_index).cloned()
+    }) else {
+        abort_active_bridge_trace();
+        return BridgeResolution::ResumeBlackhole;
+    };
+
+    let materialized: Vec<Option<std::sync::Arc<majit_metainterp::JitCode>>> = {
+        let (driver, _) = crate::eval::driver_pair();
+        let meta = driver.meta_interp();
+        resume_result
+            .frames
+            .iter()
+            .map(|section| {
+                usize::try_from(section.jitcode_index).ok().and_then(|pos| {
+                    <pyre_jit_trace::state::PyreJitState as majit_metainterp::JitState>::resolve_resume_jitcode(
+                        pos,
+                    )
+                    .or_else(|| meta.staticdata.jitcodes.get(pos).cloned())
+                })
+            })
+            .collect()
+    };
+
+    let virtual_count = storage.rd_virtuals().map_or(0, <[_]>::len);
+    let mut reader = majit_metainterp::BridgeVirtualCache::recording(
+        virtual_count,
+        majit_metainterp::default_bridge_array_descr,
+        &[],
+    );
+
+    let rebuilt = {
+        let (driver, _) = crate::eval::driver_pair();
+        let meta = driver.meta_interp_mut();
+        if let Some(ctx) = meta.trace_ctx() {
+            ctx.is_bridge_trace = true;
+            ctx.clear_merge_points();
+            ctx.set_bridge_resume_data(resume_result.clone());
+            ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
+        }
+        let liveness = meta.staticdata.liveness_info.snapshot_arc();
+        let op_live = meta.staticdata.op_live as u8;
+        meta.rebuild_portal_framestack_from_resumedata(
+            mainjitcode.clone(),
+            &resume_result.frames,
+            raw_values,
+            &retrace.fail_types,
+            &materialized,
+            liveness.as_ref(),
+            op_live,
+            &mut reader,
+        )
+    };
+    if !rebuilt {
+        abort_active_bridge_trace();
+        return BridgeResolution::ResumeBlackhole;
+    }
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        let meta = driver.meta_interp_mut();
+        // resume.py `rebuild_from_resumedata` does not restore the
+        // suspended call; `pyjitpl.py make_result_of_lastop` does at
+        // return. `interpret` writes through `return_*`, so copy a
+        // matching `BC_INLINE_CALL` here — pypyjit's bytecode walk
+        // never reaches this.
+        meta.wire_rebuilt_inline_framestack();
+        let n = meta.framestack.frames.len();
+        if n > 1 && !meta.framestack.frames[n - 1].inline_frame {
+            abort_active_bridge_trace();
+            return BridgeResolution::ResumeBlackhole;
+        }
+    }
+
+    let portal_pc = {
+        use majit_metainterp::JitCodeSym;
+        pyre_jit_trace::genentry_state::GenEntrySym {
+            pycode: PY_NULL,
+            r#gen: majit_ir::OpRef::NONE,
+            w_arg: majit_ir::OpRef::NONE,
+        }
+        .loop_header_pc()
+    };
+    let Some(boxes) = genentry_boxes_from_rebuilt_portal(&mainjitcode, portal_pc) else {
+        abort_active_bridge_trace();
+        return BridgeResolution::ResumeBlackhole;
+    };
+    // `consume_boxes` fills resume-PC liveness, so merge-point reds may
+    // be empty here. The walk starts at that PC and
+    // `opimpl_jit_merge_point` reads the banks after they are produced.
+    // pycode is `self.pycode` (`generator.py` `jit_merge_point`).
+    let gen_box = boxes
+        .w_gen
+        .filter(|&op| concrete_ref_of(op).is_some_and(is_live_generator))
+        .or_else(generator_op_in_framestack);
+    let pycode_from_gen = gen_box
+        .and_then(concrete_ref_of)
+        .and_then(pycode_of_generator);
+    let pycode_from_green = boxes
+        .pycode_op
+        .and_then(concrete_ref_of)
+        .filter(|&p| is_live_code(p));
+    let pycode_from_failargs =
+        generator_from_failargs(raw_values, &retrace.fail_types).and_then(pycode_of_generator);
+    let pycode = pycode_from_gen
+        .or(pycode_from_green)
+        .or(pycode_from_failargs);
+    let Some(pycode) = pycode else {
+        abort_active_bridge_trace();
+        return BridgeResolution::ResumeBlackhole;
+    };
+
+    {
+        use majit_metainterp::JitState;
+        let (driver, _) = crate::eval::driver_pair();
+        let meta = driver.meta_interp_mut();
+        let trace_meta = pyre_jit_trace::genentry_state::GenEntryJitState { pycode }
+            .build_meta(0, &pyre_jit_trace::state::PyreEnv);
+        meta.begin_trace_session(trace_meta);
+    }
+
+    let resume = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().prepare_resume_from_failure()
+    };
+    if let majit_metainterp::PrepareResumeFromFailure::ExitFrameWithExceptionRef(exc) = resume {
+        abort_active_bridge_trace();
+        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+            exc.0 as PyObjectRef,
+        ));
+    }
+
+    let mut sym = pyre_jit_trace::genentry_state::GenEntrySym {
+        pycode,
+        r#gen: gen_box.or(boxes.w_gen).unwrap_or(majit_ir::OpRef::NONE),
+        w_arg: boxes.w_arg.unwrap_or(majit_ir::OpRef::NONE),
+    };
+    let action = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp_mut().interpret(&mut sym, portal_pc)
+    };
+    apply_bridge_interpret_action(
+        action,
+        green_key,
+        trace_id,
+        fail_index,
+        &sym,
+        &mainjitcode,
+        portal_pc,
+    )
+}
+
+fn apply_bridge_interpret_action(
+    action: majit_metainterp::TraceAction,
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    sym: &pyre_jit_trace::genentry_state::GenEntrySym,
+    mainjitcode: &majit_metainterp::JitCode,
+    portal_pc: usize,
+) -> BridgeResolution {
+    use majit_metainterp::JitState;
+    let jump_args_from_frame = || {
+        portal_red_jump_args(mainjitcode, portal_pc).unwrap_or_else(|| {
+            pyre_jit_trace::genentry_state::GenEntryJitState::collect_jump_args(sym)
+        })
+    };
+    match action {
+        majit_metainterp::TraceAction::CompileTrace => {
+            // `reached_loop_header` already compiled into an existing
+            // target. Collect the merge-point live args the close sits on;
+            // the action itself carries none. Prefer the portal frame's
+            // reds after the walk (`opimpl_jit_merge_point` listed them).
+            let jump_args = jump_args_from_frame();
+            let live_args = live_merge_point_args(&jump_args, sym.pycode);
+            let (driver, _) = crate::eval::driver_pair();
+            driver.meta_interp_mut().finish_trace_live();
+            driver.meta_interp_mut().clear_pending_abort();
+            driver.meta_interp_mut().clear_trace_session();
+            match live_args {
+                Some(args) => BridgeResolution::CompiledContinueLive(args),
+                None => BridgeResolution::ResumeBlackhole,
+            }
+        }
+        majit_metainterp::TraceAction::Finish {
+            finish_args,
+            finish_arg_types,
+            exit_with_exception,
+            exc_value,
+        } => {
+            let produced = if exit_with_exception {
+                Some(BridgeResolution::FinishedException(
+                    pyre_jit_trace::state::ConcreteValue::Ref(exc_value as PyObjectRef),
+                ))
+            } else {
+                let value = {
+                    let (driver, _) = crate::eval::driver_pair();
+                    finish_args.first().and_then(|op| {
+                        driver
+                            .meta_interp_mut()
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.concrete_of_opref(*op))
+                    })
+                };
+                match value {
+                    Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) if ptr != 0 => {
+                        Some(BridgeResolution::Finished(
+                            pyre_jit_trace::state::ConcreteValue::Ref(ptr as PyObjectRef),
+                        ))
+                    }
+                    _ => None,
+                }
+            };
+            if exit_with_exception {
+                drain_backend_jit_exc();
+            }
+            let compile_ok = {
+                let (driver, _) = crate::eval::driver_pair();
+                driver
+                    .meta_interp_mut()
+                    .compile_finish_from_active_session(
+                        &finish_args,
+                        finish_arg_types,
+                        exit_with_exception,
+                    )
+                    .is_ok()
+            };
+            if !compile_ok {
+                abort_active_bridge_trace();
+            }
+            produced.unwrap_or(BridgeResolution::ResumeBlackhole)
+        }
+        majit_metainterp::TraceAction::CloseLoop => {
+            let jump_args = jump_args_from_frame();
+            compile_bridge_jump(green_key, trace_id, fail_index, &jump_args, sym.pycode)
+        }
+        majit_metainterp::TraceAction::CloseLoopWithArgs { jump_args, .. } => {
+            compile_bridge_jump(green_key, trace_id, fail_index, &jump_args, sym.pycode)
+        }
+        _ => {
+            abort_active_bridge_trace();
+            BridgeResolution::ResumeBlackhole
+        }
+    }
+}
+
+fn compile_bridge_jump(
+    green_key: u64,
+    trace_id: u64,
+    fail_index: u32,
+    jump_args: &[majit_ir::OpRef],
+    pycode: PyObjectRef,
+) -> BridgeResolution {
+    let outcome = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver
+            .meta_interp_mut()
+            .compile_trace(green_key, jump_args, Some((trace_id, fail_index)))
+    };
+    match outcome {
+        majit_metainterp::CompileOutcome::Compiled { .. } => {
+            // `raise_continue_running_normally(live_arg_boxes, loop_token)`:
+            // read the jump args' concretes before the session is cleared.
+            let live_args = live_merge_point_args(jump_args, pycode);
+            let (driver, _) = crate::eval::driver_pair();
+            driver.meta_interp_mut().finish_trace_live();
+            driver.meta_interp_mut().clear_pending_abort();
+            driver.meta_interp_mut().clear_trace_session();
+            match live_args {
+                Some(args) => BridgeResolution::CompiledContinueLive(args),
+                None => BridgeResolution::ResumeBlackhole,
+            }
+        }
+        _ => {
+            abort_active_bridge_trace();
+            BridgeResolution::ResumeBlackhole
+        }
+    }
+}
+
 /// compile.py handle_fail for call_assembler guard failures.
 /// Checks must_compile (jitcounter.tick), and if threshold reached,
 /// traces the alternate path via trace_and_compile_from_bridge.
@@ -4661,31 +5263,34 @@ fn jit_ca_handle_guard_failure(
         .expect("fail_descr_arc_from_addr returned non-FailDescr");
     // `compile.py handle_fail` receives the failing loop's `jitdriver_sd`
     // and `_trace_and_compile_from_bridge` rebuilds that driver's frames.
-    // The bridge start below rebuilds a `pypyjit` frame from failarg 0, its
-    // virtualizable. A `generatorentry` guard has the generator there and
-    // no virtualizable; like `run_compiled_generatorentry`, it resumes in
-    // the blackhole.
-    {
+    // A driver with `virtualizable_info is None` has no PyFrame at failarg 0
+    // (`resume.py consume_vref_and_vable_boxes`). Tick `must_compile`
+    // regardless (`AbstractResumeGuardDescr.handle_fail`).
+    let no_vinfo = {
         let (driver, _) = crate::eval::driver_pair();
-        let has_vinfo = majit_backend::descr_owning_jct(descr_fd)
-            .and_then(|token| token.outermost_jitdriver_index)
-            .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx));
-        if has_vinfo == Some(false) {
-            return None;
-        }
-    }
+        failing_loop_jitdriver_index(&descr_arc)
+            .and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
+            == Some(false)
+    };
     let n_fail_args = descr_fd.fail_arg_types().len();
-    let fail0 = unsafe { majit_backend::get_int_value(deadframe, descr_fd, 0) };
+    let fail_types = descr_fd.fail_arg_types();
+    let mut early_values: Vec<i64> = (0..n_fail_args)
+        .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
+        .collect();
+    let fail0 = early_values.first().copied().unwrap_or(0);
     let guard_value_operand = guard_value_operand_present.then_some(guard_value_operand);
-    // pyjitpl.py: the virtualizable stays a GC root for the whole
-    // handle_fail. `must_compile` and `get_compiled_exit_layout` allocate,
-    // so root failarg 0 before either runs — a raw `&mut PyFrame` taken
-    // here would dangle by the time `trace_and_compile_from_bridge`
-    // builds its `FrameRoot`.
-    if fail0 == 0 {
-        return None;
-    }
-    let mut frame_root = FrameRoot::new(unsafe { &mut *(fail0 as *mut PyFrame) });
+    // Root every Ref failarg. `FrameRoot` only when the driver has a
+    // virtualizable.
+    let _early_roots = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&mut early_values, |index| {
+            fail_types.get(index) == Some(&majit_ir::Type::Ref)
+        })
+    };
+    let mut frame_root = if no_vinfo || fail0 == 0 {
+        None
+    } else {
+        Some(FrameRoot::new(unsafe { &mut *(fail0 as *mut PyFrame) }))
+    };
 
     // compile.py handle_fail traces exception guards the same as any other
     // (`must_compile` then `_trace_and_compile_from_bridge`). The exception
@@ -4707,6 +5312,9 @@ fn jit_ca_handle_guard_failure(
     };
     // compile.py: must_compile() and not stack_almost_full()
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
+        return None;
+    }
+    if !no_vinfo && frame_root.is_none() {
         return None;
     }
 
@@ -4742,16 +5350,20 @@ fn jit_ca_handle_guard_failure(
         // (`DeadFrameRefRoots` / `compute_gcmap`).
         let _deadframe_roots = unsafe {
             majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
-                // Slot 0 is the virtualizable (PyFrame). It is a GC
-                // object even when `exit_types` has not yet classified
-                // it; a CA bridge walk that forces `f_locals` reads it
-                // as `live_vable_frame_addr`.
-                index == 0 || exit_layout.is_traced_ref_slot(index)
+                if no_vinfo {
+                    fail_types.get(index) == Some(&majit_ir::Type::Ref)
+                } else {
+                    // Slot 0 is the virtualizable (PyFrame). It is a GC
+                    // object even when `exit_types` has not yet classified
+                    // it; a CA bridge walk that forces `f_locals` reads it
+                    // as `live_vable_frame_addr`.
+                    index == 0 || exit_layout.is_traced_ref_slot(index)
+                }
             })
         };
         trace_and_compile_from_bridge(
             &descr_arc,
-            frame_root.frame(),
+            frame_root.as_mut().map(|root| root.frame()),
             &raw_values,
             &exit_layout,
             guard_exc,
@@ -4764,7 +5376,10 @@ fn jit_ca_handle_guard_failure(
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][ca-bridge] compiled={} key={} trace={} fail={}",
-            matches!(resolution, BridgeResolution::CompiledContinue),
+            matches!(
+                resolution,
+                BridgeResolution::CompiledContinue | BridgeResolution::CompiledContinueLive(_)
+            ),
             source_green_key,
             source_trace_id,
             source_fail_index,
@@ -4782,8 +5397,27 @@ fn jit_ca_handle_guard_failure(
             // The bridge walk and compile allocate, so a minor collection may
             // have moved a nursery frame since `fail0` was read. The root holds
             // the forwarded address.
-            let frame = frame_root.frame() as *mut PyFrame as i64;
-            Some(run_frame_through_portal(frame, PortalEntry::Resume))
+            if no_vinfo {
+                None
+            } else {
+                let frame = frame_root
+                    .as_mut()
+                    .expect("pypyjit CA CompiledContinue holds a FrameRoot")
+                    .frame() as *mut PyFrame as i64;
+                Some(run_frame_through_portal(frame, PortalEntry::Resume))
+            }
+        }
+        BridgeResolution::CompiledContinueLive(live) => {
+            match continue_generatorentry_portal(&live) {
+                Some(Ok(result)) => {
+                    clear_residual_call_exception();
+                    Some(result as i64)
+                }
+                Some(Err(mut err)) => Some(ca_finish_raise_word(
+                    pyre_jit_trace::state::ConcreteValue::Ref(err.to_exc_object()),
+                )),
+                None => None,
+            }
         }
         BridgeResolution::ResumeBlackhole => None,
         // `blackhole.py` `_exit_frame_with_exception` /
@@ -4830,9 +5464,6 @@ fn try_compile_ca_bridge(
     // exception live. `0` is the no-exception resume.
     guard_exc: i64,
 ) -> Option<CaFrameCompletion> {
-    if raw_values.is_empty() {
-        return None;
-    }
     let Some((source_green_key, _, _)) = bridge_source_identity_from_descr(descr_arc) else {
         return None;
     };
@@ -4848,17 +5479,37 @@ fn try_compile_ca_bridge(
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
         return None;
     }
+    let no_vinfo = guard_driver_has_no_vable(descr_arc);
     // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
     // descr's own; a bridge guard has no frontend record.
-    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
-    let frame_ptr = raw_values[0] as *mut PyFrame;
-    if frame_ptr.is_null() {
-        return None;
-    }
-    let frame = unsafe { &mut *frame_ptr };
-    let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
-    let resolution =
-        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, guard_exc, false);
+    let exit_layout = majit_metainterp::exit_layout_for_descr(descr_arc);
+    let resolution = {
+        let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
+        if no_vinfo {
+            trace_and_compile_from_bridge(
+                descr_arc,
+                None,
+                raw_values,
+                &exit_layout,
+                guard_exc,
+                false,
+            )
+        } else {
+            let frame_ptr = raw_values.first().copied().unwrap_or(0) as *mut PyFrame;
+            if frame_ptr.is_null() {
+                return None;
+            }
+            let frame = unsafe { &mut *frame_ptr };
+            trace_and_compile_from_bridge(
+                descr_arc,
+                Some(frame),
+                raw_values,
+                &exit_layout,
+                guard_exc,
+                false,
+            )
+        }
+    };
     // `blackhole.py` `_exit_frame_with_exception` /
     // `jitexc.py` `ExitFrameWithExceptionRef` leaves the assembler-called
     // frame. The walk's own `FinishConcrete::Raise` still stashes and
@@ -4866,7 +5517,20 @@ fn try_compile_ca_bridge(
     let completion = match resolution {
         BridgeResolution::FinishedException(cv) => Some(CaFrameCompletion::Raised(cv)),
         BridgeResolution::Finished(cv) => Some(CaFrameCompletion::Returned(cv)),
-        BridgeResolution::CompiledContinue | BridgeResolution::ResumeBlackhole => None,
+        BridgeResolution::CompiledContinueLive(live) if no_vinfo => {
+            match continue_generatorentry_portal(&live) {
+                Some(Ok(result)) => Some(CaFrameCompletion::Returned(
+                    pyre_jit_trace::state::ConcreteValue::Ref(result),
+                )),
+                Some(Err(mut err)) => Some(CaFrameCompletion::Raised(
+                    pyre_jit_trace::state::ConcreteValue::Ref(err.to_exc_object()),
+                )),
+                None => None,
+            }
+        }
+        BridgeResolution::CompiledContinue
+        | BridgeResolution::CompiledContinueLive(_)
+        | BridgeResolution::ResumeBlackhole => None,
     };
     // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
     crate::eval::register_quasi_immutable_deps(owning_key);
@@ -5028,9 +5692,18 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // blackhole resume after the bridge attempt.
             let _parked_guard_exc = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
+            let no_vinfo = guard_driver_has_no_vable(&descr_arc);
+            let fail_types: Vec<majit_ir::Type> = descr_arc
+                .as_fail_descr()
+                .map(|fd| fd.fail_arg_types().to_vec())
+                .unwrap_or_default();
             let _deadframe_roots = unsafe {
                 majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
-                    exit_layout.is_traced_ref_slot(index)
+                    if no_vinfo {
+                        fail_types.get(index) == Some(&majit_ir::Type::Ref)
+                    } else {
+                        exit_layout.is_traced_ref_slot(index)
+                    }
                 })
             };
             // compile.py ResumeGuardForcedDescr.handle_fail reads
@@ -5070,7 +5743,11 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // dropped into a replay.
             let ca_finished_frame = CA_WALK_FINISHED_FRAME.with(|c| c.replace(0));
             let ca_adopted_frame = CA_WALK_ADOPTED_FRAME.with(|c| c.replace(0));
-            let callee_frame = raw_values.first().copied().unwrap_or(0) as usize;
+            let callee_frame = if no_vinfo {
+                0
+            } else {
+                raw_values.first().copied().unwrap_or(0) as usize
+            };
             if let Some(result) =
                 ca_complete_after_bridge_walk(ca_finished_frame, ca_adopted_frame, callee_frame)
             {

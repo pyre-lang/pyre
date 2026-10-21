@@ -464,8 +464,8 @@ pub fn build_value_to_hlvalue_map(
                 }
                 OpKind::ConstRefAddr(addr) => {
                     map.insert(
-                        result,
-                        Hlvalue::Constant(const_ref_gcref_constant(Some(*addr))),
+                        result.clone(),
+                        const_ref_addr_define_hlvalue(*addr, &result),
                     );
                 }
                 _ => {}
@@ -499,6 +499,22 @@ fn const_ref_gcref_constant(addr: Option<i64>) -> Constant {
         Some(a) => _ptr::new_with_solid(*gcref_t, Ok(Some(_ptr_obj::IntCast(a))), true),
     };
     Constant::with_concretetype(ConstValue::LLPtr(Box::new(p)), GCREF.clone())
+}
+
+/// A JitDriver NamedConst is a frozen PBC with no attributes:
+/// `rpbc.py SingleFrozenPBCRepr.lowleveltype = Void`. The frontend
+/// stamps that on the producer (`front/mir.rs`); honour it here so
+/// the rtyper does not rewrite the graph-only `ConstRefAddr` token
+/// into a GCREF.
+fn const_ref_addr_define_hlvalue(addr: i64, result: &Variable) -> Hlvalue {
+    if FunctionGraph::concretetype_of(result) == crate::model::ConcreteType::Void {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    } else {
+        Hlvalue::Constant(const_ref_gcref_constant(Some(addr)))
+    }
 }
 
 /// A Void-typed operand is spelled as a Void `Constant`, never as a
@@ -4655,9 +4671,13 @@ fn legacy_const_define_hlvalue(
             ConstValue::None,
             LowLevelType::Void,
         )))),
-        OpKind::ConstRefAddr(addr) => Ok(Some(Hlvalue::Constant(const_ref_gcref_constant(Some(
-            *addr,
-        ))))),
+        OpKind::ConstRefAddr(addr) => {
+            let result = op
+                .result
+                .as_ref()
+                .expect("const-define result present after the result.is_none() guard");
+            Ok(Some(const_ref_addr_define_hlvalue(*addr, result)))
+        }
         // Prebuilt-constant-array define-op.  A module-level constant
         // array (`OP_STACKDEL: [i32; N]`) is carried as a bare immutable
         // `Constant(list)`; `immutableconstant` annotates it `SomeList`

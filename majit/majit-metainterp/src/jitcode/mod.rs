@@ -1167,6 +1167,50 @@ impl JitCode {
         }
         Some(site)
     }
+
+    /// Caller frame suspended in `BC_INLINE_CALL` at `end_pc`, checked
+    /// against the stacked callee.
+    ///
+    /// `resume.py rebuild_from_resumedata` seats each section with
+    /// `newframe` + `setup_resume_at_op`; `pyjitpl.py
+    /// MIFrame.make_result_of_lastop` recovers the result register from
+    /// the bytecode. The resume stream does not carry either
+    /// (`opencoder.py _ensure_parent_resumedata` blanks the result
+    /// register).
+    pub fn inline_resume_site_for(
+        &self,
+        end_pc: usize,
+        callee: &JitCode,
+    ) -> Result<InlineCallSite, InlineResumeSiteError> {
+        let site = self
+            .inline_call_ending_at(end_pc)
+            .ok_or(InlineResumeSiteError::NoInlineCallSite)?;
+        let named = self
+            .descr_at(site.sub_idx)
+            .and_then(RuntimeBhDescr::as_jitcode_owned)
+            .ok_or(InlineResumeSiteError::CallSiteNotAJitcode)?;
+        if named.try_index() != callee.try_index() {
+            return Err(InlineResumeSiteError::CallSiteCalleeMismatch);
+        }
+        let returns = callee.trailing_return_info().map(|(kind, _)| kind);
+        if returns.is_some() && site.result_slot().map(|(kind, _)| kind) != returns {
+            return Err(InlineResumeSiteError::CalleeReturnSlotMismatch);
+        }
+        Ok(site)
+    }
+}
+
+/// Why [`JitCode::inline_resume_site_for`] declined a caller/callee pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineResumeSiteError {
+    /// The caller pc is not the far side of a `BC_INLINE_CALL`.
+    NoInlineCallSite,
+    /// The call site's `j` operand does not resolve to a JitCode.
+    CallSiteNotAJitcode,
+    /// The call site names a different callee than the stacked section.
+    CallSiteCalleeMismatch,
+    /// The callee ends in a typed return but the call has no matching slot.
+    CalleeReturnSlotMismatch,
 }
 
 /// The encoded width of a leftover `BC_INLINE_CALL` that passes no

@@ -75,7 +75,17 @@ pub fn annotate(graph: &FunctionGraph) {
             // Propagate annotations through ops in this block
             for op in &block.operations {
                 if let Some(result) = op.result.as_ref() {
-                    let inferred = infer_op_type(&op.kind);
+                    let inferred = match &op.kind {
+                        OpKind::ConstRefAddr(_)
+                            if FunctionGraph::concretetype_of(result)
+                                == crate::model::ConcreteType::Void =>
+                        {
+                            // Frozen PBC with no attributes:
+                            // `rpbc.py SingleFrozenPBCRepr.lowleveltype = Void`.
+                            ValueType::Void
+                        }
+                        _ => infer_op_type(&op.kind),
+                    };
                     let current = read_binding(result);
                     let merged = union_type(&current, &inferred);
                     if merged != current {

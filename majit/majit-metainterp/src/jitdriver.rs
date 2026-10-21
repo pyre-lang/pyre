@@ -2179,6 +2179,25 @@ impl GuardResumeDecline {
     }
 }
 
+impl From<crate::jitcode::InlineResumeSiteError> for GuardResumeDecline {
+    fn from(err: crate::jitcode::InlineResumeSiteError) -> Self {
+        match err {
+            crate::jitcode::InlineResumeSiteError::NoInlineCallSite => {
+                GuardResumeDecline::NoInlineCallSite
+            }
+            crate::jitcode::InlineResumeSiteError::CallSiteNotAJitcode => {
+                GuardResumeDecline::CallSiteNotAJitcode
+            }
+            crate::jitcode::InlineResumeSiteError::CallSiteCalleeMismatch => {
+                GuardResumeDecline::CallSiteCalleeMismatch
+            }
+            crate::jitcode::InlineResumeSiteError::CalleeReturnSlotMismatch => {
+                GuardResumeDecline::CalleeReturnSlotMismatch
+            }
+        }
+    }
+}
+
 impl<S: JitState> crate::jit::JitParameterTarget for JitDriver<S> {
     fn set_param(&mut self, name: &str, value: i64) -> Result<(), crate::jit::JitHintError> {
         // warmstate.py JitCounter.compute_threshold: nonpositive thresholds
@@ -6282,59 +6301,17 @@ impl<S: JitState> JitDriver<S> {
                     call_sites.push(None);
                     continue;
                 };
-                let Some(site) = jitcode.inline_call_ending_at(*pc) else {
-                    if crate::bridge_debug_enabled() {
-                        eprintln!(
-                            "[bridgeB] DECLINE no inline call ending at depth={depth} pc={pc} jc={:?}",
-                            jitcode.name()
-                        );
-                    }
-                    return Err(Decline::NoInlineCallSite);
-                };
-                // `as_jitcode_owned`, not `as_jitcode`: a self-recursive
-                // `#[jit_inline]` helper's back edge is a `Weak` descr, so the
-                // owning variant alone misses exactly the recursion this walk
-                // exists to resume through. `BC_INLINE_CALL` resolves its `j`
-                // operand the same way.
-                let Some(named) = jitcode
-                    .descr_at(site.sub_idx)
-                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned)
-                else {
-                    if crate::bridge_debug_enabled() {
-                        eprintln!(
-                            "[bridgeB] DECLINE descrs[{}] is not a JitCode at depth={depth}",
-                            site.sub_idx,
-                        );
-                    }
-                    return Err(Decline::CallSiteNotAJitcode);
-                };
-                if named.try_index() != callee.try_index() {
-                    if crate::bridge_debug_enabled() {
-                        eprintln!(
-                            "[bridgeB] DECLINE call at depth={depth} names {:?} not {:?}",
-                            named.try_index(),
-                            callee.try_index()
-                        );
-                    }
-                    return Err(Decline::CallSiteCalleeMismatch);
-                }
-                // The pop reads the return kind off the callee's own trailing
-                // return opcode and then requires the matching caller slot
-                // (`dispatch.rs`, the inline-return arm). A callee that returns
-                // a value into no slot would panic there, so decline here
-                // instead — the blackhole arm rebuilds every frame either way.
-                let returns = crate::jitcode::JitCodeRuntimeExt::trailing_return_info(&**callee)
-                    .map(|(kind, _)| kind);
-                let slot = site.result_slot();
-                if returns.is_some() && slot.map(|(kind, _)| kind) != returns {
-                    if crate::bridge_debug_enabled() {
-                        eprintln!(
-                            "[bridgeB] DECLINE depth={depth} callee returns {returns:?} but the call slot is {slot:?}"
-                        );
-                    }
-                    return Err(Decline::CalleeReturnSlotMismatch);
-                }
-                call_sites.push(Some(site));
+                call_sites.push(Some(jitcode.inline_resume_site_for(*pc, callee).map_err(
+                    |why| {
+                        if crate::bridge_debug_enabled() {
+                            eprintln!(
+                                "[bridgeB] DECLINE inline resume site at depth={depth} pc={pc} jc={:?}: {why:?}",
+                                jitcode.name()
+                            );
+                        }
+                        why
+                    },
+                )?));
             }
             let allocator = self.blackhole_allocator.as_deref();
             let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;

@@ -5935,6 +5935,27 @@ fn load_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>
         .clone()
 }
 
+/// `call.py grab_initial_jitcodes` `jd.mainjitcode` for
+/// `generatorentry_driver` (`GENENTRY_PORTAL_KEY`).
+static GENENTRY_PORTAL_MAINJITCODE: std::sync::OnceLock<
+    Option<std::sync::Arc<majit_metainterp::JitCode>>,
+> = std::sync::OnceLock::new();
+
+fn load_genentry_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>> {
+    GENENTRY_PORTAL_MAINJITCODE
+        .get_or_init(|| {
+            pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
+                pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
+            )
+            .map(|canonical| {
+                std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
+                    (*canonical).clone(),
+                ))
+            })
+        })
+        .clone()
+}
+
 fn build_jit_driver_pair() -> JitDriverPair {
     crate::call_jit::publish_pyre_host_hooks();
     // `warmspot.py` `WarmRunnerDesc.make_virtualizable_infos` builds this
@@ -6063,6 +6084,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd2.portal_runner_adr = ll_generatorentry_portal_runner_shim as *const () as i64;
     jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
+    d.meta_interp_mut()
+        .jitdriver_sd_mut(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize)
+        .expect("generatorentry jitdrivers_sd slot")
+        .mainjitcode_loader = Some(load_genentry_portal_mainjitcode);
     // rlib/jit.py `set_param(driver, 'threshold', n)` on that driver's
     // `jitdriver_sd.warmstate`; `PYRE_JIT` below is `set_param(None, ...)`.
     let extra_threshold = i64::from(jd1_trace_threshold());
@@ -8566,9 +8591,11 @@ fn portal_error_from_exc_ref(exc: i64) -> Option<pyre_interpreter::error::PyErro
 
 /// `execute_assembler` for a compiled `generatorentry` cell.
 ///
-/// Guard exits resume through `resume_in_blackhole`. `ContinueRunningNormally`
-/// re-enters. A finish ref is the yielded value. `ExitFrameWithExceptionRef`
-/// is the portal error, `StopIteration` included.
+/// Guard exits tick `must_compile` then `_trace_and_compile_from_bridge`
+/// (`warmstate.py execute_assembler` → `fail_descr.handle_fail`).
+/// `ContinueRunningNormally` re-enters the assembler. A finish ref is
+/// the yielded value. `ExitFrameWithExceptionRef` is the portal error,
+/// `StopIteration` included.
 fn run_compiled_generatorentry(
     green_key: u64,
     live_values: &[majit_ir::Value],
@@ -8589,6 +8616,8 @@ fn run_compiled_generatorentry(
                         majit_metainterp::raw_exit_values(&r.typed_values),
                         r.exit_layout.clone(),
                         r.exception.exc_value,
+                        r.descr_arc.clone(),
+                        r.guard_value_operand,
                     )
                 })
         };
@@ -8600,6 +8629,8 @@ fn run_compiled_generatorentry(
             mut values,
             exit_layout,
             guard_exc,
+            descr_arc,
+            guard_value_operand,
         )) = extracted
         else {
             if dbg {
@@ -8634,6 +8665,66 @@ fn run_compiled_generatorentry(
                 eprintln!("[jd2] run_compiled no resume fail_index={fail_index}");
             }
             return None;
+        }
+        // `compile.py AbstractResumeGuardDescr.handle_fail`:
+        // `must_compile` then `_trace_and_compile_from_bridge`.
+        if let Some(ref descr_arc) = descr_arc {
+            let (must_compile, _) = {
+                let (driver, _) = driver_pair();
+                driver.meta_interp_mut().must_compile_with_values(
+                    descr_arc,
+                    &values,
+                    guard_value_operand,
+                    green_key,
+                )
+            };
+            if must_compile && !majit_metainterp::MetaInterp::<()>::stack_almost_full() {
+                let ref_slots: Vec<bool> = descr_arc
+                    .as_fail_descr()
+                    .map(|fd| {
+                        fd.fail_arg_types()
+                            .iter()
+                            .map(|ty| *ty == majit_ir::Type::Ref)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let _ref_roots = unsafe {
+                    majit_metainterp::resume::DeadFrameRefRoots::enter(&mut values, |index| {
+                        ref_slots.get(index).copied().unwrap_or(false)
+                    })
+                };
+                let layout = exit_layout
+                    .as_deref()
+                    .expect("a guard exit carrying resume storage carries its layout");
+                let _guard = GuardCompilingScope::new(descr_arc);
+                let resolution = crate::call_jit::trace_and_compile_from_bridge(
+                    descr_arc, None, &values, layout, guard_exc, true,
+                );
+                match resolution {
+                    crate::call_jit::BridgeResolution::CompiledContinueLive(live) => {
+                        // The walk already ran part of the send. Re-enter with
+                        // the merge-point args it closed on.
+                        if let Some((w_gen, w_arg)) = crate::call_jit::genentry_continue_reds(&live)
+                        {
+                            live_values =
+                                pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
+                            continue;
+                        }
+                    }
+                    crate::call_jit::BridgeResolution::CompiledContinue => {}
+                    crate::call_jit::BridgeResolution::Finished(cv) => {
+                        let v = match cv {
+                            pyre_jit_trace::state::ConcreteValue::Null => pyre_object::w_none(),
+                            other => other.to_pyobj(),
+                        };
+                        return Some(Ok(v));
+                    }
+                    crate::call_jit::BridgeResolution::FinishedException(cv) => {
+                        return Some(Err(finish_concrete_raise_error(cv)));
+                    }
+                    crate::call_jit::BridgeResolution::ResumeBlackhole => {}
+                }
+            }
         }
         // A non-StopIteration guard exit still has to run the portal
         // jitcode's `catch_exception` / `finally` (`blackhole.py`
@@ -11823,7 +11914,7 @@ fn handle_fail(
             // can hand a concrete `Finish` result back to its portal.
             crate::call_jit::trace_and_compile_from_bridge(
                 descr_arc,
-                frame,
+                Some(frame),
                 raw_values,
                 exit_layout,
                 guard_exc,
@@ -11855,6 +11946,12 @@ fn handle_fail(
                 // compile.py:708: bridge compiled → ContinueRunningNormally.
                 // RPython: the bridge is attached to the guard descr;
                 // re-entering compiled code will follow the bridge.
+                return (
+                    HandleFailOutcome::BridgeCompiled,
+                    savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                );
+            }
+            crate::call_jit::BridgeResolution::CompiledContinueLive(_) => {
                 return (
                     HandleFailOutcome::BridgeCompiled,
                     savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),

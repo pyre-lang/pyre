@@ -3736,6 +3736,20 @@ impl<'a> Transformer<'a> {
                 }
                 RewriteResult::Replace(Vec::new())
             }
+            // A JitDriver NamedConst is `SingleFrozenPBCRepr`
+            // (`rpbc.py`), `lowleveltype = Void`. The frontend keeps a
+            // graph-only `ConstRefAddr` token until this rewrite;
+            // `flatten.py insert_renamings` skips `v.concretetype is
+            // lltype.Void`, and `assembler.py emit_const` never sees a
+            // Void constant. Erase the define the same way ConstNone is
+            // erased, so no `ref_copy` / `constants_r` slot is minted.
+            OpKind::ConstRefAddr(_)
+                if op.result.as_ref().is_some_and(|result| {
+                    FunctionGraph::concretetype_of(result) == crate::model::ConcreteType::Void
+                }) =>
+            {
+                RewriteResult::Replace(Vec::new())
+            }
             // High-level `newlist(item0, …, itemN)` (`object_array_unsize_newlist`).
             // `rtype_newlist` expands this on the flowspace graph; jtransform
             // walks the model graph, so this arm performs the same
@@ -17417,6 +17431,28 @@ mod tests {
         );
         assert_eq!(
             FunctionGraph::concretetype_of(&unit),
+            crate::model::ConcreteType::Void
+        );
+    }
+
+    #[test]
+    fn transform_graph_erases_void_jitdriver_namedconst() {
+        let mut graph = FunctionGraph::new("void_namedconst");
+        let receiver = graph.alloc_value_var_with_type(ConcreteType::Void);
+        graph.push_op_with_result_var(graph.startblock, OpKind::ConstRefAddr(8), receiver.clone());
+        graph.set_return(graph.startblock, None);
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        assert!(
+            !transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ConstRefAddr(_))),
+            "Void JitDriver NamedConst must not become a ref_copy / constants_r slot"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&receiver),
             crate::model::ConcreteType::Void
         );
     }

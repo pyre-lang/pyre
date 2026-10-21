@@ -21440,7 +21440,10 @@ impl<'a> Lowering<'a> {
                 // A prebuilt JitDriver `const` has no registered address. Its
                 // value exists in the flow graph only as operand zero of a
                 // marker method: `ExtEnterLeaveMarker.specialize_call` makes
-                // it a receiver Constant, rtyping erases it to `Void`, and
+                // it a receiver Constant. `rpbc.py SingleFrozenPBCRepr`
+                // gives a frozen PBC with no attributes `lltype.Void`; stamp
+                // that here so pre-rtyper `split_block` rematerialises
+                // `same_as(Constant(None, Void))` (`unsimplify.py`).
                 // `Transformer.try_handle_jit_marker` discards the receiver.
                 // Keep the producer constant-shaped so `split_block` can
                 // rematerialise it, without turning the const path into a
@@ -21450,7 +21453,7 @@ impl<'a> Lowering<'a> {
                 if self.is_jitdriver_named_const(id, &place_ty) {
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
                     let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
