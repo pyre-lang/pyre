@@ -3567,6 +3567,26 @@ fn is_box_new_uninit_path(segments: &[String], args: &[LinkArg]) -> bool {
     args.is_empty() && function_path_ends_with(segments, &["boxed", "Box", "new_uninit"])
 }
 
+/// Fresh-aggregate producer: a `SyntheticTransparentCtor` stack construct
+/// or a no-arg `boxed::Box::new_uninit` heap box.  `remove_dead_aggregates`
+/// uses this as the `remove_simple_mallocs` predicate — a `FieldWrite` into
+/// such a result is a store into a malloc that never escaped, never a heap
+/// side effect through an Input, a load, or a cast.
+pub(crate) fn is_fresh_aggregate_ctor(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            ..
+        } => true,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } => is_box_new_uninit_path(segments, args),
+        _ => false,
+    }
+}
+
 /// True when `segments` is exactly `core::ptr::write` of two arguments — the
 /// store that initializes an uninit box, and the raw-write arm
 /// `sink_fused_boxing_aggregates_at_raw_writes` rematerializes.
@@ -3589,25 +3609,6 @@ fn is_assume_init_path(segments: &[String], args: &[LinkArg]) -> bool {
 
 pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::Variable;
-
-    let is_removable_ctor = |kind: &OpKind| match kind {
-        OpKind::Call {
-            target: CallTarget::SyntheticTransparentCtor { .. },
-            ..
-        } => true,
-        // `Box::new_uninit()` — a no-arg heap-box allocation. The `vec![…]`
-        // construction (`box_assume_init_into_vec_unsafe(box [..])`) whose
-        // consumer `front::mir` rewrote to `newlist` leaves the box dead:
-        // its result flows only into the `FieldWrite` that stored the now-
-        // unused `Array` aggregate. Treat it as a removable ctor so the box,
-        // its store, and (once un-pinned) the `Array` cascade out together.
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } => is_box_new_uninit_path(segments, args),
-        _ => false,
-    };
 
     let mut total_removed = 0usize;
     loop {
@@ -3663,7 +3664,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
         let mut dead: HashSet<Variable> = HashSet::new();
         for block in &graph.blocks {
             for op in &block.operations {
-                if !is_removable_ctor(&op.kind) {
+                if !is_fresh_aggregate_ctor(&op.kind) {
                     continue;
                 }
                 let Some(result) = &op.result else { continue };
@@ -3692,7 +3693,7 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
         let mut removed = 0usize;
         for block in &mut graph.blocks {
             block.operations.retain(|op| {
-                let drop = if is_removable_ctor(&op.kind) {
+                let drop = if is_fresh_aggregate_ctor(&op.kind) {
                     op.result.as_ref().is_some_and(|r| dead.contains(r))
                 } else if let OpKind::FieldWrite { base, .. } = &op.kind {
                     dead.contains(base)
@@ -6205,44 +6206,38 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     use crate::flowspace::model::Variable;
     use std::collections::HashMap;
 
-    let is_removable_producer = |kind: &OpKind| match kind {
-        OpKind::Call {
-            target: CallTarget::SyntheticTransparentCtor { .. },
-            ..
-        } => true,
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } => {
-            // `__cast_instance_intrinsic` — the front-end pointer-downcast
-            // narrow (`cast_instance_call`: operand + const(root)).
-            // Pin the arity so an unrelated multi-arg path that happens to
-            // share the synthetic marker leaf is never swept as a cast.
-            let is_cast = segments.first().map(String::as_str)
-                == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                && args.len() == 2;
-            // The same single-argument runtime helper recognized by
-            // `get_instantiate_arg_addr`; its result feeds only the class word
-            // removed with the dead header. Restrict the owner so an unrelated
-            // function with the same leaf is never classified as removable.
-            let is_get_instantiate = args.len() == 1
-                && matches!(
-                    segments.as_slice(),
-                    [.., owner, leaf]
-                        if matches!(owner.as_str(), "pyobject" | "object_model")
-                            && leaf == "get_instantiate"
-                );
-            // `boxed::Box::new_uninit()` — the no-arg heap-box allocation the
-            // `vec![…]` lowering (`box_assume_init_into_vec_unsafe(box [..])`)
-            // opens.  Once a consumer rewrite turns the `vec!` into a
-            // `newlist`, the box result flows only into the `FieldWrite` that
-            // stored the now-unused `Array` aggregate, so the box is a fresh
-            // alloc nothing reads.  Pin the arity so an unrelated multi-arg
-            // path sharing the leaf is never swept.
-            is_cast || is_get_instantiate || is_box_new_uninit_path(segments, args)
+    let is_removable_producer = |kind: &OpKind| {
+        if is_fresh_aggregate_ctor(kind) {
+            return true;
         }
-        _ => false,
+        match kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } => {
+                // `__cast_instance_intrinsic` — the front-end pointer-downcast
+                // narrow (`cast_instance_call`: operand + const(root)).
+                // Pin the arity so an unrelated multi-arg path that happens to
+                // share the synthetic marker leaf is never swept as a cast.
+                let is_cast = segments.first().map(String::as_str)
+                    == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                    && args.len() == 2;
+                // The same single-argument runtime helper recognized by
+                // `get_instantiate_arg_addr`; its result feeds only the class word
+                // removed with the dead header. Restrict the owner so an unrelated
+                // function with the same leaf is never classified as removable.
+                let is_get_instantiate = args.len() == 1
+                    && matches!(
+                        segments.as_slice(),
+                        [.., owner, leaf]
+                            if matches!(owner.as_str(), "pyobject" | "object_model")
+                                && leaf == "get_instantiate"
+                    );
+                is_cast || is_get_instantiate
+            }
+            _ => false,
+        }
     };
 
     let block_index: HashMap<BlockId, usize> = graph
@@ -6265,18 +6260,7 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
         .blocks
         .iter()
         .flat_map(|b| &b.operations)
-        .filter(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { .. },
-                ..
-            } => true,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                args,
-                ..
-            } => is_box_new_uninit_path(segments, args),
-            _ => false,
-        })
+        .filter(|op| is_fresh_aggregate_ctor(&op.kind))
         .filter_map(|op| op.result.clone())
         .collect();
 
