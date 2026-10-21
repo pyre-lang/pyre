@@ -19602,8 +19602,11 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
     })?;
     let result = crate::box_code_object(code);
+    let result_roots = pyre_object::gc_roots::push_roots();
+    let result_slot = result_roots.base();
+    let result = result_roots.pin_root(result);
     unsafe { crate::pycode::set_compilation_unit_filename_bytes(result, filename_bytes) };
-    Ok(result)
+    Ok(result_roots.get(result_slot))
 }
 
 /// `exec(source_or_code, globals=None, locals=None)` — PyPy:

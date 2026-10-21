@@ -7153,7 +7153,8 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // `is_immutable` follows `pycode.py PyCode._immutable_fields_` per field
     // plus `code_ptr` (`jit_immutable_fields`). `co_name` / `co_qualname` are
     // listed upstream but these slots are realized lazily, so they stay
-    // mutable. `w_globals?` is filled on first execution and then promoted.
+    // mutable. `w_filename` is realized in `PyCode.__init__` and listed
+    // immutable. `w_globals?` is filled on first execution and then promoted.
     let word_int = |key, offset, immutable| (key, offset, WORD, Type::Int, false, immutable, false);
     let word_ref =
         |key, offset, immutable, quasi| (key, offset, WORD, Type::Ref, false, immutable, quasi);
@@ -7267,6 +7268,12 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             word_ref("w_name", std::mem::offset_of!(PyCode, w_name), false, false),
+            word_ref(
+                "w_filename",
+                std::mem::offset_of!(PyCode, w_filename),
+                true,
+                false,
+            ),
             // The translator's `get_type_flag` banks an inline `[T; N]` as
             // one field of T's flag and N times its size, and the EffectInfo
             // write set of `_offset2lineno` names this field, so the runtime
@@ -7375,6 +7382,14 @@ pub fn pycode_w_globals_quasi_descr() -> DescrRef {
 /// it is non-null; a null slot declines to the residual, which realizes it.
 pub fn pycode_w_name_descr() -> DescrRef {
     pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_NAME_OFFSET)
+}
+
+/// `PyCode.w_filename` — `pycode.py PyCode.__init__` stores
+/// `space.newfilename(filename)` before the code object is published
+/// (`_immutable_fields_` lists `w_filename`). `importing.py update_code_filenames`
+/// is the later writer. `w_code_filename_obj` reads the slot.
+pub fn pycode_w_filename_descr() -> DescrRef {
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_FILENAME_OFFSET)
 }
 
 /// `PyCode.co_firstlineno_raw` — a signed 32-bit slot, because 3.14's
@@ -9537,6 +9552,16 @@ mod tests {
                 17,
                 false,
             ),
+            (
+                pycode_w_filename_descr(),
+                "PyCode.w_filename",
+                pyre_interpreter::pycode::CODE_W_FILENAME_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                18,
+                true,
+            ),
         ];
         let mut shared_parent = None;
         for (descr, name, offset, field_size, field_type, signed, index_in_parent, always_pure) in
@@ -9606,6 +9631,7 @@ mod tests {
                 "PyCode.co_names_w",
                 "PyCode.w_qualname",
                 "PyCode.w_name",
+                "PyCode.w_filename",
                 "PyCode.addr2line_memo",
                 "PyCode.loop_header_info",
                 "PyCode.w_globals_watchers.ptr",

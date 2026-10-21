@@ -527,10 +527,10 @@ unsafe fn walk_raw_function_roots(
     }
 }
 
-/// Forward a `PyCode`'s cached globals, realized constants, qualname and
-/// mapdict-method entries. This is both the managed wrapper's custom trace and
-/// the explicit walk for bootstrap wrappers outside the collector. No-op for
-/// non-code values.
+/// Forward a `PyCode`'s cached globals, realized constants, qualname,
+/// filename and mapdict-method entries. This is both the managed wrapper's
+/// custom trace and the explicit walk for bootstrap wrappers outside the
+/// collector. No-op for non-code values.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -575,6 +575,10 @@ pub unsafe fn walk_enrolled_code_roots(
         visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         // `co_name` is realized and retained the same way.
         visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // `pycode.py PyCode.__init__` stores `w_filename` as a movable
+        // managed string (`objspace.py newfilename`); `importing.py
+        // update_code_filenames` may replace it. Trace and forward the slot.
+        visitor(&mut *(&mut code.w_filename as *mut PyObjectRef as *mut majit_ir::GcRef));
         // `PyCode.co_consts_w` is a GCREF to a `GcArray(OBJECTPTR)` whose
         // own trace names the items. An item store barriers the array
         // (`FixedObjectArray::set_ref`), so an old array holding a young
