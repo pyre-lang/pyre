@@ -77,8 +77,18 @@ pub(crate) struct MapOrSite {
     /// owner (matching the variant-qualified `resolve_adt_field` read owner).
     pub some_owner: String,
     /// The closure env ADT `name_path` — the inherent-method owner for the
-    /// `call_once` call the `Some` arm emits.
+    /// `call_once` call the `Some` arm emits.  Empty when
+    /// [`Self::fn_item_segments`] is set: a function item has no closure env
+    /// and the `Some` arm calls the named function directly.
     pub call_once_owner: String,
+    /// When `Some`, the callable is a function item.  The `Some` arm emits
+    /// a direct `Call(FunctionPath)` to these segments — the same op a Rust
+    /// `f(x)` call site lowers to — instead of `call_once(env, (x,))`.
+    pub fn_item_segments: Option<Vec<String>>,
+    /// The function item is an ADT constructor, or a reflexive / widening
+    /// integer `From` identity: the arm builds this aggregate (the shape
+    /// `Rvalue::Aggregate` emits, or the operand itself) instead of calling it.
+    pub fn_item_ctor: Option<crate::front::mir::AggregateShape>,
     /// The `Option`'s payload `T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` field kind (the closure's unwrapped input).
     pub payload_ty: ValueType,
@@ -227,14 +237,16 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     // All structural validation passed; mutate the graph.
 
     // `then_bb` (`Some`) carries `carried` plus `opt` (the base for the
-    // `__pos_0` read) and `env` (the `call_once` receiver); `else_bb` (`None`)
-    // carries `carried` plus `default` (the forwarded fallback).  The
+    // `__pos_0` read) and, for a closure, `env` (the `call_once` receiver).
+    // A function item has no env: the arm calls the named function with the
+    // payload.  `else_bb` (`None`) carries `carried` plus `default`.  The
     // source-var lists double as the branch link args.
+    let is_fn_item = site.fn_item_segments.is_some();
     let mut then_sources = carried.clone();
     if !then_sources.contains(&opt) {
         then_sources.push(opt.clone().into_variable());
     }
-    if !then_sources.contains(&env) {
+    if !is_fn_item && !then_sources.contains(&env) {
         then_sources.push(env.clone().into_variable());
     }
     let mut else_sources = carried.clone();
@@ -244,11 +256,9 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(else_sources.len());
 
-    // `then_bb`: payload = opt.__pos_0; result = call_once(env, (payload,)).
+    // `then_bb`: payload = opt.__pos_0; result = f(payload) / call_once(env, (payload,)).
     let opt_in_then = map_source(&then_sources, &then_inputs, &opt)
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
-    let env_in_then = map_source(&then_sources, &then_inputs, &env)
-        .ok_or_else(|| format!("{name}: closure env not threaded into Some arm"))?;
     // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
     // base pointer, so the closure input is the identity on it.
     let payload = if site.niche || site.scalar_niche {
@@ -277,55 +287,77 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         });
         payload
     };
-    // The closure's `Args` tuple `(payload,)` — the transparent-ctor + a
-    // single `__pos_0` FieldWrite, the same shape `Rvalue::Aggregate` emits for
-    // a tuple.  The owner carries the per-shape `<X>`
-    // suffix (`Tuple<FrameDebugData>`) so it keys under the same classdef the
-    // extracted `call_once` reads `.0` from at `resolve_place`.
-    let tuple_owner = format!("Tuple{}", site.args_tuple_suffix);
-    let args_tuple = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(args_tuple.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::synthetic_transparent_ctor(&tuple_owner),
-            args: Vec::new(),
-            result_ty: ValueType::Ref(Some(tuple_owner.clone())),
-        },
-    });
-    // Preserve the source instance annotation at the producing write.  This
-    // is the same ordinary narrowing used for pointer-valued call results;
-    // weakening the shared Tuple field would diverge from RPython's concrete
-    // `InstanceRepr` field setup (`rclass.py`).
-    let payload = emit_narrow(graph, then_bb, payload, &site.payload_class_root);
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: None,
-        kind: OpKind::FieldWrite {
-            base: args_tuple.clone(),
-            field: FieldDescriptor {
-                name: "__pos_0".to_string(),
-                owner_root: Some(tuple_owner.clone()),
-                owner_id: None,
-                base_is_deref: None,
-                taken_by_address: false,
-                inline_vec: false,
-                vec_part: None,
-                owner_declared_gc: None,
-                host_index: None,
-                scalar_word: None,
+    let call_result = if is_fn_item {
+        crate::front::option_closure_select::emit_callable(
+            graph,
+            then_bb,
+            None,
+            &site.call_once_owner,
+            site.fn_item_segments.as_deref(),
+            site.fn_item_ctor.as_ref(),
+            Some((
+                payload,
+                site.payload_ty.clone(),
+                site.payload_class_root.clone(),
+            )),
+            site.result_ty.clone(),
+            &site.args_tuple_suffix,
+        )
+        .map_err(|msg| format!("{name}: {msg}"))?
+    } else {
+        let env_in_then = map_source(&then_sources, &then_inputs, &env)
+            .ok_or_else(|| format!("{name}: closure env not threaded into Some arm"))?;
+        // The closure's `Args` tuple `(payload,)` — the transparent-ctor + a
+        // single `__pos_0` FieldWrite, the same shape `Rvalue::Aggregate` emits for
+        // a tuple.  The owner carries the per-shape `<X>`
+        // suffix (`Tuple<FrameDebugData>`) so it keys under the same classdef the
+        // extracted `call_once` reads `.0` from at `resolve_place`.
+        let tuple_owner = format!("Tuple{}", site.args_tuple_suffix);
+        let args_tuple = graph.alloc_value_var();
+        graph.block_mut(then_bb).operations.push(SpaceOperation {
+            result: Some(args_tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor(&tuple_owner),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(tuple_owner.clone())),
             },
-            value: LinkArg::Value(payload),
-            ty: site.payload_ty.clone(),
-        },
-    });
-    let call_result = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(call_result.clone()),
-        kind: OpKind::Call {
-            target: CallTarget::method("call_once", Some(site.call_once_owner.clone())),
-            args: crate::model::call_args(vec![env_in_then, args_tuple]),
-            result_ty: site.result_ty.clone(),
-        },
-    });
+        });
+        // Preserve the source instance annotation at the producing write.  This
+        // is the same ordinary narrowing used for pointer-valued call results;
+        // weakening the shared Tuple field would diverge from RPython's concrete
+        // `InstanceRepr` field setup (`rclass.py`).
+        let payload = emit_narrow(graph, then_bb, payload, &site.payload_class_root);
+        graph.block_mut(then_bb).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_tuple.clone(),
+                field: FieldDescriptor {
+                    name: "__pos_0".to_string(),
+                    owner_root: Some(tuple_owner.clone()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(payload),
+                ty: site.payload_ty.clone(),
+            },
+        });
+        let call_result = graph.alloc_value_var();
+        graph.block_mut(then_bb).operations.push(SpaceOperation {
+            result: Some(call_result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::method("call_once", Some(site.call_once_owner.clone())),
+                args: crate::model::call_args(vec![env_in_then, args_tuple]),
+                result_ty: site.result_ty.clone(),
+            },
+        });
+        call_result
+    };
     // Re-apply the absorbed `*mut <registered ADT>` narrowing to the closure
     // result so the value B consumes keeps its pointee class (as the original
     // single post-call cast did).
@@ -453,6 +485,8 @@ mod tests {
             option_owner: "core::option::Option".into(),
             some_owner: "core::option::Option::Some".into(),
             call_once_owner: "test::closure".into(),
+            fn_item_segments: None,
+            fn_item_ctor: None,
             payload_ty: ValueType::Int,
             payload_class_root: None,
             result_ty: ValueType::Int,
@@ -539,6 +573,116 @@ mod tests {
             )
             .count();
         assert_eq!(pos0_reads, 1, "the Some arm reads __pos_0");
+    }
+
+    /// `opt.map_or(default, named_fn)`: the Some arm calls the function item
+    /// directly as `f(payload)`, with no `call_once` and no residual `map_or`.
+    #[test]
+    fn rewrite_fn_item_calls_function_in_some_arm() {
+        let mut g = FunctionGraph::new("test_map_or_fn_item");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(-1), true).unwrap();
+        let fn_item = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::model::FN_CONST_HEAD.into(),
+                            "fixture".into(),
+                            "plus_one".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map_or", Some("core::option::Option".into())),
+                    args: crate::model::call_args(vec![opt, default, fn_item]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut site = map_or_site(result);
+        site.call_once_owner = String::new();
+        site.fn_item_segments = Some(vec!["fixture".into(), "plus_one".into()]);
+
+        let rewritten = rewire_map_or_call_sites(&mut g, &[site]);
+        assert_eq!(
+            rewritten, 1,
+            "map_or(opt, default, fn_item) must be rewritten"
+        );
+        let call_targets: Vec<&CallTarget> = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(target),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !call_targets
+                .iter()
+                .any(|t| matches!(t, CallTarget::Method { name, .. } if name == "map_or")),
+            "residual map_or call removed"
+        );
+        assert!(
+            !call_targets
+                .iter()
+                .any(|t| matches!(t, CallTarget::Method { name, .. } if name == "call_once")),
+            "a function item must not go through call_once"
+        );
+        let named_fn_calls: Vec<&SpaceOperation> = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments == &["fixture".to_string(), "plus_one".to_string()]
+                )
+            })
+            .collect();
+        assert_eq!(
+            named_fn_calls.len(),
+            1,
+            "the Some arm calls the named function directly"
+        );
+        let OpKind::Call { args, .. } = &named_fn_calls[0].kind else {
+            panic!("named function call");
+        };
+        assert_eq!(
+            args.len(),
+            1,
+            "the Some arm calls f(payload), not a 0-arg define"
+        );
+        crate::model::prune_dead_phis(&mut g);
+        assert!(
+            !g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+                crate::model::fn_const_segments(match &op.kind {
+                    OpKind::Call { target, .. } => target,
+                    _ => return false,
+                })
+                .is_some()
+            }),
+            "unread function-item define is dropped"
+        );
     }
 
     /// The production shape: a `*mut <registered ADT>` result appends a

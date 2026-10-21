@@ -224,6 +224,11 @@ pub struct PyreFieldDescr {
 /// factories with no source-level array_type_id context; two `None`
 /// entries still collide on the remaining structural tuple just as
 /// the pre-bridge baseline did.
+///
+/// `load_is_acquire` is part of ARRAY identity: an Acquire raw load
+/// is a distinct ARRAY from the plain twin of the same width, so the
+/// registry returns one Arc per `(shape, acquire)` the way
+/// `descr.py` `cache[ARRAY]` returns one object per ARRAY.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct ArrayDescrKey {
     base_size: usize,
@@ -233,6 +238,7 @@ struct ArrayDescrKey {
     signed: bool,
     len_offset: Option<usize>,
     array_type_id: Option<String>,
+    load_is_acquire: bool,
 }
 
 static NEXT_ARRAY_DESCR_ID: AtomicU32 = AtomicU32::new(0);
@@ -298,6 +304,7 @@ fn gc_cached_field_descr(
         index,
         false,
         None,
+        false,
     ) as DescrRef
 }
 
@@ -310,7 +317,7 @@ fn get_or_create_array_descr(
     len_offset: Option<usize>,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
-        base_size, item_size, type_id, item_type, signed, len_offset, None,
+        base_size, item_size, type_id, item_type, signed, len_offset, None, false,
     )
 }
 
@@ -322,6 +329,7 @@ fn get_or_create_array_descr_with_full_id(
     signed: bool,
     len_offset: Option<usize>,
     array_type_id: Option<String>,
+    load_is_acquire: bool,
 ) -> DescrRef {
     let key = ArrayDescrKey {
         base_size,
@@ -331,6 +339,7 @@ fn get_or_create_array_descr_with_full_id(
         signed,
         len_offset,
         array_type_id,
+        load_is_acquire,
     };
     let mut cache = ARRAY_DESCR_REGISTRY.lock();
     if let Some(existing) = cache.get(&key) {
@@ -352,6 +361,11 @@ fn get_or_create_array_descr_with_full_id(
             ._cache_array
             .get(&gc_key)
             .cloned()
+            .filter(|existing| {
+                existing
+                    .as_array_descr()
+                    .is_some_and(|ad| ad.load_is_acquire() == key.load_is_acquire)
+            })
         {
             // Analyzer `arraydescrof_concrete` mints `type_id = 0`.
             // `init_array_descr` leaves `UNSET_GC_TYPE_ID` until
@@ -412,6 +426,7 @@ fn get_or_create_array_descr_with_full_id(
     );
     array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
     array_descr.set_cache_key(cache_key);
+    array_descr = array_descr.with_load_is_acquire(key.load_is_acquire);
     let arc: DescrRef = Arc::new(array_descr);
     cache.insert(key.clone(), arc.clone());
     // Publish the freshly-minted SimpleArrayDescr into
@@ -420,8 +435,12 @@ fn get_or_create_array_descr_with_full_id(
     // returns this exact Arc.  Without an `array_type_id` (legacy
     // `make_array_descr` callers), only the local
     // `ARRAY_DESCR_REGISTRY` carries the descr — gc_cache cannot
-    // identify it.
-    if let Some(ref atid) = key.array_type_id {
+    // identify it.  Acquire descrs stay on the registry key that
+    // includes `load_is_acquire`; `_cache_array` cannot distinguish
+    // that bit.
+    if !key.load_is_acquire
+        && let Some(ref atid) = key.array_type_id
+    {
         majit_ir::descr_registry::register_keyed_array(
             majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid)),
             arc.clone(),
@@ -454,6 +473,7 @@ pub fn raw_carray_descr(item_type: Type, item_size: usize, is_item_signed: bool)
         is_item_signed,
         None,
         Some(format!("majit::raw_carray_{prefix}{}", item_size * 8)),
+        false,
     )
 }
 
@@ -1162,6 +1182,7 @@ fn build_object_descr_group_inlining_parent(
                             is_quasi_immutable: quasi_immutable,
                             index_in_parent,
                             is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
+                            load_is_acquire: false,
                         }
                     },
                 )
@@ -2558,6 +2579,7 @@ fn mint_w_dict_int_alias(field_key: &str, display: &str, offset: usize) -> Descr
         stable_field_index(offset, WORD, Type::Int, false),
         false,
         None,
+        false,
     ) as DescrRef
 }
 
@@ -3829,6 +3851,7 @@ pub fn make_array_descr_with_full_id(
     item_type: Type,
     signed: bool,
     array_type_id: Option<String>,
+    load_is_acquire: bool,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
         base_size,
@@ -3838,6 +3861,7 @@ pub fn make_array_descr_with_full_id(
         signed,
         len_offset,
         array_type_id,
+        load_is_acquire,
     )
 }
 
@@ -4386,6 +4410,7 @@ pub fn dict_lookup_entries_array_descr() -> DescrRef {
             Type::Ref,
             false,
             Some("dict.lookup.entries".to_string()),
+            false,
         )
     });
     DESCR.clone()
@@ -8831,6 +8856,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: Some(true),
+                load_is_acquire: false,
             }],
         );
         assert!(
@@ -9859,6 +9885,7 @@ mod tests {
                 row.index(),
                 false,
                 Some(i),
+                false,
             );
             assert!(
                 std::ptr::eq(
@@ -10099,6 +10126,7 @@ mod tests {
             Type::Int,
             false,
             Some("pyre::test_singleton_id".to_string()),
+            false,
         );
         let b = crate::descr::make_array_descr_with_full_id(
             0,
@@ -10108,6 +10136,7 @@ mod tests {
             Type::Int,
             false,
             Some("pyre::test_singleton_id".to_string()),
+            false,
         );
         assert!(
             std::sync::Arc::ptr_eq(&a, &b),
@@ -10305,6 +10334,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: None,
+                    load_is_acquire: false,
                 },
                 BhFieldSpec {
                     index: 1,
@@ -10319,6 +10349,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 1,
                     is_class_word: None,
+                    load_is_acquire: false,
                 },
             ],
         };
@@ -10335,6 +10366,7 @@ mod tests {
             parent: Some(std::sync::Arc::new(parent)),
             name: "value".into(),
             owner: "Cell".into(),
+            load_is_acquire: false,
         });
         let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
 
@@ -10393,6 +10425,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: None,
+                load_is_acquire: false,
             }],
             is_gc_managed: true,
         });
@@ -10449,6 +10482,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: None,
+                load_is_acquire: false,
             }],
             is_gc_managed: true,
         });
@@ -10489,6 +10523,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: None,
+                load_is_acquire: false,
             }],
         })
     }
@@ -10514,6 +10549,7 @@ mod tests {
             parent: Some(std::sync::Arc::clone(parent)),
             name: name.into(),
             owner: "CodeObject".into(),
+            load_is_acquire: false,
         })
     }
 
@@ -10594,6 +10630,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: None,
+                load_is_acquire: false,
             }],
         });
         let count = bh_field(
@@ -10631,6 +10668,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: None,
+                load_is_acquire: false,
             }],
         });
         let imp = bh_field(
@@ -10682,6 +10720,7 @@ mod tests {
                 parent: Some(std::sync::Arc::clone(parent)),
                 name: name.into(),
                 owner: "CodeObject".into(),
+                load_is_acquire: false,
             })
             .1
         }
@@ -10747,6 +10786,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: None,
+                load_is_acquire: false,
             }],
         });
         let imp = majit_metainterp::field_descr_ref_from_bh(&BhDescr::Field {
@@ -10761,6 +10801,7 @@ mod tests {
             parent: Some(std::sync::Arc::clone(&dyn_parent)),
             name: "imp".into(),
             owner: "DictStrategyRef".into(),
+            load_is_acquire: false,
         })
         .1;
         let vtable = majit_metainterp::field_descr_ref_from_bh(&BhDescr::Field {
@@ -10775,6 +10816,7 @@ mod tests {
             parent: Some(dyn_parent),
             name: "imp.vtable".into(),
             owner: "DictStrategyRef".into(),
+            load_is_acquire: false,
         })
         .1;
         assert_eq!(imp.index(), 1);
@@ -10804,6 +10846,7 @@ mod tests {
             ei_index: u32::MAX,
             array_type_id: Some(atid.to_string()),
             interior_fields: Vec::new(),
+            load_is_acquire: false,
         });
         let runtime = crate::state::int_gcarray_descr();
         assert!(std::sync::Arc::ptr_eq(&bridged, &runtime));
@@ -10832,9 +10875,48 @@ mod tests {
                 ei_index: u32::MAX,
                 array_type_id: Some(atid.to_string()),
                 interior_fields: Vec::new(),
+                load_is_acquire: false,
             }
             .resolve_gc_tid(),
             runtime.as_array_descr().unwrap().type_id(),
+        );
+    }
+
+    #[test]
+    fn make_descr_from_bh_array_preserves_load_is_acquire() {
+        use majit_jitcode::jitcode::BhDescr;
+        let array = |load_is_acquire: bool| BhDescr::Array {
+            base_size: 0,
+            itemsize: 8,
+            len_offset: None,
+            type_id: 0,
+            gc_type_id: 0,
+            item_type: Type::Int,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: false,
+            is_gc_managed: false,
+            ei_index: u32::MAX,
+            array_type_id: Some("majit::raw_carray_u64_w7_acquire_roundtrip".into()),
+            interior_fields: Vec::new(),
+            load_is_acquire,
+        };
+        let bridged = make_descr_from_bh(&array(true));
+        let again = make_descr_from_bh(&array(true));
+        assert!(
+            bridged
+                .as_array_descr()
+                .expect("ArrayDescr")
+                .load_is_acquire()
+        );
+        assert!(Arc::ptr_eq(&bridged, &again));
+        let plain = make_descr_from_bh(&array(false));
+        assert!(!Arc::ptr_eq(&bridged, &plain));
+        assert!(
+            !plain
+                .as_array_descr()
+                .expect("ArrayDescr")
+                .load_is_acquire()
         );
     }
 
@@ -10871,6 +10953,7 @@ mod tests {
             ei_index: u32::MAX,
             array_type_id: Some(atid.to_string()),
             interior_fields: Vec::new(),
+            load_is_acquire: false,
         });
         assert!(std::sync::Arc::ptr_eq(&bridged, &runtime));
         let array = bridged.as_array_descr().expect("ArrayDescr");
@@ -10921,6 +11004,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent,
                     is_class_word: None,
+                    load_is_acquire: false,
                 }
             };
         let key = spec(0, "key", 0, Type::Ref, majit_ir::descr::ArrayFlag::Pointer);
@@ -10951,6 +11035,7 @@ mod tests {
                 ei_index: u32::MAX,
                 array_type_id: None,
                 interior_fields: vec![interior(0, key), interior(3, hash)],
+                load_is_acquire: false,
             }),
             field: Box::new(BhDescr::Field {
                 offset: 8,
@@ -10964,6 +11049,7 @@ mod tests {
                 parent: None,
                 name: "f_valid".into(),
                 owner: String::new(),
+                load_is_acquire: false,
             }),
         });
 
@@ -11027,6 +11113,7 @@ mod tests {
             is_quasi_immutable: false,
             index_in_parent: 0,
             is_class_word: None,
+            load_is_acquire: false,
         };
         let parent = BhSizeSpec {
             size: std::mem::size_of::<usize>(),
@@ -11049,6 +11136,7 @@ mod tests {
             parent: Some(std::sync::Arc::new(parent)),
             name: "capacity".into(),
             owner: "ItemsBlock".into(),
+            load_is_acquire: false,
         });
         let canonical = items_block_capacity_descr();
 
@@ -11103,6 +11191,7 @@ mod tests {
                 parent: None,
                 name: name.into(),
                 owner: "W_ListObject".into(),
+                load_is_acquire: false,
             });
             let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
             assert_ne!(field.offset(), 0, "{name} bridged to the list header");
@@ -11143,6 +11232,7 @@ mod tests {
                 parent: None,
                 name: name.into(),
                 owner: "W_ListObject".into(),
+                load_is_acquire: false,
             });
             let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
             assert!(
@@ -11184,6 +11274,7 @@ mod tests {
                 parent: None,
                 name: name.into(),
                 owner: "W_ListObject".into(),
+                load_is_acquire: false,
             });
             let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
             assert!(
@@ -11345,6 +11436,7 @@ mod tests {
                 parent: None,
                 name: name.into(),
                 owner: owner.into(),
+                load_is_acquire: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&descr, &expected),
@@ -11372,6 +11464,7 @@ mod tests {
             parent: None,
             name: "w_class".into(),
             owner: owner.into(),
+            load_is_acquire: false,
         }
     }
 
@@ -11438,6 +11531,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: None,
+                    load_is_acquire: false,
                 }],
             };
             let descr = make_descr_from_bh(&bh);
@@ -11468,6 +11562,7 @@ mod tests {
                     is_quasi_immutable: false,
                     index_in_parent: 0,
                     is_class_word: None,
+                    load_is_acquire: false,
                 }],
             };
             publish_kind0_parent_layout(spec.clone());
@@ -11585,6 +11680,7 @@ mod tests {
                 parent: None,
                 name: "gil_ready".into(),
                 owner: owner.into(),
+                load_is_acquire: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&descr, &canonical),
@@ -11604,6 +11700,7 @@ mod tests {
             parent: None,
             name: "gil_ready".into(),
             owner: "GilReadyState".into(),
+            load_is_acquire: false,
         });
         assert!(
             !std::sync::Arc::ptr_eq(&narrow, &canonical),
@@ -11681,6 +11778,7 @@ mod tests {
                     parent: None,
                     name: name.into(),
                     owner: owner.into(),
+                    load_is_acquire: false,
                 });
                 assert!(
                     std::sync::Arc::ptr_eq(&descr, &canonical),
@@ -11709,6 +11807,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 0,
                 is_class_word: None,
+                load_is_acquire: false,
             },
             BhFieldSpec {
                 index: 1,
@@ -11723,6 +11822,7 @@ mod tests {
                 is_quasi_immutable: false,
                 index_in_parent: 1,
                 is_class_word: None,
+                load_is_acquire: false,
             },
         ];
         let owner = BhSizeSpec {
@@ -11763,6 +11863,7 @@ mod tests {
             ei_index: u32::MAX,
             array_type_id: None,
             interior_fields,
+            load_is_acquire: false,
         });
         let array = descr.as_array_descr().expect("Array BhDescr -> ArrayDescr");
 
@@ -12796,6 +12897,7 @@ pub(crate) fn publish_borrowed_parent_layout(layout: majit_jitcode::jitcode::Sta
             is_quasi_immutable: field.is_quasi_immutable,
             index_in_parent: field.index_in_parent,
             is_class_word: field.is_class_word,
+            load_is_acquire: field.load_is_acquire,
         })
         .collect();
     let _group = majit_ir::descr::publish_borrowed_struct_layout(
@@ -12869,6 +12971,7 @@ fn field_descr_from_bh_field(
                     // later find cached, so it carries the declaration rather
                     // than leaving the name fallback to seed it.
                     field.is_class_word,
+                    field.load_is_acquire,
                 );
                 return fd as DescrRef;
             }
@@ -13356,6 +13459,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             parent,
             name,
             owner,
+            load_is_acquire,
             ..
         } => {
             let field_key = bh_field_cache_key(owner, name);
@@ -13650,6 +13754,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 // A standalone `BhDescr::Field` carries no layout, so nothing
                 // here declares and the name is what the rebuild reads.
                 is_class_word: None,
+                load_is_acquire: *load_is_acquire,
             };
             if name
                 .rsplit('.')
@@ -13683,6 +13788,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             ei_index,
             array_type_id,
             interior_fields,
+            load_is_acquire,
             ..
         } => {
             // Old serialized BhDescr values default `gc_type_id` to zero.
@@ -13766,6 +13872,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     *item_type,
                     *is_item_signed,
                     array_type_id.clone(),
+                    *load_is_acquire,
                 )
             };
             // `effectinfo.py compute_bitstrings` republish: the
@@ -14342,6 +14449,7 @@ fn mint_field(
         // The analyzer's `field_pos`, always computed — see the note above on
         // its two-word header offset against the runtime publish's numbering.
         Some(*index_in_parent),
+        false,
     ))
 }
 

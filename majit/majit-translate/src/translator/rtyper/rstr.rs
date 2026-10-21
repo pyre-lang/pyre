@@ -50,7 +50,7 @@ use crate::translator::rtyper::lltypesystem::rbytearray::{
 use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
-    build_ll_find_char_helper_graph, build_ll_int_helper_graph,
+    build_ll_find_char_helper_graph, build_ll_find_helper_graph, build_ll_int_helper_graph,
     build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
     build_ll_startswith_char_helper_graph, build_ll_startswith_helper_graph,
     build_ll_str_is_true_helper_graph, build_ll_str_string_helper_graph,
@@ -1888,6 +1888,130 @@ fn call_ll_strcmp_helper(
 /// surface.
 pub(crate) fn pair_string_string_rtype_compare(hop: &HighLevelOp, func: &str) -> RTypeResult {
     pair_abstract_string_rtype_compare(hop, func, STRPTR.clone(), "ll_streq", "ll_strcmp")
+}
+
+/// RPython `pairtype(AbstractStringRepr, AbstractStringRepr).rtype_contains`
+/// (`rstr.py`):
+///
+/// ```python
+/// def rtype_contains(args, hop):
+///     r_str1, r_str2 = args
+///     v_str1, v_str2 = hop.inputargs(r_str1.repr, r_str2.repr)
+///     v_end = hop.gendirectcall(r_str1.ll.ll_strlen, v_str1)
+///     vres = hop.gendirectcall(r_str1.ll.ll_find, v_str1, v_str2,
+///                              hop.inputconst(Signed, 0), v_end)
+///     hop.exception_cannot_occur()
+///     return hop.genop('int_ne', [vres, hop.inputconst(Signed, -1)],
+///                      resulttype=Bool)
+/// ```
+pub(crate) fn pair_string_string_rtype_contains(hop: &HighLevelOp) -> RTypeResult {
+    pair_same_string_rtype_contains(
+        hop,
+        string_repr().as_ref(),
+        "ll_strlen",
+        "ll_find",
+        STRPTR.clone(),
+    )
+}
+
+/// Unicode surface of [`pair_string_string_rtype_contains`] —
+/// `ll_unicode_strlen` / `ll_unicode_find` against `Ptr(UNICODE)`.
+pub(crate) fn pair_unicode_unicode_rtype_contains(hop: &HighLevelOp) -> RTypeResult {
+    pair_same_string_rtype_contains(
+        hop,
+        unicode_repr().as_ref(),
+        "ll_unicode_strlen",
+        "ll_unicode_find",
+        UNICODEPTR.clone(),
+    )
+}
+
+/// Abstract pairtype entry used when dispatch reaches
+/// `pair(AbstractStringRepr, AbstractStringRepr)` through the repr MRO.
+pub(crate) fn pair_abstract_string_rtype_contains(
+    r1: &dyn Repr,
+    r2: &dyn Repr,
+    hop: &HighLevelOp,
+) -> RTypeResult {
+    let (strlen_name, find_name) = match r1.repr_class_id() {
+        super::pairtype::ReprClassId::StringRepr => ("ll_strlen", "ll_find"),
+        super::pairtype::ReprClassId::UnicodeRepr => ("ll_unicode_strlen", "ll_unicode_find"),
+        other => {
+            return Err(TyperError::message(format!(
+                "rtype_contains: expected string-family left repr, got {other:?}"
+            )));
+        }
+    };
+    let ptr_lltype = r1.lowleveltype().clone();
+    if r2.lowleveltype() != &ptr_lltype {
+        return Err(TyperError::message(format!(
+            "rtype_contains: mixed string-family pair requires conversion before lowering: left={:?}, right={:?}",
+            r1.lowleveltype(),
+            r2.lowleveltype()
+        )));
+    }
+    pair_same_string_rtype_contains(hop, r1, strlen_name, find_name, ptr_lltype)
+}
+
+fn pair_same_string_rtype_contains(
+    hop: &HighLevelOp,
+    self_repr: &dyn Repr,
+    strlen_name: &str,
+    find_name: &str,
+    ptr_lltype: LowLevelType,
+) -> RTypeResult {
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::Repr(self_repr),
+    ])?;
+    let v_str1 = vlist
+        .first()
+        .cloned()
+        .ok_or_else(|| TyperError::message("rtype_contains: missing v_str1"))?;
+    let v_str2 = vlist
+        .get(1)
+        .cloned()
+        .ok_or_else(|| TyperError::message("rtype_contains: missing v_str2"))?;
+
+    let strlen_name_owned = strlen_name.to_string();
+    let ptr_for_strlen = ptr_lltype.clone();
+    let strlen = hop.rtyper.lowlevel_helper_function_with_builder(
+        strlen_name_owned.clone(),
+        vec![ptr_lltype.clone()],
+        LowLevelType::Signed,
+        move |_rtyper, _args, _result| {
+            build_ll_strlen_helper_graph(&strlen_name_owned, ptr_for_strlen)
+        },
+    )?;
+    let v_end = hop
+        .gendirectcall(&strlen, vec![v_str1.clone()])?
+        .ok_or_else(|| TyperError::message("ll_strlen returned Void"))?;
+
+    let find_name_owned = find_name.to_string();
+    let ptr_for_find = ptr_lltype.clone();
+    let find = hop.rtyper.lowlevel_helper_function_with_builder(
+        find_name_owned.clone(),
+        vec![
+            ptr_lltype.clone(),
+            ptr_lltype,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Signed,
+        move |_rtyper, _args, _result| build_ll_find_helper_graph(&find_name_owned, ptr_for_find),
+    )?;
+    let zero = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+    let vres = hop
+        .gendirectcall(&find, vec![v_str1, v_str2, zero, v_end])?
+        .ok_or_else(|| TyperError::message("ll_find returned Void"))?;
+
+    hop.exception_cannot_occur()?;
+    let neg1 = constant_with_lltype(ConstValue::Int(-1), LowLevelType::Signed);
+    Ok(hop.genop(
+        "int_ne",
+        vec![vres, neg1],
+        GenopResult::LLType(LowLevelType::Bool),
+    ))
 }
 
 /// RPython `pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr)`
@@ -4023,6 +4147,69 @@ mod tests {
         };
         let dbg = format!("{:?}", c.value);
         assert!(dbg.contains("ll_streq"), "expected 'll_streq' in {dbg}");
+    }
+
+    /// rstr.py — `pairtype(AbstractStringRepr,
+    /// AbstractStringRepr).rtype_contains`: `ll_strlen` then
+    /// `ll_find(s1, s2, 0, end)` then `int_ne(vres, -1)`.
+    #[test]
+    fn pair_string_string_rtype_contains_emits_ll_find_and_int_ne() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = build_pair_compare_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "contains",
+            STRPTR.clone(),
+            string_repr() as Arc<dyn Repr>,
+            crate::annotator::model::SomeValue::String(crate::annotator::model::SomeString::new(
+                false, false,
+            )),
+        );
+        let result = pair_string_string_rtype_contains(&hop)
+            .unwrap_or_else(|err| panic!("pair contains: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_contains calls exception_cannot_occur"
+        );
+        assert_eq!(
+            ops.ops.len(),
+            3,
+            "strlen + find + int_ne: {:?}",
+            ops.ops
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c_strlen) = &ops.ops[0].args[0] else {
+            panic!("expected Constant strlen funcptr");
+        };
+        let dbg_strlen = format!("{:?}", c_strlen.value);
+        assert!(
+            dbg_strlen.contains("ll_strlen"),
+            "expected 'll_strlen' in {dbg_strlen}"
+        );
+        assert_eq!(ops.ops[1].opname, "direct_call");
+        let Hlvalue::Constant(c_find) = &ops.ops[1].args[0] else {
+            panic!("expected Constant find funcptr");
+        };
+        let dbg_find = format!("{:?}", c_find.value);
+        assert!(
+            dbg_find.contains("ll_find"),
+            "expected 'll_find' in {dbg_find}"
+        );
+        assert_eq!(ops.ops[2].opname, "int_ne");
     }
 
     /// rstr.py — `pairtype(AbstractStringRepr,

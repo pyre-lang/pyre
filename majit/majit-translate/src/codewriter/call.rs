@@ -4790,6 +4790,7 @@ impl CallControl {
             // Always a claim: `field_pos_in` walks the owner's layout and
             // panics rather than hand back an unnumbered field.
             Some(index_in_parent),
+            false,
         );
         descr.set_index(idx);
         // Same arguments this `get_field_descr` miss just used, kept so
@@ -5083,6 +5084,7 @@ impl CallControl {
                         // Always a claim: `field_pos_in` walks the owner's layout and
                         // panics rather than hand back an unnumbered field.
                         Some(index_in_parent),
+                        false,
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
@@ -11760,6 +11762,7 @@ fn all_interiorfielddescrs(
                         // Always a claim: the index is this field's position in
                         // `entries`, straight off `.iter().enumerate()`.
                         Some(index_in_parent),
+                        false,
                     )
                 }
             };
@@ -11896,6 +11899,7 @@ fn all_interiorfielddescrs(
                     // Always a claim: the index is this field's position in
                     // `entries`, straight off `.iter().enumerate()`.
                     Some(index_in_parent),
+                    false,
                 )
             }
         };

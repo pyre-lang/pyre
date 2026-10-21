@@ -11658,21 +11658,25 @@ impl CraneliftBackend {
     /// shadows the missing guard. dynasm parity
     /// (`runner.rs`'s `dynasm_typeid_subclass_range`) is
     /// already RPython-orthodox.
-    fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
+    fn read_int_at_mem(
+        &self,
+        addr: i64,
+        offset: i64,
+        size: usize,
+        sign: bool,
+        acquire: bool,
+    ) -> i64 {
         if addr == 0 {
             return 0;
         }
-        let ptr = (addr as usize).wrapping_add(offset as usize);
         unsafe {
-            match (size, sign) {
-                (1, true) => (ptr as *const i8).read_unaligned() as i64,
-                (1, false) => (ptr as *const u8).read_unaligned() as i64,
-                (2, true) => (ptr as *const i16).read_unaligned() as i64,
-                (2, false) => (ptr as *const u16).read_unaligned() as i64,
-                (4, true) => (ptr as *const i32).read_unaligned() as i64,
-                (4, false) => (ptr as *const u32).read_unaligned() as i64,
-                _ => (ptr as *const i64).read_unaligned(),
-            }
+            majit_backend::llmodel::read_int_at_mem(
+                addr as usize,
+                offset as usize,
+                size,
+                sign,
+                acquire,
+            )
         }
     }
 
@@ -18091,15 +18095,35 @@ impl CraneliftBackend {
                         _ => unreachable!(),
                     };
                     let signed = value_type == Type::Int && ad.is_item_signed();
-                    let result = emit_load_from_addr(
-                        &mut builder,
-                        addr,
-                        0,
-                        value_type,
-                        ad.item_size(),
-                        signed,
-                        op.opcode,
-                    )?;
+                    let result = if op.opcode == OpCode::RawLoadI && ad.load_is_acquire() {
+                        let mem_ty = checked_cl_type_for_size(
+                            ad.item_size(),
+                            op.opcode,
+                            "acquire raw_load_i supports 1-, 2-, 4-, and 8-byte items",
+                        )?;
+                        let raw = builder.ins().atomic_load(
+                            mem_ty,
+                            MemFlagsData::new().with_aligned(),
+                            addr,
+                        );
+                        if mem_ty == cl_types::I64 {
+                            raw
+                        } else if signed {
+                            builder.ins().sextend(cl_types::I64, raw)
+                        } else {
+                            builder.ins().uextend(cl_types::I64, raw)
+                        }
+                    } else {
+                        emit_load_from_addr(
+                            &mut builder,
+                            addr,
+                            0,
+                            value_type,
+                            ad.item_size(),
+                            signed,
+                            op.opcode,
+                        )?
+                    };
                     builder.def_var(var(&opref_var_map, vi), result);
                 }
 
@@ -18247,16 +18271,41 @@ impl CraneliftBackend {
                     );
                     let offset = fd.offset() as i32;
                     let acquire = fd.load_is_acquire()
-                        && fd.field_size() == 8
-                        && matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR);
+                        && matches!(
+                            op.opcode,
+                            OpCode::GetfieldGcR
+                                | OpCode::GetfieldRawR
+                                | OpCode::GetfieldGcI
+                                | OpCode::GetfieldRawI
+                        );
                     let r = if acquire {
                         // Sequentially consistent load. It acquires the
-                        // Release publication of this pointer. Non-trusted
+                        // Release publication of this field. Non-trusted
                         // flags keep the load from moving ahead of a guard.
                         let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
-                        builder
-                            .ins()
-                            .atomic_load(cl_types::I64, MemFlagsData::new(), addr)
+                        if matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR) {
+                            builder
+                                .ins()
+                                .atomic_load(cl_types::I64, MemFlagsData::new(), addr)
+                        } else {
+                            let mem_ty = checked_cl_type_for_size(
+                                fd.field_size(),
+                                op.opcode,
+                                "acquire integer getfield supports 1-, 2-, 4-, and 8-byte fields",
+                            )?;
+                            let raw = builder.ins().atomic_load(
+                                mem_ty,
+                                MemFlagsData::new().with_aligned(),
+                                addr,
+                            );
+                            if mem_ty == cl_types::I64 {
+                                raw
+                            } else if fd.is_field_signed() {
+                                builder.ins().sextend(cl_types::I64, raw)
+                            } else {
+                                builder.ins().uextend(cl_types::I64, raw)
+                            }
+                        }
                     } else {
                         emit_load_from_addr(
                             &mut builder,
@@ -23652,7 +23701,7 @@ impl majit_backend::Backend for CraneliftBackend {
         let size = descr.as_itemsize();
         let sign = descr.is_item_signed();
         // llmodel.py: return self.read_int_at_mem(addr, offset, size, sign)
-        self.read_int_at_mem(addr, offset, size, sign)
+        self.read_int_at_mem(addr, offset, size, sign, descr.load_is_acquire())
     }
 
     /// llmodel.py bh_raw_store_i(addr, offset, newvalue, descr).
@@ -23718,7 +23767,13 @@ impl majit_backend::Backend for CraneliftBackend {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
-        self.read_int_at_mem(struct_ptr, offset as i64, size, sign)
+        self.read_int_at_mem(
+            struct_ptr,
+            offset as i64,
+            size,
+            sign,
+            fielddescr.load_is_acquire(),
+        )
     }
 
     fn bh_getfield_gc_r(
@@ -23776,7 +23831,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> i64 {
         let (base_size, itemsize, sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
-        self.read_int_at_mem(array_ptr, offset, itemsize, sign)
+        self.read_int_at_mem(array_ptr, offset, itemsize, sign, false)
     }
 
     /// model.py / llmodel.py bh_arraylen_gc.
@@ -23785,7 +23840,13 @@ impl majit_backend::Backend for CraneliftBackend {
         let ofs = arraydescr
             .array_len_offset()
             .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
-        self.read_int_at_mem(array_ptr, ofs as i64, std::mem::size_of::<usize>(), true)
+        self.read_int_at_mem(
+            array_ptr,
+            ofs as i64,
+            std::mem::size_of::<usize>(),
+            true,
+            false,
+        )
     }
 
     /// llmodel.py bh_getarrayitem_gc_r.

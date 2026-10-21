@@ -11,11 +11,20 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::flowspace::model::ConstValue;
+use crate::flowspace::model::{
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
+    SpaceOperation, Variable,
+};
+use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, Array, FixedSizeArray, FuncType, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType,
     Ptr, PtrTarget, Struct, functionptr_with_external_name, malloc,
+};
+use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, struct_lltype_from_strptr};
+use crate::translator::rtyper::rtyper::{
+    constant_with_lltype, exception_args, helper_pygraph_from_graph, variable_with_lltype,
 };
 
 pub use majit_jitcode::rffi::{
@@ -527,8 +536,187 @@ pub fn c_memset() -> Result<(), TyperError> {
 pub static TEST_RAW_ADDR_KEEP_ALIVE: LazyLock<Mutex<HashMap<String, LowLevelType>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-pub fn get_raw_address_of_string() -> Result<(), TyperError> {
-    Err(deferred("get_raw_address_of_string"))
+/// Synthesise `rffi.get_raw_address_of_string` (`rffi.py`) in the
+/// `we_are_translated()` body:
+///
+/// ```python
+/// if rgc.must_split_gc_address_space():
+///     return _get_raw_address_buf_from_string(string)
+/// if rgc.can_move(string):
+///     string = rgc.move_out_of_nursery(string)
+///     if rgc.can_move(string):
+///         return _get_raw_address_buf_from_string(string)
+/// lldata = llstr(string)
+/// data_start = (cast_ptr_to_adr(lldata) + offsetof(STR, 'chars')
+///               + itemoffsetof(STR.chars, 0))
+/// return cast(CCHARP, data_start)
+/// ```
+///
+/// `rgc.must_split_gc_address_space` (`SplitAddrSpaceEntry`) is a
+/// translation-time constant; pyre's MiniMark default is False, so the
+/// first buf return is folded. `_get_raw_address_buf_from_string` is
+/// not synthesised: its cache key is `objectmodel.compute_unique_id`
+/// and it calls `str2charp` plus `FinalizerQueue.register_finalizer`,
+/// which sit outside rffi/rgc helpers. The inner `if rgc.can_move`
+/// after `move_out_of_nursery` is kept as a second `gc_can_move`; its
+/// True arm (`return _get_raw_address_buf_from_string(string)`) is
+/// closed as an unreachable abort (`RaiseImplicit(AssertionError)`,
+/// the panicking-abort / `rtyper/debug.py ll_assert` shape) because
+/// that helper is not ported.
+pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
+    name: &str,
+) -> Result<PyGraph, TyperError> {
+    let str_struct = struct_lltype_from_strptr(&STRPTR)?;
+    let chars_array_ty = match &str_struct {
+        LowLevelType::Struct(body) => body
+            ._flds
+            .get("chars")
+            .cloned()
+            .ok_or_else(|| TyperError::message("STR struct has no chars field"))?,
+        _ => {
+            return Err(TyperError::message(
+                "ll_get_raw_address_of_string: STR body is not a Struct",
+            ));
+        }
+    };
+    let offsetof_chars = llmemory::offsetof(&str_struct, "chars").map_err(TyperError::message)?;
+    let itemoffset_chars =
+        llmemory::itemoffsetof(&chars_array_ty, 0).map_err(TyperError::message)?;
+
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let push = |block: &BlockRef, op: &str, args: Vec<Hlvalue>, result: Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            op,
+            args,
+            Hlvalue::Variable(result),
+        ));
+    };
+    let switch_bool = |block: &BlockRef,
+                       cond: Variable,
+                       true_args: Vec<Hlvalue>,
+                       true_tgt: BlockRef,
+                       false_args: Vec<Hlvalue>,
+                       false_tgt: BlockRef| {
+        block.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+        block.closeblock(vec![
+            Link::new(true_args, Some(true_tgt), Some(bool_const(true))).into_ref(),
+            Link::new(false_args, Some(false_tgt), Some(bool_const(false))).into_ref(),
+        ]);
+    };
+
+    let s = variable_with_lltype("s", STRPTR.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(s.clone())]);
+    let return_var = variable_with_lltype("result", (*CCHARP).clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let s_moved = variable_with_lltype("s", STRPTR.clone());
+    let moveblock = Block::shared(vec![Hlvalue::Variable(s_moved.clone())]);
+    let s_imm = variable_with_lltype("s", STRPTR.clone());
+    let addrblock = Block::shared(vec![Hlvalue::Variable(s_imm.clone())]);
+
+    let can_move = variable_with_lltype("can_move", LowLevelType::Bool);
+    push(
+        &startblock,
+        "gc_can_move",
+        vec![Hlvalue::Variable(s.clone())],
+        can_move.clone(),
+    );
+    switch_bool(
+        &startblock,
+        can_move,
+        vec![Hlvalue::Variable(s.clone())],
+        moveblock.clone(),
+        vec![Hlvalue::Variable(s.clone())],
+        addrblock.clone(),
+    );
+
+    let s2 = variable_with_lltype("s", STRPTR.clone());
+    push(
+        &moveblock,
+        "gc_move_out_of_nursery",
+        vec![Hlvalue::Variable(s_moved)],
+        s2.clone(),
+    );
+    let can_move2 = variable_with_lltype("can_move", LowLevelType::Bool);
+    push(
+        &moveblock,
+        "gc_can_move",
+        vec![Hlvalue::Variable(s2.clone())],
+        can_move2.clone(),
+    );
+    let abort_args = exception_args("AssertionError")?;
+    switch_bool(
+        &moveblock,
+        can_move2,
+        abort_args,
+        graph.exceptblock.clone(),
+        vec![Hlvalue::Variable(s2)],
+        addrblock.clone(),
+    );
+
+    let adr = variable_with_lltype("adr", LowLevelType::Address);
+    push(
+        &addrblock,
+        "cast_ptr_to_adr",
+        vec![Hlvalue::Variable(s_imm)],
+        adr.clone(),
+    );
+    let adr1 = variable_with_lltype("adr", LowLevelType::Address);
+    push(
+        &addrblock,
+        "adr_add",
+        vec![
+            Hlvalue::Variable(adr),
+            constant_with_lltype(
+                ConstValue::AddressOffset(offsetof_chars),
+                LowLevelType::Signed,
+            ),
+        ],
+        adr1.clone(),
+    );
+    let adr2 = variable_with_lltype("adr", LowLevelType::Address);
+    push(
+        &addrblock,
+        "adr_add",
+        vec![
+            Hlvalue::Variable(adr1),
+            constant_with_lltype(
+                ConstValue::AddressOffset(itemoffset_chars),
+                LowLevelType::Signed,
+            ),
+        ],
+        adr2.clone(),
+    );
+    let data_start = variable_with_lltype("data_start", (*CCHARP).clone());
+    push(
+        &addrblock,
+        "cast_adr_to_ptr",
+        vec![Hlvalue::Variable(adr2)],
+        data_start.clone(),
+    );
+    addrblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(data_start)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["s".to_string()],
+        func,
+    ))
 }
 
 /// RPython `_StrFinalizerQueue(rgc.FinalizerQueue)` (`rffi.py`).
@@ -651,12 +839,148 @@ mod tests {
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("c_memcpy"));
 
-        let err = get_raw_address_of_string().expect_err("raw string address helper is deferred");
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("get_raw_address_of_string"));
-
         let _scoped = scoped_alloc_buffer;
         let _finalizer = _StrFinalizerQueue::default();
+    }
+
+    #[test]
+    fn build_ll_get_raw_address_of_string_emits_can_move_then_address_arithmetic() {
+        let helper =
+            build_ll_get_raw_address_of_string_helper_graph("ll_get_raw_address_of_string")
+                .expect("build_ll_get_raw_address_of_string_helper_graph");
+        assert_eq!(helper.func.name, "ll_get_raw_address_of_string");
+        let inner = helper.graph.borrow();
+        assert_eq!(inner.name, "ll_get_raw_address_of_string");
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.inputargs.len(), 1);
+        let Hlvalue::Variable(v) = &startblock.inputargs[0] else {
+            panic!("startblock input must be a Variable");
+        };
+        assert!(
+            v.name().starts_with('s'),
+            "input variable name = {:?}",
+            v.name()
+        );
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["gc_can_move"]);
+        drop(startblock);
+
+        let mut opnames: Vec<String> = Vec::new();
+        for block in inner.iterblocks() {
+            for op in &block.borrow().operations {
+                opnames.push(op.opname.clone());
+            }
+        }
+        assert_eq!(
+            opnames
+                .iter()
+                .filter(|n| n.as_str() == "gc_can_move")
+                .count(),
+            2,
+            "second gc_can_move after move_out_of_nursery missing: {opnames:?}"
+        );
+        assert!(
+            opnames.iter().any(|n| n == "gc_move_out_of_nursery"),
+            "gc_move_out_of_nursery missing: {opnames:?}"
+        );
+
+        let moveblock = inner
+            .iterblocks()
+            .into_iter()
+            .find(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .any(|op| op.opname == "gc_move_out_of_nursery")
+            })
+            .expect("moveblock with gc_move_out_of_nursery");
+        {
+            let mb = moveblock.borrow();
+            let move_ops: Vec<&str> = mb.operations.iter().map(|op| op.opname.as_str()).collect();
+            assert_eq!(
+                move_ops,
+                vec!["gc_move_out_of_nursery", "gc_can_move"],
+                "moveblock must keep the second gc_can_move: {move_ops:?}"
+            );
+            let assert_err = crate::flowspace::model::HOST_ENV
+                .lookup_builtin("AssertionError")
+                .expect("HOST_ENV AssertionError");
+            let mut saw_abort = false;
+            let mut saw_addr = false;
+            for link in &mb.exits {
+                let lb = link.borrow();
+                let target = lb.target.as_ref().expect("link.target");
+                let exitcase_is_true = matches!(
+                    lb.exitcase,
+                    Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
+                );
+                if std::rc::Rc::ptr_eq(target, &inner.exceptblock) {
+                    assert!(
+                        exitcase_is_true,
+                        "abort arm must be the True branch of the second gc_can_move"
+                    );
+                    assert!(
+                        matches!(
+                            lb.args.first(),
+                            Some(Some(Hlvalue::Constant(c)))
+                                if matches!(
+                                    &c.value,
+                                    ConstValue::HostObject(h) if h == &assert_err
+                                )
+                        ),
+                        "abort arm must RaiseImplicit(AssertionError): {:?}",
+                        lb.args
+                    );
+                    saw_abort = true;
+                } else if !exitcase_is_true {
+                    saw_addr = target
+                        .borrow()
+                        .operations
+                        .iter()
+                        .any(|op| op.opname == "cast_ptr_to_adr");
+                }
+            }
+            assert!(
+                saw_abort,
+                "second gc_can_move True arm must abort to exceptblock"
+            );
+            assert!(
+                saw_addr,
+                "second gc_can_move False arm must take the address-arithmetic path"
+            );
+        }
+
+        assert!(
+            opnames.iter().any(|n| n == "cast_ptr_to_adr"),
+            "cast_ptr_to_adr missing: {opnames:?}"
+        );
+        assert_eq!(
+            opnames.iter().filter(|n| n.as_str() == "adr_add").count(),
+            2,
+            "offsetof(STR, chars) + itemoffsetof(STR.chars, 0): {opnames:?}"
+        );
+        assert!(
+            opnames.iter().any(|n| n == "cast_adr_to_ptr"),
+            "cast_adr_to_ptr missing: {opnames:?}"
+        );
+        assert!(
+            !opnames.iter().any(|n| n.contains("direct_call")),
+            "buf helper must not be called: {opnames:?}"
+        );
+
+        let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
+            panic!("returnblock inputarg must be a Variable");
+        };
+        assert_eq!(
+            ret.concretetype.borrow().clone(),
+            Some((*CCHARP).clone()),
+            "get_raw_address_of_string returns CCHARP"
+        );
     }
 
     #[test]

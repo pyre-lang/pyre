@@ -2967,9 +2967,11 @@ impl<'a> AssemblerARM64<'a> {
                     let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
                     let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
                     // `ldar` has a base register and no offset. x16 is ip0.
+                    // ArraylenGc/Strlen/Unicodelen share this emitter; their
+                    // descrs never carry the Acquire bit.
                     let acquire = !dst.is_xmm
                         && op
-                            .with_field_descr(|fd| fd.load_is_acquire() && fd.field_size() == 8)
+                            .with_field_descr(|fd| fd.load_is_acquire())
                             .unwrap_or(false);
                     if dst.is_xmm {
                         dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
@@ -2984,7 +2986,8 @@ impl<'a> AssemblerARM64<'a> {
                                 dynasm!(self.mc ; .arch aarch64 ; add x16, x16, x17);
                             }
                         }
-                        dynasm!(self.mc ; .arch aarch64 ; ldar X(dst.value), [x16]);
+                        // Size 4 matches the plain `ldrsw` path.
+                        self.emit_ldar_from_x16(dst, field_size, field_size == 4);
                     } else {
                         match field_size {
                             1 => {
@@ -3208,9 +3211,24 @@ impl<'a> AssemblerARM64<'a> {
                             })
                             .unwrap_or(8),
                     };
+                    let acquire = matches!(op.opcode, OpCode::RawLoadI)
+                        && !dst.is_xmm
+                        && op
+                            .with_array_descr(|ad| ad.load_is_acquire())
+                            .unwrap_or(false);
                     match arglocs.first() {
                         Some(Loc::Reg(base)) => {
-                            self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
+                            if acquire {
+                                self.emit_acquire_int_load(
+                                    base,
+                                    ofs_loc,
+                                    dst,
+                                    nsize.unsigned_abs() as usize,
+                                    nsize < 0,
+                                );
+                            } else {
+                                self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
+                            }
                         }
                         Some(Loc::Immed(base_i) | Loc::ImmedFloat(base_i)) => {
                             // `AssemblerARM64.load`: `gen_load_int` into ip0.
@@ -3221,7 +3239,17 @@ impl<'a> AssemblerARM64<'a> {
                                 value: 16,
                                 is_xmm: false,
                             };
-                            self.emit_op_gcload_regalloc(&base, ofs_loc, dst, nsize);
+                            if acquire {
+                                self.emit_acquire_int_load(
+                                    &base,
+                                    ofs_loc,
+                                    dst,
+                                    nsize.unsigned_abs() as usize,
+                                    nsize < 0,
+                                );
+                            } else {
+                                self.emit_op_gcload_regalloc(&base, ofs_loc, dst, nsize);
+                            }
                         }
                         None => {}
                         Some(other) => panic!(

@@ -1427,7 +1427,7 @@ impl std::fmt::Debug for SourceGraph {
 
 /// Analogue of `translator.buildflowgraph` for a lifted LLBC body:
 /// `copygraph` (`flowspace/model.py`) with a new name.
-fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> Rc<PyGraph> {
+pub(crate) fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> Rc<PyGraph> {
     let mut copied =
         crate::flowspace::model::copygraph(&template.graph.borrow(), false, &HashMap::new(), false);
     if let Some(name) = alt_name {
@@ -3959,6 +3959,107 @@ mod tests {
         // (`description.py`); `pkg.A` becomes `pkg_A`.
         assert_eq!(g_a.graph.borrow().name, "h__pkg_A");
         assert_eq!(g_b.graph.borrow().name, "h__pkg_B");
+    }
+
+    #[test]
+    fn specialize_argtype_dont_look_inside_splits_instance_and_tuple() {
+        // `_annspecialcase_ = specialize:argtype(0)` reaches
+        // `FunctionDesc.specialize` / `pycall` when
+        // `_jit_look_inside_ = False` (`description.py
+        // FunctionDesc.specialize`, `annrpython.py pycall`).
+        // `policy.py look_inside_graph` residualizes later.
+        let (_ann, bk) = ann_bk();
+        let mut func = compiled_graph_func("def alloc(value):\n    return value\n", Vec::new());
+        func.annspecialcase = Some("specialize:argtype(0)".to_string());
+        func._jit_look_inside_ = Some(false);
+        let signature = func.code.as_ref().unwrap().signature.clone();
+        let host = HostObject::new_user_function(func);
+        let desc = bk
+            .newfuncdesc_with_signature(&host, signature.clone())
+            .expect("newfuncdesc");
+        let fd = desc.as_function().expect("FunctionDesc");
+        assert!(
+            matches!(
+                fd.borrow().specializer.as_ref(),
+                Some(Specializer::Argtype { parms }) if parms == &["0".to_string()]
+            ),
+            "Bookkeeper.newfuncdesc must install specialize:argtype"
+        );
+        fd.borrow().cache.borrow_mut().insert(
+            GraphCacheKey::None,
+            dont_look_inside_stub("alloc", signature),
+        );
+
+        let inst = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("rordereddict::RDict", None)),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let tuple = SomeValue::Tuple(SomeTuple::new(vec![SomeValue::Integer(
+            SomeInteger::default(),
+        )]));
+        fd.borrow()
+            .pycall(
+                None,
+                &ArgumentsForTranslation::new(vec![Some(inst.clone())], None, None),
+                &SomeValue::Impossible,
+                None,
+            )
+            .expect("instance pycall");
+        fd.borrow()
+            .pycall(
+                None,
+                &ArgumentsForTranslation::new(vec![Some(tuple.clone())], None, None),
+                &SomeValue::Impossible,
+                None,
+            )
+            .expect("tuple pycall");
+        let g_inst = fd
+            .borrow()
+            .specialize(&mut vec![Some(inst)], None)
+            .expect("instance specialize")
+            .expect_graph()
+            .unwrap();
+        let g_tuple = fd
+            .borrow()
+            .specialize(&mut vec![Some(tuple)], None)
+            .expect("tuple specialize")
+            .expect_graph()
+            .unwrap();
+        assert!(!Rc::ptr_eq(&g_inst, &g_tuple));
+    }
+
+    /// Signature-only `dont_look_inside` stub: startblock inputargs
+    /// match the formals, closed onto a returnblock whose result is
+    /// `SomeImpossibleValue` (`ExtRegistryEntry.compute_result_annotation`).
+    fn dont_look_inside_stub(name: &str, sig: Signature) -> Rc<PyGraph> {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, Variable,
+        };
+        let inputargs: Vec<Hlvalue> = sig
+            .argnames
+            .iter()
+            .map(|n| Hlvalue::Variable(Variable::named(n)))
+            .collect();
+        let startblock = Block::shared(inputargs);
+        let func = GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        let mut graph_inner = FunctionGraph::new(name, startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let return_var = Variable::named("result");
+        *return_var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Impossible));
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        Rc::new(PyGraph {
+            graph: graph_inner.into_ref(),
+            func,
+            signature: RefCell::new(sig),
+            defaults: RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        })
     }
 
     #[test]

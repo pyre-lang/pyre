@@ -105,6 +105,7 @@ fn mint_field(
         u32::MAX,
         false,
         Some(*index_in_parent),
+        false,
     ))
 }
 

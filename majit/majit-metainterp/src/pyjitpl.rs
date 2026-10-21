@@ -22945,7 +22945,7 @@ impl std::error::Error for ChangeFrame {}
 /// distinguishes two `BhDescr::Array` entries — `(type_id, base_size,
 /// itemsize, len_offset, item_type, is_array_of_pointers,
 /// is_array_of_structs, is_item_signed, array_type_id,
-/// interior_fields)`.
+/// interior_fields, load_is_acquire)`.
 /// Two arrays of distinct lltypes
 /// with identical `(base_size, itemsize)` geometry land on distinct
 /// cache slots, matching upstream's per-lltype cache identity.
@@ -22976,6 +22976,10 @@ pub struct DispatchArrayDescrKey {
     pub is_gc_managed: bool,
     pub array_type_id: Option<String>,
     pub interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
+    /// Acquire raw load (`Atomic*::load`). Distinct from the plain twin
+    /// of the same shape, matching `descr.py` `cache[ARRAY]` one object
+    /// per ARRAY.
+    pub load_is_acquire: bool,
 }
 
 /// Shared `all_liveness` bytes. Cloning the handle shares the lock.
@@ -23207,7 +23211,7 @@ pub struct MetaInterpStaticData {
     /// lltype-discriminant shape carried on `BhDescr::Array`
     /// (`type_id`, `base_size`, `itemsize`, `len_offset`, `item_type`,
     /// `is_array_of_pointers`, `is_array_of_structs`, `is_item_signed`,
-    /// `interior_fields`).  Mirrors upstream
+    /// `interior_fields`, `load_is_acquire`).  Mirrors upstream
     /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py`)
     /// where the key is the lltype itself.  Pyre cannot use the lltype
     /// directly because the codewriter has already lowered the IR to

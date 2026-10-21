@@ -229,6 +229,13 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // builtin.py:89-99 — enumerate / reversed.
     analyzer_for(&mut reg, "enumerate", builtin_enumerate);
     analyzer_for(&mut reg, "reversed", builtin_reversed);
+    analyzer_for(&mut reg, "utf8iter", builtin_utf8iter);
+    analyzer_for(&mut reg, "unichr_as_utf8", builtin_unichr_as_utf8);
+    analyzer_for(
+        &mut reg,
+        "get_raw_address_of_string",
+        builtin_get_raw_address_of_string,
+    );
     // builtin.py:102-130 — bool / int / float / chr / unichr /
     // unicode / bytearray.
     analyzer_for(&mut reg, "bool", builtin_bool);
@@ -880,6 +887,58 @@ pub fn builtin_reversed(
         s_obj.clone(),
         vec!["reversed".to_string()],
     )))
+}
+
+/// Translator-synthesised `Utf8StringIterator(s)` (`rutf8.py`):
+/// `SomeIterator(s_str, ["utf8"])`.  The front spells `s.chars()` as
+/// `__majit_utf8iter(s)`; next yields a nonneg integer code point.
+pub fn builtin_utf8iter(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new("utf8iter() takes exactly one argument"));
+    }
+    let s_str = arg_at(args_s, 0, "builtin_utf8iter");
+    Ok(SomeValue::Iterator(SomeIterator::new(
+        s_str.clone(),
+        vec!["utf8".to_string()],
+    )))
+}
+
+/// Translator-synthesised `rutf8.unichr_as_utf8(code, allow_surrogates=True)`:
+/// a nonneg integer code point becomes a UTF-8 `SomeString`.  The front
+/// spells `String::push(c)`'s piece as `__majit_unichr_as_utf8(c)`.
+pub fn builtin_unichr_as_utf8(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "unichr_as_utf8() takes exactly one argument",
+        ));
+    }
+    let _s_int = arg_at(args_s, 0, "builtin_unichr_as_utf8");
+    Ok(SomeValue::String(SomeString::new(false, false)))
+}
+
+/// Translator-synthesised `rffi.get_raw_address_of_string(string)`:
+/// `SomePtr(CCHARP)`.  The front spells `str::as_ptr()` as
+/// `__majit_get_raw_address_of_string(s)`.
+pub fn builtin_get_raw_address_of_string(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "get_raw_address_of_string() takes exactly one argument",
+        ));
+    }
+    let _s_str = arg_at(args_s, 0, "builtin_get_raw_address_of_string");
+    Ok(raw_alloc_ptr_somevalue())
 }
 
 /// Upstream `builtin_bool(s_obj)` (builtin.py).
@@ -1841,6 +1900,14 @@ fn cast_instance_intrinsic(
         // not a fresh ListDef per projection. `setbinding` then `contains`
         // the same object on reflow (`TLS.no_side_effects_in_union`).
         bk.project_list_spelling_at_position(&root)
+    } else if majit_ir::descr::is_shaped_tuple_name(&root) {
+        // `KwargsDictStrategy.copy` unerase (`kwargsdict.py`): GCREF to
+        // the tuple of two lists. Same projection
+        // `derive_subject_inputcells` uses for a `Tuple<A,B>` parameter
+        // (`Bookkeeper::project_shaped_tuple`). `stable_projected_root`
+        // caches list-bearing tuples so reflow `setbinding` sees the
+        // same ListDefs.
+        bk.stable_projected_root(&root)
     } else {
         // One projection per position (`Bookkeeper.getlistdef`,
         // bookkeeper.py). Reflow setbinding then sees the same ListDefs.
@@ -3960,6 +4027,84 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_gcref_to_tuple_of_vecs_is_sometuple_and_getitem_is_somelist() {
+        // `KwargsDictStrategy.copy` unerase (`kwargsdict.py`): GCREF
+        // `dstorage` recast to the tuple of two lists, then `dstorage[0]`
+        // (`rtuple.py` `rtype_getitem`). One-word `Vec<*mut PyObject>`
+        // items are `SomeRustVec` (`rust_vec_item_kind_for_spelling`);
+        // a multi-word item (`Vec<String>`) is the SomeList the list
+        // arm of `project_struct_field_type` yields.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{Constant, Hlvalue, Variable};
+        use crate::flowspace::operation::{HLOperation, OpKind};
+
+        let bk = bk();
+        let s_gcref = crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        );
+        assert!(
+            matches!(s_gcref, SomeValue::Ptr(_)),
+            "GCREF source must be SomePtr, got {s_gcref:?}"
+        );
+        let list_root = "Tuple<Vec<String>,Vec<String>>";
+        let s_list_root = bk
+            .immutablevalue(&ConstValue::byte_str(list_root))
+            .expect("list-bearing tuple root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_gcref.clone()), Some(s_list_root)],
+            &no_kwds(),
+        )
+        .expect("GCREF to Tuple<Vec<String>,Vec<String>> unerase must annotate");
+        let SomeValue::Tuple(tuple) = &out else {
+            panic!("GCREF unerase dest must be SomeTuple, got {out:?}");
+        };
+        assert_eq!(tuple.items.len(), 2);
+        assert!(
+            matches!(tuple.items[0], SomeValue::List(_)),
+            "__pos_0 item must already be SomeList, got {:?}",
+            tuple.items[0]
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let mut v_tuple = Variable::named("dstorage");
+        ann.setbinding(&mut v_tuple, out);
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![
+                Hlvalue::Variable(v_tuple),
+                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+            ],
+        );
+        let item = hl.consider(&ann).unwrap().unwrap();
+        assert!(
+            matches!(item, SomeValue::List(_)),
+            "getitem(unerase, 0) must be SomeList, got {item:?}"
+        );
+
+        let kwargs_root = "Tuple<Vec<*mut PyObject>,Vec<*mut PyObject>>";
+        let s_kwargs_root = bk
+            .immutablevalue(&ConstValue::byte_str(kwargs_root))
+            .expect("kwargs tuple root constant");
+        let kwargs = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_gcref), Some(s_kwargs_root)],
+            &no_kwds(),
+        )
+        .expect("GCREF to Tuple<Vec<*mut PyObject>,Vec<*mut PyObject>> unerase must annotate");
+        let SomeValue::Tuple(kwargs_tuple) = &kwargs else {
+            panic!("kwargs unerase dest must be SomeTuple, got {kwargs:?}");
+        };
+        assert!(
+            matches!(kwargs_tuple.items[0], SomeValue::RustVec(_)),
+            "one-word Vec<*mut PyObject> item is SomeRustVec, got {:?}",
+            kwargs_tuple.items[0]
+        );
+    }
+
+    #[test]
     fn cast_instance_intrinsic_dyn_fat_tuple_operand_uses_data_word() {
         // Residual `&dyn Trait` / `Box<dyn Trait>` is
         // `dyn_fat_field_annotation` SomeTuple. The cast dest is a
@@ -4853,6 +4998,45 @@ mod tests {
         };
         assert_eq!(it.variant, vec!["enumerate".to_string()]);
         assert_eq!(it.enumerate_start, Some(ConstValue::Int(5)));
+    }
+
+    #[test]
+    fn builtin_utf8iter_wraps_string_as_utf8_iterator() {
+        use crate::annotator::model::SomeString;
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::new(false, true));
+        let result = builtin_utf8iter(&bk, &[Some(s_str)], &no_kwds()).unwrap();
+        let SomeValue::Iterator(it) = result else {
+            panic!("expected SomeIterator");
+        };
+        assert_eq!(it.variant, vec!["utf8".to_string()]);
+        assert!(matches!(*it.s_container, SomeValue::String(_)));
+    }
+
+    #[test]
+    fn builtin_unichr_as_utf8_returns_somestring() {
+        let bk = bk();
+        let s_int = bk.immutablevalue(&ConstValue::Int(0x20ac)).unwrap();
+        let result = builtin_unichr_as_utf8(&bk, &[Some(s_int)], &no_kwds()).unwrap();
+        assert!(
+            matches!(result, SomeValue::String(_)),
+            "unichr_as_utf8 annotates a UTF-8 string, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builtin_get_raw_address_of_string_returns_ccharp() {
+        use crate::annotator::model::{SomePtr, SomeString};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::new(false, true));
+        let result = builtin_get_raw_address_of_string(&bk, &[Some(s_str)], &no_kwds()).unwrap();
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        assert_eq!(result, SomeValue::Ptr(SomePtr::new(*ptr_ty)));
     }
 
     #[test]

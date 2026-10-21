@@ -43,8 +43,11 @@
 //!    maps to the raising flowspace `next` op), reusing `opt` as the
 //!    element result;
 //! 2. closes A with `LastException` exits — normal → the `Some` arm
-//!    (`opt.__pos_0` collapses to the element), `StopIteration` → the
-//!    `None` arm (loop break).
+//!    (`opt` IS the element on every normal-link path; every
+//!    `cast(opt, Option::Some).__pos_0` in a block dominated by that
+//!    link collapses to the element, including a later payload-compare
+//!    or match-guard block), `StopIteration` → the `None` arm (loop
+//!    break).
 //!
 //! The `None` arm carries no value in RPython (`ll_listnext` raises
 //! `StopIteration` without a result), so any `Option` scrutinee the Rust MIR
@@ -64,8 +67,8 @@ use crate::front::result_exc::{
     follow_single_exit, op_operand_vars, split_diamond_exits,
 };
 use crate::model::{
-    CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
-    ValueType,
+    BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
+    SpaceOperation, ValueType,
 };
 
 /// The `[__iter_next]` FunctionPath marker the rewrite emits in place of
@@ -153,16 +156,35 @@ fn range_probe(op: &SpaceOperation) -> Option<()> {
     }
 }
 
+fn utf8_iter_probe(op: &SpaceOperation) -> Option<Variable> {
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.len() == 1 && segments[0] == crate::runtime_names::shims::UTF8_ITER => {
+            args.first().cloned().map(LinkArg::into_variable)
+        }
+        _ => None,
+    }
+}
+
 /// The container an `iter` op constructed `var` over, when the backward walk
 /// confirms one.  `originates_from_iter_op` is this with the container
 /// discarded; [`iter_next_item_type`] needs it, because the container is the
 /// only thing that separates the two iterator reprs.
+///
+/// `__majit_utf8iter(s)` is the `str::chars` constructor (`Utf8StringIterator`);
+/// it is not a slice `iter`, so the probe is a sibling of [`iter_probe`]
+/// rather than an extension of [`is_iter_op_segments`].
 pub(crate) fn iter_op_container_with(
     graph: &FunctionGraph,
     edges: &BackEdges,
     var: &Variable,
 ) -> Option<Variable> {
-    walk_back_with(graph, edges, var, iter_probe)
+    walk_back_with(graph, edges, var, |op| {
+        iter_probe(op).or_else(|| utf8_iter_probe(op))
+    })
 }
 
 /// Walk backwards from `var` to the op that produced it, asking `probe`
@@ -847,6 +869,151 @@ fn unify_payload_projections(
     block.exits = exits;
 }
 
+/// Blocks reachable from `start` by following exits, including `start`.
+fn reachable_from(graph: &FunctionGraph, start: usize) -> Vec<bool> {
+    let n = graph.blocks.len();
+    let mut seen = vec![false; n];
+    if start >= n {
+        return seen;
+    }
+    let mut stack = vec![start];
+    seen[start] = true;
+    while let Some(b) = stack.pop() {
+        for link in &graph.blocks[b].exits {
+            let t = link.target.0;
+            if t < n && !seen[t] {
+                seen[t] = true;
+                stack.push(t);
+            }
+        }
+    }
+    seen
+}
+
+/// Blocks dominated by `root` when `root` is treated as a local CFG root:
+/// `root` itself, and every block whose every predecessor is already in
+/// the set.  A loop header that the Some arm re-enters is excluded,
+/// because the entry edge (and the StopIteration path) also reach it.
+fn cone_dominated_by(graph: &FunctionGraph, root: usize) -> Vec<bool> {
+    let n = graph.blocks.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (src, block) in graph.blocks.iter().enumerate() {
+        for link in &block.exits {
+            let dst = link.target.0;
+            if dst < n && !preds[dst].contains(&src) {
+                preds[dst].push(src);
+            }
+        }
+    }
+    let mut in_cone = vec![false; n];
+    if root >= n {
+        return in_cone;
+    }
+    in_cone[root] = true;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 0..n {
+            if in_cone[b] || preds[b].is_empty() {
+                continue;
+            }
+            if preds[b].iter().all(|&p| in_cone[p]) {
+                in_cone[b] = true;
+                changed = true;
+            }
+        }
+    }
+    in_cone
+}
+
+fn block_observes_var(block: &crate::model::Block, var: &Variable) -> bool {
+    if block
+        .operations
+        .iter()
+        .any(|op| op_operand_vars(&op.kind).contains(var))
+    {
+        return true;
+    }
+    match &block.exitswitch {
+        Some(ExitSwitch::Value(v)) if v == var => true,
+        Some(ExitSwitch::Fused { args, .. }) if args.contains(var) => true,
+        _ => false,
+    }
+}
+
+/// Slots of the Option payload (the element after rewrite) in blocks
+/// dominated by the normal link's Some target.  `ll_listnext` /
+/// `ListIteratorRepr.rtype_next` define the iteration value only on the
+/// normal path; every Some-arm-reachable `__pos_0` of that value is the
+/// element, including a later payload-compare or `Some(x) if` guard.
+///
+/// A block reachable from both the normal link and the StopIteration
+/// link is the `Some(_) | None` merge: it must not read the payload
+/// (the None arm carries no value).  A read there declines, fail-safe.
+fn plan_normal_link_payload_slots(
+    graph: &FunctionGraph,
+    some_target: BlockId,
+    none_target: BlockId,
+    pos: usize,
+    name: &str,
+) -> Result<Vec<(usize, usize)>, String> {
+    let some = some_target.0;
+    let none = none_target.0;
+    if some == none {
+        return Err(format!(
+            "{name}: Some and None arms share a block — payload collapse is not fail-safe"
+        ));
+    }
+    let cone = cone_dominated_by(graph, some);
+    let some_reach = reachable_from(graph, some);
+    let none_reach = reachable_from(graph, none);
+    if graph.blocks[some].inputargs.get(pos).is_none() {
+        return Err(format!("{name}: Some arm lacks payload slot {pos}"));
+    }
+    let mut slots: Vec<(usize, usize)> = vec![(some, pos)];
+    let mut i = 0;
+    while i < slots.len() {
+        let (b, s) = slots[i];
+        i += 1;
+        let v = graph.blocks[b]
+            .inputargs
+            .get(s)
+            .cloned()
+            .ok_or_else(|| format!("{name}: block {b} lacks payload slot {s}"))?;
+        collect_option_payload_projections(&graph.blocks[b].operations, &v)
+            .map_err(|reason| format!("{name}: Some-arm-dominated block {b} {reason}"))?;
+        for link in &graph.blocks[b].exits {
+            let t = link.target.0;
+            for (j, arg) in link.args.iter().enumerate() {
+                if !matches!(arg, LinkArg::Value(x) if *x == v) {
+                    continue;
+                }
+                if t < some_reach.len() && some_reach[t] && t < none_reach.len() && none_reach[t] {
+                    let recv = graph.blocks[t].inputargs.get(j).cloned().ok_or_else(|| {
+                        format!("{name}: shared Some(_)|None block {t} lacks slot {j}")
+                    })?;
+                    if block_observes_var(&graph.blocks[t], &recv) {
+                        return Err(format!("{name}: shared Some(_)|None arm reads the payload"));
+                    }
+                    continue;
+                }
+                if t >= cone.len() || !cone[t] {
+                    continue;
+                }
+                // The same element may occupy several inputarg slots of one
+                // successor (duplicated link args).  Each slot is the same
+                // payload; collapse both.  Distinct Option values on the
+                // Some *link from C* are still declined above
+                // (`payload_positions.len() > 1`).
+                if !slots.contains(&(t, j)) {
+                    slots.push((t, j));
+                }
+            }
+        }
+    }
+    Ok(slots)
+}
+
 fn rewire_one_next_site(
     graph: &mut FunctionGraph,
     edges: &BackEdges,
@@ -1161,15 +1328,11 @@ fn rewire_one_next_site(
         }
     }
 
-    // The payload collapse below (`collapse_pos0_read` per position) is
-    // the only fallible mutation; it mutates the Some target on success
-    // but can still `Err` on a later position.  With at most one position
-    // the collapse is the first mutation and itself atomic (it errs before
-    // writing), so a decline leaves the graph byte-identical.  Two or more
-    // positions (the same Option threaded into several Some-link slots)
-    // could half-collapse before a later `Err`, handing the legacy walker
-    // a partially-rewritten graph — decline that unusual shape up front to
-    // keep the "validate-before-mutate" fail-safe contract airtight.
+    // Payload collapse is planned before any edit (`plan_normal_link_payload_slots`
+    // plus the one-block `collapse_pos0_read` checks).  Two or more Some-link
+    // slots (the same Option threaded into several slots) could half-collapse
+    // before a later `Err` — decline that unusual shape up front to keep the
+    // "validate-before-mutate" fail-safe contract airtight.
     if payload_positions.len() > 1 {
         return Err(format!(
             "{name}: Option value threaded into {} Some-arm slots — multi-slot \
@@ -1256,6 +1419,17 @@ fn rewire_one_next_site(
             }
         }
     }
+
+    // After rewrite `opt` IS the element on the normal link
+    // (`ll_listnext` / `rtype_next`).  Collapse every Some-arm-dominated
+    // `cast(opt, Option::Some).__pos_0` pair — the first Some block and
+    // any later payload-compare / `Some(x) if` guard — onto that element.
+    // Validate the whole cone here, before the first edit.
+    let payload_slots = if let Some(&pos) = payload_positions.first() {
+        plan_normal_link_payload_slots(graph, some_target, none_target, pos, &name)?
+    } else {
+        Vec::new()
+    };
 
     // None arm (StopIteration exit): the loop-break continuation.  RPython's
     // `ll_listnext` raises `StopIteration` with NO value on the exhaustion
@@ -1358,34 +1532,25 @@ fn rewire_one_next_site(
     // All structural validation passed; mutate the graph.
     *mutated = true;
 
-    if enumerate_site.is_some() {
-        let pos = payload_positions[0];
-        if let Some(carrier) = graph.blocks[some_target.0].inputargs.get(pos).cloned()
-            && let Ok(projections) = collect_option_payload_projections(
-                &graph.blocks[some_target.0].operations,
-                &carrier,
-            )
-        {
-            unify_payload_projections(graph, some_target.0, &projections);
-        }
-    }
-
     if let Some(site) = &enumerate_site {
         crate::front::iter_adapter::rewrite_enumerate_to_builtin(graph, site);
     }
 
-    // The Some target reads the payload via `opt.__pos_0`; with the `next`
-    // result flowing directly, that read collapses to the carried value.
+    // The Some-arm-dominated reads of the payload via `opt.__pos_0` (or
+    // `cast(opt, Option::Some).__pos_0`) collapse to the carried element.
     // For enumerate that value is the `(index, item)` tuple.
-    for &pos in &payload_positions {
-        collapse_pos0_read(graph, some_target, pos, &name)?;
+    for &(block, pos) in &payload_slots {
+        let carrier = graph.blocks[block].inputargs[pos].clone();
+        if let Ok(projections) =
+            collect_option_payload_projections(&graph.blocks[block].operations, &carrier)
+        {
+            unify_payload_projections(graph, block, &projections);
+        }
+        collapse_pos0_read(graph, BlockId(block), pos, &name)?;
         if enumerate_site.is_some() {
-            let carrier = graph.blocks[some_target.0].inputargs[pos].clone();
+            let carrier = graph.blocks[block].inputargs[pos].clone();
             crate::front::iter_adapter::paint_enumerate_tuple_reads(
-                graph,
-                some_target.0,
-                &carrier,
-                &item_ty,
+                graph, block, &carrier, &item_ty,
             );
         }
     }
@@ -1743,5 +1908,384 @@ mod tests {
             native, 1,
             "native [__iter_next] replaces the residual and its recast"
         );
+    }
+
+    fn chars_next_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["core", "str", "iter", "<Impl>", "next"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            fun_decl_id: None,
+        }
+    }
+
+    /// `while let Some(ch) = s.chars().next()`: the iterator originates from
+    /// `__majit_utf8iter`, so `Chars::next` rewrites to the `[__iter_next]`
+    /// diamond.  The residual is not routed as `core::slice::iter`.
+    #[test]
+    fn utf8iter_chars_next_rewrites_to_iter_next_diamond() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let mut g = FunctionGraph::new("test_utf8iter_chars_next");
+        let n = g.startblock;
+        let s = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![s]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (a, a_args) = g.create_block_with_arg_vars(1);
+        let it_a = a_args[0].clone();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: chars_next_target(),
+                    args: crate::model::call_args(vec![it_a]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        g.push_op_var(
+            some_t,
+            OpKind::FieldRead {
+                base: some_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        );
+        g.set_return(some_t, None);
+
+        let (none_t, _none_args) = g.create_block_with_arg_vars(0);
+        g.set_return(none_t, None);
+
+        g.set_goto(n, a, vec![it]);
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c)],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "while-let Some over chars() must fold");
+        let residual_chars_next = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().is_some_and(|s| s == "next")
+                            && segments.iter().any(|s| s == "str")
+                )
+            })
+            .count();
+        assert_eq!(residual_chars_next, 0, "residual Chars::next must be gone");
+        let residual_slice_iter = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if is_iter_op_segments(segments)
+                )
+            })
+            .count();
+        assert_eq!(
+            residual_slice_iter, 0,
+            "utf8iter must not be rewritten as core::slice::iter"
+        );
+        let native = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if is_iter_next_segments(segments)
+                )
+            })
+            .count();
+        assert_eq!(native, 1, "native [__iter_next] replaces Chars::next");
+        let utf8iter = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.len() == 1
+                            && segments[0] == crate::runtime_names::shims::UTF8_ITER
+                )
+            })
+            .count();
+        assert_eq!(utf8iter, 1, "__majit_utf8iter constructor must remain");
+    }
+
+    fn option_some_cast_roots(g: &FunctionGraph) -> Vec<String> {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| {
+                crate::model::cast_instance_root(&op.kind).and_then(|root| {
+                    (root.contains("Option") && root.ends_with("::Some")).then(|| root.to_string())
+                })
+            })
+            .collect()
+    }
+
+    fn residual_iterator_next_count(g: &FunctionGraph) -> usize {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if is_iterator_next_target(target)
+                )
+            })
+            .count()
+    }
+
+    /// `match it.next() { Some(c) if c == K => A, Some(_) | None => B }`.
+    /// The Some arm extracts, switches on the payload, and the default
+    /// (guard / `Some(_)`) block extracts again — the inner
+    /// `decompose_valuefmt` shape.  After rewrite both downcasts collapse
+    /// to the element; the shared `Some(_) | None` arm does not read it.
+    #[test]
+    fn match_next_guard_collapses_dominated_option_some_downcasts() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let mut g = FunctionGraph::new("test_iter_next_match_guard");
+        let n = g.startblock;
+        let s = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![s]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (a, a_args) = g.create_block_with_arg_vars(1);
+        let it_a = a_args[0].clone();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: chars_next_target(),
+                    args: crate::model::call_args(vec![it_a]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        let narrowed = g
+            .push_op_var(
+                some_t,
+                crate::model::cast_instance_call("Option<char>::Some", some_opt.clone()),
+                true,
+            )
+            .unwrap();
+        let payload = g
+            .push_op_var(
+                some_t,
+                OpKind::FieldRead {
+                    base: narrowed,
+                    field: FieldDescriptor::new("__pos_0", None),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (guard, guard_args) = g.create_block_with_arg_vars(1);
+        let guard_opt = guard_args[0].clone();
+        let guard_narrowed = g
+            .push_op_var(
+                guard,
+                crate::model::cast_instance_call("Option<char>::Some", guard_opt),
+                true,
+            )
+            .unwrap();
+        g.push_op_var(
+            guard,
+            OpKind::FieldRead {
+                base: guard_narrowed,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        );
+
+        let (arm_a, _arm_a_args) = g.create_block_with_arg_vars(0);
+        g.set_return(arm_a, None);
+        let (shared, _shared_args) = g.create_block_with_arg_vars(0);
+        g.set_return(shared, None);
+        g.set_goto(guard, shared, Vec::new());
+
+        let (none_t, _none_args) = g.create_block_with_arg_vars(0);
+        g.set_goto(none_t, shared, Vec::new());
+
+        g.block_mut(some_t).exitswitch = Some(ExitSwitch::Value(payload));
+        g.block_mut(some_t).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                arm_a,
+                Some(ExitCase::Const(ConstValue::Int(37))),
+            )
+            .with_prevblock(some_t),
+            Link::new_mixed(
+                vec![LinkArg::Value(some_opt)],
+                guard,
+                Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+            )
+            .with_prevblock(some_t),
+        ];
+
+        g.set_goto(n, a, vec![it]);
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c)],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "match next() with a payload guard must fold");
+        assert_eq!(
+            residual_iterator_next_count(&g),
+            0,
+            "residual Chars::next must be gone"
+        );
+        assert_eq!(
+            option_some_cast_roots(&g),
+            Vec::<String>::new(),
+            "Some-arm-dominated Option::Some downcasts must collapse to the element"
+        );
+        let native = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if is_iter_next_segments(segments)
+                )
+            })
+            .count();
+        assert_eq!(native, 1, "native [__iter_next] replaces Chars::next");
     }
 }

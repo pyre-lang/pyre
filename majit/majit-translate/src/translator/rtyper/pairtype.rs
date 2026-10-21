@@ -190,6 +190,11 @@ pub enum ReprClassId {
     /// `rrange.py EnumerateIteratorRepr(IteratorRepr)` — `enumerate()`
     /// over a list, sharing the base list iterator's lowleveltype.
     EnumerateIteratorRepr,
+    /// Translator-synthesised `Utf8StringIteratorRepr` (`rutf8.py`
+    /// `Utf8StringIterator`) — code points over a UTF-8 string
+    /// (`Ptr(GcStruct('utf8iter', ('_utf8', Ptr(STR)), ('_end', Signed),
+    /// ('_pos', Signed)))`).
+    Utf8StringIteratorRepr,
 }
 
 impl ReprClassId {
@@ -261,6 +266,7 @@ impl ReprClassId {
             ReversedListIteratorRepr => &[ReversedListIteratorRepr, Repr],
             RangeIteratorRepr => &[RangeIteratorRepr, Repr],
             EnumerateIteratorRepr => &[EnumerateIteratorRepr, Repr],
+            Utf8StringIteratorRepr => &[Utf8StringIteratorRepr, Repr],
         }
     }
 }
@@ -947,6 +953,20 @@ fn dispatch_rtype_op(
         (StringRepr, StringRepr, "ge") => {
             committed(super::rstr::pair_string_string_rtype_compare(hop, "ge"))
         }
+
+        // rstr.py — pairtype(AbstractStringRepr, AbstractStringRepr).rtype_contains
+        // `ll_strlen` then `ll_find(..., 0, end)` then `int_ne(vres, -1)`.
+        // Char needles become a one-char string in front/mir (`unichr_as_utf8`)
+        // so there is no (StringRepr, IntegerRepr) contains row.
+        (StringRepr, StringRepr, "contains") => {
+            committed(super::rstr::pair_string_string_rtype_contains(hop))
+        }
+        (UnicodeRepr, UnicodeRepr, "contains") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_contains(hop))
+        }
+        (AbstractStringRepr, AbstractStringRepr, "contains") => committed(
+            super::rstr::pair_abstract_string_rtype_contains(r1, r2, hop),
+        ),
 
         // rstr.py:661-692 via `CharRepr(AbstractCharRepr, StringRepr)` MRO —
         // a String compared with a Char coerces the Char operand to a 1-char

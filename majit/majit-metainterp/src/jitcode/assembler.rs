@@ -1041,6 +1041,7 @@ impl JitCodeBuilder {
                         // header row, so the rebuilding side falls back to the
                         // name.
                         is_class_word: None,
+                        load_is_acquire: false,
                     }
                 },
             )
@@ -1154,6 +1155,7 @@ impl JitCodeBuilder {
             parent: None,
             name: String::new(),
             owner: String::new(),
+            load_is_acquire: false,
         })
     }
 
@@ -1267,6 +1269,7 @@ impl JitCodeBuilder {
             parent: parent.map(std::sync::Arc::new),
             name,
             owner: String::new(),
+            load_is_acquire: false,
         })
     }
 
@@ -2412,6 +2415,7 @@ impl JitCodeBuilder {
             array_type_id: None,
             interior_fields: Vec::new(),
             is_gc_managed: false,
+            load_is_acquire: false,
         })
     }
 
@@ -2434,6 +2438,7 @@ impl JitCodeBuilder {
             array_type_id: None,
             interior_fields: Vec::new(),
             is_gc_managed: false,
+            load_is_acquire: false,
         })
     }
 
@@ -2529,6 +2534,7 @@ impl JitCodeBuilder {
             ei_index: u32::MAX,
             array_type_id: None,
             interior_fields: Vec::new(),
+            load_is_acquire: false,
         })
     }
 
@@ -2635,6 +2641,7 @@ impl JitCodeBuilder {
             ei_index: u32::MAX,
             array_type_id: None,
             interior_fields: Vec::new(),
+            load_is_acquire: false,
         })
     }
 
@@ -2664,6 +2671,7 @@ impl JitCodeBuilder {
             ei_index: u32::MAX,
             array_type_id: None,
             interior_fields: Vec::new(),
+            load_is_acquire: false,
         })
     }
 
@@ -2770,6 +2778,7 @@ impl JitCodeBuilder {
             array_type_id: None,
             interior_fields: Vec::new(),
             is_gc_managed: true,
+            load_is_acquire: false,
         });
         self.write_insn("newlist_clear/idddd>r");
         self.push_reg_u8(length_reg, "newlist_clear length");
@@ -6414,6 +6423,7 @@ impl JitCodeBuilder {
             // Virtualizable frame array slots keep the existing
             // GUARD_GC_TYPE behavior.
             is_gc_managed: true,
+            load_is_acquire: false,
         })
     }
 
@@ -7300,6 +7310,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 array_type_id: lhs_array_type_id,
                 interior_fields: lhs_interior_fields,
                 is_gc_managed: lhs_is_gc_managed,
+                load_is_acquire: false,
             },
             CanonicalBhDescr::Array {
                 base_size: rhs_base_size,
@@ -7315,6 +7326,7 @@ fn canonical_bh_descr_eq(lhs: &CanonicalBhDescr, rhs: &CanonicalBhDescr) -> bool
                 array_type_id: rhs_array_type_id,
                 interior_fields: rhs_interior_fields,
                 is_gc_managed: rhs_is_gc_managed,
+                load_is_acquire: false,
             },
         ) => {
             // `ei_index` is intentionally NOT part of the identity

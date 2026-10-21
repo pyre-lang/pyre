@@ -8244,6 +8244,10 @@ fn build_function(
                     sink.i32_wrap_i64(); // convert to i32 address
                     let field_offset = field_offset_from_descr(op);
                     let (size, signed) = field_size_sign_from_descr(op);
+                    // Imported memory is not shared, so this stays a
+                    // plain sized load when the descr's `load_is_acquire`
+                    // is set. The host sample of that field is
+                    // `bh_getfield_gc_i`.
                     emit_sized_int_load(&mut sink, field_offset, size, signed);
                     sink.local_set(value_types.local(vi));
                 }

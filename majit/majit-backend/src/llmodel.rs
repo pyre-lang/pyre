@@ -490,6 +490,66 @@ pub unsafe fn read_ref_at_mem(addr: usize, acquire: bool) -> usize {
     }
 }
 
+/// Integer-width load at `base + ofs`.
+///
+/// The plain arm is `llmodel.py read_int_at_mem`. `acquire` selects
+/// `AtomicU*::from_ptr(..).load(Acquire)` at the field width, then
+/// sign-extends. Acquire loads require a naturally aligned address.
+///
+/// # Safety
+/// `base + ofs` must be a readable `size`-byte integer field. When
+/// `acquire` is true, the address is naturally aligned and every write
+/// of that field is an atomic store of the same width.
+pub unsafe fn read_int_at_mem(
+    base: usize,
+    ofs: usize,
+    size: usize,
+    sign: bool,
+    acquire: bool,
+) -> i64 {
+    let addr = base.wrapping_add(ofs);
+    unsafe {
+        if acquire {
+            debug_assert!(
+                size > 0 && addr % size == 0,
+                "acquire integer load requires natural alignment: addr={addr:#x} size={size}"
+            );
+            use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+            let raw = match size {
+                1 => AtomicU8::from_ptr(addr as *mut u8).load(Ordering::Acquire) as u64,
+                2 => AtomicU16::from_ptr(addr as *mut u16).load(Ordering::Acquire) as u64,
+                4 => AtomicU32::from_ptr(addr as *mut u32).load(Ordering::Acquire) as u64,
+                8 => AtomicU64::from_ptr(addr as *mut u64).load(Ordering::Acquire),
+                other => panic!("read_int_at_mem: unsupported acquire size {other}"),
+            };
+            match (size, sign) {
+                (8, _) => raw as i64,
+                (4, true) => raw as u32 as i32 as i64,
+                (4, false) => raw as u32 as i64,
+                (2, true) => raw as u16 as i16 as i64,
+                (2, false) => raw as u16 as i64,
+                (1, true) => raw as u8 as i8 as i64,
+                (1, false) => raw as u8 as i64,
+                _ => unreachable!(),
+            }
+        } else {
+            match (size, sign) {
+                (1, true) => (addr as *const i8).read_unaligned() as i64,
+                (1, false) => (addr as *const u8).read_unaligned() as i64,
+                (2, true) => (addr as *const i16).read_unaligned() as i64,
+                (2, false) => (addr as *const u16).read_unaligned() as i64,
+                (4, true) => (addr as *const i32).read_unaligned() as i64,
+                (4, false) => (addr as *const u32).read_unaligned() as i64,
+                (8, _) => (addr as *const i64).read_unaligned(),
+                other => panic!(
+                    "read_int_at_mem: unsupported (size, signed) = {other:?} \
+                     (llmodel.py read_int_at_mem NotImplementedError)"
+                ),
+            }
+        }
+    }
+}
+
 /// llmodel.py — `write_float_at_mem(gcref, ofs, newvalue)`.
 ///
 /// `FLOATSTORAGE`-width store. Like the ref store this takes no `size`:

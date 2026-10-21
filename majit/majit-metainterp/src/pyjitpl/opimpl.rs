@@ -1078,20 +1078,20 @@ where
                 )
                 .0 as i64
         } else {
-            let addr = (struct_ptr as usize).wrapping_add(offset);
+            let acquire = fielddescr
+                .as_field_descr()
+                .map(|f| f.load_is_acquire())
+                .unwrap_or(false);
+            // `llmodel.py read_int_at_mem`; acquire is
+            // `AtomicU*::load(Acquire)` at the field width.
             unsafe {
-                match (field_size, is_field_signed) {
-                    (1, true) => core::ptr::read_unaligned(addr as *const i8) as i64,
-                    (1, false) => core::ptr::read_unaligned(addr as *const u8) as i64,
-                    (2, true) => core::ptr::read_unaligned(addr as *const i16) as i64,
-                    (2, false) => core::ptr::read_unaligned(addr as *const u16) as i64,
-                    (4, true) => core::ptr::read_unaligned(addr as *const i32) as i64,
-                    (4, false) => core::ptr::read_unaligned(addr as *const u32) as i64,
-                    // A non-{1,2,4,8}-byte integer field has no
-                    // fixed-width primitive read; fall back to the
-                    // word-sized read (the pre-sized-read behavior).
-                    _ => core::ptr::read_unaligned(addr as *const i64),
-                }
+                majit_backend::llmodel::read_int_at_mem(
+                    struct_ptr as usize,
+                    offset,
+                    field_size,
+                    is_field_signed,
+                    acquire,
+                )
             }
         };
         if !is_ref && ctx.is_bridge_trace && crate::heapdbg_enabled() {

@@ -9478,6 +9478,7 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             parent: None,
             name: String::new(),
             owner: String::new(),
+            load_is_acquire: false,
         },
         pos,
     )
@@ -9521,6 +9522,7 @@ fn vable_array_field_descr(
         parent: None,
         name: String::new(),
         owner: String::new(),
+        load_is_acquire: false,
     }
 }
 

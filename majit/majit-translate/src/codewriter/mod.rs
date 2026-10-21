@@ -46,6 +46,9 @@ pub use majit_jitcode::codewriter::jitcode;
 pub mod jtransform;
 pub mod longlong;
 pub mod minmax;
+// `str.contains` for the rich-`OpKind` spine — mints `ll_find` (`rstr.py`
+// `rtype_contains`).
+pub mod strfind;
 // Opname-dispatch transducer ("Spine B"): lowers rtyper low-level helper
 // graphs (opname `SpaceOperation`s) to rich-`OpKind` graphs that re-enter the
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s

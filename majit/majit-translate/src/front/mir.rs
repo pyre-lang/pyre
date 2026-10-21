@@ -6131,6 +6131,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &guard_words,
             &expand_inline_struct,
         )?;
+        // `removeassert.py` melt of abort-bound `format!` / `assert_eq!`
+        // message construction.  Runs before the live `format!` collapsers
+        // so a placeholder panic does not expand into `str` + `ll_strconcat`
+        // only to be discarded.  `format!("line {lineno}")` that feeds an
+        // exception string is not abort-bound and stays for those collapsers.
+        let abort_messages_melted = melt_abort_message_ops(&mut lo.graph);
         // `format!`-chain expansion (descriptor census): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -6186,7 +6192,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // bare raise so `remove_assertion_errors` prunes the branch as it
         // does for a direct implicit raise.  Gated on an actual collapse
         // so untouched graphs keep their single end-of-lowering simplify.
-        if collapse_panic_message_chains(&mut lo.graph) > 0 {
+        if abort_messages_melted > 0 || collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
             let guard_words = lo.guard_word_vars.clone();
             simplify_lowered_graph_expanding(
@@ -10144,6 +10150,58 @@ impl<'a> Lowering<'a> {
             Some(hit) => *hit,
             None => identity_accumulator_of_arg_temp(self.body, self.llbc, rt),
         }
+    }
+
+    /// Owned `String` / `Wtf8Buf` accumulator `mem::take` rebinds.
+    /// Walks `atomic_ref_place` through a two-phase `&mut` the way
+    /// [`append_accumulator_of_arg_temp`] walks append receivers, then
+    /// falls back to a MIR scan of [`take_receiver_of_borrow`].
+    fn string_accumulator_of_take_arg(&self, take_arg: Option<usize>) -> Option<usize> {
+        let rt = take_arg?;
+        if let Some(MemSlot::Place(place)) = self.mem_slot(Some(rt)) {
+            let place = self.concrete_borrow_place(place);
+            if let PlaceKind::Local(i) = place.kind {
+                let i = i as usize;
+                if tyref_is_owned_str_builder(&place.ty, self.llbc)
+                    || self
+                        .body
+                        .locals
+                        .locals
+                        .get(i)
+                        .is_some_and(|local| tyref_is_owned_str_builder(&local.ty, self.llbc))
+                {
+                    return Some(i);
+                }
+            }
+        }
+        let cache = ScanCache::new(self.body.locals.locals.len());
+        cache.precompute_fresh(self.body, self.llbc);
+        let forward_blocks = forward_reachable_mask(self.llbc, self.body);
+        for candidate in owned_builder_dest_locals(self.body, self.llbc) {
+            if !is_fresh_str_builder(&cache, self.body, self.llbc, candidate) {
+                continue;
+            }
+            for (bb_idx, block) in self.body.body.iter().enumerate() {
+                if !forward_blocks[bb_idx] {
+                    continue;
+                }
+                for stmt in &block.statements {
+                    let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
+                        stmt.stmt_kind_ref()
+                    else {
+                        continue;
+                    };
+                    if matches!(source.kind, PlaceKind::Local(i) if i as usize == candidate)
+                        && let PlaceKind::Local(direct_borrow) = place.kind
+                        && take_receiver_of_borrow(self.body, self.llbc, direct_borrow as usize)
+                            == Some(rt)
+                    {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {
@@ -18660,6 +18718,50 @@ impl<'a> Lowering<'a> {
         Ok(result)
     }
 
+    /// Encode a `String::push` / `Wtf8Buf::push` code-point piece as a
+    /// one-code-point UTF-8 string (`rutf8.py unichr_as_utf8`,
+    /// `allow_surrogates=True`).  An ASCII / Unicode-scalar constant
+    /// becomes `__str_const`; a variable code point becomes
+    /// `__majit_unichr_as_utf8`.
+    fn emit_codepoint_as_utf8(
+        &mut self,
+        mir_bb: usize,
+        piece: &Variable,
+        piece_operand: Option<&Operand>,
+    ) -> Result<Variable, LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(Operand::Const(value)) = piece_operand
+            && let Ok(decoded) = decode_constant(self.llbc, value)
+        {
+            let code = match decoded {
+                DecodedConst::Int(n) => Some(n),
+                DecodedConst::UInt(n) => i64::try_from(n).ok(),
+                _ => None,
+            };
+            if let Some(code) = code
+                && let Some(text) = unichr_as_utf8_text(code)
+            {
+                return Ok(emit_str_const(&mut self.graph, bb_id, &text));
+            }
+        }
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        stamp_as_rstr_str(&result);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![piece.clone()]),
+                result_ty: ValueType::Str,
+            },
+        });
+        Ok(result)
+    }
+
     /// If `arg_locals[0]` is the sole identity argument of a builder-mode
     /// accumulator (`as_bytes` / `deref` / `as_str` on that builder), emit
     /// `ll_build` (`AbstractStringBuilderRepr.rtype_method_build`) and
@@ -18723,31 +18825,51 @@ impl<'a> Lowering<'a> {
     /// on the result type, so a later `ptr::write` compares owners by
     /// path. A class root that is already qualified, or that carries an
     /// instantiation suffix, stays the result type too.
-    fn instance_narrow_for_type(&self, dest_ty: &TyRef, arg: &Variable) -> Option<OpKind> {
+    ///
+    /// A GCREF source recast onto a tuple or list container is
+    /// `KwargsDictStrategy.copy` unerase (`kwargsdict.py`):
+    /// `lltype.cast_opaque_ptr` from GCREF to the tuple of two lists.
+    /// Aliasing would leave `SomePtr(GCREF)` for a later `dstorage[0]`
+    /// getitem (`rtuple.py` `rtype_getitem`). Named-struct dests keep
+    /// the classdef arm regardless of source.
+    fn instance_narrow_for_type(
+        &self,
+        dest_ty: &TyRef,
+        arg: &Variable,
+        src_root: Option<&str>,
+    ) -> Option<OpKind> {
         // Fieldless enums are ints. A classdef here is the
         // `pair(rtype_eq) (InstanceRepr, IntegerRepr)` wall: the tag
         // compare becomes `eq` of a minted empty instance with `ConstInt`.
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
             return None;
         }
-        let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
-        let result_owner = self
-            .cast_dest_layout_owner(dest_ty)
-            .filter(|owner| {
-                !root.contains("::")
-                    && !root.contains('<')
-                    && owner.rsplit("::").next() == Some(root.as_str())
-            })
-            .unwrap_or_else(|| root.clone());
-        Some(if result_owner == root {
-            crate::model::cast_instance_call(root, arg.clone())
-        } else {
-            crate::model::cast_instance_call_result(
-                root,
-                arg.clone(),
-                ValueType::Ref(Some(result_owner)),
-            )
-        })
+        if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
+            let result_owner = self
+                .cast_dest_layout_owner(dest_ty)
+                .filter(|owner| {
+                    !root.contains("::")
+                        && !root.contains('<')
+                        && owner.rsplit("::").next() == Some(root.as_str())
+                })
+                .unwrap_or_else(|| root.clone());
+            return Some(if result_owner == root {
+                crate::model::cast_instance_call(root, arg.clone())
+            } else {
+                crate::model::cast_instance_call_result(
+                    root,
+                    arg.clone(),
+                    ValueType::Ref(Some(result_owner)),
+                )
+            });
+        }
+        if src_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling) {
+            let node = strip_ty_wrappers(tyref_node(dest_ty, self.llbc)?, self.llbc)?;
+            if let Some(root) = raw_ptr_pointee_container_root(node, self.llbc) {
+                return Some(crate::model::cast_instance_call(root, arg.clone()));
+            }
+        }
+        None
     }
 
     /// Declaration path of `dest_ty`'s struct, reduced the way a
@@ -18824,7 +18946,7 @@ impl<'a> Lowering<'a> {
                     ValueType::Ref(None),
                 )
             } else {
-                let kind = self.instance_narrow_for_type(dest_ty, arg)?;
+                let kind = self.instance_narrow_for_type(dest_ty, arg, src_root)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -23354,6 +23476,7 @@ impl<'a> Lowering<'a> {
                 // re-match folds away together with its discriminant
                 // switch.
                 self.graph.set_raise_implicit(bb_id, "AssertionError");
+                melt_abort_message_chain(&mut self.graph, bb_id);
                 Ok(())
             }
             TermKind::UnwindResume | TermKind::UnwindTerminate => {
@@ -24176,6 +24299,11 @@ impl<'a> Lowering<'a> {
             && regular_call_is_panicking_abort(reg, self.llbc)
         {
             self.graph.set_raise_implicit(bb_id, "AssertionError");
+            // `removeassert.py` `remove_asserts` / `kill_assertion_link`:
+            // the abort is an implicit AssertionError (`ll_assert` with a
+            // constant message). Melt the format operands rustc evaluated
+            // before `panic_fmt` / `assert_failed`.
+            melt_abort_message_chain(&mut self.graph, bb_id);
             return Ok(());
         }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
@@ -24494,6 +24622,12 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Function-item identity of arg #2, captured before `call.args` is
+        // consumed.  `Option::map_or(opt, default, named_fn)` passes a `FnDef`
+        // constant (or a Copy/Move of a `FnDef`-typed local); that shape has
+        // no closure ADT, so `third_arg_ty` alone cannot name the callee.
+        let third_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(2));
+        let third_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.get(2));
         // A literal scalar index (`slice.get(1)`) has no Place type to retain
         // in `second_arg_ty`.  Charon still records the method's `I` type in
         // the regular-call generics, so classify the `get` before consuming
@@ -25102,27 +25236,49 @@ impl<'a> Lowering<'a> {
                 // destination both being string values so slice / `Vec`
                 // derefs (`&[T]`, root `Builtin::Slice`) keep their ordinary
                 // path.
+                //
+                // `String::from_utf8_lossy` is rewritten to a plain string
+                // (`unicodehelper.py str_decode_utf8` replace arm).  The
+                // consumer is `push_str(&*cow)`: dest is string-family and
+                // the Cow local is already the produced string
+                // (`string_byte_view_locals`).  A residual Cow ADT is not
+                // in that set and keeps the ordinary path.
+                //
+                // `Deref` takes `&self`, so the receiver is often `&Cow<str>`
+                // (a `Ref` of the dest local, or a later `&_cow` binding).
+                // `arg_locals` is `None` for a projection; follow the mark
+                // the same way `Rvalue::Len` does.
                 if args.len() == 1
                     && is_deref_call(&reg, self.llbc)
-                    && first_arg_ty
-                        .as_ref()
-                        .is_some_and(|t| tyref_is_string_family(t, self.llbc))
                     && tyref_is_string_family(&call.dest.ty, self.llbc)
                 {
-                    // A builder-mode accumulator's Shared borrow feeding this
-                    // deref is `ll_build`
-                    // (`AbstractStringBuilderRepr.rtype_method_build`): the
-                    // builder is a STRINGBUILDERPTR, and identity assumes
-                    // SomeString.
-                    let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
-                        Some(built) => built,
-                        None => args[0].clone(),
-                    };
-                    self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    let from_string = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|t| tyref_is_string_family(t, self.llbc));
+                    let from_lossy_cow = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|t| self.tyref_is_cow_str(t))
+                        && first_arg_is_string_byte_view;
+                    if from_string || from_lossy_cow {
+                        // A builder-mode accumulator's Shared borrow feeding this
+                        // deref is `ll_build`
+                        // (`AbstractStringBuilderRepr.rtype_method_build`): the
+                        // builder is a STRINGBUILDERPTR, and identity assumes
+                        // SomeString.
+                        let arg = match self.builder_identity_string(mir_bb, &arg_locals)? {
+                            Some(built) => built,
+                            None => args[0].clone(),
+                        };
+                        if from_lossy_cow {
+                            self.alias_dest_to_arg0(dest_local, arg, true);
+                        } else {
+                            self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
+                        }
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // A bodyless `Deref::deref` / `DerefMut::deref_mut` (`Box<T>`,
                 // and a one-word transparent wrapper) whose `&T` is a
@@ -25388,6 +25544,31 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Checked `Wtf8::from_bytes(&[u8]) -> Option<&Wtf8>`:
+                // `rutf8.py check_utf8` with `allow_surrogates=True`, then
+                // Ok → `Option::Some` of the unchecked identity, Err → None.
+                if self.try_lower_wtf8_from_bytes_checked(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                // `String::from_utf8_lossy(&[u8]) -> Cow<str>`:
+                // `unicodehelper.py str_decode_utf8` replace / U+FFFD arm.
+                if self.try_lower_from_utf8_lossy(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 // Blanket `ToString::to_string` (`alloc::string::<Impl>::to_string`)
                 // for a non-string receiver is `str(value)` (`ll_str` /
                 // `ll_chr2str` / `ll_int2dec`). A string-family receiver is
@@ -25445,6 +25626,22 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Trait `Clone::clone` of `Vec<T>` / a tuple of Copy and
+                // `Vec` fields, specialized on the receiver before the
+                // call becomes residual `["Clone","clone"]`.
+                if args.len() == 1
+                    && self.try_lower_trait_clone(
+                        mir_bb,
+                        &reg,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                        dest_local,
+                        &args,
+                        target,
+                    )?
+                {
                     return Ok(());
                 }
                 // `T::default()` for a Copy scalar or thin-pointer `T` is the
@@ -27018,6 +27215,15 @@ impl<'a> Lowering<'a> {
                             self.piece_accumulator_of_append_arg(piece_temp)
                     {
                         self.resolve_builder_build(mir_bb, piece_builder)?
+                    } else if str_builder_ctor_leaf(self.llbc, &reg) == Some("push") {
+                        // `String::push(c)` / `Wtf8Buf::push(c)`: `c` is a
+                        // code point (`rutf8.py unichr_as_utf8`), not a
+                        // leftover SomeInteger append piece.
+                        self.emit_codepoint_as_utf8(
+                            mir_bb,
+                            &args[piece_i],
+                            arg_operands.get(piece_i),
+                        )?
                     } else {
                         args[piece_i].clone()
                     };
@@ -27082,12 +27288,24 @@ impl<'a> Lowering<'a> {
                     // the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
-                    if let ValueType::Ref(_) = tyref_to_value_type_with(
-                        &call.dest.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                    ) && let Some(kind) = self.instance_narrow_for_type(&call.dest.ty, &args[0])
+                    let dest_is_ref = matches!(
+                        tyref_to_value_type_with(
+                            &call.dest.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        ),
+                        ValueType::Ref(_)
+                    );
+                    let src_root = first_arg_ty.as_ref().and_then(|ty| {
+                        tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
+                    });
+                    if dest_is_ref
+                        && let Some(kind) = self.instance_narrow_for_type(
+                            &call.dest.ty,
+                            &args[0],
+                            src_root.as_deref(),
+                        )
                     {
                         let array_tail =
                             self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?;
@@ -27890,6 +28108,105 @@ impl<'a> Lowering<'a> {
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::str::<Impl>::chars` (and the autoderef `String` →
+                // `str` receiver) constructs `rutf8.Utf8StringIterator`, not
+                // a byte `StringIteratorRepr`.  Emit `__majit_utf8iter(s)`
+                // with `fun_decl_id: None` so CallRegistry is not asked for
+                // the Opaque `chars` body (`Utf8StringIteratorRepr`).
+                if args.len() == 1 && self.is_str_chars_constructor(&reg, first_arg_ty.as_ref()) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Ref(None),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::str::<Impl>::as_ptr` on a string-family receiver
+                // is `rffi.get_raw_address_of_string` (`CCHARP`).  Emit
+                // `__majit_get_raw_address_of_string(s)` with
+                // `fun_decl_id: None` so CallRegistry is not asked for
+                // the Opaque `as_ptr` body.  `AtomicIsize::as_ptr` and
+                // slice/vec `as_ptr` have no `str` path segment.
+                if args.len() == 1
+                    && self.is_str_as_ptr(&reg, first_arg_ty.as_ref(), const_arg_ty.as_ref())
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
+                                        .to_string(),
+                                ],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::str::<Impl>::contains(haystack, needle)` is the
+                // flowspace `contains` operation (`op.contains(container, item)`,
+                // `rstr.py` `rtype_contains`).  A `char` Pattern — including
+                // the utf8iter code-point Variable `decompose_valuefmt` feeds
+                // `FMTS.contains(spec)` — becomes a one-code-point UTF-8
+                // string (`rutf8.py unichr_as_utf8`) so the pairtype is
+                // String+String.  `&str` / `&String` needles stay as the
+                // string.  Any other Pattern (closure, `&[char]`, …) keeps
+                // the residual FunctionPath.
+                if args.len() == 2
+                    && self.is_str_contains_call(&reg)
+                    && let Some(kind) = self.str_contains_needle_kind(
+                        &reg,
+                        second_arg_ty.as_ref(),
+                        second_const_arg_ty.as_ref(),
+                    )
+                {
+                    let needle = match kind {
+                        StrContainsNeedleKind::Char => {
+                            self.emit_codepoint_as_utf8(mir_bb, &args[1], arg_operands.get(1))?
+                        }
+                        StrContainsNeedleKind::Str => args[1].clone(),
+                    };
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "contains".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: needle,
+                            result_ty: ValueType::Bool,
                         },
                     });
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -31684,17 +32001,19 @@ impl<'a> Lowering<'a> {
                 self.expect_sites.push(site);
             }
         }
-        // Capture `Option::map_or(opt, default, closure)` sites for the
+        // Capture `Option::map_or(opt, default, callable)` sites for the
         // discriminant closure-select `front::option_map_or` synthesizes.
         // Like `unwrap_or`, `map_or`'s body is Opaque (foreign `core`) and its
         // receiver is the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver `args[0]`, default `args[1]`, closure
-        // env `args[2]`).  Resolving the `Option` field owners + closure
-        // `call_once` owner needs the receiver's `Option` type (`first_arg_ty`)
-        // and the env type (`third_arg_ty`), both in hand here;
-        // `recognize_map_or_site` also confirms the receiver is an `Option`.  A
-        // resolution miss leaves the residual call — an unregistered callee the
-        // rtyper census Skips, so no graph regresses.
+        // `CallTarget::Method` (receiver `args[0]`, default `args[1]`, callable
+        // `args[2]`).  The callable is a closure ADT (`third_arg_ty` →
+        // `call_once`) or a function item (`third_arg_fn_item` → a direct
+        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
+        // the callable needs the receiver type, the env type or `FnDef`
+        // path, and the result type (`call.dest.ty`), all in hand here;
+        // `recognize_map_or_site` also confirms the receiver is an `Option`.
+        // A resolution miss leaves the residual call — an unregistered callee
+        // the rtyper census Skips, so no graph regresses.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -31702,13 +32021,39 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 3
             && name == "map_or"
-            && let Some(site) = self.recognize_map_or_site(
+            && let Some(mut site) = self.recognize_map_or_site(
                 first_arg_ty.as_ref(),
                 third_arg_ty.as_ref(),
+                third_arg_fn_item.clone(),
+                third_arg_fn_decl,
                 &call.dest.ty,
                 &result_var,
             )
         {
+            // Reflexive `From` / same-width integer `From` is identity on the
+            // payload (`is_reflexive_from` / `is_widening_int_from`).  Applied
+            // here with a RegularCall of the FunDecl the FnDef names — the
+            // same predicates the ordinary call-lowering arm uses — so
+            // `recognize_map_or_site` itself does not special-case `From`.
+            if site.fn_item_segments.is_some()
+                && let Some(fd) = third_arg_fn_decl
+            {
+                let reg = RegularCall {
+                    kind: CallKind::Fun(FunId::Regular { id: fd.def_id }),
+                    generics: serde_json::json!({
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }),
+                };
+                if self.is_reflexive_from(&reg) || self.is_widening_int_from(&reg) {
+                    site.fn_item_ctor = Some(AggregateShape::Operand {
+                        index: 0,
+                        transparent: true,
+                    });
+                }
+            }
             self.map_or_sites.push(site);
         }
         // Capture `Option::is_none(opt)` / `Option::is_some(opt)` sites for the
@@ -32278,6 +32623,12 @@ impl<'a> Lowering<'a> {
             // points at an `Impl` block).
             CallKind::Trait(v) => {
                 if let Some(target) = self.specialized_trait_target(v) {
+                    return Ok(target);
+                }
+                // `Vec<T>` as `Clone::clone` is `rlist.py` `ll_copy`, the
+                // same `list` builtin `<[T]>::to_vec` retargets to. Bind
+                // it here so the call never becomes `["Clone","clone"]`.
+                if let Some(target) = self.specialized_trait_clone_list_target(v) {
                     return Ok(target);
                 }
                 // `description.py` `ClassDesc.lookup` / `MethodDesc`: a
@@ -33378,50 +33729,97 @@ impl<'a> Lowering<'a> {
                 self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
             }
             Some("take") if args.len() == 1 => {
-                let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
-                    return Ok(false);
-                };
-                let address = arg_address(self, 0);
-                if let Some(place) = self.bare_deref_place(&slot)
-                    && self.move_plan(&place.ty).is_some()
+                if let Some(acc) =
+                    self.string_accumulator_of_take_arg(arg_locals.first().copied().flatten())
                 {
-                    // `mem::take` is `replace(dest, <T as Default>::default())`.
-                    // Resolve that call before any read: a missing impl
-                    // leaves the whole `take` residual and emits nothing.
-                    let Some(target) = self.default_call_for_take(reg, &place.ty) else {
-                        return Ok(false);
+                    // `std::mem::take(&mut acc)` on a String / Wtf8Buf
+                    // accumulator is `old = place; place = empty`
+                    // (`rbuilder.py` `StringBuilder.build` then
+                    // `StringBuilder()`).  The generic mem-slot path
+                    // cannot rebind an SSA string local (`zero_for_mem_slot`
+                    // refuses `ValueType::Str`).
+                    let taken = if self.builder_mode && self.accumulator_is_builder_mode(acc) {
+                        let built = self.resolve_builder_build(mir_bb, acc)?;
+                        let bb_id = self.emit_bb(mir_bb);
+                        let fresh = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(fresh.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec![
+                                        crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
+                                    ],
+                                    fun_decl_id: None,
+                                },
+                                args: Vec::new(),
+                                result_ty: ValueType::Ref(None),
+                            },
+                        });
+                        self.local_var[acc] = Some(LocalValue::One(fresh));
+                        built
+                    } else {
+                        let Some(old) = self
+                            .local_var
+                            .get(acc)
+                            .and_then(Option::as_ref)
+                            .and_then(|value| value.one().ok())
+                        else {
+                            return Ok(false);
+                        };
+                        let bb_id = self.emit_bb(mir_bb);
+                        let empty = emit_str_const(&mut self.graph, bb_id, "");
+                        self.local_var[acc] = Some(LocalValue::One(empty));
+                        old
                     };
-                    let result_ty = tyref_to_value_type_with(
-                        &place.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                    );
-                    let bb_id = self.emit_bb(mir_bb);
-                    let fresh = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(fresh.clone()),
-                        kind: OpKind::Call {
-                            target,
-                            args: Vec::new(),
-                            result_ty,
-                        },
-                    });
-                    let Some(old) =
-                        self.exchange_deref_aggregate(mir_bb, &place, fresh, address)?
-                    else {
-                        return Ok(false);
-                    };
-                    self.local_var[dest_local] = Some(LocalValue::One(old));
+                    self.local_var[dest_local] = Some(LocalValue::One(taken));
                 } else {
-                    let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                    let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
                         return Ok(false);
                     };
-                    let old = self.read_mem_slot(mir_bb, &slot)?;
-                    self.write_mem_slot(mir_bb, slot, zero)?;
-                    self.local_var[dest_local] = Some(LocalValue::One(old));
+                    let address = arg_address(self, 0);
+                    if let Some(place) = self.bare_deref_place(&slot)
+                        && self.move_plan(&place.ty).is_some()
+                    {
+                        // `mem::take` is `replace(dest, <T as Default>::default())`.
+                        // Resolve that call before any read: a missing impl
+                        // leaves the whole `take` residual and emits nothing.
+                        let Some(target) = self.default_call_for_take(reg, &place.ty) else {
+                            return Ok(false);
+                        };
+                        let result_ty = tyref_to_value_type_with(
+                            &place.ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        );
+                        let bb_id = self.emit_bb(mir_bb);
+                        let fresh = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(fresh.clone()),
+                            kind: OpKind::Call {
+                                target,
+                                args: Vec::new(),
+                                result_ty,
+                            },
+                        });
+                        let Some(old) =
+                            self.exchange_deref_aggregate(mir_bb, &place, fresh, address)?
+                        else {
+                            return Ok(false);
+                        };
+                        self.local_var[dest_local] = Some(LocalValue::One(old));
+                    } else {
+                        let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
+                            return Ok(false);
+                        };
+                        let old = self.read_mem_slot(mir_bb, &slot)?;
+                        self.write_mem_slot(mir_bb, slot, zero)?;
+                        self.local_var[dest_local] = Some(LocalValue::One(old));
+                    }
                 }
             }
             _ => return Ok(false),
@@ -35214,6 +35612,458 @@ impl<'a> Lowering<'a> {
         tyref_is_string_value(dest_ty, self.llbc)
     }
 
+    /// Inherent checked `Wtf8::from_bytes(&[u8]) -> Option<&Wtf8>`.
+    /// Distinct from [`Self::is_wtf8_from_bytes_identity`]: that arm is
+    /// only `from_bytes_unchecked` / `from_utf8_unchecked`.
+    fn is_wtf8_from_bytes_checked(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let owner_ok = impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
+            leaf == "from_bytes" && owner.rsplit("::").next() == Some("Wtf8")
+        });
+        if !owner_ok {
+            return false;
+        }
+        crate::front::result_exc::tyref_is_option(dest_ty, self.llbc)
+            && self
+                .tyref_adt_type_arg(dest_ty, 0)
+                .is_some_and(|payload| tyref_is_string_family(&payload, self.llbc))
+    }
+
+    /// `alloc::string::<Impl>::from_utf8_lossy` whose dest is `Cow<str>`.
+    fn is_string_from_utf8_lossy(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().ends_with("::from_utf8_lossy") && self.tyref_is_cow_str(dest_ty)
+    }
+
+    /// `alloc::borrow::Cow<B>` whose borrowed form `B` is string-family
+    /// (`Cow<str>` / `Cow<&str>`).
+    ///
+    /// `Deref` takes `&self`, so the receiver is `&Cow<str>`.
+    /// [`Self::tyref_adt_type_arg`] reads the Adt node and does not peel
+    /// `Ref`; [`adt_path_of_tyref`] already does, which is why the path
+    /// check would pass and the payload check would not.
+    fn tyref_is_cow_str(&self, ty: &TyRef) -> bool {
+        let Some(path) = adt_path_of_tyref(ty, self.llbc) else {
+            return false;
+        };
+        if !path.ends_with("::Cow") {
+            return false;
+        }
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let adt_ty = peeled.as_ref().unwrap_or(ty);
+        self.tyref_adt_type_arg(adt_ty, 0).is_some_and(|payload| {
+            tyref_is_string_family(&payload, self.llbc) || tyref_strips_to_str(&payload, self.llbc)
+        })
+    }
+
+    fn fun_decl_id_path_ends_with(&self, suffix: &[&str]) -> Option<u64> {
+        let mut found = None;
+        for fd in self.llbc.iter_fun_decls() {
+            let segs: Vec<&str> = fd.item_meta.name_path_str().split("::").collect();
+            if !segs.ends_with(suffix) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(fd.def_id);
+        }
+        found
+    }
+
+    /// `pyre_object::rutf8::check_utf8` (`rutf8.py check_utf8`).
+    fn rutf8_check_utf8_fun_decl_id(&self) -> Option<u64> {
+        self.fun_decl_id_path_ends_with(&["rutf8", "check_utf8"])
+    }
+
+    /// `typedef::decode_utf8_with_errors` (`unicodehelper.py
+    /// _str_decode_utf8_slowpath` / `str_decode_utf8` replace).
+    fn decode_utf8_with_errors_fun_decl_id(&self) -> Option<u64> {
+        self.fun_decl_id_path_ends_with(&["typedef", "decode_utf8_with_errors"])
+    }
+
+    fn emit_fun_decl_call(
+        &mut self,
+        bb_id: BlockId,
+        fun_decl_id: u64,
+        segments: Vec<String>,
+        args: Vec<Variable>,
+        result_ty: ValueType,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let target = CallTarget::FunctionPath {
+            segments,
+            fun_decl_id: None,
+        }
+        .with_fun_decl_id(fun_decl_id);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target,
+                args: crate::model::call_args(args),
+                result_ty,
+            },
+        });
+        result
+    }
+
+    fn stamp_successor_local_as_rstr_str(&mut self, target: usize, dest_local: usize) {
+        if !self.block_id.is_lowered(target) {
+            return;
+        }
+        let row = self.block_id.row(target);
+        let entry = self.block_entry_local_var[row].unpack();
+        if let Some(Some(var)) = entry.get(dest_local) {
+            stamp_as_rstr_str(var);
+        }
+        // The dest is already a string byte view in this block
+        // (`from_utf8_lossy` / niche `from_bytes`).  Successor `Deref` /
+        // `&*cow` hydrates `block_entry_string_byte_view_locals`; without
+        // the mark a projected `&Cow<str>` keeps the residual Cow deref.
+        if !self.block_byte_view_conflict[row].contains(dest_local) {
+            self.block_byte_view_seen[row].insert(dest_local);
+            self.block_entry_string_byte_view_locals[row].insert(dest_local);
+        }
+    }
+
+    /// Split a terminator-call block on `disc`. `set_branch` wraps
+    /// `bool()`, so a Result tag 0 (Ok) takes the false arm and Err
+    /// takes the true arm.
+    ///
+    /// Arms join a fresh block, then that join is the emit cursor for
+    /// this MIR block (`emit_block.set`) and the goto to the MIR
+    /// successor — the slice-bounds fork shape.  Framestate pass 1
+    /// unions `emit_bb`'s exits, so a direct arm→successor edge would
+    /// drop the MIR successor out of the pending set.
+    ///
+    /// `true_raises` closes the Err arm with
+    /// `set_raise_implicit(AssertionError)` (`regular_call_is_panicking_abort`
+    /// / `TermKind::Abort` / `rtyper/debug.py ll_assert`) and does not
+    /// goto the join.  `unicodehelper.py str_decode_utf8` replace never
+    /// returns Err.  W1 leaves this false: its Err arm is the real
+    /// `Option::None`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Diamond wiring matches the emit-time Result unwrap; a context object would hide the arm extras"
+    )]
+    fn close_call_diamond(
+        &mut self,
+        mir_bb: usize,
+        target: usize,
+        dest_local: usize,
+        disc: Variable,
+        mark_string: bool,
+        true_raises: bool,
+        true_extras: &[Variable],
+        false_extras: &[Variable],
+        true_produce: impl FnOnce(&mut Self, BlockId, &[Variable]) -> Variable,
+        false_produce: impl FnOnce(&mut Self, BlockId, &[Variable]) -> Variable,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        let placeholder = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        if mark_string {
+            stamp_as_rstr_str(&placeholder);
+            if !self.string_byte_view_locals.contains(&dest_local) {
+                self.string_byte_view_locals.push(dest_local);
+            }
+        }
+        self.local_var[dest_local] = Some(LocalValue::One(placeholder.clone()));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+
+        let mut carried: Vec<Variable> = Vec::new();
+        for v in &link_args {
+            if *v != placeholder && !carried.contains(v) {
+                carried.push(v.clone());
+            }
+        }
+
+        let mut true_sources = Vec::new();
+        if !true_raises {
+            true_sources = carried.clone();
+            for extra in true_extras {
+                if !true_sources.contains(extra) {
+                    true_sources.push(extra.clone());
+                }
+            }
+        }
+        let mut false_sources = carried.clone();
+        for extra in false_extras {
+            if !false_sources.contains(extra) {
+                false_sources.push(extra.clone());
+            }
+        }
+
+        let (true_bb, true_inputs) = self.graph.create_block_with_arg_vars(true_sources.len());
+        let (false_bb, false_inputs) = self.graph.create_block_with_arg_vars(false_sources.len());
+
+        let true_mapped: Vec<Variable> = if true_raises {
+            Vec::new()
+        } else {
+            true_extras
+                .iter()
+                .map(|v| {
+                    crate::front::bool_then::map_source(&true_sources, &true_inputs, v)
+                        .expect("true-arm extra threaded")
+                })
+                .collect()
+        };
+        let false_mapped: Vec<Variable> = false_extras
+            .iter()
+            .map(|v| {
+                crate::front::bool_then::map_source(&false_sources, &false_inputs, v)
+                    .expect("false-arm extra threaded")
+            })
+            .collect();
+
+        let true_val = if true_raises {
+            None
+        } else {
+            Some(true_produce(self, true_bb, &true_mapped))
+        };
+        let false_val = false_produce(self, false_bb, &false_mapped);
+
+        let (join, join_inputs) = self.graph.create_block_with_arg_vars(link_args.len());
+        if let Some(true_val) = true_val {
+            let true_args = remap_diamond_goto_args(
+                &link_args,
+                &placeholder,
+                &true_val,
+                &true_sources,
+                &true_inputs,
+            );
+            self.graph.set_goto(true_bb, join, true_args);
+        } else {
+            self.graph.set_raise_implicit(true_bb, "AssertionError");
+        }
+        let false_args = remap_diamond_goto_args(
+            &link_args,
+            &placeholder,
+            &false_val,
+            &false_sources,
+            &false_inputs,
+        );
+        self.graph.set_goto(false_bb, join, false_args);
+        self.graph
+            .set_branch(bb_id, disc, true_bb, true_sources, false_bb, false_sources);
+
+        // Same forwarded-word remap as the slice-bounds fork, not an
+        // optimizer side table: join phis replace the head Variables so
+        // framestate `getstate` after the split is defined on `join`.
+        let mut remap: std::collections::HashMap<u64, Variable> = std::collections::HashMap::new();
+        for (src, dst) in link_args.iter().zip(join_inputs.iter()) {
+            remap.insert(src.id(), dst.clone());
+        }
+        for value in self.local_var.iter_mut().flatten() {
+            value.remap_words(&remap);
+        }
+        self.remap_forwarded_provenance(&remap);
+        if mark_string {
+            if let Some(LocalValue::One(var)) = &self.local_var[dest_local] {
+                stamp_as_rstr_str(var);
+            }
+            self.stamp_successor_local_as_rstr_str(target, dest_local);
+        }
+        self.emit_block.set(mir_bb, join);
+        let join_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(join, target_bb, join_args);
+        Ok(())
+    }
+
+    /// Checked `Wtf8::from_bytes` → `rutf8.check_utf8(bytes, true)` then
+    /// Ok → `Option::Some` of the unchecked byte identity, Err → `None`.
+    /// `rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8` fast arm.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors the other try_lower_* call intercepts"
+    )]
+    fn try_lower_wtf8_from_bytes_checked(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 1 || !self.is_wtf8_from_bytes_checked(reg, dest_ty) {
+            return Ok(false);
+        }
+        let Some(check_id) = self.rutf8_check_utf8_fun_decl_id() else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(check_id) else {
+            return Ok(false);
+        };
+        let segments = registered_path_for_fun_decl(self.llbc, fd).segments;
+        let output_ty = clone_tyref(&fd.signature.output);
+        let Some((result_owner, _, _, _, _, _)) = self.resolve_result_owners(&output_ty) else {
+            return Ok(false);
+        };
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let tagged_owners = if niche {
+            None
+        } else {
+            match self.resolve_bool_then_option_dest(dest_ty) {
+                Some(owners) => Some(owners),
+                None => return Ok(false),
+            }
+        };
+        let bytes = args[0].clone();
+        let bb_id = self.emit_bb(mir_bb);
+        let allow = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(allow.clone()),
+            kind: OpKind::ConstBool(true),
+        });
+        let result_var = self.emit_fun_decl_call(
+            bb_id,
+            check_id,
+            segments,
+            vec![bytes.clone(), allow],
+            ValueType::Ref(Some(result_owner.clone())),
+        );
+        let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var, &result_owner);
+        let option_owner = tagged_owners.as_ref().map(|(o, _, _)| o.clone());
+        let some_owner = tagged_owners.as_ref().map(|(_, s, _)| s.clone());
+        let payload_ty = tagged_owners
+            .as_ref()
+            .map(|(_, _, t)| t.clone())
+            .unwrap_or(ValueType::Str);
+        // Result Ok=0 is the false arm of `bool(disc)`.
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc,
+            niche,
+            false,
+            &[],
+            std::slice::from_ref(&bytes),
+            |this, err_bb, _| {
+                if niche {
+                    let cast = this.option_niche_null_cast(dest_ty);
+                    this.graph.push_niche_null(err_bb, cast.as_ref())
+                } else {
+                    crate::front::bool_then::emit_option_variant(
+                        &mut this.graph,
+                        err_bb,
+                        option_owner.as_ref().expect("tagged Option owner"),
+                        0,
+                        None,
+                    )
+                }
+            },
+            |this, ok_bb, mapped| {
+                let ok_bytes = mapped[0].clone();
+                if niche {
+                    stamp_as_rstr_str(&ok_bytes);
+                    ok_bytes
+                } else {
+                    crate::front::bool_then::emit_option_variant(
+                        &mut this.graph,
+                        ok_bb,
+                        option_owner.as_ref().expect("tagged Option owner"),
+                        1,
+                        Some((
+                            some_owner.as_ref().expect("tagged Some owner").as_str(),
+                            ok_bytes,
+                            payload_ty.clone(),
+                        )),
+                    )
+                }
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// `String::from_utf8_lossy` → `decode_utf8_with_errors(bytes, "replace")`
+    /// then Ok payload as a plain string (`unicodehelper.py str_decode_utf8`
+    /// replace / U+FFFD). Dest is not a Cow ADT.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors the other try_lower_* call intercepts"
+    )]
+    fn try_lower_from_utf8_lossy(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 1 || !self.is_string_from_utf8_lossy(reg, dest_ty) {
+            return Ok(false);
+        }
+        let Some(decode_id) = self.decode_utf8_with_errors_fun_decl_id() else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(decode_id) else {
+            return Ok(false);
+        };
+        let segments = registered_path_for_fun_decl(self.llbc, fd).segments;
+        let output_ty = clone_tyref(&fd.signature.output);
+        let Some((result_owner, ok_owner, _, _, _, _)) = self.resolve_result_owners(&output_ty)
+        else {
+            return Ok(false);
+        };
+        let bytes = args[0].clone();
+        let bb_id = self.emit_bb(mir_bb);
+        let replace = emit_str_const(&mut self.graph, bb_id, "replace");
+        let result_var = self.emit_fun_decl_call(
+            bb_id,
+            decode_id,
+            segments,
+            vec![bytes, replace],
+            ValueType::Ref(Some(result_owner.clone())),
+        );
+        let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var.clone(), &result_owner);
+        // Result Ok=0 is the false arm of `bool(disc)`. Err is unreachable:
+        // `unicodehelper.py str_decode_utf8` replace never returns Err, so
+        // the true arm is `RaiseImplicit(AssertionError)` (`rtyper/debug.py
+        // ll_assert`) and does not join.
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            disc,
+            true,
+            true,
+            &[],
+            std::slice::from_ref(&result_var),
+            |_, _, _| unreachable!("unicodehelper.py str_decode_utf8 replace never returns Err"),
+            |this, ok_bb, mapped| {
+                let payload = emit_payload_read(
+                    &mut this.graph,
+                    ok_bb,
+                    mapped[0].clone(),
+                    &ok_owner,
+                    ValueType::Str,
+                );
+                stamp_as_rstr_str(&payload);
+                payload
+            },
+        )?;
+        Ok(true)
+    }
+
     /// `<str as ToString>::to_string` / `<String as ToString>::to_string`
     /// (`alloc::string::<Impl>::to_string`) — a `String` clone of a value
     /// that is already a string in the lifted model (`String`/`&str`/`str`
@@ -35276,25 +36126,238 @@ impl<'a> Lowering<'a> {
     }
 
     /// `core::clone::impls::<Impl>::clone` on a Copy scalar or thin-pointer
-    /// pointee is the value itself.  A non-Copy clone (Vec, a named struct)
-    /// keeps its ordinary residual call: the path is not enough.
+    /// pointee is the value itself.  A trait `Clone::clone` on the same
+    /// kinds, or on a zero-sized Copy type (`BuildHasherDefault<_>`,
+    /// `PhantomData<_>`), is that same identity: `ll_dict_copy`
+    /// (`rordereddict.py`) has no hasher object, so a Copy/ZST clone is
+    /// the value.  A non-Copy clone (Vec, a named struct) keeps its
+    /// ordinary residual call: the path is not enough.
     fn is_copy_scalar_or_thin_ptr_clone(
         &self,
         reg: &RegularCall,
         first_arg_ty: Option<&TyRef>,
     ) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        if !is_core_clone_impls_clone_path(fd.item_meta.name_path().as_str()) {
+        if !self.is_copy_or_trait_clone_call(reg) {
             return false;
         }
-        first_arg_ty
-            .and_then(|ty| tyref_clone_pointee_node(ty, self.llbc))
-            .is_some_and(|pointee| json_ty_is_copy_scalar_or_thin_ptr(pointee, self.llbc))
+        self.clone_identity_pointee_node(reg, first_arg_ty)
+            .is_some_and(|pointee| json_ty_is_copy_or_zst_clone_identity(pointee, self.llbc))
+    }
+
+    fn is_copy_or_trait_clone_call(&self, reg: &RegularCall) -> bool {
+        match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).is_some_and(|fd| {
+                is_core_clone_impls_clone_path(fd.item_meta.name_path().as_str())
+            }),
+            CallKind::Trait(v) => is_trait_clone_clone(v, self.llbc),
+            _ => false,
+        }
+    }
+
+    /// Pointee of `&self` for `Clone::clone`, or the `Self` type in a
+    /// trait-ref `Clone` obligation.
+    fn clone_identity_pointee_node<'l>(
+        &'l self,
+        reg: &'l RegularCall,
+        first_arg_ty: Option<&'l TyRef>,
+    ) -> Option<&'l serde_json::Value> {
+        if let CallKind::Trait(v) = &reg.kind
+            && let Some(node) = trait_clone_self_node(v, self.llbc)
+        {
+            return Some(node);
+        }
+        first_arg_ty.and_then(|ty| tyref_clone_pointee_node(ty, self.llbc))
+    }
+
+    fn trait_clone_receiver_ty(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+    ) -> Option<TyRef> {
+        let node = self.clone_identity_pointee_node(reg, first_arg_ty)?;
+        serde_json::from_value(node.clone()).ok()
+    }
+
+    /// `Vec<T>` as trait `Clone::clone` → the `list` builtin
+    /// (`rtype_bltn_list` / `rlist.py` `ll_copy`).
+    fn specialized_trait_clone_list_target(
+        &self,
+        v: &serde_json::Value,
+    ) -> Option<(Vec<String>, Option<(String, String)>)> {
+        if !is_trait_clone_clone(v, self.llbc) {
+            return None;
+        }
+        let node = trait_clone_self_node(v, self.llbc)?;
+        let self_ty = serde_json::from_value::<TyRef>(node.clone()).ok()?;
+        tyref_is_vec_value(&self_ty, self.llbc).then(|| (vec!["list".to_string()], None))
+    }
+
+    /// Trait `Clone::clone` of `Vec<T>` is `rlist.py` `ll_copy` (the `list`
+    /// builtin `<[T]>::to_vec` retargets to).  A tuple of Copy/ZST and
+    /// `Vec` fields is field-wise clone plus the tuple Aggregate ctor —
+    /// `KwargsDictStrategy.copy` `self.erase((keys_w[:], values_w[:]))`
+    /// (`kwargsdict.py`).  Anything else stays residual.
+    fn try_lower_trait_clone(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        dest_local: usize,
+        args: &[Variable],
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallKind::Trait(_) = &reg.kind else {
+            return Ok(false);
+        };
+        if !self.is_copy_or_trait_clone_call(reg) {
+            return Ok(false);
+        }
+        let Some(recv) = args.first().cloned() else {
+            return Ok(false);
+        };
+        let Some(self_ty) = self.trait_clone_receiver_ty(reg, first_arg_ty) else {
+            return Ok(false);
+        };
+        if tyref_is_vec_value(&self_ty, self.llbc) {
+            self.emit_vec_list_clone(mir_bb, dest_local, recv, dest_ty, target)?;
+            return Ok(true);
+        }
+        if tyref_is_tuple(&self_ty, self.llbc) && self.tuple_fields_are_copy_or_vec(&self_ty) {
+            let tuple_ty = if tyref_is_tuple(dest_ty, self.llbc) {
+                dest_ty
+            } else {
+                &self_ty
+            };
+            return self.emit_tuple_clone(mir_bb, dest_local, recv, tuple_ty, target);
+        }
+        Ok(false)
+    }
+
+    fn tuple_fields_are_copy_or_vec(&self, ty: &TyRef) -> bool {
+        let mut idx = 0;
+        loop {
+            let Some(elem_ty) = tyref_tuple_element(ty, idx, self.llbc) else {
+                return idx > 0;
+            };
+            if !self.ty_is_copy_or_vec_clone(&elem_ty) {
+                return false;
+            }
+            idx += 1;
+        }
+    }
+
+    fn ty_is_copy_or_vec_clone(&self, ty: &TyRef) -> bool {
+        if tyref_is_vec_value(ty, self.llbc) {
+            return true;
+        }
+        tyref_node(ty, self.llbc)
+            .and_then(|node| strip_ty_indirections(node, self.llbc))
+            .is_some_and(|node| json_ty_is_copy_or_zst_clone_identity(node, self.llbc))
+    }
+
+    fn emit_vec_list_clone(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        recv: Variable,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let res = self.emit_list_copy(mir_bb, recv, dest_ty);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    fn emit_list_copy(&mut self, mir_bb: usize, recv: Variable, dest_ty: &TyRef) -> Variable {
+        let result_ty = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        self.emit_path_call(mir_bb, "list", vec![recv], result_ty)
+    }
+
+    fn emit_tuple_field_read(
+        &mut self,
+        mir_bb: usize,
+        base: Variable,
+        tuple_ty: &TyRef,
+        idx: usize,
+        elem_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let owner = tyref_positional_aggregate_root(tuple_ty, self.llbc)
+            .unwrap_or_else(|| format!("Tuple{}", tyref_tuple_suffix(tuple_ty, self.llbc)));
+        let ty = tuple_element_field_value_type(
+            elem_ty,
+            Some(clone_tyref(elem_ty)),
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        );
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner)),
+                ty,
+                pure: false,
+            },
+        });
+        res
+    }
+
+    fn emit_tuple_clone(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        recv: Variable,
+        tuple_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let mut cloned = Vec::new();
+        let mut elem_tys = Vec::new();
+        let mut idx = 0;
+        loop {
+            let Some(elem_ty) = tyref_tuple_element(tuple_ty, idx, self.llbc) else {
+                break;
+            };
+            let field = self.emit_tuple_field_read(mir_bb, recv.clone(), tuple_ty, idx, &elem_ty);
+            let value = if tyref_is_vec_value(&elem_ty, self.llbc) {
+                self.emit_list_copy(mir_bb, field, &elem_ty)
+            } else {
+                field
+            };
+            cloned.push(value);
+            elem_tys.push(elem_ty);
+            idx += 1;
+        }
+        if cloned.is_empty() {
+            return Ok(false);
+        }
+        let kind = serde_json::json!({ "Tuple": serde_json::Value::Null });
+        let Ok(shape) = self.aggregate_shape(&kind, tuple_ty, cloned.len()) else {
+            return Ok(false);
+        };
+        let AggregateShape::Ctor(ctor) = shape else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let tuple = self.emit_tuple_ctor_with_typed_fields(bb_id, &ctor, &cloned, &elem_tys);
+        self.local_var[dest_local] = Some(LocalValue::One(tuple));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// `core::default::<Impl>::default` / `core::ptr::mut_ptr::<Impl>::default`
@@ -35973,6 +37036,109 @@ impl<'a> Lowering<'a> {
                     | "alloc::boxed::iter::<Impl>::into_iter"
             )
         })
+    }
+
+    /// `core::str::<Impl>::chars` / `core::str::chars` on a string-family
+    /// receiver (`tyref_is_string_family`), including autoderef
+    /// `String` → `str`.  Yields Unicode scalars (`Utf8StringIterator`),
+    /// so it is not a byte-view identity and not a slice `iter`.
+    fn is_str_chars_constructor(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        if leaf != Some("chars") || !path.contains("str") {
+            return false;
+        }
+        first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
+    }
+
+    /// `core::str::<Impl>::as_ptr` / `core::str::as_ptr` on a
+    /// string-family receiver (`tyref_is_string_family` /
+    /// `tyref_strips_to_str`).  `as_ptr` contains the substring
+    /// `"str"`, so the owner test is a path *segment* `== "str"`.
+    fn is_str_as_ptr(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        const_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        if leaf != Some("as_ptr") || !path.split("::").any(|seg| seg == "str") {
+            return false;
+        }
+        first_arg_ty.or(const_arg_ty).is_some_and(|ty| {
+            tyref_is_string_family(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
+        })
+    }
+
+    /// `core::str::<Impl>::contains` / `core::str::contains`.
+    /// Distinct from `Range::contains`, slice `contains`, and flag-set
+    /// `contains`: those owners have no `str` path segment.  The
+    /// haystack place type is not consulted — `FMTS.contains(spec)`
+    /// materialises a `Ref` of the static whose Dedup id can share a
+    /// number with a layout node, so `tyref_is_string_family` is not a
+    /// reliable gate here.
+    fn is_str_contains_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path
+            .rsplit("::")
+            .next()
+            .map(crate::front::clause_spec::unspecialized_leaf);
+        leaf == Some("contains") && path.split("::").any(|seg| seg == "str")
+    }
+
+    /// `str::contains`'s `Pattern` generic, monomorphised.  `char` (and
+    /// a code-point Variable that rustc still types as `char`) becomes a
+    /// UTF-8 string needle; `&str` / `&String` stay a string needle.
+    fn str_contains_needle_kind(
+        &self,
+        reg: &RegularCall,
+        second_arg_ty: Option<&TyRef>,
+        second_const_arg_ty: Option<&TyRef>,
+    ) -> Option<StrContainsNeedleKind> {
+        let mut tys: Vec<TyRef> = Vec::new();
+        if let Some(ty) = str_contains_pattern_generic(reg, self.llbc) {
+            tys.push(ty);
+        }
+        if let Some(ty) = second_arg_ty {
+            tys.push(ty.clone());
+        }
+        if let Some(ty) = second_const_arg_ty {
+            tys.push(ty.clone());
+        }
+        if tys.iter().any(|ty| tyref_is_char(ty, self.llbc)) {
+            return Some(StrContainsNeedleKind::Char);
+        }
+        if tys
+            .iter()
+            .any(|ty| tyref_is_string_family(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc))
+        {
+            return Some(StrContainsNeedleKind::Str);
+        }
+        // After `str::chars` → utf8iter the live needle is a nonneg
+        // SomeInteger code point while the MIR Pattern is still `char`.
+        if tys.iter().any(|ty| tyref_is_integer_scalar(ty, self.llbc)) {
+            return Some(StrContainsNeedleKind::Char);
+        }
+        None
     }
 
     /// `<[T]>::len` / `Vec::len` — the container element count.  Lowered
@@ -39610,18 +40776,21 @@ impl<'a> Lowering<'a> {
         Some(site)
     }
 
-    /// Resolve a recognized `Option::map_or(opt, default, closure)` call into a
+    /// Resolve a recognized `Option::map_or(opt, default, callable)` call into a
     /// [`crate::front::option_map_or::MapOrSite`] — the `Option` enum root +
-    /// `Some` variant owners, the closure env's `call_once` owner, the payload
-    /// type `T` (the `Some::__pos_0` read the closure consumes), and the result
-    /// type `U` (the `call_once` / select result).  `None` (leaving the residual
-    /// call) when the receiver is not a resolvable `Option` — guarding on
-    /// `Option` since `Result::map_or` shares the name but has different tags —
-    /// or the closure env type does not resolve to an ADT.
+    /// `Some` variant owners, the closure env's `call_once` owner or the
+    /// function-item path, the payload type `T` (the `Some::__pos_0` read the
+    /// callable consumes), and the result type `U` (the `call_once` / select
+    /// result).  `None` (leaving the residual call) when the receiver is not a
+    /// resolvable `Option` — guarding on `Option` since `Result::map_or` shares
+    /// the name but has different tags — or the callable is neither a closure
+    /// ADT nor a named function item.
     fn recognize_map_or_site(
         &self,
         recv_ty: Option<&TyRef>,
         env_ty: Option<&TyRef>,
+        fn_item_segments: Option<Vec<String>>,
+        fn_item_decl: Option<&FunDecl>,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::option_map_or::MapOrSite> {
@@ -39642,22 +40811,36 @@ impl<'a> Lowering<'a> {
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         let payload_class_root = self.option_payload_instance_class_root(recv_ty);
-        // Closure env ADT → its `name_path` is the `call_once` inherent method
-        // owner (`resolve_impl_owner_adt_def_id_free` records the same spelling
-        // for the closure's transparent `call_once` body).
-        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-        let env_td = self.llbc.type_by_id(env_def_id)?;
-        let call_once_owner = closure_env_call_once_owner(env_td);
+        // Prefer a closure ADT (`call_once(env, (x,))`).  A function item has
+        // no ADT def id — `tyref_ref_adt_def_id` misses — so fall through to
+        // the `FnDef` path captured from the operand (or from `env_ty` when
+        // the item was spilled to a local).
+        let fn_item_segments = fn_item_segments
+            .or_else(|| env_ty.and_then(|ty| tyref_fn_def_call_segments(ty, self.llbc)));
+        let (call_once_owner, args_tuple_suffix, fn_item_segments) =
+            if let Some(env_def_id) = env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
+                let env_td = self.llbc.type_by_id(env_def_id)?;
+                (
+                    closure_env_call_once_owner(env_td),
+                    option_payload_tuple_suffix(recv_ty, self.llbc),
+                    None,
+                )
+            } else {
+                let segments = fn_item_segments.filter(|s| !s.is_empty())?;
+                (String::new(), String::new(), Some(segments))
+            };
+        let fn_item_ctor = match fn_item_decl {
+            Some(fd) if fn_item_segments.is_some() && fd.is_adt_constructor() => {
+                Some(self.constructor_fn_item_shape(fd, dest_ty)?)
+            }
+            _ => None,
+        };
         let result_ty = tyref_to_value_type_with(
             dest_ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
         );
-        // The single-element closure-`Args` tuple `(payload,)` the extracted
-        // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
-        // the read side derives at `resolve_place`.
-        let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         let scalar_kind = if niche {
             None
@@ -39671,6 +40854,8 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             call_once_owner,
+            fn_item_segments,
+            fn_item_ctor,
             payload_ty,
             payload_class_root,
             result_ty,
@@ -44726,7 +45911,9 @@ fn ref_temp_is_sole_append_arg(
 /// directly or through a single two-phase reborrow); a Shared borrow that is
 /// the sole argument of a string-family identity (`as_bytes` / `deref` /
 /// `as_str`, [`identity_view_of_borrow`]) — a terminal `ll_build` read
-/// (`AbstractStringBuilderRepr.rtype_method_build`); or a bare `move c`
+/// (`AbstractStringBuilderRepr.rtype_method_build`); a `mem::take(&mut c)`
+/// borrow ([`take_receiver_of_borrow`], including the two-phase reborrow
+/// `take` uses) — `old = place; place = empty`; or a bare `move c`
 /// (ownership transfer of the complete accumulated string).  Any other use — a
 /// `copy`, a projection read/write (`c.field` / `*c`), `&c.field`, `Len`/
 /// `Discriminant`, an opaque `escape(&c)`, or `c` in an assert / switch — is an
@@ -44734,7 +45921,7 @@ fn ref_temp_is_sole_append_arg(
 /// declines.  The returned temps are the call-argument locals the append arm
 /// resolves against ([`append_accumulator_of_arg_temp`]), which for a
 /// reborrowed `&mut` argument is the reborrow, not the direct borrow. Identity
-/// temps are accepted but not returned: they are not append receivers.
+/// and take temps are accepted but not returned: they are not append receivers.
 fn clean_accumulator_ref_temps(
     cache: &ScanCache,
     body: &Unstructured,
@@ -44863,11 +46050,164 @@ fn clean_accumulator_ref_temps_scan(
             receivers.push(receiver);
         } else if append_piece_of_borrow(cache, body, llbc, rt).is_none()
             && identity_view_of_borrow(cache, body, llbc, rt).is_none()
+            && take_receiver_of_borrow(body, llbc, rt).is_none()
         {
             return None;
         }
     }
     Some(receivers)
+}
+
+/// Whether `call` is `core::mem::take` / `std::mem::take` of one argument.
+fn is_mem_take_call(llbc: &Llbc, call: &CallPayload) -> bool {
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    if call.args.len() != 1 {
+        return false;
+    }
+    let Some(name) = regular_call_name_path(reg, llbc) else {
+        return false;
+    };
+    matches!(name.rsplit("::").next(), Some("take"))
+        && (name.starts_with("core::mem::") || name.starts_with("std::mem::"))
+}
+
+/// Whether borrow temp `rt` is used exactly once as the sole argument of
+/// `mem::take` and nowhere else.
+fn ref_temp_is_sole_take_arg(body: &Unstructured, llbc: &Llbc, rt: usize) -> bool {
+    let mut selected = 0usize;
+    let mut other = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for st in &bb.statements {
+            match st.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                let take = is_mem_take_call(llbc, call);
+                for (i, arg) in call.args.iter().enumerate() {
+                    if operand_reads_local(arg, rt) {
+                        if take && i == 0 {
+                            selected += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
+            }
+            _ => {}
+        }
+    }
+    selected == 1 && other == 0
+}
+
+/// Resolve a direct `&(mut) acc` borrow temp `rt` to the temp actually
+/// passed as `mem::take`'s argument.  Method-autoref `take(&mut acc)`
+/// reaches the call as `rt`; a two-phase reborrow
+/// (`rt := &mut acc; recv := &TwoPhaseMut *rt`) is the same walk
+/// [`append_receiver_of_borrow`] uses for an explicit `&mut buf`
+/// append.  Accepted by [`clean_accumulator_ref_temps`] like an identity
+/// view: the borrow does not disqualify the accumulator and is not an
+/// append receiver.
+fn take_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    if ref_temp_is_sole_take_arg(body, llbc, rt) {
+        return Some(rt);
+    }
+    let mut recv: Option<usize> = None;
+    let mut other = 0usize;
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for st in &bb.statements {
+            match st.stmt_kind_ref() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if let Rvalue::Ref { place: rp, .. } | Rvalue::RawPtr { place: rp, .. } = rvalue
+                        && place_is_immediate_deref_of(rp, rt)
+                    {
+                        let &PlaceKind::Local(r) = &place.kind else {
+                            return None;
+                        };
+                        if recv.replace(r as usize).is_some() {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(rvalue, rt, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(place, rt)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(a)) if operand_reads_local(&a.cond, rt) => {
+                    other += 1;
+                }
+                _ => {}
+            }
+        }
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Call { call, .. }) => {
+                if let CallFunc::Dynamic(op) = &call.func
+                    && operand_reads_local(op, rt)
+                {
+                    other += 1;
+                }
+                if call.args.iter().any(|a| operand_reads_local(a, rt)) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_reads_local(discr, rt) {
+                    other += 1;
+                }
+            }
+            Ok(TermKind::Assert { assert, .. }) if operand_reads_local(&assert.cond, rt) => {
+                other += 1;
+            }
+            _ => {}
+        }
+    }
+    let recv = recv?;
+    if other != 0 {
+        return None;
+    }
+    ref_temp_is_sole_take_arg(body, llbc, recv).then_some(recv)
 }
 
 /// Whether `call` is a 1-arg string-family identity: `as_bytes` / `bytes`,
@@ -45411,10 +46751,11 @@ fn identity_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize)
 
 /// Count the terminal consumptions of a fresh accumulator local `c`.
 /// [`clean_accumulator_ref_temps`] already proves every other use of `c`
-/// is the ctor def, an append borrow, or a string-family identity view, so
-/// each `move c`, each inner-builder append piece, and each identity-view
-/// borrow (`as_bytes` / `deref` / `as_str`) is a terminal materialisation of
-/// the finished string — the point where a real builder must run `ll_build`
+/// is the ctor def, an append borrow, a string-family identity view, or a
+/// `mem::take`, so each `move c`, each inner-builder append piece, each
+/// identity-view borrow (`as_bytes` / `deref` / `as_str`), and each
+/// `mem::take` is a terminal materialisation of the finished string — the
+/// point where a real builder must run `ll_build`
 /// (`AbstractStringBuilderRepr.rtype_method_build`).  Exclusive-branch
 /// identity views are several such points; sequential `build()` is valid
 /// on one `StringBuilder`.  See [`is_builder_mode_accumulator`].
@@ -45444,7 +46785,8 @@ fn accumulator_materialization_site_count(
                     && let Ok(StmtKind::Assign(place, _)) = st.stmt_kind_ref()
                     && let &PlaceKind::Local(rt) = &place.kind
                     && (append_piece_of_borrow(cache, body, llbc, rt as usize).is_some()
-                        || identity_view_of_borrow(cache, body, llbc, rt as usize).is_some())
+                        || identity_view_of_borrow(cache, body, llbc, rt as usize).is_some()
+                        || take_receiver_of_borrow(body, llbc, rt as usize).is_some())
                 {
                     moves += 1;
                 }
@@ -45527,14 +46869,14 @@ fn single_def_is_str_builder_ctor(body: &Unstructured, llbc: &Llbc, c: usize) ->
 ///   ([`single_def_is_str_builder_ctor`]) — a non-constructor definition is
 ///   an already-built string, and the ctor rewrite would replace that
 ///   producer with `__majit_stringbuilder_new`,
-/// * every borrow of `c` an append or a string-family identity view
-///   ([`clean_accumulator_ref_temps`]), and
+/// * every borrow of `c` an append, a string-family identity view, or a
+///   `mem::take` ([`clean_accumulator_ref_temps`]), and
 /// * at least one terminal consumption
 ///   ([`accumulator_materialization_site_count`]) — a by-value move, an
-///   inner-builder append piece, or an identity-view `as_bytes` / `deref` /
-///   `as_str` (`AbstractStringBuilderRepr.rtype_method_build`). Exclusive
-///   branches may each `ll_build`; sequential `build()` is valid on one
-///   `StringBuilder`.
+///   inner-builder append piece, an identity-view `as_bytes` / `deref` /
+///   `as_str`, or a `mem::take` (`AbstractStringBuilderRepr.rtype_method_build`).
+///   Exclusive branches may each `ll_build`; sequential `build()` is valid
+///   on one `StringBuilder`.
 ///
 /// Zero terminal reads, or a non-constructor definition, keep the
 /// `ll_strconcat` fallback so the builder rewrite only fires where the
@@ -64820,14 +66162,19 @@ fn raw_ptr_pointee_class_root_with(
     adt_node_class_root_with(strip_ty_wrappers(raw.first()?, llbc)?, llbc, tombstoned)
 }
 
-/// The projected list root of a raw pointer onto a Rust container.
+/// The projected list or tuple root of a raw pointer onto a Rust container.
 ///
 /// RPython keeps pointers to `GcArray` values typed, including null pointers
 /// (`lltype.nullptr(ARRAY)`).  Rust's corresponding owner can be a
 /// `*mut Vec<T>` field, which otherwise enters the annotator as a
 /// classdef-less pointer and cannot union with the `SomeList` produced when
-/// the array is allocated.  Return the same rendered container spelling
-/// `Bookkeeper::project_struct_field_type` consumes at the cast boundary.
+/// the array is allocated.  A `*const (Vec<T>, Vec<T>)` is the kwargs
+/// unerase dest (`KwargsDictStrategy.copy` `unerase` /
+/// `lltype.cast_opaque_ptr`): Charon spells the builtin tuple as `(A,B)`,
+/// while FieldRead owners and `is_shaped_tuple_name` use `Tuple<A,B>`.
+/// Return the same rendered container spelling
+/// `Bookkeeper::project_struct_field_type` / `project_shaped_tuple`
+/// consume at the cast boundary.
 fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let pointee = node
         .as_object()?
@@ -64835,6 +66182,9 @@ fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Opti
         .as_array()?
         .first()
         .and_then(|node| strip_ty_wrappers(node, llbc))?;
+    if let Some(root) = tyref_shaped_tuple_root(&TyRef::Other(pointee.clone()), llbc) {
+        return Some(root);
+    }
     let rendered = charon_type_value_to_ast_string(pointee, llbc, 0);
     (rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") || rendered.starts_with('['))
         .then_some(rendered)
@@ -65807,6 +67157,14 @@ fn json_ty_is_copy_scalar_or_thin_ptr(node: &serde_json::Value, llbc: &Llbc) -> 
     json_ty_is_copy_scalar(node, llbc) || json_ty_is_thin_pointer_element(node, llbc)
 }
 
+/// Copy-scalar / thin-pointer clone identity, plus a zero-sized Copy
+/// type (`BuildHasherDefault<_>`, `PhantomData<_>`). `ll_dict_copy`
+/// (`rordereddict.py`) has no hasher object, so that clone is the value.
+fn json_ty_is_copy_or_zst_clone_identity(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    json_ty_is_copy_scalar_or_thin_ptr(node, llbc)
+        || tyref_is_void_zst(&TyRef::Other(node.clone()), llbc)
+}
+
 fn tyref_peel_one_ref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node
@@ -66062,6 +67420,50 @@ fn tyref_is_char(ty: &TyRef, llbc: &Llbc) -> bool {
             };
             lit.as_str() == Some("Char") || lit.as_object().is_some_and(|o| o.contains_key("Char"))
         })
+}
+
+/// Needle of `str::contains<P>` after Pattern monomorphisation.
+enum StrContainsNeedleKind {
+    /// `char`, including a utf8iter code-point Variable still typed as `char`.
+    Char,
+    /// `&str` / `&String` / string-family.
+    Str,
+}
+
+/// `str::contains<P>`'s monomorphised Pattern type `P`.
+///
+/// Charon `--monomorphize` copies the instance arguments onto the call
+/// (`RegularCall::take_instance_arguments`); the FunDecl Instantiated
+/// segment is the fallback when the call's `types` list is empty.
+fn str_contains_pattern_generic(reg: &RegularCall, llbc: &Llbc) -> Option<TyRef> {
+    let from_call = reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+        .cloned();
+    let from_decl = match &reg.kind {
+        CallKind::Fun(FunId::Regular { id }) => llbc
+            .fn_by_id(*id)
+            .and_then(|fd| fd.item_meta.instantiation())
+            .and_then(|inst| inst.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .cloned(),
+        _ => None,
+    };
+    let raw = from_call.or(from_decl)?;
+    Some(serde_json::from_value(raw.clone()).unwrap_or_else(|_| TyRef::Other(raw)))
+}
+
+/// `{"Scalar": {"Integer": …}}` after stripping `&T` / `*T`.
+/// utf8iter yields a nonneg SomeInteger code point for `str::chars`.
+fn tyref_is_integer_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(|node| node.as_object()?.get("Scalar"))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scalar| scalar.contains_key("Integer"))
 }
 
 fn json_ty_literal_byte_size(node: &serde_json::Value) -> Option<i64> {
@@ -68531,6 +69933,52 @@ fn trait_payload_owner(v: &serde_json::Value, llbc: &Llbc) -> Option<(String, St
     let path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
     let trait_leaf = path.rsplit("::").next()?.to_string();
     Some((trait_leaf, method_leaf))
+}
+
+/// `CallKind::Trait` payload of `Clone::clone`.
+fn is_trait_clone_clone(v: &serde_json::Value, llbc: &Llbc) -> bool {
+    if let Some((trait_leaf, method_leaf)) = trait_payload_owner(v, llbc)
+        && trait_leaf == "Clone"
+        && method_leaf == "clone"
+    {
+        return true;
+    }
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
+    if arr.get(1).and_then(serde_json::Value::as_u64) != Some(0) {
+        return false;
+    }
+    traitref_unwrap(arr.first().unwrap_or(v), llbc, 0)
+        .and_then(|tref| tref.pointer("/kind/BuiltinOrAuto/builtin_data"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Clone")
+}
+
+/// Owned `Self` of a trait `Clone::clone` obligation, from the trait-ref
+/// generic `types[0]`. A leading `&` is peeled so a tuple `Self` is the
+/// tuple, not the borrow (`tyref_is_tuple` does not peel refs).
+fn trait_clone_self_node<'l>(
+    v: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let arr = v.as_array()?;
+    let tref = traitref_unwrap(arr.first()?, llbc, 0)?;
+    let ty = tref
+        .pointer("/trait_decl_ref/skip_binder/generics/types")?
+        .as_array()?
+        .first()?;
+    let node = strip_ty_indirections(ty, llbc)?;
+    if let Some(pointee) = node
+        .as_object()
+        .and_then(|o| o.get("Ref"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+    {
+        strip_ty_indirections(pointee, llbc)
+    } else {
+        Some(node)
+    }
 }
 
 fn trait_ref_decl_id(trait_ref: &serde_json::Value, llbc: &Llbc) -> Option<u64> {
@@ -74097,6 +75545,29 @@ fn emit_niche_null(
     }
 }
 
+/// Reproduce a diamond arm's goto args: the placeholder dest slot is
+/// the arm's produced value, every other live Variable is re-sourced
+/// from the arm's threaded inputarg (`bool_then::map_source`).
+fn remap_diamond_goto_args(
+    link_args: &[Variable],
+    placeholder: &Variable,
+    produced: &Variable,
+    sources: &[Variable],
+    inputs: &[Variable],
+) -> Vec<Variable> {
+    link_args
+        .iter()
+        .map(|v| {
+            if v == placeholder {
+                produced.clone()
+            } else {
+                crate::front::bool_then::map_source(sources, inputs, v)
+                    .expect("diamond edge arg carried")
+            }
+        })
+        .collect()
+}
+
 fn emit_enum_disc_read(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -76635,6 +78106,17 @@ fn stamp_as_rstr_str(var: &Variable) {
     var.set_concretetype(Some(STRPTR.clone()));
 }
 
+/// `rutf8.unichr_as_utf8(code, allow_surrogates=True)` for a Unicode
+/// scalar constant.  Surrogates are left to the runtime helper (Rust
+/// `String` cannot hold them).
+fn unichr_as_utf8_text(code: i64) -> Option<String> {
+    let code = u32::try_from(code).ok()?;
+    if code > 0x10FFFF {
+        return None;
+    }
+    char::from_u32(code).map(String::from)
+}
+
 /// Emit a `__str_const` constant of `text` into `bb_id` and return its
 /// Variable — the same synthetic `Call(["__str_const", text])` shape the
 /// constant lowering uses (see [`Lowering::emit_constant`]); the flowspace
@@ -78726,6 +80208,294 @@ fn can_thread_var_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable
     }
 }
 
+/// `alloc::fmt::format`, `fmt::Arguments` constructors, `fmt::rt::Argument::new_*`,
+/// and the pure helpers that exist only to fill those operands (`kind_name`,
+/// `expected_fmt_arg`, `__len`).  `rtyper/debug.py` `ll_assert` takes a
+/// constant message; rustc still evaluates these before `panic_fmt`.
+fn is_abort_message_call(segments: &[String]) -> bool {
+    if segments.first().map(String::as_str) == Some("__str_const") {
+        return true;
+    }
+    if fmt_path_ends_with(segments, &["fmt", "format"]) {
+        return true;
+    }
+    let Some(raw_leaf) = segments.last() else {
+        return false;
+    };
+    let leaf = crate::front::clause_spec::unspecialized_leaf(raw_leaf);
+    if is_abort_message_helper_leaf(leaf) {
+        return true;
+    }
+    if segments.iter().any(|s| s == "Argument") && leaf.starts_with("new_") {
+        return true;
+    }
+    if segments.iter().any(|s| s == "Arguments")
+        && (matches!(
+            leaf,
+            "new" | "new_v1" | "new_const" | "from_str" | "from_str_nonconst"
+        ) || leaf.starts_with("new_"))
+    {
+        return true;
+    }
+    // `core::fmt::<Impl>::new` when the owner stayed an `<Impl>` placeholder.
+    leaf == "new"
+        && segments.iter().any(|s| s == "fmt")
+        && !segments.iter().any(|s| s == "Argument")
+}
+
+fn is_abort_message_helper_leaf(leaf: &str) -> bool {
+    matches!(leaf, "kind_name" | "expected_fmt_arg" | "__len")
+}
+
+fn abort_message_call_target(target: &crate::model::CallTarget) -> bool {
+    use crate::model::CallTarget;
+    match target {
+        CallTarget::FunctionPath { segments, .. } => is_abort_message_call(segments),
+        CallTarget::Method {
+            name,
+            resolved_path,
+            ..
+        } => {
+            resolved_path
+                .as_ref()
+                .is_some_and(|p| is_abort_message_call(&p.segments))
+                || is_abort_message_helper_leaf(name)
+        }
+        CallTarget::SyntheticTransparentCtor { name, .. } => {
+            matches!(name.as_str(), "Tuple" | "Array" | "Some")
+        }
+        _ => false,
+    }
+}
+
+fn block_produced_var_ids(block: &crate::model::Block) -> std::collections::HashSet<u64> {
+    block
+        .operations
+        .iter()
+        .filter_map(|op| op.result.as_ref().map(|r| r.id()))
+        .collect()
+}
+
+fn is_abort_message_op(
+    kind: &crate::model::OpKind,
+    produced_in_block: &std::collections::HashSet<u64>,
+) -> bool {
+    use crate::model::OpKind;
+    match kind {
+        // `graph_body.rs` `stamp_declared` / `declaration` pin startblock
+        // `Input` ops to the funcobj header. A unique-pred chain from the
+        // startblock into an abort (a body that is only `panic!("…{}", x)`)
+        // still has to keep those parameters even when they feed only the
+        // melted message.
+        OpKind::Input { .. } => false,
+        OpKind::Call { target, .. } => abort_message_call_target(target),
+        OpKind::FieldWrite { base, .. } => produced_in_block.contains(&base.id()),
+        _ => crate::inline::can_remove_op(kind),
+    }
+}
+
+fn abort_message_op_is_live(
+    op: &crate::model::SpaceOperation,
+    produced_in_block: &std::collections::HashSet<u64>,
+    live: &std::collections::HashSet<u64>,
+) -> bool {
+    use crate::model::OpKind;
+    if !is_abort_message_op(&op.kind, produced_in_block) {
+        return false;
+    }
+    match &op.kind {
+        // A write into a live aggregate (the pieces / args array whose
+        // `Arguments::new` result escaped) must keep its value operand.
+        OpKind::FieldWrite { base, .. } => live.contains(&base.id()),
+        _ => op.result.as_ref().is_some_and(|r| live.contains(&r.id())),
+    }
+}
+
+fn link_raises_implicit_assertion_error(
+    link: &crate::model::Link,
+    exceptblock: BlockId,
+    assert_err: &crate::flowspace::model::HostObject,
+) -> bool {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::LinkArg;
+    link.target == exceptblock
+        && matches!(
+            link.args.first(),
+            Some(LinkArg::Const(c))
+                if matches!(&c.value, ConstValue::HostObject(h) if *h == *assert_err)
+        )
+}
+
+/// Abort block plus the unique-predecessor chain that has no other successor
+/// — the blocks rustc fills with `format_args!` before `panic_fmt`.
+fn abort_message_region(graph: &FunctionGraph, abort: BlockId) -> Vec<BlockId> {
+    let mut region = vec![abort];
+    let mut cur = abort;
+    for _ in 0..graph.blocks.len() {
+        let preds = graph.predecessors(cur);
+        if preds.len() != 1 {
+            break;
+        }
+        let pred = preds[0];
+        if graph.block(pred).exits.len() != 1 {
+            break;
+        }
+        region.push(pred);
+        cur = pred;
+    }
+    region
+}
+
+/// Melt abort-bound message construction (`removeassert.py` "melt away the
+/// (hopefully) dead operation that compute the condition").  Ops whose
+/// result is used only as the panicking call's format operands disappear;
+/// a store into an escaped object, and a `format!` whose result is live,
+/// stay.
+fn melt_abort_message_chain(graph: &mut FunctionGraph, abort: BlockId) -> usize {
+    use crate::model::LinkArg;
+    let region = abort_message_region(graph, abort);
+    let region_set: std::collections::HashSet<BlockId> = region.iter().copied().collect();
+    let exceptblock = graph.exceptblock;
+    let mut outside_used: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        let in_region = region_set.contains(&block.id);
+        if !in_region {
+            for op in &block.operations {
+                for v in crate::inline::op_variable_refs(&op.kind) {
+                    outside_used.insert(v.id());
+                }
+            }
+        }
+        for exit in &block.exits {
+            if in_region && (region_set.contains(&exit.target) || exit.target == exceptblock) {
+                continue;
+            }
+            for arg in &exit.args {
+                if let Some(v) = arg.as_variable() {
+                    outside_used.insert(v.id());
+                }
+            }
+        }
+    }
+    let mut live = outside_used;
+    for block in &graph.blocks {
+        if !region_set.contains(&block.id) {
+            continue;
+        }
+        let produced = block_produced_var_ids(block);
+        for op in &block.operations {
+            if is_abort_message_op(&op.kind, &produced) {
+                continue;
+            }
+            for v in crate::inline::op_variable_refs(&op.kind) {
+                live.insert(v.id());
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bi in 0..graph.blocks.len() {
+            let block_id = graph.blocks[bi].id;
+            if !region_set.contains(&block_id) {
+                continue;
+            }
+            let live_inputs: Vec<usize> = graph.blocks[bi]
+                .inputargs
+                .iter()
+                .enumerate()
+                .filter(|(_, inp)| live.contains(&inp.id()))
+                .map(|(i, _)| i)
+                .collect();
+            let preds = graph.predecessors(block_id);
+            for pred in preds {
+                if !region_set.contains(&pred) {
+                    continue;
+                }
+                for exit in &graph.block(pred).exits {
+                    if exit.target != block_id {
+                        continue;
+                    }
+                    for &i in &live_inputs {
+                        if let Some(LinkArg::Value(v)) = exit.args.get(i)
+                            && live.insert(v.id())
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            let produced = block_produced_var_ids(&graph.blocks[bi]);
+            let pull: Vec<u64> = graph.blocks[bi]
+                .operations
+                .iter()
+                .filter(|op| abort_message_op_is_live(op, &produced, &live))
+                .flat_map(|op| crate::inline::op_variable_refs(&op.kind))
+                .map(|v| v.id())
+                .collect();
+            for id in pull {
+                if live.insert(id) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut deleted = 0usize;
+    for block in &mut graph.blocks {
+        if !region_set.contains(&block.id) {
+            continue;
+        }
+        let produced = block_produced_var_ids(block);
+        let dead: Vec<usize> = block
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| {
+                is_abort_message_op(&op.kind, &produced)
+                    && !abort_message_op_is_live(op, &produced, &live)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if dead.is_empty() {
+            continue;
+        }
+        deleted += dead.len();
+        let drop: std::collections::HashSet<usize> = dead.into_iter().collect();
+        let mut kept = Vec::with_capacity(block.operations.len() - drop.len());
+        for (i, op) in block.operations.drain(..).enumerate() {
+            if !drop.contains(&i) {
+                kept.push(op);
+            }
+        }
+        block.operations = kept;
+    }
+    deleted
+}
+
+fn melt_abort_message_ops(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::HOST_ENV;
+    let assert_err = HOST_ENV
+        .lookup_builtin("AssertionError")
+        .expect("HOST_ENV missing AssertionError");
+    let exceptblock = graph.exceptblock;
+    let aborts: Vec<BlockId> = graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.exits.as_slice(),
+                [exit] if link_raises_implicit_assertion_error(exit, exceptblock, &assert_err)
+            )
+        })
+        .map(|block| block.id)
+        .collect();
+    let mut deleted = 0usize;
+    for abort in aborts {
+        deleted += melt_abort_message_chain(graph, abort);
+    }
+    deleted
+}
+
 /// A block is collapsible into a bare implicit-`AssertionError` raise when
 /// every op is a pure value / ctor / field op or a recognised `fmt`
 /// message extern — the message-building work a Rust `panic!` / `assert!`
@@ -78737,44 +80507,14 @@ fn can_thread_var_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable
 /// — a real side-effecting function such as `Write::write_fmt` — likewise
 /// blocks the collapse.
 fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
-    use crate::model::{CallTarget, OpKind};
-    let is_message_extern = |segments: &[String]| -> bool {
-        if segments.first().map(String::as_str) == Some("__str_const") {
-            return true;
-        }
-        let n = segments.len();
-        n >= 2
-            && segments.first().map(String::as_str) == Some("fmt")
-            && matches!(segments[n - 2].as_str(), "Argument" | "Arguments")
-    };
+    use crate::model::OpKind;
     let mut produced = std::collections::HashSet::new();
     for op in &block.operations {
         let pure = match &op.kind {
-            OpKind::ConstInt(_)
-            | OpKind::ConstFnAddr { .. }
-            | OpKind::ConstUInt(_)
-            | OpKind::ConstBool(_)
-            | OpKind::ConstFloat(_)
-            | OpKind::ConstStr(_)
-            | OpKind::ConstInternedStr(_)
-            | OpKind::ConstRef(_)
-            | OpKind::ConstRefNull
-            | OpKind::ConstNone
-            | OpKind::ConstRefAddr(_)
-            | OpKind::ConstSymbolic { .. }
-            | OpKind::FieldRead { .. }
-            | OpKind::BinOp { .. }
-            | OpKind::UnaryOp { .. } => true,
+            OpKind::Input { .. } => false,
+            OpKind::Call { target, .. } => abort_message_call_target(target),
             OpKind::FieldWrite { base, .. } => produced.contains(&base.id()),
-            OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { .. },
-                ..
-            } => true,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => is_message_extern(segments),
-            _ => false,
+            kind => crate::inline::can_remove_op(kind),
         };
         if !pure {
             return false;
@@ -90248,6 +91988,146 @@ mod tests {
         Llbc::from_slice(file.to_string().as_bytes()).expect("std extern fixture Llbc parses")
     }
 
+    /// Trait `Clone::clone` of `self_ty` (`&Self` argument, owned dest).
+    fn trait_clone_call_fixture(
+        caller_name: &str,
+        self_ty: serde_json::Value,
+        type_decls: Vec<serde_json::Value>,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let recv_ty = serde_json::json!({"Ref": ["_", self_ty.clone(), "Shared"]});
+        let locals = vec![
+            serde_json::json!({
+                "index": 0,
+                "name": null,
+                "span": span(),
+                "ty": self_ty.clone()
+            }),
+            serde_json::json!({
+                "index": 1,
+                "name": "arg0",
+                "span": span(),
+                "ty": recv_ty.clone()
+            }),
+        ];
+        let trait_ref = serde_json::json!({
+            "kind": {"BuiltinOrAuto": {"builtin_data": "Clone"}},
+            "trait_decl_ref": {
+                "skip_binder": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [self_ty.clone()],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [recv_ty.clone()],
+                "output": self_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": locals
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Trait": [trait_ref, 0]},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [{
+                                                "Copy": {"kind": {"Local": 1}, "ty": recv_ty.clone()}
+                                            }],
+                                            "dest": {"kind": {"Local": 0}, "ty": self_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let clone_trait = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["core", "clone", "Clone"], false),
+            "methods": [{"skip_binder": {"name": "clone"}}]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": type_decls,
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [clone_trait],
+                "assoc_item_names": [{"types": [], "methods": ["clone"], "consts": []}],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("trait clone fixture Llbc parses")
+    }
+
     fn call_leafs(ops: &[&SpaceOperation]) -> Vec<String> {
         ops.iter()
             .filter_map(|op| match &op.kind {
@@ -90391,6 +92271,195 @@ mod tests {
         assert!(
             call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
             "core::clone::<Impl>::clone must not use the impls identity; ops={ops:?}"
+        );
+    }
+
+    fn named_adt(id: u64, types: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [],
+                    "types": types,
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    fn type_decl_struct(
+        id: u64,
+        path: &[&str],
+        fields: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": {
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": false
+            },
+            "kind": {"Struct": fields}
+        })
+    }
+
+    #[test]
+    fn trait_clone_of_build_hasher_default_is_identity() {
+        let hasher = named_adt(0, vec![named_adt(1, vec![])]);
+        let llbc = trait_clone_call_fixture(
+            "clone_hasher",
+            hasher,
+            vec![
+                type_decl_struct(0, &["core", "hash", "BuildHasherDefault"], vec![]),
+                type_decl_struct(1, &["fixture", "Fnv1aHasher"], vec![]),
+            ],
+        );
+        let graph =
+            super::lower_function(&llbc, "clone_hasher").expect("lower BuildHasherDefault Clone");
+        let ops = graph_ops(&graph);
+        let leaves = call_leafs(&ops);
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "clone"),
+            "Copy ZST Clone::clone must be identity; ops={ops:?}"
+        );
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "list"),
+            "BuildHasherDefault clone must not become list; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_vec_is_list_builtin() {
+        let vec_ty = named_adt(0, vec![named_adt(1, vec![])]);
+        let llbc = trait_clone_call_fixture(
+            "clone_vec",
+            vec_ty,
+            vec![
+                type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
+                type_decl_struct(1, &["pyre_object", "object", "PyObjectRef"], vec![]),
+            ],
+        );
+        let graph = super::lower_function(&llbc, "clone_vec").expect("lower Vec Clone");
+        let ops = graph_ops(&graph);
+        let leaves = call_leafs(&ops);
+        assert!(
+            leaves.iter().any(|leaf| *leaf == "list"),
+            "Vec Clone::clone must become the list builtin; ops={ops:?}"
+        );
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "clone"),
+            "Vec Clone::clone must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_vec_pair_is_two_list_copies_and_tuple() {
+        let vec_ty = named_adt(0, vec![named_adt(1, vec![])]);
+        let tuple_ty = serde_json::json!({
+            "Adt": {
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [vec_ty.clone(), vec_ty.clone()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let llbc = trait_clone_call_fixture(
+            "clone_vec_pair",
+            tuple_ty,
+            vec![
+                type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
+                type_decl_struct(1, &["pyre_object", "object", "PyObjectRef"], vec![]),
+            ],
+        );
+        let graph = super::lower_function(&llbc, "clone_vec_pair").expect("lower (Vec, Vec) Clone");
+        let ops = graph_ops(&graph);
+        let list_calls = call_leafs(&ops)
+            .iter()
+            .filter(|leaf| *leaf == "list")
+            .count();
+        assert_eq!(
+            list_calls, 2,
+            "(Vec, Vec) Clone::clone must emit two list copies; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "(Vec, Vec) Clone::clone must not residualize; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+            )),
+            "(Vec, Vec) clone must read field 0; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "__pos_1"
+            )),
+            "(Vec, Vec) clone must read field 1; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )),
+            "(Vec, Vec) clone must construct a tuple; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_user_struct_stays_residual() {
+        let user = named_adt(0, vec![]);
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let field = serde_json::json!({
+            "name": "payload",
+            "ty": i64_ty,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            }
+        });
+        let llbc = trait_clone_call_fixture(
+            "clone_user",
+            user,
+            vec![type_decl_struct(0, &["fixture", "UserClone"], vec![field])],
+        );
+        let graph = super::lower_function(&llbc, "clone_user").expect("lower user Clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "a non-Copy user Clone must stay residual; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "list"),
+            "a user Clone must not become list; ops={ops:?}"
         );
     }
 
@@ -96809,6 +98878,280 @@ mod tests {
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!({"Scalar": []})));
     }
 
+    /// `*mut GCREFOpaque` and `*const (Vec<*mut PyObject>, Vec<*mut PyObject>)`
+    /// — the kwargs unerase dest (`KwargsDictStrategy.copy` `unerase`).
+    fn kwargs_unerase_ptr_tys() -> (serde_json::Value, serde_json::Value) {
+        let empty_g = empty_generics();
+        let adt = |id: u64| {
+            serde_json::json!({
+                "Adt": {"id": id, "generics": empty_g.clone()}
+            })
+        };
+        let gcref_ptr = serde_json::json!({"RawPtr": [adt(0), "Mut"]});
+        let vec_item = serde_json::json!({"RawPtr": [adt(1), "Mut"]});
+        let vec_ty = serde_json::json!({
+            "Adt": {
+                "id": 2,
+                "generics": {
+                    "regions": [],
+                    "types": [vec_item],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let tuple_ty = serde_json::json!({
+            "Adt": {
+                "builtin": "Tuple",
+                "generics": {
+                    "regions": [],
+                    "types": [vec_ty.clone(), vec_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let dest_ptr = serde_json::json!({"RawPtr": [tuple_ty, "Const"]});
+        (gcref_ptr, dest_ptr)
+    }
+
+    fn kwargs_unerase_type_decls() -> Vec<serde_json::Value> {
+        vec![
+            type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]),
+            type_decl_struct(1, &["fixture", "PyObject"], vec![]),
+            type_decl_struct(2, &["alloc", "vec", "Vec"], vec![]),
+        ]
+    }
+
+    fn gctype_impl_row(self_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "impl_trait": {
+                "id": 0,
+                "generics": {"types": [{
+                    "Value": [self_id, {
+                        "Adt": {
+                            "id": self_id,
+                            "generics": empty_generics()
+                        }
+                    }]
+                }]}
+            }
+        })
+    }
+
+    fn gctype_trait_decl() -> serde_json::Value {
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["majit_gc", "header", "GcType"], "", false)
+        })
+    }
+
+    fn kwargs_unerase_cast_llbc(src_is_gcref: bool) -> Llbc {
+        let (gcref_ptr, dest_ptr) = kwargs_unerase_ptr_tys();
+        let src_ty = if src_is_gcref {
+            gcref_ptr.clone()
+        } else {
+            serde_json::json!({
+                "RawPtr": [{
+                    "Adt": {"id": 1, "generics": empty_generics()}
+                }, "Mut"]
+            })
+        };
+        let span = span_json();
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "unerase"], "", true),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ptr.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ptr.clone()},
+                    {"index": 1, "name": "dstorage", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ptr),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [src_ty.clone(), dest_ptr.clone()]}},
+                                {"Move": place(1, &src_ty)}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let impls = if src_is_gcref {
+            serde_json::json!([gctype_impl_row(0)])
+        } else {
+            serde_json::json!([gctype_impl_row(1)])
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": kwargs_unerase_type_decls(),
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [gctype_trait_decl()],
+                "trait_impls": impls
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("kwargs unerase fixture parses")
+    }
+
+    #[test]
+    fn raw_ptr_pointee_container_root_names_a_tuple_of_vecs() {
+        let llbc = kwargs_unerase_cast_llbc(true);
+        let (_, dest_ptr) = kwargs_unerase_ptr_tys();
+        let root = super::raw_ptr_pointee_container_root(&dest_ptr, &llbc)
+            .expect("tuple-of-vecs dest must be a container root");
+        assert!(
+            majit_ir::descr::is_shaped_tuple_name(&root),
+            "dest spelling must be Tuple<...>, got {root}"
+        );
+        assert!(
+            root.contains("Vec<") && root.contains("PyObject"),
+            "tuple items must be Vec of PyObject pointers, got {root}"
+        );
+    }
+
+    #[test]
+    fn gcref_cast_to_tuple_of_vecs_emits_cast_instance_marker() {
+        let llbc = kwargs_unerase_cast_llbc(true);
+        let graph = super::lower_function(&llbc, "unerase").expect("lower GCREF unerase");
+        let roots: Vec<&str> = graph_ops(&graph)
+            .iter()
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert!(
+            roots
+                .iter()
+                .any(|root| majit_ir::descr::is_shaped_tuple_name(root)),
+            "GCREF as *const (Vec, Vec) must emit __cast_instance_intrinsic; roots={roots:?}"
+        );
+    }
+
+    #[test]
+    fn non_gcref_cast_to_tuple_of_vecs_aliases() {
+        let llbc = kwargs_unerase_cast_llbc(false);
+        let graph = super::lower_function(&llbc, "unerase").expect("lower PyObject unerase");
+        let roots: Vec<&str> = graph_ops(&graph)
+            .iter()
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert!(
+            roots
+                .iter()
+                .all(|root| !majit_ir::descr::is_shaped_tuple_name(root)),
+            "a non-GCREF source must keep today's alias; roots={roots:?}"
+        );
+    }
+
+    #[test]
+    fn gcref_field_cast_to_tuple_graph_annotates_sometuple_and_pos0_list() {
+        // Synthetic graph, not LLBC-backed: Input(GCREF) then unerase
+        // marker then `__pos_0` FieldRead (`rtuple.py` `rtype_getitem`).
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomeValue;
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+        // Multi-word Vec items project to SomeList. Production kwargs
+        // `Vec<*mut PyObject>` is one-word and projects to SomeRustVec
+        // (`rust_vec_item_kind_for_spelling`); the lowering tests above
+        // keep that spelling.
+        let tuple_root = "Tuple<Vec<String>,Vec<String>>";
+        let mut graph = FunctionGraph::new("kwargs_unerase");
+        let entry = graph.startblock;
+        let dstorage = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "dstorage".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("GCREF".to_string()),
+                },
+                true,
+            )
+            .expect("input");
+        graph.push_inputarg_var(entry, dstorage.clone());
+        let unerased = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call(tuple_root, dstorage),
+                true,
+            )
+            .expect("cast");
+        let item0 = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: unerased,
+                    field: FieldDescriptor::new("__pos_0", Some(tuple_root.to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .expect("pos_0");
+        graph.set_return(entry, Some(item0));
+
+        let marker = graph_ops(&graph)
+            .iter()
+            .find_map(|op| crate::model::cast_instance_root(&op.kind));
+        assert_eq!(marker, Some(tuple_root));
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let lifted = function_graph_to_flowspace(&graph, &registry).expect("lift unerase graph");
+        crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+        let start = lifted.graph.borrow().startblock.clone();
+        let n_inputs = start.borrow().inputargs.len();
+        let gcref = crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        );
+        let cells: Vec<Option<SomeValue>> = (0..n_inputs).map(|_| Some(gcref.clone())).collect();
+        ann.addpendingblock(&lifted.graph, &start, &cells);
+        ann.complete_pending_blocks()
+            .expect("GCREF unerase then getitem(0) must annotate");
+        let ret = lifted.graph.borrow().getreturnvar();
+        let s_ret = ann.binding(&ret);
+        assert!(
+            matches!(s_ret, SomeValue::List(_)),
+            "__pos_0 of the unerase tuple must annotate SomeList, got {s_ret:?}"
+        );
+    }
+
+    /// Anchor the unerase marker to real `kwargs_storage`. Ignored by
+    /// default (loads pyre-object.ullbc).
+    #[test]
+    #[ignore]
+    fn kwargs_storage_unerase_emits_cast_instance() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load pyre-object.ullbc");
+        let graph = super::lower_function(&llbc, "kwargs_storage").expect("lower kwargs_storage");
+        let roots: Vec<&str> = graph_ops(&graph)
+            .iter()
+            .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+            .collect();
+        assert!(
+            roots
+                .iter()
+                .any(|root| majit_ir::descr::is_shaped_tuple_name(root)),
+            "kwargs_storage unerase must emit Tuple<Vec,Vec> marker; roots={roots:?}"
+        );
+    }
+
     #[test]
     fn int_binop_needs_ptr_to_int_only_for_int_ops_with_a_ref() {
         let ptr = ValueType::Ref(None);
@@ -98370,6 +100713,232 @@ mod tests {
             crate::model::ValueType::Ref(Some("Option<i64>".into()))
         );
         assert_ne!(usize_ty, i64_ty);
+    }
+
+    fn option_i64_ty() -> serde_json::Value {
+        option_adt_node(0, option_int_arg(true))
+    }
+
+    fn option_impl_seg() -> serde_json::Value {
+        serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": {"Value": [0, option_i64_ty()]},
+            "kind": "InherentImplBlock"
+        }}})
+    }
+
+    fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
+        let i64_ty = interior_i64();
+        let opt_ty = option_i64_ty();
+        let fn_id = fn_item
+            .get("def_id")
+            .and_then(serde_json::Value::as_u64)
+            .expect("fn item def_id");
+        let fn_ty = serde_json::json!({
+            "FnDef": {
+                "kind": {"Fun": fn_id},
+                "generics": empty_generics()
+            }
+        });
+        let map_or = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["option", 0]},
+                    option_impl_seg(),
+                    {"Ident": ["map_or", 0]}
+                ],
+                "span": interior_span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [opt_ty.clone(), i64_ty.clone(), fn_ty.clone()],
+                "output": i64_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let caller = interior_caller(
+            "map_or_fn_item",
+            1,
+            vec![opt_ty.clone()],
+            i64_ty.clone(),
+            vec![
+                interior_local(0, None, &i64_ty),
+                interior_local(1, Some("opt"), &opt_ty),
+            ],
+            vec![
+                interior_bb(
+                    vec![],
+                    interior_call(
+                        1,
+                        vec![
+                            interior_copy(interior_place(1, &opt_ty)),
+                            interior_const_i64("-1", &i64_ty),
+                            serde_json::json!({"Const": [{
+                                "FnDef": {
+                                    "kind": {"Fun": fn_id},
+                                    "generics": empty_generics()
+                                }
+                            }, fn_ty]}),
+                        ],
+                        interior_place(0, &i64_ty),
+                        2,
+                        1,
+                    ),
+                ),
+                interior_bb(vec![], interior_unwind()),
+                interior_bb(vec![], interior_return()),
+            ],
+        );
+        llbc_with_types(
+            "fixture",
+            vec![option_enum(0)],
+            vec![caller, map_or, fn_item],
+        )
+    }
+
+    fn graph_has_map_or(graph: &FunctionGraph) -> bool {
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "map_or"
+            ) || matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("map_or")
+            )
+        })
+    }
+
+    fn graph_has_fn_const(graph: &FunctionGraph) -> bool {
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target, .. } if crate::model::fn_const_segments(target).is_some()
+            )
+        })
+    }
+
+    /// `opt.map_or(-1, i64::from)` with reflexive `From<i64> for i64`: residual
+    /// `map_or` and the 0-arg `__fn_const` define are gone; the Some arm is
+    /// identity on the payload (ordinary `is_reflexive_from`).
+    #[test]
+    fn map_or_i64_from_fn_item_is_identity_select() {
+        let from = interior_opaque(
+            2,
+            &["core", "convert", "<Impl>", "from"],
+            vec![interior_i64()],
+            interior_i64(),
+        );
+        let llbc = option_map_or_fn_item_llbc(from);
+        let graph = lower_interior(&llbc, "map_or_fn_item");
+        assert!(
+            !graph_has_map_or(&graph),
+            "residual map_or must be rewritten; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            !graph_has_fn_const(&graph),
+            "function-item define must not survive; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("from")
+                )),
+            "reflexive From is identity, not a residual from call; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+                )),
+            "the Some arm still reads the payload"
+        );
+        assert_eq!(
+            graph.blocks[graph.startblock.0].exits.len(),
+            2,
+            "A branches to Some/None arms"
+        );
+    }
+
+    /// `opt.map_or(-1, plus_one)` with a local function item: residual `map_or`
+    /// and `__fn_const` are gone; the Some arm calls `plus_one` directly.
+    #[test]
+    fn map_or_plus_one_fn_item_calls_the_function() {
+        let plus_one = interior_opaque(
+            2,
+            &["fixture", "plus_one"],
+            vec![interior_i64()],
+            interior_i64(),
+        );
+        let llbc = option_map_or_fn_item_llbc(plus_one);
+        let graph = lower_interior(&llbc, "map_or_fn_item");
+        assert!(
+            !graph_has_map_or(&graph),
+            "residual map_or must be rewritten; ops={:?}",
+            graph_ops(&graph)
+        );
+        assert!(
+            !graph_has_fn_const(&graph),
+            "function-item define must not survive; ops={:?}",
+            graph_ops(&graph)
+        );
+        let named: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("plus_one")
+                )
+            })
+            .collect();
+        assert_eq!(
+            named.len(),
+            1,
+            "the Some arm calls plus_one; ops={:?}",
+            graph_ops(&graph)
+        );
+        let OpKind::Call { args, .. } = &named[0].kind else {
+            panic!("plus_one call");
+        };
+        assert_eq!(args.len(), 1, "the Some arm calls plus_one(payload)");
+        assert_eq!(
+            graph.blocks[graph.startblock.0].exits.len(),
+            2,
+            "A branches to Some/None arms"
+        );
     }
 
     /// Two `Code` declarations in one LLBC. `fixture::Code` strips to the
@@ -108621,6 +111190,49 @@ mod tests {
         })
     }
 
+    fn char_ty() -> Value {
+        json!({"Scalar": "Char"})
+    }
+
+    fn const_char_op(ch: &str) -> Value {
+        json!({"Const": [{"Char": ch}, {"Scalar": "Char"}]})
+    }
+
+    fn push_char_decl() -> Value {
+        json!({
+            "def_id": 2,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("rustpython_wtf8"),
+                ident_seg("Wtf8Buf"),
+                wtf8buf_impl_seg(),
+                ident_seg("push"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_wtf8("Mut"), char_ty()],
+                "output": unit_ty()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn mem_take_decl() -> Value {
+        json!({
+            "def_id": 3,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("core"),
+                ident_seg("mem"),
+                ident_seg("take"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_wtf8("Mut")],
+                "output": wtf8_adt()
+            },
+            "body": "Opaque"
+        })
+    }
+
     fn as_bytes_decl() -> Value {
         json!({
             "def_id": 3,
@@ -108725,6 +111337,28 @@ mod tests {
             })
     }
 
+    fn leftover_push_or_take(graph: &FunctionGraph) -> Vec<Vec<String>> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str);
+                    let is_string_push = leaf == Some("push")
+                        && segments.iter().any(|s| s == "String" || s == "Wtf8Buf");
+                    let is_mem_take = leaf == Some("take")
+                        && segments.windows(2).any(|w| w[0] == "mem" && w[1] == "take");
+                    (is_string_push || is_mem_take).then(|| segments.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn assert_builder_identity_lowering(graph: &FunctionGraph, name: &str) {
         assert!(
             !has_path_leaf(graph, "push_str"),
@@ -108744,6 +111378,148 @@ mod tests {
                 "{name}: missing builder marker {marker}: {graph:#?}"
             );
         }
+    }
+
+    /// `Wtf8Buf::new(); buf.push('%'); mem::take(&mut buf)` — W4 + W5:
+    /// the take borrow is clean, `push(char)` becomes a one-char str, and
+    /// neither `push` nor `take` remains a FunctionPath.
+    #[test]
+    fn owned_ctor_push_char_take_lowers() {
+        let wtf8 = wtf8_adt();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let graph = lower_owned_concat(
+            "ctor_push_char_take",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "ctor_push_char_take",
+                    0,
+                    vec![],
+                    wtf8.clone(),
+                    vec![
+                        local_of(0, &wtf8),
+                        local_of(1, &wtf8),
+                        local_of(2, &borrow),
+                        local_of(3, &unit),
+                        local_of(4, &borrow),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(1, &wtf8), 1, 4)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(2, &borrow),
+                                ref_rvalue(place_of(1, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(2, &borrow)), const_char_op("%")],
+                                place_of(3, &unit),
+                                2,
+                                4,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(4, &borrow),
+                                ref_rvalue(place_of(1, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(4, &borrow))],
+                                place_of(0, &wtf8),
+                                3,
+                                4,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                wtf8buf_new_decl(),
+                push_char_decl(),
+                mem_take_decl(),
+            ],
+        );
+        let leftover = leftover_push_or_take(&graph);
+        assert!(
+            leftover.is_empty(),
+            "push(char)/take must not stay residual: {leftover:#?} {graph:#?}"
+        );
+        let has_str_const = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.first().map(String::as_str) == Some("__str_const"))
+            })
+        });
+        assert!(
+            has_path_leaf(&graph, crate::runtime_names::shims::UNICHAR_AS_UTF8) || has_str_const,
+            "push(char) must become unichr_as_utf8 or a one-char str const: {graph:#?}"
+        );
+    }
+
+    /// `Wtf8Buf::new(); buf.push(ch); return buf` — a variable code point
+    /// piece is `__majit_unichr_as_utf8`, not a leftover SomeInteger.
+    #[test]
+    fn owned_ctor_push_char_local_lowers() {
+        let wtf8 = wtf8_adt();
+        let ch = char_ty();
+        let unit = unit_ty();
+        let borrow = ref_wtf8("Mut");
+        let graph = lower_owned_concat(
+            "ctor_push_char_local",
+            vec![wtf8buf_decl()],
+            vec![
+                subject_decl(
+                    "ctor_push_char_local",
+                    1,
+                    vec![ch.clone()],
+                    wtf8.clone(),
+                    vec![
+                        local_of(0, &wtf8),
+                        local_of(1, &ch),
+                        local_of(2, &wtf8),
+                        local_of(3, &borrow),
+                        local_of(4, &unit),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &wtf8), 1, 4)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &borrow),
+                                ref_rvalue(place_of(2, &wtf8), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &ch))],
+                                place_of(4, &unit),
+                                2,
+                                4,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(0, &wtf8),
+                                use_move(place_of(2, &wtf8)),
+                            )],
+                            json!("Return"),
+                        ),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                wtf8buf_new_decl(),
+                push_char_decl(),
+            ],
+        );
+        let leftover = leftover_push_or_take(&graph);
+        assert!(
+            leftover.is_empty(),
+            "push(char) must not stay residual: {leftover:#?} {graph:#?}"
+        );
+        assert!(
+            has_path_leaf(&graph, crate::runtime_names::shims::UNICHAR_AS_UTF8),
+            "a variable code point must go through unichr_as_utf8: {graph:#?}"
+        );
     }
 
     /// `Wtf8Buf::new(); buf.push_str(s); buf.as_bytes()` — a Shared identity
@@ -109810,6 +112586,918 @@ mod tests {
                     if field.name == "__pos_0" && field.owner_root.as_deref().is_some_and(|owner| owner.ends_with("::Ok")))
             }),
             "the Result Ok payload must keep the lifted string repr: {graph:#?}"
+        );
+    }
+
+    /// `panic!("x {} y", n)` / `assert_eq!(a, b, "m {}", c)` / live
+    /// `format!("line {}", n)` — the `removeassert.py` melt of abort-bound
+    /// `format!` construction (`remove_asserts` / `kill_assertion_link`).
+    fn leftover_fmt_message_paths(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| {
+                let crate::model::OpKind::Call { target, .. } = &op.kind else {
+                    return None;
+                };
+                let segs: Vec<String> = match target {
+                    crate::model::CallTarget::FunctionPath { segments, .. } => segments.clone(),
+                    crate::model::CallTarget::Method {
+                        name,
+                        resolved_path,
+                        ..
+                    } => resolved_path
+                        .as_ref()
+                        .map(|p| p.segments.clone())
+                        .unwrap_or_else(|| vec![name.clone()]),
+                    _ => return None,
+                };
+                let leaf = segs
+                    .last()
+                    .map(|s| crate::front::clause_spec::unspecialized_leaf(s).to_string());
+                let is_fmt = super::fmt_path_ends_with(&segs, &["fmt", "format"])
+                    || segs.iter().any(|s| s == "Arguments")
+                    || (segs.iter().any(|s| s == "Argument")
+                        && leaf.as_deref().is_some_and(|l| l.starts_with("new_")));
+                is_fmt.then_some(segs)
+            })
+            .collect()
+    }
+
+    fn has_implicit_assertion_error(graph: &crate::model::FunctionGraph) -> bool {
+        graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| oefmt_link_is_assert_raise(link, graph.exceptblock))
+        })
+    }
+
+    fn regular_call_block(
+        fun_id: u64,
+        args: Vec<serde_json::Value>,
+        dest: serde_json::Value,
+        target: u64,
+        unwind: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "statements": [],
+            "terminator": {
+                "span": span_json(),
+                "kind": {
+                    "Call": {
+                        "call": {
+                            "func": {
+                                "Regular": {
+                                    "kind": {"Fun": fun_id},
+                                    "generics": empty_generics()
+                                }
+                            },
+                            "args": args,
+                            "dest": dest
+                        },
+                        "target": target,
+                        "on_unwind": unwind
+                    }
+                }
+            }
+        })
+    }
+
+    fn fmt_chain_opaque_fun(
+        def_id: u64,
+        path: &[&str],
+        inputs: Vec<serde_json::Value>,
+        output: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": inputs,
+                "output": output
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn fmt_placeholder_types() -> (
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        serde_json::Value,
+        Vec<serde_json::Value>,
+    ) {
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let argument_ty = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": empty_generics()}
+        });
+        let arguments_ty = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": empty_generics()}
+        });
+        let str_ty = serde_json::json!({
+            "Adt": {"builtin": "Str", "generics": empty_generics()}
+        });
+        let types = vec![
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": item_meta_json(&["core", "fmt", "rt", "Argument"], "", false),
+                "kind": {"Struct": []}
+            }),
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": item_meta_json(&["core", "fmt", "Arguments"], "", false),
+                "kind": {"Struct": []}
+            }),
+        ];
+        (i64_ty, unit, argument_ty, arguments_ty, str_ty, types)
+    }
+
+    fn fmt_placeholder_callees(
+        argument_ty: &serde_json::Value,
+        arguments_ty: &serde_json::Value,
+        str_ty: &serde_json::Value,
+        i64_ty: &serde_json::Value,
+        unit: &serde_json::Value,
+        abort_leaf: &str,
+    ) -> Vec<serde_json::Value> {
+        vec![
+            fmt_chain_opaque_fun(
+                1,
+                &["core", "fmt", "rt", "Argument", "new_display"],
+                vec![i64_ty.clone()],
+                argument_ty.clone(),
+            ),
+            fmt_chain_opaque_fun(
+                2,
+                &["core", "fmt", "Arguments", "new"],
+                vec![argument_ty.clone()],
+                arguments_ty.clone(),
+            ),
+            fmt_chain_opaque_fun(
+                3,
+                &["alloc", "fmt", "format"],
+                vec![arguments_ty.clone()],
+                str_ty.clone(),
+            ),
+            fmt_chain_opaque_fun(
+                4,
+                &["core", "panicking", abort_leaf],
+                vec![str_ty.clone()],
+                unit.clone(),
+            ),
+        ]
+    }
+
+    fn fmt_placeholder_chain_blocks(
+        i64_ty: &serde_json::Value,
+        argument_ty: &serde_json::Value,
+        arguments_ty: &serde_json::Value,
+        str_ty: &serde_json::Value,
+        n_local: u64,
+        arg_local: u64,
+        args_local: u64,
+        formatted_local: u64,
+        after_format: u64,
+        unwind: u64,
+    ) -> Vec<serde_json::Value> {
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": {"kind": {"Local": i}, "ty": ty}});
+        let dest =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        vec![
+            regular_call_block(
+                1,
+                vec![copy(n_local, i64_ty)],
+                dest(arg_local, argument_ty),
+                1,
+                unwind,
+            ),
+            regular_call_block(
+                2,
+                vec![copy(arg_local, argument_ty)],
+                dest(args_local, arguments_ty),
+                2,
+                unwind,
+            ),
+            regular_call_block(
+                3,
+                vec![copy(args_local, arguments_ty)],
+                dest(formatted_local, str_ty),
+                after_format,
+                unwind,
+            ),
+        ]
+    }
+
+    /// `panic!("x {} y", n)`: the placeholder chain feeds only
+    /// `panic_fmt`.  `removeassert.py` melts it to a bare implicit
+    /// `AssertionError` raise.
+    #[test]
+    fn panic_placeholder_format_melts_to_implicit_assertion_error() {
+        let (i64_ty, unit, argument_ty, arguments_ty, str_ty, types) = fmt_placeholder_types();
+        let unwind = 4u64;
+        let mut body = fmt_placeholder_chain_blocks(
+            &i64_ty,
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            1,
+            2,
+            3,
+            4,
+            3,
+            unwind,
+        );
+        body.push(regular_call_block(
+            4,
+            vec![serde_json::json!({"Copy": {"kind": {"Local": 4}, "ty": str_ty}})],
+            serde_json::json!({"kind": {"Local": 0}, "ty": unit}),
+            5,
+            unwind,
+        ));
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "UnwindResume"}
+        }));
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "Return"}
+        }));
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "panic_placeholder"], "", true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [i64_ty.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span_json(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span_json(), "ty": unit},
+                            {"index": 1, "name": "n", "span": span_json(), "ty": i64_ty},
+                            {"index": 2, "name": "arg", "span": span_json(), "ty": argument_ty},
+                            {"index": 3, "name": "args", "span": span_json(), "ty": arguments_ty},
+                            {"index": 4, "name": "msg", "span": span_json(), "ty": str_ty}
+                        ]
+                    },
+                    "body": body
+                }
+            }
+        });
+        let mut funs = vec![caller];
+        funs.extend(fmt_placeholder_callees(
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            &i64_ty,
+            &unit,
+            "panic_fmt",
+        ));
+        let llbc = llbc_with_types("fixture", types, funs);
+        let graph =
+            super::lower_function(&llbc, "panic_placeholder").expect("lower panic!(\"x {} y\", n)");
+        let leftover = leftover_fmt_message_paths(&graph);
+        assert!(
+            leftover.is_empty(),
+            "panic! placeholder format must melt: leftover={leftover:?} graph={graph:#?}"
+        );
+        assert!(
+            has_implicit_assertion_error(&graph),
+            "panic! must remain RaiseImplicit(AssertionError): {graph:#?}"
+        );
+        let start = graph.block(graph.startblock);
+        let input_ops = start
+            .operations
+            .iter()
+            .filter(|op| matches!(op.kind, crate::model::OpKind::Input { .. }))
+            .count();
+        assert_eq!(
+            input_ops,
+            start.inputargs.len(),
+            "melt must keep startblock Input ops (`stamp_declared`): {graph:#?}"
+        );
+    }
+
+    /// `assert_eq!(a, b, "m {}", c)`: the fail arm is the same placeholder
+    /// chain into `assert_failed`.  Format / Arguments must not remain.
+    #[test]
+    fn assert_eq_placeholder_format_melts_to_implicit_assertion_error() {
+        let (i64_ty, unit, argument_ty, arguments_ty, str_ty, types) = fmt_placeholder_types();
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let unwind = 6u64;
+        let copy = |i: u64, ty: &serde_json::Value| serde_json::json!({"Copy": {"kind": {"Local": i}, "ty": ty}});
+        let dest =
+            |i: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": i}, "ty": ty});
+        let body = vec![
+            serde_json::json!({
+                "statements": [],
+                "terminator": {
+                    "span": span_json(),
+                    "kind": {
+                        "Switch": {
+                            "discr": {"Copy": {"kind": {"Local": 1}, "ty": bool_ty}},
+                            "targets": {"If": [1, 2]}
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": unit},
+                        {"Aggregate": ["Tuple", []]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }),
+            regular_call_block(1, vec![copy(2, &i64_ty)], dest(3, &argument_ty), 3, unwind),
+            regular_call_block(
+                2,
+                vec![copy(3, &argument_ty)],
+                dest(4, &arguments_ty),
+                4,
+                unwind,
+            ),
+            regular_call_block(3, vec![copy(4, &arguments_ty)], dest(5, &str_ty), 5, unwind),
+            regular_call_block(4, vec![copy(5, &str_ty)], dest(0, &unit), 1, unwind),
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "UnwindResume"}
+            }),
+        ];
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "assert_eq_placeholder"], "", true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [bool_ty.clone(), i64_ty.clone()],
+                "output": unit.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span_json(),
+                    "locals": {
+                        "arg_count": 2,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span_json(), "ty": unit},
+                            {"index": 1, "name": "eq", "span": span_json(), "ty": bool_ty},
+                            {"index": 2, "name": "c", "span": span_json(), "ty": i64_ty},
+                            {"index": 3, "name": "arg", "span": span_json(), "ty": argument_ty},
+                            {"index": 4, "name": "args", "span": span_json(), "ty": arguments_ty},
+                            {"index": 5, "name": "msg", "span": span_json(), "ty": str_ty}
+                        ]
+                    },
+                    "body": body
+                }
+            }
+        });
+        let mut funs = vec![caller];
+        funs.extend(fmt_placeholder_callees(
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            &i64_ty,
+            &unit,
+            "assert_failed",
+        ));
+        let llbc = llbc_with_types("fixture", types, funs);
+        let graph = super::lower_function(&llbc, "assert_eq_placeholder")
+            .expect("lower assert_eq!(a, b, \"m {}\", c)");
+        let leftover = leftover_fmt_message_paths(&graph);
+        assert!(
+            leftover.is_empty(),
+            "assert_eq! placeholder format must melt: leftover={leftover:?} graph={graph:#?}"
+        );
+    }
+
+    /// `let s = format!("line {}", n); use(s)` is not abort-bound.
+    /// `is_fmt_format_call` + `traces_to_str_const` stay for a literal;
+    /// a placeholder `format!` keeps the format call or the existing
+    /// str-concat expansion.
+    #[test]
+    fn live_format_placeholder_is_not_melted() {
+        let (i64_ty, unit, argument_ty, arguments_ty, str_ty, types) = fmt_placeholder_types();
+        let unwind = 4u64;
+        let mut body = fmt_placeholder_chain_blocks(
+            &i64_ty,
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            1,
+            2,
+            3,
+            0,
+            3,
+            unwind,
+        );
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "Return"}
+        }));
+        body.push(serde_json::json!({
+            "statements": [],
+            "terminator": {"span": span_json(), "kind": "UnwindResume"}
+        }));
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "live_format_placeholder"], "", true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [i64_ty.clone()],
+                "output": str_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span_json(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span_json(), "ty": str_ty},
+                            {"index": 1, "name": "n", "span": span_json(), "ty": i64_ty},
+                            {"index": 2, "name": "arg", "span": span_json(), "ty": argument_ty},
+                            {"index": 3, "name": "args", "span": span_json(), "ty": arguments_ty}
+                        ]
+                    },
+                    "body": body
+                }
+            }
+        });
+        let mut funs = vec![caller];
+        funs.extend(fmt_placeholder_callees(
+            &argument_ty,
+            &arguments_ty,
+            &str_ty,
+            &i64_ty,
+            &unit,
+            "panic_fmt",
+        ));
+        let llbc = llbc_with_types("fixture", types, funs);
+        let graph = super::lower_function(&llbc, "live_format_placeholder")
+            .expect("lower live format!(\"line {}\", n)");
+        let leftover = leftover_fmt_message_paths(&graph);
+        let has_str_concat = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                crate::model::OpKind::BinOp { op: name, .. } if name == "add" => true,
+                crate::model::OpKind::UnaryOp { op: name, .. } if name == "str" => true,
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__str_const") => true,
+                _ => false,
+            });
+        assert!(
+            !leftover.is_empty() || has_str_concat,
+            "live format! must keep its format call or the str-concat expansion: \
+             leftover={leftover:?} graph={graph:#?}"
+        );
+        assert!(
+            !has_implicit_assertion_error(&graph),
+            "live format! must not become RaiseImplicit(AssertionError): {graph:#?}"
+        );
+    }
+
+    fn oefmt_call_paths(graph: &crate::model::FunctionGraph) -> Vec<Vec<String>> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn oefmt_mentions_cow(graph: &crate::model::FunctionGraph) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                let cow_in = |s: &str| s.contains("Cow");
+                match &op.kind {
+                    OpKind::Call {
+                        target, result_ty, ..
+                    } => {
+                        let path = match target {
+                            CallTarget::FunctionPath { segments, .. } => {
+                                segments.iter().any(|s| cow_in(s))
+                            }
+                            CallTarget::Method {
+                                name,
+                                receiver_root,
+                                resolved_path,
+                                ..
+                            } => {
+                                cow_in(name)
+                                    || receiver_root.as_deref().is_some_and(cow_in)
+                                    || resolved_path
+                                        .as_ref()
+                                        .is_some_and(|p| p.segments.iter().any(|s| cow_in(s)))
+                            }
+                            CallTarget::SyntheticTransparentCtor {
+                                name, owner_path, ..
+                            } => cow_in(name) || owner_path.iter().any(|s| cow_in(s)),
+                            _ => false,
+                        };
+                        let ty = match result_ty {
+                            ValueType::Ref(Some(root)) => cow_in(root),
+                            _ => false,
+                        };
+                        path || ty
+                    }
+                    OpKind::FieldRead { field, ty, .. } | OpKind::FieldWrite { field, ty, .. } => {
+                        field.owner_root.as_deref().is_some_and(cow_in)
+                            || matches!(ty, ValueType::Ref(Some(root)) if cow_in(root))
+                    }
+                    _ => false,
+                }
+            })
+    }
+
+    fn oefmt_is_empty_str_const(op: &crate::model::SpaceOperation) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )
+    }
+
+    fn oefmt_link_is_assert_raise(
+        link: &crate::model::Link,
+        except: crate::model::BlockId,
+    ) -> bool {
+        use crate::flowspace::model::ConstValue;
+        if link.target != except {
+            return false;
+        }
+        let Some(LinkArg::Const(ty)) = link.args.first() else {
+            return false;
+        };
+        let ConstValue::HostObject(class) = &ty.value else {
+            return false;
+        };
+        if !class.is_class() || !class.qualname().contains("AssertionError") {
+            return false;
+        }
+        let Some(LinkArg::Const(value)) = link.args.get(1) else {
+            return false;
+        };
+        let ConstValue::HostObject(inst) = &value.value else {
+            return false;
+        };
+        inst.is_instance()
+            && inst.instance_args().is_some_and(|args| {
+                matches!(
+                    args.first(),
+                    Some(ConstValue::UniStr(msg))
+                        if msg == "implicit AssertionError shouldn't occur"
+                )
+            })
+    }
+
+    /// `decode_utf8_with_errors` Err arm is `RaiseImplicit(AssertionError)`
+    /// (`rtyper/debug.py ll_assert`), never a fabricated `""`.
+    /// `remove_assertion_errors` (simplify.py) may prune that arm.
+    fn oefmt_decode_utf8_err_arm_is_assert_raise(graph: &crate::model::FunctionGraph) {
+        let decode_bb = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()])
+                ))
+            })
+            .expect("decode_utf8_with_errors call");
+        assert!(
+            !decode_bb.operations.iter().any(oefmt_is_empty_str_const),
+            "decode block must not fabricate \"\": {decode_bb:#?}"
+        );
+        let except = graph.exceptblock;
+        let mut saw_assert_raise = false;
+        for link in &decode_bb.exits {
+            if oefmt_link_is_assert_raise(link, except) {
+                saw_assert_raise = true;
+                continue;
+            }
+            let succ = graph.block(link.target);
+            assert!(
+                !succ.operations.iter().any(oefmt_is_empty_str_const),
+                "decode successor must not fabricate \"\": {succ:#?}"
+            );
+            if succ
+                .exits
+                .iter()
+                .any(|exit| oefmt_link_is_assert_raise(exit, except))
+            {
+                saw_assert_raise = true;
+            }
+        }
+        assert!(
+            saw_assert_raise || decode_bb.exits.len() == 1,
+            "Err arm must RaiseImplicit(AssertionError) or be pruned by \
+             remove_assertion_errors: {graph:#?}"
+        );
+    }
+
+    /// Checked `Wtf8::from_bytes` is `rutf8.py check_utf8` plus the
+    /// Option Some/None wrap (`unicodehelper.py str_decode_utf8` fast arm).
+    #[test]
+    #[ignore]
+    fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "oefmt").expect("lower oefmt");
+        let paths = oefmt_call_paths(&graph);
+        assert!(
+            !paths
+                .iter()
+                .any(|segments| segments == &["Wtf8".to_string(), "from_bytes".to_string()]),
+            "checked Wtf8::from_bytes must not remain a residual: {paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.ends_with(&["rutf8".to_string(), "check_utf8".to_string()])
+            }),
+            "rutf8.check_utf8 must remain in the caller: {paths:#?}"
+        );
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstBool(true))),
+            "allow_surrogates=True is ConstBool(true): {graph:#?}"
+        );
+        let has_null_mut = ops.iter().any(|op| {
+            matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                if segments == &["core".to_string(), "ptr".to_string(), "null_mut".to_string()])
+        });
+        let has_option_ctor = ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } => matches!(name.as_str(), "Some" | "None"),
+            _ => false,
+        });
+        assert!(
+            has_null_mut || has_option_ctor,
+            "Ok/Err of check_utf8 must construct Option Some/None: {graph:#?}"
+        );
+    }
+
+    /// `String::from_utf8_lossy` is `unicodehelper.py str_decode_utf8`
+    /// replace / U+FFFD (`typedef::decode_utf8_with_errors`), never a Cow.
+    /// The Result Err arm is `RaiseImplicit(AssertionError)`
+    /// (`rtyper/debug.py ll_assert`), never a fabricated `""`.
+    #[test]
+    #[ignore]
+    fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "oefmt").expect("lower oefmt");
+        let paths = oefmt_call_paths(&graph);
+        assert!(
+            !paths.iter().any(|segments| {
+                segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "from_utf8_lossy")
+            }),
+            "from_utf8_lossy must not remain a residual: {paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.ends_with(&["typedef".to_string(), "decode_utf8_with_errors".to_string()])
+            }),
+            "decode_utf8_with_errors must remain in the caller: {paths:#?}"
+        );
+        assert!(
+            !oefmt_mentions_cow(&graph),
+            "from_utf8_lossy dest is a plain string, not Cow: {graph:#?}"
+        );
+        oefmt_decode_utf8_err_arm_is_assert_raise(&graph);
+    }
+
+    /// `decompose_valuefmt` `current: String` is a `StringBuilder`
+    /// (`rbuilder.py`): `push(char)` is `unichr_as_utf8` then append,
+    /// `mem::take` is `build()` plus a fresh builder.
+    #[test]
+    #[ignore]
+    fn decompose_valuefmt_lowers_string_accumulator_push_and_take() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "decompose_valuefmt").expect("lower decompose_valuefmt");
+        let paths = oefmt_call_paths(&graph);
+        let leftover: Vec<_> = paths
+            .iter()
+            .filter(|segments| {
+                let leaf = segments.last().map(String::as_str);
+                let is_string_push = leaf == Some("push")
+                    && segments.iter().any(|s| s == "String" || s == "Wtf8Buf");
+                let is_mem_take = leaf == Some("take")
+                    && segments.windows(2).any(|w| w[0] == "mem" && w[1] == "take");
+                let is_str_contains =
+                    leaf == Some("contains") && segments.iter().any(|s| s == "str");
+                is_string_push || is_mem_take || is_str_contains
+            })
+            .cloned()
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "String/Wtf8Buf::push, mem::take, and str::contains must not remain residual: {leftover:#?}"
+        );
+        // The `contains` dest feeds an If whose false arm is only
+        // `fmt::Arguments::from_str` + Panic.  That chain is
+        // `set_raise_implicit(AssertionError)`, so `remove_assertion_errors`
+        // promotes the If and `prune_dead_phis` reclaims the pure BinOp.
+        // Live dest is asserted by `str_contains_lowers_as_binop_contains`.
+        assert!(
+            paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::UNICHAR_AS_UTF8)
+                    || (segments.first().map(String::as_str) == Some("__str_const"))
+            }),
+            "push(char) must become unichr_as_utf8 or a one-char str const: {paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                matches!(
+                    segments.last().map(String::as_str),
+                    Some(crate::runtime_names::shims::STRINGBUILDER_APPEND)
+                        | Some(crate::runtime_names::shims::STRINGBUILDER_BUILD)
+                        | Some(crate::runtime_names::shims::STRINGBUILDER_NEW)
+                )
+            }) || graph.blocks.iter().any(|block| {
+                block.operations.iter().any(
+                    |op| matches!(&op.kind, crate::model::OpKind::BinOp { op, .. } if op == "add"),
+                )
+            }),
+            "the accumulator must append (builder or ll_strconcat): {graph:#?}"
+        );
+        let leftover_some_casts: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| {
+                crate::model::cast_instance_root(&op.kind).and_then(|root| {
+                    (root.contains("Option") && root.ends_with("::Some")).then_some(root)
+                })
+            })
+            .collect();
+        assert!(
+            leftover_some_casts.is_empty(),
+            "inner next payload downcasts must collapse; leftover {leftover_some_casts:#?}"
+        );
+        let residual_next: Vec<_> = paths
+            .iter()
+            .filter(|segments| {
+                crate::front::iter_next::is_iterator_next_target(&CallTarget::FunctionPath {
+                    segments: (*segments).clone(),
+                    fun_decl_id: None,
+                })
+            })
+            .cloned()
+            .collect();
+        assert!(
+            residual_next.is_empty(),
+            "Iterator::next must rewrite to [__iter_next]: {residual_next:#?}"
+        );
+    }
+
+    /// `oefmt_single_t` `valuefmt.as_ptr()` is `rffi.get_raw_address_of_string`
+    /// (`__majit_get_raw_address_of_string`).  A leftover
+    /// `core::str::<Impl>::as_ptr` FunctionPath is the prepass wall.
+    #[test]
+    #[ignore]
+    fn oefmt_single_t_lowers_str_as_ptr_to_get_raw_address() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "oefmt_single_t").expect("lower oefmt_single_t");
+        let paths = oefmt_call_paths(&graph);
+        let leftover: Vec<_> = paths
+            .iter()
+            .filter(|segments| {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("as_ptr") && segments.iter().any(|s| s == "str")
+            })
+            .cloned()
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "str::as_ptr must not remain residual: {leftover:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+            }),
+            "as_ptr must become get_raw_address_of_string: {paths:#?}"
+        );
+    }
+
+    /// `core::str::<Impl>::contains` with a returned dest, so the BinOp
+    /// survives `prune_dead_phis`.  A `char` Pattern is `unichr_as_utf8`
+    /// then Contains; `&str` is Contains on the string (`rstr.py`
+    /// `rtype_contains`).
+    #[test]
+    fn str_contains_lowers_as_binop_contains() {
+        let str_ty = str_ref_ty();
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let char_ty = serde_json::json!({"Scalar": "Char"});
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_contains_char",
+                &["core", "str", "<Impl>", "contains"],
+                &[str_ty.clone(), char_ty],
+                bool_ty.clone(),
+            ),
+            "str_contains_char",
+        )
+        .expect("lower str::contains(char)");
+        let paths = oefmt_call_paths(&graph);
+        assert!(
+            !paths.iter().any(|segments| {
+                segments.last().map(String::as_str) == Some("contains")
+                    && segments.iter().any(|s| s == "str")
+            }),
+            "str::contains must not remain residual: {paths:#?}"
+        );
+        let binops: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                crate::model::OpKind::BinOp { op, .. } => Some(op.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            binops.iter().any(|op| *op == "contains"),
+            "char needle must become BinOp contains; binops={binops:?} paths={paths:#?}"
+        );
+        assert!(
+            paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::UNICHAR_AS_UTF8)
+            }),
+            "char needle must become unichr_as_utf8: {paths:#?}"
+        );
+
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_contains_str",
+                &["core", "str", "<Impl>", "contains"],
+                &[str_ty.clone(), str_ty],
+                bool_ty,
+            ),
+            "str_contains_str",
+        )
+        .expect("lower str::contains(&str)");
+        let paths = oefmt_call_paths(&graph);
+        let binops: Vec<&str> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                crate::model::OpKind::BinOp { op, .. } => Some(op.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            binops.iter().any(|op| *op == "contains"),
+            "&str needle must become BinOp contains; binops={binops:?} paths={paths:#?}"
+        );
+        assert!(
+            !paths.iter().any(|segments| {
+                segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::UNICHAR_AS_UTF8)
+            }),
+            "&str needle must not go through unichr_as_utf8: {paths:#?}"
         );
     }
 
@@ -115465,8 +119153,12 @@ mod tests {
         let chars = super::lower_function(&string_view_call_llbc("chars"), "string_view_call")
             .expect("chars lowers");
         assert!(
-            graph_calls_leaf(&chars, "chars"),
-            "str::chars must stay a call, graph: {chars:#?}"
+            graph_calls_leaf(&chars, crate::runtime_names::shims::UTF8_ITER),
+            "str::chars must rewrite to __majit_utf8iter, graph: {chars:#?}"
+        );
+        assert!(
+            !graph_calls_leaf(&chars, "chars"),
+            "str::chars must not remain a residual chars call, graph: {chars:#?}"
         );
         assert!(
             !returned_value_is_start_input(&chars),
@@ -115485,6 +119177,34 @@ mod tests {
                 "{leaf} aliases the receiver, graph: {graph:#?}"
             );
         }
+    }
+
+    #[test]
+    fn str_as_ptr_rewrites_to_get_raw_address_of_string() {
+        let dest = serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Const"]
+        });
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_as_ptr",
+                &["core", "str", "<Impl>", "as_ptr"],
+                &[str_ref_ty()],
+                dest,
+            ),
+            "str_as_ptr",
+        )
+        .expect("lower str::as_ptr");
+        assert!(
+            graph_calls_leaf(
+                &graph,
+                crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
+            ),
+            "str::as_ptr must rewrite to get_raw_address_of_string, graph: {graph:#?}"
+        );
+        assert!(
+            !graph_calls_leaf(&graph, "as_ptr"),
+            "str::as_ptr must not remain residual, graph: {graph:#?}"
+        );
     }
 
     fn layout_struct_llbc(

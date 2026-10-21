@@ -69,6 +69,7 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::B
         parent: None,
         name: f.field_name().to_string(),
         owner: String::new(),
+        load_is_acquire: f.stored_load_is_acquire(),
     })
 }
 
@@ -113,6 +114,7 @@ fn descr_to_bh_array_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::B
         array_type_id: None,
         interior_fields: Vec::new(),
         is_gc_managed: a.is_gc_managed(),
+        load_is_acquire: a.load_is_acquire(),
     })
 }
 

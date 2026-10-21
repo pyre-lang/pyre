@@ -2066,20 +2066,25 @@ impl DynasmBackend {
     }
 
     /// llmodel.py read_int_at_mem(gcref, ofs, size, sign).
-    fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
-        let Some(ptr) = Self::raw_mem_ptr(addr, offset) else {
+    fn read_int_at_mem(
+        &self,
+        addr: i64,
+        offset: i64,
+        size: usize,
+        sign: bool,
+        acquire: bool,
+    ) -> i64 {
+        let Some(_) = Self::raw_mem_ptr(addr, offset) else {
             return 0;
         };
         unsafe {
-            match (size, sign) {
-                (1, true) => (ptr as *const i8).read_unaligned() as i64,
-                (1, false) => (ptr as *const u8).read_unaligned() as i64,
-                (2, true) => (ptr as *const i16).read_unaligned() as i64,
-                (2, false) => (ptr as *const u16).read_unaligned() as i64,
-                (4, true) => (ptr as *const i32).read_unaligned() as i64,
-                (4, false) => (ptr as *const u32).read_unaligned() as i64,
-                _ => (ptr as *const i64).read_unaligned(),
-            }
+            majit_backend::llmodel::read_int_at_mem(
+                addr as usize,
+                offset as usize,
+                size,
+                sign,
+                acquire,
+            )
         }
     }
 
@@ -4422,7 +4427,7 @@ impl Backend for DynasmBackend {
         let size = descr.as_itemsize();
         let sign = descr.is_item_signed();
         // llmodel.py: return self.read_int_at_mem(addr, offset, size, sign)
-        self.read_int_at_mem(addr, offset, size, sign)
+        self.read_int_at_mem(addr, offset, size, sign, descr.load_is_acquire())
     }
 
     /// llmodel.py bh_raw_store_i(addr, offset, newvalue, descr).
@@ -4473,7 +4478,13 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) -> i64 {
         let (offset, size, sign) = fielddescr.unpack_fielddescr_size();
-        self.read_int_at_mem(struct_ptr, offset as i64, size, sign)
+        self.read_int_at_mem(
+            struct_ptr,
+            offset as i64,
+            size,
+            sign,
+            fielddescr.load_is_acquire(),
+        )
     }
 
     /// `llmodel.py bh_setfield_gc_i` →
@@ -4520,7 +4531,7 @@ impl Backend for DynasmBackend {
     ) -> i64 {
         let (base_size, itemsize, sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
-        self.read_int_at_mem(array_ptr, offset, itemsize, sign)
+        self.read_int_at_mem(array_ptr, offset, itemsize, sign, false)
     }
 
     /// model.py / llmodel.py bh_arraylen_gc.
@@ -4529,7 +4540,13 @@ impl Backend for DynasmBackend {
         let ofs = arraydescr
             .array_len_offset()
             .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
-        self.read_int_at_mem(array_ptr, ofs as i64, std::mem::size_of::<usize>(), true)
+        self.read_int_at_mem(
+            array_ptr,
+            ofs as i64,
+            std::mem::size_of::<usize>(),
+            true,
+            false,
+        )
     }
 
     /// llmodel.py bh_getarrayitem_gc_r: ofs=base_size, item width

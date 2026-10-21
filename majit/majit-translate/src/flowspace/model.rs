@@ -1804,6 +1804,23 @@ impl HostEnv {
             crate::runtime_names::shims::LL_ARRAYMOVE,
             HostObject::new_builtin_callable(crate::runtime_names::shims::LL_ARRAYMOVE),
         );
+        // Front-end spelling of `rutf8.Utf8StringIterator(s)`: `s.chars()`
+        // becomes `__majit_utf8iter(s)`.  Not a Python builtin class; a
+        // translator shim keyed like CAST_INSTANCE (callable, not a class).
+        self.insert_builtin("utf8iter", HostObject::new_builtin_callable("utf8iter"));
+        // Front-end spelling of `rutf8.unichr_as_utf8(code, True)`: a
+        // `String::push` / `Wtf8Buf::push` code-point piece becomes a
+        // one-code-point UTF-8 string.
+        self.insert_builtin(
+            "unichr_as_utf8",
+            HostObject::new_builtin_callable("unichr_as_utf8"),
+        );
+        // Front-end spelling of `rffi.get_raw_address_of_string(s)`:
+        // `s.as_ptr()` on a string-family value becomes a `CCHARP`.
+        self.insert_builtin(
+            "get_raw_address_of_string",
+            HostObject::new_builtin_callable("get_raw_address_of_string"),
+        );
     }
 
     fn bootstrap_std_modules(&mut self) {

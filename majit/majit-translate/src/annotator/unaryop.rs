@@ -2214,6 +2214,10 @@ fn dict_method_move_to_end(
 // unaryop.py:593-690 — @op.contains.register(SomeString|SomeUnicodeString)
 // + class __extend__(SomeString, SomeUnicodeString) shared overrides
 
+/// `unaryop.py contains_String` (`@op.contains.register(SomeString)`).
+/// The needle is named `char` upstream; a SomeString needle (str-in-str,
+/// including a `char` Pattern rewritten to UTF-8 in `front/mir`) takes
+/// the same SomeBool path — `const_str_of` already reads SomeString.
 #[allow(non_snake_case)]
 pub fn contains_String(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s_string = ann
@@ -4005,6 +4009,12 @@ fn someiterator_next(ann: &RPythonAnnotator, it: &SomeIterator) -> SomeValue {
             SomeValue::Integer(SomeInteger::new(true, false)),
             s_item,
         ]));
+    }
+    // `Utf8StringIterator.next` (`rutf8.py`) returns a nonneg int code
+    // point.  Must run before `container_getanyitem`, which would give
+    // SomeChar for a SomeString container.
+    if it.variant.first().map(String::as_str) == Some("utf8") {
+        return SomeValue::Integer(SomeInteger::new(true, false));
     }
     // upstream: `if variant == ("reversed",): variant = ()`.
     let variant: Option<&str> = if it.variant.len() == 1 && it.variant[0] == "reversed" {
@@ -6374,6 +6384,24 @@ mod tests {
     }
 
     #[test]
+    fn consider_someiterator_next_utf8_on_string_returns_nonneg_integer() {
+        use super::super::model::SomeString;
+        let ann = mk_ann();
+        let it = SomeIterator::new(
+            SomeValue::String(SomeString::new(false, true)),
+            vec!["utf8".to_string()],
+        );
+        let mut v = Variable::named("it");
+        ann.setbinding(&mut v, SomeValue::Iterator(it));
+        let hl = HLOperation::new(OpKind::Next, vec![Hlvalue::Variable(v)]);
+        let r = hl.consider(&ann).unwrap().unwrap();
+        match r {
+            SomeValue::Integer(i) => assert!(i.nonneg, "utf8 next is a nonneg code point"),
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn consider_someiterator_next_on_unicode_returns_codepoint() {
         let ann = mk_ann();
         let it = SomeIterator::new(
@@ -6470,6 +6498,27 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::Iterator(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn consider_contains_string_with_string_needle_returns_bool() {
+        let ann = mk_ann();
+        let mut v_string = Variable::named("s");
+        ann.setbinding(
+            &mut v_string,
+            SomeValue::String(SomeString::new(false, false)),
+        );
+        let mut v_needle = Variable::named("n");
+        ann.setbinding(
+            &mut v_needle,
+            SomeValue::String(SomeString::new(false, false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::Contains,
+            vec![Hlvalue::Variable(v_string), Hlvalue::Variable(v_needle)],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(matches!(r, SomeValue::Bool(_)), "got {r:?}");
     }
 
     #[test]

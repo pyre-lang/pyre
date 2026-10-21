@@ -162,6 +162,66 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
+    /// Acquire integer load from an address already in `x16`.
+    ///
+    /// `ldar X` / `ldar W` / `ldarh` / `ldarb`, then sign-extend when
+    /// `signed` and the width is narrower than a word.
+    pub(crate) fn emit_ldar_from_x16(&mut self, dst: &RegLoc, size: usize, signed: bool) {
+        match size {
+            1 => {
+                dynasm!(self.mc ; .arch aarch64 ; ldarb W(dst.value), [x16]);
+                if signed {
+                    dynasm!(self.mc ; .arch aarch64 ; sxtb X(dst.value), W(dst.value));
+                }
+            }
+            2 => {
+                dynasm!(self.mc ; .arch aarch64 ; ldarh W(dst.value), [x16]);
+                if signed {
+                    dynasm!(self.mc ; .arch aarch64 ; sxth X(dst.value), W(dst.value));
+                }
+            }
+            4 => {
+                dynasm!(self.mc ; .arch aarch64 ; ldar W(dst.value), [x16]);
+                if signed {
+                    dynasm!(self.mc ; .arch aarch64 ; sxtw X(dst.value), W(dst.value));
+                }
+            }
+            _ => {
+                dynasm!(self.mc ; .arch aarch64 ; ldar X(dst.value), [x16]);
+            }
+        }
+    }
+
+    /// Form `x16 = base + ofs_loc` then [`Self::emit_ldar_from_x16`].
+    pub(crate) fn emit_acquire_int_load(
+        &mut self,
+        base: &RegLoc,
+        ofs_loc: &Loc,
+        dst: &RegLoc,
+        size: usize,
+        signed: bool,
+    ) {
+        dynasm!(self.mc ; .arch aarch64 ; mov x16, X(base.value));
+        match ofs_loc {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                let o = i.value as i32;
+                if o != 0 {
+                    if (0..4096).contains(&o) {
+                        dynasm!(self.mc ; .arch aarch64 ; add x16, x16, o as u32);
+                    } else {
+                        self.emit_mov_imm64(17, o as i64);
+                        dynasm!(self.mc ; .arch aarch64 ; add x16, x16, x17);
+                    }
+                }
+            }
+            Loc::Reg(ofs_r) => {
+                dynasm!(self.mc ; .arch aarch64 ; add x16, x16, X(ofs_r.value));
+            }
+            _ => {}
+        }
+        self.emit_ldar_from_x16(dst, size, signed);
+    }
+
     // ── emit_op_gc_store ──
     // aarch64/opassembler.py emit_op_gc_store
     // x86/assembler.py:1746 genop_gc_store — size_loc

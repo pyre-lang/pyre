@@ -232,6 +232,16 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
         ("max", rtype_builtin_max),
         // rbuiltin.py `typer_for(reversed)`
         ("reversed", rtype_builtin_reversed),
+        // Translator shim: `__majit_utf8iter` → HOST_ENV `utf8iter`.
+        ("utf8iter", rtype_builtin_utf8iter),
+        // Translator shim: `__majit_unichr_as_utf8` → HOST_ENV `unichr_as_utf8`.
+        ("unichr_as_utf8", rtype_builtin_unichr_as_utf8),
+        // Translator shim: `__majit_get_raw_address_of_string` → HOST_ENV
+        // `get_raw_address_of_string` (`rffi.get_raw_address_of_string`).
+        (
+            "get_raw_address_of_string",
+            rtype_builtin_get_raw_address_of_string,
+        ),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -2249,6 +2259,67 @@ pub fn rtype_builtin_reversed(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize
         .clone()
         .ok_or_else(|| TyperError::message("rtype_builtin_reversed: r_result missing"))?;
     r_result.newiter(hop)
+}
+
+/// `utf8iter(s)` — the front's `__majit_utf8iter` spelling of
+/// `Utf8StringIterator(s)` (`rutf8.py`).  Same shape as
+/// `rtype_builtin_reversed`: the result repr's `newiter` mallocs the
+/// iterator from the string operand.
+pub fn rtype_builtin_utf8iter(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_builtin_utf8iter: r_result missing"))?;
+    r_result.newiter(hop)
+}
+
+/// `unichr_as_utf8(code)` — the front's `__majit_unichr_as_utf8` spelling
+/// of `rutf8.unichr_as_utf8(code, allow_surrogates=True)`.  The helper
+/// graph encodes 1–4 UTF-8 bytes; `code > 0x10FFFF` raises ValueError.
+pub fn rtype_builtin_unichr_as_utf8(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        STRPTR, build_ll_unichr_as_utf8_helper_graph,
+    };
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::Signed)])?;
+    hop.exception_is_here()?;
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_unichr_as_utf8".to_string(),
+        vec![LowLevelType::Signed],
+        STRPTR.clone(),
+        move |_rtyper, _args, _result| build_ll_unichr_as_utf8_helper_graph("ll_unichr_as_utf8"),
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// `get_raw_address_of_string(s)` — the front's
+/// `__majit_get_raw_address_of_string` spelling of
+/// `rffi.get_raw_address_of_string`.  Returns `CCHARP`.
+pub fn rtype_builtin_get_raw_address_of_string(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rffi::{
+        CCHARP, build_ll_get_raw_address_of_string_helper_graph,
+    };
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&*STRPTR)])?;
+    hop.exception_cannot_occur()?;
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_get_raw_address_of_string".to_string(),
+        vec![STRPTR.clone()],
+        (*CCHARP).clone(),
+        move |_rtyper, _args, _result| {
+            build_ll_get_raw_address_of_string_helper_graph("ll_get_raw_address_of_string")
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
 }
 
 /// The receiver of an exception `__init__` hop, as `InstanceRepr`.
