@@ -99,6 +99,10 @@ impl<T> ForkMutex<T> {
         unsafe { (*self.inner.get()).lock() }
     }
 
+    fn try_lock(&self) -> Option<parking_lot::MutexGuard<'_, T>> {
+        unsafe { (*self.inner.get()).try_lock() }
+    }
+
     /// Write a fresh mutex around the live payload.  Must not lock: the
     /// inherited waiter table can hang on Linux.  Same write as
     /// `cpyext::ForkMutex::reinit_after_fork` / `ForkListLock::reinit_after_fork`.
@@ -381,6 +385,35 @@ pub(crate) fn register_execution_context(ec: *const crate::PyExecutionContext) {
         unsafe { (*(ec as *mut crate::PyExecutionContext)).signals_enabled = 1 };
     }
     EXECUTION_CONTEXTS.lock().insert(ident, ec as usize);
+}
+
+/// `_RPython_ThreadLocals_AcquireTimeout(max_wait_iterations)`, then
+/// `_RPython_ThreadLocals_Enum` over every registered thread and
+/// `_RPython_ThreadLocals_Release`, for faulthandler's dump.  The acquire is
+/// a bounded busy loop of `try_lock`s, so a signal that lands while the
+/// faulting thread holds the registry gives up rather than deadlocking;
+/// `false` is that timeout.  Allocation-free: it runs from signal handlers.
+///
+/// Threads are visited newest first, the order `PyInterpreterState_ThreadHead`
+/// / `PyThreadState_Next` hand `_Py_DumpTracebackThreads`.
+pub fn threadlocals_enum_timeout(
+    mut max_wait_iterations: u32,
+    mut visit: impl FnMut(i64, *const crate::PyExecutionContext),
+) -> bool {
+    let contexts = loop {
+        if let Some(contexts) = EXECUTION_CONTEXTS.try_lock() {
+            break contexts;
+        }
+        if max_wait_iterations == 0 {
+            return false;
+        }
+        max_wait_iterations -= 1;
+        std::hint::spin_loop();
+    };
+    for (&ident, &ec) in contexts.iter().rev() {
+        visit(ident, ec as *const crate::PyExecutionContext);
+    }
+    true
 }
 
 pub(crate) fn unregister_execution_context() {

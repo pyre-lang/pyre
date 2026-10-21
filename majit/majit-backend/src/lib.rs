@@ -1055,11 +1055,20 @@ pub struct CompiledLoopToken {
     /// `model.py` `self.cpu` — the backend tracker `__del__` bumps.
     /// Set by [`record_compiled_loop_token`] at assemble time.
     cpu_tracker: parking_lot::Mutex<Option<Arc<CpuTotalTracker>>>,
-    /// Backend CALL_ASSEMBLER map retract. `__del__` /
-    /// `free_loop_and_bridges` unregisters by token identity so a
-    /// side table cannot keep this CLT alive.
-    /// The `usize` is [`JitCellToken::identity_key`] stamped at register.
-    ca_unregister: parking_lot::Mutex<Option<(usize, fn(usize))>>,
+    /// Backend CALL_ASSEMBLER retract. `__del__` / `free_loop_and_bridges`
+    /// hands it this CLT so the backend can drop what it hung on
+    /// [`Self::call_assembler_target`]. The `usize` is
+    /// [`JitCellToken::identity_key`] stamped at register.
+    ca_unregister: parking_lot::Mutex<Option<(usize, fn(&CompiledLoopToken, usize))>>,
+    /// What a CALL_ASSEMBLER to this loop enters, read off the descr's
+    /// `loop_token.compiled_loop_token` as `rewrite.py handle_call_assembler`
+    /// reads `_ll_initial_locs` and `frame_info`. `redirect_call_assembler`
+    /// replaces it on the old token. Cranelift cannot patch the old loop's
+    /// code the way `x86/assembler.py redirect_call_assembler` does, so it
+    /// keeps the entry pointers and exit table of the loop to run here.
+    /// `free_loop_and_bridges` clears it, which breaks the
+    /// `CLT → target → fail descrs → rd_loop_token → CLT` cycle.
+    pub call_assembler_target: parking_lot::RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>,
 }
 
 /// PyPy `model.py:296-307` `CompiledLoopToken.__init__` opens the
@@ -1119,6 +1128,7 @@ impl CompiledLoopToken {
             loop_allocation_recorded: AtomicBool::new(false),
             cpu_tracker: parking_lot::Mutex::new(None),
             ca_unregister: parking_lot::Mutex::new(None),
+            call_assembler_target: parking_lot::RwLock::new(None),
         }
     }
 
@@ -1238,7 +1248,7 @@ impl CompiledLoopToken {
     /// so a side table cannot keep this CLT after `LoopToken.__del__`.
     /// `token_key` is [`JitCellToken::identity_key`] (`redirect_call_assembler`
     /// identity), not `number`.
-    pub fn set_ca_unregister(&self, token_key: usize, unregister: fn(usize)) {
+    pub fn set_ca_unregister(&self, token_key: usize, unregister: fn(&CompiledLoopToken, usize)) {
         *self.ca_unregister.lock() = Some((token_key, unregister));
     }
 
@@ -1253,8 +1263,9 @@ impl CompiledLoopToken {
     /// runs. Idempotent: a second call finds empty lists.
     pub fn free_loop_and_bridges(&self) {
         if let Some((token_key, unregister)) = self.ca_unregister.lock().take() {
-            unregister(token_key);
+            unregister(self, token_key);
         }
+        self.call_assembler_target.write().take();
         self.asmmemmgr_gcreftracers.lock().clear();
         self.asmmemmgr_blocks.lock().clear();
     }

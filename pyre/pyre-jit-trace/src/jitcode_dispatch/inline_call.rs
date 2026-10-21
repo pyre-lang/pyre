@@ -18497,6 +18497,11 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     /// receive its own earlier result again rather than walk the callee a
     /// second time; `finishframe` hands each result to the call that made it.
     replay_log: Vec<CompletedSubWalk>,
+    /// Trace position of the CALL step this frame suspended at, before the
+    /// callee recorded anything.  A callee that fails is cut back to it
+    /// before the step replays, so the replayed step's decline arms see the
+    /// trace their recursive form saw.
+    suspend_trace_position: Option<majit_metainterp::recorder::TracePosition>,
 }
 
 struct PendingSubReturn {
@@ -18837,6 +18842,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                             .last_mut()
                             .expect("sub-walk driver lost its root frame");
                         frame.pc = pc;
+                        frame.suspend_trace_position = self.exchange.step_trace_position;
                         // Keep the results this pass consumed; the callee that
                         // just suspended appends its own when it finishes.
                         let mut replay_log = std::mem::take(&mut self.exchange.completed);
@@ -18874,6 +18880,19 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         });
                         parent.pc = next_pc;
                         continue;
+                    }
+                    // A recursive walk's decline arm cuts to a position it
+                    // took before the callee recorded; the replayed step
+                    // takes its position only now, past the callee's IR.
+                    // Cut the failed callee's IR here so a declined descent
+                    // leaves none of it behind -- a symbolic `fnaddr` call
+                    // it recorded would otherwise reach the backend.  The
+                    // heap cache may name boxes of the cut IR.
+                    if result.is_err()
+                        && let Some(position) = parent.suspend_trace_position.take()
+                    {
+                        trace_ctx.cut_trace_with_snapshots(position);
+                        trace_ctx.heap_cache_mut().reset();
                     }
                     SUBWALK_CALL_REPLAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     parent.pc = caller_pc;
@@ -19553,6 +19572,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         live_after_jit_pc: usize::MAX,
         pending_subreturn: None,
         replay_log: Vec::new(),
+        suspend_trace_position: None,
     };
 
     if !driver_pointer.is_null() {

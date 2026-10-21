@@ -91,6 +91,8 @@ struct LoopTargetDescrState {
     /// Cached `JitCellToken.number` so `unroll.rs` can compare owners
     /// without upgrading the Weak.
     original_jitcell_token_number: Option<i64>,
+    /// `majit_ir::LoopTargetDescr::backend_loop_entry`.
+    backend_loop_entry: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// `history.py TargetToken(AbstractDescr)`: one object that is both the
@@ -295,6 +297,14 @@ impl majit_ir::LoopTargetDescr for TargetToken {
 
     fn set_target_arglocs(&self, arglocs: Vec<majit_ir::TargetArgLoc>) {
         self.state.lock().target_arglocs = arglocs;
+    }
+
+    fn backend_loop_entry(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.state.lock().backend_loop_entry.clone()
+    }
+
+    fn set_backend_loop_entry(&self, entry: Arc<dyn std::any::Any + Send + Sync>) {
+        self.state.lock().backend_loop_entry = Some(entry);
     }
 
     fn original_jitcell_token_number(&self) -> Option<i64> {

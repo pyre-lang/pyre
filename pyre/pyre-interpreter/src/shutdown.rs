@@ -428,6 +428,10 @@ pub fn finalize_runtime(
     // itself holds, so without this a stream owned by any other module loses
     // its buffered writes.
     pyre_object::with_roots!(canonical => crate::module::_io::flush_all_streams());
+    // `faulthandler`'s (moduledef.py `shutdown`) cancels the watchdog and
+    // restores the signal handlers before any module is torn down.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    crate::module::faulthandler::handler::finish();
     // `finalize_modules` opens with this and every release below is its module
     // teardown, so the clearing has to precede the whole walk rather than sit
     // beside `clear_shutdown_modules`.

@@ -1713,6 +1713,55 @@ crate::rffi::llexternal!(
     compilation_info = LOADAVG_ECI
 );
 
+#[cfg(target_os = "windows")]
+crate::rffi::external_compilation_info! {
+    const UMASK_ECI = {
+        includes: ["io.h", "sys/stat.h"],
+    };
+}
+
+// `rposix.c_umask`: `external(UNDERSCORE_ON_WIN32 + 'umask', ...)`.
+#[cfg(target_os = "windows")]
+crate::rffi::llexternal!(
+    pub c_umask = "_umask",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = UMASK_ECI
+);
+
+/// `rposix.umask`, `_WIN32` arm.
+#[cfg(target_os = "windows")]
+pub fn umask(newmask: crate::rffi::INT) -> i64 {
+    unsafe { c_umask(newmask) as i64 }
+}
+
+/// `rposix.kill`, `_WIN32` arm.
+#[cfg(target_os = "windows")]
+pub fn kill(pid: crate::rffi::INT, sig: crate::rffi::INT) -> Result<(), rwin32::WindowsError> {
+    if sig as rwin32::DWORD == rwin32::CTRL_C_EVENT
+        || sig as rwin32::DWORD == rwin32::CTRL_BREAK_EVENT
+    {
+        if unsafe { rwin32::GenerateConsoleCtrlEvent(sig as rwin32::DWORD, pid as rwin32::DWORD) }
+            == 0
+        {
+            return Err(rwin32::lastSavedWindowsError(
+                "kill() failed generating event",
+            ));
+        }
+        return Ok(());
+    }
+    let handle = rwin32::OpenProcess(rwin32::PROCESS_ALL_ACCESS, 0, pid as rwin32::DWORD)?;
+    let result = if unsafe { rwin32::TerminateProcess(handle, sig as crate::rffi::UINT) } == 0 {
+        Err(rwin32::lastSavedWindowsError(
+            "kill() failed to terminate process",
+        ))
+    } else {
+        Ok(())
+    };
+    unsafe { rwin32::CloseHandle(handle) };
+    result
+}
+
 /// `rposix.getloadavg`.
 #[cfg(unix)]
 pub fn getloadavg() -> Result<[f64; 3], ()> {

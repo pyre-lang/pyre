@@ -1,10 +1,12 @@
 //! faulthandler module — PyPy: pypy/module/faulthandler/
 //!
-//! Unix fatal-signal and user-signal handling lives in `cintf` (`cintf.py` +
-//! `faulthandler.c`). Traceback dump from a signal handler needs
-//! `vmprof_get_traceback`, which is not ported.
+//! The fatal-signal handlers, the watchdog thread and (off Windows) the
+//! user-signal handlers live in `cintf` (`cintf.py` + `faulthandler.c`); the
+//! traceback they write comes from `dumper` (`dumper.py`).
 
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 mod cintf;
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+mod dumper;
 
 pyre_interpreter::pyre_module_init!(handler);

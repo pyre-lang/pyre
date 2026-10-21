@@ -549,10 +549,21 @@ pub(crate) unsafe fn is_simple_namespace(obj: PyObjectRef) -> bool {
 /// `type(sys.implementation)` and re-published by `types.py`
 /// (`SimpleNamespace = type(sys.implementation)`).
 ///
-/// `lib_pypy._structseq.SimpleNamespace`, with CPython 3.14's newer constructor,
-/// full rich-comparison surface, pickle reducer and `__replace__`.  Storage
-/// remains PyPy-shaped: the values live in the instance dict, not a side
-/// table or a second native mapping.
+/// `lib_pypy._structseq.SimpleNamespace`, with the newer constructor,
+/// rich-comparison slots, pickle reducer and `__replace__` of
+/// `namespaceobject.c`.  Storage remains PyPy-shaped: the values live in the
+/// instance dict, not a side table or a second native mapping.
+///
+/// [3.15-spec] The type itself stays an interpreter-built static type rather
+/// than PyPy's app-level class: `_structseq.py SimpleNamespace` is a heap type
+/// (`__flags__ & Py_TPFLAGS_HEAPTYPE`, attribute assignment on the class
+/// allowed, `'%T'` spelling `SimpleNamespace`), while `PyNamespace_Type` is
+/// immutable and named `types.SimpleNamespace`. Evidence:
+/// `lib-python/3/test/test_types.py`
+/// `SimpleNamespaceTests.test_richcompare_unsupported` matches "not supported
+/// between instances of 'types.SimpleNamespace' and 'types.SimpleNamespace'",
+/// and a measured CPython 3.15.0b1 run answers `0` for the heap-type flag and
+/// "cannot set 'foo' attribute of immutable type 'types.SimpleNamespace'".
 pub(crate) fn simple_namespace_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
@@ -834,10 +845,15 @@ fn simple_namespace_richcompare(
     if !unsafe { crate::baseobjspace::issubtype_w(other_type, simple_namespace_type()) } {
         return Ok(w_not_implemented());
     }
-    // CPython 3.14 forwards all six operations to the two namespace dicts.
-    // In particular, ordering reaches dict's TypeError instead of returning
-    // NotImplemented from the namespace type itself.
-    //
+    // `namespace_richcompare` forwards only `==` and `!=` to the two
+    // namespace dicts; ordering answers NotImplemented from the namespace
+    // type itself, so `a < b` reports the namespace types, not `dict`.
+    if !matches!(
+        op,
+        crate::baseobjspace::CompareOp::Eq | crate::baseobjspace::CompareOp::Ne
+    ) {
+        return Ok(w_not_implemented());
+    }
     // A subclass `__getattribute__` runs on each lookup, so both operands and
     // the first dict have to survive it.
     let _roots = pyre_object::gc_roots::push_roots();

@@ -1110,11 +1110,15 @@ mod win_nt {
     /// `wrap_oserror` of an `rwin32` `WindowsError`: the code is a Win32
     /// error and lands in `.winerror`.
     pub(super) fn windows_err(error: majit_rlib::rwin32::WindowsError) -> crate::PyError {
-        crate::PyError::os_error_win32_syscall2(
-            error.winerror as i32,
-            pyre_object::PY_NULL,
-            pyre_object::PY_NULL,
-        )
+        windows_err_with_filename(error, pyre_object::PY_NULL)
+    }
+
+    /// `wrap_oserror2` of an `rwin32` `WindowsError` naming `filename`.
+    fn windows_err_with_filename(
+        error: majit_rlib::rwin32::WindowsError,
+        filename: PyObjectRef,
+    ) -> crate::PyError {
+        crate::PyError::os_error_win32_syscall2(error.winerror as i32, filename, pyre_object::PY_NULL)
     }
 
     fn io_err_with_filename(error: &std::io::Error, filename: PyObjectRef) -> crate::PyError {
@@ -1194,11 +1198,14 @@ mod win_nt {
         // while a network path answers.
         let final_path = {
             let _blocked = crate::module::thread::before_external_block();
-            host_nt::getfinalpathname(&path)
+            super::super::interp_nt::_getfinalpathname(&path)
         };
         match final_path {
-            Ok(result) => Ok(wrap_path(&result, as_bytes)),
-            Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
+            Ok(units) => {
+                use std::os::windows::ffi::OsStringExt;
+                Ok(wrap_path(&std::ffi::OsString::from_wide(&units), as_bytes))
+            }
+            Err(error) => Err(windows_err_with_filename(error, resolved.w_path())),
         }
     }
 
@@ -1346,16 +1353,16 @@ mod win_nt {
             ));
         };
         let fd = crate::baseobjspace::c_int_w(arg)?;
-        let info = host_nt::get_file_information(host_nt::handle_from_fd(fd))
-            .map_err(|error| io_err(&error, ""))?;
+        let (volume_serial_number, file_index_high, file_index_low) =
+            super::super::interp_nt::_getfileinformation(fd).map_err(windows_err)?;
         let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_int_new(info.volume_serial_number as i64));
-        fields.push(pyre_object::w_int_new(info.file_index_high as i64));
-        fields.push(pyre_object::w_int_new(info.file_index_low as i64));
+        fields.push(pyre_object::w_int_new(volume_serial_number));
+        fields.push(pyre_object::w_int_new(file_index_high));
+        fields.push(pyre_object::w_int_new(file_index_low));
         Ok(pyre_object::w_tuple_new(fields.take()))
     }
 
-    /// shutil.disk_usage helper — (total, free) bytes. host_env::getdiskusage
+    /// shutil.disk_usage helper — (total, free) bytes. `win32_getdiskusage`
     /// retries against the parent directory when the path names a file
     /// (ERROR_DIRECTORY).
     pub fn _getdiskusage(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1364,16 +1371,16 @@ mod win_nt {
         // `GetDiskFreeSpaceExW`, which reaches the volume itself.
         let usage = {
             let _blocked = crate::module::thread::before_external_block();
-            host_nt::getdiskusage(&path)
+            super::super::interp_nt::win32_getdiskusage(&path)
         };
         match usage {
             Ok((total, free)) => {
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(pyre_object::w_int_new(total as i64));
-                fields.push(pyre_object::w_int_new(free as i64));
+                fields.push(pyre_object::w_int_new(total));
+                fields.push(pyre_object::w_int_new(free));
                 Ok(pyre_object::w_tuple_new(fields.take()))
             }
-            Err(error) => Err(io_err_with_filename(&error, resolved.w_path())),
+            Err(error) => Err(windows_err_with_filename(error, resolved.w_path())),
         }
     }
 
@@ -1511,8 +1518,15 @@ mod win_nt {
         // `arg_path` keeps the code units it decoded the path into; going back
         // through a `str` would have no spelling for a lone surrogate and would
         // address a different directory.
-        let cookie = host_winapi::add_dll_directory(&path)
-            .map_err(|error| io_err_with_filename(&error, resolved.w_path()))?;
+        // `rwin32.AddDllDirectory` widens the UTF-8 with `scoped_utf82wcharp`
+        // and calls `_AddDllDirectory`; the units here are already wide.
+        let cookie = unsafe { majit_rlib::rwin32::_AddDllDirectory(path.as_ptr() as _) };
+        if cookie.is_null() {
+            return Err(windows_err_with_filename(
+                majit_rlib::rwin32::lastSavedWindowsError("AddDllDirectory"),
+                resolved.w_path(),
+            ));
+        }
         LIVE_DLL_DIRECTORY_COOKIES.lock().push(cookie as usize);
         Ok(dll_cookie_new(cookie as usize))
     }
@@ -1558,19 +1572,18 @@ mod win_nt {
                 .position(|&issued| issued == cookie)
                 .ok_or_else(not_a_cookie)?;
             live.swap_remove(index);
-            if host_winapi::remove_dll_directory(cookie as host_winapi::DllDirectoryCookie).is_ok()
-            {
+            if unsafe { majit_rlib::rwin32::RemoveDllDirectory(cookie as _) } != 0 {
                 None
             } else {
                 // The capsule is renamed only after a successful removal, so a
                 // failed one leaves the cookie usable.
-                let error = std::io::Error::last_os_error();
+                let error = majit_rlib::rwin32::lastSavedWindowsError("RemoveDllDirectory");
                 live.push(cookie);
                 Some(error)
             }
         };
         match failure {
-            Some(error) => Err(io_err(&error, "")),
+            Some(error) => Err(windows_err(error)),
             None => {
                 // `PyCapsule_SetName(cookie, NULL)`: the object stops carrying a
                 // cookie at all, so a second removal is refused even where the
@@ -14881,9 +14894,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let sig = crate::baseobjspace::c_int_w(args[1])?;
                     let result = {
                         let _blocked = crate::module::thread::before_external_block();
-                        host_nt::kill(pid as u32, sig as u32)
+                        majit_rlib::rposix::kill(pid, sig)
                     };
-                    result.map_err(|error| fs_err_with_filename(error, pyre_object::PY_NULL))?;
+                    result.map_err(win_nt::windows_err)?;
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -15193,10 +15206,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         return Err(crate::PyError::type_error("umask() requires 1 argument"));
                     }
                     let mask = crate::baseobjspace::c_int_w(args[0])?;
-                    match host_nt::umask(mask) {
-                        Ok(previous) => Ok(pyre_object::w_int_new(previous as i64)),
-                        Err(e) => Err(errno_err(crt_errno_of(&e), "")),
-                    }
+                    Ok(pyre_object::w_int_new(majit_rlib::rposix::umask(mask)))
                 },
                 1,
             )
@@ -15228,7 +15238,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "getppid",
             crate::make_builtin_function_with_arity(
                 "getppid",
-                |_| Ok(pyre_object::w_int_new(host_nt::getppid() as i64)),
+                |_| match super::interp_nt::win32_getppid() {
+                    Ok(ppid) => Ok(pyre_object::w_int_new(ppid)),
+                    Err(errno) => Err(crate::PyError::os_error_errno_strerror(
+                        errno,
+                        "getppid failed",
+                    )),
+                },
                 0,
             )
         );
@@ -15274,14 +15290,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "getlogin",
             crate::make_builtin_function_with_arity(
                 "getlogin",
-                |_| match host_nt::getlogin() {
-                    Ok(name) => Ok(pyre_object::w_str_new_managed(&name)),
-                    Err(e) => Err(fs_err_with_filename2(
-                        e,
-                        0,
-                        pyre_object::PY_NULL,
-                        pyre_object::PY_NULL,
-                    )),
+                |_| match majit_rlib::rwin32::getlogin() {
+                    // `wcharp2utf8n` writes WTF-8.
+                    Ok(name) => Ok(pyre_object::w_str_from_wtf8_managed_borrowed(unsafe {
+                        rustpython_wtf8::Wtf8::from_bytes_unchecked(&name)
+                    })),
+                    Err(error) => Err(win_nt::windows_err(error)),
                 },
                 0,
             )

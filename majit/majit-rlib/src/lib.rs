@@ -56,6 +56,9 @@ pub mod rvmprof;
 #[cfg(target_os = "windows")]
 #[allow(non_snake_case)]
 pub mod rwin32;
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+pub mod rwin32file;
 
 /// `lltype.malloc(T, flavor='raw')` (`rpython/rtyper/lltypesystem/lltype.py`) —
 /// an allocation the collector neither traces nor reclaims.

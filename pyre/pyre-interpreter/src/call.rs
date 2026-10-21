@@ -750,6 +750,15 @@ pub fn take_last_exec_ctx() -> *const crate::PyExecutionContext {
     LAST_EXEC_CTX.with(|c| c.get())
 }
 
+/// [`take_last_exec_ctx`] for a signal handler: `try_with`, so a signal that
+/// lands while the thread's TLS is being torn down reads null instead of
+/// panicking.
+pub fn peek_last_exec_ctx() -> *const crate::PyExecutionContext {
+    LAST_EXEC_CTX
+        .try_with(|c| c.get())
+        .unwrap_or(std::ptr::null())
+}
+
 pub(crate) fn capture_last_exec_ctx_cell() -> *const () {
     LAST_EXEC_CTX.with(|cell| cell as *const _ as *const ())
 }

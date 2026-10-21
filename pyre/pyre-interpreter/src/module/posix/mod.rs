@@ -10,6 +10,10 @@
 #[cfg(not(target_arch = "wasm32"))]
 crate::pyre_module_init!(interp_posix);
 
+/// `interp_nt.py`, the Windows helpers `interp_posix` calls.
+#[cfg(all(windows, feature = "host_env"))]
+mod interp_nt;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use interp_posix::{W_DirEntry, W_ScandirIterator};
 

@@ -4120,6 +4120,22 @@ pub trait LoopTargetDescr: Descr {
 
     fn target_arglocs(&self) -> Vec<TargetArgLoc>;
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>);
+    /// The backend's record of the compiled loop this LABEL enters, kept
+    /// beside `_ll_loop_code` as the x86 backend keeps `_x86_arglocs` on the
+    /// token. Cranelift cannot JMP into another function, so an external
+    /// JUMP that leaves generated code re-enters the target through the host
+    /// loop and needs that loop's wrapper entry, exit table and frame layout.
+    /// `None` until a backend has compiled the LABEL.
+    fn backend_loop_entry(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+    fn set_backend_loop_entry(&self, _entry: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        panic!(
+            "set_backend_loop_entry requires a state-backed slot \
+             (LoopTargetDescr impl: {})",
+            std::any::type_name::<Self>(),
+        );
+    }
 
     /// `history.py self.original_jitcell_token = original_jitcell_token`.
     /// The owning JitCellToken's log-only `number` for this TargetToken —
@@ -4177,6 +4193,8 @@ struct BasicLoopTargetDescrState {
     /// The owner object itself, weak for the reason given on
     /// `LoopTargetDescr::original_jitcell_token_handle`.
     original_jitcell_token: Option<std::sync::Weak<dyn std::any::Any + Send + Sync>>,
+    /// [`LoopTargetDescr::backend_loop_entry`].
+    backend_loop_entry: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 #[derive(Debug)]
@@ -4296,6 +4314,14 @@ impl LoopTargetDescr for BasicLoopTargetDescr {
 
     fn set_target_arglocs(&self, arglocs: Vec<TargetArgLoc>) {
         self.state.lock().target_arglocs = arglocs;
+    }
+
+    fn backend_loop_entry(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.state.lock().backend_loop_entry.clone()
+    }
+
+    fn set_backend_loop_entry(&self, entry: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.state.lock().backend_loop_entry = Some(entry);
     }
 
     fn original_jitcell_token_number(&self) -> Option<i64> {

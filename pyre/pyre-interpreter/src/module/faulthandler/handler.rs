@@ -1,33 +1,19 @@
 //! faulthandler implementation — PyPy: pypy/module/faulthandler/handler.py
 //!
-//! Verbatim move of the inline block previously in importing.rs.  `init_faulthandler`
-//! was renamed to `register_module`; the host_env signal handlers and the
-//! `faulthandler_extract_fd` helper stay private.
-
-// faulthandler module — PyPy: pypy/module/faulthandler/.
-//
-// CPython's faulthandler dumps the Python traceback on fatal signals.
-// Pyre has no Python-level traceback machinery yet, so our handler
-// writes a short "Fatal Python error: <name>" line to the descriptor
-// `enable` was given and then restores the disposition the signal had
-// before `enable` + reraises it so the process dies the normal way.
-// ──────────────────────────────────────────────────────────────────────
+//! `Handler` owns the files the installed handlers write to; the handlers
+//! themselves and the traceback walk are `cintf` (`cintf.py` +
+//! `faulthandler.c`) and `dumper` (`dumper.py`), on both hosts.
 
 /// `handler.py` `Handler`: one record per space.  The signal callback is a
-/// bare `extern "C" fn` and cannot capture, so the fields that callback
-/// reads stay atomic; the rest matches `Handler._cleanup_` /
-/// `fatal_error_w_file` / `user_w_files`.
+/// bare `extern "C" fn` and cannot capture, so everything it reads lives in
+/// `cintf`'s `fatal_error`; this keeps `Handler._cleanup_`'s
+/// `fatal_error_w_file` / `dump_traceback_later_w_file` / `user_w_files`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 struct Handler {
-    /// Windows fatal-handler enabled flag. Unix reads `pypy_faulthandler_is_enabled`.
-    #[cfg(windows)]
-    enabled: std::sync::atomic::AtomicBool,
-    /// The descriptor `enable` resolved from its `file` argument. Defaults
-    /// to 2, which is what `get_fileno_and_file` answers for None.
-    #[cfg(windows)]
-    fd: std::sync::atomic::AtomicI32,
     /// `self.fatal_error_w_file`. Walked as a GC root.
     fatal_error_w_file: std::sync::atomic::AtomicPtr<pyre_object::PyObject>,
+    /// `self.dump_traceback_later_w_file`. Walked as a GC root.
+    dump_traceback_later_w_file: std::sync::atomic::AtomicPtr<pyre_object::PyObject>,
     state_lock: parking_lot::Mutex<()>,
     /// `self.user_w_files`. Addresses rather than `PyObjectRef` so the
     /// table is `Sync`.
@@ -40,11 +26,8 @@ struct Handler {
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 static HANDLER: Handler = Handler {
-    #[cfg(windows)]
-    enabled: std::sync::atomic::AtomicBool::new(false),
-    #[cfg(windows)]
-    fd: std::sync::atomic::AtomicI32::new(2),
     fatal_error_w_file: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+    dump_traceback_later_w_file: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     state_lock: parking_lot::const_mutex(()),
     #[cfg(unix)]
     user_w_files: parking_lot::const_mutex(Vec::new()),
@@ -61,17 +44,27 @@ fn set_fatal_error_file(w_file: pyre_object::PyObjectRef) {
         .store(w_file, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `enable` / `disable` / `register` / `unregister` each install (or remove) a
-/// handler and then hand the matching file to the owner slot in a second
-/// statement.  `Handler` runs those two statements under the GIL, so no other
-/// thread can interleave between them; pyre has no GIL, and an interleaving
-/// leaves the installed descriptor owned by the *other* call's file — the file
-/// this call resolved is then unrooted, collected, and its finalizer closes the
-/// descriptor the handler still writes through.  Serialize the pairs.
+/// `self.dump_traceback_later_w_file = w_file`; a null drops it.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+fn set_dump_traceback_later_file(w_file: pyre_object::PyObjectRef) {
+    HANDLER
+        .dump_traceback_later_w_file
+        .store(w_file, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `enable` / `disable` / `register` / `unregister` /
+/// `dump_traceback_later` / `cancel_dump_traceback_later` each install (or
+/// remove) a handler and then hand the matching file to the owner slot in a
+/// second statement.  `Handler` runs those two statements under the GIL, so
+/// no other thread can interleave between them; pyre has no GIL, and an
+/// interleaving leaves the installed descriptor owned by the *other* call's
+/// file — the file this call resolved is then unrooted, collected, and its
+/// finalizer closes the descriptor the handler still writes through.
+/// Serialize the pairs.
 ///
 /// Held across the host install or removal and the owner bookkeeping that
 /// follows it.  The file is resolved — which runs Python — before the guard is
-/// taken, and the fatal-signal handler reads `Handler.fd` atomically
+/// taken, and the fatal-signal handler reads `fatal_error.fd` atomically
 /// without acquiring anything.  A failed install still builds its exception
 /// inside the guard, so take it through `lock_faulthandler_state`.
 ///
@@ -111,7 +104,7 @@ fn clear_user_signal_file(signum: libc::c_int) {
     HANDLER.user_w_files.lock().retain(|&(s, _)| s != signum);
 }
 
-/// Root walker for the two file-owner tables, registered alongside the other
+/// Root walker for the file-owner slots, registered alongside the other
 /// process-global interpreter roots.  Forwards each slot in place so a moving
 /// collection relocates the held file rather than leaving a stale address the
 /// installed handler would keep writing through.
@@ -131,14 +124,17 @@ pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         });
         slot as usize
     };
-    let fatal = HANDLER
-        .fatal_error_w_file
-        .load(std::sync::atomic::Ordering::Relaxed);
-    if !fatal.is_null() {
-        HANDLER.fatal_error_w_file.store(
-            forward(fatal as usize) as pyre_object::PyObjectRef,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    for owner in [
+        &HANDLER.fatal_error_w_file,
+        &HANDLER.dump_traceback_later_w_file,
+    ] {
+        let file = owner.load(std::sync::atomic::Ordering::Relaxed);
+        if !file.is_null() {
+            owner.store(
+                forward(file as usize) as pyre_object::PyObjectRef,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
     #[cfg(unix)]
     {
@@ -152,144 +148,74 @@ pub fn walk_faulthandler_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 #[cfg(not(all(any(unix, windows), feature = "host_env")))]
 pub fn walk_faulthandler_roots(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 
-/// Write one unsigned decimal without allocating.  The structured-exception
-/// callback runs at an arbitrary fault point, so it cannot enter formatting
-/// machinery or the managed heap.
-#[cfg(all(windows, feature = "host_env"))]
-fn faulthandler_write_decimal(fd: i32, mut value: usize) {
-    let mut digits = [0u8; 20];
-    let mut start = digits.len();
-    loop {
-        start -= 1;
-        digits[start] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    rustpython_host_env::faulthandler::write_fd(fd, &digits[start..]);
-}
-
-/// Write the current thread's application frames from the same live
-/// `ExecutionContext.topframeref` chain that PyPy's `dumper._dump_callback`
-/// walks.  Every referenced filename/name is immutable storage owned by the
-/// code object, and all scratch space is on the native stack: the exception
-/// callback must remain allocation-free.
-#[cfg(all(windows, feature = "host_env"))]
-unsafe fn faulthandler_dump_current_traceback(fd: i32) {
-    rustpython_host_env::faulthandler::write_fd(fd, b"Current thread 0x");
-    let thread_id = rustpython_host_env::faulthandler::current_thread_id() as usize;
-    let mut hex = [0u8; 2 * std::mem::size_of::<usize>()];
-    let mut start = hex.len();
-    let mut value = thread_id;
-    loop {
-        start -= 1;
-        hex[start] = b"0123456789abcdef"[value & 0xf];
-        value >>= 4;
-        if value == 0 {
-            break;
-        }
-    }
-    rustpython_host_env::faulthandler::write_fd(fd, &hex[start..]);
-    rustpython_host_env::faulthandler::write_fd(fd, b" (most recent call first):\n");
-
-    let ec = pyre_interpreter::call::getexecutioncontext();
-    let mut frame = if ec.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe { (*ec).topframeref }
-    };
-    let mut depth = 0usize;
-    while !frame.is_null() && depth < 100 {
-        let pycode = unsafe { (*frame).pycode as *const pyre_interpreter::pycode::PyCode };
-        if pycode.is_null() || unsafe { (*pycode).code_ptr.is_null() } {
-            break;
-        }
-        let code = unsafe { &*((*pycode).code_ptr as *const pyre_interpreter::CodeObject) };
-        let filename = if unsafe { (*pycode).filename_bytes.is_null() } {
-            code.source_path.as_bytes()
-        } else {
-            unsafe { &*(*pycode).filename_bytes }.as_slice()
-        };
-        rustpython_host_env::faulthandler::write_fd(fd, b"  File \"");
-        rustpython_host_env::faulthandler::write_fd(fd, filename);
-        rustpython_host_env::faulthandler::write_fd(fd, b"\", line ");
-        let lineno = unsafe { (*frame).get_lineno_at((*frame).last_instr) }.max(0) as usize;
-        faulthandler_write_decimal(fd, lineno);
-        rustpython_host_env::faulthandler::write_fd(fd, b" in ");
-        let cached_name = unsafe { (*pycode).w_name };
-        let name_bytes = if cached_name.is_null() {
-            code.obj_name.as_bytes()
-        } else {
-            unsafe { pyre_object::w_str_get_wtf8(cached_name) }.as_bytes()
-        };
-        rustpython_host_env::faulthandler::write_fd(fd, name_bytes);
-        rustpython_host_env::faulthandler::write_fd(fd, b"\n");
-        frame = unsafe { (*frame).f_backref };
-        depth += 1;
-    }
-
-    // CPython's `_Py_DumpStack` prints this section after the Python stack.
-    // Pyre has no async-safe native symbolizer yet; its accepted failure form
-    // is preferable to calling an allocator or loader lock from an SEH hook.
-    rustpython_host_env::faulthandler::write_fd(
-        fd,
-        b"Current thread's C stack trace (most recent call first):\n<C stack unavailable>\n",
+/// `handler.py finish`, called from `moduledef.py Module.shutdown`:
+/// `Handler.finish` tears the handlers and the watchdog down, then
+/// `_cleanup_` drops the files they wrote to.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+pub fn finish() {
+    let _state = lock_faulthandler_state();
+    super::cintf::pypy_faulthandler_teardown();
+    #[cfg(windows)]
+    rustpython_host_env::faulthandler::remove_vectored_exception_handler(
+        HANDLER
+            .exc_handler
+            .swap(0, std::sync::atomic::Ordering::Relaxed),
     );
+    // `Handler._cleanup_`.
+    set_fatal_error_file(pyre_object::PY_NULL);
+    set_dump_traceback_later_file(pyre_object::PY_NULL);
+    #[cfg(unix)]
+    HANDLER.user_w_files.lock().clear();
 }
 
-/// `faulthandler.c:280-330 faulthandler_exc_handler`.  A fatal fault on Windows
-/// arrives as a structured exception, not as a signal — a null read never
-/// reaches the `SIGSEGV` handler — so without this, `enable()` there prints
-/// nothing and the process dies at 0xc0000005 in silence.
+#[cfg(not(all(any(unix, windows), feature = "host_env")))]
+pub fn finish() {}
+
+/// [3.15-spec] `Modules/faulthandler.c faulthandler_exc_handler`.  PyPy has
+/// no vectored exception handler: a fatal fault on Windows arrives as a
+/// structured exception, not as a signal — a null read never reaches the
+/// `SIGSEGV` handler — so `enable()` there prints nothing and the process
+/// dies at 0xc0000005 in silence. Evidence:
+/// `lib-python/3/test/test_faulthandler.py` `test_raise_exception` expects
+/// "Windows fatal exception: access violation" followed by a traceback.
 ///
-/// Answers `EXCEPTION_CONTINUE_SEARCH` like the original: this only reports,
-/// and the handler that decides the process's fate runs after it.
+/// Writes through `cintf`'s `fatal_error` descriptor and dumps with the same
+/// `faulthandler_dump_traceback`, then answers `EXCEPTION_CONTINUE_SEARCH`:
+/// this only reports, and the handler that decides the process's fate runs
+/// after it.
 #[cfg(all(windows, feature = "host_env"))]
 unsafe extern "system" fn faulthandler_exc_handler(
     exc_info: *mut rustpython_host_env::faulthandler::ExceptionPointers,
 ) -> i32 {
     use rustpython_host_env::faulthandler::EXCEPTION_CONTINUE_SEARCH;
+    let fd = super::cintf::fatal_error_fd();
     let code = unsafe { rustpython_host_env::faulthandler::exception_code(exc_info) };
-    // `faulthandler.c:283-286`: a non-error status, and the C++ / CLR throws a
-    // running program uses for control flow, are none of this handler's
-    // business — and every Rust panic under MSVC is one of them.
+    // `faulthandler_ignore_exception`: a non-error status, and the C++ / CLR
+    // throws a running program uses for control flow, are none of this
+    // handler's business — and every Rust panic under MSVC is one of them.
     if rustpython_host_env::faulthandler::ignore_exception(code) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    // Assembled on the stack for the same reason as the signal handler's.
-    const PREFIX: &[u8] = b"Windows fatal exception: ";
-    let mut msg = [0u8; 64];
-    msg[..PREFIX.len()].copy_from_slice(PREFIX);
-    let mut end = PREFIX.len();
+    super::cintf::pypy_faulthandler_write(fd, b"Windows fatal exception: ");
     match rustpython_host_env::faulthandler::exception_description(code) {
-        Some(name) => {
-            let name = &name.as_bytes()[..name.len().min(msg.len() - end - 2)];
-            msg[end..end + name.len()].copy_from_slice(name);
-            end += name.len();
-        }
+        Some(name) => super::cintf::pypy_faulthandler_write(fd, name.as_bytes()),
         None => {
-            // `faulthandler.c:322-324` spells an unnamed one `code 0x` plus
-            // eight hexadecimal digits.
-            const UNNAMED: &[u8] = b"code 0x";
-            msg[end..end + UNNAMED.len()].copy_from_slice(UNNAMED);
-            end += UNNAMED.len();
-            for digit in (0..8).rev() {
-                msg[end] = b"0123456789abcdef"[((code >> (digit * 4)) & 0xf) as usize];
-                end += 1;
+            // An unnamed one is `code 0x` plus eight hexadecimal digits.
+            let mut text = *b"code 0x00000000";
+            for (index, shift) in (0..8u32).rev().enumerate() {
+                text[7 + index] = b"0123456789abcdef"[((code >> (shift * 4)) & 0xf) as usize];
             }
+            super::cintf::pypy_faulthandler_write(fd, &text);
         }
     }
-    msg[end] = b'\n';
-    msg[end + 1] = b'\n';
-    let fd = HANDLER.fd.load(std::sync::atomic::Ordering::Relaxed);
-    rustpython_host_env::faulthandler::write_fd(fd, &msg[..end + 2]);
-    unsafe { faulthandler_dump_current_traceback(fd) };
-    // `faulthandler.c:326-334`: the access violation is also delivered to the
-    // program as SIGSEGV, and reporting it twice helps nobody.
+    super::cintf::pypy_faulthandler_write(fd, b"\n\n");
+    // The access violation is also delivered to the program as SIGSEGV, and
+    // reporting it twice helps nobody.
     if rustpython_host_env::faulthandler::is_access_violation(code) {
-        rustpython_host_env::faulthandler::disable_fatal_signal(libc::SIGSEGV);
+        super::cintf::faulthandler_disable_fatal_handler(libc::SIGSEGV);
     }
+    super::cintf::faulthandler_dump_fatal_traceback(fd);
+    super::cintf::faulthandler_dump_c_stack(fd);
     EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -331,7 +257,7 @@ const WINDOWS_EXCEPTIONS: [(&str, i32); 5] = [
 ];
 
 /// `handler.py Handler.check_err`.
-#[cfg(all(unix, feature = "host_env"))]
+#[cfg(all(any(unix, windows), feature = "host_env"))]
 fn check_err(p_err: *const libc::c_char) -> Result<(), pyre_interpreter::PyError> {
     if p_err.is_null() {
         return Ok(());
@@ -340,6 +266,14 @@ fn check_err(p_err: *const libc::c_char) -> Result<(), pyre_interpreter::PyError
     Err(pyre_interpreter::PyError::runtime_error(format!(
         "faulthandler: {msg}"
     )))
+}
+
+/// `handler.py Handler.setup`.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+fn setup() -> Result<(), pyre_interpreter::PyError> {
+    check_err(super::cintf::pypy_faulthandler_setup(
+        super::dumper::_dump_callback,
+    ))
 }
 
 /// `handler.py Handler.check_signum`.
@@ -361,54 +295,40 @@ fn check_signum(signum: libc::c_int) -> Result<(), pyre_interpreter::PyError> {
     }
 }
 
-/// `faulthandler_suppress_crash_report` — the crash helpers below take the
-/// process down on purpose, so the OS must not stop to offer a crash dialog
-/// first and hang a test run waiting on it.
-fn suppress_crash_report() {
-    #[cfg(all(unix, feature = "host_env"))]
-    super::cintf::faulthandler_suppress_crash_report();
-    #[cfg(all(windows, feature = "host_env"))]
-    rustpython_host_env::faulthandler::suppress_crash_report();
+/// An `@unwrap_spec(x=int)` argument; a slot the binder left null takes
+/// `default`.
+fn int_arg(
+    args: &[pyre_object::PyObjectRef],
+    index: usize,
+    default: i64,
+) -> Result<i64, pyre_interpreter::PyError> {
+    args.get(index)
+        .copied()
+        .filter(|a| !a.is_null())
+        .map(pyre_interpreter::baseobjspace::gateway_int_w)
+        .transpose()
+        .map(|value| value.unwrap_or(default))
 }
 
-/// Windows fatal-signal handler. Unix uses `cintf::faulthandler_fatal_error`.
-#[cfg(all(windows, feature = "host_env"))]
-extern "C" fn faulthandler_signal_handler(signum: libc::c_int) {
-    // Stay async-signal-safe: write with raw libc::write, and reraise so the
-    // process dies through the disposition the program actually had.
-    //
-    // `faulthandler_fatal_error` restores `handler->previous` and clears
-    // `handler->enabled` before writing anything, then reraises so that
-    // handler runs.  Replacing it with SIG_DFL instead would silently drop a
-    // disposition the program installed for SIGABRT/SIGFPE/… before calling
-    // `faulthandler.enable()`.
-    //
-    // SIGSEGV keeps the default disposition.  `faulthandler_fatal_error`
-    // already refuses to hand SIGSEGV back to its previous handler on
-    // Windows, and here the previous one is the Rust runtime's stack-overflow
-    // probe, which returns without terminating when the address is not its
-    // guard page — which is every software `raise`, `_sigsegv` below included.
-    if signum != libc::SIGSEGV {
-        rustpython_host_env::faulthandler::disable_fatal_signal(signum);
-    }
-    let name =
-        rustpython_host_env::faulthandler::fatal_signal_name(signum).unwrap_or("unknown signal");
-    // Assembled on the stack: a `format!` here would call into the allocator,
-    // and the fault this is handling may well have come from inside it.
-    const PREFIX: &[u8] = b"Fatal Python error: ";
-    let mut msg = [0u8; 64];
-    msg[..PREFIX.len()].copy_from_slice(PREFIX);
-    let name = &name.as_bytes()[..name.len().min(msg.len() - PREFIX.len() - 1)];
-    msg[PREFIX.len()..PREFIX.len() + name.len()].copy_from_slice(name);
-    msg[PREFIX.len() + name.len()] = b'\n';
-    let fd = HANDLER.fd.load(std::sync::atomic::Ordering::Relaxed);
-    let out = &msg[..PREFIX.len() + name.len() + 1];
-    rustpython_host_env::faulthandler::write_fd(fd, out);
-    if signum == libc::SIGSEGV {
-        rustpython_host_env::faulthandler::signal_default_and_raise(signum);
-    } else {
-        rustpython_host_env::faulthandler::raise_signal(signum);
-    }
+/// [3.15-spec] The kw-only `max_threads=100` of `enable`, `dump_traceback`,
+/// `dump_traceback_later` and `register`, which `handler.py` does not take.
+/// Evidence: `lib-python/3/test/test_faulthandler.py`
+/// `test_dump_traceback_max_threads` calls
+/// `dump_traceback(file=sys.stderr, max_threads=CAP)` and
+/// `test_register_max_threads` calls `register(..., max_threads=CAP)`;
+/// `dump_traceback_later` has no test, and its `max_threads: Py_ssize_t = 100`
+/// is the clinic signature of `faulthandler_dump_traceback_later_impl` in
+/// `Modules/faulthandler.c` read at v3.15.0rc2.
+fn with_max_threads_default(function: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(function);
+    pyre_interpreter::gateway::function_set_kwonly_default_pair(
+        fn_slot,
+        "max_threads",
+        pyre_object::w_int_new(100),
+    );
+    roots.get(fn_slot)
 }
 
 /// `handler.py Handler.get_fileno_and_file` — resolve a
@@ -496,25 +416,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         ns_slot,
         "enable",
         // `handler.py enable(space, w_file=None, all_threads=0)`; clinic also
-        // takes `c_stack=True`.
-        pyre_interpreter::gateway::function_set_null_positional_defaults(
+        // takes `c_stack=True` and `*, max_threads=100`.
+        with_max_threads_default(pyre_interpreter::gateway::function_set_null_positional_defaults(
             pyre_interpreter::make_builtin_function_with_signature(
                 "enable",
                 |args| {
-                    // `handler.py enable` — file=None, all_threads=True.
-                    // Resolving the argument runs a user `fileno()` and `flush()`;
-                    // keep those side effects behind the support gate, so a build
-                    // that can only answer NotImplementedError does not run them
-                    // first.
+                    // `handler.py Handler.enable`. Resolving the argument runs a
+                    // user `fileno()` and `flush()`; keep those side effects
+                    // behind the support gate, so a build that can only answer
+                    // NotImplementedError does not run them first.
                     #[cfg(all(any(unix, windows), feature = "host_env"))]
                     {
-                        let all_threads = args
-                            .get(1)
-                            .copied()
-                            .filter(|a| !a.is_null())
-                            .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                            .transpose()?
-                            .unwrap_or(1);
+                        let all_threads = int_arg(args, 1, 1)?;
+                        // [3.15-spec] `c_stack: bool = True` is not
+                        // upstream's; see `cintf::FatalError::c_stack`.
+                        let c_stack = match args.get(2).copied().filter(|a| !a.is_null()) {
+                            Some(w_c_stack) => pyre_interpreter::baseobjspace::is_true(w_c_stack)?,
+                            None => true,
+                        };
+                        let max_threads = int_arg(args, 3, 100)?;
                         let (fd, w_file) = faulthandler_get_fileno_and_file(
                             args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         )?;
@@ -526,60 +446,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             pyre_object::gc_roots::shadow_stack_len() - 1
                         });
                         let _state = lock_faulthandler_state();
-                        #[cfg(unix)]
-                        {
-                            check_err(super::cintf::pypy_faulthandler_setup())?;
-                            check_err(super::cintf::pypy_faulthandler_enable(
-                                fd,
-                                all_threads as libc::c_int,
-                            ))?;
-                            set_fatal_error_file(file_slot.map_or(
-                                pyre_object::PY_NULL,
-                                pyre_object::gc_roots::shadow_stack_get,
-                            ));
-                            return Ok(pyre_object::w_none());
-                        }
+                        setup()?;
+                        // `self.fatal_error_w_file = w_file` comes before the
+                        // install's `check_err`.
+                        set_fatal_error_file(file_slot.map_or(
+                            pyre_object::PY_NULL,
+                            pyre_object::gc_roots::shadow_stack_get,
+                        ));
+                        check_err(super::cintf::pypy_faulthandler_enable(
+                            fd,
+                            all_threads as libc::c_int,
+                            c_stack as libc::c_int,
+                            max_threads as libc::c_int,
+                        ))?;
                         #[cfg(windows)]
+                        if HANDLER
+                            .exc_handler
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            == 0
                         {
-                            let _ = all_threads;
-                            // `pypy_faulthandler_enable(fileno, all_threads)` takes
-                            // the descriptor as an argument, so the handler never
-                            // observes a descriptor the install did not commit to.
-                            let previous_fd =
-                                HANDLER.fd.swap(fd, std::sync::atomic::Ordering::Relaxed);
-                            let ok = rustpython_host_env::faulthandler::enable_fatal_handlers(
-                                faulthandler_signal_handler,
-                                0,
+                            HANDLER.exc_handler.store(
+                                rustpython_host_env::faulthandler::add_vectored_exception_handler(
+                                    Some(faulthandler_exc_handler),
+                                ),
+                                std::sync::atomic::Ordering::Relaxed,
                             );
-                            if ok {
-                                if HANDLER
-                                    .exc_handler
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                    == 0
-                                {
-                                    HANDLER.exc_handler.store(
-                                    rustpython_host_env::faulthandler::add_vectored_exception_handler(
-                                        Some(faulthandler_exc_handler),
-                                    ),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                }
-                                HANDLER
-                                    .enabled
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                set_fatal_error_file(file_slot.map_or(
-                                    pyre_object::PY_NULL,
-                                    pyre_object::gc_roots::shadow_stack_get,
-                                ));
-                                return Ok(pyre_object::w_none());
-                            }
-                            HANDLER
-                                .fd
-                                .store(previous_fd, std::sync::atomic::Ordering::Relaxed);
-                            Err(pyre_interpreter::PyError::runtime_error(
-                                "faulthandler.enable: sigaction failed",
-                            ))
                         }
+                        Ok(pyre_object::w_none())
                     }
                     #[cfg(not(all(any(unix, windows), feature = "host_env")))]
                     {
@@ -589,18 +482,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         ))
                     }
                 },
-                // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
-                // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
                 pyre_interpreter::Signature::new(
-                    vec!["file", "all_threads", "c_stack"],
+                    vec!["file", "all_threads", "c_stack", "max_threads"],
                     None,
                     None,
-                    0,
+                    1,
                     0,
                 ),
             ),
             3,
-        )
+        ))
     );
     crate::__pyre_put_new!(
         ns_slot,
@@ -608,24 +499,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "disable",
             |_| {
+                // `handler.py Handler.disable`.
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
                     let _state = lock_faulthandler_state();
-                    #[cfg(unix)]
                     super::cintf::pypy_faulthandler_disable();
                     #[cfg(windows)]
-                    {
-                        rustpython_host_env::faulthandler::disable_fatal_handlers();
-                        rustpython_host_env::faulthandler::remove_vectored_exception_handler(
-                            HANDLER
-                                .exc_handler
-                                .swap(0, std::sync::atomic::Ordering::Relaxed),
-                        );
+                    rustpython_host_env::faulthandler::remove_vectored_exception_handler(
                         HANDLER
-                            .enabled
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    // `handler.py` `self.fatal_error_w_file = None`.
+                            .exc_handler
+                            .swap(0, std::sync::atomic::Ordering::Relaxed),
+                    );
                     set_fatal_error_file(pyre_object::PY_NULL);
                 }
                 Ok(pyre_object::w_none())
@@ -639,16 +523,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "is_enabled",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
                     Ok(pyre_object::w_bool_from(
                         super::cintf::pypy_faulthandler_is_enabled(),
-                    ))
-                }
-                #[cfg(all(windows, feature = "host_env"))]
-                {
-                    Ok(pyre_object::w_bool_from(
-                        HANDLER.enabled.load(std::sync::atomic::Ordering::Relaxed),
                     ))
                 }
                 #[cfg(not(all(any(unix, windows), feature = "host_env")))]
@@ -660,43 +538,51 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     crate::__pyre_put_new!(
         ns_slot,
         "dump_traceback",
-        // `handler.py dump_traceback(space, w_file=None, all_threads=0)`
-        pyre_interpreter::gateway::function_set_null_positional_defaults(
+        // `handler.py dump_traceback(space, w_file=None, all_threads=0)`, plus
+        // the kw-only `max_threads`.
+        with_max_threads_default(pyre_interpreter::gateway::function_set_null_positional_defaults(
             pyre_interpreter::make_builtin_function_with_signature(
                 "dump_traceback",
                 |args| {
-                    // `handler.py dump_traceback`. The C dump walks with
-                    // `vmprof_get_traceback`; without it the Python entry still
-                    // resolves the file and writes a placeholder.
-                    #[cfg(all(unix, feature = "host_env"))]
+                    // `handler.py Handler.dump_traceback`.
+                    #[cfg(all(any(unix, windows), feature = "host_env"))]
                     {
-                        let all_threads = args
-                            .get(1)
-                            .copied()
-                            .filter(|a| !a.is_null())
-                            .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                            .transpose()?
-                            .unwrap_or(1);
+                        let all_threads = int_arg(args, 1, 1)? as libc::c_int;
+                        let max_threads = int_arg(args, 2, 100)? as libc::c_int;
                         let (fd, w_file) = faulthandler_get_fileno_and_file(
                             args.first().copied().unwrap_or(pyre_object::PY_NULL),
                         )?;
+                        // `keepalive_until_here(w_file)`.
                         let _roots = pyre_object::gc_roots::push_roots();
                         if !w_file.is_null() {
                             let _ = pyre_object::gc_roots::pin_root(w_file);
                         }
-                        check_err(super::cintf::pypy_faulthandler_setup())?;
-                        super::cintf::pypy_faulthandler_dump_traceback(
-                            fd,
-                            all_threads as libc::c_int,
-                            std::ptr::null_mut(),
-                        );
-                        super::cintf::pypy_faulthandler_write(
-                            fd,
-                            b"<faulthandler: pyre has no Python-level traceback yet>\n",
-                        );
+                        setup()?;
+                        if all_threads != 0 {
+                            // Without a GIL the other threads keep pushing and
+                            // freeing frames while their chains are walked;
+                            // `faulthandler_dump_traceback_py_impl` stops the
+                            // world around the walk for the same reason
+                            // (gh-128400).
+                            majit_gc::gc_sync::request_stw(|_| {
+                                super::cintf::pypy_faulthandler_dump_traceback(
+                                    fd,
+                                    all_threads,
+                                    max_threads,
+                                    std::ptr::null_mut(),
+                                )
+                            });
+                        } else {
+                            super::cintf::pypy_faulthandler_dump_traceback(
+                                fd,
+                                all_threads,
+                                max_threads,
+                                std::ptr::null_mut(),
+                            );
+                        }
                         Ok(pyre_object::w_none())
                     }
-                    #[cfg(not(all(unix, feature = "host_env")))]
+                    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
                     {
                         let _ = args;
                         pyre_interpreter::host_seam::emit_stderr(
@@ -705,36 +591,150 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         Ok(pyre_object::w_none())
                     }
                 },
-                pyre_interpreter::Signature::new(vec!["file", "all_threads"], None, None, 0, 0),
+                pyre_interpreter::Signature::new(
+                    vec!["file", "all_threads", "max_threads"],
+                    None,
+                    None,
+                    1,
+                    0,
+                ),
             ),
             2,
+        ))
+    );
+    crate::__pyre_put_new!(
+        ns_slot,
+        "dump_c_stack",
+        // [3.15-spec] `faulthandler.dump_c_stack(file=sys.stderr)` has no
+        // PyPy counterpart; see `cintf::pypy_faulthandler_dump_stack`.
+        pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature(
+                "dump_c_stack",
+                |args| {
+                    #[cfg(all(any(unix, windows), feature = "host_env"))]
+                    {
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(
+                            args.first().copied().unwrap_or(pyre_object::PY_NULL),
+                        )?;
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        if !w_file.is_null() {
+                            let _ = pyre_object::gc_roots::pin_root(w_file);
+                        }
+                        super::cintf::pypy_faulthandler_dump_stack(fd);
+                        Ok(pyre_object::w_none())
+                    }
+                    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+                    {
+                        let _ = args;
+                        Err(pyre_interpreter::PyError::not_implemented(
+                            "faulthandler.dump_c_stack requires host_env feature",
+                        ))
+                    }
+                },
+                pyre_interpreter::Signature::new(vec!["file"], None, None, 0, 0),
+            ),
+            1,
         )
     );
     crate::__pyre_put_new!(
         ns_slot,
         "dump_traceback_later",
-        // `pypy_faulthandler_dump_traceback_later` starts a watchdog thread
-        // (`faulthandler_thread`). That rewrite is out of this pass; the
-        // Python entry remains a no-op.
-        pyre_interpreter::make_builtin_function_passthrough0(
-            "dump_traceback_later",
-            |_| Ok(pyre_object::w_none()),
-            |_args| Ok(pyre_object::w_none()),
-        )
+        // `handler.py` `@unwrap_spec(timeout=float, repeat=int, exit=int)
+        // dump_traceback_later(space, timeout, repeat=0, w_file=None, exit=0)`,
+        // plus the kw-only `max_threads`.
+        with_max_threads_default(pyre_interpreter::gateway::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature(
+                "dump_traceback_later",
+                |args| {
+                    let Some(&w_timeout) = args.first().filter(|a| !a.is_null()) else {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "dump_traceback_later() missing required argument 'timeout' (pos 1)",
+                        ));
+                    };
+                    // `handler.py Handler.dump_traceback_later`.
+                    let timeout = pyre_interpreter::baseobjspace::float_w(w_timeout)? * 1e6;
+                    let repeat = int_arg(args, 1, 0)?;
+                    let exit = int_arg(args, 3, 0)?;
+                    let max_threads = int_arg(args, 4, 100)?;
+                    // `ovfcheck_float_to_longlong`: in range or OverflowError,
+                    // NaN included; the conversion truncates.
+                    if !(-9.223372036854776e18..9.223372036854776e18).contains(&timeout) {
+                        return Err(pyre_interpreter::PyError::overflow_error(
+                            "timeout value is too large",
+                        ));
+                    }
+                    let microseconds = timeout as i64;
+                    if microseconds <= 0 {
+                        return Err(pyre_interpreter::PyError::value_error(
+                            "timeout must be greater than 0",
+                        ));
+                    }
+                    #[cfg(all(any(unix, windows), feature = "host_env"))]
+                    {
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(
+                            args.get(2).copied().unwrap_or(pyre_object::PY_NULL),
+                        )?;
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let file_slot = (!w_file.is_null()).then(|| {
+                            let _ = pyre_object::gc_roots::pin_root(w_file);
+                            pyre_object::gc_roots::shadow_stack_len() - 1
+                        });
+                        let _state = lock_faulthandler_state();
+                        setup()?;
+                        check_err(super::cintf::pypy_faulthandler_dump_traceback_later(
+                            microseconds,
+                            repeat as libc::c_int,
+                            fd,
+                            exit as libc::c_int,
+                            max_threads as libc::c_int,
+                        ))?;
+                        set_dump_traceback_later_file(file_slot.map_or(
+                            pyre_object::PY_NULL,
+                            pyre_object::gc_roots::shadow_stack_get,
+                        ));
+                        Ok(pyre_object::w_none())
+                    }
+                    #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+                    {
+                        let _ = (microseconds, repeat, exit, max_threads);
+                        Err(pyre_interpreter::PyError::not_implemented(
+                            "faulthandler.dump_traceback_later requires host_env feature",
+                        ))
+                    }
+                },
+                pyre_interpreter::Signature::new(
+                    vec!["timeout", "repeat", "file", "exit", "max_threads"],
+                    None,
+                    None,
+                    1,
+                    0,
+                ),
+            ),
+            3,
+        ))
     );
     crate::__pyre_put_new!(
         ns_slot,
         "cancel_dump_traceback_later",
         pyre_interpreter::make_builtin_function_with_arity(
             "cancel_dump_traceback_later",
-            |_| Ok(pyre_object::w_none()),
+            |_| {
+                // `handler.py Handler.cancel_dump_traceback_later`.
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
+                {
+                    setup()?;
+                    let _state = lock_faulthandler_state();
+                    super::cintf::pypy_faulthandler_cancel_dump_traceback_later();
+                    set_dump_traceback_later_file(pyre_object::PY_NULL);
+                }
+                Ok(pyre_object::w_none())
+            },
             0,
         )
     );
     // `handler.py register(signum, file=None, all_threads=True, chain=False)`.
     // Unix installs `faulthandler_user`, which dumps to `user->fd` with
-    // `user->all_threads` and honours `chain`. The dump itself is a no-op
-    // until `vmprof_get_traceback` exists.
+    // `user->all_threads` and honours `chain`.
     //
     // The pair exists only off Windows, which has no user signal to hand them
     // (`moduledef.py` guards the two `extra_interpdef` calls on the platform).
@@ -745,7 +745,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         ns_slot,
         "register",
         // `handler.py register(space, signum, w_file=None, all_threads=1, chain=0)`
-        pyre_interpreter::gateway::function_set_null_positional_defaults(
+        with_max_threads_default(pyre_interpreter::gateway::function_set_null_positional_defaults(
             pyre_interpreter::make_builtin_function_with_signature(
                 "register",
                 |args| {
@@ -778,6 +778,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         .transpose()?
                         .unwrap_or(0)
                         != 0;
+                    let max_threads = int_arg(args, 4, 100)? as libc::c_int;
                     #[cfg(all(unix, feature = "host_env"))]
                     {
                         // Resolving the file runs a user `fileno()` and `flush()`.
@@ -798,12 +799,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             pyre_object::gc_roots::shadow_stack_len() - 1
                         });
                         let _state = lock_faulthandler_state();
-                        check_err(super::cintf::pypy_faulthandler_setup())?;
+                        setup()?;
                         check_err(super::cintf::pypy_faulthandler_register(
                             signum,
                             fd,
                             all_threads as libc::c_int,
                             chain as libc::c_int,
+                            max_threads,
                         ))?;
                         // `handler.py` `self.user_w_files[signum] = w_file`,
                         // after `check_err` — a register that failed owns nothing.
@@ -818,22 +820,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                     #[cfg(not(all(unix, feature = "host_env")))]
                     {
-                        let _ = (signum, all_threads, chain);
+                        let _ = (signum, all_threads, chain, max_threads);
                         Err(pyre_interpreter::PyError::not_implemented(
                             "faulthandler.register requires host_env feature",
                         ))
                     }
                 },
                 pyre_interpreter::Signature::new(
-                    vec!["signum", "file", "all_threads", "chain"],
+                    vec!["signum", "file", "all_threads", "chain", "max_threads"],
                     None,
                     None,
-                    0,
+                    1,
                     0,
                 ),
             ),
             3,
-        )
+        ))
     );
     #[cfg(unix)]
     crate::__pyre_put_new!(
@@ -883,13 +885,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     args.len()
                 )));
             }
-            if let Some(&release_gil) = args.first() {
-                let _ = pyre_interpreter::baseobjspace::int_w(release_gil)?;
+            // `@unwrap_spec(release_gil=int) read_null(space, release_gil=0)`.
+            let release_gil = int_arg(args, 0, 0)? != 0;
+            #[cfg(all(any(unix, windows), feature = "host_env"))]
+            {
+                // `pypy_faulthandler_read_null_releasegil`.
+                let _blocked =
+                    release_gil.then(pyre_interpreter::module::thread::before_external_block);
+                super::cintf::pypy_faulthandler_read_null();
             }
-            suppress_crash_report();
-            // `handler.py read_null` — null-pointer deref.
-            let p: *const u8 = std::ptr::null();
-            let _ = unsafe { p.read_volatile() };
+            // Without `cintf` the fault is still the point: `read_null`
+            // calls its C helper unconditionally.
+            #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+            {
+                let _ = release_gil;
+                let p: *const u8 = std::ptr::null();
+                let _ = unsafe { p.read_volatile() };
+            }
             Ok(pyre_object::w_none())
         })
     );
@@ -903,16 +915,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     args.len()
                 )));
             }
-            if let Some(&release_gil) = args.first() {
-                let _ = pyre_interpreter::baseobjspace::int_w(release_gil)?;
+            // `@unwrap_spec(release_gil=int) sigsegv(space, release_gil=0)`.
+            let release_gil = int_arg(args, 0, 0)? != 0;
+            #[cfg(all(any(unix, windows), feature = "host_env"))]
+            {
+                // `pypy_faulthandler_sigsegv_releasegil`.
+                let _blocked =
+                    release_gil.then(pyre_interpreter::module::thread::before_external_block);
+                super::cintf::pypy_faulthandler_sigsegv();
             }
-            suppress_crash_report();
-            // `raise` is in the Windows CRT too, and `enable` installs the
-            // fatal handlers there through `signal()`, so the software raise
-            // reaches them on either host.
-            #[cfg(any(unix, windows))]
-            unsafe {
-                libc::raise(libc::SIGSEGV);
+            #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+            {
+                let _ = release_gil;
+                #[cfg(any(unix, windows))]
+                unsafe {
+                    libc::raise(libc::SIGSEGV);
+                }
             }
             Ok(pyre_object::w_none())
         })
@@ -923,18 +941,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "_sigfpe",
             |_| {
-                suppress_crash_report();
-                // `handler.py sigfpe` raises the signal, which is what an
-                // integer division by zero traps as on unix.  Windows delivers
-                // that fault as a structured exception instead, and Rust checks
-                // the divisor rather than letting the CPU trap, so name the
-                // status the hardware would have raised.
-                #[cfg(all(windows, feature = "host_env"))]
-                rustpython_host_env::faulthandler::raise_exception(
-                    rustpython_host_env::faulthandler::EXCEPTION_INT_DIVIDE_BY_ZERO,
-                    0,
-                );
-                #[cfg(unix)]
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
+                super::cintf::pypy_faulthandler_sigfpe();
+                #[cfg(all(any(unix, windows), not(feature = "host_env")))]
                 unsafe {
                     libc::raise(libc::SIGFPE);
                 }
@@ -949,12 +958,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::make_builtin_function_with_arity(
             "_sigabrt",
             |_| {
-                suppress_crash_report();
-                #[cfg(any(unix, windows))]
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
+                super::cintf::pypy_faulthandler_sigabrt();
+                #[cfg(all(any(unix, windows), not(feature = "host_env")))]
                 unsafe {
-                    libc::abort();
+                    libc::abort()
                 }
-                #[cfg(not(any(unix, windows)))]
+                #[cfg(not(all(any(unix, windows), not(feature = "host_env"))))]
                 Ok(pyre_object::w_none())
             },
             0,
@@ -1005,32 +1015,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     crate::__pyre_put_new!(
         ns_slot,
         "_stack_overflow",
-        pyre_interpreter::make_builtin_function_with_arity(
-            "_stack_overflow",
-            |_| {
-                suppress_crash_report();
-                // `handler.py stack_overflow` — infinite recursion.
-                fn blow() {
-                    let _buf = [0u8; 4096];
-                    blow();
-                    std::hint::black_box(_buf);
-                }
-                blow();
-                #[allow(unreachable_code)]
+        // `@unwrap_spec(levels=int) stack_overflow(space, levels=100000000)`.
+        pyre_interpreter::make_builtin_function("_stack_overflow", |args| {
+            if args.len() > 1 {
+                return Err(pyre_interpreter::PyError::type_error(format!(
+                    "_stack_overflow() takes at most 1 argument ({} given)",
+                    args.len()
+                )));
+            }
+            let levels = int_arg(args, 0, 100_000_000)? as f64;
+            #[cfg(all(any(unix, windows), feature = "host_env"))]
+            {
+                Ok(pyre_object::w_float_new(
+                    super::cintf::pypy_faulthandler_stackoverflow(levels),
+                ))
+            }
+            #[cfg(not(all(any(unix, windows), feature = "host_env")))]
+            {
+                let _ = levels;
                 Ok(pyre_object::w_none())
-            },
-            0,
-        )
+            }
+        })
     );
-    // `handler.py enable(w_file=None, all_threads=0)` and
-    // `register(signum, file=None, all_threads=1, chain=0)`: trailing
-    // omitted slots take `Function.defs_w` (`interp2app._getdefaults`).
-    if let Some(mut function) = unsafe {
-        pyre_object::w_dict_getitem_str(pyre_object::gc_roots::shadow_stack_get(ns_slot), "enable")
-    } {
-        function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 3);
-        pyre_interpreter::__pyre_put_new!(ns_slot, "enable", function);
-    }
     #[cfg(unix)]
     if let Some(mut function) = unsafe {
         pyre_object::w_dict_getitem_str(
@@ -1038,6 +1044,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             "register",
         )
     } {
+        // `register(signum, file=None, all_threads=1, chain=0)`: trailing
+        // omitted slots take `Function.defs_w` (`interp2app._getdefaults`).
         function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 3);
         pyre_interpreter::__pyre_put_new!(ns_slot, "register", function);
     }
