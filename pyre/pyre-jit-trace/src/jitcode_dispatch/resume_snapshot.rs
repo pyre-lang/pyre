@@ -1009,39 +1009,59 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
                 }
             }
-            let (entry_jitcode_pc, entry_twin, entry_caller) =
-                if let Some(live_pc) = scope.liveness_jit_pc {
-                    // Resume and liveness share this later `-live-`.  The opcode
-                    // floor would snapshot the landing, whose live set omits the
-                    // caught exception a PUSH_EXC_INFO prev-nullity guard must
-                    // carry (`pyjitpl.py` `get_list_of_active_boxes` at the
-                    // interpreter pc that already bound `last_exc_value`).
-                    (
-                        live_pc as i32,
-                        OuterActiveBoxesEntryTwin::Plain,
-                        "guard_snapshot_carried_live",
+            let (entry_jitcode_pc, entry_twin, entry_caller) = if let Some(live_pc) =
+                scope.liveness_jit_pc
+            {
+                // Resume and liveness share this later `-live-`.  The opcode
+                // floor would snapshot the landing, whose live set omits the
+                // caught exception a PUSH_EXC_INFO prev-nullity guard must
+                // carry (`pyjitpl.py` `get_list_of_active_boxes` at the
+                // interpreter pc that already bound `last_exc_value`).
+                (
+                    live_pc as i32,
+                    OuterActiveBoxesEntryTwin::Plain,
+                    "guard_snapshot_carried_live",
+                )
+            } else if after_residual_call && guard_jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC
+            {
+                // `get_list_of_active_boxes(after_residual_call=True)` reads
+                // `registers_X[index]` at the trailing `-live-` (`self.pc`).
+                // `make_result_of_lastop` / `do_residual_call` /
+                // `execute_varargs` wrote the call result into that
+                // register before `generate_guard(GUARD_NOT_FORCED)` and
+                // `handle_possible_exception`. Key pcdep at that same
+                // trailing `-live-` (banks already use `guard_jitcode_pc`)
+                // so `collect_outer_active_boxes` prefers the just-written
+                // walk register. The fallthrough opcode floor's color→slot
+                // map can name a reused pre-call slot; the virtualizable
+                // overlay then substitutes that slot's shadow and the
+                // GUARD_NOT_FORCED failargs omit the call result.
+                (
+                    guard_jitcode_pc,
+                    OuterActiveBoxesEntryTwin::Plain,
+                    "guard_snapshot_after_residual",
+                )
+            } else {
+                let entry = unsafe {
+                    crate::py_coord::first_floor_boundary_for_py(
+                        &walked_owned.payload.metadata,
+                        liveness_py_pc,
                     )
-                } else {
-                    let entry = unsafe {
-                        crate::py_coord::first_floor_boundary_for_py(
-                            &walked_owned.payload.metadata,
-                            liveness_py_pc,
-                        )
-                        .map(|(pc, _)| pc)
-                    };
-                    match entry {
-                        Some(pc) => (
-                            pc as i32,
-                            OuterActiveBoxesEntryTwin::Plain,
-                            "guard_snapshot_fallthrough",
-                        ),
-                        None => (
-                            resolved_offset as i32,
-                            OuterActiveBoxesEntryTwin::Trivia,
-                            "guard_snapshot_fallthrough",
-                        ),
-                    }
+                    .map(|(pc, _)| pc)
                 };
+                match entry {
+                    Some(pc) => (
+                        pc as i32,
+                        OuterActiveBoxesEntryTwin::Plain,
+                        "guard_snapshot_fallthrough",
+                    ),
+                    None => (
+                        resolved_offset as i32,
+                        OuterActiveBoxesEntryTwin::Trivia,
+                        "guard_snapshot_fallthrough",
+                    ),
+                }
+            };
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,

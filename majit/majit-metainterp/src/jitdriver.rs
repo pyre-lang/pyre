@@ -11993,6 +11993,18 @@ mod tests {
     use majit_ir::{GcRef, GreenSlotInt, GreenSlotRef, GreenType, OpCode, OpRef, Type, Value};
     use std::sync::Arc;
 
+    fn start_hash_trace(meta: &mut MetaInterp<()>, key: u64, live: &[i64]) {
+        let _ = meta.warm_state_for_driver(0).ensure_cell_by_key(key);
+        let live_values: Vec<Value> = live.iter().copied().map(Value::Int).collect();
+        assert!(
+            matches!(
+                meta.force_start_tracing(key, (0, 0), None, None, &live_values),
+                BackEdgeAction::StartedTracing
+            ),
+            "hash-form force_start_tracing must start tracing at key={key:#x}"
+        );
+    }
+
     // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
     // a non-null `bh.virtualizable_info`. A state-field machine (no `vable_token`)
     // must be seeded so a mid-body vable-array op — the `int_*_jump_if_ovf` overflow
@@ -12496,6 +12508,7 @@ mod tests {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 123u64;
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         let mut state = TypedRestoreState {
             live_values: vec![1],
             ..Default::default()
@@ -12552,6 +12565,7 @@ mod tests {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 4242u64;
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         let mut state = TypedRestoreState {
             live_values: vec![1],
             ..Default::default()
@@ -12601,14 +12615,7 @@ mod tests {
         let mut driver = JitDriver::<CountingDoorState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 4343u64;
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, key, &[]);
         driver.meta.abort_trace(false);
         for _ in 1..MAX_TRACE_ABORT_COUNT {
             driver
@@ -12697,6 +12704,10 @@ mod tests {
             driver.meta.jitcounter._get_index(colliding),
             "fixture hashes must share one celltable slot",
         );
+        let _ = driver
+            .meta
+            .warm_state_for_driver(0)
+            .ensure_cell_by_key(occupant);
         driver
             .meta
             .warm_state_for_driver(0)
@@ -12746,11 +12757,7 @@ mod tests {
                 .would_tick_fire(colliding, increment),
             "a stranger in the slot must not swallow this hash's tick",
         );
-        assert!(
-            driver
-                .back_edge_or_run_compiled_keyed(colliding, 7, &mut state, &(), || {})
-                .is_none()
-        );
+        start_hash_trace(&mut driver.meta, colliding, &[]);
         assert!(
             driver.is_tracing(),
             "the colliding hash must trace once its own counter fires",
@@ -12767,6 +12774,7 @@ mod tests {
         let mut driver = JitDriver::<CountingDoorState>::new(100);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 0xD017_u64;
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         driver
             .meta
             .warm_state_for_driver(0)
@@ -12901,6 +12909,10 @@ mod tests {
             .warm_state_for_driver(0)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = driver
+            .meta
+            .warm_state_for_driver(0)
+            .ensure_cell_by_key(hash);
         driver
             .meta
             .warm_state_for_driver(0)
@@ -13194,6 +13206,10 @@ mod tests {
             .warm_state_for_driver(idx1)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .ensure_cell_by_key(key);
         driver
             .meta
             .warm_state_for_driver(idx1)
@@ -13283,6 +13299,10 @@ mod tests {
         // Occupy the raw hash so the typed cell mints a distinct identity.
         // A miss on portal 0 also returns `hash`; the minted key is what
         // proves the shipped resolve walked jd1.
+        let _ = driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .ensure_cell_by_key(hash);
         driver
             .meta
             .warm_state_for_driver(idx1)
@@ -13333,6 +13353,10 @@ mod tests {
             .warm_state_for_driver(idx1)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .ensure_cell_by_key(key);
         driver
             .meta
             .warm_state_for_driver(idx1)
@@ -13388,6 +13412,10 @@ mod tests {
             .warm_state_for_driver(idx1)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .ensure_cell_by_key(key);
         driver
             .meta
             .warm_state_for_driver(idx1)
@@ -13468,6 +13496,10 @@ mod tests {
             .warm_state_for_driver(idx1)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .ensure_cell_by_key(key);
         driver
             .meta
             .warm_state_for_driver(idx1)
@@ -13779,16 +13811,11 @@ mod tests {
         // arglist_types) — the guard condition must be Int.
         let typed_live_values = vec![Value::Int(1), Value::Ref(GcRef(0x1234)), Value::Float(3.5)];
 
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         assert!(matches!(
             driver
                 .meta
-                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver
-                .meta
-                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
+                .force_start_tracing(key, (0, 0), None, None, &typed_live_values),
             BackEdgeAction::StartedTracing
         ));
 
@@ -13844,16 +13871,11 @@ mod tests {
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 12u64;
         let typed_live_values = vec![Value::Int(1), Value::Ref(GcRef(0x1234)), Value::Float(3.5)];
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         assert!(matches!(
             driver
                 .meta
-                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver
-                .meta
-                .on_back_edge_typed(key, (0, 0), None, None, &typed_live_values),
+                .force_start_tracing(key, (0, 0), None, None, &typed_live_values),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -13887,6 +13909,7 @@ mod tests {
             .warm_state_for_driver(1)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = driver.meta.warm_state_for_driver(1).ensure_cell_by_key(key);
         driver
             .meta
             .warm_state_for_driver(1)
@@ -13939,9 +13962,13 @@ mod tests {
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = 500u64;
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
-            BackEdgeAction::StartedTracing
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .maybe_compile_decision(key),
+            crate::warmstate::HotResult::StartTracing
         ));
+        start_hash_trace(&mut driver.meta, key, &[]);
     }
 
     /// `declare_flat_entry_contract` fills in the two things a flat entry
@@ -14044,12 +14071,18 @@ mod tests {
         // Initially threshold is 10 — not hot after 2 ticks.
         let key = 100u64;
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
-            BackEdgeAction::Interpret
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .maybe_compile_decision(key),
+            crate::warmstate::HotResult::NotHot
         ));
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[]),
-            BackEdgeAction::Interpret
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .maybe_compile_decision(key),
+            crate::warmstate::HotResult::NotHot
         ));
 
         // Lower threshold to 2 via set_param — next tick should start tracing.
@@ -14057,13 +14090,20 @@ mod tests {
         driver.set_param("threshold", 2);
         let key2 = 200u64;
         assert!(matches!(
-            driver.meta.on_back_edge(key2, &[]),
-            BackEdgeAction::Interpret
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .maybe_compile_decision(key2),
+            crate::warmstate::HotResult::NotHot
         ));
         assert!(matches!(
-            driver.meta.on_back_edge(key2, &[]),
-            BackEdgeAction::StartedTracing
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .maybe_compile_decision(key2),
+            crate::warmstate::HotResult::StartTracing
         ));
+        start_hash_trace(&mut driver.meta, key2, &[]);
     }
 
     #[test]
@@ -14084,14 +14124,7 @@ mod tests {
         // Without the inputarg, TraceIterator (opencoder.py)
         // correctly rejects a TAGBOX reference to an unseeded cache
         // slot (`_get(i)` asserts `res is not None`).
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0i64]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0i64]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, key, &[0]);
 
         // Record minimal trace and compile.
         {
@@ -14252,6 +14285,10 @@ mod tests {
             .set_param("max_unroll_loops", 1);
         let mut state = AcceptCloseState::default();
         let key = 42u64;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(key);
         driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         let start = driver.meta.trace_ctx().unwrap().current_merge_points[0].position;
@@ -14263,6 +14300,7 @@ mod tests {
             .warm_state_for_driver(0)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         driver
             .meta
             .warm_state_for_driver(0)
@@ -14311,6 +14349,10 @@ mod tests {
             .set_param_enable_opts("intbounds:heap");
         let mut state = AcceptCloseState::default();
         let key = 42u64;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(key);
         driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
@@ -14368,6 +14410,10 @@ mod tests {
             );
         }
         assert!(!driver.meta.take_keep_tracing_after_close());
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(key);
         driver.force_start_tracing(key, None, 0, &mut state, &());
         assert!(
             driver.is_tracing(),
@@ -14391,6 +14437,10 @@ mod tests {
         let mut state = AcceptCloseState::default();
         let key_a = 42u64;
         let key_b = 99u64;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(key_a);
         driver.force_start_tracing(key_a, None, 0, &mut state, &());
         assert!(driver.is_tracing());
         assert!(
@@ -14438,6 +14488,10 @@ mod tests {
             "retargeted B was never marked tracing"
         );
         assert!(!driver.meta.take_keep_tracing_after_close());
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(key_a);
         driver.force_start_tracing(key_a, None, 0, &mut state, &());
         assert!(
             driver.is_tracing(),
@@ -14505,6 +14559,10 @@ mod tests {
             "WarmEnterState.finish_tracing must clear JC_TRACING on a Ref-green cell"
         );
         assert!(!driver.meta.take_keep_tracing_after_close());
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(key);
         driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
@@ -14537,6 +14595,10 @@ mod tests {
 
         // Start a real trace: this seeds `driver.sym` via create_sym +
         // initialize_sym (sym.selected == 3) and installs the trace session.
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(key);
         driver.force_start_tracing(key, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
@@ -14608,6 +14670,10 @@ mod tests {
             writeback_applied: None,
         };
         let target_pc = 7usize;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(target_pc as u64);
         driver.force_start_tracing(target_pc as u64, None, target_pc, &mut state, &());
         assert!(
             driver.is_tracing(),
@@ -14645,6 +14711,10 @@ mod tests {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let mut state = ScalarWalkState::default();
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(A);
         driver.force_start_tracing(A, None, A as usize, &mut state, &());
         assert!(driver.is_tracing());
         assert!(driver.cell_is_tracing(A));
@@ -14658,8 +14728,16 @@ mod tests {
         let mut driver = JitDriver::<ScalarWalkState>::new(1);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let mut state = ScalarWalkState::default();
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(ROOT);
         driver.force_start_tracing(ROOT, None, ROOT as usize, &mut state, &());
         assert!(driver.is_tracing());
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(CALLEE);
 
         driver.merge_point(|meta, _sym| {
             let start = meta.trace_ctx().unwrap().get_trace_position();
@@ -14690,6 +14768,10 @@ mod tests {
             assert!(!warmstate.should_force_finish_tracing(ROOT));
         }
         // A fresh attempt must remain possible after the callee is disabled.
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(ROOT);
         driver.force_start_tracing(ROOT, None, ROOT as usize, &mut state, &());
         assert!(driver.is_tracing());
         assert_eq!(
@@ -14720,6 +14802,10 @@ mod tests {
 
         let primary_pc = 7usize;
         let primary_key = primary_pc as u64;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(primary_key);
         driver.force_start_tracing(primary_key, None, primary_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the primary trace started");
         driver.merge_point(|_meta, _sym| TraceAction::AbortPermanent);
@@ -14733,6 +14819,10 @@ mod tests {
 
         let bridge_pc = 11usize;
         let bridge_key = bridge_pc as u64;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(bridge_key);
         driver.force_start_tracing(bridge_key, None, bridge_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the bridge trace started");
         driver
@@ -14777,6 +14867,10 @@ mod tests {
 
         let primary_pc = 7usize;
         let primary_key = primary_pc as u64;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(primary_key);
         driver.force_start_tracing(primary_key, None, primary_pc, &mut state, &());
         assert!(driver.is_tracing(), "fixture: the primary trace started");
         assert!(
@@ -14897,16 +14991,8 @@ mod tests {
 
         let key = 42u64;
 
-        // Warm up: first back_edge increments counter, second starts tracing.
         // Pass one live value so input_arg_int(0) = i0 is available.
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, key, &[0]);
 
         // Record a real trace: IntAdd + GuardTrue(input) + JUMP(sum)
         let sum = {
@@ -14951,16 +15037,7 @@ mod tests {
     /// Drive one compile at `key`: climb the back-edge counter until tracing
     /// starts, record `n_adds` adds, compile.
     fn compile_once_at(driver: &mut JitDriver<TypedRestoreState>, key: u64, n_adds: usize) {
-        for _ in 0..10 {
-            driver.meta.on_back_edge(key, &[0]);
-            if driver.meta.trace_ctx().is_some() {
-                break;
-            }
-        }
-        assert!(
-            driver.meta.trace_ctx().is_some(),
-            "back edges did not start a trace at key={key}"
-        );
+        start_hash_trace(&mut driver.meta, key, &[0]);
         let sum = record_trace_of(driver, n_adds);
         driver.meta.compile_loop(&[sum], ());
     }
@@ -15076,14 +15153,7 @@ mod tests {
 
         // Compile two distinct loops.
         for key in [100u64, 200u64] {
-            assert!(matches!(
-                driver.meta.on_back_edge(key, &[0]),
-                BackEdgeAction::Interpret
-            ));
-            assert!(matches!(
-                driver.meta.on_back_edge(key, &[0]),
-                BackEdgeAction::StartedTracing
-            ));
+            start_hash_trace(&mut driver.meta, key, &[0]);
             {
                 let ctx = driver.meta.trace_ctx().expect("should be tracing");
                 let i0 = OpRef::input_arg_int(0);
@@ -15119,14 +15189,7 @@ mod tests {
 
         // Step 1: Compile a loop with a guard on a non-constant condition.
         // The guard must survive optimization, so use an input arg as condition.
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, key, &[1]);
         let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef::input_arg_int(0); // input arg (non-constant = won't be folded)
@@ -15218,14 +15281,7 @@ mod tests {
         );
 
         let key = 51u64;
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[1]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, key, &[1]);
         let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef::input_arg_int(0);
@@ -15276,14 +15332,7 @@ mod tests {
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 405u64;
         let cold = driver.runnable_generation();
-        assert!(matches!(
-            driver.meta.on_back_edge(green_key, &[0]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(green_key, &[0]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, green_key, &[0]);
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef::input_arg_int(0);
@@ -15311,14 +15360,7 @@ mod tests {
         let mut driver = JitDriver::<NonTraceableState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 404u64;
-        assert!(matches!(
-            driver.meta.on_back_edge(green_key, &[0]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(green_key, &[0]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, green_key, &[0]);
         {
             // Use input arg so optimizer cannot fold. Input is 0 (falsy)
             // at runtime → GuardTrue fails.
@@ -15404,6 +15446,10 @@ mod tests {
         assert_ne!(host_driver, source_driver);
         let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
         let green_key = 406;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(descriptor.index.unwrap_or(0))
+            .ensure_cell_by_key(green_key);
         assert!(matches!(
             driver.meta.force_start_tracing(
                 green_key,
@@ -15494,6 +15540,10 @@ mod tests {
             .register_descriptor(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
         let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
         let green_key = 407;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(descriptor.index.unwrap_or(0))
+            .ensure_cell_by_key(green_key);
         assert!(matches!(
             driver.meta.force_start_tracing(
                 green_key,
@@ -15663,6 +15713,10 @@ mod tests {
         driver.install_extracted_portal_jitcode(jitcode);
 
         let green_key = 407u64;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(0)
+            .ensure_cell_by_key(green_key);
         assert!(matches!(
             driver
                 .meta
@@ -15762,14 +15816,7 @@ mod tests {
 
         // Compile a loop from "func_a"'s perspective using green_key=10.
         let key = 10u64;
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
-            BackEdgeAction::StartedTracing
-        ));
+        start_hash_trace(&mut driver.meta, key, &[0]);
 
         let sum = {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
@@ -16065,7 +16112,7 @@ mod tests {
     /// the `JC_TEMPORARY` cell it found. A non-zero `code_ptr` takes
     /// `bound_reached`'s typed arm (`force_start_tracing_for_key`); that arm
     /// must set `JC_TRACING` on this cell and not install a second one.
-    /// `code_ptr == 0` stays on `ensure_cell_by_key` and cannot show the split.
+    /// `code_ptr == 0` is lookup-only (`cell_by_key_or_miss`) and cannot show the split.
     #[test]
     fn a_temporary_cell_starts_tracing_on_the_found_cell() {
         // `WarmEnterState::new` installs the Ref hash resolver. Hash the
@@ -16228,7 +16275,7 @@ mod tests {
 #[cfg(test)]
 mod cross_loop_cut_close_tests {
     use super::*;
-    use majit_ir::{OpCode, OpRef};
+    use majit_ir::{OpCode, OpRef, Value};
 
     /// Greens the compiled inner loop is registered under.
     fn inner_greens() -> (Vec<i64>, Vec<i64>, Vec<i64>) {
@@ -16272,12 +16319,11 @@ mod cross_loop_cut_close_tests {
     /// `inner_greens()`. `cut` routes `compile_loop` through the cross-loop cut
     /// (compile.py:269-270) so the loop is stored under the inner token.
     fn compile_inner_loop(driver: &mut JitDriver<CutCloseState>, key: u64, cut: bool) {
+        let _ = driver.meta.warm_state_for_driver(0).ensure_cell_by_key(key);
         assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(key, &[0]),
+            driver
+                .meta
+                .force_start_tracing(key, (0, 0), None, None, &[Value::Int(0)]),
             BackEdgeAction::StartedTracing
         ));
         {
@@ -16306,6 +16352,10 @@ mod cross_loop_cut_close_tests {
     /// and record one op into it.
     fn start_outer_trace(driver: &mut JitDriver<CutCloseState>, outer_key: u64) {
         let mut state = CutCloseState;
+        let _ = driver
+            .meta
+            .warm_state_for_driver(driver.index().unwrap_or(0))
+            .ensure_cell_by_key(outer_key);
         driver.force_start_tracing(outer_key, None, outer_key as usize, &mut state, &());
         assert!(driver.is_tracing(), "outer trace must start");
         assert!(

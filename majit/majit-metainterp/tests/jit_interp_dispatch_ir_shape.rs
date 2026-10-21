@@ -8,6 +8,7 @@
 //! nothing; AbortPermanent / Unsupported abort this frame. Loop close
 //! follows the arm chain.
 
+use majit_ir::GreenType;
 use majit_metainterp::jitcode::insns::{
     BC_ABORT, BC_GETARRAYITEM_GC_I_PURE, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
     BC_INT_RETURN, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE, BC_STORE_STATE_FIELD,
@@ -678,7 +679,13 @@ fn a_trace_entry_takes_the_state_field_store_back_from_a_second_driver() {
     let program = [OP_INC_A, OP_END];
     let mut state = DispatchTestState { a: 0 };
     first.meta_interp_mut().finish_setup_descrs_for_jitdrivers();
-    first.force_start_tracing(0, None, 0, &mut state, &program[..]);
+    first.force_start_tracing(
+        0,
+        Some((&[0], &[GreenType::Int])),
+        0,
+        &mut state,
+        &program[..],
+    );
     assert_eq!(
         majit_metainterp::current_state_field_fvc_epoch(),
         first.state_field_fvc_epoch(),

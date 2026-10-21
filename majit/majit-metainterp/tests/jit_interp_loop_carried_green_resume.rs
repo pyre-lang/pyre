@@ -13,7 +13,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use majit_ir::OpRef;
+use majit_ir::{GreenType, OpRef};
 use majit_metainterp::{
     Assembler, JitArgKind, JitCode, JitCodeBuilder, JitDriver, TraceAction, trace_jitcode_with_args,
 };
@@ -404,7 +404,13 @@ fn a_header_revisit_after_continue_rereads_kind() {
             .build_meta(0, &program)
             .install_canonical_liveness(&mut driver);
     }
-    driver.force_start_tracing(0, None, 0, &mut state, &program[..]);
+    driver.force_start_tracing(
+        0,
+        Some((&[0], &[GreenType::Int])),
+        0,
+        &mut state,
+        &program[..],
+    );
     assert!(
         driver.is_tracing(),
         "force_start_tracing must start a trace"
@@ -472,7 +478,13 @@ fn a_header_revisit_close_matches_label_arity() {
             .build_meta(0, &program)
             .install_canonical_liveness(&mut driver);
     }
-    driver.force_start_tracing(0, None, 0, &mut state, &program[..]);
+    driver.force_start_tracing(
+        0,
+        Some((&[0], &[GreenType::Int])),
+        0,
+        &mut state,
+        &program[..],
+    );
     assert!(
         driver.is_tracing(),
         "force_start_tracing must start a trace"

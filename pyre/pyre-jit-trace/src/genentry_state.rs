@@ -179,12 +179,15 @@ mod tests {
         let mut jd2 = WarmEnterState::new(1039);
         let pycode = 0x51ED as PyObjectRef;
         let hash = genentry_green_hash(pycode);
-        jd2.disable_noninlinable_function(hash);
+        assert!(
+            jd2.get_cell(hash).is_none(),
+            "hash form does not install a cell"
+        );
         let typed = genentry_green_key(pycode);
         let minted = jd2.ensure_cell_key(&typed);
-        assert_ne!(
+        assert_eq!(
             minted, hash,
-            "typed genentry greens mint a sibling beside the hash-only cell"
+            "typed genentry greens take the raw hash when no hash-only cell occupies it"
         );
         assert_eq!(
             genentry_resolved_cell_key(&jd2, pycode),
