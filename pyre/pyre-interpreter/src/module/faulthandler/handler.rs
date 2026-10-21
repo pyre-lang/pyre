@@ -318,7 +318,7 @@ fn int_arg(
 /// `test_register_max_threads` calls `register(..., max_threads=CAP)`;
 /// `dump_traceback_later` has no test, and its `max_threads: Py_ssize_t = 100`
 /// is the clinic signature of `faulthandler_dump_traceback_later_impl` in
-/// `Modules/faulthandler.c` read at v3.15.0rc2.
+/// `Modules/faulthandler.c` read at v3.15.0.
 fn with_max_threads_default(function: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let fn_slot = pyre_object::gc_roots::shadow_stack_len();

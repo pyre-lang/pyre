@@ -3931,11 +3931,55 @@ pub fn make_builtin_type_with_metatype(
     )
 }
 
+/// `intobject.py W_IntObject.descr_new` → `_new_int` → `_new_baseint` for
+/// `int(x)` of the exact `int` type with no base.
+///
+/// The body is this leaf so `BuiltinCode.func` joins the wrapper family, as
+/// [`__majit_wrap_bool_descr_new`] does.  `_new_baseint`'s first arm returns
+/// an exact `int` argument itself; an exact `float` whose truncation fits a
+/// machine Signed takes `float.__int__` (`floatobject.py descr_trunc`,
+/// `newint_from_float`).  No argument, a base, a subclass `cls`, and every
+/// other argument stay on [`int_descr_new`], which is `dont_look_inside` so
+/// the `__int__` / `__index__` / literal-parse arms are not graphs inside
+/// this one.
+pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() == 2 && !args[1].is_null() {
+        let int_type = gettypeobject(&pyre_object::INT_TYPE);
+        if std::ptr::eq(args[0], int_type) {
+            let w_value = args[1];
+            // intobject.py `_new_baseint`:
+            // `space.is_w(space.type(w_value), space.w_int)`.
+            let w_type = r#type(w_value);
+            if w_type.is_some() && w_type == gettypefor(&pyre_object::INT_TYPE) {
+                return Ok(w_value);
+            }
+            if unsafe { pyre_object::is_exact_builtin_instance_nonnull(w_value) }
+                && unsafe { pyre_object::is_float(w_value) }
+            {
+                // `ovfcheck_float_to_int`'s range: `2**63` is exact in a
+                // double while `i64::MAX` is not, so the upper bound is
+                // strict.  NaN fails both tests.
+                let x = unsafe { pyre_object::w_float_get_value(w_value) };
+                if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
+                    return crate::objspace::descroperation::_int_from_trunc(x);
+                }
+            }
+        }
+    }
+    int_descr_new(args)
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_int_descr_new,
+    __majit_wrap_int_descr_new
+);
+
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
 ///
 /// If cls is the builtin int type, returns a plain W_IntObject.
 /// If cls is a subclass of int, returns a W_ObjectObject with the
 /// int value stored internally (for int subclasses like IntFlag).
+#[majit_macros::dont_look_inside]
 fn int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut cls = new_descr_class(args, "int")?;
     // intobject.py _new_int → check_user_subclass
@@ -23617,7 +23661,7 @@ fn init_int_type(ns: PyObjectRef) {
             // `int(x, base)` still bind through `_match_signature`.
             crate::gateway::function_set_null_positional_defaults(
                 make_new_descr_with_fast_arity_and_signature(
-                    int_descr_new,
+                    __majit_wrap_int_descr_new,
                     2,
                     crate::gateway::Signature::new(vec!["cls", "x", "base"], None, None, 0, 2),
                 ),

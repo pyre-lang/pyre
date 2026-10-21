@@ -166,36 +166,83 @@ fn monotonic_seconds() -> f64 {
     }
 }
 
-/// Wall-clock seconds since the unix epoch, falling back to 0 on
-/// `SystemTimeError`.  Routes through `host_env::time` when enabled.
-pub fn duration_since_epoch() -> std::time::Duration {
+/// `_Py_clock_info_t`: what the read behind a clock reports to `_setinfo`.
+struct ClockInfo {
+    implementation: &'static str,
+    resolution: f64,
+    monotonic: bool,
+    adjustable: bool,
+}
+
+impl ClockInfo {
+    const fn new(
+        implementation: &'static str,
+        resolution: f64,
+        monotonic: bool,
+        adjustable: bool,
+    ) -> Self {
+        Self {
+            implementation,
+            resolution,
+            monotonic,
+            adjustable,
+        }
+    }
+}
+
+/// `clock_getres(clk_id)` in seconds, 1e-9 when the clock has no answer.
+#[cfg(all(unix, feature = "host_env"))]
+fn clock_getres_seconds(clk: libc::clockid_t) -> f64 {
+    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    let ret = unsafe { majit_rlib::rtime::c_clock_getres(clk as _, &mut ts) };
+    if ret == 0 {
+        timespec_to_seconds(&ts)
+    } else {
+        1.0e-9
+    }
+}
+
+/// `py_get_system_clock`: the wall clock, and with `info` the read that
+/// produced it.  `None` is the failure `_time_impl` turns into
+/// RuntimeError.
+fn system_clock(info: Option<&mut ClockInfo>) -> Option<std::time::Duration> {
     #[cfg(all(target_arch = "wasm32", not(feature = "sandbox")))]
     {
+        if let Some(info) = info {
+            *info = ClockInfo::new("ClockProvider::wall_nanos()", 1.0e-9, false, true);
+        }
         let nanos = with_clock(|clock| clock.wall_nanos(), 0).max(0) as u128;
-        std::time::Duration::new(
+        Some(std::time::Duration::new(
             (nanos / 1_000_000_000) as u64,
             (nanos % 1_000_000_000) as u32,
-        )
+        ))
     }
     #[cfg(feature = "sandbox")]
     {
+        if let Some(info) = info {
+            *info = ClockInfo::new("clock_gettime(CLOCK_REALTIME)", 1.0e-9, false, true);
+        }
         let secs = crate::host_seam::ops::time().unwrap_or(0.0).max(0.0);
-        std::time::Duration::from_secs_f64(secs)
+        Some(std::time::Duration::from_secs_f64(secs))
     }
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        // `rtime.time` / `interp_time._gettimeofday_impl`.
-        let mut tv = unsafe { std::mem::zeroed::<libc::timeval>() };
-        let tz = std::ptr::null_mut::<libc::timezone>();
-        let errcode = unsafe { majit_rlib::rtime::c_gettimeofday(&mut tv, tz) };
-        if errcode == 0 && tv.tv_sec >= 0 {
-            return std::time::Duration::new(
-                tv.tv_sec as u64,
-                (tv.tv_usec as u32).saturating_mul(1000),
+        let ts = clock_gettime_timespec(libc::CLOCK_REALTIME).ok()?;
+        if let Some(info) = info {
+            *info = ClockInfo::new(
+                "clock_gettime(CLOCK_REALTIME)",
+                clock_getres_seconds(libc::CLOCK_REALTIME),
+                false,
+                true,
             );
         }
-        let t = unsafe { majit_rlib::rtime::c_time(std::ptr::null_mut()) };
-        std::time::Duration::from_secs(t.max(0) as u64)
+        if ts.tv_sec < 0 {
+            return Some(std::time::Duration::ZERO);
+        }
+        Some(std::time::Duration::new(
+            ts.tv_sec as u64,
+            ts.tv_nsec as u32,
+        ))
     }
     #[cfg(all(
         feature = "host_env",
@@ -204,28 +251,56 @@ pub fn duration_since_epoch() -> std::time::Duration {
         not(unix)
     ))]
     {
-        host_time::duration_since_system_now().unwrap_or_default()
+        if let Some(info) = info {
+            *info = ClockInfo::new("GetSystemTimePreciseAsFileTime()", 1.0e-7, false, true);
+        }
+        Some(host_time::duration_since_system_now().unwrap_or_default())
     }
     #[cfg(not(any(feature = "host_env", feature = "sandbox", target_arch = "wasm32")))]
     {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+        if let Some(info) = info {
+            *info = ClockInfo::new("clock_gettime(CLOCK_REALTIME)", 1.0e-9, false, true);
+        }
+        Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default(),
+        )
     }
+}
+
+/// `_PyTime_GetSystemClock`: wall-clock time since the unix epoch, 0 when
+/// the clock cannot be read.
+pub fn duration_since_epoch() -> std::time::Duration {
+    system_clock(None).unwrap_or_default()
+}
+
+/// `interp_time._time_impl`.  A non-null `w_info` gets the description
+/// of the read before the read's own failure is checked.
+fn time_impl(w_info: PyObjectRef) -> Result<std::time::Duration, crate::PyError> {
+    let res = if w_info.is_null() {
+        system_clock(None)
+    } else {
+        let mut info = ClockInfo::new("", 0.0, false, false);
+        let res = system_clock(Some(&mut info));
+        setinfo(w_info, &info)?;
+        res
+    };
+    res.ok_or_else(|| crate::PyError::runtime_error("could not get system clock"))
 }
 
 /// time.time() → float (seconds since epoch)
 pub fn time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
     Ok(floatobject::w_float_new(
-        duration_since_epoch().as_secs_f64(),
+        time_impl(pyre_object::PY_NULL)?.as_secs_f64(),
     ))
 }
 
 /// time.time_ns() → int (nanoseconds since epoch)
 pub fn time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(w_int_new(duration_since_epoch().as_nanos() as i64))
+    Ok(w_int_new(time_impl(pyre_object::PY_NULL)?.as_nanos() as i64))
 }
 
 /// time.monotonic() → float
@@ -452,6 +527,86 @@ pub fn perf_counter_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(w_int_new(monotonic_nanos() as i64))
 }
 
+/// `interp_time._setinfo`.
+fn setinfo(w_info: PyObjectRef, clock_info: &ClockInfo) -> Result<(), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let info_slot = roots.base();
+    let _ = roots.pin_root(w_info);
+    let impl_slot = info_slot + 1;
+    let _ = roots.pin_root(w_str_new_managed(clock_info.implementation));
+    crate::baseobjspace::setattr_str(roots.get(info_slot), "implementation", roots.get(impl_slot))?;
+    crate::baseobjspace::setattr_str(
+        roots.get(info_slot),
+        "resolution",
+        floatobject::w_float_new(clock_info.resolution),
+    )?;
+    crate::baseobjspace::setattr_str(
+        roots.get(info_slot),
+        "monotonic",
+        w_bool_from(clock_info.monotonic),
+    )?;
+    crate::baseobjspace::setattr_str(
+        roots.get(info_slot),
+        "adjustable",
+        w_bool_from(clock_info.adjustable),
+    )?;
+    Ok(())
+}
+
+/// The call behind `monotonic`, `perf_counter` and `thread_time`, whose
+/// value paths make a single read; `time` and `process_time` report from
+/// their own read instead.
+fn other_clock_info(name: &str) -> Result<(&'static str, bool, bool), crate::PyError> {
+    // Windows: `monotonic` and `perf_counter` are `Instant`, and
+    // `thread_time` is the `GetThreadTimes` read of `thread_time_nanos`.
+    #[cfg(windows)]
+    let info = match name {
+        "monotonic" | "perf_counter" => ("QueryPerformanceCounter()", true, false),
+        "thread_time" => ("GetThreadTimes()", true, false),
+        _ => return Err(crate::PyError::value_error("unknown clock")),
+    };
+    // The guest makes no syscall: every clock is a question put to the
+    // embedder.
+    #[cfg(target_arch = "wasm32")]
+    let info = match name {
+        "monotonic" | "perf_counter" => ("ClockProvider::monotonic_nanos()", true, false),
+        _ => return Err(crate::PyError::value_error("unknown clock")),
+    };
+    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
+    let info = match name {
+        "monotonic" | "perf_counter" => {
+            #[cfg(target_os = "macos")]
+            {
+                ("mach_absolute_time()", true, false)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                ("clock_gettime(CLOCK_MONOTONIC)", true, false)
+            }
+        }
+        // `interp_time.py` gates `thread_time` on HAS_THREAD_TIME; describe
+        // it only where the platform carries CLOCK_THREAD_CPUTIME_ID and the
+        // host clock is wired (the exact gate under which mod.rs registers the
+        // `thread_time` function), so the report never names a clock whose
+        // function is absent; otherwise fall through to the "unknown clock"
+        // ValueError.
+        #[cfg(all(
+            unix,
+            feature = "host_env",
+            not(any(
+                target_os = "illumos",
+                target_os = "netbsd",
+                target_os = "solaris",
+                target_os = "openbsd",
+                target_os = "redox",
+            ))
+        ))]
+        "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
+        _ => return Err(crate::PyError::value_error("unknown clock")),
+    };
+    Ok(info)
+}
+
 /// `interp_time.py _get_time_info` — fill the app-level namespace
 /// used by `time.get_clock_info`.  The observable fields follow Python 3.14;
 /// all clocks exposed by pyre have nanosecond representation internally.
@@ -477,80 +632,24 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) };
     let name_str = name.as_str().unwrap_or_default();
-    // Each name reports the call the corresponding function is actually made
-    // of, so the Windows table is its own — none of the five is a
-    // `clock_gettime` there.  `time` is `SystemTime::now`, `monotonic` and
-    // `perf_counter` are `Instant`, and the two CPU clocks are the
-    // `Get*Times` pair `process_time_nanos` / `thread_time_nanos` read.
-    #[cfg(windows)]
-    let (implementation, monotonic, adjustable) = match name_str {
-        "time" => ("GetSystemTimePreciseAsFileTime()", false, true),
-        "monotonic" | "perf_counter" => ("QueryPerformanceCounter()", true, false),
-        "process_time" => ("GetProcessTimes()", true, false),
-        "thread_time" => ("GetThreadTimes()", true, false),
-        _ => return Err(crate::PyError::value_error("unknown clock")),
-    };
-    // The guest makes no syscall: every clock is a question put to the
-    // embedder, and `process_time` is the monotonic one because that is the
-    // only clock this target has.
-    #[cfg(target_arch = "wasm32")]
-    let (implementation, monotonic, adjustable) = match name_str {
-        "time" => ("ClockProvider::wall_nanos()", false, true),
-        "monotonic" | "perf_counter" | "process_time" => {
-            ("ClockProvider::monotonic_nanos()", true, false)
+    match name_str {
+        "time" => {
+            time_impl(info)?;
         }
-        _ => return Err(crate::PyError::value_error("unknown clock")),
-    };
-    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
-    let (implementation, monotonic, adjustable) = match name_str {
-        "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
-        "monotonic" | "perf_counter" => {
-            #[cfg(target_os = "macos")]
-            {
-                ("mach_absolute_time()", true, false)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                ("clock_gettime(CLOCK_MONOTONIC)", true, false)
-            }
+        "process_time" => {
+            process_time_impl(info, false)?;
         }
-        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        "process_time" => ("clock_gettime(CLOCK_PROF)", true, false),
-        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
-        "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false),
-        // `interp_time.py` gates `thread_time` on HAS_THREAD_TIME; describe
-        // it only where the platform carries CLOCK_THREAD_CPUTIME_ID and the
-        // host clock is wired (the exact gate under which mod.rs registers the
-        // `thread_time` function), so the report never names a clock whose
-        // function is absent; otherwise fall through to the "unknown clock"
-        // ValueError.
-        #[cfg(all(
-            unix,
-            feature = "host_env",
-            not(any(
-                target_os = "illumos",
-                target_os = "netbsd",
-                target_os = "solaris",
-                target_os = "openbsd",
-                target_os = "redox",
-            ))
-        ))]
-        "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false),
-        _ => return Err(crate::PyError::value_error("unknown clock")),
-    };
-    let roots = pyre_object::gc_roots::push_roots();
-    let info_slot = roots.base();
-    let _ = roots.pin_root(info);
-    let impl_slot = info_slot + 1;
-    let _ = roots.pin_root(w_str_new_managed(implementation));
-    crate::baseobjspace::setattr_str(roots.get(info_slot), "implementation", roots.get(impl_slot))?;
-    crate::baseobjspace::setattr_str(roots.get(info_slot), "monotonic", w_bool_from(monotonic))?;
-    crate::baseobjspace::setattr_str(roots.get(info_slot), "adjustable", w_bool_from(adjustable))?;
-    crate::baseobjspace::setattr_str(
-        roots.get(info_slot),
-        "resolution",
-        floatobject::w_float_new(get_clock_info_resolution(name_str)),
-    )?;
+        _ => {
+            let (implementation, monotonic, adjustable) = other_clock_info(name_str)?;
+            let clock_info = ClockInfo::new(
+                implementation,
+                get_clock_info_resolution(name_str),
+                monotonic,
+                adjustable,
+            );
+            setinfo(info, &clock_info)?;
+        }
+    }
     Ok(w_none())
 }
 
@@ -572,14 +671,13 @@ fn mach_timebase_resolution_seconds() -> f64 {
     1.0e-9
 }
 
-/// The `resolution` value `time.get_clock_info(name)` reports.
+/// The `resolution` value `time.get_clock_info(name)` reports for the
+/// clocks [`other_clock_info`] describes.
 ///
-/// `clock_getres(clk_id)` for every clock-backed source — `time`,
-/// `process_time`, `thread_time`, and `monotonic`/`perf_counter` off macOS —
-/// with a 1e-9 fallback when the clock is unreadable, mirroring the
-/// `_process_time_impl`/`_thread_time_impl` `clock_getres` paths.  On macOS
-/// `monotonic`/`perf_counter` run on `mach_absolute_time`, whose resolution is
-/// the timebase rate rather than `clock_getres(CLOCK_MONOTONIC)`.
+/// `clock_getres(clk_id)` with a 1e-9 fallback, as `_thread_time_impl`
+/// and `py_get_monotonic_clock` read it.  On macOS `monotonic`/`perf_counter`
+/// run on `mach_absolute_time`, whose resolution is the timebase rate rather
+/// than `clock_getres(CLOCK_MONOTONIC)`.
 #[cfg(all(unix, feature = "host_env", not(target_os = "redox")))]
 fn get_clock_info_resolution(name: &str) -> f64 {
     #[cfg(target_os = "macos")]
@@ -589,20 +687,7 @@ fn get_clock_info_resolution(name: &str) -> f64 {
         }
     }
     let clk = match name {
-        "time" => libc::CLOCK_REALTIME,
         "monotonic" | "perf_counter" => libc::CLOCK_MONOTONIC,
-        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        "process_time" => libc::CLOCK_PROF,
-        #[cfg(not(any(
-            target_os = "illumos",
-            target_os = "netbsd",
-            target_os = "solaris",
-            target_os = "openbsd",
-            target_os = "wasi",
-            target_os = "freebsd",
-            target_os = "dragonfly",
-        )))]
-        "process_time" => libc::CLOCK_PROCESS_CPUTIME_ID,
         #[cfg(not(any(
             target_os = "illumos",
             target_os = "netbsd",
@@ -613,19 +698,13 @@ fn get_clock_info_resolution(name: &str) -> f64 {
         "thread_time" => libc::CLOCK_THREAD_CPUTIME_ID,
         _ => return 1.0e-9,
     };
-    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
-    let ret = unsafe { majit_rlib::rtime::c_clock_getres(clk as _, &mut ts) };
-    if ret == 0 {
-        timespec_to_seconds(&ts)
-    } else {
-        1.0e-9
-    }
+    clock_getres_seconds(clk)
 }
 
 /// Windows has no `clock_getres`; each clock's resolution is a property of
 /// the call behind it.  `QueryPerformanceFrequency` answers for the two
-/// `Instant` clocks, and the other three are counted in the 100ns unit both
-/// `FILETIME` and `Get*Times` use.
+/// `Instant` clocks, and `thread_time` is counted in the 100ns unit
+/// `GetThreadTimes` uses.
 #[cfg(all(windows, feature = "host_env"))]
 fn get_clock_info_resolution(name: &str) -> f64 {
     const FILETIME_TICK_SECONDS: f64 = 1.0e-7;
@@ -647,39 +726,91 @@ fn get_clock_info_resolution(_name: &str) -> f64 {
     1.0e-9
 }
 
-/// Process CPU time (kernel + user) as nanoseconds.
+/// `interp_time._process_time_impl`: process CPU time (kernel + user) as an
+/// int of nanoseconds when `return_ns`, else as float seconds.
 ///
-/// `interp_time._process_time_impl` Unix arm: `clock_gettime(CLOCK_PROF)`
-/// when libc defines it, else `CLOCK_PROCESS_CPUTIME_ID`; on failure
-/// `rtime.c_getrusage(RUSAGE_SELF)` and `decode_timeval_ns` of
-/// `ru_utime` + `ru_stime`. This is the process_time fallback, not a
-/// clock. With no usable reading, `_clock_impl` raises RuntimeError
-/// rather than reporting a bogus zero.
+/// Unix arm: `clock_gettime(CLOCK_PROF)` when libc defines it, else
+/// `CLOCK_PROCESS_CPUTIME_ID`; on failure `rtime.c_getrusage(RUSAGE_SELF)`
+/// (`decode_timeval` / `decode_timeval_ns` of `ru_utime` + `ru_stime`), then
+/// `rposix.c_times` over `rposix.CLOCK_TICKS_PER_SECOND`.  Each stage that
+/// reads publishes its own call and resolution into a non-null `w_info`
+/// (`_setinfo`), then builds its own result.  With
+/// no usable reading, RuntimeError rather than a bogus zero.
 #[cfg(all(unix, feature = "host_env"))]
-fn process_time_nanos() -> Result<i128, crate::PyError> {
+fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef, crate::PyError> {
     #[cfg(feature = "sandbox")]
     {
+        // The seam's `clock` op is the `ll_time_clock` analog, which is
+        // `_clock_impl`'s `clock()` with its `1 / CLOCKS_PER_SEC`.
         let secs =
             crate::host_seam::ops::clock().map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-        Ok((secs * 1_000_000_000.0) as i128)
+        if !w_info.is_null() {
+            setinfo(w_info, &ClockInfo::new("clock()", 1.0e-6, true, false))?;
+        }
+        if return_ns {
+            return Ok(w_int_new((secs * 1_000_000_000.0) as i64));
+        }
+        Ok(floatobject::w_float_new(secs))
     }
     #[cfg(not(feature = "sandbox"))]
     {
         #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        let clk_id = libc::CLOCK_PROF;
+        let (clk_id, implementation) = (libc::CLOCK_PROF, "clock_gettime(CLOCK_PROF)");
         #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
-        let clk_id = libc::CLOCK_PROCESS_CPUTIME_ID;
+        let (clk_id, implementation) = (
+            libc::CLOCK_PROCESS_CPUTIME_ID,
+            "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)",
+        );
         if let Ok(ts) = clock_gettime_timespec(clk_id) {
-            return Ok(timespec_to_nanos_i128(&ts));
+            if !w_info.is_null() {
+                setinfo(
+                    w_info,
+                    &ClockInfo::new(implementation, clock_getres_seconds(clk_id), true, false),
+                )?;
+            }
+            if return_ns {
+                return Ok(w_int_new(timespec_to_nanos_i128(&ts) as i64));
+            }
+            return Ok(floatobject::w_float_new(timespec_to_seconds(&ts)));
         }
         let mut rusage = unsafe { std::mem::zeroed::<majit_rlib::rtime::RUSAGE>() };
         let ret =
             unsafe { majit_rlib::rtime::c_getrusage(majit_rlib::rtime::RUSAGE_SELF, &mut rusage) };
         if ret == 0 {
-            return Ok(
-                majit_rlib::rtime::decode_timeval_ns(&rusage.ru_utime) as i128
-                    + majit_rlib::rtime::decode_timeval_ns(&rusage.ru_stime) as i128,
-            );
+            if !w_info.is_null() {
+                setinfo(
+                    w_info,
+                    &ClockInfo::new("getrusage(RUSAGE_SELF)", 1.0e-6, true, false),
+                )?;
+            }
+            if return_ns {
+                return Ok(w_int_new(
+                    majit_rlib::rtime::decode_timeval_ns(&rusage.ru_utime)
+                        + majit_rlib::rtime::decode_timeval_ns(&rusage.ru_stime),
+                ));
+            }
+            return Ok(floatobject::w_float_new(
+                majit_rlib::rtime::decode_timeval(&rusage.ru_utime)
+                    + majit_rlib::rtime::decode_timeval(&rusage.ru_stime),
+            ));
+        }
+        let mut tms = unsafe { std::mem::zeroed::<libc::tms>() };
+        let ret = unsafe { majit_rlib::rposix::c_times(&mut tms) };
+        if ret as i64 != -1 {
+            let cpu_time = tms.tms_utime as i64 + tms.tms_stime as i64;
+            let ticks_per_second = *majit_rlib::rposix::CLOCK_TICKS_PER_SECOND;
+            if !w_info.is_null() {
+                setinfo(
+                    w_info,
+                    &ClockInfo::new("times()", 1.0 / ticks_per_second, true, false),
+                )?;
+            }
+            if return_ns {
+                return Ok(w_int_new(
+                    cpu_time * 1_000_000_000 / ticks_per_second as i64,
+                ));
+            }
+            return Ok(floatobject::w_float_new(cpu_time as f64 / ticks_per_second));
         }
         Err(crate::PyError::runtime_error(
             "the processor time used is not available or its value cannot be represented",
@@ -691,21 +822,45 @@ fn process_time_nanos() -> Result<i128, crate::PyError> {
 /// reads on this platform.  The monotonic fallback below would count a sleep,
 /// which is the one thing process time must not do.
 #[cfg(all(windows, feature = "host_env"))]
-fn process_time_nanos() -> Result<i128, crate::PyError> {
-    host_time::get_process_time_100ns()
-        .map(|hundred_ns| i128::from(hundred_ns) * 100)
-        .ok_or_else(|| {
-            crate::PyError::runtime_error(
-                "the processor time used is not available or its value cannot be represented",
-            )
-        })
+fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef, crate::PyError> {
+    // `wrap_oserror(space, rwin32.lastSavedWindowsError("GetProcessTimes"))`:
+    // the failed call's own Win32 code, read before anything else runs.
+    let Some(hundred_ns) = host_time::get_process_time_100ns() else {
+        let winerror = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return Err(crate::PyError::os_error_win32_syscall2(
+            winerror,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ));
+    };
+    if !w_info.is_null() {
+        setinfo(
+            w_info,
+            &ClockInfo::new("GetProcessTimes()", 1.0e-7, true, false),
+        )?;
+    }
+    if return_ns {
+        return Ok(w_int_new((i128::from(hundred_ns) * 100) as i64));
+    }
+    Ok(floatobject::w_float_new(hundred_ns as f64 * 1e-7))
 }
 
 #[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
-fn process_time_nanos() -> Result<i128, crate::PyError> {
+fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef, crate::PyError> {
     // No process clock available; report the monotonic one, which is
     // non-decreasing and is the only clock this target has.
-    Ok(monotonic_nanos())
+    if !w_info.is_null() {
+        #[cfg(target_arch = "wasm32")]
+        let implementation = "ClockProvider::monotonic_nanos()";
+        #[cfg(not(target_arch = "wasm32"))]
+        let implementation = "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)";
+        setinfo(w_info, &ClockInfo::new(implementation, 1.0e-9, true, false))?;
+    }
+    let nanos = monotonic_nanos();
+    if return_ns {
+        return Ok(w_int_new(nanos as i64));
+    }
+    Ok(floatobject::w_float_new(nanos as f64 * 1e-9))
 }
 
 /// `GetThreadTimes`' kernel + user total for the calling thread — the
@@ -738,15 +893,13 @@ pub fn thread_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// Process time for profiling: sum of the kernel and user-space CPU time.
 pub fn process_time(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(floatobject::w_float_new(
-        process_time_nanos()? as f64 * 1e-9,
-    ))
+    process_time_impl(pyre_object::PY_NULL, false)
 }
 
 /// time.process_time_ns() → int
 pub fn process_time_ns(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _ = args;
-    Ok(w_int_new(process_time_nanos()? as i64))
+    process_time_impl(pyre_object::PY_NULL, true)
 }
 
 /// Thread CPU time (kernel + user) for the calling thread as nanoseconds.

@@ -25288,14 +25288,17 @@ pub(crate) fn crt_write_once(fd: libc::c_int, data: &[u8]) -> (i64, i32) {
             });
             let doserrno = unsafe { *__doserrno() };
             if ret >= 0 || errno != libc::ENOSPC || doserrno != 0 {
+                // `rposix.c_write` is `save_err=RFFI_SAVE_ERRNO`:
+                // `_errno_after` saves errno whatever the call returned.
+                majit_rlib::rposix::set_saved_errno(errno);
                 return (ret as i64, errno);
             }
             write_count /= 2;
             if write_count == 0 {
                 // CPython assigns `errno = EAGAIN` before returning -1.
-                // BufferedWriter reads that saved CRT errno after FileIO has
+                // BufferedWriter reads that saved errno after FileIO has
                 // translated the syscall result to None.
-                rustpython_host_env::os::set_errno(libc::EAGAIN);
+                majit_rlib::rposix::set_saved_errno(libc::EAGAIN);
                 return (ret as i64, libc::EAGAIN);
             }
         }

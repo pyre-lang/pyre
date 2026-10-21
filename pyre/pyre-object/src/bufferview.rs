@@ -736,6 +736,18 @@ impl BufferView {
                     length: slicelength * n,
                 }
             }
+            // [3.15-spec] `buffer.py BufferSlice.new_slice` builds
+            // `BufferSlice(self.parent, start + self.start, self.step * step,
+            // slicelength)`: the start is not mapped through the parent's
+            // step, and the new slice has no `w_obj`.  On PyPy 3.11
+            // `memoryview(b'0123456789')[::2][1:]` reads `b'1357'` and its
+            // `.obj` is not the base's; CPython reads `b'2468'` and keeps
+            // `.obj`, which `parent_index` (`self.start + self.step * idx`)
+            // also implies.  Artefact: `lib-python/3/test/test_buffer.py`
+            // `test_memoryview_slice`, `m1[4:1:-2][::-1] = m1[1:4:2][::1]`
+            // then `assertEqual(m1, ex1)` against `_testbuffer.ndarray`.
+            // `BufferSlice` carries only `_immutable_` / `_attrs_`, which
+            // govern its fields, not this arithmetic.
             BufferView::Slice {
                 parent,
                 w_obj,

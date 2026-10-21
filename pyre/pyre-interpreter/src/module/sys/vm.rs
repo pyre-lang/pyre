@@ -562,7 +562,7 @@ pub(crate) unsafe fn is_simple_namespace(obj: PyObjectRef) -> bool {
 /// `lib-python/3/test/test_types.py`
 /// `SimpleNamespaceTests.test_richcompare_unsupported` matches "not supported
 /// between instances of 'types.SimpleNamespace' and 'types.SimpleNamespace'",
-/// and a measured CPython 3.15.0b1 run answers `0` for the heap-type flag and
+/// and a measured CPython 3.15.0 run answers `0` for the heap-type flag and
 /// "cannot set 'foo' attribute of immutable type 'types.SimpleNamespace'".
 pub(crate) fn simple_namespace_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();

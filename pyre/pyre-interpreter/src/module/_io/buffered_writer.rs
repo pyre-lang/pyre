@@ -27,7 +27,7 @@ pub(super) fn make_write_blocking_error(written: usize) -> crate::PyError {
     // ints first so the only word that can move is already on the root stack
     // before the constructor allocates.
     let _roots = pyre_object::gc_roots::push_roots();
-    let errno = w_int_new(crate::builtins::crt_errno() as i64);
+    let errno = w_int_new(majit_rlib::rposix::get_saved_errno() as i64);
     let written = w_int_new(written as i64);
     let msg_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(

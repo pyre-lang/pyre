@@ -469,7 +469,7 @@ pub fn pypy_faulthandler_write_uint(fd: INT, mut uvalue: libc::c_ulong, mut min_
 /// sizeof(unsigned long) * 2)`, lower-case and zero-padded. Evidence:
 /// `lib-python/3/test/test_faulthandler.py` `THREAD_ID` matches
 /// `Thread 0x[0-9a-f]+` (the case). The padding is `write_thread_id` in
-/// `Python/traceback.c` read at v3.15.0rc2, and the 3.15.0b1 build measured
+/// `Python/traceback.c` read at v3.15.0, and the 3.15.0 build measured
 /// on Windows prints `Current thread 0x00009f1c`, an 8-digit field for the
 /// 4-byte `unsigned long`.
 fn pypy_faulthandler_write_hex(fd: INT, mut uvalue: u64) {
@@ -568,7 +568,7 @@ fn faulthandler_dump_traceback(fd: INT, all_threads: INT, max_threads: INT, ucon
 /// Upstream writes no C stack; `Modules/faulthandler.c` follows every fatal
 /// dump with one and publishes it as `dump_c_stack()`. pyre has no
 /// async-signal-safe unwinder, so this is the form CPython itself writes on
-/// a host without `backtrace()` (measured: CPython 3.15.0b1 on Windows).
+/// a host without `backtrace()` (measured: CPython 3.15.0 on Windows).
 /// Evidence: `lib-python/3/test/test_faulthandler.py` `C_STACK_REGEX` and
 /// `test_dump_c_stack`.
 pub fn pypy_faulthandler_dump_stack(fd: INT) {
@@ -971,20 +971,26 @@ fn faulthandler_fatal_error_body(signum: INT, ucontext: VOIDP) {
         // called.
         return;
     }
-    // `faulthandler_fatal_error` restores `handler->previous` then `raise`s.
-    // The previous SIGSEGV handler is the runtime stack-overflow probe, which
-    // returns when the fault address is not the guard page — every software
-    // `raise` included. Install SIG_DFL so the reraise terminates.
-    #[cfg(unix)]
-    if signum == libc::SIGSEGV {
-        unsafe {
-            ll::c_signal(signum, libc::SIG_DFL);
-        }
-    }
     // Call the previous signal handler: it is called immediately if we use
     // sigaction() thanks to SA_NODEFER flag, otherwise it is deferred.
     unsafe {
         ll::c_raise(signum);
+    }
+    // The Rust runtime's SIGSEGV stack-overflow probe is a previous handler
+    // that returns from a software `raise`: for a fault outside its guard
+    // page it reinstalls SIG_DFL and returns.  Raise once more into that
+    // default so the fatal error terminates.  A handler that stays installed
+    // after returning is left to what it did, as upstream leaves it.
+    #[cfg(unix)]
+    if signum == libc::SIGSEGV {
+        let mut current = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        if unsafe { ll::c_sigaction(signum, std::ptr::null(), &mut current) } == 0
+            && current.sa_sigaction == libc::SIG_DFL
+        {
+            unsafe {
+                ll::c_raise(signum);
+            }
+        }
     }
 }
 

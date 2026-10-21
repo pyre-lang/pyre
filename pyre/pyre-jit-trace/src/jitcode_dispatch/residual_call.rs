@@ -9500,13 +9500,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((outcome, op.next_pc));
     }
 
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && try_walker_orthodox_int_call(ctx, code, op, &r_args, dst)?.is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
     // Ahead of the `bare_super_call` re-route, which sits with the other
     // substitutions below and is what a decline here falls through to.
     if ctx.is_authoritative_executor

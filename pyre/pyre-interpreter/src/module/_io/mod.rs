@@ -455,12 +455,18 @@ fn iobase_closed_get(args: &[PyObjectRef]) -> crate::PyResult {
 /// in `fileio.c` or `stringio.c`; `flush` and `isatty` below carry the same
 /// spelling this one does.
 fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
-    // CPython 3.14 `IOBase._checkClosed` no longer exposes PyPy's optional
-    // `message` argument: Argument Clinic rejects every argument after self.
+    // [3.15-spec] Both upstreams reject a message: PyPy 3.11 (8.0.0) raises
+    // `takes 1 positional argument but 2 were given` (the `interp2app`
+    // arity error).  `Modules/_io/iobase.c` (v3.15.0) lists `_checkClosed`
+    // as METH_NOARGS, and `Objects/descrobject.c method_vectorcall_NOARGS`
+    // formats `"%U takes no arguments (%zd given)"`.  Measured on 3.15.0:
+    // `io.BytesIO()._checkClosed('m')` raises
+    // `TypeError('_IOBase._checkClosed() takes no arguments (1 given)')`.
     if args.len() != 1 {
-        return Err(crate::PyError::type_error(
-            "_IOBase._checkClosed() takes no arguments",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "_IOBase._checkClosed() takes no arguments ({} given)",
+            args.len().saturating_sub(1)
+        )));
     }
     let self_obj = args
         .first()
@@ -924,16 +930,62 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
             }
         };
         let _line_root = pyre_object::gc_roots::push_roots();
+        let line_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(line);
-        let line =
-            pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
-        call_method_result(
-            pyre_object::gc_roots::shadow_stack_get(sp),
-            "write",
-            &[line],
-        )?;
+        loop {
+            match call_method_result(
+                pyre_object::gc_roots::shadow_stack_get(sp),
+                "write",
+                &[pyre_object::gc_roots::shadow_stack_get(line_slot)],
+            ) {
+                Ok(_) => break,
+                Err(mut err) => {
+                    if trap_eintr(&mut err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
     }
     Ok(w_none())
+}
+
+/// `interp_iobase.py trap_eintr`: whether `error` is an `EnvironmentError`
+/// whose `errno` is EINTR.  Any failure while asking answers False.
+///
+/// Upstream reads `get_w_value`; an error raised from Rust carries its
+/// instance only once normalized, so this asks `normalize_exception`, which
+/// returns the same instance for an error that already has one.
+pub(crate) fn trap_eintr(error: &mut crate::PyError) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    const EINTR: i64 = libc::EINTR as i64;
+    #[cfg(target_arch = "wasm32")]
+    const EINTR: i64 = crate::builtins::wasm_errno::EINTR as i64;
+    let Some(w_environment_error) = crate::builtins::lookup_exc_class("OSError") else {
+        return false;
+    };
+    if !error.match_(PY_NULL, w_environment_error) {
+        return false;
+    }
+    let Ok(w_value) = error.normalize_exception(PY_NULL) else {
+        return false;
+    };
+    // The `errno` getter and `__eq__` can run Python and collect; the
+    // carrier the caller returns is pinned across them and reloaded after.
+    let roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_value);
+    let error_slot = error.pin(&roots);
+    let trapped = match crate::baseobjspace::getattr_str(roots.get(value_slot), "errno") {
+        Ok(mut w_errno) => pyre_object::with_roots!(w_errno => {
+            crate::baseobjspace::eq_w(w_errno, w_int_new(EINTR))
+        })
+        .unwrap_or(false),
+        Err(_) => false,
+    };
+    error.reload(&roots, error_slot);
+    trapped
 }
 
 /// A null value means the argument was not supplied and produces the same
@@ -1779,6 +1831,11 @@ pub(crate) fn text_encoding(
     if unsafe { !pyre_object::is_none(encoding) } {
         return Ok(encoding);
     }
+    // [3.15-spec] `interp_textio.py text_encoding` and `_pyio.text_encoding`
+    // end the message in a period; `_iomodule.c _io_text_encoding_impl` does
+    // not.  Measured on 3.15.0 under `-X warn_default_encoding -W error`:
+    // `io.text_encoding(None)` raises
+    // `EncodingWarning("'encoding' argument not specified")`.
     if crate::importing::warn_default_encoding_flag() {
         crate::warn::warn_category(
             "'encoding' argument not specified",

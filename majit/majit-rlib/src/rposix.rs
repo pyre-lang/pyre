@@ -1695,6 +1695,13 @@ crate::rffi::llexternal!(
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
+/// `rposix.CLOCK_TICKS_PER_SECOND = float(os.sysconf('SC_CLK_TCK'))`.
+/// Upstream binds it once at translation time; this reads it once, on first
+/// use.
+#[cfg(unix)]
+pub static CLOCK_TICKS_PER_SECOND: std::sync::LazyLock<f64> =
+    std::sync::LazyLock::new(|| unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64);
+
 // `rposix.c_getloadavg` leaves `save_err` at `RFFI_ERR_NONE`.
 // `rposix.getloadavg` raises a bare `OSError` when the count is not 3.
 // `<stdlib.h>` declares `getloadavg`.
