@@ -6,7 +6,9 @@
 # interp_fileio.py descr_init space.setattr(self, "name", w_name) stores a
 # young str on an old rawmalloced FileIO; the original w_name is a livevar,
 # not a getattr of opened after a collecting call.
+# Also covers posix/pyexpat/codecs arguments held across a Python callback.
 # parity-env: PYPY_GC_NURSERY=4096
+# parity-env: MAJIT_GC_NURSERY_POISON=1
 
 """FileIO.name is the interp_member_w w_name field.
 
@@ -134,6 +136,131 @@ def threaded_text_open_keeps_fileio_name_live():
             pass
 
 
+def _churn_small_strings():
+    junk = []
+    for i in range(3000):
+        junk.append(str(i))
+    return junk[-1]
+
+
+class _AllocPath:
+    def __init__(self, path):
+        self._path = path
+
+    def __fspath__(self):
+        _churn_small_strings()
+        return self._path
+
+
+class _AllocBool:
+    def __bool__(self):
+        _churn_small_strings()
+        return False
+
+    def __index__(self):
+        _churn_small_strings()
+        return 0
+
+
+def os_open_path_survives_fspath_collection():
+    fd = os.open(_AllocPath(os.devnull), os.O_RDONLY, 0o777)
+    os.close(fd)
+    print("open-fspath ok")
+
+
+def os_symlink_args_survive_a_collection():
+    if not hasattr(os, "symlink"):
+        print("symlink-fspath ok")
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dst = os.path.join(tmpdir, "dst")
+        try:
+            os.symlink(_AllocPath("src"), _AllocPath(dst), _AllocBool())
+        except OSError:
+            print("symlink-fspath ok")
+            return
+        if os.readlink(dst) != "src":
+            raise AssertionError((os.readlink(dst), "src"))
+    print("symlink-fspath ok")
+
+
+def posix_spawn_keywords_survive_a_collection():
+    if not hasattr(os, "posix_spawn"):
+        print("posix_spawn-kw", 0)
+        return
+    if os.path.exists("/bin/true"):
+        exe = "/bin/true"
+        argv = [exe]
+    else:
+        exe = sys.executable
+        argv = [exe, "-c", "pass"]
+    pid = os.posix_spawn(
+        _AllocPath(exe),
+        argv,
+        os.environ,
+        setpgroup=None,
+        resetids=False,
+        setsid=False,
+        file_actions=[],
+    )
+    _wpid, status = os.waitpid(pid, 0)
+    if hasattr(os, "waitstatus_to_exitcode"):
+        code = os.waitstatus_to_exitcode(status)
+    else:
+        code = status >> 8
+    print("posix_spawn-kw", code)
+
+
+def expat_parsefile_read_method_survives_a_collection():
+    import xml.parsers.expat
+
+    texts = []
+
+    class F:
+        def __init__(self):
+            self.n = 0
+
+        def read(self, n):
+            _churn_small_strings()
+            self.n += 1
+            if self.n == 1:
+                return b"<a>"
+            if self.n == 2:
+                return b"x" * 50
+            if self.n == 3:
+                return b"</a>"
+            return b""
+
+    parser = xml.parsers.expat.ParserCreate()
+    parser.CharacterDataHandler = lambda data: texts.append(data)
+    parser.ParseFile(F())
+    print("parsefile-read", sum(len(t) for t in texts))
+
+
+def codec_search_function_survives_a_collection():
+    import codecs
+
+    def search(name):
+        _churn_small_strings()
+        if name == "pyregcutf":
+            return codecs.lookup("utf-8")
+        return None
+
+    codecs.register(search)
+    try:
+        first = codecs.lookup("pyregcutf").name
+        second = codecs.lookup("pyregcutf").name
+        encoded = "x".encode("pyregcutf")
+        print("codec-search", first, second, encoded)
+    finally:
+        codecs.unregister(search)
+
+
 closed_fileio_name_stays_a_live_str_across_minors()
 threaded_text_open_keeps_fileio_name_live()
+os_open_path_survives_fspath_collection()
+os_symlink_args_survive_a_collection()
+posix_spawn_keywords_survive_a_collection()
+expat_parsefile_read_method_survives_a_collection()
+codec_search_function_survives_a_collection()
 print("OK")

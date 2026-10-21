@@ -2034,17 +2034,8 @@ unsafe fn load_attr_slowpath(
                         mapdict_map_or_null(pyre_object::gc_roots::shadow_stack_get(base + 1))
                     };
                     if std::ptr::eq(current_map, map) {
-                        unsafe { find_map_attr(current_map, Wtf8::new(attrname), attrkind) }.map(
-                            |attr| {
-                                let mut inst = unsafe {
-                                    mapdict_carrier(pyre_object::gc_roots::shadow_stack_get(
-                                        base + 1,
-                                    ))
-                                };
-                                let value = unsafe { direct_read(attr, &mut inst) };
-                                (current_map, attr, value)
-                            },
-                        )
+                        unsafe { find_map_attr(current_map, Wtf8::new(attrname), attrkind) }
+                            .map(|attr| (current_map, attr))
                     } else {
                         None
                     }
@@ -2052,7 +2043,7 @@ unsafe fn load_attr_slowpath(
                 pycode = pyre_object::gc_roots::shadow_stack_get(base);
                 w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                 w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
-                if let Some((current_map, attr, value)) = direct {
+                if let Some((current_map, attr)) = direct {
                     // mapdict.py `_fill_cache(...,
                     // valid_for_store=w_type.setattr_if_not_from_object() is None)`.
                     let valid_for_store =
@@ -2069,8 +2060,13 @@ unsafe fn load_attr_slowpath(
                             valid_for_store,
                         );
                     }
-                    // mapdict.py `return attr._direct_read(w_obj)`.
-                    return Ok(value);
+                    // `fill_cache` may park in `code_cache_lock` /
+                    // `before_external_block`.  mapdict.py
+                    // `LOAD_ATTR_slowpath` fills first, then
+                    // `return attr._direct_read(w_obj)`.
+                    let w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
+                    let mut inst = unsafe { mapdict_carrier(w_obj) };
+                    return Ok(unsafe { direct_read(attr, &mut inst) });
                 }
             }
         }

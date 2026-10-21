@@ -1740,8 +1740,8 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // A 32-bit target's `usize` is narrower than the `__index__`
     // result, so a size it cannot hold is reported rather than
     // wrapped to a smaller request.
-    let n = usize::try_from(n)
-        .map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
+    let n =
+        usize::try_from(n).map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
     // `interp_posix.urandom` calls `rurandom.urandom`. A size the
     // allocator cannot meet is refused rather than reaching the
     // entropy source.
@@ -1752,14 +1752,13 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // from `rurandom._getrandom` on Linux `EINTR`.
         let mut signal_error: Option<crate::PyError> = None;
         let outcome = {
-            let mut checker =
-                || match crate::module::signal::interp_signal::checksignals_now() {
-                    Ok(()) => true,
-                    Err(err) => {
-                        signal_error = Some(err);
-                        false
-                    }
-                };
+            let mut checker = || match crate::module::signal::interp_signal::checksignals_now() {
+                Ok(()) => true,
+                Err(err) => {
+                    signal_error = Some(err);
+                    false
+                }
+            };
             pyre_object::with_roots!(w_n => {
                 majit_rlib::rurandom::urandom(n, Some(&mut checker))
             })
@@ -3250,9 +3249,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // `posixmodule.c` clinic: `file_actions=()`, `setsigmask=()`,
                 // `setsigdef=()`. Binding None here made omitted
                 // `os.posix_spawn` iterate None (`test_close_fds`).
-                "file_actions" | "setsigmask" | "setsigdef" => {
-                    pyre_object::w_tuple_new(Vec::new())
-                }
+                "file_actions" | "setsigmask" | "setsigdef" => pyre_object::w_tuple_new(Vec::new()),
                 _ => pyre_object::w_none(),
             };
             crate::gateway::function_set_kwonly_default_pair(fn_slot, name, value);
@@ -3454,32 +3451,36 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |args| {
                 let (bound, mut kwargs, _kwonly) =
                     bind_path_args(args, "open", &["path", "flags", "mode"], 2, &["dir_fd"])?;
+                // Path/flags/mode stay in one bracket with the kw-only pins
+                // (`rename_impl` / `link`). Each converter (`__fspath__`,
+                // `c_int_w`) can collect, so later arguments are read back
+                // from their slots.
                 let roots = pyre_object::gc_roots::push_roots();
                 let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                let path = crate::gateway::fsencode_path_or_fd_w(
+                let pos_base = roots.publish(&[
                     bound[0].expect("path is required"),
-                    "open",
-                    false,
-                );
+                    bound[1].expect("flags is required"),
+                    bound[2].unwrap_or(pyre_object::PY_NULL),
+                ]);
+                if kw_n > 0 {
+                    roots.normalize(kw_base, kw_n + 3);
+                } else {
+                    roots.normalize(pos_base, 3);
+                }
+                let path =
+                    crate::gateway::fsencode_path_or_fd_w(roots.get(pos_base), "open", false)?;
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
-                let path = path?;
-                let roots = pyre_object::gc_roots::push_roots();
-                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                let flags = crate::baseobjspace::c_int_w(bound[1].expect("flags is required"));
+                let flags = crate::baseobjspace::c_int_w(roots.get(pos_base + 1))? as libc::c_int;
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
-                drop(roots);
-                let flags = flags? as libc::c_int;
-                let mode: u32 = match bound[2] {
-                    Some(value) => {
-                        let roots = pyre_object::gc_roots::push_roots();
-                        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                        let r = crate::baseobjspace::c_int_w(value);
-                        kwargs = reload_bound_kwonly(kw_base, kw_n);
-                        drop(roots);
-                        r? as u32
+                let mode: u32 = {
+                    let w = roots.get(pos_base + 2);
+                    if w.is_null() {
+                        0o777
+                    } else {
+                        crate::baseobjspace::c_int_w(w)? as u32
                     }
-                    None => 0o777,
                 };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 // `open` types `dir_fd` as `DirFD(rposix.HAVE_OPENAT)`
                 // (`interp_posix.py`). Only the `openat` arm below reads it;
                 // every other build has already turned a descriptor away, because
@@ -11390,26 +11391,39 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // kinds and is ignored everywhere else (`os_symlink_impl`).
                     // Bound rather than dropped so a fourth positional is the
                     // `dir_fd` error it is, not a silently created link.
-                    let _target_is_directory = match bound[2] {
-                        Some(value) => {
-                            let roots = pyre_object::gc_roots::push_roots();
-                            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                            let r = crate::baseobjspace::is_true(value);
-                            kwargs = reload_bound_kwonly(kw_base, kw_n);
-                            drop(roots);
-                            r?
+                    // Src/dst/flag share one bracket with the kw-only pins
+                    // (`rename_impl` / `link`); `is_true` / `__fspath__` can
+                    // collect, so later arguments are read back from slots.
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                    let pos_base = roots.publish(&[
+                        bound[0].expect("src is required"),
+                        bound[1].expect("dst is required"),
+                        bound[2].unwrap_or(pyre_object::PY_NULL),
+                    ]);
+                    if kw_n > 0 {
+                        roots.normalize(kw_base, kw_n + 3);
+                    } else {
+                        roots.normalize(pos_base, 3);
+                    }
+                    let _target_is_directory = {
+                        let w = roots.get(pos_base + 2);
+                        if w.is_null() {
+                            false
+                        } else {
+                            crate::baseobjspace::is_true(w)?
                         }
-                        None => false,
                     };
+                    kwargs = reload_bound_kwonly(kw_base, kw_n);
                     // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`.
                     let _dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_SYMLINKAT)?;
                     let src = crate::gateway::fsencode_path_named_w(
-                        bound[0].expect("src is required"),
+                        roots.get(pos_base),
                         "symlink",
                         "src",
                     )?;
                     let dst = crate::gateway::fsencode_path_named_w(
-                        bound[1].expect("dst is required"),
+                        roots.get(pos_base + 1),
                         "symlink",
                         "dst",
                     )?;
@@ -13080,14 +13094,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     |index: usize| pyre_object::gc_roots::shadow_stack_get(positional_base + index);
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = crate::gateway::fsencode_path_named_w(positional(0), func, "path")?;
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(|_| {
                     crate::PyError::value_error("posix_spawn: embedded null in path")
                 })?;
                 let argv = collect_cstring_seq(positional(1), func, "argv")?;
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 // posixmodule.c parses `env` through the same keys/values
                 // snapshot used by execve, then filesystem-encodes paired
                 // elements into `key=value`.
                 let env = collect_spawn_env(positional(2))?;
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let setpgroup = match bound_kwonly_named(&kwargs, kwonly, "setpgroup") {
                     Some(value) if !unsafe { pyre_object::is_none(value) } => {
                         let value = crate::baseobjspace::space_index(value)?;
@@ -13100,10 +13117,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     _ => None,
                 };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let resetids = bound_kwonly_named(&kwargs, kwonly, "resetids")
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
                     .unwrap_or(false);
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let setsid = bound_kwonly_named(&kwargs, kwonly, "setsid")
                     .map(crate::baseobjspace::is_true)
                     .transpose()?
@@ -13111,16 +13130,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if setsid && !supports_posix_spawn_setsid() {
                     return Err(argument_unavailable(func, "setsid"));
                 }
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let setsigmask = match bound_kwonly_named(&kwargs, kwonly, "setsigmask") {
                     Some(value) => Some(sigset_arg(value)?),
                     None => None,
                 };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let setsigdef = match bound_kwonly_named(&kwargs, kwonly, "setsigdef") {
                     Some(value) => Some(sigset_arg(value)?),
                     None => None,
                 };
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let _scheduler =
                     parse_spawn_scheduler(func, bound_kwonly_named(&kwargs, kwonly, "scheduler"))?;
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let file_actions_obj = bound_kwonly_named(&kwargs, kwonly, "file_actions");
                 let actions: Vec<PosixSpawnFileAction> = if let Some(fa) = file_actions_obj {
                     if unsafe { pyre_object::is_none(fa) } {
@@ -15110,20 +15133,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`,
                     // and `CreateSymbolicLinkW` resolves a relative name against
                     // the working directory alone.
+                    // Src/dst/flag share one bracket; `__fspath__` / `__bool__`
+                    // can collect, so later arguments are read back from slots.
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let pos_base = roots.publish(&[
+                        bound[0].expect("src is required"),
+                        bound[1].expect("dst is required"),
+                        bound[2].unwrap_or(pyre_object::PY_NULL),
+                    ]);
+                    roots.normalize(pos_base, 3);
                     dir_fd_kwarg(kwargs.first().copied().flatten(), false)?;
                     let src = crate::gateway::fsencode_path_named_w(
-                        bound[0].expect("src is required"),
+                        roots.get(pos_base),
                         "symlink",
                         "src",
                     )?;
                     let dst = crate::gateway::fsencode_path_named_w(
-                        bound[1].expect("dst is required"),
+                        roots.get(pos_base + 1),
                         "symlink",
                         "dst",
                     )?;
-                    let target_is_directory = match bound[2] {
-                        Some(w) => crate::baseobjspace::is_true(w)?,
-                        None => false,
+                    let target_is_directory = {
+                        let w = roots.get(pos_base + 2);
+                        if w.is_null() {
+                            false
+                        } else {
+                            crate::baseobjspace::is_true(w)?
+                        }
                     };
                     let (wide_src, wide_dst) =
                         (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);

@@ -613,7 +613,7 @@ fn metaclass_init(args: &[PyObjectRef], initialize: fn(PyObjectRef) -> PyResult)
             "metaclass __init__ expects name, bases and namespace",
         ));
     }
-    let cls = args
+    let mut cls = args
         .first()
         .copied()
         .filter(|&obj| unsafe { pyre_object::is_type(obj) })
@@ -626,7 +626,9 @@ fn metaclass_init(args: &[PyObjectRef], initialize: fn(PyObjectRef) -> PyResult)
             "already initialized",
         ));
     }
-    initialize(cls)?;
+    // `initialize` may collect (`type_call_instantiate` / `do_warn`);
+    // `gct_direct_call` pushes livevars around that call.
+    pyre_object::with_roots!(cls => initialize(cls))?;
     set_type_attr(cls, META_INITIALIZED_KEY, pyre_object::w_bool_from(true));
     Ok(pyre_object::w_none())
 }
@@ -1062,7 +1064,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     let info_slot = fields_slot + 4;
     let pointer_type_slot = fields_slot + 5;
     let cls = || fields_roots.get(cls_slot);
-    let entries = field_entries(fields_roots.get(fields_slot))?;
+    let mut entries = field_entries(fields_roots.get(fields_slot))?;
     let anonymous = anonymous_names(cls())?;
 
     for name in &anonymous {
@@ -1087,9 +1089,16 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         && !cfg!(windows)
         && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls(), "_layout_") }.is_none()
     {
+        // `do_warn` can collect. `FieldEntry.ty` lives in a native Vec, so
+        // pin and reload it the way `gct_direct_call` would push livevars.
+        let tys: Vec<PyObjectRef> = entries.iter().map(|entry| entry.ty).collect();
+        let ty_base = fields_roots.pin_roots(&tys);
         pyre_interpreter::warn::warn_deprecation(
             "_pack_ without explicit _layout_ uses deprecated MSVC layout",
         )?;
+        for (i, entry) in entries.iter_mut().enumerate() {
+            entry.ty = fields_roots.get(ty_base + i);
+        }
     }
 
     // Reject before mutating the class: a type already frozen (used as a field

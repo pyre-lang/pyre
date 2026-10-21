@@ -4,6 +4,9 @@
 # pyre-check: pypy-diverges: its container slot is zero-based, so `repr` of a
 # fresh py_object raises IndexError on an empty table and answers the first
 # stored object once one exists (measured on PyPy 7.3.20)
+# import ctypes builds byte-swapped simple types through a metaclass `__init__` whose `type` argument must survive the collecting `type.__call__`.
+# parity-env: PYPY_GC_NURSERY=4096
+# parity-env: MAJIT_GC_NURSERY_POISON=1
 
 """``ctypes.py_object`` must survive the collector relocating its target.
 
@@ -121,5 +124,58 @@ none_pointer_base = ObjectArray()
 none_pointer = ctypes.cast(none_pointer_base, ctypes.POINTER(ctypes.py_object))
 none_pointer[0] = None
 assert "0" not in none_pointer._objects
+
+# After CFuncPtr.__del__, a later call still reaches the Python callable.
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+def cb(x):
+    return x + 1
+
+
+recorded = cb(1)
+d = getattr(cb, "__del__", None)
+if d is not None:
+    d()
+    d()
+    assert cb(1, 2) == 2
+assert cb(1) == 2
+
+# A CFUNCTYPE wrapping a native address keeps that address after __del__.
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+def kept(x):
+    return x + 1
+
+
+native = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)(
+    ctypes.cast(kept, ctypes.c_void_p).value
+)
+d = getattr(native, "__del__", None)
+if d is not None:
+    d()
+assert native(7) == 8
+
+try:
+    absfn = ctypes.CDLL(None).abs
+    absfn.argtypes = [ctypes.c_int]
+    absfn.restype = ctypes.c_int
+except (OSError, AttributeError, TypeError):
+    absfn = None
+if absfn is not None:
+    d = getattr(absfn, "__del__", None)
+    if d is not None:
+        d()
+    assert absfn(-9) == 9
+
+_simple_type_codes = ("h", "H", "i", "I", "l", "L", "q", "Q", "f", "d")
+_simple_names = ["T%02d" % n for n in range(50)]
+gc.collect(0)
+for i in range(50):
+    T = type(
+        _simple_names[i],
+        (ctypes._SimpleCData,),
+        {"_type_": _simple_type_codes[i % 10]},
+    )
+    _ = ["%d-%d" % (i, j) for j in range(500)]
+    assert T.__ctype_be__._type_ == T._type_
+    assert T.__ctype_le__._type_ == T._type_
 
 print("OK")
