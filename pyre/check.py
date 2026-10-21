@@ -526,6 +526,7 @@ def _run_timed_unix(args, timeout_s, env=None, keep_output=False):
     # reap the child itself and leave nothing for wait4, and draining pipes by
     # hand risks the classic full-buffer deadlock.
     import resource  # noqa: F401  (documents the rusage struct's origin)
+    import signal
     import tempfile
     import threading
 
@@ -535,9 +536,16 @@ def _run_timed_unix(args, timeout_s, env=None, keep_output=False):
         proc = subprocess.Popen(args, stdout=out_f, stderr=err_f, env=env)
 
         def _kill():
+            # Popen.kill() polls with waitpid(WNOHANG) before signalling, which
+            # can reap this child on the timer thread and leave wait4 with
+            # ECHILD. os.kill does not reap; the zombie still owns the pid
+            # until wait4 collects it, so the signal cannot hit a recycled pid.
             nonlocal timed_out
             timed_out = True
-            proc.kill()
+            try:
+                os.kill(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
         timer = threading.Timer(timeout_s, _kill) if timeout_s else None
         if timer is not None:
