@@ -3584,47 +3584,6 @@ pub fn descr_init() {}
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn descr_classmethod__new__(
-    _subtype: PyObjectRef,
-    w_function: PyObjectRef,
-) -> PyObjectRef {
-    let _ = _subtype;
-    if w_function.is_null() {
-        pyre_object::w_none()
-    } else {
-        pyre_object::function::w_classmethod_new(w_function)
-    }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn descr_classmethod_get(
-    w_obj: PyObjectRef,
-    obj: PyObjectRef,
-    w_cls: PyObjectRef,
-) -> PyObjectRef {
-    unsafe {
-        let _ = w_cls;
-        if obj.is_null() || pyre_object::is_none(obj) {
-            w_obj
-        } else {
-            let func = pyre_object::w_classmethod_get_func(w_obj);
-            let cls = if w_obj.is_null() {
-                pyre_object::w_none()
-            } else {
-                obj
-            };
-            pyre_object::w_method_new(func, cls, cls)
-        }
-    }
-}
-
-#[inline]
-/// # Safety
-/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
-/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_staticmethod__new__(
     _subtype: PyObjectRef,
     w_function: PyObjectRef,

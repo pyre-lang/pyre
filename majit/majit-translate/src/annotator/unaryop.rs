@@ -1732,14 +1732,14 @@ fn list_method_extend(
 }
 
 #[allow(dead_code)]
-fn descr_reverse(_ann: &RPythonAnnotator, s_self: &super::model::SomeList) -> Option<SomeValue> {
+fn method_reverse(_ann: &RPythonAnnotator, s_self: &super::model::SomeList) -> Option<SomeValue> {
     // unaryop.py:369-370 — falls off the end (void op).
     s_self.listdef.mutate().expect("listdef.mutate");
     None
 }
 
 #[allow(dead_code)]
-fn descr_insert(
+fn method_insert(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     _s_index: &SomeValue,
@@ -1750,7 +1750,7 @@ fn descr_insert(
 }
 
 #[allow(dead_code)]
-fn descr_remove(
+fn method_remove(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
     s_value: &SomeValue,
@@ -2749,7 +2749,7 @@ fn str_method_isalpha(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue
 }
 
 #[allow(dead_code)]
-fn descr_isalnum(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
+fn method_isalnum(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
@@ -2789,7 +2789,7 @@ fn str_method_splitlines(ann: &RPythonAnnotator, s_self: &SomeValue) -> SomeValu
 }
 
 #[allow(dead_code)]
-fn descr_format(_ann: &RPythonAnnotator, _s_self: &SomeValue, _args: &[SomeValue]) -> SomeValue {
+fn method_format(_ann: &RPythonAnnotator, _s_self: &SomeValue, _args: &[SomeValue]) -> SomeValue {
     // unaryop.py method_format — always raises.
     panic!("AnnotatorError: Method format() is not RPython")
 }
@@ -2864,9 +2864,9 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
         SomeValue::List(_) => match name {
             "append" => "list_method_append",
             "extend" => "list_method_extend",
-            "reverse" => "descr_reverse",
-            "insert" => "descr_insert",
-            "remove" => "descr_remove",
+            "reverse" => "method_reverse",
+            "insert" => "method_insert",
+            "remove" => "method_remove",
             "pop" => "list_method_pop",
             "index" => "list_method_index",
             // Raw-pointer `p.is_null()` on a `SomeList` receiver (the list
@@ -2924,10 +2924,10 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "lower" => "str_method_lower",
             "isdigit" => "str_method_isdigit",
             "isalpha" => "str_method_isalpha",
-            "isalnum" => "descr_isalnum",
+            "isalnum" => "method_isalnum",
             "replace" => "str_method_replace",
             "splitlines" => "str_method_splitlines",
-            "format" => "descr_format",
+            "format" => "method_format",
             _ => return None,
         },
         SomeValue::UnicodeString(_) => match name {
@@ -2946,9 +2946,9 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "lower" => "str_method_lower",
             "isdigit" => "str_method_isdigit",
             "isalpha" => "str_method_isalpha",
-            "isalnum" => "descr_isalnum",
+            "isalnum" => "method_isalnum",
             "replace" => "str_method_replace",
-            "format" => "descr_format",
+            "format" => "method_format",
             _ => return None,
         },
         SomeValue::Char(_) => match name {
@@ -2956,7 +2956,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "lower" => "str_method_lower",
             "isdigit" => "str_method_isdigit",
             "isalpha" => "str_method_isalpha",
-            "isalnum" => "descr_isalnum",
+            "isalnum" => "method_isalnum",
             "isspace" => "char_method_isspace",
             "islower" => "char_method_islower",
             "isupper" => "char_method_isupper",
@@ -2967,7 +2967,7 @@ pub(crate) fn find_method(s_self: &SomeValue, name: &str) -> Option<SomeBuiltinM
             "lower" => "str_method_lower",
             "isdigit" => "str_method_isdigit",
             "isalpha" => "str_method_isalpha",
-            "isalnum" => "descr_isalnum",
+            "isalnum" => "method_isalnum",
             _ => return None,
         },
         // rstring.py — the `StringBuilder` call surface.  Only the
@@ -3147,7 +3147,7 @@ pub(crate) fn call_builtin_method(
             };
             return Ok(list_method_extend(ann, s_self, s_iterable));
         }
-        "descr_reverse" => {
+        "method_reverse" => {
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
@@ -3155,9 +3155,9 @@ pub(crate) fn call_builtin_method(
             let [] = scope.as_slice() else {
                 unreachable!();
             };
-            return Ok(descr_reverse(ann, s_self));
+            return Ok(method_reverse(ann, s_self));
         }
-        "descr_insert" => {
+        "method_insert" => {
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
@@ -3171,9 +3171,9 @@ pub(crate) fn call_builtin_method(
             let [s_index, s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            return Ok(descr_insert(ann, s_self, s_index, s_value));
+            return Ok(method_insert(ann, s_self, s_index, s_value));
         }
-        "descr_remove" => {
+        "method_remove" => {
             let SomeValue::List(s_self) = &*method.s_self else {
                 return Err(builtin_method_receiver_error(method));
             };
@@ -3182,7 +3182,7 @@ pub(crate) fn call_builtin_method(
             let [s_value] = scope.as_slice() else {
                 unreachable!();
             };
-            return Ok(descr_remove(ann, s_self, s_value));
+            return Ok(method_remove(ann, s_self, s_value));
         }
         "list_method_pop" => {
             let SomeValue::List(s_self) = &*method.s_self else {
@@ -3721,12 +3721,12 @@ pub(crate) fn call_builtin_method(
             };
             str_method_isalpha(ann, &method.s_self)
         }
-        "descr_isalnum" => {
+        "method_isalnum" => {
             let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;
             let [] = scope.as_slice() else {
                 unreachable!();
             };
-            descr_isalnum(ann, &method.s_self)
+            method_isalnum(ann, &method.s_self)
         }
         "str_method_replace" => {
             let scope =
@@ -3749,18 +3749,18 @@ pub(crate) fn call_builtin_method(
             };
             str_method_splitlines(ann, &method.s_self)
         }
-        "descr_format" => {
+        "method_format" => {
             if !kwds.is_empty() {
                 return Err(builtin_method_arg_error(method));
             }
-            // upstream `descr_format` always raises — the args are
+            // upstream `method_format` always raises — the args are
             // unused, so the Option layer can be flattened with
             // Impossible at this single call site.
             let args_concrete: Vec<SomeValue> = args_s
                 .iter()
                 .map(|s| s.clone().unwrap_or_else(super::model::s_impossible_value))
                 .collect();
-            descr_format(ann, &method.s_self, &args_concrete)
+            method_format(ann, &method.s_self, &args_concrete)
         }
         "char_method_isspace" => {
             let scope = bind_builtin_method_args(args_s, kwds, &[], None, &method.analyser_name)?;

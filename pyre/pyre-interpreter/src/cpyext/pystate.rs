@@ -144,11 +144,15 @@ pub unsafe extern "C" fn PyEval_ReleaseThread(_state: *mut CPyThreadState) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyThreadState_Get() -> *mut CPyThreadState {
     if !STATE_IS_CURRENT.with(|current| current.get()) {
+        // [3.15-spec] lib-python/3/test/test_capi/test_misc.py
+        // `test_no_FatalError_infinite_loop` Py_GIL_DISABLED arm. PyPy
+        // `pystate.py PyThreadState_Get` reports "no current thread".
         super::pyerrors::fatal_error(
             Some("PyThreadState_Get"),
-            "the function must be called with the GIL held, after Python \
-             initialization and before Python finalization, but the GIL is \
-             released (the current Python thread state is NULL)",
+            "the function must be called with an active thread state, \
+             after Python initialization and before Python finalization, \
+             but it was called without an active thread state. \
+             Are you trying to call the C API inside of a Py_BEGIN_ALLOW_THREADS block?",
         );
     }
     thread_state()

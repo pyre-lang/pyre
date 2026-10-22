@@ -352,7 +352,11 @@ fn get_filter(
         }
     }
     let action = get_default_action()?;
-    Ok((crate::baseobjspace::text_w(action)?.to_string(), PY_NULL))
+    let action = crate::baseobjspace::text_w(action)?.to_string();
+    if action.is_empty() {
+        return Err(PyError::value_error("warnings.defaultaction not found"));
+    }
+    Ok((action, PY_NULL))
 }
 
 fn already_warned(

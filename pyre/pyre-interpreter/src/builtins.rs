@@ -1426,9 +1426,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             }
             return Err(crate::PyError::type_error("memoryview: invalid slice key"));
         }
-        Err(crate::PyError::type_error(
-            "memoryview: invalid slice key, must be int or slice",
-        ))
+        Err(crate::PyError::type_error("memoryview: invalid slice key"))
     }
 }
 
@@ -1645,9 +1643,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return Ok(w_none());
         }
         if !index_check(index) {
-            return Err(crate::PyError::type_error(
-                "memoryview: invalid slice key, must be int or slice",
-            ));
+            return Err(crate::PyError::type_error("memoryview: invalid slice key"));
         }
         // PyPy `W_MemoryView.descr_getitem` rejects an integer selecting the
         // leading dimension of an N-D view because that would have to return
@@ -6491,29 +6487,6 @@ pub(crate) fn clinic_keyword_only_error(
         .iter()
         .find(|key| !kwonly.iter().any(|name| key.as_str() == Ok(*name)))
         .map(|key| unexpected_keyword_error(fn_name, key, kwonly))
-}
-
-/// Bind a positional-or-keyword parameter that follows a positional-only
-/// prefix (`eval`/`exec`/`compile` style).  Prefers the positional slot and
-/// falls back to the matching keyword.  Raises the argument-clinic
-/// "given by name and position" TypeError when the same parameter is supplied
-/// both ways.  `pos_index` is the 1-based position used in that message.
-pub fn bind_pos_or_kw(
-    positional: &[PyObjectRef],
-    kwargs: Option<PyObjectRef>,
-    slot: usize,
-    key: &str,
-    fn_name: &str,
-    pos_index: usize,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
-    match (positional.get(slot).copied(), kwarg_get(kwargs, key)) {
-        (Some(_), Some(_)) => Err(crate::PyError::type_error(format!(
-            "argument for {fn_name}() given by name ('{key}') and position ({pos_index})"
-        ))),
-        (Some(p), None) => Ok(Some(p)),
-        (None, Some(k)) => Ok(Some(k)),
-        (None, None) => Ok(None),
-    }
 }
 
 /// Resolve a single positional-or-keyword builtin argument: prefer the
@@ -20217,7 +20190,10 @@ pub fn exec_or_eval(
     // module-code arm has already bound w_locals = w_globals, matching
     // PyPy's `exec(src, g)` (and `exec(src, g, l)` where `l is g`).
     if let Some(slot) = locals_object_slot {
-        frame.setdictscope(pyre_object::gc_roots::shadow_stack_get(slot))?;
+        frame.setdictscope(
+            pyre_object::gc_roots::shadow_stack_get(slot),
+            inject_closure,
+        )?;
     } else if let Some(implicit_locals_slot) = implicit_locals_slot {
         // pyopcode.py:2015 — `exec(src)` with no globals/locals uses
         // the caller's `getdictscope()` as locals.  Skip when the
@@ -20229,7 +20205,7 @@ pub fn exec_or_eval(
         let same_as_globals = !caller_globals_obj.is_null()
             && std::ptr::eq(implicit_caller_locals, caller_globals_obj);
         if !same_as_globals {
-            frame.setdictscope(implicit_caller_locals)?;
+            frame.setdictscope(implicit_caller_locals, inject_closure)?;
         }
     }
     // run_with_jit rather than execute_frame so that

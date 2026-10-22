@@ -7010,6 +7010,19 @@ pub fn check_user_subclass(
     w_self: PyObjectRef,
     w_subtype: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    if w_subtype.is_null() || !unsafe { pyre_object::is_type(w_subtype) } {
+        return check_new_subtype(w_self, w_subtype);
+    }
+    // typeobject.py check_user_subclass: `if not w_subtype.layout`.
+    let sub_layout = unsafe { pyre_object::w_type_get_layout_ptr(w_subtype) };
+    if sub_layout.is_null() {
+        let self_name = unsafe { pyre_object::w_type_get_name(w_self) };
+        let sub_name = unsafe { pyre_object::w_type_get_name(w_subtype) };
+        return Err(crate::PyError::type_error(format!(
+            "{}.__new__({}): uninitialized type {} may not be instantiated yet.",
+            self_name, sub_name, sub_name,
+        )));
+    }
     check_new_subtype(w_self, w_subtype)?;
     if std::ptr::eq(w_subtype, w_self) {
         return Ok(());

@@ -6888,23 +6888,6 @@ impl JitCodeBuilder {
         }
     }
 
-    #[allow(dead_code)]
-    fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.touch_reg(dst);
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(fn_ptr_idx);
-        self.push_u16(dst);
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
-        }
-        self.record_resulttype('i');
-    }
-
     fn push_label_ref(&mut self, label: u16) {
         // RPython `assembler.py:176` records the offset of the 2-byte
         // label slot in `alllabels` just before the temp bytes go in.
@@ -7039,40 +7022,6 @@ impl JitCodeBuilder {
             "float reg {reg} out of u8 range (assembler.py:72 chr() parity)"
         );
         self.num_regs_f = max(self.num_regs_f, reg.saturating_add(1));
-    }
-
-    #[allow(dead_code)]
-    fn call_ref_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.touch_ref_reg(dst);
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(fn_ptr_idx);
-        self.push_u16(dst);
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
-        }
-        self.record_resulttype('r');
-    }
-
-    #[allow(dead_code)]
-    fn call_float_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
-        self.touch_float_reg(dst);
-        for &arg in arg_regs {
-            self.touch_call_arg(arg);
-        }
-        self.start_instr(opcode);
-        self.push_u16(fn_ptr_idx);
-        self.push_u16(dst);
-        self.push_u16(arg_regs.len() as u16);
-        for &arg in arg_regs {
-            self.push_u8(arg.kind.encode());
-            self.push_u16(arg.reg);
-        }
-        self.record_resulttype('f');
     }
 
     fn touch_call_arg(&mut self, arg: JitCallArg) {

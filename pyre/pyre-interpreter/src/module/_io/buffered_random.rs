@@ -1230,6 +1230,7 @@ impl W_BufferedRandom {
                 pyre_object::gc_hook::try_gc_write_barrier(
                     Self::from_slot(slot) as *mut Self as pyre_object::gc_hook::GCREF
                 );
+                super::maybe_unregister_rpython_finalizer_io(Self::from_slot(slot).self_obj());
                 Ok(())
             }
         }

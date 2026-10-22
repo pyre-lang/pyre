@@ -554,7 +554,7 @@ fn ffi_addressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_alignof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "alignof", &["cdecl"], 1)?;
+    let a = bind_method(args, "alignof", &["arg"], 1)?;
     let w_ctype = ffi_type(a[0], a[1], ACCEPT_ALL)?;
     Ok(pyre_object::w_int_new(
         ctypeobj::ctype_arg(w_ctype)?.alignof()?,
@@ -562,7 +562,7 @@ fn ffi_alignof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "cast", &["cdecl", "source"], 2)?;
+    let a = bind_method(args, "cast", &["arg", "ob"], 2)?;
     let roots = pyre_object::gc_roots::push_roots();
     let source_slot = roots.base();
     let _ = roots.pin_root(a[2]);
@@ -717,7 +717,7 @@ fn ffi_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_from_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "from_handle", &["x"], 1)?;
+    let a = bind_method(args, "from_handle", &["arg"], 1)?;
     let roots = pyre_object::gc_roots::push_roots();
     let value_slot = roots.base();
     let _ = roots.pin_root(a[1]);
@@ -792,7 +792,7 @@ fn ffi_memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_new_value(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "new", &["cdecl", "init"], 1)?;
+    let a = bind_method(args, "new", &["arg", "init"], 1)?;
     let roots = pyre_object::gc_roots::push_roots();
     let init_slot = roots.base();
     let init = if a[2].is_null() {
@@ -842,7 +842,7 @@ fn ffi_new_allocator(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_new_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "new_handle", &["x"], 1)?;
+    let a = bind_method(args, "new_handle", &["arg"], 1)?;
     let roots = pyre_object::gc_roots::push_roots();
     let value_slot = roots.base();
     let _ = roots.pin_root(a[1]);
@@ -884,7 +884,7 @@ fn ffi_release(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "sizeof", &["cdecl"], 1)?;
+    let a = bind_method(args, "sizeof", &["arg"], 1)?;
     let (w_ctype, size) = if let Some(cdata) = W_CData::from_obj(a[1]) {
         let mut w_ctype = cdata.ctype;
         let size = pyre_object::with_roots!(w_ctype => cdataobj::cdata_sizeof(a[1]))?;
@@ -917,7 +917,7 @@ fn ffi_string(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_typeof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "typeof", &["cdecl"], 1)?;
+    let a = bind_method(args, "typeof", &["arg"], 1)?;
     if wrapper::W_FunctionWrapper::from_obj(a[1]).is_some() {
         return wrapper::typeof_wrapper(a[1], a[0]);
     }
@@ -925,7 +925,7 @@ fn ffi_typeof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 fn ffi_dlopen(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "dlopen", &["name", "flags"], 1)?;
+    let a = bind_method(args, "dlopen", &["filename", "flags"], 1)?;
     let flags = if a[2].is_null() {
         0
     } else {
@@ -1141,7 +1141,7 @@ fn init_once_slowpath(
 }
 
 fn ffi_init_once(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let a = bind_method(args, "init_once", &["function", "tag"], 2)?;
+    let a = bind_method(args, "init_once", &["func", "tag"], 2)?;
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.base();
     for &value in &a {

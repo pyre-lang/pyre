@@ -2148,14 +2148,18 @@ pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
             "ldexp() takes exactly 2 arguments",
         ));
     }
-    // PyPy: pypy/module/math/interp_math.py::ldexp — second argument
-    // must be an integer (via `__index__`), not a float.
-    // interp_math.py::ldexp evaluates x before converting the exponent.
-    // Besides preserving callback order, this avoids retaining an unboxed
-    // exponent rbigint across x.__float__.
+    // interp_math.py `ldexp`: convert x first, then require a real `int`
+    // (`isinstance_w(w_i, space.w_int)`), not an `__index__` object.
     let w_x = args[0];
     let mut w_exp = args[1];
     let x = pyre_object::with_roots!(w_exp => try_get_double(w_x))?;
+    if !pyre_object::with_roots!(w_exp => unsafe {
+        pyre_interpreter::baseobjspace::isinstance_int_w(w_exp)
+    }) {
+        return Err(pyre_interpreter::PyError::type_error(
+            "integer required for second argument",
+        ));
+    }
     let exp_big = RBigIntGcRoot::new(get_bigint(w_exp)?);
     // Short-circuit special cases so an overflowing exponent doesn't
     // mask inf/nan propagation.

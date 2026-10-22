@@ -3582,7 +3582,7 @@ struct SpecializeArgtypeArgs {
 impl Parse for SpecializeArgtypeArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let indices =
-            syn::punctuated::Punctuated::<syn::LitInt, Token![,]>::parse_separated_nonempty(input)?;
+            syn::punctuated::Punctuated::<syn::LitInt, Token![,]>::parse_terminated(input)?;
         Ok(Self {
             indices: indices.into_iter().collect(),
         })
@@ -5364,6 +5364,12 @@ mod tests {
             .to_string();
         assert!(text.contains("\"specialize:argtype(0,1)\""), "{text}");
         assert!(text.contains("_annspecialcase_argtype_convert"), "{text}");
+    }
+
+    #[test]
+    fn specialize_argtype_empty_indices_emits_empty_hint() {
+        let text = specialize_argtype_tokens("", "fn convert(a: i64) -> i64 { a }").to_string();
+        assert!(text.contains("\"specialize:argtype()\""), "{text}");
     }
 
     #[test]
