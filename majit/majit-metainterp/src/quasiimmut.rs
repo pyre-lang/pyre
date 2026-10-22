@@ -1,12 +1,14 @@
 //! `rpython/jit/metainterp/quasiimmut.py` — the residual half of an
 //! `_immutable_fields_` entry spelled with a `?`.
 //!
-//! Only `do_force_quasi_immutable` lives here.  The recording half
-//! (`QuasiImmutDescr`, `get_current_qmut_instance`, `register_loop_token`)
-//! is reached through [`majit_ir::QuasiImmutHandle`], which the host
-//! implements; this is the other end, the one a `jit_force_quasi_immutable`
-//! bytecode runs when the blackhole executes the write that revokes the
-//! folded loops.
+//! `do_force_quasi_immutable` and `get_current_qmut_instance` live here.
+//! The host owns the mutate-field representation; majit computes the field
+//! address from the struct pointer and the mutate descr, then calls the
+//! matching [`HostHooks`](crate::pyjitpl::HostHooks) entry.  The recording
+//! half's `QuasiImmut` instance is reached through
+//! [`majit_ir::QuasiImmutHandle`], which the host implements; the force
+//! half is the one a `jit_force_quasi_immutable` bytecode runs when the
+//! write revokes the folded loops.
 //!
 //! Upstream's hidden `mutate_<name>` field holds a `GCREF` to a `QuasiImmut`
 //! instance, so the force reads the pointer, nulls it and invalidates what it
@@ -24,6 +26,36 @@
 /// ```
 /// as one host call taking the address of the hidden mutate field.
 pub type ForceQuasiImmutable = extern "C" fn(field_addr: i64);
+
+/// `quasiimmut.py get_current_qmut_instance(cpu, gcref, mutatefielddescr)`
+/// as one host call taking the address of the hidden mutate field.
+///
+/// Returns the field's current `QuasiImmut` instance, creating one when
+/// the field is still null.  A Rust `fn` (not `extern "C"`) because the
+/// result is an [`Arc`](std::sync::Arc) trait object.
+pub type GetCurrentQmutInstance =
+    fn(field_addr: i64) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle>;
+
+/// `quasiimmut.py get_current_qmut_instance(cpu, gcref, mutatefielddescr)`.
+///
+/// Computes the mutate-field address the same way
+/// [`do_force_quasi_immutable`] does and asks the host for the instance.
+pub fn get_current_qmut_instance(
+    struct_ptr: i64,
+    mutatefielddescr: &majit_jitcode::jitcode::BhDescr,
+) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle> {
+    let hook = crate::pyjitpl::host_hooks().get_current_qmut_instance;
+    // Reaching here means the codewriter emitted `record_quasiimmut_field`
+    // and the tracer is walking it, so the frontend is one that needs the
+    // hook.  Returning a dummy handle would mint a `QuasiImmutDescr` that
+    // cannot later invalidate the loops that folded this read.
+    let hook = hook.expect(
+        "record_quasiimmut_field executed with no host qmut-instance routine: \
+         call `publish_host_hooks` before running a jitcode that emits it",
+    );
+    let field_addr = struct_ptr.wrapping_add(mutatefielddescr.as_offset() as i64);
+    hook(field_addr)
+}
 
 /// `quasiimmut.py`:
 /// ```python

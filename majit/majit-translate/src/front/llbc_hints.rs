@@ -4,7 +4,8 @@
 //! `_jit_unroll_safe_<NAME>`, `_not_rpython_<NAME>`, `oopspec_<NAME>`,
 //! `_gctransformer_hint_close_stack_<NAME>`,
 //! `_call_aroundstate_target_<NAME>`,
-//! `_random_effects_on_gcobjs_<NAME>`).
+//! `_random_effects_on_gcobjs_<NAME>`,
+//! `_jit_llop_<NAME>`).
 //!
 //! The source attribute (`#[elidable]` / `#[dont_look_inside]` / …) is
 //! consumed by the proc-macro at expansion time and does NOT survive in
@@ -152,6 +153,24 @@ pub fn harvest_hints_from_llbcs<L: Borrow<Llbc>>(llbcs: &[L]) -> HashMap<String,
                     &mut out,
                     marker_path_to_fn_path(&path, "oopspec_", &function_paths),
                     &format!("oopspec:{spec}"),
+                );
+                continue;
+            }
+            // `#[jit_llop("opname")]` emits `_jit_llop_<NAME>: &'static str =
+            // "opname"`. The declaration stands for the upstream callee
+            // identity (`ExtRegistryEntry._about_`); the opname names the
+            // llop its calls specialize to.
+            if leaf.starts_with("_jit_llop_") {
+                let opname = global_marker_str(llbc, gd).unwrap_or_else(|| {
+                    panic!(
+                        "_jit_llop_ marker `{path}` has an undecodable string \
+                         initializer; this signals a marker encoding/decoder drift"
+                    )
+                });
+                push_hint(
+                    &mut out,
+                    marker_path_to_fn_path(&path, "_jit_llop_", &function_paths),
+                    &format!("llop:{opname}"),
                 );
                 continue;
             }
@@ -492,6 +511,12 @@ pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[
             && !spec.is_empty()
         {
             graph.func.oopspec = Some(spec.to_string());
+        }
+        if graph.func.llop.is_none()
+            && let Some(opname) = hint.strip_prefix("llop:")
+            && !opname.is_empty()
+        {
+            graph.func.llop = Some(opname.to_string());
         }
     }
 }
@@ -895,6 +920,19 @@ mod tests {
                 &functions,
             ),
             "rordereddict::<Impl>::lookup"
+        );
+    }
+
+    #[test]
+    fn marker_path_keeps_jit_llop_impl_body_local_parent() {
+        let functions = HashSet::from(["owner::Type::jit_force_quasi_immutable".to_string()]);
+        assert_eq!(
+            marker_path_to_fn_path(
+                "mod::owner::Type::jit_force_quasi_immutable::_jit_llop_jit_force_quasi_immutable",
+                "_jit_llop_",
+                &functions,
+            ),
+            "owner::Type::jit_force_quasi_immutable"
         );
     }
 

@@ -3342,6 +3342,11 @@ pub enum DispatchError {
     /// or decide whether to jump to the label target, so surface the
     /// missing concrete explicitly instead of guessing.
     GotoIfNotValueNotConcrete { pc: usize, value: OpRef },
+    /// `opimpl_jit_force_quasi_immutable` decides invalidate-and-abort vs
+    /// `GUARD_ISNULL` on the executed mutate-field value; without that
+    /// concrete value the walker cannot choose, so it surfaces the missing
+    /// concrete instead of assuming null.
+    ForceQuasiImmutableValueNotConcrete { pc: usize, value: OpRef },
     /// `OS_NOT_IN_TRACE` must run the callee concretely and record no
     /// IR on the normal path (`pyjitpl.py`). The standalone
     /// symbolic walker has no concrete executor, so it must stop here
@@ -3637,6 +3642,9 @@ impl DispatchError {
             Self::ExpectedSwitchDescr { .. } => "ExpectedSwitchDescr",
             Self::SwitchValueNotConcrete { .. } => "SwitchValueNotConcrete",
             Self::GotoIfNotValueNotConcrete { .. } => "GotoIfNotValueNotConcrete",
+            Self::ForceQuasiImmutableValueNotConcrete { .. } => {
+                "ForceQuasiImmutableValueNotConcrete"
+            }
             Self::NotInTraceRequiresConcreteExecution { .. } => {
                 "NotInTraceRequiresConcreteExecution"
             }
@@ -3724,6 +3732,7 @@ impl DispatchError {
             | Self::ExpectedSwitchDescr { pc, .. }
             | Self::SwitchValueNotConcrete { pc, .. }
             | Self::GotoIfNotValueNotConcrete { pc, .. }
+            | Self::ForceQuasiImmutableValueNotConcrete { pc, .. }
             | Self::NotInTraceRequiresConcreteExecution { pc, .. }
             | Self::JitForceVirtualRequiresConcreteResolver { pc, .. }
             | Self::VableBoxNotSeeded { pc, .. }
@@ -14576,6 +14585,8 @@ fn handle<Sym: WalkSym>(
         // `execute_with_descr` records and executes GETFIELD_GC_R; it does
         // not consult or populate the heapcache (unlike
         // `_opimpl_getfield_gc_any_pureornot`).
+        // An unobserved mutate value declines (upstream `execute_with_descr`
+        // always executes the load).
         "jit_force_quasi_immutable/rd" => {
             let obj = read_ref_reg(code, op, 0, ctx)?;
             let descr = read_descr(code, op, 1, ctx)?;
@@ -14583,7 +14594,12 @@ fn handle<Sym: WalkSym>(
                 crate::state::execute_getfield_gc_r_uncached(ctx.trace_ctx, obj, descr.clone());
             let installed = match ctx.trace_ctx.box_value(mutatebox) {
                 Some(majit_ir::Value::Ref(r)) => r.0 != 0,
-                _ => false,
+                _ => {
+                    return Err(DispatchError::ForceQuasiImmutableValueNotConcrete {
+                        pc: op.pc,
+                        value: mutatebox,
+                    });
+                }
             };
             if installed {
                 let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj) else {

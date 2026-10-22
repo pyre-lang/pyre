@@ -308,9 +308,10 @@ impl Function {
 
     /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
     /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
-    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The codewriter
-    /// turns this call back into the llop (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace
-    /// never looks inside it.
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
     #[inline(never)]
     pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
         self.mutate_field(QuasiImmutSlot::from_mutate_field_name(mutatefieldname))

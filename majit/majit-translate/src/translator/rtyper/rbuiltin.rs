@@ -1745,6 +1745,76 @@ pub(super) fn rtype_jit_force_virtualizable(
     ))
 }
 
+/// Rust source marker for RPython `InstanceRepr.hook_setfield`.
+///
+/// Upstream emits `jit_force_quasi_immutable(vinst, c_fieldname)`
+/// during rtyping (`rclass.py`) and never annotates an invalidation
+/// body. The source marker is an ordinary call; this typer specializes
+/// it to that same llop. `jtransform.rewrite_op_jit_force_quasi_immutable`
+/// rewrites the residual in looked-inside JIT graphs.
+pub(super) fn rtype_jit_force_quasi_immutable(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_inst = hop
+        .args_r
+        .borrow()
+        .first()
+        .and_then(Clone::clone)
+        .ok_or_else(|| {
+            TyperError::message(
+                "rtype_jit_force_quasi_immutable: instance repr missing".to_string(),
+            )
+        })?;
+    let v_inst = hop.inputarg(&r_inst, 0)?;
+    hop.exception_cannot_occur()?;
+    // `InstanceRepr.hook_setfield` emits
+    // `jit_force_quasi_immutable(vinst, c_fieldname)` with
+    // `c_fieldname = inputconst(Void, 'mutate_' + fieldname)`.
+    // Arg 1 must be that constant string.
+    let fieldname = {
+        let args_s = hop.args_s.borrow();
+        let s1 = args_s.get(1).ok_or_else(|| {
+            TyperError::message(
+                "rtype_jit_force_quasi_immutable: field name missing; \
+                 rclass.py InstanceRepr.hook_setfield always passes a constant"
+                    .to_string(),
+            )
+        })?;
+        let cv = s1.const_().ok_or_else(|| {
+            TyperError::message(
+                "rtype_jit_force_quasi_immutable: field name is not a constant string; \
+                 rclass.py InstanceRepr.hook_setfield always passes a constant"
+                    .to_string(),
+            )
+        })?;
+        cv.as_text().map(str::to_string).ok_or_else(|| {
+            TyperError::message(
+                "rtype_jit_force_quasi_immutable: field name is not a constant string; \
+                 rclass.py InstanceRepr.hook_setfield always passes a constant"
+                    .to_string(),
+            )
+        })?
+    };
+    let c_fieldname = Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::byte_str(fieldname),
+        LowLevelType::Void,
+    ));
+    // hop.genop(resulttype=lltype.Void) returns its Void Variable.
+    // `GenopResult::Void` is resulttype=None and returns no Variable,
+    // which makes translate_hl_to_ll require s_ImpossibleValue instead
+    // of the marker's s_None annotation. `rclass.py hook_setfield`
+    // calls `llops.genop(..., resulttype=None)` because it is not a
+    // hop specialize_call.
+    Ok(hop.genop(
+        "jit_force_quasi_immutable",
+        vec![v_inst, c_fieldname],
+        GenopResult::LLType(LowLevelType::Void),
+    ))
+}
+
 /// `rlib/jit.py ConditionalCallEntry.specialize_call` for
 /// `_jit_conditional_call`.
 pub(super) fn rtype_jit_conditional_call(
@@ -6184,6 +6254,72 @@ mod tests {
                 assert!(matches!(c.value, ConstValue::Dict(_)));
             }
             other => panic!("cflags must be a Void dict constant, got {other:?}"),
+        }
+        match &last.result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),
+            other => panic!("the force result must be a Void Variable, got {other:?}"),
+        }
+        assert!(
+            llops._called_exception_is_here_or_cannot_occur,
+            "the typer must declare that the force cannot raise",
+        );
+    }
+
+    /// `rclass.py InstanceRepr.hook_setfield` emits the llop for every
+    /// quasi-immutable field write. Pyre spells that hook as a callable
+    /// marker, so this typer is what each setter's force resolves to,
+    /// and its emitted shape is what `jtransform.py
+    /// rewrite_op_jit_force_quasi_immutable` matches on.
+    #[test]
+    fn rtype_jit_force_quasi_immutable_emits_a_two_argument_void_llop() {
+        use crate::annotator::model::{SomeInteger, SomeString};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let hop = dummy_hop();
+        let inst = Variable::named("v_inst");
+        inst.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(inst));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        let inst_repr: Arc<dyn Repr> =
+            Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int")));
+        hop.args_r.borrow_mut().push(Some(inst_repr));
+
+        let mut s_field = SomeString::new(false, false);
+        s_field.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("mutate_closure")));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                "mutate_closure",
+            ))));
+        hop.args_s.borrow_mut().push(SomeValue::String(s_field));
+        hop.args_r.borrow_mut().push(None);
+
+        let result = rtype_jit_force_quasi_immutable(&hop, &HashMap::new())
+            .unwrap()
+            .expect("a None-returning marker must return its Void Variable");
+
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the quasi-immut llop is emitted");
+        assert_eq!(result, last.result);
+        assert_eq!(last.opname, "jit_force_quasi_immutable");
+        assert_eq!(
+            last.args.len(),
+            2,
+            "hook_setfield emits [vinst, c_fieldname]",
+        );
+        match &last.args[0] {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
+            other => panic!("the instance argument must stay a Variable, got {other:?}"),
+        }
+        match &last.args[1] {
+            Hlvalue::Constant(c) => {
+                assert_eq!(c.concretetype, Some(LowLevelType::Void));
+                assert_eq!(c.value.as_pystr(), Some("mutate_closure"));
+            }
+            other => panic!("c_fieldname must be a Void constant, got {other:?}"),
         }
         match &last.result {
             Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),

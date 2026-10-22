@@ -11528,4 +11528,248 @@ mod tests {
     fn build_vable_snapshot_boxes_panics_on_an_untyped_entry() {
         build_vable_snapshot_boxes(&[majit_ir::OpRef::NONE, majit_ir::OpRef::ref_op(7)]);
     }
+
+    /// Process-global `HOST_HOOKS` is one slot; these tests save and restore
+    /// it under a lock so they cannot overwrite each other or a sibling.
+    static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    fn with_host_hooks<T>(hooks: crate::HostHooks, f: impl FnOnce() -> T) -> T {
+        let _guard = HOOK_TEST_LOCK.lock();
+        let saved = crate::host_hooks();
+        crate::publish_host_hooks(hooks);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        crate::publish_host_hooks(saved);
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestQmutHandle;
+    impl majit_ir::QuasiImmutHandle for TestQmutHandle {
+        fn is_current(&self) -> bool {
+            true
+        }
+        fn register_loop_token(&self, _token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>) {}
+        fn instance_identity(&self) -> usize {
+            1
+        }
+    }
+
+    fn test_get_current_qmut_instance(
+        _field_addr: i64,
+    ) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle> {
+        std::sync::Arc::new(TestQmutHandle)
+    }
+
+    fn quasi_layout(builder: &mut JitCodeBuilder, type_id: u64) {
+        builder.register_struct_layout(
+            16,
+            type_id,
+            true,
+            false,
+            &[
+                (0, false, "value", 8, true, false),
+                (8, true, "mutate_value", 8, false, false),
+            ],
+            "value?",
+        );
+    }
+
+    /// A second `record_quasiimmut_field` on the same box is heapcache-known
+    /// and records nothing; the first records `QUASIIMMUT_FIELD` +
+    /// `GUARD_NOT_INVALIDATED`.
+    #[test]
+    fn record_quasiimmut_field_second_on_same_box_is_heapcache_known() {
+        const TYPE_ID: u64 = 0x5155_14_01;
+        let mut obj = [42u64, 0];
+        let ptr = obj.as_mut_ptr() as i64;
+
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        quasi_layout(&mut builder, TYPE_ID);
+        builder.live(&mut asm, &[], &[0], &[]);
+        builder.record_quasiimmut_field(0, TYPE_ID, "value", "mutate_value");
+        builder.live(&mut asm, &[], &[0], &[]);
+        builder.record_quasiimmut_field(0, TYPE_ID, "value", "mutate_value");
+        let jitcode = builder.finish();
+        number_the_descrs(&jitcode);
+
+        let hooks = crate::HostHooks {
+            get_current_qmut_instance: Some(test_get_current_qmut_instance),
+            ..crate::HostHooks::default()
+        };
+        let opcodes = with_host_hooks(hooks, || {
+            let mut ctx = context_with_liveness(&[Type::Ref], &asm);
+            let struct_ref = ctx.const_ref(ptr);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[(JitArgKind::Ref, struct_ref, ptr)],
+            );
+            assert!(matches!(action, TraceAction::Continue));
+            ctx.into_recorder()
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            opcodes,
+            vec![OpCode::QuasiimmutField, OpCode::GuardNotInvalidated],
+            "second record_quasiimmut_field on the same box must be heapcache-known",
+        );
+        let _keep = &obj;
+    }
+
+    /// A null mutate field records `GETFIELD_GC_R` + `GUARD_ISNULL` and does
+    /// not call the force hook.
+    #[test]
+    fn jit_force_quasi_immutable_null_mutate_guards_isnull() {
+        const TYPE_ID: u64 = 0x5155_14_02;
+        let mut obj = [0u64, 0];
+        let ptr = obj.as_mut_ptr() as i64;
+        static FORCE_ADDR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        FORCE_ADDR.store(0, std::sync::atomic::Ordering::SeqCst);
+        extern "C" fn force_hook(field_addr: i64) {
+            FORCE_ADDR.store(field_addr, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        quasi_layout(&mut builder, TYPE_ID);
+        builder.live(&mut asm, &[], &[0], &[]);
+        builder.jit_force_quasi_immutable(0, TYPE_ID, "mutate_value");
+        let jitcode = builder.finish();
+        number_the_descrs(&jitcode);
+
+        let hooks = crate::HostHooks {
+            force_quasi_immutable: Some(force_hook),
+            ..crate::HostHooks::default()
+        };
+        let opcodes = with_host_hooks(hooks, || {
+            let mut ctx = context_with_liveness(&[Type::Ref], &asm);
+            let struct_ref = ctx.const_ref(ptr);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[(JitArgKind::Ref, struct_ref, ptr)],
+            );
+            assert!(matches!(action, TraceAction::Continue));
+            ctx.into_recorder()
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(opcodes, vec![OpCode::GetfieldGcR, OpCode::GuardIsnull],);
+        assert_eq!(FORCE_ADDR.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _keep = &obj;
+    }
+
+    /// A nonnull mutate field calls the force hook and returns
+    /// `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`.
+    #[test]
+    fn jit_force_quasi_immutable_nonnull_mutate_switches_to_blackhole() {
+        const TYPE_ID: u64 = 0x5155_14_03;
+        let mut obj = [0u64, 0x11];
+        let ptr = obj.as_mut_ptr() as i64;
+        static FORCE_ADDR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        FORCE_ADDR.store(0, std::sync::atomic::Ordering::SeqCst);
+        extern "C" fn force_hook(field_addr: i64) {
+            FORCE_ADDR.store(field_addr, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        quasi_layout(&mut builder, TYPE_ID);
+        builder.live(&mut asm, &[], &[0], &[]);
+        builder.jit_force_quasi_immutable(0, TYPE_ID, "mutate_value");
+        let jitcode = builder.finish();
+        number_the_descrs(&jitcode);
+
+        let hooks = crate::HostHooks {
+            force_quasi_immutable: Some(force_hook),
+            ..crate::HostHooks::default()
+        };
+        let (action, opcodes) = with_host_hooks(hooks, || {
+            let mut ctx = context_with_liveness(&[Type::Ref], &asm);
+            let struct_ref = ctx.const_ref(ptr);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[(JitArgKind::Ref, struct_ref, ptr)],
+            );
+            let opcodes = ctx
+                .into_recorder()
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>();
+            (action, opcodes)
+        });
+        match action {
+            TraceAction::SwitchToBlackhole(s) => {
+                assert_eq!(s.reason, crate::counters::ABORT_FORCE_QUASIIMMUT);
+                assert!(!s.raising_exception);
+            }
+            other => panic!("expected SwitchToBlackhole, got {other:?}"),
+        }
+        assert_eq!(opcodes, vec![OpCode::GetfieldGcR]);
+        assert_eq!(
+            FORCE_ADDR.load(std::sync::atomic::Ordering::SeqCst),
+            ptr.wrapping_add(8),
+        );
+        let _keep = &obj;
+    }
+
+    /// A null struct pointer aborts rather than treating the mutate field as
+    /// null (`GUARD_ISNULL`).
+    #[test]
+    fn jit_force_quasi_immutable_null_struct_aborts() {
+        const TYPE_ID: u64 = 0x5155_14_04;
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        quasi_layout(&mut builder, TYPE_ID);
+        builder.live(&mut asm, &[], &[0], &[]);
+        builder.jit_force_quasi_immutable(0, TYPE_ID, "mutate_value");
+        let jitcode = builder.finish();
+        number_the_descrs(&jitcode);
+
+        let mut ctx = context_with_liveness(&[Type::Ref], &asm);
+        let struct_ref = ctx.const_ref(0);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            0,
+            |_pc| 0,
+            &[(JitArgKind::Ref, struct_ref, 0)],
+        );
+        assert!(matches!(action, TraceAction::Abort));
+        let opcodes: Vec<_> = ctx
+            .into_recorder()
+            .ops()
+            .iter()
+            .map(|op| op.opcode)
+            .collect();
+        assert!(
+            opcodes.is_empty(),
+            "null struct must not record GETFIELD or GUARD_ISNULL, got {opcodes:?}"
+        );
+    }
 }

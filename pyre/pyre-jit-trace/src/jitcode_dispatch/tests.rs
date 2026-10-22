@@ -5019,6 +5019,44 @@ fn goto_if_not_requires_concrete_int_value() {
     );
 }
 
+#[test]
+fn jit_force_quasi_immutable_declines_unobserved_mutate_value() {
+    // `jit_force_quasi_immutable/rd` needs the executed mutate-field
+    // value to choose invalidate-and-abort vs `GUARD_ISNULL`. A
+    // receiver with no concrete leaves the GETFIELD_GC_R result
+    // unstamped, so the arm must surface
+    // `ForceQuasiImmutableValueNotConcrete` rather than assume null.
+    let byte = *insns_opname_to_byte()
+        .get("jit_force_quasi_immutable/rd")
+        .expect("`jit_force_quasi_immutable/rd` must be in insns table");
+    // Operand layout `rd`: 1B r-reg + 2B descr-index.
+    let code = [byte, 0x00, 0x00, 0x00];
+    let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(
+        1,
+        16,
+        8,
+        majit_ir::Type::Ref,
+        false,
+    ));
+    let descr_pool = vec![descr];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = [OpRef::input_arg_ref(0)];
+    let err = run_hint_step_with_descrs(&code, &mut tc, &mut regs_r, &mut [], &mut [], &descr_pool)
+        .expect_err("unobserved mutate value must not assume null");
+    let last = tc
+        .ops()
+        .last()
+        .expect("GETFIELD_GC_R is recorded before the decline");
+    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcR);
+    assert_eq!(
+        err,
+        DispatchError::ForceQuasiImmutableValueNotConcrete {
+            pc: 0,
+            value: last.pos().get(),
+        }
+    );
+}
+
 /// Production-like `sub_jitcode_lookup` that resolves `idx` against
 /// `crate::jitcode_runtime::all_jitcodes()`. Used by the end-to-end
 /// helper acceptance tests (`walk_return_value_helper_*`,

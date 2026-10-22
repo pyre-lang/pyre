@@ -11,6 +11,7 @@
 /// - #[not_rpython]: objectmodel.py — Reject from RPython flow graphs
 ///
 /// majit-specific extensions:
+/// - #[jit_llop]: ExtRegistryEntry._about_ — declare the llop a call specializes to
 /// - #[jit_driver]: Annotate an interpreter's main dispatch loop
 /// - #[jit_interp]: Auto-generate trace_instruction and JitState from dispatch
 /// - #[jit_inline]: Serialize a helper into a hidden sub-JitCode
@@ -3814,6 +3815,70 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Body-local `_jit_llop_<NAME>` is what `harvest_hints_from_llbcs` keys
+/// (`_jit_llop_` prefix); Charon promotes it under the function path, and
+/// `marker_path_to_fn_path` binds that parent.
+fn jit_llop_body_markers(fn_ident: &Ident, opname: &str) -> proc_macro2::TokenStream {
+    let body_name = format_ident!("_jit_llop_{}", fn_ident);
+    quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals, dead_code)]
+        const #body_name: &'static str = #opname;
+    }
+}
+
+/// Module-level sibling for a free function. Methods skip it: a trait impl
+/// rejects a foreign associated item (`rpython_attribute_const_for`).
+fn jit_llop_sibling_const(
+    vis: &syn::Visibility,
+    fn_ident: &Ident,
+    opname: &str,
+) -> proc_macro2::TokenStream {
+    let const_name = format_ident!("_jit_llop_{}", fn_ident);
+    quote! {
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis const #const_name: &'static str = #opname;
+    }
+}
+
+fn expand_jit_llop_item(opname: &str, func: &ItemFn) -> proc_macro2::TokenStream {
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &func.sig;
+    let block = &func.block;
+    let body_markers = jit_llop_body_markers(&sig.ident, opname);
+    let sibling = if sig.receiver().is_none() {
+        Some(jit_llop_sibling_const(vis, &sig.ident, opname))
+    } else {
+        None
+    };
+    quote! {
+        #(#attrs)*
+        #vis #sig {
+            #body_markers
+            #block
+        }
+
+        #sibling
+    }
+}
+
+/// The declaration stands for the upstream callee identity
+/// (`ExtRegistryEntry._about_`); the opname names the llop its calls
+/// specialize to.
+///
+/// The function stays an ordinary callable, so the untranslated (native)
+/// path still runs its body.
+///
+/// Usage: `#[jit_llop("jit_force_quasi_immutable")]`
+#[proc_macro_attribute]
+pub fn jit_llop(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let opname: syn::LitStr = parse_macro_input!(attr as syn::LitStr);
+    let func = parse_macro_input!(item as ItemFn);
+    expand_jit_llop_item(&opname.value(), &func).into()
+}
+
 /// Look inside (including unrolling loops) the target function, if and only if
 /// `predicate(args)` returns true.
 ///
@@ -5472,6 +5537,57 @@ mod tests {
             sibling_const_names(&items)
                 .iter()
                 .any(|name| name == "oopspec_lookup_trampoline")
+        );
+    }
+
+    #[test]
+    fn jit_llop_emits_body_local_marker_and_free_function_sibling() {
+        let func = parse_fn(
+            r#"
+            pub fn jit_force_quasi_immutable(x: i64) {
+                x;
+            }
+            "#,
+        );
+        let items = parse_expansion_items(expand_jit_llop_item("jit_force_quasi_immutable", &func));
+        let expanded = expansion_fn(&items, "jit_force_quasi_immutable");
+        assert!(
+            const_has_str(
+                expanded,
+                "_jit_llop_jit_force_quasi_immutable",
+                "jit_force_quasi_immutable"
+            ),
+            "body-local _jit_llop_<NAME>, got {:?}",
+            fn_const_names(expanded)
+        );
+        assert!(
+            sibling_const_names(&items)
+                .iter()
+                .any(|name| name == "_jit_llop_jit_force_quasi_immutable"),
+            "free function sibling, got {:?}",
+            sibling_const_names(&items)
+        );
+    }
+
+    #[test]
+    fn jit_llop_method_emits_body_local_marker_without_sibling() {
+        let func = parse_fn(
+            r#"
+            pub fn jit_force_quasi_immutable(&self, name: &'static str) {}
+            "#,
+        );
+        let tokens = expand_jit_llop_item("jit_force_quasi_immutable", &func);
+        let items = parse_expansion_items(tokens.clone());
+        assert_eq!(items.len(), 1, "methods skip the sibling const: {tokens}");
+        let expanded = expansion_fn(&items, "jit_force_quasi_immutable");
+        assert!(
+            const_has_str(
+                expanded,
+                "_jit_llop_jit_force_quasi_immutable",
+                "jit_force_quasi_immutable"
+            ),
+            "body-local _jit_llop_<NAME>, got {:?}",
+            fn_const_names(expanded)
         );
     }
 }

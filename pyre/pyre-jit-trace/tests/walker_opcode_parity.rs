@@ -303,14 +303,6 @@ const PYRE_ONLY: &[&str] = &[
     "setinteriorfield_gc_f/rifd",
     "setinteriorfield_gc_i/riid",
     "setinteriorfield_gc_r/rird",
-    // `jtransform.py rewrite_op_getfield` emits this ahead of a
-    // quasi-immutable getfield. Majit's tracer has no arm; the production
-    // walk records it here. The blackhole handler is the no-op
-    // `bhimpl_record_quasiimmut_field`.
-    "record_quasiimmut_field/rdd",
-    // `pyjitpl.py opimpl_jit_force_quasi_immutable`. Majit's tracer has
-    // no arm; the production walk records it here.
-    "jit_force_quasi_immutable/rd",
     // Constant-index string read (`pyjitpl.py opimpl_strgetitem`). Majit's
     // `BC_STRLEN` / `BC_STRGETITEM` arms decode the register-index shapes
     // only.

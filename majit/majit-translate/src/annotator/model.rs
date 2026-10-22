@@ -2763,6 +2763,7 @@ impl SomeValue {
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::LoopHeader { .. }
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::ForType { .. }
                             | crate::translator::rtyper::extregistry::ExtRegistryEntry::JitForceVirtualizable
+                            | crate::translator::rtyper::extregistry::ExtRegistryEntry::JitForceQuasiImmutable
                     )
                 {
                     return entry.compute_annotation_with_kwds(&bk, &kwds_s).map(Some);

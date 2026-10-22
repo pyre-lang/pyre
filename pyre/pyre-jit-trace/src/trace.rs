@@ -7204,7 +7204,11 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // entry is keyed on the guard descr, which that cell does not
                 // gate, so this attempt aborts and `jitcounter.tick` leaves
                 // the guard to be traced again.
-                DE::GotoIfNotValueNotConcrete { .. } => {
+                // `ForceQuasiImmutableValueNotConcrete` is the same class: an
+                // unobserved mutate-field value cannot choose invalidate vs
+                // `GUARD_ISNULL`, and retracing the entry meets the same hole.
+                DE::GotoIfNotValueNotConcrete { .. }
+                | DE::ForceQuasiImmutableValueNotConcrete { .. } => {
                     fbw_decline(crate::driver::make_green_key(
                         w_code,
                         start_pc,

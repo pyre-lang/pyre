@@ -2835,6 +2835,12 @@ fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
         .iter()
         .find(|h| h.starts_with("specialize:"))
         .cloned();
+    func._jit_llop_ = graph
+        .hints
+        .iter()
+        .find_map(|h| h.strip_prefix("llop:"))
+        .filter(|opname| !opname.is_empty())
+        .map(str::to_string);
     func
 }
 
@@ -6415,6 +6421,17 @@ mod tests {
     fn an_access_directly_graph_outside_the_jit_set_fails_the_sanity_check() {
         let (registry, _) = registry_with_a_flagged_graph();
         check_access_directly_sanity(&registry, &HashSet::new());
+    }
+
+    #[test]
+    fn source_graph_func_sets_jit_llop_from_llop_hint() {
+        let mut graph = LegacyGraph::new("jit_force_quasi_immutable");
+        graph.hints.push("llop:jit_force_quasi_immutable".into());
+        let func = source_graph_func(&graph);
+        assert_eq!(
+            func._jit_llop_.as_deref(),
+            Some("jit_force_quasi_immutable")
+        );
     }
 
     #[test]
