@@ -3978,52 +3978,51 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // `GUARD_NO_EXCEPTION`. Record the residual, compute the error here.
     let record_init_none_check = constructor_result.is_some();
     let mut init_type_error = None;
+    if let Some((_, _)) = constructor_result
+        && let ResidualExecOutcome::Executed(Ok(result)) = &exec
+        && let Err(e) =
+            pyre_interpreter::call::check_init_returned_none(*result as pyre_object::PyObjectRef)
+    {
+        init_type_error = Some(e);
+    }
     if let Some((dst_bank, dst)) = dst {
         // `descr_call` discards `__init__`'s result after checking it is None
         // and returns `w_newobject`. The assembler result is `__init__`'s
         // return; writing that into the CALL dst made `C()` evaluate to None,
         // and residualizing the original CALL would re-run the prefix the
-        // sub-walk already executed. `opimpl_jit_merge_point` continues this
-        // frame, so the instance replaces None here, before GUARD_NOT_FORCED
-        // snapshots the dst. A non-None result skips the dst write: the CALL
-        // raises instead.
-        let write_err = if let Some((instance, instance_concrete)) = constructor_result {
-            if let ResidualExecOutcome::Executed(Ok(result)) = &exec
-                && let Err(e) = pyre_interpreter::call::check_init_returned_none(
-                    *result as pyre_object::PyObjectRef,
-                )
-            {
-                init_type_error = Some(e);
-            }
-            if init_type_error.is_some() {
-                Ok(())
-            } else {
-                match &exec {
-                    ResidualExecOutcome::Executed(Err(_)) => {
-                        write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
-                    }
-                    _ => write_ref_reg(ctx, pc, dst, instance, instance_concrete),
+        // sub-walk already executed. A constructor delays the instance write
+        // until after the None check: `GUARD_NOT_FORCED` captures
+        // `descr_call`'s tail (`ctor_continuation` assembler resume) so a
+        // force still runs the check and the tail's `ref_return` fills dest.
+        // A non-constructor CALL writes the assembler result before the
+        // guards, matching `do_residual_call`.
+        if constructor_result.is_none() {
+            let write_err = write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result);
+            if let Err(e) = write_err {
+                if leave_callee_ec {
+                    leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
+                } else {
+                    abandon_portal_scope(ctx);
                 }
+                return Err(e);
             }
-        } else {
-            write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
-        };
-        if let Err(e) = write_err {
-            if leave_callee_ec {
-                leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
-            } else {
-                abandon_portal_scope(ctx);
-            }
-            return Err(e);
         }
     }
     // `opimpl_jit_merge_point` pops the frame holding the merge point
     // (`finishframe(None, leave_portal_frame=False)`) before its caller
-    // records the call, so the guards below capture the callers alone. The
-    // inline route is already in its caller; the bridge resume is still in
-    // the callee and scopes its captures to the callers.
+    // records the call. A non-constructor captures the callers alone. A
+    // constructor plants `descr_call`'s tail above them (`W_TypeObject.descr_call`
+    // is still on `framestack` when `do_recursive_call` records
+    // `GUARD_NOT_FORCED`).
     let scope = GuardCaptureScope {
-        finished_callee_result: dst.is_none().then_some(ca_result),
+        finished_callee_result: if record_init_none_check {
+            None
+        } else {
+            dst.is_none().then_some(ca_result)
+        },
+        constructor_assembler: constructor_result
+            .as_ref()
+            .map(|(instance, _)| (*instance, ca_result)),
         ..Default::default()
     };
 
@@ -4116,6 +4115,14 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         }
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
+        // Compiled leftover only: a force resumes through the tail's
+        // `ref_return` instead. `write_ref_reg` updates the walk banks so
+        // later ops in this caller use the instance.
+        if let Some((_, dst)) = dst
+            && let Some((instance, instance_concrete)) = constructor_result
+        {
+            write_ref_reg(ctx, pc, dst, instance, instance_concrete)?;
+        }
     }
 
     Ok(Some(WalkerLoopCalleePortalRecord {
@@ -11587,7 +11594,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // executed. A recorder refusal blackholes from the merge point
             // (the mid-body latch above; `ctor_continuation` plays the
             // tail). When the recorder can emit, `descr_call`'s tail is the
-            // dst write that substitutes the instance for `__init__`'s None.
+            // assembler resume captured on `GUARD_NOT_FORCED`, and the
+            // instance dest write happens after the None check.
             if !loop_callee_portal_call_can_record(
                 ctx,
                 ca_callee_frame,

@@ -20,6 +20,7 @@ except ImportError:
 WARM = 400
 N = 20000
 flag = [0]
+force = [0]
 
 
 class C:
@@ -31,27 +32,59 @@ class C:
             return 1
 
 
+class Forced:
+    def __init__(self):
+        i = 0
+        while i < 5:
+            i += 1
+        if force[0]:
+            sys._getframe(1).f_locals
+            return 1
+
+
 def hot(n):
     for _ in range(n):
         C()
 
 
+def hot_forced(n):
+    for _ in range(n):
+        Forced()
+
+
+def expect_init_typeerror(fn):
+    try:
+        fn()
+        return None
+    except TypeError as e:
+        return str(e)
+
+
 def main():
+    expected = "__init__() should return None, not 'int'"
     hot(WARM)
     hot(N)
     flag[0] = 1
-    try:
-        hot(1)
-        print("FAIL expected TypeError from __init__ returning non-None")
+    got = expect_init_typeerror(lambda: hot(1))
+    if got != expected:
+        print("FAIL expected TypeError from __init__ returning non-None, got %r" % (got,))
         return 1
-    except TypeError as e:
-        got = str(e)
-        expected = "__init__() should return None, not 'int'"
-        if got != expected:
-            print("FAIL unexpected message: %r" % got)
-            return 1
-        print("PASS TypeError: %s" % got)
-        return 0
+    # The loop is already cut into CALL_ASSEMBLER. Forcing that call
+    # (`sys._getframe(1).f_locals` after warm-up) must still run
+    # `descr_call`'s None check: GUARD_NOT_FORCED used to resume in the
+    # caller with the instance and skip it.
+    hot_forced(WARM)
+    hot_forced(N)
+    force[0] = 1
+    got = expect_init_typeerror(lambda: hot_forced(1))
+    if got != expected:
+        print(
+            "FAIL expected TypeError from forced CALL_ASSEMBLER __init__ "
+            "returning non-None, got %r" % (got,)
+        )
+        return 1
+    print("PASS TypeError: %s" % got)
+    return 0
 
 
 sys.exit(main())

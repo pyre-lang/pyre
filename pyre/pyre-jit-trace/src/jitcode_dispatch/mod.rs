@@ -8195,6 +8195,13 @@ pub(crate) struct GuardCaptureScope {
     /// the innermost holding this box in its result slot.
     pub finished_callee_result: Option<OpRef>,
 
+    /// Constructor `CALL_ASSEMBLER`: the instance and `__init__`'s result.
+    /// `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` capture `descr_call`'s tail
+    /// (`ctor_continuation` assembler resume) above the callers, so a force
+    /// still runs `bh_check_init_returned_none` and `ref_return` of the
+    /// instance (`W_TypeObject.descr_call` after `get_and_call_args`).
+    pub constructor_assembler: Option<(OpRef, OpRef)>,
+
     /// Select which already-recorded guard op receives the resume position.
     /// Needed whenever the guard being captured is not the last thing recorded:
     /// `_nonstandard_virtualizable` (pyjitpl.py) emits its promote
@@ -8455,6 +8462,36 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         caller_py_pc: None,
         // `__init__`'s result register is pending, not live, at the resume
         // pc, so `boxes` has no place for a finished `__init__`'s result.
+        result_slot: CallResultSlot::Unknown,
+    })
+}
+
+/// `descr_call`'s tail after a constructor `CALL_ASSEMBLER`: `__init__` has
+/// already returned, so `INIT_RESULT_REG` is live beside the instance.
+///
+/// `capture_resumedata` (`pyjitpl.py`) takes this shape from `descr_call`
+/// itself — `do_residual_call` writes dest before `GUARD_NOT_FORCED`. Pyre
+/// plants the same level with both boxes so a force still runs the None check
+/// and `ref_return` fills the caller's pending dest.
+pub(crate) fn ctor_continuation_assembler_parent_frame(
+    instance: OpRef,
+    init_result: OpRef,
+) -> Option<InlineParentFrame> {
+    let jitcode_index = crate::ctor_continuation::jitcode_index()?;
+    let resume_pc = crate::ctor_continuation::assembler_resume_pc()?;
+    Some(InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+        resume_marker_jit_pc: Some(resume_pc),
+        boxes: vec![instance, init_result],
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
         result_slot: CallResultSlot::Unknown,
     })
 }

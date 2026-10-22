@@ -8839,8 +8839,14 @@ fn reconstruct_inline_recipe(
     // and `ref_return` of the instance, which the drain can carry out by
     // substituting the box on the way out.  Decode that one box here.
     if crate::ctor_continuation::is_installed_level(frame.jitcode_index) {
-        let [instance_value] = frame.values.as_slice() else {
-            decline!("CtorTailArity");
+        // In-call resume carries the instance alone (`r1` pending). After
+        // CALL_ASSEMBLER both registers are live; the tail still has to run
+        // `bh_check_init_returned_none`, so decline and let the blackhole
+        // execute it (`W_TypeObject.descr_call` after `get_and_call_args`).
+        let instance_value = match frame.values.as_slice() {
+            [instance_value] => instance_value,
+            [_, _] => decline!("CtorTailAssembler"),
+            _ => decline!("CtorTailArity"),
         };
         let (instance, _) = bridge_decode_box(
             ctx,
