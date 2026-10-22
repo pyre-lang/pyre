@@ -6240,6 +6240,16 @@ fn build_jit_driver_pair() -> JitDriverPair {
     );
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
+    // pyjitpl.py finish_setup: `self.blackholeinterpbuilder =
+    // BlackholeInterpBuilder(codewriter, self)`. The constructor body is
+    // `build_pyre_production_bh_builder`; `MetaInterpStaticData::new` still
+    // installs the generic empty inline-call-only builder for embedders
+    // that have no codewriter tables. `install_blackhole_builder` rebinds
+    // cpu after the replace (`BlackholeInterpBuilder.__init__`
+    // `self.cpu = codewriter.cpu`).
+    d.meta_interp().install_blackhole_builder(
+        pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder(),
+    );
     (d, info)
 }
 
@@ -7963,7 +7973,10 @@ fn drive_portal_metatrace(
             outcome
         }
         TraceAction::Abort | TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-            let mut builder = pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder();
+            let staticdata = std::sync::Arc::clone(&meta.staticdata);
+            let mut builder = majit_metainterp::SharedBlackholeInterpPool::new(
+                &staticdata.blackholeinterpbuilder,
+            );
             let per_frame =
                 pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
             let ec = pyre_interpreter::call::getexecutioncontext()
@@ -16698,7 +16711,7 @@ mod tests {
         );
         assert_eq!(&bytes[..baked.len()], baked);
 
-        let mut builder = pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder();
+        let mut builder = staticdata.blackholeinterpbuilder.lock();
         builder.setup_cached_control_opcodes(
             staticdata.op_live,
             staticdata.op_catch_exception,
@@ -16711,6 +16724,7 @@ mod tests {
             staticdata.op_catch_exception as u8
         );
         assert_eq!(blackhole.op_rvmprof_code, staticdata.op_rvmprof_code as u8);
+        builder.release_interp(blackhole);
     }
 
     #[allow(dead_code)]

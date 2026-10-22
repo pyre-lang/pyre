@@ -21,7 +21,7 @@ pub use frame::{MIFrame, MIFrameStack};
 use indexmap::IndexMap;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering, compiler_fence},
 };
 
 use crate::jitprof::Instant;
@@ -2563,7 +2563,12 @@ pub struct MetaInterp<M: Clone> {
     /// warmspot.py `WarmRunnerDesc.memory_manager`, shared by every
     /// `jitdriver_sd.warmstate` (`warmstate.py set_param_retrace_limit`).
     pub memory_manager: crate::memmgr::MemoryManager,
-    pub(crate) backend: BackendImpl,
+    /// warmspot.py creates one `cpu` and hands the same object to
+    /// `codewriter` / `metainterp_sd`. Boxed so the `BackendImpl` heap
+    /// address stays stable across `MetaInterp` moves (`JitDriver { meta }`);
+    /// `BlackholeInterpBuilder.cpu` stores that address
+    /// (`blackhole.py` `self.cpu = codewriter.cpu`).
+    pub(crate) backend: Box<BackendImpl>,
     /// Keyed by `(jitdriver_sd.index, cell green_key)`. Cell keys are unique
     /// only inside one `WarmEnterState` (`warmstate.py JitCell`).
     pub(crate) compiled_loops: crate::FxIndexMap<(usize, u64), CompiledEntry<M>>,
@@ -4596,7 +4601,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             jitcounter: crate::warmstate::new_runner_jitcounter(),
             memory_manager: crate::warmstate::new_runner_memory_manager(),
-            backend: BackendImpl::new(),
+            backend: Box::new(BackendImpl::new()),
             compiled_loops: crate::FxIndexMap::default(),
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
@@ -4699,7 +4704,7 @@ impl<M: Clone> MetaInterp<M> {
         std::sync::Arc::get_mut(staticdata)
             .expect("MetaInterpStaticData must be uniquely owned during MetaInterp::new")
             .jit_starting_line = format!("JIT starting ({})", backend.backend_name());
-        staticdata.attach_descrs_to_cpu(backend);
+        staticdata.attach_descrs_to_cpu(backend.as_mut());
         // jitprof.py:105-106 `self.cpu.tracker` — bind the profiler's
         // tracker handle to the backend's `CpuTotalTracker` Arc so
         // `TOTAL_COMPILED_*` / `TOTAL_FREED_*` reads route to the same
@@ -4716,7 +4721,39 @@ impl<M: Clone> MetaInterp<M> {
         // exists from the start so its state carries this threshold.
         this.ensure_default_driver_sd();
         this.warm_state_for_driver(0).set_threshold(threshold);
+        // `BlackholeInterpBuilder.__init__` sets `self.cpu = codewriter.cpu`
+        // once. The wired builder is already installed; bind the MetaInterp
+        // CPU here so `acquire_interp` copies it and consume does not rebind.
+        // `backend` is `Box<BackendImpl>`, so this address survives
+        // `JitDriver { meta }` moving `this`.
+        this.bind_blackhole_builder_shared_fields();
         this
+    }
+
+    /// `BlackholeInterpBuilder.__init__` copies `codewriter.cpu` and
+    /// `setup_insns(asm.insns)` onto the builder once. `acquire_interp`
+    /// copies those fields; it does not rebind them.
+    ///
+    /// Skip the opcode copy while `op_live` is still the constructor
+    /// sentinel `-1`: the wired builder already has `setup_insns` bytes,
+    /// and `setup_cached_control_opcodes(-1, …)` would store `BC_ABSENT`.
+    fn bind_blackhole_builder_shared_fields(&self) {
+        let mut builder = self.staticdata.blackholeinterpbuilder.lock();
+        builder.set_cpu(self.blackhole_cpu());
+        if self.staticdata.op_live >= 0 {
+            builder.setup_cached_control_opcodes(
+                self.staticdata.op_live,
+                self.staticdata.op_catch_exception,
+                self.staticdata.op_rvmprof_code,
+            );
+        }
+    }
+
+    /// `pyjitpl.py` `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`.
+    /// Replaces the staticdata builder, then binds this MetaInterp's cpu.
+    pub fn install_blackhole_builder(&self, builder: crate::blackhole::BlackholeInterpBuilder) {
+        self.staticdata.blackholeinterpbuilder.install(builder);
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// `warmspot.py` `self.metainterp_sd.finish_setup(self.codewriter)`
@@ -4746,29 +4783,37 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         codewriter: &dyn majit_jitcode::codewriter::codewriter::CodeWriterSetup,
     ) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::finish_setup called after `staticdata` was cloned; \
-             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
-        );
-        staticdata.finish_setup(codewriter);
-        // pyjitpl.py `finish_setup_descrs`: PyPy invokes
-        // this as the immediately-following lifecycle step from
-        // `warmspot.py:289` after `finish_setup(codewriter)`. Pyre
-        // mirrors the call ordering — auto-invocation here means
-        // pyre-jit's bootstrap doesn't need a second hook, and every
-        // production caller of `MetaInterp::finish_setup` picks up
-        // `compute_bitstrings` for free.
-        staticdata.finish_setup_descrs();
-        // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol
-        //                                  .callinfocollection`. Upstream
-        // exposes the populated collection through `metainterp.staticdata
-        // .callinfocollection`; pyre's distribution path threads it as the
-        // `Option<Arc<…>>` field on `MetaInterp` (consumed by optimizer /
-        // unroll / cranelift / pyre-jit eval guard-exit). Seeding the Arc
-        // here means every later `self.callinfocollection.clone()` shares
-        // identity through `Arc::clone` and the `vstring`/`Concat` resume
-        // paths see a populated table instead of `None`.
-        self.callinfocollection = Some(std::sync::Arc::new(staticdata.callinfocollection.clone()));
+        let callinfocollection = {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::finish_setup called after `staticdata` was cloned; \
+                 RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+            );
+            staticdata.finish_setup(codewriter);
+            // pyjitpl.py `finish_setup_descrs`: PyPy invokes
+            // this as the immediately-following lifecycle step from
+            // `warmspot.py` after `finish_setup(codewriter)`. Pyre
+            // mirrors the call ordering — auto-invocation here means
+            // pyre-jit's bootstrap doesn't need a second hook, and every
+            // production caller of `MetaInterp::finish_setup` picks up
+            // `compute_bitstrings` for free.
+            staticdata.finish_setup_descrs();
+            // pyjitpl.py `self.callinfocollection = codewriter.callcontrol
+            //                                  .callinfocollection`. Upstream
+            // exposes the populated collection through `metainterp.staticdata
+            // .callinfocollection`; pyre's distribution path threads it as the
+            // `Option<Arc<…>>` field on `MetaInterp` (consumed by optimizer /
+            // unroll / cranelift / pyre-jit eval guard-exit). Seeding the Arc
+            // here means every later `self.callinfocollection.clone()` shares
+            // identity through `Arc::clone` and the `vstring`/`Concat` resume
+            // paths see a populated table instead of `None`.
+            staticdata.callinfocollection.clone()
+        };
+        self.callinfocollection = Some(std::sync::Arc::new(callinfocollection));
+        // `finish_setup` assigned a fresh `BlackholeInterpBuilder(codewriter,
+        // self)` (`install_wired`). Rebind cpu / control opcodes the way
+        // `BlackholeInterpBuilder.__init__` copies `codewriter.cpu` and
+        // `setup_insns(asm.insns)`.
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// `pyjitpl.py finish_setup_descrs` lifecycle hook.
@@ -4803,7 +4848,7 @@ impl<M: Clone> MetaInterp<M> {
              must still have refcount 1; call before any tracing session \
              clones it",
         );
-        sd_mut.finish_setup_descrs_for_jitdrivers(backend);
+        sd_mut.finish_setup_descrs_for_jitdrivers(backend.as_mut());
     }
 
     /// Narrow lifecycle hook for state-field JIT: install the canonical
@@ -4818,11 +4863,14 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         asm: &majit_jitcode::codewriter::assembler::Assembler,
     ) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
-             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
-        );
-        staticdata.install_canonical_liveness(asm);
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
+                 RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+            );
+            staticdata.install_canonical_liveness(asm);
+        }
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// warmspot.py `self.metainterp_sd.jitcodes = jitcodes` — hand the
@@ -4929,13 +4977,16 @@ impl<M: Clone> MetaInterp<M> {
         insns: &indexmap::IndexMap<String, u8>,
         all_liveness: &[u8],
     ) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::install_liveness_from_build_parts called after `staticdata` was \
-             cloned; RPython warmspot.py:289 invariant requires a single owner at \
-             finish_setup time",
-        );
-        staticdata.setup_insns(insns);
-        staticdata.liveness_info.set(all_liveness.to_vec());
+        {
+            let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+                "MetaInterp::install_liveness_from_build_parts called after `staticdata` was \
+                 cloned; RPython warmspot.py:289 invariant requires a single owner at \
+                 finish_setup time",
+            );
+            staticdata.setup_insns(insns);
+            staticdata.liveness_info.set(all_liveness.to_vec());
+        }
+        self.bind_blackhole_builder_shared_fields();
     }
 
     /// Point `staticdata.liveness_info` at the lock `intern_liveness`
@@ -5162,7 +5213,7 @@ impl<M: Clone> MetaInterp<M> {
         // is re-bound inside the same method — re-run the attachment so
         // each driver picks the correct `done_with_this_frame_descr_*`
         // sibling and the cpu observes the shared exc_descr.
-        sd.finish_setup_descrs_for_jitdrivers(backend);
+        sd.finish_setup_descrs_for_jitdrivers(backend.as_mut());
     }
 
     /// warmspot.py:449 — the per-driver static result_type.
@@ -5332,7 +5383,7 @@ impl<M: Clone> MetaInterp<M> {
         } = self;
         let sd = std::sync::Arc::get_mut(staticdata)
             .expect("register_jitdriver_sd: staticdata has other owners");
-        let idx = sd.register_jitdriver_sd(jd, backend);
+        let idx = sd.register_jitdriver_sd(jd, backend.as_mut());
         // warmspot.py `make_enter_functions`: every `jd` gets its
         // `warmstate` as soon as the driver list is known.
         for jd_no in 0..self.staticdata.jitdrivers_sd.len() {
@@ -6545,7 +6596,7 @@ impl<M: Clone> MetaInterp<M> {
         // unbalanced (which would trigger later `debug_stop`
         // mismatch panics).
         let rollback = DebugSectionRollback::arm("jit-tracing");
-        self.staticdata._setup_once(&mut self.backend);
+        self.staticdata._setup_once(&mut *self.backend);
         // Profiler event opens after `_setup_once`, matching PyPy
         // line 2890.  `open_profiler_tracing_inner` is the
         // debug_start-skipping variant of `enter_profiler_tracing`
@@ -7062,7 +7113,7 @@ impl<M: Clone> MetaInterp<M> {
         // `_opimpl_getfield_gc_any_pureornot` reads `self.metainterp.cpu`.
         // MetaInterp owns both `tracing` and `backend`, and tracing is
         // torn down before `self` moves.
-        ctx.set_cpu(Some(&self.backend));
+        ctx.set_cpu(Some(&*self.backend));
         // pyjitpl.py `MetaInterp.cpu` for `execute_and_record` /
         // `executor.execute` (`model.py AbstractCPU`).
         ctx.set_metainterp_cpu(self.cpu.clone());
@@ -7297,7 +7348,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_loops = &self.compiled_loops;
         let staticdata = &self.staticdata;
         let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
-        let runtime_state = std::cell::RefCell::new(&mut self.backend);
+        let runtime_state = std::cell::RefCell::new(&mut *self.backend);
         let resolver = |_n: u64| -> Option<Arc<JitCellToken>> {
             // BC_CALL_ASSEMBLER descrs carry a Weak to the token object
             // (`JitCallAssemblerTarget`). Number is log-only.
@@ -7556,10 +7607,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `None` assigns the portal vable to every level, so a cancelled
     /// inlined callee would mark the caller's frame finished and publish
     /// the caller as `topframeref`.
-    pub fn run_blackhole_interp_to_cancel_tracing(
+    pub fn run_blackhole_interp_to_cancel_tracing<P: crate::blackhole::BlackholeInterpPool>(
         &mut self,
         stb: SwitchToBlackhole,
-        builder: &mut crate::blackhole::BlackholeInterpBuilder,
+        builder: &mut P,
         per_frame: Option<&[(i64, usize)]>,
         on_enter_level: Option<&dyn Fn(i64)>,
         on_leave_level: Option<&dyn Fn(i64)>,
@@ -7604,7 +7655,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         self.abort_trace(false);
-        builder.set_cpu(self.blackhole_cpu());
+        builder.with_builder(|builder| builder.set_cpu(self.blackhole_cpu()));
         let result = crate::jitdriver::drive_multi_frame_blackhole(
             builder,
             &mut self.framestack,
@@ -10175,7 +10226,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -11736,7 +11787,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -12834,7 +12885,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -13347,7 +13398,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -14562,6 +14613,15 @@ impl<M: Clone> MetaInterp<M> {
     /// recompile or redirect has already replaced, and entering that one
     /// re-enters invalidated machine code and fails GUARD_NOT_INVALIDATED on
     /// every iteration.
+    ///
+    /// `warmstate.py execute_assembler` is a method call: residual
+    /// `assembler_call_helper` compiles a bridge or loop into
+    /// `compiled_loops` before this returns, and `handle_fail` then
+    /// reads that map. Boxing `MetaInterp.backend` (one `cpu` object)
+    /// lets LLVM treat `&mut BackendImpl` as noalias with the sibling
+    /// IndexMap and CSE `compiled_entry` across the run; `traces.get`
+    /// then walks a freed map. Keep this a call boundary.
+    #[inline(never)]
     pub fn execute_assembler_at_dispatch_key(
         &mut self,
         procedure_token: &JitCellToken,
@@ -14613,6 +14673,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
+        // Escape the map so LLVM cannot CSE `compiled_entry_on_driver`
+        // across `func_execute_token` (`warmstate.py execute_assembler`).
+        compiler_fence(Ordering::SeqCst);
+        let _ = std::hint::black_box(&self.compiled_loops);
 
         self.consume_executed_frame(green_key, meta, frame)
     }
@@ -16067,7 +16131,15 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `AbstractResumeGuardDescr.must_compile` on the concrete descr:
-    /// `self.status`, then `jitcounter.tick(hash, increment)`.
+    /// `self.status`, then `jitcounter.tick(hash, increment)` with
+    /// `increment = jitdriver_sd.warmstate.increment_trace_eagerness`.
+    ///
+    /// `jitdriver_sd` is the argument `handle_fail(deadframe, metainterp_sd,
+    /// jitdriver_sd)` received from `execute_assembler` /
+    /// `assembler_call_helper`. `make_jitcell_token` sets
+    /// `outermost_jitdriver_sd` for CALL_ASSEMBLER keepalive
+    /// (`direct_assembler_call`); `must_compile` does not read
+    /// `rd_loop_token`.
     ///
     /// The plain `handle_fail` path already selected `ResumeGuardDescr` /
     /// `ResumeAtPositionDescr`. Forced and loop-version descrs override
@@ -16078,6 +16150,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_values: &[i64],
         guard_value_operand: Option<i64>,
         owning_key: u64,
+        jitdriver_sd: usize,
     ) -> (bool, u64) {
         let descr_addr = rgd as *const crate::compile::ResumeGuardDescr as usize;
         if rgd.bridge_declined_terminally.load(Ordering::Acquire) {
@@ -16093,11 +16166,9 @@ impl<M: Clone> MetaInterp<M> {
                     return (false, owning_key);
                 }
             };
-        let jct = unsafe { &*rgd.rd_loop_token_clt.get() }
-            .as_ref()
-            .and_then(|clt| clt.upgrade_loop_token());
-        let jd_no = self.jitdriver_index_for_failed_token(jct.as_deref());
-        let fired = self.warm_state_for_driver(jd_no).tick_guard_failure(hash);
+        let fired = self
+            .warm_state_for_driver(jitdriver_sd)
+            .tick_guard_failure(hash);
         if fired {
             crate::mc_diag_bump(4);
         }
@@ -16749,7 +16820,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
                 compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut self.backend,
+                    &mut *self.backend,
                     token.as_ref(),
                     trace_id,
                     &mut terminal_exit_layouts,
@@ -17848,7 +17919,7 @@ impl<M: Clone> MetaInterp<M> {
         // `setup_tracing` for the contract on raw-pointer lifetime
         // pinning by MetaInterp ownership.  Bridge traces share the
         // same backend reference as the source loop.
-        ctx.set_cpu(Some(&self.backend));
+        ctx.set_cpu(Some(&*self.backend));
         ctx.set_metainterp_cpu(self.cpu.clone());
         // pyjitpl.py:2898 `self.resumekey_original_loop_token = ...`.
         // Stash the source token on the trace context so
@@ -21435,7 +21506,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut warm = Self::jd_warmstate(staticdata, jd_index);
         let make_token = |memmgr: &mut crate::memmgr::MemoryManager| {
             compile::compile_tmp_callback(
-                backend,
+                backend.as_mut(),
                 target_sd,
                 green_key,
                 greenboxes,
@@ -22358,14 +22429,17 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Access the backend directly (for advanced operations).
     pub fn backend(&self) -> &BackendImpl {
-        &self.backend
+        &*self.backend
     }
 
     /// The same CPU object `BlackholeInterpBuilder.cpu` receives upstream.
     /// This trait-object view avoids exposing the selected BackendImpl type
     /// across crate boundaries while preserving object identity.
+    ///
+    /// The data pointer is the heap `BackendImpl`, not the `Box` header, so it
+    /// stays valid after `MetaInterp` moves.
     pub fn blackhole_cpu(&self) -> &dyn majit_backend::Backend {
-        &self.backend
+        &*self.backend
     }
 
     /// `cpu.asmmemmgr.get_stats()` used by
@@ -22376,7 +22450,7 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Access the backend mutably (for advanced operations).
     pub fn backend_mut(&mut self) -> &mut BackendImpl {
-        &mut self.backend
+        &mut *self.backend
     }
 
     pub fn backend_supports_dispatch_key_entry(&self) -> bool {
@@ -23059,9 +23133,13 @@ impl PartialEq<&[u8]> for SharedLiveness {
 /// `finish_setup` assigns `BlackholeInterpBuilder(codewriter, self)` once.
 /// `blackhole.py` `resume_in_blackhole` / `blackhole_from_resumedata` take
 /// that one builder. `acquire_interp` mutates `blackholeinterps` under the
-/// GIL; the mutex is that serialisation. The builder holds raw CPU pointers
-/// and is not Send; every access goes through the lock, which is how the
-/// single GIL object is shared on a free-threaded build.
+/// GIL; the mutex is that serialisation. The lock covers only builder
+/// operations (`acquire_interp`, `release_interp`, `setup_jitdrivers_sd`,
+/// `blackhole_from_resumedata` chain construction). `set_cpu` and
+/// `setup_cached_control_opcodes` run once at `MetaInterp::new` /
+/// `finish_setup`, matching `BlackholeInterpBuilder.__init__`. It is not
+/// held across `resume_mainloop` / `run` / a residual call, so a nested
+/// resume on the same thread pops another interpreter off this same builder.
 pub struct SharedBlackholeInterpBuilder {
     inner: parking_lot::Mutex<crate::blackhole::BlackholeInterpBuilder>,
 }
@@ -23085,6 +23163,9 @@ impl SharedBlackholeInterpBuilder {
     /// `BlackholeInterpBuilder(codewriter, self)`. Pyre's assembler insns
     /// are not the blackhole dispatch table; the constructor body is
     /// [`crate::blackhole::build_inline_call_only_bh_builder`].
+    /// Replaces the builder. The owner rebinds cpu afterwards
+    /// (`MetaInterp::new` / `finish_setup` call
+    /// `bind_blackhole_builder_shared_fields`).
     fn install_wired(&mut self) {
         *self.inner.get_mut() = crate::blackhole::build_inline_call_only_bh_builder(&[]);
     }
@@ -23092,49 +23173,53 @@ impl SharedBlackholeInterpBuilder {
     /// `resume_in_blackhole` reads `metainterp_sd.blackholeinterpbuilder`
     /// as a field pointer. Callers clone `MetaInterp.staticdata` first
     /// (`convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`)
-    /// so the guard does not borrow `MetaInterp` and resume writeback can
-    /// still take `&mut MetaInterp` while the builder is held.
+    /// so the guard does not borrow `MetaInterp`.
     ///
-    /// Upstream never holds the builder across a resume: `acquire_interp`
-    /// pops `blackholeinterps` or builds a new `BlackholeInterpreter`, so a
-    /// resume nested inside another resume's residual call gets fresh
-    /// interpreters off the same builder. Here the outer resume holds the
-    /// builder for its whole run, so a nested resume on this thread (or one
-    /// on another thread) gets a freshly wired builder instead of blocking
-    /// on the lock: the same fresh-interpreter outcome.
-    pub fn lock(&self) -> BlackholeInterpBuilderGuard<'_> {
-        match self.inner.try_lock() {
-            Some(guard) => BlackholeInterpBuilderGuard::Shared(guard),
-            None => BlackholeInterpBuilderGuard::Nested(Box::new(
-                crate::blackhole::build_inline_call_only_bh_builder(&[]),
-            )),
-        }
+    /// Drop the guard before `resume_mainloop` / `run` / any residual call:
+    /// `BlackholeInterpreter.__init__` already copied cpu/descrs/dispatch
+    /// off the builder, and holding the mutex across those would deadlock a
+    /// nested resume on this thread.
+    pub fn lock(&self) -> parking_lot::MutexGuard<'_, crate::blackhole::BlackholeInterpBuilder> {
+        self.inner.lock()
+    }
+
+    /// `pyjitpl.py` `MetaInterpStaticData.finish_setup` assigns
+    /// `self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)`.
+    /// Embedders with a codewriter-built builder install it here; the
+    /// constructor default remains [`crate::blackhole::build_inline_call_only_bh_builder`].
+    /// Replaces the builder and drops any previously bound cpu. The
+    /// owning MetaInterp rebinds through [`MetaInterp::install_blackhole_builder`].
+    pub fn install(&self, builder: crate::blackhole::BlackholeInterpBuilder) {
+        *self.lock() = builder;
+    }
+
+    /// Run `f` with the one builder locked, then drop the guard.
+    pub fn with_locked<R>(
+        &self,
+        f: impl FnOnce(&mut crate::blackhole::BlackholeInterpBuilder) -> R,
+    ) -> R {
+        f(&mut *self.lock())
     }
 }
 
-/// [`SharedBlackholeInterpBuilder::lock`]: the one builder, or a fresh one
-/// for a resume that runs while the one builder is held.
-pub enum BlackholeInterpBuilderGuard<'a> {
-    Shared(parking_lot::MutexGuard<'a, crate::blackhole::BlackholeInterpBuilder>),
-    Nested(Box<crate::blackhole::BlackholeInterpBuilder>),
+/// [`BlackholeInterpPool`](crate::blackhole::BlackholeInterpPool) adapter that
+/// locks [`SharedBlackholeInterpBuilder`] only for each pool operation.
+pub struct SharedBlackholeInterpPool<'a> {
+    shared: &'a SharedBlackholeInterpBuilder,
 }
 
-impl std::ops::Deref for BlackholeInterpBuilderGuard<'_> {
-    type Target = crate::blackhole::BlackholeInterpBuilder;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Shared(guard) => guard,
-            Self::Nested(builder) => builder,
-        }
+impl<'a> SharedBlackholeInterpPool<'a> {
+    pub fn new(shared: &'a SharedBlackholeInterpBuilder) -> Self {
+        Self { shared }
     }
 }
 
-impl std::ops::DerefMut for BlackholeInterpBuilderGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Shared(guard) => guard,
-            Self::Nested(builder) => builder,
-        }
+impl crate::blackhole::BlackholeInterpPool for SharedBlackholeInterpPool<'_> {
+    fn with_builder<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::blackhole::BlackholeInterpBuilder) -> R,
+    ) -> R {
+        self.shared.with_locked(f)
     }
 }
 
@@ -25739,7 +25824,7 @@ mod metainterp_static_data_tests {
                 ..
             } = &mut meta;
             let sd = std::sync::Arc::get_mut(staticdata).unwrap();
-            let _ = sd.register_jitdriver_sd(driver, backend);
+            let _ = sd.register_jitdriver_sd(driver, backend.as_mut());
         }
         meta.framestack.push(crate::pyjitpl::MIFrame::new(
             std::sync::Arc::new(jitcode),
@@ -27217,7 +27302,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         // `compile_and_run_once` runs `_setup_once` before any compile;
         // the CALL_ASSEMBLER below needs the WB slowpaths it builds.
-        meta.staticdata._setup_once(&mut meta.backend);
+        meta.staticdata._setup_once(&mut *meta.backend);
         let jd = meta.staticdata.jitdrivers_sd[idx].clone();
         let red_arg_types: Vec<majit_ir::Type> = Vec::new();
         assert_eq!(
@@ -27233,7 +27318,7 @@ mod metainterp_static_data_tests {
                 ..
             } = &mut meta;
             compile::compile_tmp_callback(
-                backend,
+                backend.as_mut(),
                 &jd,
                 0x00C0_FFEE,
                 &[],
@@ -27308,7 +27393,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         // `compile_and_run_once` runs `_setup_once` before any compile;
         // the temporary callback's CALL_ASSEMBLER needs its WB slowpaths.
-        meta.staticdata._setup_once(&mut meta.backend);
+        meta.staticdata._setup_once(&mut *meta.backend);
 
         let key = gk(0x5eC0);
         let planted = std::sync::Arc::new(majit_backend::JitCellToken::new(11));
@@ -29801,7 +29886,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
         jc.replace_jitdriver_sd(Some(idx));
         assert!(!meta.is_main_jitcode(&jc));
@@ -29821,7 +29906,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
 
         let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
@@ -29844,8 +29929,8 @@ mod metainterp_static_data_tests {
                 ..
             } = &mut meta;
             let sd = std::sync::Arc::get_mut(staticdata).unwrap();
-            sd.register_jitdriver_sd(first, backend);
-            sd.register_jitdriver_sd(second, backend)
+            sd.register_jitdriver_sd(first, backend.as_mut());
+            sd.register_jitdriver_sd(second, backend.as_mut())
         };
         assert_ne!(second_index, 0);
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
@@ -30084,7 +30169,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
 
         let mut jc = JitCodeBuilder::new().finish();
@@ -30169,7 +30254,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
 
         let mut jc = JitCodeBuilder::new().finish();
@@ -30215,7 +30300,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
         let mut jc = JitCodeBuilder::new().finish();
         jc.replace_jitdriver_sd(Some(idx));
@@ -30856,11 +30941,24 @@ mod metainterp_static_data_tests {
         let expected = codewriter.assembler.all_liveness().to_vec();
 
         let callcontrol = CallControl::new();
-        let mut meta = MetaInterp::<()>::new(0);
+        let meta = MetaInterp::<()>::new(0);
+        // warmspot.py hands one `cpu` object around. Boxing `MetaInterp.backend`
+        // keeps that heap address across the `JitDriver { meta }` move.
+        let cpu_ptr = meta.blackhole_cpu() as *const dyn majit_backend::Backend as *const ();
+        let mut meta = meta;
+        assert_eq!(
+            meta.blackhole_cpu() as *const dyn majit_backend::Backend as *const (),
+            cpu_ptr,
+            "MetaInterp.backend heap address is stable across a move",
+        );
         meta.finish_setup_descrs_for_jitdrivers();
         meta.finish_setup(&codewriter.with_callcontrol(&callcontrol));
 
         assert_eq!(meta.staticdata.liveness_info, expected);
+        assert!(
+            meta.staticdata.blackholeinterpbuilder.lock().has_cpu(),
+            "finish_setup install_wired rebinds BlackholeInterpBuilder.cpu"
+        );
     }
 
     #[test]
@@ -30950,6 +31048,26 @@ mod metainterp_static_data_tests {
             meta.staticdata.op_void_return,
             crate::jitcode::insns::BC_VOID_RETURN as i32,
         );
+        // `BlackholeInterpBuilder.__init__` copies cpu / `setup_insns`
+        // once. `MetaInterp::new` binds cpu; this hook copies the
+        // opcode ids `setup_insns` just wrote. `acquire_interp` then
+        // sees both without a per-resume rebind.
+        {
+            let builder = meta.staticdata.blackholeinterpbuilder.lock();
+            assert!(
+                builder.has_cpu(),
+                "MetaInterp::new binds BlackholeInterpBuilder.cpu"
+            );
+            assert_eq!(builder.op_live, crate::jitcode::insns::BC_LIVE);
+            assert_eq!(
+                builder.op_catch_exception,
+                crate::jitcode::insns::BC_CATCH_EXCEPTION,
+            );
+            assert_eq!(
+                builder.op_rvmprof_code,
+                crate::jitcode::insns::BC_RVMPROF_CODE,
+            );
+        }
     }
 
     #[test]
@@ -30981,7 +31099,7 @@ mod metainterp_static_data_tests {
             } = &mut meta;
             std::sync::Arc::get_mut(staticdata)
                 .unwrap()
-                .register_jitdriver_sd(jd, backend)
+                .register_jitdriver_sd(jd, backend.as_mut())
         };
         let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
         assert_eq!(sd.jitdrivers_sd[idx].index, Some(idx));
@@ -31081,16 +31199,18 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::{Arc, OnceLock};
 
-    /// A resume that starts while another resume holds
-    /// `metainterp_sd.blackholeinterpbuilder` (a residual call re-entering
-    /// the driver) must not block on it.
+    /// A resume that starts while another resume is running (a residual call
+    /// re-entering the driver) acquires from the same builder.
+    /// `blackhole.py` `acquire_interp` pops another interpreter; the lock
+    /// covers only that pop, so the nested resume does not block.
     #[test]
-    fn blackholeinterpbuilder_held_gives_a_nested_resume_a_fresh_builder() {
+    fn nested_resume_acquires_from_the_same_builder() {
         let sd = MetaInterpStaticData::new();
-        let outer = sd.blackholeinterpbuilder.lock();
-        let nested = sd.blackholeinterpbuilder.lock();
-        assert!(matches!(outer, BlackholeInterpBuilderGuard::Shared(_)));
-        assert!(matches!(nested, BlackholeInterpBuilderGuard::Nested(_)));
+        let outer = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let nested = sd.blackholeinterpbuilder.lock().acquire_interp();
+        let mut builder = sd.blackholeinterpbuilder.lock();
+        builder.release_interp(nested);
+        builder.release_interp(outer);
     }
 
     /// Producer-bound `Operand` for an op-arg / fail-arg `OpRef`, oparser-faithful
@@ -33362,7 +33482,7 @@ mod tests {
         );
         compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
         compile::patch_backend_terminal_recovery_layouts_for_trace(
-            &mut meta.backend,
+            &mut *meta.backend,
             &token,
             trace_id,
             &mut terminal_exit_layouts,
@@ -34663,7 +34783,7 @@ mod tests {
             staticdata
                 .jitdrivers_sd
                 .push(JitDriverStaticData::new(vec![], vec![]));
-            staticdata.finish_setup_descrs_for_jitdrivers(&mut meta.backend);
+            staticdata.finish_setup_descrs_for_jitdrivers(&mut *meta.backend);
         }
         assert_eq!(meta.staticdata.jitdrivers_sd[0].portal_runner_adr, 0);
         let key = gk(889);
@@ -35638,6 +35758,62 @@ mod tests {
         assert!(
             !meta.warm_state_for_driver(0).tick_guard_failure(hash),
             "driver 0's timetable did not receive the failed-token ticks"
+        );
+        let _keep = token;
+    }
+
+    #[test]
+    fn must_compile_resume_guard_ticks_handle_fail_jitdriver_sd() {
+        // `AbstractResumeGuardDescr.must_compile` ticks
+        // `jitdriver_sd.warmstate.increment_trace_eagerness` for the
+        // `jitdriver_sd` `handle_fail` was passed. The token's
+        // `outermost_jitdriver_sd` is CALL_ASSEMBLER keepalive and is
+        // not the counter.
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        meta.set_trace_eagerness(8);
+        meta.warm_state_for_driver(idx1)
+            .set_param_trace_eagerness(2);
+
+        let token = crate::compile::make_jitcell_token(Some(idx1));
+        token.set_number(91);
+        crate::compile::wire_clt_loop_token_wref(&token);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd = descr.as_fail_descr().expect("resume guard");
+        fd.set_rd_loop_token_clt(token.compiled_loop_token_expect());
+        let hash = meta.warm_state_for_driver(idx0).fetch_next_hash();
+        fd.store_hash(hash);
+        let rgd = crate::compile::resume_guard_from_fail(fd).expect("plain ResumeGuardDescr");
+
+        assert!(!meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0);
+        assert!(
+            !meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0,
+            "handle_fail's jitdriver_sd is idx0 (eagerness 8), so two ticks do not fire"
+        );
+        for _ in 0..5 {
+            assert!(!meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0);
+        }
+        assert!(
+            meta.must_compile_resume_guard(rgd, &[], None, 1, idx0).0,
+            "eighth tick on handle_fail's jitdriver_sd fires"
+        );
+        assert!(
+            !meta.warm_state_for_driver(idx1).tick_guard_failure(hash),
+            "outermost_jitdriver_sd's timetable did not receive the ticks"
         );
         let _keep = token;
     }

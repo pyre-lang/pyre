@@ -1503,6 +1503,11 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) -> Vec<majit_ir::OpRc> {
         let mut pendingfields = Vec::new();
+        // `AbstractCachedEntry.force_lazy_set` reads `optheap` as `self`
+        // and emits through `self.next_optimization`. Route extras from
+        // the heap index even when the guard was emitted by an earlier pass.
+        let saved_pass_idx = ctx.current_pass_idx;
+        ctx.current_pass_idx = self_pass_idx;
 
         // heap.py:610-621: iterate cached fields
         // Collect lazy sets WITHOUT consuming them: a virtual-valued
@@ -1533,36 +1538,9 @@ impl OptHeap {
                 pendingfields.push(op);
                 continue;
             }
-            // heap.py: cf.force_lazy_set(self, descr) →
-            // _lazy_set = None, invalidate, emit_extra(op, emit=False),
-            // then put_field_back_to_info restores the cache.
-            // optimizer.py setarg loop parity.
-            for arg_i in 0..op.num_args() {
-                op.setarg(arg_i, ctx.resolve_operand_operand(&op.arg(arg_i)));
-            }
-            let final_value = op.arg(1);
-            let field_idx = self.cached_fields[i].0;
-            // heap.py: invalidate(descr) — purity self-gate
-            // inside CachedField::invalidate (heap.py parity).
-            {
-                let (idx, descr, cf) = &mut self.cached_fields[i];
-                cf.lazy_set = None;
-                cf.invalidate(descr, *idx, ctx);
-            }
-            // heap.py put_field_back_to_info needs the lazy_set Op
-            // AFTER it's been emitted by emit_extra. Clone it so the
-            // structinfo write goes through `structinfo_setfield` (which
-            // also handles the constant arg0 → const_infos route).
-            let put_back_op = op.clone();
-            // emit_extra(op, emit=False): route through passes after heap.
-            // RPython: self.next_optimization — always starts AFTER heap,
-            // regardless of which pass emitted the guard that triggered this.
-            ctx.emit_extra_rc(self_pass_idx, op);
-            // heap.py: put_field_back_to_info — restore cache + PtrInfo.
-            // Struct base = op.getarg(0) (args already resolved above).
-            let obj_box = ctx.resolve_operand_operand(&put_back_op.arg(0));
-            self.cached_fields[i].2.register_info(&obj_box);
-            ctx.structinfo_setfield(&put_back_op, field_idx, &final_value);
+            // heap.py `cf.force_lazy_set(self, descr)`: emit postponed_op
+            // when a lazy-set arg `is` it, then `emit_extra(op, emit=False)`.
+            self.force_lazy_set_field_at(i, true, ctx);
         }
 
         // heap.py:622-636: iterate cached array items
@@ -1589,29 +1567,12 @@ impl OptHeap {
                 continue;
             }
 
-            // heap.py cf.force_lazy_set(...): consume the lazy set
-            // (the non-virtual arm is what clears it).
-            if let Some(cai) = self
-                .get_cached_array_submap_mut(descr_idx)
-                .and_then(|s| s.const_get_mut(index))
-            {
-                cai.lazy_set = None;
-            }
-            // optimizer.py:651-652 setarg loop parity.
-            for i in 0..op.num_args() {
-                op.setarg(i, ctx.resolve_operand_operand(&op.arg(i)));
-            }
-            let final_value = op.arg(2);
-            let array_ref = op.arg(0);
-            let descr = op.getdescr();
-            let put_back_op = op.clone();
-            // emit_extra(op, emit=False): route through passes after heap.
-            ctx.emit_extra_rc(self_pass_idx, op);
-            self.cache_arrayitem(&array_ref, descr_idx, index, descr.as_ref());
-            // info.py: ArrayPtrInfo.setitem — keep PtrInfo in sync.
-            ctx.arrayinfo_setitem(&put_back_op, index as usize, &final_value);
+            // heap.py `cf.force_lazy_set(self, descr)` — same postponed_op
+            // emit as the field arm.
+            self.force_lazy_set_array(descr_idx, index, true, ctx);
         }
 
+        ctx.current_pass_idx = saved_pass_idx;
         pendingfields
     }
 

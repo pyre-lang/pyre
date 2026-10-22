@@ -707,14 +707,15 @@ pub struct TraceCtx {
     /// value matches `upd.currfieldbox.getint()/getref_base()/
     /// constbox()` before bumping `HEAPCACHED_OPS`.
     ///
-    /// Pyre's `MetaInterp.backend: BackendImpl` owns the cpu; TraceCtx
+    /// Pyre's `MetaInterp.backend: Box<BackendImpl>` owns the cpu; TraceCtx
     /// lives alongside it on the same MetaInterp. The pointer captured
-    /// here is to the metainterp-owned backend; it stays valid for the
-    /// full duration of the trace because the metainterp does not
-    /// move while tracing is active. `None` (the default for unit
-    /// tests + standalone-trace entries) disables the sanity check —
-    /// mirroring RPython's `translate_support_code=True` mode where
-    /// the executor strips the load.
+    /// here is the heap `BackendImpl`; boxing keeps that address stable
+    /// across `MetaInterp` moves (`JitDriver { meta }`). Tracing still
+    /// does not move the metainterp while this pointer is live. `None`
+    /// (the default for unit tests + standalone-trace entries) disables
+    /// the sanity check — mirroring RPython's
+    /// `translate_support_code=True` mode where the executor strips the
+    /// load.
     ///
     /// Wired by `set_cpu` at trace setup; read by `field_sanity_load`
     /// which deref's the pointer to invoke `executor::do_getfield_gc_*`.

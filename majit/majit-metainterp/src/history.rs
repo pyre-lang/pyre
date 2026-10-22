@@ -3106,15 +3106,6 @@ impl TraceCtx {
         recorder.record_op_with_descr(opcode, args, descr)
     }
 
-    pub(crate) fn do_record_guard(
-        recorder: &mut Trace,
-        opcode: OpCode,
-        args: &[OpRef],
-        descr: Option<DescrRef>,
-    ) -> OpRef {
-        Self::do_record_guard_with_value(recorder, opcode, args, descr, None)
-    }
-
     pub(crate) fn do_record_guard_with_value(
         recorder: &mut Trace,
         opcode: OpCode,

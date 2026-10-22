@@ -210,27 +210,23 @@ pub fn drive_single_frame_blackhole(
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
 
-    let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
-    builder.set_cpu(cpu);
-    builder.setup_cached_control_opcodes(
-        metainterp_sd.op_live,
-        metainterp_sd.op_catch_exception,
-        metainterp_sd.op_rvmprof_code,
-    );
-    for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
-        *value = *forwarded;
-        miframe.set_forwarded_ref_value(*index, *forwarded);
-    }
-    if let Some(index) = exception_root {
-        last_exc_value = packed_ref_roots[index];
-    }
-    if let Some(index) = virtualizable_root {
-        virtualizable_ptr = packed_ref_roots[index];
-    }
+    let mut bh = {
+        let mut builder = metainterp_sd.blackholeinterpbuilder.lock();
+        builder.debug_assert_cpu(cpu);
+        for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
+            *value = *forwarded;
+            miframe.set_forwarded_ref_value(*index, *forwarded);
+        }
+        if let Some(index) = exception_root {
+            last_exc_value = packed_ref_roots[index];
+        }
+        if let Some(index) = virtualizable_root {
+            virtualizable_ptr = packed_ref_roots[index];
+        }
 
-    builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
-
-    let mut bh = builder.acquire_interp();
+        builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
+        builder.acquire_interp()
+    };
     bh.copy_data_from_miframe(miframe);
     bh.state_field_layout = state_field_layout;
     bh.virtualizable_info = virtualizable_info;
@@ -276,7 +272,10 @@ pub fn drive_single_frame_blackhole(
         virtualizable_ptr,
         abort_permanent_bail: bh.abort_permanent_bail,
     };
-    builder.release_interp(bh);
+    metainterp_sd
+        .blackholeinterpbuilder
+        .lock()
+        .release_interp(bh);
     result
 }
 
@@ -341,8 +340,8 @@ pub struct PendingAbortBlackhole {
     clippy::too_many_arguments,
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
 )]
-pub fn drive_multi_frame_blackhole(
-    builder: &mut crate::blackhole::BlackholeInterpBuilder,
+pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
+    builder: &mut P,
     framestack: &mut crate::pyjitpl::MIFrameStack,
     state_field_layout: crate::blackhole::StateFieldLayout,
     virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
@@ -376,22 +375,24 @@ pub fn drive_multi_frame_blackhole(
         majit_gc::shadow_stack::push_resume_ref_roots(packed_ref_roots.as_mut_slice());
     }
 
-    builder.setup_cached_control_opcodes(
-        metainterp_sd.op_live,
-        metainterp_sd.op_catch_exception,
-        metainterp_sd.op_rvmprof_code,
-    );
-    for ((frame_index, color), forwarded) in ref_locations
-        .into_iter()
-        .zip(packed_ref_roots.iter().copied())
-    {
-        framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
-    }
-    if let Some(index) = exception_root {
-        last_exc_value = packed_ref_roots[index];
-    }
+    builder.with_builder(|builder| {
+        builder.setup_cached_control_opcodes(
+            metainterp_sd.op_live,
+            metainterp_sd.op_catch_exception,
+            metainterp_sd.op_rvmprof_code,
+        );
+        for ((frame_index, color), forwarded) in ref_locations
+            .into_iter()
+            .zip(packed_ref_roots.iter().copied())
+        {
+            framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
+        }
+        if let Some(index) = exception_root {
+            last_exc_value = packed_ref_roots[index];
+        }
 
-    builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
+        builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
+    });
 
     let mut terminal = None;
     let outcome = crate::blackhole::convert_and_run_from_pyjitpl(
@@ -2794,8 +2795,8 @@ impl<S: JitState> JitDriver<S> {
         let sd_mut = std::sync::Arc::get_mut(staticdata)
             .expect("MetaInterpStaticData must be uniquely owned at register_descriptor time");
         let idx = match preinstalled_index {
-            Some(index) => sd_mut.preinstall_jitdriver_sd(jd, index, backend),
-            None => sd_mut.register_jitdriver_sd(jd, backend),
+            Some(index) => sd_mut.preinstall_jitdriver_sd(jd, index, backend.as_mut()),
+            None => sd_mut.register_jitdriver_sd(jd, backend.as_mut()),
         };
         // Mirror onto self.descriptor so JitDriver::index() returns Some(idx)
         // — A.3.1a's accessor reads through descriptor, not the
@@ -3237,10 +3238,14 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
-        let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-        bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
+        staticdata
+            .blackholeinterpbuilder
+            .lock()
+            .debug_assert_cpu(self.meta_interp().blackhole_cpu());
+        let mut pool =
+            crate::pyjitpl::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
         let outcome = drive_multi_frame_blackhole(
-            &mut bh_builder,
+            &mut pool,
             framestack,
             layout.clone(),
             vinfo_ptr,
@@ -7392,6 +7397,11 @@ impl<S: JitState> JitDriver<S> {
     /// (`cpu.get_int_value`); no savedata / grab_exc
     /// (`ResumeGuardDescr.handle_fail` does not read `jf_savedata` or
     /// `jf_guard_exc`).
+    ///
+    /// `execute_assembler` does `fail_descr = cpu.get_latest_descr(deadframe)`
+    /// then `fail_descr.handle_fail(deadframe, ...)`. The bag holds the
+    /// deadframe so `consume_compiled_entry_result` can borrow that same
+    /// descr; it does not copy fail_index / trace_id / status / owning key.
     fn handle_fail_plain_resume_guard(
         &mut self,
         green_key: u64,
@@ -7403,28 +7413,16 @@ impl<S: JitState> JitDriver<S> {
         portal_rca: bool,
     ) -> Option<PortalResume> {
         crate::pyjitpl::MetaInterp::<S::Meta>::finish_compiled_run_io();
-        // `handle_fail` reads fields of `self` (the descr) while the
-        // deadframe is live. Copy the words the CompileResult carries;
-        // consume borrows the descr back off `result.deadframe`.
-        let fd = self.meta.backend().get_latest_descr(&frame);
-        let fail_index = fd.fail_index();
-        let trace_id = fd.trace_id();
-        let is_back_edge_poll = fd.is_back_edge_poll();
-        let rd_loop_token = majit_backend::descr_owning_green_key(fd);
-        let status = fd.get_status();
-        let guard_value_operand = self.meta.resolve_guard_value_operand(fd, &frame);
-        self.meta
-            .record_guard_failure_event(green_key, trace_id, fail_index, is_back_edge_poll);
         let mut result = crate::compile::CompileResult {
             typed_values: crate::compile::ExitValues::new(),
             meta: None,
-            fail_index,
-            trace_id,
+            fail_index: 0,
+            trace_id: 0,
             descr_arc: None,
             is_finish: false,
             is_exit_frame_with_exception: false,
             exit_layout: None,
-            rd_loop_token,
+            rd_loop_token: None,
             savedata: None,
             deadframe: Some(frame),
             exception: crate::blackhole::ExceptionState {
@@ -7432,8 +7430,8 @@ impl<S: JitState> JitDriver<S> {
                 exc_value: 0,
                 ovf_flag: false,
             },
-            status,
-            guard_value_operand,
+            status: 0,
+            guard_value_operand: None,
         };
         self.consume_compiled_entry_result(
             green_key,
@@ -7456,8 +7454,10 @@ impl<S: JitState> JitDriver<S> {
     /// The int finish that already returned a word never reaches this.
     ///
     /// `compile.py AbstractResumeGuardDescr.handle_fail(self, deadframe, ...)`
-    /// is a method on the descr and takes the frame by pointer. The bag is
-    /// borrowed in place; a by-value copy of `CompileResult` has no counterpart.
+    /// is a method on the descr and takes the frame by pointer. On the plain
+    /// path the bag holds the deadframe so this function can borrow that
+    /// descr; fail_index / trace_id / status / owning key are read off
+    /// `&ResumeGuardDescr`, not copied into the bag.
     fn consume_compiled_entry_result(
         &mut self,
         green_key: u64,
@@ -7598,8 +7598,6 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // compile.py handle_fail
-        let fail_index = result.fail_index;
-        let trace_id = result.trace_id;
         // `compile.py ResumeGuardDescr.handle_fail` / `resume.py
         // blackhole_from_resumedata` read fail values from the deadframe
         // in place (`resume.py ResumeDataDirectReader.decode_int` via
@@ -7612,10 +7610,11 @@ impl<S: JitState> JitDriver<S> {
         //
         // `handle_fail` is a method on the descr, reached through
         // `jf_descr` (`llmodel.py get_latest_descr`). The plain path
-        // borrows it off the deadframe for this call; the lifetime is
-        // the deadframe's, not the backend's, so later `&mut self`
-        // calls keep the borrow. `get_latest_descr_arc` /
-        // `ExitDescr::to_arc` is only the non-plain path.
+        // borrows that one `&ResumeGuardDescr` off the deadframe for this
+        // call (`get_latest_descr` lifetime is the deadframe's, not the
+        // backend's), so decode / `must_compile` / resume read `self`.
+        // `get_latest_descr_arc` / `ExitDescr::to_arc` is only the
+        // non-plain path.
         let descr_arc: Option<std::sync::Arc<dyn majit_ir::Descr>> =
             (!plain_handle_fail).then(|| {
                 result
@@ -7623,21 +7622,56 @@ impl<S: JitState> JitDriver<S> {
                     .take()
                     .expect("a guard exit carries its descr")
             });
-        let fd: &dyn majit_ir::FailDescr = match &descr_arc {
-            Some(descr) => descr
-                .as_fail_descr()
-                .expect("a guard exit carries a FailDescr"),
-            None => self.meta.backend().get_latest_descr(
+        let rgd_plain: Option<&crate::compile::ResumeGuardDescr> = if plain_handle_fail {
+            let fd = self.meta.backend().get_latest_descr(
                 result
                     .deadframe
                     .as_ref()
                     .expect("plain handle_fail keeps the deadframe"),
-            ),
+            );
+            Some(
+                crate::compile::resume_guard_from_fail(fd)
+                    .expect("plain handle_fail is ResumeGuardDescr"),
+            )
+        } else {
+            None
         };
-        let guard_value_operand = result.guard_value_operand;
+        let fd: &dyn majit_ir::FailDescr = match rgd_plain {
+            Some(rgd) => rgd,
+            None => descr_arc
+                .as_ref()
+                .expect("non-plain keeps the Arc")
+                .as_fail_descr()
+                .expect("a guard exit carries a FailDescr"),
+        };
+        let fail_index = fd.fail_index();
+        let trace_id = fd.trace_id();
+        let guard_value_operand = if plain_handle_fail {
+            self.meta.resolve_guard_value_operand(
+                fd,
+                result
+                    .deadframe
+                    .as_ref()
+                    .expect("plain handle_fail keeps the deadframe"),
+            )
+        } else {
+            result.guard_value_operand
+        };
         // `compile.py handle_fail` `resumedescr.rd_loop_token`, resolved
-        // once where the run handed the descr back.
-        let descr_owning_key = result.rd_loop_token;
+        // from the descr itself on the plain path.
+        let descr_owning_key = if rgd_plain.is_some() {
+            majit_backend::descr_owning_green_key(fd)
+        } else {
+            result.rd_loop_token
+        };
+        if plain_handle_fail {
+            self.meta.record_guard_failure_event(
+                green_key,
+                trace_id,
+                fail_index,
+                fd.is_back_edge_poll(),
+            );
+        }
         // blackhole.py `_prepare_resume_from_failure(deadframe)`:
         // the pending exception grabbed at guard failure
         // (cpu.grab_exc_value) must seed the blackhole resume so an
@@ -7720,11 +7754,18 @@ impl<S: JitState> JitDriver<S> {
         // live (`compile.py must_compile` `cpu.get_value_direct`). The
         // fail-values slice is only the fallback for backends that
         // resolve the GUARD_VALUE index from the dense vector.
-        let (must_compile, owning_key) = if plain_handle_fail {
-            let rgd = crate::compile::resume_guard_from_fail(fd)
-                .expect("plain handle_fail is ResumeGuardDescr");
-            self.meta
-                .must_compile_resume_guard(rgd, &[], guard_value_operand, owning_key)
+        let (must_compile, owning_key) = if let Some(rgd) = rgd_plain {
+            // `must_compile(self, deadframe, metainterp_sd, jitdriver_sd)`:
+            // tick this portal's warmstate, the `jd` `execute_assembler` /
+            // `assembler_call_helper` passed into `handle_fail`.
+            let jitdriver_sd = self.index().unwrap_or(0);
+            self.meta.must_compile_resume_guard(
+                rgd,
+                &[],
+                guard_value_operand,
+                owning_key,
+                jitdriver_sd,
+            )
         } else {
             self.meta.must_compile_with_owning_key(
                 descr_arc.as_ref().expect("non-plain keeps the Arc"),
@@ -7825,12 +7866,12 @@ impl<S: JitState> JitDriver<S> {
         // walker updates, and nothing is built per failure to hold them.
         //
         // `handle_fail` is a method on the descr (`assert isinstance(self,
-        // ResumeGuardDescr)`); those `_attrs_` are fields. One
-        // downcast (including the Forced wrapper), then payload / types /
-        // rd_locs reads. `ResumeGuardCopiedDescr` has no inner descr
+        // ResumeGuardDescr)`); those `_attrs_` are fields. The plain
+        // path already holds `&ResumeGuardDescr`. Forced / Exc unwrap
+        // once here. `ResumeGuardCopiedDescr` has no inner descr
         // (`get_resumestorage(): return prev`); its FailDescr vtable
         // chases `prev`.
-        let rgd = crate::compile::resume_guard_from_fail(fd);
+        let rgd = rgd_plain.or_else(|| crate::compile::resume_guard_from_fail(fd));
         let (rd_numb, rd_consts_slice, rd_virtuals_opt, fail_arg_types, rd_pendingfields, rd_locs) =
             if let Some(d) = rgd {
                 (
@@ -7898,32 +7939,13 @@ impl<S: JitState> JitDriver<S> {
             // multi-frame state-field-JIT chain reconstructs sub-frames
             // via parent.descrs[idx].as_jitcode() above.  3
             // retired the dispatch_one BC_INLINE_CALL legacy arm so an
-            // empty builder would now panic on byte 17.  Re-apply
-            // staticdata control opcodes after the constructor's
-            // BC_LIVE/BC_CATCH_EXCEPTION/BC_RVMPROF_CODE defaults so
-            // the values match the metainterp's actual byte
-            // assignments.
+            // empty builder would now panic on byte 17.
             // `convert_and_run_from_pyjitpl`: `metainterp_sd = metainterp.staticdata`
             // then `metainterp_sd.blackholeinterpbuilder`. Clone the Arc so
             // the lock does not borrow `self.meta`.
+            // `BlackholeInterpBuilder.__init__` already copied cpu and
+            // control opcodes; `acquire_interp` copies them. Do not rebind.
             let staticdata = std::sync::Arc::clone(&self.meta.staticdata);
-            let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
-            bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
-            bh_builder.setup_cached_control_opcodes(
-                self.meta_interp().staticdata.op_live,
-                self.meta_interp().staticdata.op_catch_exception,
-                self.meta_interp().staticdata.op_rvmprof_code,
-            );
-            // `blackhole_from_resumedata` below acquires one interpreter
-            // per resumed frame, and every frame that still has a caller
-            // takes `bhimpl_jit_merge_point`'s recursive-portal branch
-            // (blackhole.py), which indexes `jitdrivers_sd`
-            // directly. Seed the table from this staticdata; the builder
-            // is the one `finish_setup` installed.
-            let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
-            if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
-                bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
-            }
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. A GC
             // jitframe is re-read through `ShadowRoot`; an off-heap
@@ -7950,9 +7972,23 @@ impl<S: JitState> JitDriver<S> {
             // `_prepare_next_section` passes
             // `self.metainterp_sd.liveness_info` to `enumerate_vars`
             // in place. The decode borrows that table; it does not
-            // take a copy. Drop the guard before `resume_mainloop`
-            // so this method can take `&mut self` again.
+            // take a copy. Lock only for `setup_jitdrivers_sd` and the
+            // `blackhole_from_resumedata` acquire loop; drop it
+            // before `resume_mainloop` so a nested resume can acquire
+            // from this same builder.
             let (mut bh, vable_ptr) = {
+                let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
+                bh_builder.debug_assert_cpu(self.meta_interp().blackhole_cpu());
+                // `blackhole_from_resumedata` below acquires one interpreter
+                // per resumed frame, and every frame that still has a caller
+                // takes `bhimpl_jit_merge_point`'s recursive-portal branch
+                // (blackhole.py), which indexes `jitdrivers_sd`
+                // directly. Seed the table from this staticdata; the builder
+                // is the one `finish_setup` installed.
+                let jitdrivers_sd = bh_jitdrivers_sd(&self.meta_interp().staticdata);
+                if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
+                    bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
+                }
                 let all_liveness = self.meta.staticdata.liveness_info.read();
                 crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
@@ -8044,10 +8080,13 @@ impl<S: JitState> JitDriver<S> {
                             Some(caller) => {
                                 // Layout + vinfo were seeded across the
                                 // whole chain before the loop started.
-                                if plain_handle_fail {
-                                    bh_builder.release_interp_plain(bh);
-                                } else {
-                                    bh_builder.release_interp(bh);
+                                {
+                                    let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
+                                    if plain_handle_fail {
+                                        bh_builder.release_interp_plain(bh);
+                                    } else {
+                                        bh_builder.release_interp(bh);
+                                    }
                                 }
                                 bh = caller;
                                 cur_exc = next_exc;
@@ -8315,16 +8354,18 @@ impl<S: JitState> JitDriver<S> {
                             .map(|pc| PortalResume::ExitFrameWithException { pc, args })
                     }
                 };
-                if plain_handle_fail {
-                    bh_builder.release_interp_plain(bh);
-                } else {
-                    bh_builder.release_interp(bh);
+                {
+                    let mut bh_builder = staticdata.blackholeinterpbuilder.lock();
+                    if plain_handle_fail {
+                        bh_builder.release_interp_plain(bh);
+                    } else {
+                        bh_builder.release_interp(bh);
+                    }
                 }
                 // `BlackholeInterpBuilder.release_interp` makes the frame
                 // reusable as soon as `_run_forever` is done. The
                 // interpreter may re-enter the portal on the pc we return,
                 // so the builder goes back to the pool before that.
-                drop(bh_builder);
                 if let Some(resume) = resume_pc {
                     if let Some(raw_values) = raw_values_for_bridge {
                         self.exit_raw_scratch_out(raw_values);
