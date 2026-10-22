@@ -20,7 +20,7 @@
 
 use majit_charon_reader::{
     Llbc,
-    ullbc::{FunDecl, GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind},
+    ullbc::{FunDecl, GlobalDecl, Operand, PlaceKind, Rvalue, StmtKind, TypeDeclKind},
 };
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -323,14 +323,21 @@ pub fn harvest_immutable_fields_from_llbcs(
 }
 
 /// Marker-const prefix for `_alloc_flavor_ = 'raw'` (`rclass.py
-/// getgcflavor` / `classdesc.get_param('_alloc_flavor_')`).
+/// getgcflavor` / `classdesc.py ClassDesc.get_param`).
 const ALLOC_FLAVOR_PREFIX: &str = "_alloc_flavor_";
 
 /// Build the set of structs whose `_alloc_flavor_<Struct>` marker is
 /// `"raw"`.
 ///
-/// Both the bare struct leaf and the crate-stripped qualified path are
-/// inserted, mirroring [`harvest_immutable_fields_from_llbcs`].
+/// Each marker is resolved to the struct `TypeDecl` in the same `Llbc`
+/// whose name-path leaf (generics stripped) equals the marker's struct
+/// name. One candidate, or the unique candidate in the marker's own
+/// module, is the identity; several distinct candidates panic as a
+/// marker encoding drift. The stored string is the class intern key
+/// `canonical_struct_name` of the crate-stripped TypeDecl path, the
+/// same key `Bookkeeper::stamp_raw_alloc_flavor` receives.
+/// `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param` read
+/// `_alloc_flavor_` off that classdesc.
 pub fn harvest_alloc_flavor_raw_from_llbcs(llbcs: &[Llbc]) -> HashSet<String> {
     let mut out = HashSet::new();
     for llbc in llbcs {
@@ -349,40 +356,103 @@ pub fn harvest_alloc_flavor_raw_from_llbcs(llbcs: &[Llbc]) -> HashSet<String> {
             if flavor != "raw" {
                 continue;
             }
-            let qualified = {
-                let stripped = strip_crate_prefix(&path);
-                match stripped.rsplit_once("::") {
-                    Some((module, _)) => format!("{module}::{struct_name}"),
-                    None => struct_name.to_string(),
-                }
-            };
-            out.insert(struct_name.to_string());
-            out.insert(qualified);
+            out.insert(resolve_alloc_flavor_raw_identity(llbc, &path, struct_name));
         }
     }
     out
 }
 
-/// Whether `path` names a struct harvested as `_alloc_flavor_ = raw`.
-/// Matches the intern key's leaf against harvested `CodeObject` /
-/// `pycode::CodeObject` spellings (`canonical_struct_name` may be
-/// `bytecode::CodeObject`).
+/// Intern key for a TypeDecl path: `canonical_struct_name` of the
+/// crate-stripped name, matching `Bookkeeper::intern_class_by_qualname`
+/// / `intern_class_by_qualname_with_bases`.
+fn alloc_flavor_class_intern_key(type_name_path: &str) -> String {
+    majit_ir::descr::canonical_struct_name(&strip_crate_prefix(type_name_path))
+}
+
+fn path_leaf_stripped(path: &str) -> &str {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    leaf.split('<').next().unwrap_or(leaf)
+}
+
+fn path_module(stripped: &str) -> Option<&str> {
+    stripped.rsplit_once("::").map(|(module, _)| module)
+}
+
+/// Resolve `_alloc_flavor_<Struct>` to one intern-key identity in `llbc`.
+fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name: &str) -> String {
+    let marker_stripped = strip_crate_prefix(marker_path);
+    let marker_module = path_module(&marker_stripped);
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for td in llbc.iter_type_decls() {
+        if !matches!(&td.kind, TypeDeclKind::Struct(_)) {
+            continue;
+        }
+        let td_path = td.item_meta.name_path();
+        if path_leaf_stripped(&td_path) != struct_name {
+            continue;
+        }
+        let identity = alloc_flavor_class_intern_key(&td_path);
+        if !candidates.iter().any(|(id, _)| id == &identity) {
+            candidates.push((identity, td_path));
+        }
+    }
+    if candidates.len() == 1 {
+        return candidates.pop().expect("len == 1").0;
+    }
+    let mut in_module: Vec<(String, String)> = Vec::new();
+    for (identity, td_path) in &candidates {
+        let stripped = strip_crate_prefix(td_path);
+        if path_module(&stripped) == marker_module
+            && !in_module.iter().any(|(id, _)| id == identity)
+        {
+            in_module.push((identity.clone(), td_path.clone()));
+        }
+    }
+    if in_module.len() == 1 {
+        return in_module.pop().expect("len == 1").0;
+    }
+    let named: Vec<&str> = candidates.iter().map(|(_, path)| path.as_str()).collect();
+    panic!(
+        "_alloc_flavor_ marker `{marker_path}` does not resolve to a unique \
+         struct TypeDecl (candidates: {named:?}); this signals a marker \
+         encoding/decoder drift"
+    );
+}
+
+/// Peel a `*const T` / `*mut T` / `&mut T` / `&T` spelling to `T`.
+///
+/// `ValueType::Ref(Some(name))` may carry the pointer form the front
+/// renders, or the pointee intern path; both name the same raw identity.
+fn peel_pointer_spelling(path: &str) -> &str {
+    let path = path.trim();
+    path.strip_prefix("*const ")
+        .or_else(|| path.strip_prefix("*mut "))
+        .or_else(|| path.strip_prefix("&mut "))
+        .or_else(|| path.strip_prefix('&'))
+        .map(str::trim)
+        .unwrap_or(path)
+}
+
+/// Whether `path` is a harvested `_alloc_flavor_ = raw` identity.
+///
+/// `path` is the intern key `Bookkeeper::stamp_raw_alloc_flavor` receives
+/// (`canonical_struct_name` of the struct), a crate-prefixed TypeDecl
+/// path the front paints on `ValueType::Ref(Some(..))`, or a `*const` /
+/// `*mut` / `&` spelling of either. The harvested set stores the
+/// crate-stripped intern key; a bare leaf does not match a different
+/// module path. `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param`
+/// read `_alloc_flavor_` off that classdesc.
 pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bool {
     if raw.is_empty() {
         return false;
     }
-    let leaf = path.rsplit("::").next().unwrap_or(path);
-    let leaf = leaf.split('<').next().unwrap_or(leaf);
-    if raw.contains(leaf) || raw.contains(path) {
+    let path = peel_pointer_spelling(path);
+    let identity = majit_ir::descr::canonical_struct_name(path);
+    if raw.contains(path) || raw.contains(&identity) {
         return true;
     }
     let stripped = strip_crate_prefix(path);
-    if raw.contains(&stripped) {
-        return true;
-    }
-    let stripped_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_str());
-    let stripped_leaf = stripped_leaf.split('<').next().unwrap_or(stripped_leaf);
-    raw.contains(stripped_leaf)
+    stripped != path && raw.contains(&stripped)
 }
 
 /// Split the marker's comma-joined payload into `(field_name, rank)`
@@ -1016,5 +1086,27 @@ mod tests {
         );
         assert!(g.func.elidable);
         assert!(g.func.unroll_safe);
+    }
+
+    #[test]
+    fn alloc_flavor_raw_identity_does_not_match_another_module_leaf() {
+        let raw = HashSet::from(["bytecode::CodeObject".to_string()]);
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "bytecode::CodeObject"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "rustpython_compiler_core::bytecode::CodeObject"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "*const rustpython_compiler_core::bytecode::CodeObject"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "&bytecode::CodeObject"
+        ));
+        assert!(!super::alloc_flavor_raw_contains(&raw, "other::CodeObject"));
     }
 }

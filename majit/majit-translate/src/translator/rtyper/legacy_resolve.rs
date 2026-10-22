@@ -25,10 +25,12 @@
 //! Transforms annotated ValueTypes into concrete low-level types
 //! and specializes operations accordingly.
 
+use std::collections::HashSet;
+
 use crate::codewriter::annotation_state::somevalue_to_valuetype;
 use crate::codewriter::type_state::{ConcreteType, kind_char_to_concrete, valuetype_to_concrete};
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::model::{FunctionGraph, Link, LinkArg, OpKind};
+use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType};
 
 /// Resolve annotations to concrete types.
 ///
@@ -39,7 +41,7 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind};
 /// every populated `Variable.concretetype` cell; downstream consumers
 /// read kinds via `FunctionGraph::concretetype_of(&v)`
 /// (`getkind(v.concretetype)`).
-pub fn resolve_types(graph: &FunctionGraph) {
+pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<String>) {
     // RPython `rtyper.setup_block_entry` writes `Signed` for `etype`
     // and `GcRef` for `evalue` on every graph's exceptblock unconditionally
     // at rtyper time (`rpython/rtyper/rtyper.py:setup_block_entry`
@@ -74,7 +76,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
         let ann = var.annotation.borrow();
         if let Some(rc_some) = ann.as_ref() {
             let vtype = somevalue_to_valuetype(rc_some);
-            let concrete = valuetype_to_concrete(&vtype);
+            let concrete = valuetype_to_concrete_for_legacy(&vtype, raw_alloc_flavor_structs);
             commit_concretetype(&var, concrete);
         }
     }
@@ -90,7 +92,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                     .as_ref()
                     .map(|rc| somevalue_to_valuetype(rc))
                     .unwrap_or(crate::model::ValueType::Unknown);
-                let concrete = valuetype_to_concrete(&vtype);
+                let concrete = valuetype_to_concrete_for_legacy(&vtype, raw_alloc_flavor_structs);
                 if concrete != ConcreteType::Unknown {
                     commit_concretetype(var, concrete);
                 }
@@ -98,7 +100,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
         }
         for op in &block.operations {
             if let Some(result_var) = op.result.as_ref() {
-                let inferred = infer_concrete_from_op(&op.kind);
+                let inferred = infer_concrete_from_op(&op.kind, raw_alloc_flavor_structs);
                 if inferred != ConcreteType::Unknown {
                     // The op carries authoritative result kind (post-
                     // jtransform `float_*` rewrite, explicit Call /
@@ -110,6 +112,7 @@ pub fn resolve_types(graph: &FunctionGraph) {
                     // rewrite arm.
                     commit_concretetype(result_var, inferred);
                 }
+                seed_raw_ptr_cast_source(&op.kind, raw_alloc_flavor_structs);
             }
         }
     }
@@ -608,7 +611,60 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
     }
 }
 
-fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
+/// `history.py getkind` of a `Ptr` whose `TO._gckind` is raw is `'int'`.
+/// `rclass.py getgcflavor` / `getinstancerepr` give a raw `InstanceRepr`
+/// for a class with `_alloc_flavor_ = "raw"`, so a `*const` / `&` value
+/// whose `ValueType::Ref(Some(name))` names that struct is `Signed`.
+fn valuetype_to_concrete_for_legacy(
+    vt: &ValueType,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> ConcreteType {
+    if let ValueType::Ref(Some(name)) = vt
+        && crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
+    {
+        return ConcreteType::Signed;
+    }
+    valuetype_to_concrete(vt)
+}
+
+/// A FieldRead of a raw pointer is often `Ref(None)`; the following
+/// `__cast_instance_intrinsic` carries `Ref(Some(intern_key))`.
+/// `history.py getkind` of that raw `Ptr` is `'int'`, so the source
+/// shares the Signed bank with the cast result (`rclass.py getgcflavor`).
+fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<String>) {
+    let OpKind::Call {
+        target,
+        args,
+        result_ty,
+    } = kind
+    else {
+        return;
+    };
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return;
+    };
+    if segments.last().map(String::as_str) != Some("__cast_instance_intrinsic") {
+        return;
+    }
+    if valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs) != ConcreteType::Signed
+    {
+        return;
+    }
+    let Some(src) = args.first().and_then(LinkArg::as_variable) else {
+        return;
+    };
+    match FunctionGraph::concretetype_of(src) {
+        ConcreteType::GcRef | ConcreteType::Unknown => {
+            FunctionGraph::set_concretetype_of_inline(src, ConcreteType::Signed);
+        }
+        _ => {}
+    }
+}
+
+fn infer_concrete_from_op(
+    kind: &OpKind,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> ConcreteType {
     match kind {
         OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => ConcreteType::Signed,
         // Unsigned shares the JIT integer register bank with Signed; the
@@ -631,7 +687,7 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         // integer-op backward-constraint pass (`resolve_types`) can
         // upgrade operands of pure integer ops to `Signed` before the
         // final GcRef backfill.
-        OpKind::Input { ty, .. } => valuetype_to_concrete(ty),
+        OpKind::Input { ty, .. } => valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs),
         // Field / array reads whose declared `ty` is pyre-only Unknown
         // default to `ConcreteType::GcRef` so the value reaches
         // regalloc. RPython's rtyper resolves the field / element type
@@ -642,7 +698,7 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         // canonical `getfield_gc_i/rd>i` key still carries the
         // correct result kind at assembler emit time.
         OpKind::FieldRead { ty, .. } => {
-            let c = valuetype_to_concrete(ty);
+            let c = valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -650,7 +706,7 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
             }
         }
         OpKind::ArrayRead { item_ty, .. } => {
-            let c = valuetype_to_concrete(item_ty);
+            let c = valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -658,21 +714,23 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
             }
         }
         OpKind::InteriorFieldRead { item_ty, .. } => {
-            let c = valuetype_to_concrete(item_ty);
+            let c = valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
                 c
             }
         }
-        OpKind::Call { result_ty, .. } => valuetype_to_concrete(result_ty),
+        OpKind::Call { result_ty, .. } => {
+            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
+        }
         OpKind::CallElidable { result_kind, .. }
         | OpKind::CallResidual { result_kind, .. }
         | OpKind::CallMayForce { result_kind, .. }
         | OpKind::InlineCall { result_kind, .. }
         | OpKind::RecursiveCall { result_kind, .. } => kind_char_to_concrete(*result_kind),
         OpKind::UnaryOp { op, result_ty, .. } if op == "same_as" => {
-            valuetype_to_concrete(result_ty)
+            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
         }
         // For `BinOp` / `UnaryOp` whose `result_ty` is still
         // `ValueType::Unknown`, return `ConcreteType::Unknown` rather
@@ -686,16 +744,18 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
         // value persists; the loop below still upgrades the concrete
         // type to `Float` for `neg(Float)` etc. via the special arms.
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
-            valuetype_to_concrete(result_ty)
+            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
         }
         // Vtable funcptr extraction returns an integer pointer (RPython
         // `op.args[0]` of `indirect_call` is `Ptr(FuncType)`).
         OpKind::VtableMethodPtr { .. } => ConcreteType::Signed,
-        OpKind::IndirectCall { result_ty, .. } => valuetype_to_concrete(result_ty),
+        OpKind::IndirectCall { result_ty, .. } => {
+            valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
+        }
         // Virtualizable field / array reads inherit the RPython
         // canonical result kind from the declared field/element type.
         OpKind::VableFieldRead { ty, .. } => {
-            let c = valuetype_to_concrete(ty);
+            let c = valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -703,7 +763,7 @@ fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
             }
         }
         OpKind::VableArrayRead { item_ty, .. } => {
-            let c = valuetype_to_concrete(item_ty);
+            let c = valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs);
             if c == ConcreteType::Unknown {
                 ConcreteType::GcRef
             } else {
@@ -742,7 +802,7 @@ mod tests {
         graph.set_return(entry, Some(v_var.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::Signed);
     }
 
@@ -766,7 +826,7 @@ mod tests {
         graph.set_return(entry, Some(v_var.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::GcRef);
     }
 
@@ -781,7 +841,7 @@ mod tests {
         graph.set_return(target, Some(phi_var.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(
             FunctionGraph::concretetype_of(&phi_var),
             ConcreteType::Signed
@@ -834,7 +894,7 @@ mod tests {
             graph.set_return(entry, Some(result_var.clone()));
 
             annotate::annotate(&graph);
-            resolve_types(&graph);
+            resolve_types(&graph, &HashSet::new());
             assert_eq!(
                 FunctionGraph::concretetype_of(&lhs_var),
                 ConcreteType::Signed,
@@ -885,7 +945,7 @@ mod tests {
         graph.set_return(entry, Some(result.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(FunctionGraph::concretetype_of(&lhs), ConcreteType::Signed);
         assert_eq!(FunctionGraph::concretetype_of(&rhs), ConcreteType::Signed);
         assert_eq!(
@@ -943,7 +1003,7 @@ mod tests {
         graph.set_return(entry, Some(alias_var.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(
             FunctionGraph::concretetype_of(&value_var),
             ConcreteType::GcRef
@@ -973,7 +1033,7 @@ mod tests {
         graph.set_return(entry, Some(alias_var.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(
             FunctionGraph::concretetype_of(&value_var),
             ConcreteType::Signed
@@ -1018,7 +1078,7 @@ mod tests {
         graph.set_return(target, Some(result_var.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(
             FunctionGraph::concretetype_of(&phi_var),
             ConcreteType::Signed
@@ -1051,7 +1111,7 @@ mod tests {
         graph.set_return(entry, Some(value_var.clone()));
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(
             FunctionGraph::concretetype_of(&value_var),
             ConcreteType::GcRef
@@ -1087,7 +1147,7 @@ mod tests {
         );
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
         assert_eq!(
             FunctionGraph::concretetype_of(&last_exception_var),
             ConcreteType::Signed

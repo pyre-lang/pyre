@@ -29341,7 +29341,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
@@ -29435,7 +29435,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
@@ -29597,7 +29597,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();
@@ -29826,7 +29826,7 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
         lower_indirect_calls(&mut graph, &cc);
 
         let config = GraphTransformConfig::default();

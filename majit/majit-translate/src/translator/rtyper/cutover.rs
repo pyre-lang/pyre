@@ -349,7 +349,10 @@ pub(crate) fn dual_gate_check_with_registry(
     let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy_graph);
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::legacy_annotator::annotate(legacy_graph);
-        super::legacy_resolve::resolve_types(legacy_graph);
+        super::legacy_resolve::resolve_types(
+            legacy_graph,
+            &call_registry.bookkeeper().raw_alloc_flavor_structs(),
+        );
     }));
     if let Err(payload) = baseline {
         let msg = crate::annotator::model::panic_payload_text(&*payload)
@@ -5584,7 +5587,10 @@ pub(crate) fn dual_gate_outcome_from_cache(
     let _annotation_guard = LegacyAnnotationGuard::snapshot(legacy);
     let baseline = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::legacy_annotator::annotate(legacy);
-        super::legacy_resolve::resolve_types(legacy);
+        super::legacy_resolve::resolve_types(
+            legacy,
+            &call_registry.bookkeeper().raw_alloc_flavor_structs(),
+        );
     }));
     if let Err(payload) = baseline {
         let msg = crate::annotator::model::panic_payload_text(&*payload)

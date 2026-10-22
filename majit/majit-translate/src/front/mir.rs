@@ -448,6 +448,8 @@ pub(crate) fn absorb_semantic_program(
                     })
                     .or_insert(id);
             }
+            acc.raw_alloc_flavor_structs
+                .extend(prog.raw_alloc_flavor_structs);
             acc.atomic_load_decls.extend(prog.atomic_load_decls);
         }
     }
@@ -563,13 +565,6 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             &mut seen_trait_names,
             &dedup_key,
         );
-        if let Some(acc) = &mut merged {
-            acc.raw_alloc_flavor_structs.extend(
-                crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
-                    std::slice::from_ref(*llbc),
-                ),
-            );
-        }
     }
     // The per-file builder hardened each program individually, but the
     // `or_insert` merges above can re-introduce a bare-leaf alias that
@@ -1507,6 +1502,7 @@ struct CrateExports {
     exact_layouts:
         std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
     struct_ids: std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
+    raw_alloc_flavor_structs: std::collections::HashSet<String>,
 }
 
 /// One artefact's lowering context: the artefact, the host addresses and
@@ -1693,6 +1689,10 @@ impl CrateLoweringState {
                 struct_origins,
                 exact_layouts,
                 struct_ids,
+                raw_alloc_flavor_structs:
+                    crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                        std::slice::from_ref(llbc),
+                    ),
             }),
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
@@ -2328,6 +2328,7 @@ impl CrateLoweringState {
             struct_origins,
             exact_layouts,
             struct_ids,
+            raw_alloc_flavor_structs,
         } = self.exports.take();
         let atomic_load_decls = self.atomic_load_decls.take();
         crate::front::semantic::SemanticProgram {
@@ -2341,7 +2342,7 @@ impl CrateLoweringState {
             // (the `attributes` array carries DocComment / Outer but not our
             // proc-macro hints).
             immutable_fields: std::collections::HashMap::new(),
-            raw_alloc_flavor_structs: std::collections::HashSet::new(),
+            raw_alloc_flavor_structs,
             enum_variant_by_discriminant,
             struct_origins,
             struct_field_attrs,

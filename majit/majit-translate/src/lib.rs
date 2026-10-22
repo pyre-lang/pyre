@@ -253,7 +253,6 @@ fn build_semantic_program_via_active_frontend(
             let mut hints: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
-            let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
@@ -332,11 +331,6 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
-                raw_alloc_flavor_structs.extend(
-                    front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
-                        &llbc,
-                    )),
-                );
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);
@@ -439,7 +433,6 @@ fn build_semantic_program_via_active_frontend(
             );
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
-            program.raw_alloc_flavor_structs = raw_alloc_flavor_structs;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             return (program, gc_struct_ids);

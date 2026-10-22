@@ -726,7 +726,7 @@ mod tests {
             "annotation-layer projection of Constant(None) follows SomeNone → Ref",
         );
 
-        legacy_resolve::resolve_types(&graph);
+        legacy_resolve::resolve_types(&graph, &std::collections::HashSet::new());
         assert_eq!(
             FunctionGraph::concretetype_of(&ret_var),
             crate::codewriter::type_state::ConcreteType::Void,

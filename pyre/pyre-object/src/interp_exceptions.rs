@@ -1420,12 +1420,14 @@ pub fn is_canonical_exc_class(cls: PyObjectRef) -> bool {
 /// The atomic slot read stays in [`lookup_exc_class_for_kind`] (`@jit.elidable`
 /// on that helper, same as the process-global class table). This body is a
 /// signed trip over the contiguous discriminants so the prepass lifts the
-/// graph (`rpython/annotator/builtin.py` `builtin_range`).
+/// graph (`rpython/annotator/builtin.py` `builtin_range`).  The exclusive
+/// `0..MAX + 1` is `range(MAX + 1)`; an inclusive `..=` has no `range()`
+/// counterpart and leaves `RangeInclusive::next` unregistered.
 pub fn kind_of_canonical_exc_class(cls: PyObjectRef) -> Option<ExcKind> {
     if cls.is_null() {
         return None;
     }
-    for raw in 0..=ExcKind::MAX_DISCRIMINANT {
+    for raw in 0..ExcKind::MAX_DISCRIMINANT + 1 {
         let kind = unsafe { std::mem::transmute::<u8, ExcKind>(raw) };
         if lookup_exc_class_for_kind(kind) == cls {
             return Some(kind);

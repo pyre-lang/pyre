@@ -942,8 +942,9 @@ pub struct SemanticProgram {
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
     /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
     /// `rclass.py getgcflavor` / `getinstancerepr` build a raw
-    /// `InstanceRepr` for those classdefs. Keys are the bare leaf and
-    /// the crate-stripped qualified path, matching `immutable_fields`.
+    /// `InstanceRepr` for those classdefs. Each key is the class intern
+    /// key of the one struct the marker resolves to
+    /// (`llbc_hints::harvest_alloc_flavor_raw_from_llbcs`).
     pub raw_alloc_flavor_structs: std::collections::HashSet<String>,
     /// Enum discriminant → variant name, keyed by enum type (both the
     /// qualified path and the bare leaf, mirroring `struct_fields`).

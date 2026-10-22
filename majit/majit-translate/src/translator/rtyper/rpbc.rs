@@ -958,7 +958,7 @@ pub(crate) mod tests {
         assert_eq!(pre_indirect, 1, "expected 1 Indirect Call pre-lowering");
 
         annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
         lower_indirect_calls(&mut graph, &cc);
 
         // Post-lowering: invariant — zero Indirect targets.
@@ -1165,7 +1165,7 @@ pub(crate) mod tests {
 
         let pre_ops_len = graph.blocks[graph.startblock.0].operations.len();
         annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
         lower_indirect_calls(&mut graph, &cc);
 
         // Same op count; the Call op survives untouched.

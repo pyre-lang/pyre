@@ -14173,13 +14173,22 @@ fn ensure_baseint_result(
     obj: PyObjectRef,
     _original: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // intobject.py `_ensure_baseint`: an object whose interp-level class is
+    // `W_IntObject` / `W_LongObject` is returned as is; a `W_BoolObject` or a
+    // user-subclass instance is rewrapped.
     unsafe {
         if is_int(obj) {
-            // intobject.py: W_IntObject (or subclass) → wrapint
+            if !pyre_object::is_bool(obj) && pyre_object::is_exact_builtin_instance_nonnull(obj) {
+                return Ok(obj);
+            }
+            // intobject.py: `wrapint(space, w_intvalue.intval)`
             return Ok(w_int_new(w_int_get_value(obj)));
         }
         if pyre_object::pyobject::is_long(obj) {
-            // intobject.py:1100-1102: W_AbstractLongObject → newlong
+            if pyre_object::is_exact_builtin_instance_nonnull(obj) {
+                return Ok(obj);
+            }
+            // intobject.py: `newlong(space, w_intvalue.asbigint())`
             return Ok(pyre_object::longobject::w_long_from_raw(
                 pyre_object::longobject::w_long_get_raw_value(obj),
             ));
@@ -30104,16 +30113,16 @@ mod tests {
     }
 
     #[test]
-    fn ensure_baseint_long_rewraps_without_cloning_payload() {
+    fn ensure_baseint_returns_exact_int_and_rewraps_bool() {
         let input = w_long_new(BigInt::one().lshift(80).unwrap());
-        let result = ensure_baseint_result(input, input).unwrap();
+        assert_eq!(ensure_baseint_result(input, input).unwrap(), input);
 
-        assert_ne!(result, input);
+        let w_true = pyre_object::w_bool_from(true);
+        let result = ensure_baseint_result(w_true, w_true).unwrap();
+        assert_ne!(result, w_true);
         unsafe {
-            assert!(std::ptr::eq(
-                w_long_get_value(result),
-                w_long_get_value(input)
-            ));
+            assert!(!pyre_object::is_bool(result));
+            assert_eq!(w_int_get_value(result), 1);
         }
     }
 

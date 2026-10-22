@@ -333,55 +333,6 @@ impl CodeWriter {
         registry.release_source_graphs();
     }
 
-    /// Port of `CodeWriter.transform_graph_to_jitcode`.
-    ///
-    /// Transforms a `FunctionGraph` into a `JitCode` through the upstream
-    /// transform, register-allocation, flattening, liveness, and assembly
-    /// pipeline.
-    /// Upstream signature `(self, graph, jitcode, verbose, index)`. Pyre adds
-    /// `path` / `callcontrol` / `config` as pyre-specific additions:
-    ///   - `path`: graph identity surrogate (upstream uses `graph` object
-    ///     identity; pyre uses `CallPath`).
-    ///   - `callcontrol`: upstream has `self.callcontrol`; pyre passes
-    ///     `&mut` due to Rust borrow-checker constraints (the Transformer
-    ///     borrows callcontrol during `transform()`).
-    ///   - `config`: pyre's `GraphTransformConfig` carries options that
-    ///     upstream keeps in globals / command-line flags.
-    ///
-    /// Pyre performs annotation and rtyping before the upstream stages, calls
-    /// `compute_liveness` from its assembler, and fills the call descriptors
-    /// before committing the assembled body. The resulting stage order remains
-    /// the one implemented by `CodeWriter.transform_graph_to_jitcode`.
-    ///
-    /// **Type-source contract (post graph-side concretetype migration)**
-    ///
-    /// `regalloc`/`flatten`/`assemble`/`liveness`/`format` all read
-    /// kinds via `FunctionGraph::concretetype_of(&v)`, which routes
-    /// straight to the backing `Variable.concretetype` cell carried
-    /// inline by the `Variable` objects the IR references. RPython's
-    /// `flowspace.model.Variable.concretetype` is the
-    /// single source of truth for every value.  No type side-table
-    /// parameter survives across stages: the post-rtyper merge
-    /// `merge_synth_kinds_into_graph` stamps each synthetic
-    /// Variable's `.concretetype` cell via
-    /// `set_concretetype_of_inline`; before jtransform,
-    /// `apply_from_flowspace_variables` copies lltypes from typed Variables
-    /// in the `value_to_var` map so the rtyper's `Variable.concretetype` is
-    /// what jtransform starts from.  Slots without a rtyper-bound Variable
-    /// keep the synthetic canonical type the merge wrote.
-    ///
-    /// **Remaining structural divergence** — pyre's codewriter still
-    /// consumes [`crate::model::FunctionGraph`] (a slot-indexed legacy
-    /// IR) instead of [`crate::flowspace::model::FunctionGraph`] (the
-    /// upstream `Variable`-based shape).  Operand identity in
-    /// `SpaceOperation` payloads is already `Variable`;
-    /// `FlatOp` operands are `Register` (regalloc color +
-    /// kind).  What still ties the codewriter to the legacy IR is that
-    /// it consumes [`crate::model::FunctionGraph`] and bridges to the
-    /// rtyper's typed Variables through the identity-keyed
-    /// `value_to_var` map. A graph-native typed IR would remove that bridge and
-    /// let the codewriter consume the rtyper's `Variable` graph directly.
-    ///
     /// Dual-gate skip reason for one graph, the same annotation
     /// [`Self::dual_gate_publish_concretetypes`] / the two-phase prepass run.
     /// `Ok(None)` is Match; `Ok(Some(reason))` is Skip. Does not fall back
@@ -571,7 +522,10 @@ impl CodeWriter {
                 // the only source of types for these graphs.  Reads
                 // annotations off `Variable.annotation` populated by
                 // the preceding `annotate` post-loop publish.
-                crate::translator::rtyper::legacy_resolve::resolve_types(graph);
+                crate::translator::rtyper::legacy_resolve::resolve_types(
+                    graph,
+                    &callcontrol.raw_alloc_flavor_structs,
+                );
                 // Clear `Variable.annotation` after the Skip-arm
                 // legacy walker has committed each cell's
                 // `Variable.concretetype` via
@@ -605,6 +559,54 @@ impl CodeWriter {
         }
     }
 
+    /// Port of `CodeWriter.transform_graph_to_jitcode`.
+    ///
+    /// Transforms a `FunctionGraph` into a `JitCode` through the upstream
+    /// transform, register-allocation, flattening, liveness, and assembly
+    /// pipeline.
+    /// Upstream signature `(self, graph, jitcode, verbose, index)`. Pyre adds
+    /// `path` / `callcontrol` / `config` as pyre-specific additions:
+    ///   - `path`: graph identity surrogate (upstream uses `graph` object
+    ///     identity; pyre uses `CallPath`).
+    ///   - `callcontrol`: upstream has `self.callcontrol`; pyre passes
+    ///     `&mut` due to Rust borrow-checker constraints (the Transformer
+    ///     borrows callcontrol during `transform()`).
+    ///   - `config`: pyre's `GraphTransformConfig` carries options that
+    ///     upstream keeps in globals / command-line flags.
+    ///
+    /// Pyre performs annotation and rtyping before the upstream stages, calls
+    /// `compute_liveness` from its assembler, and fills the call descriptors
+    /// before committing the assembled body. The resulting stage order remains
+    /// the one implemented by `CodeWriter.transform_graph_to_jitcode`.
+    ///
+    /// **Type-source contract (post graph-side concretetype migration)**
+    ///
+    /// `regalloc`/`flatten`/`assemble`/`liveness`/`format` all read
+    /// kinds via `FunctionGraph::concretetype_of(&v)`, which routes
+    /// straight to the backing `Variable.concretetype` cell carried
+    /// inline by the `Variable` objects the IR references. RPython's
+    /// `flowspace.model.Variable.concretetype` is the
+    /// single source of truth for every value.  No type side-table
+    /// parameter survives across stages: the post-rtyper merge
+    /// `merge_synth_kinds_into_graph` stamps each synthetic
+    /// Variable's `.concretetype` cell via
+    /// `set_concretetype_of_inline`; before jtransform,
+    /// `apply_from_flowspace_variables` copies lltypes from typed Variables
+    /// in the `value_to_var` map so the rtyper's `Variable.concretetype` is
+    /// what jtransform starts from.  Slots without a rtyper-bound Variable
+    /// keep the synthetic canonical type the merge wrote.
+    ///
+    /// **Remaining structural divergence** — pyre's codewriter still
+    /// consumes [`crate::model::FunctionGraph`] (a slot-indexed legacy
+    /// IR) instead of [`crate::flowspace::model::FunctionGraph`] (the
+    /// upstream `Variable`-based shape).  Operand identity in
+    /// `SpaceOperation` payloads is already `Variable`;
+    /// `FlatOp` operands are `Register` (regalloc color +
+    /// kind).  What still ties the codewriter to the legacy IR is that
+    /// it consumes [`crate::model::FunctionGraph`] and bridges to the
+    /// rtyper's typed Variables through the identity-keyed
+    /// `value_to_var` map. A graph-native typed IR would remove that bridge and
+    /// let the codewriter consume the rtyper's `Variable` graph directly.
     #[expect(
         clippy::mutable_key_type,
         reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"

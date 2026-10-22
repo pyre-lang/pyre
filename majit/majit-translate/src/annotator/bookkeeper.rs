@@ -1309,6 +1309,12 @@ impl Bookkeeper {
         }
     }
 
+    /// The harvested `_alloc_flavor_ = raw` identities, for the legacy
+    /// resolver's comparison baseline.
+    pub fn raw_alloc_flavor_structs(&self) -> HashSet<String> {
+        self.raw_alloc_flavor_structs.borrow().clone()
+    }
+
     /// `classdesc.get_param('_alloc_flavor_')` carrier on the interned class.
     fn stamp_raw_alloc_flavor(&self, host: &HostObject, key: &str) {
         if crate::front::llbc_hints::alloc_flavor_raw_contains(
