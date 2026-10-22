@@ -92427,7 +92427,7 @@ mod tests {
         named_adt(0, vec![elem])
     }
 
-    fn pyobject_gcref() -> serde_json::Value {
+    fn gc_ref_ty() -> serde_json::Value {
         serde_json::json!({"RawPtr": [named_adt(1, vec![]), "Mut"]})
     }
 
@@ -92555,7 +92555,7 @@ mod tests {
 
     #[test]
     fn trait_clone_of_vec_gcref_is_list_builtin() {
-        let vec_ty = vec_of(pyobject_gcref());
+        let vec_ty = vec_of(gc_ref_ty());
         let payload = trait_clone_kind_payload(vec_ty.clone());
         let llbc =
             trait_clone_call_fixture("clone_vec_gcref", vec_ty.clone(), vec_gcref_type_decls());
