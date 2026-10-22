@@ -808,24 +808,22 @@ unsafe fn walk_one_global_cache(
 /// `LOAD_GLOBAL` fast path (`celldict.py get_global_cache`).
 /// Allocated lazily on first cache install. The mutex protects this
 /// strategy-owned registry when multiple Python threads share a module.
+#[repr(C)]
+#[majit_macros::jit_immutable_fields("version?")]
 pub struct ModuleDictStrategy {
     pub version: VersionTag,
     pub caches: parking_lot::Mutex<Option<GlobalCacheRegistry>>,
-    /// The hidden `mutate_version` field for `celldict.py:34
-    /// _immutable_fields_ = ["version?"]`.  Each compiled loop whose trace
-    /// promoted `self.version` (and folded a module-global lookup keyed on it)
-    /// registers its `JitCellToken` invalidation flag here; `mutated()`
-    /// reassigns `version`, which under the `?` declaration must invalidate
-    /// every such loop.
-    ///
-    /// The same [`crate::quasiimmut::QuasiImmutField`] `W_TypeObject`'s
-    /// `_version_tag?` uses, as upstream's one `QuasiImmut` class serves every
-    /// quasi-immutable field.  Before that it was a bare `Vec` pushed to
-    /// without synchronisation while `mutated()` swept it from another thread,
-    /// and it had no `compress_looptokens_list`, so a module recompiled against
-    /// many times and never mutated grew one entry per compile.
-    version_watchers: crate::quasiimmut::QuasiImmutField,
+    /// Hidden `mutate_version` field `quasiimmut.py get_mutate_field_name`
+    /// names and `rclass.py InstanceRepr._setup_repr` adds as
+    /// `('mutate_' + name, OBJECTPTR)` for
+    /// `celldict.py ModuleDictStrategy._immutable_fields_ = ["version?"]`.
+    pub mutate_version: crate::quasiimmut::QuasiImmutField,
 }
+
+/// Byte offset of `mutate_version` within [`ModuleDictStrategy`].
+/// `rclass.py InstanceRepr._setup_repr` / `quasiimmut.py get_mutate_field_name`.
+pub const MODULE_DICT_MUTATE_VERSION_OFFSET: usize =
+    std::mem::offset_of!(ModuleDictStrategy, mutate_version);
 
 /// Runtime-assigned GC type id for the [`ModuleDictStrategy`] box.
 static MODULE_DICT_STRATEGY_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
@@ -854,7 +852,7 @@ impl ModuleDictStrategy {
         Self {
             version: VersionTag::fresh(),
             caches: parking_lot::Mutex::new(None),
-            version_watchers: crate::quasiimmut::QuasiImmutField::new(),
+            mutate_version: crate::quasiimmut::QuasiImmutField::new(),
         }
     }
 
@@ -863,13 +861,13 @@ impl ModuleDictStrategy {
     /// `mutated()` reached later in the same trace finds the field non-null and
     /// the recording can carry the instance to `compile.py:204-207`.
     pub fn current_version_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.version_watchers.get_current_qmut_instance()
+        self.mutate_version.get_current_qmut_instance()
     }
 
     /// `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable mutatebox.nonnull()` — whether some trace or loop is
     /// watching `version?` right now.
     pub fn version_qmut_installed(&self) -> bool {
-        self.version_watchers.is_installed()
+        self.mutate_version.is_installed()
     }
 
     /// `quasiimmut.py do_force_quasi_immutable`, which the tracer calls
@@ -877,21 +875,25 @@ impl ModuleDictStrategy {
     /// already taken returns early, so the interpreter re-running the opcode
     /// after the abort forces nothing a second time.
     pub fn force_version_qmut(&self) {
-        self.version_watchers.invalidate();
+        self.mutate_version.invalidate();
     }
 
-    /// Invalidate every loop watching `version`
-    /// (`quasiimmut.py _invalidate_now`).  Sets each live flag to
-    /// `true`, the polarity `GuardNotInvalidated` tests.
-    ///
-    /// The installed check stays traced and the sweep is residual, for the
-    /// reason upstream's own walk is out of line: it hangs off
-    /// `jit_force_quasi_immutable`, never a trace.
-    fn notify_version_watchers(&self) {
-        if !self.version_watchers.is_installed() {
-            return;
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The codewriter
+    /// turns this call back into the llop (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace
+    /// never looks inside it.
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_version" => {
+                if !self.mutate_version.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_version) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
         }
-        unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.version_watchers) };
     }
 
     /// `celldict.py get_global_cache`:
@@ -1038,12 +1040,11 @@ impl ModuleDictStrategy {
     ///     self.version = VersionTag()
     /// ```
     ///
-    /// Reassigning the `version?` quasi-immutable field invalidates the JIT.
-    /// `rclass.py hook_setfield` notifies watchers before the store;
-    /// pyre flips the registered loop flags explicitly at this write site.
+    /// `rclass.py InstanceRepr.hook_setfield` emits `jit_force_quasi_immutable`
+    /// before the store to `version?`.
     #[inline]
     pub fn mutated(&mut self) {
-        self.notify_version_watchers();
+        self.jit_force_quasi_immutable("mutate_version");
         self.version = VersionTag::fresh();
     }
 
@@ -1640,7 +1641,7 @@ mod tests {
         // notify (via mutated) must not panic, and `_invalidate_now` unlinks
         // the instance whether or not any flag could still be upgraded.
         strategy.mutated();
-        assert!(!strategy.version_watchers.is_installed());
+        assert!(!strategy.mutate_version.is_installed());
     }
 
     #[test]
