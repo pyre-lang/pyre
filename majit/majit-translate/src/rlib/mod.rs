@@ -8,7 +8,9 @@
 //! | `entrypoint`          | `entrypoint.py`               |
 //! | `jit`                 | `jit.py` (marker/extregistry half; the user hint API lives at `majit_metainterp::jit`) |
 //! | `rarithmetic`         | `rarithmetic.py`              |
+//! | `rstring`             | `rstring.py`                  |
 
 pub mod entrypoint;
 pub mod jit;
 pub mod rarithmetic;
+pub mod rstring;

@@ -484,7 +484,9 @@ fn transduce_op(
         // `jtransform.py Transformer.rewrite_op_jit_record_exact_value`:
         // int → `record_exact_value_i`, ref → `record_exact_value_r`.
         // Void result, same `push_op_var(..., false)` shape as `keepalive`
-        // / `copystrcontent`.
+        // / `copystrcontent`. Operands pass through unchanged upstream;
+        // Constants (including null and non-null GC pointers) become the
+        // same Const* defines other `_r` ops use.
         "jit_record_exact_value" => {
             let kind0 = hlvalue_getkind(&op.args[0]);
             let kind1 = hlvalue_getkind(&op.args[1]);
@@ -508,8 +510,8 @@ fn transduce_op(
                 );
                 "record_exact_value_r"
             };
-            let arg0 = materialize(out, block, &op.args[0]);
-            let arg1 = materialize(out, block, &op.args[1]);
+            let arg0 = materialize_record_exact_value_arg(out, block, &op.args[0]);
+            let arg1 = materialize_record_exact_value_arg(out, block, &op.args[1]);
             out.push_op_var(
                 block,
                 OpKind::LoweredBlackholeOp {
@@ -828,6 +830,33 @@ fn resolve_string(chars_alias: &HashMap<FVar, FVar>, arr: &Hlvalue) -> FVar {
         .get(&arr_var)
         .cloned()
         .expect("array operand was not a same-block getsubstruct(\"chars\") result")
+}
+
+/// `jit_record_exact_value` operands: Variables pass through, Constants
+/// become the Const* define `record_exact_value_const_opkind` picks —
+/// ints/bools plus null and non-null GC pointer constants. Generic
+/// [`materialize`] stays int/bool-only; a ref constant here is an
+/// ordinary `_r` operand, not an int-bank literal.
+fn materialize_record_exact_value_arg(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    hlv: &Hlvalue,
+) -> FVar {
+    match hlv {
+        Hlvalue::Variable(v) => v.clone(),
+        Hlvalue::Constant(c) => {
+            let kind = crate::codewriter::jtransform::record_exact_value_const_opkind(&c.value);
+            let result = out
+                .push_op_var(block, kind, true)
+                .expect("record_exact_value constant produces a result var");
+            let ty = c
+                .concretetype
+                .clone()
+                .expect("jit_record_exact_value constant operand has concretetype");
+            result.set_concretetype(Some(ty));
+            result
+        }
+    }
 }
 
 /// Map a flowspace operand to a model operand `Variable`, materialising
@@ -1314,6 +1343,87 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], cond);
+    }
+
+    fn objectptr_const(null: bool) -> Hlvalue {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc, nullptr};
+        use crate::translator::rtyper::rclass::{OBJECT, OBJECTPTR};
+        let ptr = if null {
+            nullptr(OBJECT.clone()).expect("nullptr(OBJECT)")
+        } else {
+            malloc(OBJECT.clone(), None, MallocFlavor::Gc, true).expect("malloc OBJECT")
+        };
+        constant_with_lltype(ConstValue::LLPtr(Box::new(ptr)), OBJECTPTR.clone())
+    }
+
+    fn lower_graph_lowers_jit_record_exact_value_ref_const(const_arg: Hlvalue, expect_null: bool) {
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        let value = variable_with_lltype("p", OBJECTPTR.clone());
+        let start = Block::shared(vec![Hlvalue::Variable(value.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "ll_record_exact_value_ref",
+            start.clone(),
+            Hlvalue::Variable(value.clone()),
+        );
+        let void_res = variable_with_lltype("v", LowLevelType::Void);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_record_exact_value",
+            vec![Hlvalue::Variable(value.clone()), const_arg],
+            Hlvalue::Variable(void_res),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(value.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        if expect_null {
+            assert!(
+                ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
+                "null ref constant materialises as ConstRefNull: {ops:?}"
+            );
+        } else {
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.kind, OpKind::ConstRefAddr(_))),
+                "non-null ConstPtr materialises as ConstRefAddr: {ops:?}"
+            );
+        }
+        let rec = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "record_exact_value_r"
+                )
+            })
+            .unwrap_or_else(|| panic!("expected record_exact_value_r, got {ops:?}"));
+        assert!(rec.result.is_none(), "record_exact_value_r is void");
+        let OpKind::LoweredBlackholeOp { args, .. } = &rec.kind else {
+            unreachable!();
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], value);
+    }
+
+    #[test]
+    fn lower_graph_lowers_jit_record_exact_value_null_ref_to_record_exact_value_r() {
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        lower_graph_lowers_jit_record_exact_value_ref_const(
+            constant_with_lltype(ConstValue::None, OBJECTPTR.clone()),
+            true,
+        );
+        lower_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(true), true);
+    }
+
+    #[test]
+    fn lower_graph_lowers_jit_record_exact_value_constptr_to_record_exact_value_r() {
+        lower_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(false), false);
     }
 
     /// The integer fragment in `LLHelpers.ll_int2hex` is not the all-binary

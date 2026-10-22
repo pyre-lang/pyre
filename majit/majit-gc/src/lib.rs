@@ -1254,6 +1254,13 @@ pub trait GcAllocator: Send {
         true
     }
 
+    /// framework.py `get_finalizer_queue_index`: map a FinalizerQueue (keyed
+    /// by its `ll_finalizer_trigger`) to its handler index, allocating the
+    /// handler on first visit. Backends without finalizer queues return 0.
+    fn get_finalizer_queue_index(&mut self, _trigger: FinalizerTriggerFn) -> usize {
+        0
+    }
+
     /// rgc.py `FinalizerQueue.register_finalizer` /
     /// framework.py `gc_fq_register`: register `obj` with one translated
     /// finalizer handler.  Backends without finalizer queues ignore it.
@@ -2114,6 +2121,9 @@ impl GcAllocator for GcHandle {
     }
     fn isenabled(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.isenabled())
+    }
+    fn get_finalizer_queue_index(&mut self, trigger: FinalizerTriggerFn) -> usize {
+        gc_sync::gc_op(|gc| gc.get_finalizer_queue_index(trigger))
     }
     fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
         gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))
@@ -4538,9 +4548,12 @@ pub fn gc_remove_root(slot: *mut GcRef) -> bool {
 pub type RegisterFinalizerFn = fn(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn);
 /// rgc.py `FinalizerQueue.next_dead` - routed to the active backend GC.
 pub type FinalizerNextDeadFn = fn(fq_index: usize) -> Option<GcRef>;
+/// framework.py `get_finalizer_queue_index` - routed to the active backend GC.
+pub type GetFinalizerQueueIndexFn = fn(trigger: FinalizerTriggerFn) -> usize;
 
 global_hook!(static ACTIVE_REGISTER_FINALIZER: RegisterFinalizerFn);
 global_hook!(static ACTIVE_FINALIZER_NEXT_DEAD: FinalizerNextDeadFn);
+global_hook!(static ACTIVE_GET_FINALIZER_QUEUE_INDEX: GetFinalizerQueueIndexFn);
 
 /// Install the active backend's finalizer trampolines. Pass `None` to clear.
 pub fn set_active_finalizer_hooks(
@@ -4549,6 +4562,21 @@ pub fn set_active_finalizer_hooks(
 ) {
     ACTIVE_REGISTER_FINALIZER.set(register);
     ACTIVE_FINALIZER_NEXT_DEAD.set(next_dead);
+}
+
+/// Install the active backend's `get_finalizer_queue_index` trampoline.
+/// Pass `None` to clear; [`gc_get_finalizer_queue_index`] then uses `gc_sync`.
+pub fn set_active_get_finalizer_queue_index(hook: Option<GetFinalizerQueueIndexFn>) {
+    ACTIVE_GET_FINALIZER_QUEUE_INDEX.set(hook);
+}
+
+/// framework.py `get_finalizer_queue_index` — allocate or reuse the handler
+/// index for this FinalizerQueue, identified by its trigger fn.
+pub fn gc_get_finalizer_queue_index(trigger: FinalizerTriggerFn) -> usize {
+    match ACTIVE_GET_FINALIZER_QUEUE_INDEX.get() {
+        Some(f) => f(trigger),
+        None => gc_sync::gc_op(|gc| gc.get_finalizer_queue_index(trigger)),
+    }
 }
 
 /// Register an object with an RPython-style finalizer queue on the active GC.

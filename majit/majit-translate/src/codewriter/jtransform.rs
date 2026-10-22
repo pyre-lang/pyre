@@ -3811,10 +3811,18 @@ impl<'a> Transformer<'a> {
             OpKind::Call { target, args, .. } if is_jit_force_quasi_immutable_target(target) => {
                 self.rewrite_op_jit_force_quasi_immutable(target, args, graph, graph_name)
             }
-            // `jtransform.py rewrite_op_jit_record_exact_value`: the rtyper
-            // llop, dispatched the same way as `jit_force_virtualizable`.
-            OpKind::Call { target, args, .. } if is_jit_record_exact_value_target(target) => {
-                self.rewrite_op_jit_record_exact_value(args, graph, graph_name)
+            // `jtransform.py rewrite_op_jit_record_exact_value` rewrites
+            // the rtyper llop `jit_record_exact_value` only (single-segment
+            // path from helper builders such as rstr.rs
+            // `emit_record_exact_value_and_return`). The helper
+            // `majit_rlib::jit::record_exact_value` is `rlib/jit.py
+            // record_exact_value`; pyre has no ExtRegistryEntry, so the
+            // helper arm inlines `Entry.specialize_call` here.
+            OpKind::Call { target, args, .. } if is_jit_record_exact_value_llop(target) => {
+                self.rewrite_op_jit_record_exact_value(args, graph, graph_name, None)
+            }
+            OpKind::Call { target, args, .. } if is_record_exact_value_helper(target) => {
+                self.rewrite_op_jit_record_exact_value(args, graph, graph_name, op.result.clone())
             }
             // RPython `Transformer.rewrite_op_same_as` / `rewrite_op_cast_*`
             // drop the op and alias the result to the operand. `deref` is
@@ -12317,12 +12325,26 @@ impl<'a> Transformer<'a> {
     /// `jtransform.py Transformer.rewrite_op_jit_record_exact_value`.
     ///
     /// `getkind(op.args[0].concretetype)`: int → `record_exact_value_i`,
-    /// ref → `record_exact_value_r`, no result.
+    /// ref → `record_exact_value_r`, no result. Constants stay operands
+    /// (`op.args` passed through upstream); pyre materialises them as the
+    /// Const* defines other `_i`/`_r` ops use, including null and
+    /// non-null GC pointer constants.
+    ///
+    /// `alias_result` is the Call result of `rlib/jit.py record_exact_value`
+    /// (`majit_rlib::jit::record_exact_value`). `Entry.specialize_call` is
+    /// `hop.gendirectcall(ll_record_exact_value, v_inst, v_const_inst)` and
+    /// that helper returns `ll_const_value`; this tree has no
+    /// `ll_record_exact_value`, so this arm is that specialize_call. The
+    /// helper body is `ll_assert` (`debug_assert`, dropped:
+    /// `rewrite_op_debug_assert` returns []), the void llop, and
+    /// `return ll_const_value` (`rewrite_op_same_as` aliases the Call
+    /// result to the const operand).
     fn rewrite_op_jit_record_exact_value(
         &mut self,
         args: &[LinkArg],
         graph: &mut FunctionGraph,
         graph_name: &str,
+        alias_result: Option<crate::flowspace::model::Variable>,
     ) -> RewriteResult {
         assert!(
             args.len() >= 2,
@@ -12349,9 +12371,12 @@ impl<'a> Transformer<'a> {
             result: None,
             kind: OpKind::LoweredBlackholeOp {
                 opname: opname.to_string(),
-                args: vec![arg0, arg1],
+                args: vec![arg0, arg1.clone()],
             },
         });
+        if let Some(result) = alias_result {
+            self.aliases.insert(result, arg1);
+        }
         RewriteResult::Replace(ops)
     }
 
@@ -12382,15 +12407,7 @@ impl<'a> Transformer<'a> {
         match arg {
             LinkArg::Value(v) => v.clone(),
             LinkArg::Const(c) => {
-                let kind = match &c.value {
-                    crate::flowspace::model::ConstValue::Bool(b) => OpKind::ConstBool(*b),
-                    crate::flowspace::model::ConstValue::Int(n) => OpKind::ConstInt(*n),
-                    crate::flowspace::model::ConstValue::UInt(n) => OpKind::ConstUInt(*n),
-                    crate::flowspace::model::ConstValue::None => OpKind::ConstRefNull,
-                    other => {
-                        panic!("rewrite_op_jit_record_exact_value: unsupported constant {other:?}")
-                    }
-                };
+                let kind = record_exact_value_const_opkind(&c.value);
                 let ty = match self.record_exact_value_arg_kind(arg) {
                     'i' => crate::model::ConcreteType::Signed,
                     'r' => crate::model::ConcreteType::GcRef,
@@ -14781,15 +14798,49 @@ fn link_arg_const_str_in_graph(
     }
 }
 
-/// `jtransform.py rewrite_op_jit_record_exact_value` Call-target match.
-/// Last segment is the ExtRegistry llop / `ll_record_exact_value` helper.
-fn is_jit_record_exact_value_target(target: &CallTarget) -> bool {
+/// `jtransform.py rewrite_op_jit_record_exact_value` matches the rtyper
+/// llop only. Helper builders emit the single-segment path
+/// (`rstr.rs emit_record_exact_value_and_return` /
+/// `SpaceOperation::new("jit_record_exact_value", …)`).
+fn is_jit_record_exact_value_llop(target: &CallTarget) -> bool {
     matches!(target, CallTarget::FunctionPath { segments, .. }
-    if segments.last().is_some_and(|name| {
-        name == "jit_record_exact_value"
-            || name == "record_exact_value"
-            || name == "ll_record_exact_value"
-    }))
+        if segments.as_slice() == ["jit_record_exact_value"])
+}
+
+/// `rlib/jit.py record_exact_value` (`majit_rlib::jit::record_exact_value`).
+/// The helper returns the const operand; it is not the void llop.
+fn is_record_exact_value_helper(target: &CallTarget) -> bool {
+    matches!(target, CallTarget::FunctionPath { segments, .. }
+        if segments.as_slice() == ["majit_rlib", "jit", "record_exact_value"])
+}
+
+/// Const* define other `_i`/`_r` ops already emit for a Constant
+/// operand. `rewrite_op_jit_record_exact_value` keeps `op.args`
+/// unchanged upstream; `LoweredBlackholeOp` takes Variables, so a
+/// Constant becomes this define. Null GC pointers are `ConstRefNull`;
+/// a non-null `lltype._ptr` / HostObject is the same ConstRefAddr /
+/// ConstRef path `ref_copy` uses.
+pub(crate) fn record_exact_value_const_opkind(
+    value: &crate::flowspace::model::ConstValue,
+) -> OpKind {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::_address;
+    match value {
+        ConstValue::Bool(b) => OpKind::ConstBool(*b),
+        ConstValue::Int(n) => OpKind::ConstInt(*n),
+        ConstValue::UInt(n) => OpKind::ConstUInt(*n),
+        ConstValue::None => OpKind::ConstRefNull,
+        ConstValue::LLAddress(_address::Null) => OpKind::ConstRefNull,
+        ConstValue::LLAddress(_address::IntCast(addr)) => OpKind::ConstRefAddr(*addr),
+        ConstValue::LLAddress(_address::Fake(p)) if !p.nonzero() => OpKind::ConstRefNull,
+        ConstValue::LLAddress(_address::Fake(p)) => {
+            OpKind::ConstRefAddr(p._hashable_identity() as i64)
+        }
+        ConstValue::LLPtr(p) if !p.nonzero() => OpKind::ConstRefNull,
+        ConstValue::LLPtr(p) => OpKind::ConstRefAddr(p._hashable_identity() as i64),
+        ConstValue::HostObject(obj) => OpKind::ConstRef(obj.clone()),
+        other => panic!("rewrite_op_jit_record_exact_value: unsupported constant {other:?}"),
+    }
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
@@ -22693,6 +22744,262 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], lt);
+    }
+
+    fn objectptr_const(null: bool) -> crate::flowspace::model::Constant {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, malloc, nullptr};
+        use crate::translator::rtyper::rclass::{OBJECT, OBJECTPTR};
+        let ptr = if null {
+            nullptr(OBJECT.clone()).expect("nullptr(OBJECT)")
+        } else {
+            malloc(OBJECT.clone(), None, MallocFlavor::Gc, true).expect("malloc OBJECT")
+        };
+        crate::flowspace::model::Constant::with_concretetype(
+            crate::flowspace::model::ConstValue::LLPtr(Box::new(ptr)),
+            OBJECTPTR.clone(),
+        )
+    }
+
+    fn transform_graph_lowers_jit_record_exact_value_ref_const(
+        const_value: crate::flowspace::model::Constant,
+        expect_null: bool,
+    ) {
+        let mut graph = FunctionGraph::new("record_exact_value_r_demo");
+        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, value.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_record_exact_value"]),
+                args: vec![LinkArg::from(value.clone()), LinkArg::Const(const_value)],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops = &result.graph.block(graph.startblock).operations;
+        if expect_null {
+            assert!(
+                ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
+                "null ConstPtr materialises as ConstRefNull: {ops:?}"
+            );
+        } else {
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.kind, OpKind::ConstRefAddr(_))),
+                "non-null ConstPtr materialises as ConstRefAddr: {ops:?}"
+            );
+        }
+        let rec = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "record_exact_value_r"
+                )
+            })
+            .unwrap_or_else(|| panic!("expected record_exact_value_r, got {ops:?}"));
+        assert!(rec.result.is_none(), "record_exact_value_r is void");
+        let OpKind::LoweredBlackholeOp { args, .. } = &rec.kind else {
+            unreachable!();
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], value);
+    }
+
+    #[test]
+    fn transform_graph_lowers_jit_record_exact_value_null_ref_to_record_exact_value_r() {
+        transform_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(true), true);
+    }
+
+    #[test]
+    fn transform_graph_lowers_jit_record_exact_value_constptr_to_record_exact_value_r() {
+        transform_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(false), false);
+    }
+
+    fn transform_graph_helper_record_exact_value_keeps_result(
+        helper: impl IntoIterator<Item = &'static str>,
+    ) {
+        let mut graph = FunctionGraph::new("record_exact_value_helper_demo");
+        let value = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, value.clone());
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(helper),
+                args: vec![
+                    LinkArg::from(value.clone()),
+                    LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
+                        crate::flowspace::model::ConstValue::Bool(true),
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                    )),
+                ],
+                result_ty: ValueType::Int,
+            },
+            result.clone(),
+        );
+        graph.set_return(graph.startblock, Some(result.clone()));
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let block = transformed.graph.block(graph.startblock);
+        let ops = &block.operations;
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "helper Call must be rewritten, got {ops:?}"
+        );
+        let rec = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "record_exact_value_i"
+                )
+            })
+            .unwrap_or_else(|| panic!("expected record_exact_value_i, got {ops:?}"));
+        assert!(rec.result.is_none(), "record_exact_value_i is void");
+        let const_def = ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::ConstBool(true)))
+            .unwrap_or_else(|| panic!("Constant(True) materialises as ConstBool: {ops:?}"));
+        let const_var = const_def
+            .result
+            .clone()
+            .expect("ConstBool defines a result");
+        assert_eq!(block.exits.len(), 1);
+        assert_eq!(
+            block.exits[0].args,
+            vec![LinkArg::Value(const_var)],
+            "helper result is the const operand: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn transform_graph_record_exact_value_helper_keeps_result_defined_by_const() {
+        transform_graph_helper_record_exact_value_keeps_result([
+            "majit_rlib",
+            "jit",
+            "record_exact_value",
+        ]);
+    }
+
+    #[test]
+    fn transform_graph_unrelated_record_exact_value_stays_a_call() {
+        let mut graph = FunctionGraph::new("unrelated_record_exact_value");
+        let value = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let const_value = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, value.clone());
+        graph.push_inputarg_var(graph.startblock, const_value.clone());
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["my_mod", "record_exact_value"]),
+                args: vec![LinkArg::from(value), LinkArg::from(const_value)],
+                result_ty: ValueType::Int,
+            },
+            result.clone(),
+        );
+        graph.set_return(graph.startblock, Some(result));
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. }
+                    if opname == "record_exact_value_i" || opname == "record_exact_value_r"
+            )),
+            "unrelated helper must not become the JIT intrinsic: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["my_mod", "record_exact_value"]
+            )),
+            "unrelated call stays a Call: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn is_jit_record_exact_value_llop_matches_the_single_segment_rtyper_path() {
+        assert!(is_jit_record_exact_value_llop(&CallTarget::function_path(
+            ["jit_record_exact_value"]
+        )));
+        assert!(!is_jit_record_exact_value_llop(&CallTarget::function_path(
+            ["x", "jit_record_exact_value"]
+        )));
+        assert!(is_record_exact_value_helper(&CallTarget::function_path([
+            "majit_rlib",
+            "jit",
+            "record_exact_value"
+        ])));
+        assert!(!is_record_exact_value_helper(&CallTarget::function_path([
+            "my_mod",
+            "record_exact_value"
+        ])));
+    }
+
+    #[test]
+    fn transform_graph_nested_jit_record_exact_value_is_not_the_llop() {
+        let mut graph = FunctionGraph::new("nested_jit_record_exact_value");
+        let lhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let rhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, lhs.clone());
+        graph.push_inputarg_var(graph.startblock, rhs.clone());
+        let lt = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::BinOp {
+                op: "lt".to_string(),
+                lhs,
+                rhs,
+                result_ty: ValueType::Int,
+            },
+            lt.clone(),
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["x", "jit_record_exact_value"]),
+                args: vec![
+                    LinkArg::from(lt),
+                    LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
+                        crate::flowspace::model::ConstValue::Bool(true),
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                    )),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. }
+                    if opname == "record_exact_value_i" || opname == "record_exact_value_r"
+            )),
+            "multi-segment jit_record_exact_value is not the llop: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["x", "jit_record_exact_value"]
+            )),
+            "multi-segment llop lookalike stays a Call: {ops:?}"
+        );
     }
 
     fn mark_instance_flags(

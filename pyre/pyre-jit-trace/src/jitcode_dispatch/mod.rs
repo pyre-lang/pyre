@@ -13865,6 +13865,62 @@ fn trace_record_exact_value<Sym: WalkSym>(
         }
         invalid = true;
     }
+    let error = if invalid {
+        "record_exact_value with two different constant, this is a bug!"
+    } else {
+        "record_exact_value with non-constant second argument, ignored"
+    };
+    if majit_metainterp::debug::have_debug_prints() {
+        let python_name = |index: i32| {
+            crate::state::pyjitcode_for_jitcode_index(index)
+                .map(|pjc| pjc.jitcode.name().to_string())
+        };
+        let current_python = ctx
+            .inline_callee_consts
+            .and_then(|c| python_name(c.jitcode_index))
+            .or_else(|| {
+                let idx = ctx.session.borrow().recording_jitcode_index;
+                if idx >= 0 {
+                    python_name(idx)
+                } else {
+                    python_name(ctx.outer_jitcode_index as i32)
+                }
+            });
+        let helper = ctx
+            .fbw_mode
+            .transparent_helper_jitcode_index
+            .and_then(|i| crate::jitcode_runtime::get_jitcode_ref_by_index(i))
+            .map(|jc| jc.name.clone());
+        // pyjitpl.py `_record_exact_value`: caller of `ll_record_exact_value`
+        // is `framestack[-2]` when present, else the current jitcode.
+        let name = match (current_python, helper) {
+            (Some(caller), Some(_)) => caller,
+            (None, Some(helper)) => helper,
+            (Some(current), None) => current,
+            (None, None) => String::new(),
+        };
+        // pyjitpl.py `_record_exact_value`: empty `current_merge_points`
+        // prints "unknown language location"; otherwise
+        // `jd_sd.warmstate.get_location_str(greenkey)` of
+        // `current_merge_points[0][:num_green_args]`.
+        let loc = match ctx.trace_ctx.current_merge_points_first_greenkey() {
+            None => "unknown language location".to_string(),
+            Some(green_key) => {
+                let jd_sd = ctx
+                    .trace_ctx
+                    .driver_descriptor()
+                    .and_then(|jd_sd| jd_sd.index)
+                    .and_then(|idx| ctx.trace_ctx.metainterp_sd().jitdrivers_sd.get(idx))
+                    .or_else(|| ctx.trace_ctx.driver_descriptor())
+                    .or_else(|| ctx.trace_ctx.metainterp_sd().jitdrivers_sd.first());
+                match jd_sd.and_then(|jd_sd| jd_sd.warmstate.as_ref()) {
+                    Some(ws) => ws.borrow().get_location(green_key),
+                    None => format!("<jit key 0x{green_key:x}>"),
+                }
+            }
+        };
+        majit_metainterp::debug::debug_print(&format!("{error} {name} {loc}"));
+    }
     if invalid {
         DispatchOutcome::SwitchToBlackhole {
             reason: majit_metainterp::counters::ABORT_BAD_LOOP,
