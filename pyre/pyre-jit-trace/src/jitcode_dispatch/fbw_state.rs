@@ -624,6 +624,7 @@ pub struct ParkedWalkTls {
     executed_residual_mayforce: u32,
     executed_residual_plain: u32,
     executed_effect_count: usize,
+    heap_writing_effect_count: usize,
     opcode_entry_effects: Option<(usize, usize)>,
     qmut_abort_stack: Option<(usize, Vec<OpRef>)>,
     branch_abort_stack: Option<(usize, Vec<OpRef>)>,
@@ -699,6 +700,7 @@ pub fn park_walk_tls() {
         executed_residual_mayforce: super::FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.replace(0)),
         executed_residual_plain: super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.replace(0)),
         executed_effect_count: super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.replace(0)),
+        heap_writing_effect_count: super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.replace(0)),
         opcode_entry_effects: super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.take()),
         qmut_abort_stack: super::FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take()),
         branch_abort_stack: super::FBW_BRANCH_ABORT_STACK.with(|c| c.borrow_mut().take()),
@@ -748,6 +750,7 @@ pub fn restore_walk_tls() {
     super::FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.set(parked.executed_residual_mayforce));
     super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.set(parked.executed_residual_plain));
     super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(parked.executed_effect_count));
+    super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(parked.heap_writing_effect_count));
     super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(parked.opcode_entry_effects));
     super::FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = parked.qmut_abort_stack);
     super::FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = parked.branch_abort_stack);
@@ -1007,6 +1010,33 @@ mod parked_walk_tls_root_tests {
         );
         super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.set(std::ptr::null_mut()));
         super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn park_walk_tls_restores_the_outer_heap_writing_effect_count() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
+            }
+        }
+        let _restore = RestoreOnDrop;
+        super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(7));
+        park_walk_tls();
+        assert_eq!(
+            fbw_heap_writing_effect_count(),
+            0,
+            "nested walk starts with a fresh heap-writing count"
+        );
+        super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(3));
+        restore_walk_tls();
+        assert_eq!(
+            fbw_heap_writing_effect_count(),
+            7,
+            "outer heap-writing count must survive the nested walk"
+        );
+        super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
     }
 }
 

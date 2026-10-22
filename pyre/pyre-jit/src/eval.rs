@@ -7869,7 +7869,7 @@ fn drive_portal_metatrace(
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
-    if driver.meta_interp_mut().is_tracing() {
+    if driver.has_attempt_in_flight() {
         return None;
     }
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
@@ -8122,7 +8122,7 @@ fn unpack_merge_point_jit(
     // runner) and never this hook. A residual that reaches the interpreted
     // portal goes through `ll_portal_runner` / this insert, which may start
     // a trace — the same as PyPy. Same-green reentry is `JC_TRACING` /
-    // `meta.is_tracing()` inside `drive_unpack_iterable_trace`, not a
+    // `has_attempt_in_flight()` inside `drive_unpack_iterable_trace`, not a
     // blackhole-running flag (none exists upstream).
     if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
         return;
@@ -8192,7 +8192,7 @@ fn genentry_merge_point_jit(
     }
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        driver.has_attempt_in_flight()
     };
     if tracing {
         return None;
@@ -8300,11 +8300,11 @@ fn drive_generatorentry_trace(
 
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        driver.has_attempt_in_flight()
     };
     if tracing {
         if dbg {
-            eprintln!("[jd2] bail: meta.is_tracing()");
+            eprintln!("[jd2] bail: has_attempt_in_flight()");
         }
         return None;
     }
@@ -8889,11 +8889,13 @@ fn drive_unpack_iterable_trace(
 
     let (driver, _) = driver_pair();
     let meta = driver.meta_interp_mut();
-    // The shared `MetaInterp.tracing` slot holds exactly one ctx; never nest a
-    // jd1 trace inside an active (jd0 or jd1) session.
-    if meta.is_tracing() {
+    // One MetaInterp owns one attempt (`tracing`, `compile_tracing`, or an
+    // open profiler TRACING). Nested `compile_and_run_once` parks first
+    // (`warmstate.py bound_reached` is a fresh MetaInterp); jd1 is the
+    // same door without that park, so refuse while any attempt is in flight.
+    if meta.has_attempt_in_flight() {
         if dbg {
-            eprintln!("[jd1] bail: meta.is_tracing()");
+            eprintln!("[jd1] bail: has_attempt_in_flight()");
         }
         return;
     }
@@ -10487,7 +10489,7 @@ fn generatorentry_ll_portal_runner(
     // A trace already in progress belongs to the caller.
     let tracing = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().is_tracing()
+        driver.has_attempt_in_flight()
     };
     // The portal's reds and green stay live across `maybe_compile_and_run`,
     // which can trace, compile or run the loop.
@@ -10913,9 +10915,10 @@ pub(crate) fn portal_blackhole_recursive_result(frame: &mut PyFrame) -> PyResult
 /// callee jitcode from the resume pc. `portal_ptr` is `PyFrame.dispatch`
 /// (`warmspot.py` `handle_jitexception` ContinueRunningNormally arm),
 /// inside the still-open enter/leave. Dispatch from the resume pc through
-/// `eval_loop_jit`, then `ExecutionContext.leave` — `execute_frame`'s
-/// `finally`. A JIT-less `eval_loop` would skip `jit_merge_point` and
-/// run `PUSH_EXC_INFO` against an unforced virtualizable stack.
+/// `eval_loop_jit`, then `return_trace` and `ExecutionContext.leave` —
+/// `execute_frame`'s inner `finally` then outer `finally`. A JIT-less
+/// `eval_loop` would skip `jit_merge_point` and run `PUSH_EXC_INFO` against
+/// an unforced virtualizable stack.
 pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
@@ -10928,6 +10931,32 @@ pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
     }
     if ec.is_null() {
         return outer_result;
+    }
+    // `execute_frame`'s inner `finally`: `return_trace` still runs when
+    // dispatch raised, then `leave` with that `got_exception`.
+    let return_trace_result = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let exit_slot = roots.base();
+        let exit = roots.pin_root(w_exitvalue);
+        let err_slot = match &mut outer_result {
+            Err(err) => Some(err.pin(&roots)),
+            Ok(_) => None,
+        };
+        let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
+        w_exitvalue = roots.get(exit_slot);
+        if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
+            err.reload(&roots, base);
+        }
+        trace
+    };
+    match return_trace_result {
+        Err(err) => outer_result = Err(err),
+        Ok(live) => {
+            w_exitvalue = live;
+            if outer_result.is_ok() {
+                outer_result = Ok(live);
+            }
+        }
     }
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();

@@ -5643,24 +5643,13 @@ fn assemble_peeled_trace_with_jump_args(
                 );
                 // unroll.py `finalize_short_preamble`:
                 //   label_op.initarglist(label_op.getarglist() + sb.used_boxes)
-                // A preamble-defined box used after the loop LABEL is a
-                // used_box. IntBound.make_guards extra guards at JUMP
-                // (unroll.py `inline_short_preamble` / intutils.py make_guards, or
-                // vstring.py StrPtrInfo.make_guards) can mention it
-                // without the short-preamble builder having recorded it.
-                // `push_fallthrough_same_as` no-ops when `stream_defs`
-                // already contains the box, so the backend loc dies after
-                // the back edge unless the box is a LABEL/JUMP slot.
-                //
-                // A body use-before-def with no preamble producer stays
-                // extra_before_label (the SameAs above), not a LABEL slot:
-                // publishing that without a used_boxes entry makes every
-                // bridge JUMP (`_jump_to_existing_trace` `args + extra`)
-                // one arg short of the compiled LABEL.
-                if stream_defs.contains(&arg) {
-                    full_label_args.push(arg);
-                    appended_label_args.push(arg);
-                }
+                // shortpreamble.py `add_preamble_op` also appends invented
+                // names to `extra_same_as`. `push_fallthrough_same_as` is
+                // that SameAs; the LABEL/JUMP slot is `used_boxes` and is
+                // appended even when the SameAs was just created, so a
+                // bridge that enters at LABEL still has the alias.
+                full_label_args.push(arg);
+                appended_label_args.push(arg);
                 label_set.insert(arg);
             };
             for a in op.args_slice().iter() {

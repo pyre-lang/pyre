@@ -5331,7 +5331,7 @@ fn jit_ca_handle_guard_failure(
     // when this guard fails outside a trace.
     {
         let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
+        if driver.has_attempt_in_flight() {
             return None;
         }
     }

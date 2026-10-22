@@ -6999,7 +6999,14 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        if self.tracing.is_some() {
+        // One MetaInterp owns one attempt. `tracing` is empty while a residual
+        // parks the recorder in `compile_tracing`, and
+        // `profiler_tracing_active` stays true for that whole
+        // `compile_and_run_once` (`pyjitpl.py` start_tracing / end_tracing).
+        // `prepare_trace_start_runtime` must not re-open TRACING on that
+        // object; `warmstate.py bound_reached` builds a fresh MetaInterp
+        // instead, which pyre's NestedTraceGuard parks to empty first.
+        if self.has_attempt_in_flight() {
             return BackEdgeAction::AlreadyTracing;
         }
         // warmstate.py maybe_compile_and_run is bound on this driver's
@@ -7192,7 +7199,7 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        if self.tracing.is_some() {
+        if self.has_attempt_in_flight() {
             return BackEdgeAction::AlreadyTracing;
         }
         // warmstate.py bound_reached: `jitcounter.decay_all_counters()`,
@@ -7283,7 +7290,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
     ) -> HotResult {
-        if self.tracing.is_some() {
+        if self.has_attempt_in_flight() {
             return HotResult::AlreadyTracing;
         }
 
@@ -18184,6 +18191,15 @@ impl<M: Clone> MetaInterp<M> {
         // key, and a memmgr prune can drop the frontend entry while the
         // descr still names a live token.
         crate::mc_diag_bump(6); // start_retrace_from_guard entered
+        // compile.py `_trace_and_compile_from_bridge` constructs a fresh
+        // MetaInterp before `handle_guard_failure`. pyre reuses one object,
+        // so a CALL_ASSEMBLER deopt that fires while `compile_tracing` or
+        // the profiler TRACING scope is still open must not call
+        // `enter_profiler_tracing` (or `begin_attempt`, which would wipe
+        // the outer attempt without parking it).
+        if self.has_attempt_in_flight() {
+            return None;
+        }
         // compile.py _trace_and_compile_from_bridge: MetaInterp(...) then
         // handle_guard_failure. Attempt fields start as `__init__` left them.
         self.begin_attempt();
@@ -25727,6 +25743,44 @@ mod metainterp_static_data_tests {
             Some(marked),
             "the trace is keyed on the cell force_start_tracing marked"
         );
+    }
+
+    #[test]
+    fn force_start_tracing_refuses_when_compile_tracing_holds_the_recorder() {
+        // Residual execution parks the recorder in `compile_tracing`, so
+        // `is_tracing()` is false while `profiler_tracing_active` stays
+        // true. A second `force_start_tracing` must not call
+        // `prepare_trace_start_runtime` (`open_profiler_tracing_inner`).
+        use crate::BackEdgeAction;
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let key = gk(1);
+        let action = meta.force_start_tracing(
+            key.get_uhash(),
+            (0, 0),
+            Some((&key.values, &key.types)),
+            None,
+            &[],
+        );
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        assert!(meta.profiler_tracing_active);
+        meta.compile_tracing = meta.tracing.take();
+        assert!(!meta.is_tracing());
+        assert!(meta.has_attempt_in_flight());
+        let key2 = gk(2);
+        let nested = meta.force_start_tracing(
+            key2.get_uhash(),
+            (0, 0),
+            Some((&key2.values, &key2.types)),
+            None,
+            &[],
+        );
+        assert!(
+            matches!(nested, BackEdgeAction::AlreadyTracing),
+            "prepare_trace_start_runtime must not re-enter while compile_tracing holds the outer recorder"
+        );
+        assert!(meta.compile_tracing.is_some());
+        assert!(meta.profiler_tracing_active);
     }
 
     #[test]
