@@ -3927,6 +3927,13 @@ impl<M: Clone> MetaInterp<M> {
         // `registers_r` for the same reason: leftover boxes must not keep
         // GCREFs alive.
         for frame in self.framestack.frames.iter_mut() {
+            // pyjitpl.py `MIFrame.greenkey` — `newframe` / `setup` stores
+            // the portal green boxes. Recycled `free_frames` /
+            // `free_frames_list` entries are reset by `setup_reused`
+            // before they are read again, so they are not walked.
+            if let Some((_, gk)) = frame.greenkey.as_mut() {
+                gk.walk_refs(&mut visitor);
+            }
             for slot in frame.ref_regs.iter_mut() {
                 // Forward the interned `ConstPtr` table slot; non-Const
                 // positions (ResOp / InputArg refs) carry no inline ref.
@@ -3934,6 +3941,20 @@ impl<M: Clone> MetaInterp<M> {
                     opref.trace_const_ptr(&mut visitor);
                 }
             }
+        }
+        // pyjitpl.py `portal_trace_positions` / `aborted_tracing_greenkey`
+        // hold the same ConstPtr boxes. Walk them even when `tracing` is
+        // None: `find_biggest_function` and the abort hook read them after
+        // the recorder is taken.
+        if let Some(positions) = self.portal_trace_positions.as_mut() {
+            for (_, key, _) in positions.iter_mut() {
+                if let Some((_, gk)) = key {
+                    gk.walk_refs(&mut visitor);
+                }
+            }
+        }
+        if let Some((_, gk)) = self.aborted_tracing_greenkey.as_mut() {
+            gk.walk_refs(&mut visitor);
         }
         if let Some(op) = self.last_exc_box.as_ref() {
             op.trace_const_ptr(&mut visitor);
@@ -4005,6 +4026,7 @@ impl<M: Clone> MetaInterp<M> {
         // the cache holds it. Heapcache key ownership is a separate
         // census from the independently rooted CALL_PURE constants below.
         trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
+        trace_ctx.walk_stored_greenkey_refs(&mut visitor);
         for mp in &mut trace_ctx.current_merge_points {
             for gb in &mut mp.green_boxes {
                 gb.opref.trace_const_ptr(&mut visitor);
@@ -31664,6 +31686,66 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(0);
         meta.walk_active_trace_refs(|_| {});
         assert!(meta.tracing.is_none());
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_stored_greenkey_refs() {
+        // history.py `ConstPtr.value`: portal log, frame greenkey, and
+        // merge-point keys hold copied Ref addresses.
+        let mut meta = MetaInterp::<()>::new(0);
+        let old = 0xA000usize;
+        let new = 0xB000usize;
+        let key = majit_ir::GreenKey::with_types(vec![7, old as i64], vec![Type::Int, Type::Ref]);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        trace_ctx.set_green_key_values(key.clone());
+        trace_ctx.set_close_typed_key(key.clone());
+        trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
+        let pos = trace_ctx.get_trace_position();
+        meta.tracing = Some(trace_ctx);
+        meta.portal_trace_positions = Some(vec![(0, Some((key.get_uhash(), key.clone())), pos)]);
+        meta.aborted_tracing_greenkey = Some((key.get_uhash(), key.clone()));
+
+        let mut b = crate::jitcode::JitCodeBuilder::default();
+        b.ref_return(0);
+        let mut frame = crate::pyjitpl::MIFrame::new(Arc::new(b.finish()), 0);
+        frame.greenkey = Some((key.get_uhash(), key.clone()));
+        meta.framestack = crate::pyjitpl::MIFrameStack::new(frame);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == old {
+                slot.0 = new;
+            }
+        });
+
+        assert_eq!(
+            meta.portal_trace_positions.as_ref().unwrap()[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .1
+                .values[1],
+            new as i64
+        );
+        assert_eq!(
+            meta.aborted_tracing_greenkey.as_ref().unwrap().1.values[1],
+            new as i64
+        );
+        assert_eq!(
+            meta.framestack.frames[0]
+                .greenkey
+                .as_ref()
+                .unwrap()
+                .1
+                .values[1],
+            new as i64
+        );
+        let ctx = meta.tracing.as_ref().unwrap();
+        assert_eq!(ctx.green_key_values().unwrap().values[1], new as i64);
+        assert_eq!(ctx.close_green_key().unwrap().values[1], new as i64);
+        assert_eq!(
+            ctx.current_merge_points[0].green_key_typed.values[1],
+            new as i64
+        );
     }
 
     fn intern_const_ptr(addr: GcRef) -> (OpRef, u32, RestoreConstPtr) {

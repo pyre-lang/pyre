@@ -2605,6 +2605,24 @@ impl TraceCtx {
         current
     }
 
+    /// history.py `ConstPtr.value` — typed green keys hold copied Ref
+    /// addresses (`green_key_values`, `close_typed_key`, each
+    /// `current_merge_points[i].green_key_typed`).
+    pub(crate) fn walk_stored_greenkey_refs(
+        &mut self,
+        visitor: &mut impl FnMut(&mut majit_ir::GcRef),
+    ) {
+        if let Some(gk) = self.green_key_values.as_mut() {
+            gk.walk_refs(visitor);
+        }
+        if let Some(gk) = self.close_typed_key.as_mut() {
+            gk.walk_refs(visitor);
+        }
+        for mp in &mut self.current_merge_points {
+            mp.green_key_typed.walk_refs(visitor);
+        }
+    }
+
     /// Forward `ReconstructRecipe::concrete_r` ref words while the carrier
     /// still sits on this context. Those words are copies of resume values;
     /// once the carrier is taken off, the caller has to publish them onto a
