@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=__init__,direct_while,wrapped_while,direct_for,wrapped_for
+# pyre-check: selfcheck-compiles=entry-bridge:__init__,loop:__init__,direct_for,wrapped_for
 # A constructor whose `__init__` carries a loop of its own evaluated to
 # `None` instead of the instance.
 #

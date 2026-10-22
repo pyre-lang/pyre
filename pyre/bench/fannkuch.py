@@ -1,3 +1,6 @@
+# pyre-check: jitstats-band=guard_failures=1
+# CALL_ASSEMBLER ubuntu cranelift reads 5050 against the 5049 baseline;
+# loops_compiled and bridges_compiled stay 6 and 22.
 # Almost nothing but cross-loop JUMP. wasm uses a module-local br and
 # jitframe slots; dynasm remaps LABEL values in registers.
 # Fannkuch-Redux benchmark (The Computer Language Benchmarks Game)

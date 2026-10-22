@@ -1,10 +1,12 @@
-# pyre-check: max-pypy-ratio=125
+# pyre-check: max-pypy-ratio=28
 # Function-entry `push` deopts on each list realloc. The orthodox
 # append fold compiles two helper traces with 1 guard failure
 # on dynasm and cranelift (was 5).
 # The trip count puts pypy above the startup-subtraction floor, so this ratio
 # is a measurement rather than pyre divided by the floor constant. The ceiling
-# is twice the slowest backend observed (61.9x on cranelift).
+# is 28 from gated readings 7.4x-10.3x (macOS dynasm/cranelift); 28 keeps a
+# quarter of it (7x) under the fastest gated reading and stays above the
+# floor-clamped wasm reading (~27.5x).
 # #171/#34: the orthodox list.append fold fires in function-entry (no-loop)
 # helper traces, not only loop traces.  `push` is a no-loop helper called in a
 # hot loop on two alternating receivers, so it traces from entry (header_pc==0)

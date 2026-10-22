@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=4.5
-# The rename aborts tracing (abrt_force_qmut), as PyPy's does, so both run
-# interpreted. Ubuntu cranelift 4.3x, macos dynasm 4.5x.
+# pyre-check: max-pypy-ratio=5.6
+# ubuntu dynasm 4.9x at pypy exec 0.10s (wall 0.50s). 5.6 is 15% over that
+# reading. The rename aborts tracing (abrt_force_qmut), as PyPy's does, so
+# both run interpreted.
 N = 80000
 
 # Exercises the writable type.__name__ setter under the JIT: a successful

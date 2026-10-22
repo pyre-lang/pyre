@@ -8341,7 +8341,7 @@ pub fn pytraceback_field_descr(index: usize) -> DescrRef {
 }
 
 /// Field descriptor for `PyTraceback.frame`, the node's own frame slot read by
-/// `descr_get_tb_frame`.
+/// `typedef.py interp_attrproperty_w('frame')`.
 pub fn pytraceback_frame_descr() -> DescrRef {
     let index = PYTRACEBACK_DESCR_GROUP
         .field_descrs
@@ -8792,9 +8792,10 @@ pub fn pyframe_w_builtin_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
 }
 
-/// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
-/// traced `tb_frame` fold to reproduce the getter's `mark_as_escaped()`.
-/// Located by offset, so appending another field cannot repoint it.
+/// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED` (`pyframe.py escaped`).
+/// `executioncontext.py leave` and the traceback-construction escape emit
+/// read-or-write it.  Located by offset, so appending another field cannot
+/// repoint it.
 pub fn pyframe_flags_descr() -> DescrRef {
     let index = PYFRAME_DESCR_GROUP
         .field_descrs

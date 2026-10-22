@@ -326,6 +326,37 @@ def instance_iter_deopt_arms():
 
     assert not_an_iterator() == N
 
+    # `__iter__` has an effect and returns a non-iterator.  dest-keep must
+    # still run `space.lookup(w_iter, '__next__')` on that dest
+    # (`descroperation.py iter`) and raise from GET_ITER, not from FOR_ITER.
+    class ReturnsInt:
+        def __init__(self):
+            self.seen = 0
+
+        def __iter__(self):
+            self.seen += 1
+            return 42
+
+        def __next__(self):
+            raise StopIteration
+
+    def returns_int():
+        obj = ReturnsInt()
+        hits = 0
+        for _ in range(N):
+            try:
+                for _x in obj:
+                    pass
+            except TypeError as err:
+                text = str(err)
+                if "returned non-iterator" in text or "must return an iterator" in text:
+                    hits += 1
+        return hits, obj.seen
+
+    hits, seen = returns_int()
+    assert hits == N
+    assert seen == N
+
     # The fold pins the receiver type's version tag, so replacing `__iter__`
     # mid-loop must switch away from the recorded body on the very next iteration.
     class Rebound:

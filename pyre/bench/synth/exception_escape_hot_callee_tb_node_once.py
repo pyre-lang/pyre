@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=7.0
-# Dynasm floor-fail 1.8x against 11.2; 7.0 keeps the derived floor at 1.75x.
-# Main had 7.2 (twice ubuntu 5.6x); 7.2/4 = 1.8, which is the dynasm reading.
+# pyre-check: max-pypy-ratio=5.6
+# Readings across hosts: macOS dynasm 1.6-1.9x locally and 2.0-2.7x on CI,
+# ubuntu dynasm 2.8-2.9x, windows 2.3-2.7x, cranelift 3.1-4.2x. 5.6 puts the
+# derived floor at 1.4x and leaves the slowest reading 33% under the ceiling.
 # A hot compiled CALLEE holding a try block the exception does not stay in used
 # to record its own traceback node TWICE.
 #

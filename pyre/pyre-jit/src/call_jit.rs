@@ -1186,7 +1186,11 @@ fn run_frame_through_portal(frame_ptr: i64, entry: PortalEntry) -> i64 {
     // identity, and is neither complete nor stable enough to choose the door.
     let outcome = match entry {
         PortalEntry::TracedActivation => crate::eval::portal_traced_activation_result(frame),
-        PortalEntry::Resume => crate::eval::portal_body_result(frame),
+        // CALL_ASSEMBLER force: `walker_ec_enter` already ran; compiled
+        // `leave` sits after `GUARD_NOT_FORCED` and does not run here.
+        // `blackhole.py` `resume_in_blackhole` continues `portal_ptr` =
+        // `dispatch` and `execute_frame`'s `finally: leave` still owes.
+        PortalEntry::Resume => crate::eval::continue_entered_frame(frame),
     };
     let result = match outcome {
         Ok(r) => r,
@@ -1389,20 +1393,16 @@ pub extern "C" fn bh_portal_runner_c(
         // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
         crate::eval::correct_resume_vsd(frame, pc);
     }
-    // The bracket is owed, but not for the reason a reading of
-    // `bhimpl_recursive_call_r` suggests.  pyre's codewriter emits no
-    // `recursive_call`, so the live door here is `bhimpl_jit_merge_point`'s
-    // recursive-portal arm (blackhole.py), taken when `nextblackholeinterp`
-    // is not None — a frame that already has a caller in the resumed chain,
-    // i.e. an inlined callee, mid-body at its own loop header.  That IS a
-    // resume, and upstream reaches it through `portal_ptr` = `dispatch`, one
-    // level below `execute_frame`.  What makes it an activation for pyre is
-    // where the frame came from: `emit_new_pyframe_inline_with_params` built
-    // it inside compiled code, and `walker_ec_enter` records only `enter`'s
-    // frame-chain half, never `call_trace` — so this is the frame's first and
-    // only bracket, not a second one.  The bottom level, which is the frame
-    // the interpreter itself bracketed, never arrives here: it raises
-    // `ContinueRunningNormally` and takes the unbracketed entry instead.
+    // `blackhole.py bhimpl_jit_merge_point` when `nextblackholeinterp` is
+    // not None: an inlined callee reached its own loop header. Upstream
+    // calls `get_portal_runner` → `ll_portal_runner` → `portal_ptr` =
+    // `PyFrame.dispatch`, inside `execute_frame`'s already-open enter/leave.
+    // Resume rebuilt that chain from the virtualrefs (`resume.py
+    // rebuild_from_resumedata`); `walker_ec_enter` recorded the enter.
+    // `portal_activation_result` would `install_current_frame` and relink
+    // this ancestor while a nested inlined callee is still top (`f_back`
+    // cycle). Blackhole does not replay the trace's `leave`, so the door
+    // still runs `ExecutionContext.leave` — `execute_frame`'s `finally`.
     //
     // `ec` is a red arg and the frame no longer carries one, so publish it for
     // the duration of the call: `execute_frame` reads its execution context
@@ -1412,7 +1412,7 @@ pub extern "C" fn bh_portal_runner_c(
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
-    let result = crate::eval::portal_activation_result(frame);
+    let result = crate::eval::portal_blackhole_recursive_result(frame);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
@@ -2139,12 +2139,11 @@ fn ca_complete_after_bridge_walk(
     // already executed the resumed region's effects concretely, so a
     // guard-state resume would re-apply them over the advanced heap
     // (double-execution / stale-value return). Complete the callee from its
-    // adopted state via the portal runner instead — the same
-    // portal_ptr(*args) completion the ContinueRunningNormally arm of
-    // handle_blackhole_result performs.
+    // adopted state: enter already ran in compiled code, so dispatch then
+    // `ExecutionContext.leave` — `execute_frame`'s `finally`.
     if ca_adopted_frame != 0 && ca_adopted_frame == callee_frame {
         let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
-        return match crate::eval::portal_body_result(frame) {
+        return match crate::eval::continue_entered_frame(frame) {
             Ok(result) => Some(result as i64),
             Err(mut err) => {
                 let exc_obj = err.to_exc_object();
@@ -3716,7 +3715,10 @@ fn handle_blackhole_result(bh_result: BlackholeResult) -> Option<i64> {
             if !ec.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(ec);
             }
-            let result = crate::eval::portal_body_result(frame);
+            // CALL_ASSEMBLER blackhole CRN: the callee's enter ran in the
+            // caller's compiled code; `GUARD_NOT_FORCED` failed so the
+            // compiled leave does not run. `portal_ptr` + `finally: leave`.
+            let result = crate::eval::continue_entered_frame(frame);
             pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
             match result {
                 Ok(result) => Some(result as i64),
@@ -5329,7 +5331,7 @@ fn jit_ca_handle_guard_failure(
     // when this guard fails outside a trace.
     {
         let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
+        if driver.has_attempt_in_flight() {
             return None;
         }
     }

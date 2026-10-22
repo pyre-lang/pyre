@@ -15982,7 +15982,7 @@ impl CodeWriter {
         // with the runtime translator's exact precedence while the codewriter
         // still owns the marker tables: sparse carry-forward override first,
         // otherwise the derivable resume marker. This is deliberately only
-        // the set of trace-entry greens (function entry and loop headers), not
+        // the set of trace-entry greens (`after_return_generator_index` and loop headers), not
         // a general coordinate inverse.
         //
         // A header this body never lowered does NOT qualify.  `abort_permanent`
@@ -16011,7 +16011,11 @@ impl CodeWriter {
                 .is_some()
             })
             .collect();
-        trace_entry_pcs.push(0);
+        // Function-entry merge is the first pc `execute_frame` / `next_instr`
+        // actually dispatch (`after_return_generator_index`): 0 for ordinary code, the
+        // `POP_TOP` after `RETURN_GENERATOR` for a generator.
+        // `try_function_entry_jit` keys the first resume on `next_instr()`.
+        trace_entry_pcs.push(pyre_interpreter::after_return_generator_index(code));
         trace_entry_pcs.sort_unstable();
         trace_entry_pcs.dedup();
         let resolve_marker = |py_pc: usize| {
@@ -17022,6 +17026,190 @@ mod tests {
                 _ => None,
             })
             .expect("expected nested function code object")
+    }
+
+    fn nested_function_code_named(source: &str, name: &str) -> CodeObject {
+        fn walk(code: &CodeObject, name: &str) -> Option<CodeObject> {
+            if code.obj_name.as_str() == name {
+                return Some(code.clone());
+            }
+            for constant in code.constants.iter() {
+                if let ConstantData::Code { code } = constant
+                    && let Some(found) = walk(code, name)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let module = compile_exec(source).expect("compile failed");
+        walk(&module, name).unwrap_or_else(|| panic!("expected nested function {name}"))
+    }
+
+    #[test]
+    fn chunked_read_if_join_keeps_buf_prefix() {
+        use pyre_interpreter::bytecode::Instruction;
+        use pyre_jit_trace::jitcode_runtime::{decode_op_at, decoded_ops};
+
+        let source = include_str!(
+            "../../../extra_tests/parity_tests/chunked_read_keeps_its_buffered_tail.py"
+        );
+        let code = nested_function_code_named(source, "read");
+        let buf_idx = code
+            .varnames
+            .iter()
+            .position(|name| {
+                let name: &str = name.as_ref();
+                name == "buf"
+            })
+            .expect("read has a buf local");
+        let mut store_buf_pcs = Vec::new();
+        let mut last_pjif_before_join = None;
+        for pc in 0..code.instructions.len() {
+            let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(&code, pc) else {
+                continue;
+            };
+            match instr {
+                Instruction::StoreFast { var_num }
+                    if pyre_interpreter::load_fast_var_num_to_index(var_num, op_arg) == buf_idx =>
+                {
+                    store_buf_pcs.push(pc);
+                }
+                Instruction::PopJumpIfFalse { .. } => last_pjif_before_join = Some(pc),
+                _ => {}
+            }
+            if store_buf_pcs.len() == 2 {
+                break;
+            }
+        }
+        assert!(
+            store_buf_pcs.len() >= 2,
+            "read has the early-return buf store and the drain-prefix buf store"
+        );
+        let join_store_pc = store_buf_pcs[1];
+        let pjif_pc = last_pjif_before_join.expect("if n > want: precedes the drain-prefix store");
+        let (pjif_instr, pjif_arg) =
+            pyre_interpreter::decode_instruction_at(&code, pjif_pc).expect("pjif decodes");
+        let Instruction::PopJumpIfFalse { delta } = pjif_instr else {
+            panic!("last jump before the drain-prefix store is PopJumpIfFalse");
+        };
+        let pjif_target =
+            pyre_interpreter::jump_target_forward_decoded(&code, pjif_pc + 1, delta, pjif_arg);
+        assert!(
+            pjif_target <= join_store_pc,
+            "if n > want: jumps to the drain-prefix, not past it"
+        );
+
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("read portal must produce a jitcode");
+        assert!(!pyjit.has_abort, "read-like function must lower");
+
+        let jitcode = pyjit.jitcode.code.as_slice();
+        let exact = &pyjit.metadata.py_exact_by_jit_pc;
+        let py_pc_at = |jit_pc: usize| -> Option<u32> {
+            let jit_pc = jit_pc as u32;
+            exact
+                .iter()
+                .rev()
+                .find(|&&(off, _)| off <= jit_pc)
+                .map(|&(_, py)| py)
+        };
+        let jit_label_at = |op: &pyre_jit_trace::jitcode_runtime::DecodedOp| -> Option<usize> {
+            let signature = op.argcodes.split('>').next()?;
+            let mut offset = 0usize;
+            for operand in signature.chars() {
+                match operand {
+                    'L' => {
+                        let lo = *jitcode.get(op.pc + 1 + offset)? as usize;
+                        let hi = *jitcode.get(op.pc + 1 + offset + 1)? as usize;
+                        return Some(lo | (hi << 8));
+                    }
+                    'i' | 'r' | 'f' => offset += 1,
+                    _ => return None,
+                }
+            }
+            None
+        };
+        let follow_trampoline = |start: usize| -> usize {
+            let mut pc = start;
+            for _ in 0..32 {
+                let Some(op) = decode_op_at(jitcode, pc) else {
+                    return pc;
+                };
+                match op.opname {
+                    "live" | "ref_copy" => pc = op.next_pc,
+                    "goto" => pc = jit_label_at(&op).unwrap_or(pc),
+                    _ => return pc,
+                }
+            }
+            pc
+        };
+
+        let goto_if_not = decoded_ops(jitcode)
+            .find(|op| {
+                op.opname.starts_with("goto_if_not")
+                    && py_pc_at(op.pc).is_some_and(|py| py as usize == pjif_pc)
+            })
+            .expect("if n > want: lowers to goto_if_not");
+        let label = jit_label_at(&goto_if_not).expect("goto_if_not carries a label");
+        let resolved = follow_trampoline(label);
+        let resolved_py = py_pc_at(resolved);
+        assert!(
+            resolved_py.is_some_and(|py| {
+                let py = py as usize;
+                py <= join_store_pc && py >= pjif_target
+            }),
+            "if n > want: false-edge landing must be the drain-prefix \
+             (pjif_target={pjif_target}..=join_store={join_store_pc}), not the while header; \
+             resolved trampoline jit_pc={resolved} py={resolved_py:?} pjif_pc={pjif_pc}"
+        );
+
+        let mut visited = std::collections::HashSet::new();
+        let mut work = vec![resolved];
+        let mut reached_join_store = false;
+        while let Some(pc) = work.pop() {
+            if !visited.insert(pc) || visited.len() > 4096 {
+                continue;
+            }
+            if py_pc_at(pc).is_some_and(|py| py as usize == join_store_pc) {
+                reached_join_store = true;
+                break;
+            }
+            let Some(op) = decode_op_at(jitcode, pc) else {
+                continue;
+            };
+            if op.opname == "goto" {
+                if let Some(target) = jit_label_at(&op) {
+                    work.push(follow_trampoline(target));
+                }
+                continue;
+            }
+            if op.opname.starts_with("raise")
+                || op.opname.contains("return")
+                || op.opname == "unreachable"
+            {
+                continue;
+            }
+            work.push(op.next_pc);
+        }
+        assert!(
+            reached_join_store,
+            "if n > want: false edge must reach STORE_FAST buf at py_pc {join_store_pc}, \
+             resolved trampoline jit_pc={resolved} py={:?}",
+            py_pc_at(resolved)
+        );
     }
 
     #[test]

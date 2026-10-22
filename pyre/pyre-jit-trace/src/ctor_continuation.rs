@@ -42,7 +42,8 @@
 //! `descr_call`.  Then `__init__` is a frame inside a frame, the discard and
 //! the None check are that graph's own jitcode, and this module deletes.
 //! Until then the stand-in is deliberately the smallest thing that can hold a
-//! resume coordinate: three ops, entered only by resume, never compiled.
+//! resume coordinate: the placeholder call, two `-live-` anchors, the None
+//! check, and `ref_return`, entered only by resume, never compiled.
 //!
 //! Without such a level the constructor route cannot be seeded at all.  A
 //! blackhole level's return kind is decided by the `*_return` op the callee
@@ -63,9 +64,17 @@
 //! ```text
 //!   0:          inline_call_r_r <placeholder>, self -> init_result
 //!   resume_pc:  -live-                       [r0 live, r1 pending]
+//!   assembler:  -live-                       [r0 live, r1 live]
 //!               residual_call_r_v  bh_check_init_returned_none(init_result)
 //!               ref_return         instance
 //! ```
+//!
+//! `resume_pc` is the in-call coordinate: a guard inside `__init__` keeps this
+//! level paused with `r1` pending so `_setup_return_value_r` fills it when
+//! `__init__` returns. The assembler coordinate is the same tail after
+//! `CALL_ASSEMBLER` has already produced that result (`do_residual_call`
+//! writes dest before `GUARD_NOT_FORCED`): both registers are live, and a
+//! force resumes here so the None check still runs.
 //!
 //! The level is only ever *resumed*, never entered from the top:
 //! `blackhole_from_resumedata` sets each level's `position` from its resume
@@ -100,34 +109,37 @@ const PLACEHOLDER_CALLEE: u16 = 0;
 /// Returns nothing, matching the `'v'` result the calldescr declares —
 /// `bh_call_v_dispatch` (`majit-backend/src/call_stub.rs`) transmutes the
 /// address to a `()`-returning `extern "C"` fn, so any other Rust return type
-/// would be a signature mismatch.  The exception reaches the blackhole through
-/// `BH_LAST_EXC_VALUE`, which `handler_residual_call_r_v` zeroes before the
-/// call and tests after it.  The compiled-code channel (`store_jit_exception`)
-/// is deliberately not written: this jitcode is a resume coordinate, never a
-/// compilation unit.
+/// would be a signature mismatch.  A refusal publishes through
+/// `ResidualError::publish_residual` (`jit_publish_residual_error`):
+/// `BH_LAST_EXC_VALUE` for the blackhole handler and the compiled
+/// `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` cell.  The walker records this
+/// helper after a loop-callee `CALL_ASSEMBLER` so a non-None `__init__`
+/// result raises as `descr_call`'s outcome instead of aborting into an
+/// entry replay.
 pub extern "C" fn bh_check_init_returned_none(result: pyre_object::PyObjectRef) {
-    if let Err(mut err) = pyre_interpreter::call::check_init_returned_none(result) {
-        let exc_obj = err.to_exc_object();
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    if let Err(err) = pyre_interpreter::call::check_init_returned_none(result) {
+        use majit_ir::helper_fnaddr::ResidualError;
+        err.publish_residual();
     }
 }
 
 thread_local! {
-    static LEVEL: std::cell::OnceCell<Option<(i32, usize)>> =
+    static LEVEL: std::cell::OnceCell<Option<(i32, usize, usize)>> =
         const { std::cell::OnceCell::new() };
 }
 
-/// `(jitcode index, resume pc)` of the shared tail, built on first use.
+/// `(jitcode index, in-call resume pc, assembler resume pc)` of the shared
+/// tail, built on first use.
 ///
 /// Thread-local because `MetaInterpStaticData` is: the index it hands back
 /// names a slot in this thread's `jitcodes`.
-fn level() -> Option<(i32, usize)> {
+fn level() -> Option<(i32, usize, usize)> {
     LEVEL.with(|cell| *cell.get_or_init(build))
 }
 
 /// The jitcode index of the tail, or `None` when it could not be built.
 pub(crate) fn jitcode_index() -> Option<i32> {
-    level().map(|(index, _)| index)
+    level().map(|(index, _, _)| index)
 }
 
 /// Whether `index` names the tail, WITHOUT building it.
@@ -138,15 +150,21 @@ pub(crate) fn jitcode_index() -> Option<i32> {
 /// append that slot in every process that ever decodes a resume section,
 /// shifting the index space for programs that never inline a constructor.
 pub(crate) fn is_installed_level(index: i32) -> bool {
-    LEVEL.with(|cell| matches!(cell.get(), Some(&Some((installed, _))) if installed == index))
+    LEVEL.with(|cell| matches!(cell.get(), Some(&Some((installed, _, _))) if installed == index))
 }
 
-/// The byte offset the tail's resume section must name.
+/// The byte offset the tail's in-call resume section must name.
 pub(crate) fn resume_pc() -> Option<usize> {
-    level().map(|(_, pc)| pc)
+    level().map(|(_, pc, _)| pc)
 }
 
-fn build() -> Option<(i32, usize)> {
+/// The byte offset a constructor `CALL_ASSEMBLER` `GUARD_NOT_FORCED` names:
+/// `__init__` has already returned, so `INIT_RESULT_REG` is live.
+pub(crate) fn assembler_resume_pc() -> Option<usize> {
+    level().map(|(_, _, pc)| pc)
+}
+
+fn build() -> Option<(i32, usize, usize)> {
     let mut builder = JitCodeBuilder::new();
     builder.set_name("descr_call_tail");
 
@@ -165,6 +183,17 @@ fn build() -> Option<(i32, usize)> {
     let liveness_offset = crate::state::intern_liveness(&[], &[INSTANCE_REG as u8], &[])?;
     let live_patch = builder.live_placeholder();
     builder.patch_live_offset(live_patch, liveness_offset);
+
+    // After `CALL_ASSEMBLER`, `_setup_return_value_r` has already run: both
+    // the instance and `__init__`'s result are live, and a force resumes here
+    // so `bh_check_init_returned_none` still executes. `bhimpl_live` is a
+    // marker skip, so an in-call resume that falls through this second
+    // `-live-` keeps the result `_setup_return_value_r` just wrote.
+    let assembler_resume_pc = builder.current_pos();
+    let assembler_liveness =
+        crate::state::intern_liveness(&[], &[INSTANCE_REG as u8, INIT_RESULT_REG as u8], &[])?;
+    let assembler_live_patch = builder.live_placeholder();
+    builder.patch_live_offset(assembler_live_patch, assembler_liveness);
 
     let funcptr = pyre_interpreter::residual_word_addr!(1, bh_check_init_returned_none) as i64;
     let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
@@ -200,7 +229,7 @@ fn build() -> Option<(i32, usize)> {
         /* has_abort */ false,
     ));
     let index = crate::state::install_codeless_jitcode(payload);
-    Some((index, resume_pc))
+    Some((index, resume_pc, assembler_resume_pc))
 }
 
 #[cfg(test)]
@@ -211,7 +240,7 @@ mod tests {
     /// `_setup_return_value_r` can read `code[position-1]` as the dest.
     #[test]
     fn resume_anchor_sits_behind_the_inline_call_return_tail() {
-        let Some((index, resume_pc)) = level() else {
+        let Some((index, resume_pc, _)) = level() else {
             return;
         };
         let payload = crate::state::pyjitcode_for_jitcode_index(index)
@@ -241,11 +270,12 @@ mod tests {
             "the anchor must be addressable as a resume coordinate",
         );
         // `run_inner` asserts membership on every dispatched position, not
-        // only the entry one, so the tail's three remaining ops need theirs
-        // too: `inline_call`, `-live-`, `residual_call_r_v`, `ref_return`.
+        // only the entry one, so the tail's ops need theirs too: `inline_call`,
+        // in-call `-live-`, assembler `-live-`, `residual_call_r_v`,
+        // `ref_return`.
         assert_eq!(
             startpoints.len(),
-            4,
+            5,
             "startpoints must cover every op in the tail, got {startpoints:?}",
         );
     }
@@ -256,7 +286,7 @@ mod tests {
     /// parent aborts the guard with `GuardResumeCoordinateUnavailable`.
     #[test]
     fn the_anchor_resolves_as_an_ordinary_parent_resume_coordinate() {
-        let Some((index, resume_pc)) = level() else {
+        let Some((index, resume_pc, _)) = level() else {
             return;
         };
         let payload = crate::state::pyjitcode_for_jitcode_index(index)
@@ -271,6 +301,29 @@ mod tests {
             payload.resolve_resume_pc_with_jitcode_pc(resume_pc as i32, crate::state::op_live()),
             Some(resume_pc),
             "the parent loop must resolve the anchor to itself",
+        );
+    }
+
+    /// A constructor `CALL_ASSEMBLER` force resumes with `__init__`'s result
+    /// already in `INIT_RESULT_REG`, so that coordinate's `-live-` names both
+    /// ref registers.
+    #[test]
+    fn assembler_resume_names_the_instance_and_the_init_result() {
+        let Some((index, _, assembler_pc)) = level() else {
+            return;
+        };
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)
+            .expect("the tail was just installed at this index");
+        assert!(
+            payload
+                .jitcode
+                .can_decode_live_vars(assembler_pc, crate::state::op_live()),
+            "the assembler anchor must decode its live vars",
+        );
+        assert_eq!(
+            crate::state::frame_value_count_at(index, assembler_pc as i32),
+            2,
+            "instance and __init__ result are both live after CALL_ASSEMBLER",
         );
     }
 
