@@ -179,12 +179,12 @@ mod super_tests {
 /// Python property descriptor object.
 ///
 /// Layout: `[ob_type | fget | fset | fdel | w_doc | w_name | getter_doc |
-/// fget_watchers | fset_watchers]`
+/// fget_watchers | fset_watchers | fdel_watchers]`
 #[pyre_class("property", type_id = 19, static_name = "PROPERTY", user_layout)]
 pub struct W_Property {
     /// `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",
     /// "w_fdel?"]` declares all three quasi-immutable; the hidden watcher
-    /// fields below implement the `?` for the two a fold bakes.
+    /// fields below implement the `?` for all three.
     pub fget: PyObjectRef,
     pub fset: PyObjectRef,
     pub fdel: PyObjectRef,
@@ -212,13 +212,11 @@ pub struct W_Property {
     /// its own instance; `property_destructor` in `pyre-jit/src/eval.rs` takes
     /// it back on sweep instead.  `W_TypeObject` and `Function`'s inline
     /// `mutate_<name>` fields carry the same pattern.
-    ///
-    /// `w_fdel?` is declared upstream on the same line and gets no watcher
-    /// here: no fold bakes `fdel`, so nothing would ever register on it.  A
-    /// `__delete__` fold must add the third one rather than bake without it.
     pub fget_watchers: crate::quasiimmut::QuasiImmutField,
     /// The `w_fset?` twin of [`Self::fget_watchers`].
     pub fset_watchers: crate::quasiimmut::QuasiImmutField,
+    /// The `w_fdel?` twin of [`Self::fget_watchers`].
+    pub fdel_watchers: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Allocate a new property object.
@@ -250,6 +248,7 @@ pub fn w_property_new(
             getter_doc: false,
             fget_watchers: crate::quasiimmut::QuasiImmutField::new(),
             fset_watchers: crate::quasiimmut::QuasiImmutField::new(),
+            fdel_watchers: crate::quasiimmut::QuasiImmutField::new(),
         },
         crate::gc_roots::shadow_stack_get(base + 3),
     )
@@ -307,6 +306,9 @@ pub unsafe fn w_property_reinit(
     }
     if (*prop).fset_watchers.is_installed() {
         crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fset_watchers);
+    }
+    if (*prop).fdel_watchers.is_installed() {
+        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fdel_watchers);
     }
     (*prop).fget = fget;
     (*prop).fset = fset;

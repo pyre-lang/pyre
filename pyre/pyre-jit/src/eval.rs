@@ -633,7 +633,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     unsafe { (*t).w_name_watchers.reclaim() };
 }
 
-/// Reclaim `W_Property`'s `w_fget?` / `w_fset?` instances on sweep.
+/// Reclaim `W_Property`'s `w_fget?` / `w_fset?` / `w_fdel?` instances on sweep.
 ///
 /// The instances hang off an `AtomicPtr` that no descr row and no
 /// `gc_ptr_offsets` entry covers, so nothing traces them and a swept property
@@ -655,6 +655,7 @@ unsafe fn property_destructor(obj_addr: usize) {
     let p = obj_addr as *const pyre_object::descriptor::W_Property;
     unsafe { (*p).fget_watchers.reclaim() };
     unsafe { (*p).fset_watchers.reclaim() };
+    unsafe { (*p).fdel_watchers.reclaim() };
 }
 
 /// The `w_function?` counterpart of [`property_destructor`] for `staticmethod`.
