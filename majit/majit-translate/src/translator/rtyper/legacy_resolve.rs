@@ -1000,7 +1000,7 @@ mod tests {
         graph.set_return(void_bb, None);
 
         annotate::annotate(&graph);
-        resolve_types(&graph);
+        resolve_types(&graph, &HashSet::new());
     }
 
     #[test]
