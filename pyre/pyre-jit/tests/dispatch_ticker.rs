@@ -34,3 +34,79 @@ fn fired_ticker_is_serviced_once_before_the_opcode() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn simple_counted_loop_runs_through_the_portal() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            pyre_module::register();
+            init_jit_hooks();
+            let ec = Rc::new(PyExecutionContext::default());
+            let ec_ptr = Rc::as_ptr(&ec) as *mut PyExecutionContext;
+            pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
+            let code = compile_source_with_filename(
+                "i = 0\nwhile i < 2000:\n    i += 1\nassert i == 2000\n",
+                Mode::Exec,
+                "t1_loop.py",
+            )
+            .unwrap();
+            let mut frame = PyFrame::new_with_context(code, ec.clone()).unwrap();
+            eval_with_jit(&mut frame, None).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn for_range_loop_runs_through_the_portal() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            pyre_module::register();
+            init_jit_hooks();
+            let ec = Rc::new(PyExecutionContext::default());
+            let ec_ptr = Rc::as_ptr(&ec) as *mut PyExecutionContext;
+            pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
+            let code = compile_source_with_filename(
+                "s = 0\nfor i in range(2000):\n    s += i\nassert s == 1999000\n",
+                Mode::Exec,
+                "t1_for.py",
+            )
+            .unwrap();
+            let mut frame = PyFrame::new_with_context(code, ec.clone()).unwrap();
+            eval_with_jit(&mut frame, None).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn list_subscript_loop_runs_through_the_portal() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            pyre_module::register();
+            init_jit_hooks();
+            let ec = Rc::new(PyExecutionContext::default());
+            let ec_ptr = Rc::as_ptr(&ec) as *mut PyExecutionContext;
+            pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
+            let code = compile_source_with_filename(
+                concat!(
+                    "a = [0] * 1423\n",
+                    "for i in range(1423):\n",
+                    "    assert a[i] == 0\n",
+                ),
+                Mode::Exec,
+                "t1_subscr.py",
+            )
+            .unwrap();
+            let mut frame = PyFrame::new_with_context(code, ec.clone()).unwrap();
+            eval_with_jit(&mut frame, None).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

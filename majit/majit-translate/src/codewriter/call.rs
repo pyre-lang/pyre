@@ -901,14 +901,6 @@ pub struct CallDescriptor {
 }
 
 impl CallDescriptor {
-    pub fn known(extra_info: EffectInfo) -> Self {
-        Self::from_signature(&[], Type::Void, extra_info)
-    }
-
-    pub fn override_effect(extra_info: EffectInfo) -> Self {
-        Self::from_signature(&[], Type::Void, extra_info)
-    }
-
     pub fn from_signature(arg_types: &[Type], result_type: Type, extra_info: EffectInfo) -> Self {
         let arg_classes = arg_types.iter().map(|tp| type_to_argclass(*tp)).collect();
         let (result_type, result_signed, result_size, result_erased) =
@@ -12892,11 +12884,13 @@ pub(crate) fn is_int_arithmetic_target(target: &CallTarget) -> bool {
 ///
 /// RPython: part of `CallControl.getcalldescr()` — returns effect info
 /// for known functions like `w_int_add` (elidable), `w_float_sub` (elidable).
-pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
+/// The table supplies only EffectInfo; the call site's FUNC signature
+/// is applied when the calldescr is attached.
+pub(crate) fn describe_call(target: &CallTarget) -> Option<EffectInfo> {
     CALL_DESCRIPTOR_TABLE
         .iter()
         .find(|entry| matches_any(target, entry.targets))
-        .map(|entry| CallDescriptor::known(entry.get_extra_info()))
+        .map(|entry| entry.get_extra_info())
 }
 
 #[cfg(test)]

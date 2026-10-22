@@ -784,6 +784,25 @@ fn dispatch_op(
             let label_id = builder_label(state, &label.name);
             state.builder.jump(label_id);
         }
+        "switch" => {
+            // `flatten.py` `GraphFlattener.insert_exits` `switch/id`: int
+            // register plus SwitchDictDescr.  Missing keys fall through
+            // (`blackhole.py` `bhimpl_switch`).
+            assert_eq!(args.len(), 2, "switch expects [value, SwitchDictDescr]");
+            let value = expect_reg(&args[0], Kind::Int);
+            let cases: Vec<(i64, u16)> = match &args[1] {
+                Operand::Descr(descr) => match &**descr {
+                    DescrOperand::SwitchDict(switch) => switch
+                        .labels
+                        .iter()
+                        .map(|(key, tlabel)| (*key, builder_label(state, &tlabel.name)))
+                        .collect(),
+                    other => panic!("switch descr must be SwitchDictDescr, got {other:?}"),
+                },
+                other => panic!("switch second arg must be Descr, got {other:?}"),
+            };
+            state.builder.switch(value, &cases);
+        }
         "goto_if_not" => {
             let cond = expect_reg(&args[0], Kind::Int);
             let label = expect_tlabel(&args[1]);

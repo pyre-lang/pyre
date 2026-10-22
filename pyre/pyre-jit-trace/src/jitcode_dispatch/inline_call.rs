@@ -790,8 +790,8 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
     false
 }
 
-/// True iff `body_code` carries a `jit_merge_point`, i.e. the callee owns a
-/// loop header of its own.
+/// True iff `body_code` carries a `loop_header` (the lowered `can_enter_jit`
+/// at a backward-jump site), i.e. the callee owns a loop header of its own.
 ///
 /// Reaching one during an inline sub-walk surfaces
 /// `SubLoopCalleeCallAssembler`, the one arm of
@@ -803,8 +803,12 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
 ///
 /// A loop header is also where a deferred `load_method_self`'s two
 /// operand-stack entries can be crossed by a failing guard.
+///
+/// The test is `loop_header`, not `jit_merge_point`: the merge point marks the
+/// portal's dispatch entry (`interp_jit.py PyFrame.dispatch`), while the
+/// back-edge is `can_enter_jit` (`interp_jit.py PyFrame.jump_absolute`).
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
-    crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "jit_merge_point")
+    crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "loop_header")
 }
 
 /// Whether running a straight-line callee body before deciding to keep it can
@@ -15486,11 +15490,11 @@ pub(crate) struct GeneratorResumeCensus {
     /// hook against the ones a straight-line resume would already serve.
     ///
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
-    /// `jit_merge_point` op.  That op is emitted only under `is_true_portal`,
-    /// and a generator body is never one, so the jitcode test answers `false`
-    /// for every generator whatever its source says.  `merge_entry_by_green`
-    /// is `find_loop_header_pcs` plus function entry and is built for every
-    /// code object, so it survives the portal distinction.
+    /// `loop_header` op.  A generator body is never a true portal, so that
+    /// jitcode test answers `false` for every generator whatever its source
+    /// says.  `merge_entry_by_green` is `find_loop_header_pcs` plus function
+    /// entry and is built for every code object, so it survives the portal
+    /// distinction.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.

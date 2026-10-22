@@ -3315,11 +3315,16 @@ impl JitCodeBuilder {
     }
 
     pub fn mark_label(&mut self, label: u16) {
+        let target = self.code.len();
+        // `assembler.py` `fix_labels`: `assert 0 <= target <= 0xFFFF`.
+        if target > u16::MAX as usize {
+            self.encoding_overflow = true;
+        }
         let slot = self
             .labels
             .get_mut(label as usize)
             .expect("jitcode label out of bounds");
-        *slot = Some(self.code.len());
+        *slot = Some(target);
     }
 
     /// RPython `flatten.py` emits a plain `Bool` exitswitch as opname
@@ -6506,11 +6511,6 @@ impl JitCodeBuilder {
             || total_i > 256
             || total_r > 256
             || total_f > 256
-            // `assembler.py` `fix_labels`: `assert 0 <= target <= 0xFFFF`.
-            // A position past that unsigned 16-bit range cannot be named as
-            // a jump target or as a resume pc. Decline it like the
-            // register/const ceilings above; the interpreter keeps running it.
-            || self.code.len() > u16::MAX as usize
         {
             return None;
         }
@@ -8976,11 +8976,24 @@ mod tests {
         assert!(builder.try_finish().is_some());
     }
 
-    /// One byte past the unsigned label target. `fix_labels` cannot name it.
+    /// `assembler.py` has no code-length ceiling. A body past `u16::MAX`
+    /// with no label targeting that range still assembles.
     #[test]
-    fn try_finish_declines_code_past_u16_label_target() {
+    fn try_finish_accepts_code_past_u16_without_a_label_target() {
         let mut builder = JitCodeBuilder::new();
         builder.code.resize(u16::MAX as usize + 1, 0);
+        assert!(builder.try_finish().is_some());
+    }
+
+    /// `fix_labels` `assert 0 <= target <= 0xFFFF`: a label whose mark
+    /// sits past that range latches `encoding_overflow`.
+    #[test]
+    fn try_finish_declines_label_target_past_u16() {
+        let mut builder = JitCodeBuilder::new();
+        let label = builder.new_label();
+        builder.code.resize(u16::MAX as usize + 1, 0);
+        builder.mark_label(label);
+        assert!(builder.encoding_overflow);
         assert!(builder.try_finish().is_none());
     }
 

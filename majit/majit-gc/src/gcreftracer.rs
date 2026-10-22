@@ -463,6 +463,39 @@ mod tests {
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E700);
     }
 
+    #[test]
+    fn pending_gc_table_pinned_slot_survives_second_minor() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E702 };
+        assert!(
+            owner.pin(root),
+            "TypeInfo::simple has no GC pointers, so pin is allowed"
+        );
+        let table = GcTable::from_gcrefs(&[root]);
+        owner.remember_gc_table(&table);
+        owner.do_collect_nursery();
+        assert_eq!(
+            table.slot(0),
+            root,
+            "a pinned nursery slot is not copied on the first drain"
+        );
+        owner.unpin(root);
+        owner.do_collect_nursery();
+        let after_unpin = table.slot(0);
+        assert_ne!(
+            after_unpin, root,
+            "unpin then a second minor copies the young slot out"
+        );
+        assert_eq!(unsafe { *(after_unpin.0 as *const u64) }, 0xA11C_E702);
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn pinned_rewrite_gcrefs_survive_minor_before_in_code() {

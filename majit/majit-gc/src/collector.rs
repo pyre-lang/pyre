@@ -9909,10 +9909,25 @@ impl MiniMarkGC {
 
     /// Drain this MiniMark's table remembered set. Same consume as
     /// `collect_oldrefs_to_nursery` on `old_objects_pointing_to_young`.
+    ///
+    /// `collect_oldrefs_to_nursery` restores `GCFLAG_TRACK_YOUNG_PTRS` so a
+    /// later young store re-remembers the object, and pinned nursery
+    /// children stay on `old_objects_pointing_to_pinned`. A `GcTable` is
+    /// not a GC object and has neither flag; re-queue it when a slot is
+    /// still young (`can_move`) so the next minor forwards it. A sibling
+    /// MiniMark's pending list is untouched (`gcreftracer` pending-owner
+    /// test).
     fn collect_pending_gc_tables_to_nursery(&mut self) {
         let pending = std::mem::take(&mut self.pending_gc_tables);
         for table in pending.into_iter().filter_map(|w| w.upgrade()) {
             table.trace(&mut |r| self.drag_out_root(r));
+            if table
+                .slots()
+                .iter()
+                .any(|g| !g.is_null() && self.can_move(*g))
+            {
+                self.pending_gc_tables.push(Arc::downgrade(&table));
+            }
         }
     }
 

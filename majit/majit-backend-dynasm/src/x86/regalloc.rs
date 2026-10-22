@@ -1049,13 +1049,15 @@ impl<'a> RegAlloc<'a> {
             OpCode::ConvertLonglongBytesToFloat if !args.is_empty() => {
                 self.consider_cast_int_to_float(dst.unwrap_or(op.pos().get()), args[0], i, asm);
             }
+            OpCode::LoadFromGcTable => {
+                self.consider_load_from_gc_table(dst.unwrap_or(op.pos().get()), op, i, asm);
+            }
             OpCode::CastPtrToInt
             | OpCode::CastIntToPtr
             | OpCode::CastOpaquePtr
             | OpCode::SameAsI
             | OpCode::SameAsR
             | OpCode::SameAsF
-            | OpCode::LoadFromGcTable
             | OpCode::VirtualRefR
                 if !args.is_empty() =>
             {
@@ -1468,6 +1470,29 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, [argloc], Some(resloc), asm);
     }
 
+    /// x86/regalloc.py `consider_load_from_gc_table` /
+    /// aarch64/regalloc.py `prepare_op_load_from_gc_table`.
+    ///
+    /// The assembler reads the table index off `op.getarg(0)`
+    /// (`assembler.py genop_load_from_gc_table`); arglocs are the
+    /// result register only. Routing this through `consider_same_as`
+    /// would `loc()` the index immediate and bind the Ref result to that
+    /// integer, so a later call can pass the intern/table index as a
+    /// pointer (`descroperation::compare` SIGSEGV at 0x39).
+    pub(crate) fn consider_load_from_gc_table(
+        &mut self,
+        dst: OpRef,
+        op: &Op,
+        i: usize,
+        asm: &mut dyn RegAllocAssembler,
+    ) {
+        self.possibly_free_vars_for_op(op);
+        self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
+        self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
+        let resloc = Loc::Reg(self.force_allocate_reg(dst, Type::Ref, &[], None, false));
+        self.perform(i, [] as [Loc; 0], Some(resloc), asm);
+    }
+
     pub(crate) fn _consider_float_op(
         &mut self,
         dst: OpRef,
@@ -1733,7 +1758,11 @@ impl<'a> RegAlloc<'a> {
         asm: &mut dyn RegAllocAssembler,
     ) {
         let args = [base, offset];
-        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        // x86/regalloc.py `_consider_gc_load`: `make_sure_var_in_reg(op.getarg(0))`
+        // uses the box type. A raw address (eval-breaker word, recursion-limit
+        // word) is Int; forcing `Type::Ref` materialises the constant into a
+        // GP register and can steal a loop-carried intval.
+        let base_loc = self.make_sure_var_in_reg(base, self.tp(base), &args, None, false);
         // A ConstInt offset comes back as an immediate; `addr_add` and the
         // location builder encode one that does not fit 32 bits.
         let ofs_loc = self.make_sure_var_in_reg(offset, Type::Int, &args, None, false);
@@ -1759,8 +1788,10 @@ impl<'a> RegAlloc<'a> {
         asm: &mut dyn RegAllocAssembler,
     ) {
         let args = [base, index, scale, offset, size];
-        // x86/regalloc.py:1175
-        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        // x86/regalloc.py `_consider_gc_load_indexed`:
+        // `make_sure_var_in_reg(op.getarg(0))` — box type,
+        // not a forced `Type::Ref` (raw addresses are Int).
+        let base_loc = self.make_sure_var_in_reg(base, self.tp(base), &args, None, false);
         // x86/regalloc.py:1176
         let ofs_loc = self.make_sure_var_in_reg(index, Type::Int, &args, None, false);
         // x86/regalloc.py:1177

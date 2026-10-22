@@ -375,8 +375,9 @@ pub struct CallEffectOverride {
     /// collapsed back to the generic residual category during lookup.
     #[serde(default)]
     pub effect: CallEffectKind,
-    /// `calldescr`-equivalent EffectInfo wrapper attached to the call.
-    pub descriptor: CallDescriptor,
+    /// EffectInfo the override supplies. Argument and result types come
+    /// from the call site when the calldescr is attached.
+    pub effect_info: EffectInfo,
 }
 
 impl CallEffectOverride {
@@ -384,7 +385,7 @@ impl CallEffectOverride {
         Self {
             target,
             effect,
-            descriptor: CallDescriptor::override_effect(effect_info_for_kind(effect)),
+            effect_info: effect_info_for_kind(effect),
         }
     }
 }
@@ -8847,7 +8848,7 @@ impl<'a> Transformer<'a> {
                     let extraeffect = classified
                         .as_ref()
                         .filter(|(_, _, is_override)| *is_override)
-                        .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect);
+                        .map(|(info, _, _)| info.extraeffect);
                     let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
@@ -8857,8 +8858,8 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
-                    if let Some((declared, _, true)) = classified {
-                        descriptor.extra_info = declared.extra_info;
+                    if let Some((info, _, true)) = classified {
+                        descriptor.extra_info = info;
                     }
                     let rewritten = self.handle_residual_call(
                         graph,
@@ -8891,12 +8892,13 @@ impl<'a> Transformer<'a> {
 
         // Fallback when no CallControl: effect-only classification (legacy path).
         // RPython: always residual_call_*, effect only in calldescr.
-        if let Some((descriptor, _effect, _)) = classify_call(target, &self.config.call_effects) {
+        if let Some((info, _effect, _)) = classify_call(target, &self.config.call_effects) {
             let non_void_args = resolve_non_void_arg_types_from_vars(args);
-            let descriptor = descriptor.with_signature(
+            let descriptor = crate::call::CallDescriptor::from_signature(
                 &non_void_args,
                 self.resolve_call_result(op.result.as_ref(), result_ty)
                     .ir_type,
+                info,
             );
             self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
         } else {
@@ -9091,16 +9093,10 @@ impl<'a> Transformer<'a> {
             // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
         }
         let (oopspecindex, extraeffect_override) =
-            if let Some((descriptor, _, _)) = classify_call(target, &self.config.call_effects) {
-                (
-                    descriptor.extra_info.oopspecindex,
-                    Some(descriptor.extra_info.extraeffect),
-                )
-            } else if let Some(descriptor) = crate::call::describe_call(target) {
-                (
-                    descriptor.extra_info.oopspecindex,
-                    Some(descriptor.extra_info.extraeffect),
-                )
+            if let Some((info, _, _)) = classify_call(target, &self.config.call_effects) {
+                (info.oopspecindex, Some(info.extraeffect))
+            } else if let Some(info) = crate::call::describe_call(target) {
+                (info.oopspecindex, Some(info.extraeffect))
             } else if let Some(spec) = user_oopspec.as_deref() {
                 // rlib/jit.py — map user oopspec string to OopSpecIndex.
                 // jtransform.py:1731-1755 — jit.* oopspecs.
@@ -15357,7 +15353,7 @@ pub fn call_effect_override_census(overrides: &[CallEffectOverride]) -> Vec<Stri
 fn classify_call(
     target: &CallTarget,
     overrides: &[CallEffectOverride],
-) -> Option<(CallDescriptor, CallEffectKind, bool)> {
+) -> Option<(EffectInfo, CallEffectKind, bool)> {
     fn classify_effect_info(info: &majit_ir::descr::EffectInfo) -> CallEffectKind {
         if info.check_forces_virtual_or_virtualizable() {
             CallEffectKind::MayForce
@@ -15374,12 +15370,11 @@ fn classify_call(
         .find(|override_| call_target_matches_loose(&override_.target, target))
     {
         record_override_match(&override_.target);
-        let descriptor = override_.descriptor.clone();
-        return Some((descriptor, override_.effect, true));
+        return Some((override_.effect_info.clone(), override_.effect, true));
     }
-    let descriptor = crate::call::describe_call(target)?;
-    let effect = classify_effect_info(&descriptor.get_extra_info());
-    Some((descriptor, effect, false))
+    let info = crate::call::describe_call(target)?;
+    let effect = classify_effect_info(&info);
+    Some((info, effect, false))
 }
 
 /// Whether a synthetic aggregate ctor `name` is a closure environment: its

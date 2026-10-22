@@ -239,6 +239,7 @@ struct ArrayDescrKey {
     len_offset: Option<usize>,
     array_type_id: Option<String>,
     load_is_acquire: bool,
+    is_gc_managed: bool,
 }
 
 static NEXT_ARRAY_DESCR_ID: AtomicU32 = AtomicU32::new(0);
@@ -317,7 +318,7 @@ fn get_or_create_array_descr(
     len_offset: Option<usize>,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
-        base_size, item_size, type_id, item_type, signed, len_offset, None, false,
+        base_size, item_size, type_id, item_type, signed, len_offset, None, false, true,
     )
 }
 
@@ -330,6 +331,7 @@ fn get_or_create_array_descr_with_full_id(
     len_offset: Option<usize>,
     array_type_id: Option<String>,
     load_is_acquire: bool,
+    is_gc_managed: bool,
 ) -> DescrRef {
     let key = ArrayDescrKey {
         base_size,
@@ -340,6 +342,7 @@ fn get_or_create_array_descr_with_full_id(
         len_offset,
         array_type_id,
         load_is_acquire,
+        is_gc_managed,
     };
     let mut cache = ARRAY_DESCR_REGISTRY.lock();
     if let Some(existing) = cache.get(&key) {
@@ -427,6 +430,19 @@ fn get_or_create_array_descr_with_full_id(
     array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
     array_descr.set_cache_key(cache_key);
     array_descr = array_descr.with_load_is_acquire(key.load_is_acquire);
+    // `cpu.arraydescrof(rffi.CArray(TYPE))`: no GC header, so
+    // `ArrayPtrInfo::make_guards` must not emit `GUARD_GC_TYPE` at
+    // `ptr - GcHeader::SIZE`.  The jitcode intern path is
+    // `Assembler::add_raw_int_array_descr_signed` (`is_gc_managed: false`).
+    // A producer that shipped `is_gc_managed: false` keeps it as well.
+    if !key.is_gc_managed
+        || key
+            .array_type_id
+            .as_deref()
+            .is_some_and(|s| s.starts_with("majit::raw_carray_"))
+    {
+        array_descr.set_is_gc_managed(false);
+    }
     let arc: DescrRef = Arc::new(array_descr);
     cache.insert(key.clone(), arc.clone());
     // Publish the freshly-minted SimpleArrayDescr into
@@ -473,6 +489,7 @@ pub fn raw_carray_descr(item_type: Type, item_size: usize, is_item_signed: bool)
         is_item_signed,
         None,
         Some(format!("majit::raw_carray_{prefix}{}", item_size * 8)),
+        false,
         false,
     )
 }
@@ -3456,11 +3473,9 @@ static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
-// `pyframe.py FrameDebugData` — the payload behind `self.getorcreatedebug()`,
-// holding the frame's own locals mapping (read at the head of `fast2locals`)
-// and the rare per-frame globals override (read by `get_w_globals`).  Not a
-// PyObject — no vtable, and the trace never NEWs one: it arrives as the
-// `debugdata` virtualizable field and is only read.
+// `pyframe.py FrameDebugData` — the payload behind `self.getorcreatedebug()`.
+// Not a PyObject — no vtable, and the trace never NEWs one: it arrives as
+// the `debugdata` virtualizable field and is only read.
 //
 // Headerless, because `getorcreate_debug_data` falls back to `malloc_raw`
 // whenever the owning frame is not collector-owned, so a loaded pointer may
@@ -3469,10 +3484,15 @@ static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
 // the GcCache mints from the structural key, which names nothing in the
 // collector's type table and so fails on every check.
 //
-// Both fields are MUTABLE — `setdictscope` and `fast2locals`' lazy
-// materialisation rebind `w_locals`, `set_w_globals` rebinds `w_globals` — so
-// neither read may be treated as always-pure.
+// `heaptracker.py all_fielddescrs` walks every `STRUCT._names` leaf, and
+// `descr.py get_field_descr` caches one FieldDescr per `(STRUCT, fieldname)`.
+// A subset list lets kind-0 parent layouts (the same `path_hash` STRUCT)
+// name a leaf the declared group never minted; `descr_from_set_member` then
+// sees a published size without a unique field and reports Ambiguous.
+// Every field is mutable (`pyframe.py FrameDebugData` has no
+// `_immutable_fields_`).
 static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_interpreter::pyframe::FrameDebugData;
     build_headerless_object_descr_group_with_def_path(
         pyre_interpreter::pyframe::FRAME_DEBUG_DATA_SIZE,
         &[
@@ -3518,9 +3538,63 @@ static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
             // resolve by position keep their slots.
             (
                 "is_being_profiled",
-                std::mem::offset_of!(pyre_interpreter::pyframe::FrameDebugData, is_being_profiled),
+                std::mem::offset_of!(FrameDebugData, is_being_profiled),
                 std::mem::size_of::<bool>(),
                 Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "is_in_line_tracing",
+                std::mem::offset_of!(FrameDebugData, is_in_line_tracing),
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "f_trace_lines",
+                std::mem::offset_of!(FrameDebugData, f_trace_lines),
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "f_trace_opcodes",
+                std::mem::offset_of!(FrameDebugData, f_trace_opcodes),
+                std::mem::size_of::<bool>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "instr_prev_plus_one",
+                std::mem::offset_of!(FrameDebugData, instr_prev_plus_one),
+                std::mem::size_of::<isize>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "f_lineno",
+                std::mem::offset_of!(FrameDebugData, f_lineno),
+                std::mem::size_of::<isize>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "hidden_operationerr",
+                std::mem::offset_of!(FrameDebugData, hidden_operationerr),
+                std::mem::size_of::<usize>(),
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -3926,6 +4000,7 @@ pub fn make_array_descr_with_full_id(
         len_offset,
         array_type_id,
         load_is_acquire,
+        true,
     )
 }
 
@@ -6851,12 +6926,22 @@ pub fn long_value_descr() -> DescrRef {
 /// later index, and the reader that keeps a stale one then guards a
 /// neighbouring slot instead of its own.
 fn frame_debug_data_field_descr_at(offset: usize) -> DescrRef {
+    frame_debug_data_field_descr_at_opt(offset)
+        .expect("FrameDebugData descr group has no field at requested offset")
+}
+
+/// `descr.py get_field_descr(gccache, FrameDebugData, fieldname)` for a
+/// packed field that already knows the slot offset. Missing offset falls
+/// through to the generic parent mint.
+fn frame_debug_data_field_descr_at_opt(offset: usize) -> Option<DescrRef> {
     let index = FRAME_DEBUG_DATA_DESCR_GROUP
         .field_descrs
         .iter()
-        .position(|d| d.offset() == offset)
-        .expect("FrameDebugData descr group has no field at requested offset");
-    field_descr_from_group(&*FRAME_DEBUG_DATA_DESCR_GROUP, index)
+        .position(|d| d.offset() == offset)?;
+    Some(field_descr_from_group(
+        &*FRAME_DEBUG_DATA_DESCR_GROUP,
+        index,
+    ))
 }
 
 /// `FrameDebugData.w_locals` — the mapping `getorcreatedebug().w_locals`
@@ -9706,7 +9791,7 @@ mod tests {
     fn pyframe_field_descr_accessors_name_their_own_offsets() {
         use crate::frame_layout as fl;
         let offset = |descr: DescrRef| descr.as_field_descr().expect("PyFrame FieldDescr").offset();
-        let cases: [(&str, DescrRef, usize); 11] = [
+        let cases: [(&str, DescrRef, usize); 12] = [
             (
                 "locals_cells_stack_w",
                 pyframe_locals_cells_stack_descr(),
@@ -9753,6 +9838,11 @@ mod tests {
                 "failed_attr_cleanup",
                 pyframe_failed_attr_cleanup_descr(),
                 fl::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+            ),
+            (
+                "vable_token",
+                pyframe_vable_token_descr(),
+                fl::PYFRAME_VABLE_TOKEN_OFFSET,
             ),
         ];
         for (name, descr, want) in cases {
@@ -11013,6 +11103,32 @@ mod tests {
                 .expect("ArrayDescr")
                 .load_is_acquire()
         );
+    }
+
+    #[test]
+    fn make_descr_from_bh_non_gc_array_keeps_layout() {
+        use majit_jitcode::jitcode::BhDescr;
+        let bridged = make_descr_from_bh(&BhDescr::Array {
+            base_size: 8,
+            itemsize: 8,
+            len_offset: Some(0),
+            type_id: 0,
+            gc_type_id: 0,
+            item_type: Type::Int,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: true,
+            is_gc_managed: false,
+            ei_index: u32::MAX,
+            array_type_id: Some("test::NonGcVarsizeArray".to_string()),
+            interior_fields: Vec::new(),
+            load_is_acquire: false,
+        });
+        let ad = bridged.as_array_descr().expect("ArrayDescr");
+        assert_eq!(ad.base_size(), 8);
+        assert!(!ad.is_gc_managed());
+        assert!(ad.len_descr().is_some());
+        assert_eq!(ad.item_size(), 8);
     }
 
     /// A traced integer-dict `NEW_ARRAY_CLEAR` must keep the collector
@@ -12669,7 +12785,12 @@ fn published_declared_group(
     let size_ref = gc._cache_size.get(&key)?.clone();
     let size_descr =
         majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleSizeDescr>(size_ref).ok()?;
-    if size_descr.vtable() == 0 {
+    // A vtable-less *shell* still falls through: that path is the one
+    // `register_keyed_size` may upgrade.  A headerless layout that
+    // already published its fields (`FrameDebugData`) is the declared
+    // group — returning None here mints a parallel SizeDescr and a
+    // second Arc for every field.
+    if size_descr.vtable() == 0 && size_descr.all_fielddescrs().is_empty() {
         return None;
     }
     let fields = gc._cache_field.get(&key)?;
@@ -13639,6 +13760,34 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     return canonical;
                 }
             }
+            // `FrameDebugData` is headerless (`vtable == 0`). A jitcode that
+            // reads one of its fields (`get_w_f_trace` behind
+            // `executioncontext.rs`'s trace hooks) names it through
+            // `flatten_descr_by_ptr`; the parent-group lookup below skips a
+            // vtable-less SizeDescr and mints
+            // `T{cache_key}.FrameDebugData.w_f_trace`. Heap CSE keys on
+            // descr identity, so that parallel mint keeps two reads of one
+            // field apart. One field is one descr (`descr.py
+            // get_field_descr`); bridge to the declared group before that
+            // mint, same as ExecutionContext above.
+            //
+            // Flatten stores the display name (`FrameDebugData.w_f_trace`)
+            // and the owner separately. The packed parent may spell the
+            // owner `pyframe::FrameDebugData` or with the crate prefix;
+            // both hash to the same STRUCT. Offset is the slot
+            // `get_field_descr` already published.
+            if matches!(
+                owner.as_str(),
+                "FrameDebugData"
+                    | "pyframe::FrameDebugData"
+                    | "pyre_interpreter::pyframe::FrameDebugData"
+            ) && let Some(canonical) = frame_debug_data_field_descr_at_opt(*offset)
+                && let Some(field) = canonical.as_field_descr()
+                && field.field_size() == *field_size
+                && field.field_type() == *field_type
+            {
+                return canonical;
+            }
             // `GilReadyState.gil_ready` is the process-wide `gil_ready?`
             // word. The codewriter has no `?` attribute on it (that would
             // emit `record_quasiimmut_field`, which the production
@@ -13874,6 +14023,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             array_type_id,
             interior_fields,
             load_is_acquire,
+            is_gc_managed,
             ..
         } => {
             // Old serialized BhDescr values default `gc_type_id` to zero.
@@ -13949,15 +14099,18 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 // BhDescr::Array entries that disagree only on the
                 // Rust type spelling don't collapse to the same
                 // registry slot (`set_ei_index` clobber).
-                make_array_descr_with_full_id(
+                // `is_gc_managed` rides along: a header-less producer descr (`cpu.arraydescrof(rffi.CArray(T))`)
+                // must not gain a `GUARD_GC_TYPE` at `ptr - GcHeader::SIZE`.
+                get_or_create_array_descr_with_full_id(
                     *base_size,
                     *itemsize,
                     resolved_gc_type_id,
-                    *len_offset,
                     *item_type,
                     *is_item_signed,
+                    *len_offset,
                     array_type_id.clone(),
                     *load_is_acquire,
+                    *is_gc_managed,
                 )
             };
             // `effectinfo.py compute_bitstrings` republish: the
@@ -15282,6 +15435,34 @@ mod set_member_lookup_tests {
             descr_from_set_member(&member(published)),
             SetMemberLookup::Ambiguous
         ));
+    }
+
+    /// `heaptracker.py all_fielddescrs` includes `hidden_operationerr`.
+    /// Opcode Field parents carry the same STRUCT's full layout, so the
+    /// frozen EffectInfo stamps that leaf even when no opcode names it.
+    /// The declared group is the one `get_field_descr` cache for that
+    /// `(STRUCT, fieldname)`.
+    #[test]
+    fn frame_debug_data_hidden_operationerr_resolves_to_one_descr() {
+        std::sync::LazyLock::force(&FRAME_DEBUG_DATA_DESCR_GROUP);
+        let struct_id = majit_ir::descr::path_hash("pyframe::FrameDebugData");
+        let lookup = descr_from_set_member(&DescrSetMember::Field {
+            struct_id,
+            field_name: "hidden_operationerr".to_string(),
+        });
+        let SetMemberLookup::Resolved(descr) = lookup else {
+            panic!("pyframe::FrameDebugData.hidden_operationerr did not resolve uniquely");
+        };
+        let field = descr.as_field_descr().expect("field descr");
+        assert_eq!(
+            field.offset(),
+            std::mem::offset_of!(
+                pyre_interpreter::pyframe::FrameDebugData,
+                hidden_operationerr
+            ),
+        );
+        assert_eq!(field.field_size(), std::mem::size_of::<usize>());
+        assert_eq!(field.field_type(), Type::Ref);
     }
 
     /// The EffectInfo member for the shared header is `pyobject::PyObject.w_class`.

@@ -1010,3 +1010,21 @@ fn the_module_answers_every_ctype_family_it_has_ported() {
     );
     run_on_worker(PROGRAM, "cffi_backend");
 }
+
+#[test]
+fn array_cdata_loop_terminates() {
+    const PROGRAM: &str = concat!(
+        "from _cffi_backend import *\n",
+        "p = new_primitive_type('int')\n",
+        "LENGTH = 1423\n",
+        "p1 = new_array_type(new_pointer_type(p), LENGTH)\n",
+        "a = newp(p1, None)\n",
+        "for i in range(LENGTH):\n",
+        "    assert a[i] == 0\n",
+        "for i in range(LENGTH):\n",
+        "    a[i] = i * i + 1\n",
+        "for i in range(LENGTH):\n",
+        "    assert a[i] == i * i + 1\n",
+    );
+    run_on_worker(PROGRAM, "array_cdata_loop_terminates");
+}

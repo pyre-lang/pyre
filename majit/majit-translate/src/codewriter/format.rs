@@ -1000,7 +1000,11 @@ mod tests {
 
         let mut ssa = empty_ssa();
         let funcptr = CallTarget::function_path(["foo"]);
-        let descriptor = CallDescriptor::known(EffectInfo::default());
+        let descriptor = CallDescriptor::from_signature(
+            &[majit_ir::value::Type::Int, majit_ir::value::Type::Ref],
+            majit_ir::value::Type::Int,
+            EffectInfo::default(),
+        );
         ssa.insns.push(FlatOp::op(SpaceOperation {
             kind: OpKind::CallResidual {
                 funcptr: CallFuncPtr::Target(funcptr),

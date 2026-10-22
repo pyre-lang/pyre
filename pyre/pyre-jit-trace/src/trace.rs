@@ -4382,6 +4382,90 @@ fn blackhole_terminal_error(error: &crate::jitcode_dispatch::DispatchError) -> b
     ) || error.can_convert_seeded_inline()
 }
 
+/// Whether `marker` is the portal dispatch-top merge sandwich at `header_pc`.
+///
+/// `jtransform.py Transformer.handle_jit_marker__jit_merge_point` emits
+/// `[op3=-live-, jit_merge_point, op2=-live-]`. Guard resume lands on op2,
+/// so `loop_header_marker_jit_pc` is op2, not `merge_entry_for` (op3).
+/// `containing_py_pc_for_jitcode_pc(op2)` can name `header_pc + 1` when the
+/// next instruction's floor or block-head starts at op2; that is still the
+/// header merge (`interp_jit.py PyFrame.dispatch`), not a marker inside a
+/// super-instruction. Check the sandwich before attributing the marker to a
+/// later Python PC.
+fn portal_dispatch_merge_sandwich_contains(
+    pjc: &crate::pyjitcode::PyJitCode,
+    header_pc: usize,
+    marker: usize,
+) -> bool {
+    let code = pjc.jitcode.code.as_slice();
+    if live_follows_portal_merge(code, marker) {
+        return true;
+    }
+    let Some(entry) = pjc.merge_entry_for(header_pc) else {
+        return false;
+    };
+    if marker == entry {
+        return true;
+    }
+    if pjc.resume_marker_for_jitcode_pc(entry) == Some(marker) {
+        return true;
+    }
+    let Some(op3) = crate::jitcode_runtime::decode_op_at(code, entry) else {
+        return false;
+    };
+    if op3.opname != "live" {
+        return false;
+    }
+    let mut pc = op3.next_pc;
+    loop {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.opname == "live" {
+            return false;
+        }
+        if op.opname == "jit_merge_point" {
+            let hi = crate::jitcode_runtime::decode_op_at(code, op.next_pc)
+                .filter(|op2| op2.opname == "live")
+                .map(|op2| op2.pc)
+                .unwrap_or(op.pc);
+            let lo = entry.min(hi);
+            let hi = entry.max(hi);
+            return marker >= lo && marker <= hi;
+        }
+        if op.next_pc <= pc {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+}
+
+/// Guard-resume op2 sits immediately after `jit_merge_point`. Body merges
+/// are not in `merge_entry_by_green`, so the header-table path cannot name
+/// them; the byte stream still has the sandwich.
+fn live_follows_portal_merge(code: &[u8], marker: usize) -> bool {
+    let Some(at) = crate::jitcode_runtime::decode_op_at(code, marker) else {
+        return false;
+    };
+    if at.opname != "live" {
+        return false;
+    }
+    let mut pc = 0;
+    while pc < marker {
+        let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+            return false;
+        };
+        if op.next_pc == marker {
+            return op.opname == "jit_merge_point";
+        }
+        if op.next_pc <= pc || op.next_pc > marker {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    false
+}
+
 fn run_perfn_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     flush_committed: &std::cell::Cell<bool>,
@@ -5061,15 +5145,25 @@ fn run_perfn_walk<Sym: WalkSym>(
                 },
                 _end_pc,
             )) => Some(loop_header_marker_jit_pc.map_or(*loop_header_pc, |marker| {
-                let marker_py =
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, marker)
-                        as usize;
-                if marker_py == *loop_header_pc
-                    && pjc.merge_entry_for(*loop_header_pc) != Some(marker)
-                {
-                    *loop_header_pc + 1
+                // Sandwich first: op2 of the dispatch-top merge belongs to
+                // this header even when `containing_py_pc` names header+1.
+                if portal_dispatch_merge_sandwich_contains(&pjc, *loop_header_pc, marker) {
+                    *loop_header_pc
                 } else {
-                    marker_py
+                    let marker_py =
+                        crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, marker)
+                            as usize;
+                    if marker_py != *loop_header_pc {
+                        marker_py
+                    } else if pjc.merge_entry_for(*loop_header_pc).is_some() {
+                        // Marker inside a loop-header super-instruction.
+                        *loop_header_pc + 1
+                    } else {
+                        // Body merge: not a static loop header, so +1 would
+                        // skip the opcode the merge belongs to and flush a
+                        // NULL operand into the next instruction.
+                        *loop_header_pc
+                    }
                 }
             })),
             _ => None,

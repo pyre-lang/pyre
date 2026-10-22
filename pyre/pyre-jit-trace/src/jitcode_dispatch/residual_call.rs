@@ -6339,14 +6339,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // reaches that continuation whenever every live color has a
             // concrete value, so build the resume-past image here, before
             // WalkContext's concrete banks disappear, and consume it in
-            // run_perfn_walk's VableEscaped epilogue.  Both the latch
-            // (non-bridge, empty framestack, not an inline sub-walk, resolvable
-            // snapshot sym) and the adopt (`try_adopt_single_frame_blackhole` →
+            // run_perfn_walk's VableEscaped epilogue.  The latch (portal,
+            // not an inline sub-walk, resolvable snapshot sym) and the adopt
+            // (`try_adopt_single_frame_blackhole` →
             // `apply_single_frame_blackhole_crn`, which validates every mapped
             // color and every live operand-stack slot before writing anything)
             // decline to the pre-existing escape/replay path on any unmet
             // condition, so this only ever replaces a replay that would have
-            // produced the same state.
+            // produced the same state.  A bridge walk reaches the same
+            // epilogue; excluding it left ABORT_ESCAPE on the legacy replay
+            // path, which re-enters the loop at GET_ITER.
             //
             // Neither `writes_live_heap` nor the odometer gates it.  Both
             // describe hazards of RE-RUNNING the escaping opcode, which is what
@@ -6383,13 +6385,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     ),
                     Err(exc) => (None, exc, true),
                 };
-                // Same non-bridge latch as the escape-flush commit above:
-                // a bridge walk never adopts this image (`run_perfn_walk`
-                // epilogue is skipped).
-                if ctx.session.borrow().at_portal()
-                    && !ctx.fbw_mode.inline_subwalk
-                    && !ctx.trace_ctx.is_bridge_trace
-                {
+                // Same portal latch as the escape-flush commit above.
+                // `run_perfn_walk`'s VableEscape epilogue adopts this image
+                // for root and bridge walks alike (`pyjitpl.py`
+                // `SwitchToBlackhole(ABORT_ESCAPE)` then
+                // `run_blackhole_interp_to_cancel_tracing`).
+                if ctx.session.borrow().at_portal() && !ctx.fbw_mode.inline_subwalk {
                     let jitcode = unsafe {
                         let sym = &*ctx.fbw_mode.snapshot_sym;
                         (!sym.jitcode().is_null())

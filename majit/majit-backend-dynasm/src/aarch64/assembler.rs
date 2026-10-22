@@ -2922,23 +2922,27 @@ impl<'a> AssemblerARM64<'a> {
                     self.regalloc_mov(src, dst);
                 }
             }
-            // `assembler.py genop_load_from_gc_table`: load the reference
-            // constant from slot `index` of the table reserved at the start
-            // of this code block (`reserve_gcref_table`), PC-relative. The
+            // `opassembler.py emit_op_load_from_gc_table`: result loc only;
+            // the table index is `op.getarg(0).getint()`. Load the
+            // reference constant from the slot reserved at the start of
+            // this code block (`reserve_gcref_table`), PC-relative. The
             // gc_table root walker forwards the slot in place, so each load
             // observes the relocated object.
             OpCode::LoadFromGcTable => {
-                let (Some(Loc::Immed(idx) | Loc::ImmedFloat(idx)), Some(Loc::Reg(dst))) =
-                    (arglocs.first(), result_loc)
-                else {
+                let Some(Loc::Reg(dst)) = result_loc else {
                     panic!(
-                        "LoadFromGcTable expects [Immed(index)] and a register result, \
+                        "LoadFromGcTable expects a register result, \
                          got arglocs={arglocs:?} result={result_loc:?}"
                     );
                 };
+                let index =
+                    op.arg(0)
+                        .to_opref()
+                        .const_int_value()
+                        .expect("LoadFromGcTable index is ConstInt") as usize;
                 let slot = *self
                     .gcref_table
-                    .get(idx.value as usize)
+                    .get(index)
                     .expect("LoadFromGcTable index inside the reserved gcref table");
                 dynasm!(self.mc ; .arch aarch64 ; ldr X(dst.value), =>slot);
             }
