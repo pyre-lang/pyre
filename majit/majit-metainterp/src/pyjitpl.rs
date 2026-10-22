@@ -35633,13 +35633,13 @@ mod tests {
 
     #[test]
     fn generatorentry_greens_force_start_and_typed_lookup_share_one_cell() {
-        // jd2 greens are `(pycode, GENERATORENTRY_JD_INDEX)` (`genentry_green_key`).
+        // jd2 greens are `(pycode)` (`genentry_green_key`).
         // `force_start_tracing` with those greenargs installs `JitCell(*greenargs)`,
-        // so a later CALL_ASSEMBLER `ensure_cell_for_key` finds that cell.
+        // so a later `ensure_cell_for_key` finds that cell.
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
-        let values = [0xabc0i64, 2];
-        let types = [majit_ir::GreenType::Ref, majit_ir::GreenType::Int];
+        let values = [0xabc0i64];
+        let types = [majit_ir::GreenType::Ref];
         let key = majit_ir::GreenKey::from_greenargs(&values, &types);
         let green_key = key.get_uhash();
         meta.force_start_tracing(
