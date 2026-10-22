@@ -14190,7 +14190,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// intobject.py _ensure_baseint
-pub(crate) fn ensure_baseint_result(
+fn ensure_baseint_result(
     obj: PyObjectRef,
     _original: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
