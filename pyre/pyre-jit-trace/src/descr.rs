@@ -4447,7 +4447,7 @@ pub fn function_w_text_signature_descr() -> DescrRef {
 /// `(offset, field_size, field_type, signed)` — so keying an arm on it is only
 /// safe while no other quasi-immutable descriptor can land on the same number.
 /// The other owners that address a real struct field either use a different
-/// `Type` ([`TYPE_VERSION_TAG_FIELD_DESCR`], [`MODULE_DICT_VERSION_FIELD_DESCR`])
+/// `Type` ([`TYPE_VERSION_TAG_FIELD_DESCR`], [`module_dict_version_descr`])
 /// or carry a reserved tag outside `FIELD_DESCR_TAG`
 /// ([`MAPDICT_DESCR_TAG`], [`PROPERTY_DESCR_TAG`], [`WRAPPER_DESCR_TAG`],
 /// [`CELL_FAMILY_DESCR_TAG`], [`EC_W_TRACEFUNC_INDEX`]).  A descriptor that
@@ -4754,34 +4754,127 @@ pub fn type_name_obj_descr() -> DescrRef {
     TYPE_NAME_OBJ_FIELD_DESCR.clone()
 }
 
-/// `celldict.py ModuleDictStrategy.version` — the module-namespace version
-/// tag (`u64`, 8 bytes, unsigned) on the strategy box.
+/// `celldict.py ModuleDictStrategy` field descrs. `descr.py get_field_descr`
+/// gives every field its `index`, publishes it in `_cache_field[STRUCT][fieldname]`,
+/// and attaches the parent `SizeDescr` (`get_size_descr`); `optimizer.py
+/// ensure_ptr_info_arg0` reads that parent.
 ///
-/// Quasi-immutable, per `celldict.py _immutable_fields_ = ["version?"]`,
-/// which is the same declaration `getdictvalue_no_unwrapping` promotes before
-/// its elidable lookup (`celldict.py`). The `LOAD_GLOBAL` / `STORE_GLOBAL`
-/// cell folds bake the slot's stored cell as a `ConstPtr` under a
-/// `QUASIIMMUT_FIELD` on this field: `_setitem_str_cell_known`
-/// (`celldict.py`) calls `mutated()` before every write that replaces the
-/// stored pointer, and an in-place cell write leaves the pointer alone, so the
-/// version is exactly the datum that proves the baked address still stands.
+/// One group, the shape `GIL_READY_DESCR_GROUP` uses
+/// (`make_simple_descr_group_keyed_with_headerless`). The cache_key is
+/// `path_hash("celldict::ModuleDictStrategy")`, the crate-stripped STRUCT
+/// spelling `DECLARED_GROUPS` and the analyzer's EffectInfo use
+/// (`front/mir.rs strip_crate_prefix`, `definition_path_type_id`). The
+/// `is_module_dict_strategy_struct` / `descr_from_set_member` bridges still
+/// recognise the leaf and `pyre_object::celldict::ModuleDictStrategy` hashes.
 ///
-/// `offset_of!` rather than a literal because `ModuleDictStrategy` is not
-/// `repr(C)`.
+/// `version` is `celldict.py _immutable_fields_ = ["version?"]`: the
+/// `LOAD_GLOBAL` / `STORE_GLOBAL` cell folds bake the stored cell under a
+/// `QUASIIMMUT_FIELD` on this field. `_setitem_str_cell_known` (`celldict.py`)
+/// calls `mutated()` before every write that replaces the stored pointer.
+/// `is_immutable` / `is_quasi_immutable` match
+/// [`make_quasi_immutable_field_descr`]. Its `index` stays
+/// `stable_field_index` of the 8-byte Int so `state.rs quasi_immut_descr`
+/// still selects this slot.
 ///
-/// One object per run, for the reason spelled out on
-/// [`TYPE_VERSION_TAG_FIELD_DESCR`].
-static MODULE_DICT_VERSION_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
-    make_quasi_immutable_field_descr(
-        core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
-        8,
-        Type::Int,
-        false,
-    )
-});
+/// `mutate_version` is the hidden OBJECTPTR `rclass.py InstanceRepr._setup_repr`
+/// adds (`quasiimmut.py get_mutate_field_name`). `mutate_version_lock` is the
+/// second word `FUNCTION_DESCR_GROUP` declares for each `mutate_<name>`.
+static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
+    LazyLock::new(|| {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+        use pyre_object::celldict::ModuleDictStrategy;
+        let version_offset = core::mem::offset_of!(ModuleDictStrategy, version);
+        let mutate_offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
+            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
+        let mutate_lock_offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
+            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+        let field = |index,
+                     field_key: &str,
+                     offset,
+                     field_size,
+                     field_type,
+                     is_immutable,
+                     is_quasi_immutable,
+                     flag,
+                     index_in_parent| {
+            SimpleFieldDescrSpec {
+                index,
+                field_key: field_key.to_string(),
+                name: format!("ModuleDictStrategy.{field_key}"),
+                offset,
+                field_size,
+                field_type,
+                is_immutable,
+                is_quasi_immutable,
+                flag,
+                virtualizable: false,
+                index_in_parent,
+                is_class_word: Some(false),
+                load_is_acquire: false,
+            }
+        };
+        let specs = [
+            field(
+                stable_field_index(version_offset, 8, Type::Int, false),
+                "version",
+                version_offset,
+                8,
+                Type::Int,
+                false,
+                true,
+                ArrayFlag::Unsigned,
+                0,
+            ),
+            field(
+                stable_field_index(mutate_offset, WORD, Type::Ref, false),
+                "mutate_version",
+                mutate_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                1,
+            ),
+            field(
+                stable_field_index(mutate_lock_offset, WORD, Type::Ref, false),
+                "mutate_version_lock",
+                mutate_lock_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                2,
+            ),
+        ];
+        let cache_key = majit_ir::descr::path_hash("celldict::ModuleDictStrategy");
+        let type_id = pyre_object::celldict::module_dict_strategy_gc_type_id();
+        // `gc_alloc_storage_box` (`gc_storage.rs`) lays `[GcHeader | T]` and
+        // `register_leaf_storage_box` tags it with `MODULE_DICT_STRATEGY_GC_TYPE_ID`
+        // (`celldict.rs`). `is_gc_managed` matches that box. `headerless` is
+        // false once the tid is published (`build_gc`); a still-zero tid cannot
+        // name the header, so `GUARD_GC_TYPE` must not fire against type_id 0.
+        let headerless = type_id == 0;
+        majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            core::mem::size_of::<ModuleDictStrategy>(),
+            type_id,
+            cache_key,
+            0,
+            true,
+            headerless,
+            &specs,
+            &[],
+        )
+    });
 
 pub fn module_dict_version_descr() -> DescrRef {
-    MODULE_DICT_VERSION_FIELD_DESCR.clone()
+    MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[0].clone() as DescrRef
+}
+
+pub fn module_dict_mutate_version_descr() -> DescrRef {
+    MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[1].clone() as DescrRef
 }
 
 // These headerless-map-node descrs deliberately retain `parent_descr = None`
@@ -11935,6 +12028,217 @@ mod tests {
         );
     }
 
+    #[test]
+    fn module_dict_mutate_version_descr_is_pointer_sized_ref() {
+        let descr = module_dict_mutate_version_descr();
+        let field = descr.as_field_descr().expect("field descr");
+        let offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
+            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
+        assert_eq!(field.offset(), offset);
+        assert_eq!(field.field_size(), WORD);
+        assert_eq!(field.field_type(), Type::Ref);
+        assert_eq!(field.field_key(), "mutate_version");
+    }
+
+    #[test]
+    fn module_dict_strategy_field_descrs_have_parent_and_index() {
+        let version = module_dict_version_descr();
+        let mutate = module_dict_mutate_version_descr();
+        let version_field = version.as_field_descr().expect("version field descr");
+        let mutate_field = mutate.as_field_descr().expect("mutate_version field descr");
+        let version_parent = version_field
+            .get_parent_descr()
+            .expect("version parent SizeDescr");
+        let mutate_parent = mutate_field
+            .get_parent_descr()
+            .expect("mutate_version parent SizeDescr");
+        assert!(
+            std::sync::Arc::ptr_eq(&version_parent, &mutate_parent),
+            "both fields share the ModuleDictStrategy SizeDescr",
+        );
+        assert_eq!(
+            version_parent.as_size_descr().map(|sd| sd.size()),
+            Some(core::mem::size_of::<
+                pyre_object::celldict::ModuleDictStrategy,
+            >()),
+        );
+        assert_eq!(version_field.index_in_parent(), 0);
+        assert_eq!(mutate_field.index_in_parent(), 1);
+        assert_eq!(
+            version.index(),
+            stable_field_index(
+                core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
+                8,
+                Type::Int,
+                false,
+            ),
+        );
+        assert!(version.is_quasi_immutable());
+        assert!(!version.is_always_pure());
+        assert_eq!(
+            version_field.offset(),
+            core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
+        );
+        assert_eq!(version_field.field_size(), 8);
+        assert_eq!(version_field.field_type(), Type::Int);
+    }
+
+    #[test]
+    fn make_descr_from_bh_bridges_module_dict_mutate_version() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let canonical = module_dict_mutate_version_descr();
+        let offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
+            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
+        for owner in [
+            "ModuleDictStrategy",
+            "celldict::ModuleDictStrategy",
+            "pyre_object::celldict::ModuleDictStrategy",
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset,
+                field_size: WORD,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: Some(0),
+                parent: None,
+                name: "mutate_version".into(),
+                owner: owner.into(),
+                load_is_acquire: false,
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.mutate_version must bridge to the Type::Ref descr",
+            );
+        }
+
+        let nested = make_descr_from_bh(&BhDescr::Field {
+            offset,
+            field_size: 2 * WORD,
+            field_type: Type::Ref,
+            field_flag: ArrayFlag::Struct,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "mutate_version".into(),
+            owner: "ModuleDictStrategy".into(),
+            load_is_acquire: false,
+        });
+        assert!(
+            std::sync::Arc::ptr_eq(&nested, &canonical),
+            "a two-word STRUCT spelling must still bridge onto the pointer word",
+        );
+
+        let narrow = make_descr_from_bh(&BhDescr::Field {
+            offset,
+            field_size: WORD / 2,
+            field_type: Type::Ref,
+            field_flag: ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "mutate_version".into(),
+            owner: "ModuleDictStrategy".into(),
+            load_is_acquire: false,
+        });
+        assert!(
+            !std::sync::Arc::ptr_eq(&narrow, &canonical),
+            "a size that is not the pointer word does not bridge",
+        );
+    }
+
+    #[test]
+    fn make_descr_from_bh_bridges_module_dict_version() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let canonical = module_dict_version_descr();
+        let offset = core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version);
+        for owner in [
+            "ModuleDictStrategy",
+            "celldict::ModuleDictStrategy",
+            "pyre_object::celldict::ModuleDictStrategy",
+        ] {
+            let descr = make_descr_from_bh(&BhDescr::Field {
+                offset,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Unsigned,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: Some(0),
+                parent: None,
+                name: "version".into(),
+                owner: owner.into(),
+                load_is_acquire: false,
+            });
+            assert!(
+                std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.version must bridge to the quasi descr",
+            );
+        }
+
+        let narrow = make_descr_from_bh(&BhDescr::Field {
+            offset,
+            field_size: 4,
+            field_type: Type::Int,
+            field_flag: ArrayFlag::Unsigned,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "version".into(),
+            owner: "ModuleDictStrategy".into(),
+            load_is_acquire: false,
+        });
+        assert!(
+            !std::sync::Arc::ptr_eq(&narrow, &canonical),
+            "a 4-byte spelling must not bridge onto the 8-byte version cell",
+        );
+    }
+
+    #[test]
+    fn descr_from_set_member_bridges_module_dict_version() {
+        let canonical = module_dict_version_descr();
+        let lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: majit_ir::descr::path_hash("pyre_object::celldict::ModuleDictStrategy"),
+            field_name: "version".into(),
+        });
+        let SetMemberLookup::Resolved(descr) = lookup else {
+            panic!("version Field member must resolve");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "version Field member must bridge to the quasi descr",
+        );
+    }
+
+    #[test]
+    fn descr_from_set_member_bridges_module_dict_mutate_version() {
+        let canonical = module_dict_mutate_version_descr();
+        let lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: majit_ir::descr::path_hash("pyre_object::celldict::ModuleDictStrategy"),
+            field_name: "mutate_version".into(),
+        });
+        let SetMemberLookup::Resolved(descr) = lookup else {
+            panic!("mutate_version Field member must resolve");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "mutate_version Field member must bridge to the Type::Ref descr",
+        );
+    }
+
     /// The hand-lowered handler ops and translated execution-context helpers
     /// address the same three words through the same descriptor objects.
     /// `pypy/jit/backend/llsupport/descr.py GcCache.get_field_descr` has no
@@ -12672,6 +12976,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("pyre_object::gil_ready::GilReadyState", || {
         LazyLock::force(&GIL_READY_DESCR_GROUP);
+    }),
+    ("celldict::ModuleDictStrategy", || {
+        LazyLock::force(&MODULE_DICT_STRATEGY_DESCR_GROUP);
+    }),
+    ("pyre_object::celldict::ModuleDictStrategy", || {
+        LazyLock::force(&MODULE_DICT_STRATEGY_DESCR_GROUP);
     }),
 ];
 
@@ -13806,6 +14116,42 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     return canonical;
                 }
             }
+            // `ModuleDictStrategy.version` is `celldict.py` `"version?"`.
+            // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+            // for the translated read; the generated
+            // `fielddescrof(ModuleDictStrategy, "version")` must be the
+            // canonical object so `state.rs quasi_immut_descr` recognises it
+            // by index. The codewriter names the owner by leaf or by module
+            // path, as `is_pycode_w_globals_descr` does for PyCode's
+            // generated `w_globals`. Size 8, Int.
+            if (owner.as_str() == "ModuleDictStrategy"
+                || owner.as_str().ends_with("::ModuleDictStrategy"))
+                && name.as_str() == "version"
+            {
+                let canonical = module_dict_version_descr();
+                if *field_size == 8 && *field_type == Type::Int {
+                    return canonical;
+                }
+            }
+            // `ModuleDictStrategy.mutate_version` is the hidden OBJECTPTR
+            // `rclass.py _setup_repr` adds for `version?`. The codewriter
+            // names the owner by leaf or by module path; a nested
+            // `QuasiImmutField` may arrive as a two-word STRUCT at the same
+            // offset. Bridge to the pointer-sized `Type::Ref` descr before
+            // the generic parent lookup mints a twin. Lookup is by name
+            // (`descr.py get_field_descr(STRUCT, fieldname)`), so a STRUCT
+            // or unsigned-pointer spelling of the same slot still lands here.
+            if (owner.as_str() == "ModuleDictStrategy"
+                || owner.as_str().ends_with("::ModuleDictStrategy"))
+                && name.as_str() == "mutate_version"
+            {
+                let canonical = module_dict_mutate_version_descr();
+                if let Some(field) = canonical.as_field_descr()
+                    && (*field_size == field.field_size() || *field_size == 2 * WORD)
+                {
+                    return canonical;
+                }
+            }
             if owner.as_str() == "W_ListObject" {
                 match name.as_str() {
                     "int_items.len" => return list_int_items_len_descr(),
@@ -14642,6 +14988,24 @@ fn mint_field(
                 as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
         }
     }
+    if field_name == "version"
+        && let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
+        && is_module_dict_strategy_struct(*struct_id)
+    {
+        let canonical = &MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[0];
+        if *field_size == 8 && *field_type == Type::Int {
+            return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+        }
+    }
+    if field_name == "mutate_version"
+        && let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
+        && is_module_dict_strategy_struct(*struct_id)
+    {
+        let canonical = &MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[1];
+        if *field_size == canonical.field_size() || *field_size == 2 * WORD {
+            return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+        }
+    }
     // PyPy's single GcCache sees the runtime declaration at the same
     // `cpu.fielddescrof` request that creates this slot. At pyre's AOT
     // boundary, restore that order for this exact STRUCT only: its declaration
@@ -14943,6 +15307,18 @@ fn is_gil_ready_struct(struct_id: u64) -> bool {
     .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
 }
 
+/// Whether `struct_id` names `ModuleDictStrategy` under one of the owner
+/// spellings `make_descr_from_bh` bridges.
+fn is_module_dict_strategy_struct(struct_id: u64) -> bool {
+    [
+        "ModuleDictStrategy",
+        "celldict::ModuleDictStrategy",
+        "pyre_object::celldict::ModuleDictStrategy",
+    ]
+    .into_iter()
+    .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
+}
+
 pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
     use majit_ir::descr::{LLType, gc_cache};
 
@@ -14958,6 +15334,13 @@ pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) ->
             // quasi descr, as `make_descr_from_bh` does for the opcode.
             if field_name.as_str() == "gil_ready" && is_gil_ready_struct(*struct_id) {
                 return SetMemberLookup::Resolved(gil_ready_descr());
+            }
+            if field_name.as_str() == "version" && is_module_dict_strategy_struct(*struct_id) {
+                return SetMemberLookup::Resolved(module_dict_version_descr());
+            }
+            if field_name.as_str() == "mutate_version" && is_module_dict_strategy_struct(*struct_id)
+            {
+                return SetMemberLookup::Resolved(module_dict_mutate_version_descr());
             }
             let struct_key = LLType::Struct(*struct_id);
             let mut gc = gc_cache().lock();

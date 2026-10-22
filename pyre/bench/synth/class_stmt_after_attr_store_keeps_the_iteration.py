@@ -1,52 +1,31 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=entry-bridge:ForArm,entry-bridge:WhileArm
-# Regression guard: a class statement in a loop body used to LOSE the rest of
-# the iteration it aborted in, whenever an earlier opcode of that same body had
-# already mutated the heap.
+# Regression guard: a class statement in a loop body must keep the rest of
+# that iteration, even when an earlier opcode of the same body has already
+# mutated the heap.
 #
 # The chain, all on the default path:
 #   1. the walk consumes the FOR_ITER item and stashes it in flight;
 #   2. `c.x = 1` runs its STORE_ATTR residual concretely.  It writes the live
 #      heap outside every journal, so it bumps the executed-effect odometer AND
 #      raises the R1 "body effect since consume" signal;
-#   3. the class statement is one residual (`__build_class__` has no generated
-#      gateway to descend into), and the walker asks its
-#      `jit_force_quasi_immutable` question at that boundary -- the class body
-#      stores into a `newdict(module=True)` namespace, and upstream abandons
-#      every trace that executes a class body;
-#   4. the `ForceQuasiImmutable` flush leg DECLINED, because the class-body site
-#      offered it no operand-stack mirror.  The walk rolled back and left the
-#      legacy replay to re-run the region;
-#   5. that replay needs the consumed FOR_ITER item pushed back, and
+#   3. `JitPolicy.look_inside_graph` residualizes `build_class` because the
+#      graph contains loops (`compiling.py build_class` builds keyword-name
+#      lists with comprehensions) and is not `unroll_safe`.  The class body's
+#      own portal entry may start a separate trace;
+#   4. that inner trace aborts on ABORT_FORCE_QUASIIMMUT when its STORE_NAME
+#      mutates the class namespace's `ModuleDictStrategy.version?`;
+#   5. a declined flush would need the consumed FOR_ITER item pushed back, and
 #      `fbw_foriter_inflight_take` refuses to deliver it while R1 stands -- a
 #      re-run of the body would apply the step-2 store a second time.
 #
-# Refusing delivery is the never-double rule, so the item was DROPPED and the
-# loop moved on: the `APPENDED.append(1)` after the class statement never ran
-# for that iteration.  This file measured 9995 appends for 10000 iterations on
-# dynasm; the same shape reduced to one script was equally red on cranelift, so
-# it is not backend-specific.  Spelling the tail as `acc += 1` loses the same
-# five increments, which is what makes it a lost ITERATION rather than a lost
-# store -- `c.x` itself ends correct either way.
-#
-# Two things had to change, and the fixture needs both:
-#   * the class-body `ABORT_FORCE_QUASIIMMUT` site now latches the operand-stack
-#     mirror its two sibling qmut sites already latched, so the leg has
-#     something to adopt;
-#   * the latch's own sanity check only exempted ONE disagreeing slot, the
-#     in-progress opcode's TOS.  A `CALL` pops its whole callable/self/args run
-#     into registers before its residual -- four operand slots for a class
-#     statement -- so every one of them read NULL in the vable shadow and the
-#     flush declined on the first.  The qmut leg now exempts the consumed
-#     SUFFIX.
-#
-# The wider exemption is the QMUT LEG'S ALONE, and that is measured, not
-# cautious: the escape leg's opcode is IN PROGRESS -- its residual is what
-# forced -- so its `last_instr = pc - 1` reads as "about to run the CALL" while
-# the callee doing the forcing is already inside it.  Letting it commit the
-# deeper run turned `caller_f_lasti_across_residual_call` red, 2 of 20000 reads
-# answering 42 (the `LOAD_GLOBAL` ahead of the call) instead of 52.  The qmut
-# abort has no such conflict: it fires BEFORE its residual executes.
+# Refusing delivery is the never-double rule, so a dropped item used to skip
+# the `APPENDED.append(1)` after the class statement.  History: 9995 appends
+# for 10000 iterations on dynasm (cranelift the same shape).  Spelling the
+# tail as `acc += 1` lost the same five increments -- a lost ITERATION rather
+# than a lost store; `c.x` itself ends correct either way.  The fixture
+# guards that a class statement in a loop body never loses the rest of that
+# iteration.
 #
 # The while-loop arm is the control that isolates the loss to the dropped item:
 # it runs the same store, the same class statement and the same append, aborts

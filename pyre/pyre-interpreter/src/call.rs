@@ -6484,12 +6484,12 @@ fn build_class_inner(
         slot
     });
     // The class body's frame is built from the function's code, globals and
-    // closure at the bottom of this function, after `__prepare__`, the
-    // namespace allocations and the namespace replay have all run.  The globals
-    // are a dict and the closure a tuple, both nursery-allocated, so the three
-    // are read off `body_fn` there rather than cached here.  A `Function` is
-    // `try_gc_alloc_stable`, so its own address survives; what the pin buys is
-    // that the block is still allocated when that late read happens.
+    // closure at the bottom of this function, after `__prepare__` has run.
+    // The globals are a dict and the closure a tuple, both nursery-allocated,
+    // so the three are read off `body_fn` there rather than cached here.  A
+    // `Function` is `try_gc_alloc_stable`, so its own address survives; what
+    // the pin buys is that the block is still allocated when that late read
+    // happens.
     let body_fn_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(body_fn);
     let bases = || bases_scope.get(bases_slot);
@@ -6607,103 +6607,23 @@ fn build_class_inner(
         None
     };
 
-    // Create class namespace — use __prepare__ result or fresh namespace.
-    // __prepare__ may return a dict subclass (e.g. EnumDict).
-    // dict subclass instances created by w_instance_new store entries in
-    // their mapdict instance storage, not in W_DictObject.entries. We
-    // handle both cases.
-    // `w_dict_items` dispatches through `is_module_dict`, so the
-    // rare `__prepare__` returning a W_ModuleDictObject still walks
-    // correctly.  Both branches share the same shape; collapse them
-    // around the dispatching surface.
-    let _class_ns_root = pyre_object::gc_roots::push_roots();
-    let w_namespace_root = w_namespace.map(|w_namespace| {
-        let root = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_namespace);
-        root
+    // compiling.py `build_class`: one `w_namespace` — the `__prepare__`
+    // result, or `newdict(module=True)` when the lookup raised
+    // AttributeError.  `type_descr_prepare` answers `w_module_dict_new()`
+    // for the same fallback; an absent `w_metaclass` is pyre's spelling of
+    // the builtin `type` winner, which never looked the method up.
+    let _ns_root = pyre_object::gc_roots::push_roots();
+    let w_namespace_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(match w_namespace {
+        Some(ns) => ns,
+        None => pyre_object::w_module_dict_new(),
     });
-    // The body executes in the namespace `__prepare__` returned, and
-    // `descr___prepare__` answers `newdict(module=True)`; the default metaclass
-    // reaches here with no prepared namespace at all, since `real_build_class`
-    // spells that winner as an absent `w_metaclass`.  Only a `__prepare__` that
-    // produced a plain dict keeps the body out of a module-strategy mapping.
-    let prepared_plain_dict = w_namespace_root
-        .map(pyre_object::gc_roots::shadow_stack_get)
-        .is_some_and(|w_namespace| unsafe {
-            pyre_object::is_dict(w_namespace)
-                && !pyre_object::dictmultiobject::is_module_dict(w_namespace)
-        });
-    let class_ns = if prepared_plain_dict {
-        pyre_object::w_dict_new()
-    } else {
-        pyre_object::w_module_dict_new()
-    };
-    let class_ns_root = pyre_object::gc_roots::shadow_stack_len();
-    let class_ns = pyre_object::gc_roots::pin_root(class_ns);
-    if let Some(w_namespace_root) = w_namespace_root {
-        let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-        if unsafe { pyre_object::is_dict(w_prepared_dict) } {
-            let keys: Vec<Wtf8Buf> = unsafe {
-                pyre_object::w_dict_str_entries_wtf8(w_prepared_dict)
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect()
-            };
-            for key in keys {
-                let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-                let Some(value) =
-                    (unsafe { pyre_object::w_dict_getitem_wtf8(w_prepared_dict, &key) })
-                else {
-                    continue;
-                };
-                if value.is_null() {
-                    continue;
-                }
-                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
-            }
-        }
-        // dict subclass instance (e.g. EnumDict): resolve the mapping payload
-        let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-        if unsafe { pyre_object::is_instance(w_prepared_dict) } {
-            let backing = crate::type_methods::resolve_dict_backing(w_prepared_dict);
-            if !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
-                let backing_root = pyre_object::gc_roots::shadow_stack_len();
-                let backing = pyre_object::gc_roots::pin_root(backing);
-                let keys: Vec<Wtf8Buf> = unsafe {
-                    pyre_object::w_dict_str_entries_wtf8(backing)
-                        .into_iter()
-                        .map(|(key, _)| key)
-                        .collect()
-                };
-                for key in keys {
-                    let backing = pyre_object::gc_roots::shadow_stack_get(backing_root);
-                    let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(backing, &key) })
-                    else {
-                        continue;
-                    };
-                    if value.is_null() {
-                        continue;
-                    }
-                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                    unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
-                }
-            }
-        }
-    }
-
-    // w_namespace: if __prepare__ returned a custom dict, we'll replay
-    // class body stores into it after execution. This lets EnumDict etc.
-    // track member definitions via __setitem__.
 
     let exec_ctx = take_last_exec_ctx();
 
-    // Create frame with class_locals set AND closure from enclosing scope.
-    // PyPy: executes class body with w_locals = fresh dict, w_globals = module globals,
-    // and the closure tuple is passed through for LOAD_DEREF access.
-    //
-    // Read the three off the pinned function here: everything above ran Python
-    // or allocated, and the globals dict and the closure tuple both relocate.
+    // compiling.py `build_class`: `space.createframe(code, w_func.w_func_globals, w_func)`
+    // then `setdictscope(w_namespace)`.  The globals dict and the closure
+    // tuple both relocate, so they are read off the pinned function here.
     let body_fn = pyre_object::gc_roots::shadow_stack_get(body_fn_slot);
     let w_code = unsafe { crate::getcode(body_fn) };
     let w_globals = unsafe { function_get_globals_obj(body_fn) };
@@ -6733,32 +6653,6 @@ fn build_class_inner(
         }
     }
 
-    // When `__prepare__` returned a custom mapping (a dict subclass such as
-    // enum._EnumDict, or any non-dict mapping), the class body must execute
-    // against it directly so its `__setitem__`/`__getitem__` fire mid-body —
-    // e.g. `WHITE = RED | GREEN` reads the values `_EnumDict.__setitem__`
-    // resolved on assignment, not the stale `auto()` sentinels.  Upstream
-    // `compiling.py` runs `frame.setdictscope(w_namespace)`
-    // unconditionally; route the frame's name binding through the mapping
-    // via setdictscope.  An absent or plain-dict namespace keeps the
-    // plain-dict fast path (plain-dict stores have no observable side
-    // effects, and the metaclass replay below restores its final contents).
-    let mapping_namespace = w_namespace_root
-        .map(pyre_object::gc_roots::shadow_stack_get)
-        .filter(|&w| unsafe { !pyre_object::is_dict(w) });
-    // The prepared mapping is live across the class body and the replay
-    // below. Read the Option before any of those calls and keep the word
-    // in one slot.
-    let has_mapping_namespace = mapping_namespace.is_some();
-    let mapping_word = mapping_namespace.unwrap_or(pyre_object::PY_NULL);
-    let prepared_mapping_slot = if has_mapping_namespace {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(mapping_word);
-        slot
-    } else {
-        0
-    };
-
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
             w_code as *const (),
@@ -6768,19 +6662,12 @@ fn build_class_inner(
             closure,
             crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         )?);
-    // The class body executes against a namespace OBJECT (setdictscope)
-    // so STORE_NAME / LOAD_NAME route through the object form, not the raw
-    // `*mut DictStorage` w_locals.  A custom non-dict `__prepare__` mapping is
-    // used directly (already rooted by the caller); otherwise class_ns itself
-    // is the body namespace.  The latter identity is semantic: compiler-made
-    // `__classdict__` cells close over class_ns, so STORE_NAME must update that
-    // same object rather than a temporary copy.
-    let _ns_root = pyre_object::gc_roots::push_roots();
-    let body_ns = if has_mapping_namespace {
-        pyre_object::gc_roots::shadow_stack_get(prepared_mapping_slot)
-    } else {
-        pyre_object::gc_roots::shadow_stack_get(class_ns_root)
-    };
+    // compiling.py `build_class`: `frame.setdictscope(w_namespace)` then
+    // `frame.run()`.  The body executes against a namespace OBJECT so
+    // STORE_NAME / LOAD_NAME route through the object form, not the raw
+    // `*mut DictStorage` w_locals.  Compiler-made `__classdict__` cells
+    // close over this same object (`LOAD_LOCALS` / `STORE_DEREF`).
+    let body_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
     frame.setdictscope(body_ns)?;
 
     // Route the class body through the JIT portal (like the exec / import
@@ -6795,155 +6682,28 @@ fn build_class_inner(
     // shadow-stack pin are forwarded, keeping the object alive at its new
     // address, but this stack-local `body_ns` copy is not — it is left
     // pointing at the freed nursery slot.  Re-read the forwarded object
-    // from the frame before any downstream use; a stale read would
-    // dereference reclaimed memory (`resolve_dict_backing` / `w_dict_items`
-    // below, then `__set_name__`).
-    let body_ns = frame.get_w_locals();
-    if has_mapping_namespace {
-        pyre_object::gc_roots::shadow_stack_set(prepared_mapping_slot, body_ns);
-    }
-    let body_is_mapping = has_mapping_namespace;
+    // from the frame before any downstream use.
+    let w_namespace = frame.get_w_locals();
+    pyre_object::gc_roots::shadow_stack_set(w_namespace_root, w_namespace);
 
-    // The body wrote through `body_ns`; mirror its final contents into
-    // class_ns for the downstream type construction (classcell capture,
-    // create_all_slots, __set_name__), which read class_ns.
-    {
-        let w_ns = if has_mapping_namespace {
-            pyre_object::gc_roots::shadow_stack_get(prepared_mapping_slot)
-        } else {
-            pyre_object::gc_roots::shadow_stack_get(class_ns_root)
-        };
-        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-        let w_ns = pyre_object::gc_roots::pin_root(w_ns);
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        // A plain class body now writes directly into class_ns, preserving the
-        // `__classdict__` closure identity.  Only a distinct custom prepared
-        // mapping needs to be mirrored for downstream type construction.
-        let distinct_namespace = !std::ptr::eq(w_ns, class_ns);
-        if distinct_namespace {
-            // Rebuild from the final contents so names `del`eted from the
-            // namespace during body execution don't survive in class_ns.
-            unsafe { pyre_object::w_dict_clear(class_ns) };
-        }
-        let backing = crate::type_methods::resolve_dict_backing(
-            pyre_object::gc_roots::shadow_stack_get(ns_slot),
-        );
-        if distinct_namespace && !backing.is_null() && unsafe { pyre_object::is_dict(backing) } {
-            // Dict subclass: read final entries off the backing dict.
-            let backing_root = pyre_object::gc_roots::shadow_stack_len();
-            let backing = pyre_object::gc_roots::pin_root(backing);
-            let keys: Vec<Wtf8Buf> = unsafe {
-                pyre_object::w_dict_str_entries_wtf8(backing)
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect()
-            };
-            for key in keys {
-                let backing = pyre_object::gc_roots::shadow_stack_get(backing_root);
-                let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(backing, &key) })
-                else {
-                    continue;
-                };
-                if value.is_null() {
-                    continue;
-                }
-                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                unsafe { pyre_object::w_dict_setitem_wtf8_no_proxy(class_ns, &key, value) };
-            }
-        } else if distinct_namespace && has_metaclass {
-            // A custom metaclass receives the raw mapping unchanged (passed
-            // below) and owns its enumeration — `type.__new__` runs
-            // `PyMapping_Keys` itself.  The mapping must therefore not be
-            // walked here; only `__classcell__` is consumed locally, for the
-            // post-metaclass cell validation below, so lift just that one key
-            // via `space.getitem` rather than calling the mapping's `keys()`.
-            let cellkey_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
-                "__classcell__",
-            ));
-            match crate::baseobjspace::getitem(
-                pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                pyre_object::gc_roots::shadow_stack_get(cellkey_slot),
-            ) {
-                Ok(value) if !value.is_null() => {
-                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                    unsafe {
-                        pyre_object::w_dict_setitem_str_no_proxy(class_ns, "__classcell__", value)
-                    };
-                }
-                Ok(_) => {}
-                Err(e) if e.kind == crate::PyErrorKind::KeyError => {}
-                Err(e) => return Err(e),
-            }
-        } else if distinct_namespace {
-            // Arbitrary non-dict mapping with the default metaclass: this path
-            // builds the type directly from `class_ns`, so materialize the
-            // whole namespace via the mapping protocol's `keys()` (the
-            // `PyMapping_Keys` path `type.__new__` takes for a non-dict
-            // namespace) and read each value back via `space.getitem` so
-            // `__getitem__` overrides apply.  `keys()` rather than `iter()`
-            // keeps a mapping without `__iter__` working.
-            let keys_method = crate::baseobjspace::getattr_str(
-                pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                "keys",
-            )?;
-            let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
-            let keys = crate::builtins::collect_iterable(keys_obj)?;
-            let nkeys = keys.len();
-            let key_base = pyre_object::gc_roots::pin_roots(&keys);
-            for index in 0..nkeys {
-                let key = pyre_object::gc_roots::shadow_stack_get(key_base + index);
-                if !unsafe { pyre_object::is_str(key) } {
-                    continue;
-                }
-                let value = crate::baseobjspace::getitem(
-                    pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                    pyre_object::gc_roots::shadow_stack_get(key_base + index),
-                )?;
-                if !value.is_null() {
-                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                    unsafe {
-                        pyre_object::w_dict_setitem_wtf8_no_proxy(
-                            class_ns,
-                            pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(
-                                key_base + index,
-                            )),
-                            value,
-                        )
-                    };
-                }
-            }
-        }
-    }
-
-    // compiling.py:211-212 — when __mro_entries__ rewrote the bases, expose
-    // the user-declared bases via __orig_bases__ in the class namespace.
+    // compiling.py `build_class`: when __mro_entries__ rewrote the bases,
+    // `space.setitem(w_namespace, "__orig_bases__", w_orig_bases)` on that
+    // same namespace.  Interning the key still allocates on a first
+    // sighting, so the mapping is reloaded after the pin.
     if let Some(orig_bases_slot) = orig_bases_slot {
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                class_ns,
-                "__orig_bases__",
-                pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
-            )
-        };
-        if has_mapping_namespace {
-            // Interning the key still allocates on a first sighting, so
-            // the mapping is reloaded after the pin.
-            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
-                prepared_mapping_slot,
-            ));
-            let key_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
-                "__orig_bases__",
-            ));
-            crate::baseobjspace::setitem(
-                pyre_object::gc_roots::shadow_stack_get(ns_slot),
-                pyre_object::gc_roots::shadow_stack_get(key_slot),
-                pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
-            )?;
-        }
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
+            w_namespace_root,
+        ));
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::unicodeobject::intern_str_value(
+            "__orig_bases__",
+        ));
+        crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            pyre_object::gc_roots::shadow_stack_get(orig_bases_slot),
+        )?;
     }
 
     // type_new_classcell (typeobject.c) — capture the `__classcell__` cell
@@ -6957,10 +6717,10 @@ fn build_class_inner(
     // (type.__new__ receives the full namespace) and `type.__new__`
     // (type_new_classcell) consumes them, so they are dropped per
     // construction path below rather than up front.
-    let classcell = {
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classcell__") }
-    };
+    let classcell = crate::baseobjspace::finditem_str(
+        pyre_object::gc_roots::shadow_stack_get(w_namespace_root),
+        "__classcell__",
+    )?;
     // Read the Option once. Later checks reload the word from the slot:
     // metaclass construction collects before the cell is stored into.
     let has_classcell = classcell.is_some();
@@ -6983,13 +6743,15 @@ fn build_class_inner(
         None
     };
     let classcell_root = classcell_slot.filter(|_| classcell_is_cell);
-    // CPython 3.14 type_new_set_classdict: compiler-generated annotation
-    // functions and comprehensions capture `__classdict__` through this
-    // separate cell.  type.__new__ consumes the namespace entry and replaces
-    // the cell's provisional body namespace with the completed type dict.
+    // type_new_set_classdict: compiler-generated annotation functions and
+    // comprehensions capture `__classdict__` through this separate cell.
+    // type.__new__ consumes the namespace entry and replaces the cell's
+    // provisional body namespace with the completed type dict.
     let classdictcell_root = {
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        let cell = unsafe { pyre_object::w_dict_getitem_str(class_ns, "__classdictcell__") };
+        let cell = crate::baseobjspace::finditem_str(
+            pyre_object::gc_roots::shadow_stack_get(w_namespace_root),
+            "__classdictcell__",
+        )?;
         // `type_new_set_classdictcell` refuses a non-cell value; only the
         // default shortcut has to spell it here, because a custom metaclass
         // reaches `type.__new__` and is refused there.
@@ -7043,80 +6805,13 @@ fn build_class_inner(
         None
     };
     let w_type = if has_metaclass {
-        let _metaclass_ns_root = pyre_object::gc_roots::push_roots();
-        let mut w_namespace_dict_root = None;
-        // Convert class namespace to a dict for metaclass call.
-        // If __prepare__ returned a custom dict, replay stores into it
-        // so that __setitem__ side effects (e.g. EnumDict tracking) fire.
-        let mut w_namespace_dict = if let Some(w_namespace_root) = w_namespace_root {
-            let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-            // Replay class body stores into the prepared dict so __setitem__
-            // side effects (EnumDict tracking) fire — but only on the legacy
-            // path where the body wrote into class_ns.  When the body executed
-            // directly against the mapping (setdictscope above) it
-            // already holds every store; replaying would re-run __setitem__
-            // and, for _EnumDict, reject the duplicate member keys.
-            if !body_is_mapping {
-                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                let keys: Vec<Wtf8Buf> = unsafe {
-                    pyre_object::w_dict_str_entries_wtf8(class_ns)
-                        .into_iter()
-                        .map(|(key, _)| key)
-                        .collect()
-                };
-                for key in keys {
-                    let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                    let Some(value) = (unsafe { pyre_object::w_dict_getitem_wtf8(class_ns, &key) })
-                    else {
-                        continue;
-                    };
-                    if value.is_null() {
-                        continue;
-                    }
-                    let w_prepared_dict = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-                    // `w_prepared_dict` is an exact `dict` on this branch
-                    // (`!body_is_mapping`), so no user code runs.
-                    unsafe {
-                        pyre_object::w_dict_setitem_wtf8_no_proxy(w_prepared_dict, &key, value)
-                    };
-                }
-            }
-            pyre_object::gc_roots::shadow_stack_get(w_namespace_root)
-        } else {
-            let d = pyre_object::w_dict_new();
-            let d_root = pyre_object::gc_roots::shadow_stack_len();
-            let d = pyre_object::gc_roots::pin_root(d);
-            w_namespace_dict_root = Some(d_root);
-            let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-            let keys: Vec<String> = unsafe {
-                pyre_object::w_dict_str_entries(class_ns)
-                    .into_iter()
-                    .map(|(key, _)| key)
-                    .collect()
-            };
-            for key in keys {
-                let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-                let Some(value) = (unsafe { pyre_object::w_dict_getitem_str(class_ns, &key) })
-                else {
-                    continue;
-                };
-                if value.is_null() {
-                    continue;
-                }
-                let d = pyre_object::gc_roots::shadow_stack_get(d_root);
-                unsafe { pyre_object::w_dict_setitem_str_no_proxy(d, &key, value) };
-            }
-            pyre_object::gc_roots::shadow_stack_get(d_root)
-        };
-        // Call metaclass(name, bases, namespace, **kwds)
-        // Pass the ORIGINAL bases (not w_effective_bases) — the metaclass
-        // expects the user-declared bases. Default (object,) is added by
-        // type.__new__ internally if needed.
+        // compiling.py `build_class`: `space.call_args(w_meta, args)` with
+        // `args_w=[w_name, w_bases, w_namespace]` — the same object the
+        // body wrote.  Name allocation can collect, so reload the namespace
+        // after the pin.
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
-        if let Some(root) = w_namespace_dict_root {
-            w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(root);
-        }
+        let w_namespace = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         clear_call_error();
         let result = if let Some(kw) = current_kwds() {
             // Only use kwargs path if there are actual extra kwargs
@@ -7126,7 +6821,7 @@ fn build_class_inner(
                     w_metaclass_live().unwrap_or(pyre_object::PY_NULL),
                     pyre_object::gc_roots::shadow_stack_get(name_slot),
                     bases(),
-                    w_namespace_dict,
+                    w_namespace,
                     kw,
                 )
             } else {
@@ -7135,7 +6830,7 @@ fn build_class_inner(
                     &[
                         pyre_object::gc_roots::shadow_stack_get(name_slot),
                         bases(),
-                        w_namespace_dict,
+                        w_namespace,
                     ],
                 )
             }
@@ -7145,7 +6840,7 @@ fn build_class_inner(
                 &[
                     pyre_object::gc_roots::shadow_stack_get(name_slot),
                     bases(),
-                    w_namespace_dict,
+                    w_namespace,
                 ],
             )
         };
@@ -7180,13 +6875,13 @@ fn build_class_inner(
                 pyre_object::gc_roots::shadow_stack_get(classcell_slot),
             ));
         }
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classcell__") };
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classdictcell__") };
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         crate::builtins::type_new_set_hash_if_eq(class_ns);
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         crate::builtins::type_new_wrap_special_methods(class_ns);
         // `PyDict_Copy(ctx->orig_dict)` — the class dict is the namespace as
         // the body left it, keys of every type included.  The clone carries
@@ -7194,14 +6889,14 @@ fn build_class_inner(
         // `__hash__` again — running a side-effecting one an extra time, and
         // dropping the entry outright once that `__hash__` starts raising,
         // because the store surface cannot report an error.
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
         let _ = pyre_object::gc_roots::pin_root(dict_obj);
         // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
         // `RuntimeWarning` reported below; reading the keys answers it
         // without hashing any of them.
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
+        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
         let has_non_string_key = unsafe { pyre_object::w_dict_items(class_ns) }
             .iter()
             .any(|&(key, _)| !unsafe { pyre_object::is_str(key) });
