@@ -210,8 +210,8 @@ pub struct W_Property {
     /// stated precondition: the lock cannot be remapped out from under a
     /// holder.  A GC object's `Drop` never runs, so the field cannot reclaim
     /// its own instance; `property_destructor` in `pyre-jit/src/eval.rs` takes
-    /// it back on sweep instead.  `W_TypeObject` and `Function::mutate_slots`
-    /// carry the same pattern.
+    /// it back on sweep instead.  `W_TypeObject` and `Function`'s inline
+    /// `mutate_<name>` fields carry the same pattern.
     ///
     /// `w_fdel?` is declared upstream on the same line and gets no watcher
     /// here: no fold bakes `fdel`, so nothing would ever register on it.  A

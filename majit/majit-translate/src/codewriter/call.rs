@@ -9399,6 +9399,24 @@ impl CallControl {
                 // canraise.py: LL_OPERATIONS[op.opname].canraise
                 for op in &block.operations {
                     let op_result = match &op.kind {
+                        // The analyzer runs over the rtyped graph, before
+                        // `jtransform.rewrite_op_jit_force_quasi_immutable`
+                        // turns this Call into `OpKind::JitForceQuasiImmutable`
+                        // on the cloned graph. Treat it as the llop:
+                        // `LL_OPERATIONS['jit_force_quasi_immutable']` has no
+                        // canraise (`lloperation.py`), so
+                        // `RaiseAnalyzer.analyze_simple_operation`
+                        // (`canraise.py`) answers False rather than
+                        // recursing into the native method body.
+                        // `rclass.py InstanceRepr.hook_setfield` is the
+                        // llop's producer.
+                        OpKind::Call { target, .. }
+                            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                                target,
+                            ) =>
+                        {
+                            false
+                        }
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
                                 Some(p) => p,
@@ -9486,6 +9504,14 @@ impl CallControl {
                             break 'walk true;
                         }
                         OpKind::VableForce { .. } => break 'walk true,
+                        // The Call is the llop, not a graph to recurse into.
+                        // `VirtualizableAnalyzer.analyze_simple_operation`
+                        // matches only `jit_force_virtualizable` /
+                        // `jit_force_virtual`.
+                        OpKind::Call { target, .. }
+                            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                                target,
+                            ) => {}
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
                                 Some(p) => p,
@@ -9564,6 +9590,13 @@ impl CallControl {
             for block in graph.iterblocks() {
                 for op in &block.operations {
                     match &op.kind {
+                        // The Call is the llop, not a graph to recurse into.
+                        // `RandomEffectsAnalyzer.analyze_simple_operation`
+                        // always returns False (`effectinfo.py`).
+                        OpKind::Call { target, .. }
+                            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                                target,
+                            ) => {}
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
                                 Some(p) => p,
@@ -9656,6 +9689,16 @@ impl CallControl {
                         "calls the function pointer {funcptr} indirectly, and its \
                          family is unknown"
                     )),
+                    // The Call is the llop; not a RandomEffects /
+                    // ForcesVirtualizable witness, and not a graph to
+                    // recurse into.
+                    OpKind::Call { target, .. }
+                        if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                            target,
+                        ) =>
+                    {
+                        None
+                    }
                     OpKind::Call { target, .. } => self.target_to_path(target).and_then(|callee| {
                         self.walk_effect_witness(&callee, witness, seen, chain)
                             .then(|| format!("calls {}", callee.segments.join("::")))
@@ -9717,9 +9760,8 @@ impl CallControl {
     ///
     /// analyze_simple_operation: op.opname == 'jit_force_quasi_immutable'.
     ///
-    /// In majit: we don't have quasi-immutable ops in the model yet,
-    /// so this always returns false. The transitive call check is still
-    /// performed for future-proofing.
+    /// `effectinfo.py QuasiImmutAnalyzer.analyze_simple_operation`:
+    /// `op.opname == 'jit_force_quasi_immutable'` → true.
     fn analyze_can_invalidate(
         &self,
         path: &CallPath,
@@ -9737,8 +9779,25 @@ impl CallControl {
             for block in graph.iterblocks() {
                 for op in &block.operations {
                     // RPython: jit_force_quasi_immutable → true
-                    // majit: no such op yet, but check calls transitively
                     match &op.kind {
+                        OpKind::JitForceQuasiImmutable { .. } => break 'walk true,
+                        // The analyzer runs over the rtyped graph, before
+                        // `jtransform.rewrite_op_jit_force_quasi_immutable`
+                        // turns this Call into `OpKind::JitForceQuasiImmutable`
+                        // on the cloned graph. `CallControl.function_graphs`
+                        // still holds the `OpKind::Call`. Match the upstream
+                        // opname leaf directly.
+                        // `effectinfo.py QuasiImmutAnalyzer.analyze_simple_operation`:
+                        // `op.opname == 'jit_force_quasi_immutable'` → True.
+                        // `rclass.py InstanceRepr.hook_setfield` puts the llop
+                        // into the rtyped graph.
+                        OpKind::Call { target, .. }
+                            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                                target,
+                            ) =>
+                        {
+                            break 'walk true;
+                        }
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
                                 Some(p) => p,
@@ -9843,6 +9902,15 @@ impl CallControl {
                         | OpKind::NewArray { .. }
                         | OpKind::NewArrayClear { .. }
                         | OpKind::NewListClear { .. } => break 'walk true,
+                        // The Call is the llop, not a graph to recurse into.
+                        // `CollectAnalyzer.analyze_simple_operation` answers
+                        // True only for `malloc` / `malloc_varsize` with
+                        // `flavor='gc'` and `LL_OPERATIONS[op].canmallocgc`;
+                        // `jit_force_quasi_immutable` has neither.
+                        OpKind::Call { target, .. }
+                            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                                target,
+                            ) => {}
                         OpKind::Call { target, .. } => {
                             // graphanalyze.py: analyze_direct_call — recurse
                             let callee_path = match self.target_to_path(target) {
@@ -10616,6 +10684,21 @@ impl CallControl {
             for op in &block.operations {
                 // graphanalyze.py `analyze(op, seen, graphinfo)`.
                 let effects = match &op.kind {
+                    // The analyzer runs before
+                    // `jtransform.rewrite_op_jit_force_quasi_immutable`.
+                    // `ReadWriteAnalyzer.analyze_simple_operation`
+                    // (`writeanalyze.py`) does not match
+                    // `jit_force_quasi_immutable` as setfield/setarrayitem,
+                    // so the Call contributes `empty_set` and is not
+                    // recursed into. `rclass.py InstanceRepr.hook_setfield`
+                    // is the llop's producer.
+                    OpKind::Call { target, .. }
+                        if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                            target,
+                        ) =>
+                    {
+                        ReadWriteEffects::bottom_result()
+                    }
                     OpKind::Call { target, .. } => match self.target_to_path(target) {
                         Some(callee) => self.analyze_readwrite(&callee, seen, analyzed),
                         None => ReadWriteEffects::bottom_result(),
@@ -12356,6 +12439,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // jtransform.py — `record_quasiimmut_field` is pure bookkeeping
         // that the metainterp converts into a guard; cannot raise.
         | OpKind::RecordQuasiImmutField { .. }
+        | OpKind::JitForceQuasiImmutable { .. }
         | OpKind::Live
         // jtransform.py:1707 `jit_merge_point` / :1718 `loop_header` — pure
         // markers consumed by the metainterp; cannot raise.
@@ -12390,6 +12474,17 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // RPython LL: int_neg_ovf → canraise = (OverflowError,)
         OpKind::UnaryOp { .. } => RaiseClass::Yes, // ovf (others matched above)
 
+        // The analyzer runs over the rtyped graph, before
+        // `jtransform.rewrite_op_jit_force_quasi_immutable` rewrites this
+        // Call. `LL_OPERATIONS['jit_force_quasi_immutable']` has no
+        // canraise (`lloperation.py`); `RaiseAnalyzer.analyze_simple_operation`
+        // (`canraise.py`) therefore answers False. `rclass.py
+        // InstanceRepr.hook_setfield` is the llop's producer.
+        OpKind::Call { target, .. }
+            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(target) =>
+        {
+            RaiseClass::No
+        }
         // RPython: Call ops dispatch to analyze_direct_call/analyze_external_call.
         // op_can_raise is only for "simple operations" (non-call).
         // But if we see a Call here (shouldn't happen in normal flow),
@@ -17211,6 +17306,105 @@ mod tests {
                 &mut new_analyzed_calls()
             ));
         }
+    }
+
+    /// `CallControl.function_graphs` still holds the pre-rewrite
+    /// `OpKind::Call` to `jit_force_quasi_immutable`. Analyzers must treat
+    /// that Call as the llop itself
+    /// (`effectinfo.py QuasiImmutAnalyzer.analyze_simple_operation`,
+    /// `rclass.py InstanceRepr.hook_setfield`), not recurse into the
+    /// native method body.
+    #[test]
+    fn analyzers_see_pre_rewrite_jit_force_quasi_immutable_call_as_llop() {
+        let mut cc = CallControl::new();
+
+        let mut callee = FunctionGraph::new("m::S::jit_force_quasi_immutable");
+        let callee_start = callee.startblock;
+        callee.blocks[callee_start.0]
+            .operations
+            .push(indirect_call_op(None));
+        callee.set_return(callee_start, None);
+        cc.register_function_graph(
+            CallPath::from_segments(["m", "S", "jit_force_quasi_immutable"]),
+            callee,
+        );
+
+        let mut setter = FunctionGraph::new("setter");
+        let force_call = OpKind::Call {
+            target: CallTarget::function_path(["m", "S", "jit_force_quasi_immutable"]),
+            args: Vec::new(),
+            result_ty: ValueType::Void,
+        };
+        setter.push_op_var(setter.startblock, force_call.clone(), false);
+        setter.set_return(setter.startblock, None);
+        let setter_path = CallPath::from_segments(["setter"]);
+        cc.register_function_graph(setter_path.clone(), setter);
+
+        assert!(
+            cc.analyze_can_invalidate(
+                &setter_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ),
+            "QuasiImmutAnalyzer.analyze_simple_operation: the Call is the llop"
+        );
+
+        assert_eq!(op_can_raise(&force_call), RaiseClass::No);
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &setter_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "LL_OPERATIONS['jit_force_quasi_immutable'] has no canraise; \
+             raise class must not come from the callee body"
+        );
+
+        let effects = cc.analyze_readwrite(
+            &setter_path,
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        );
+        assert!(
+            !ReadWriteEffects::is_top_result(&effects),
+            "IndirectCall graphs=None in the callee would be top"
+        );
+        match &effects {
+            ReadWriteEffects::Set(set) => assert!(
+                set.is_empty(),
+                "ReadWriteAnalyzer.analyze_simple_operation: not \
+                 setfield/setarrayitem → empty"
+            ),
+            ReadWriteEffects::Top => unreachable!("checked is_top_result above"),
+        }
+
+        assert!(
+            !cc.analyze_forces_virtualizable(
+                &setter_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ),
+            "VirtualizableAnalyzer.analyze_simple_operation does not match \
+             jit_force_quasi_immutable"
+        );
+        assert!(
+            !cc.analyze_random_effects(
+                &setter_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ),
+            "RandomEffectsAnalyzer.analyze_simple_operation is False"
+        );
+        assert!(
+            !cc.analyze_can_collect(
+                &setter_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls()
+            ),
+            "CollectAnalyzer.analyze_simple_operation does not match \
+             jit_force_quasi_immutable"
+        );
     }
 
     #[test]

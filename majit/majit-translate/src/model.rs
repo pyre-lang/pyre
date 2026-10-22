@@ -1713,6 +1713,18 @@ pub enum OpKind {
         mutate_field: FieldDescriptor,
     },
 
+    /// `jtransform.py rewrite_op_jit_force_quasi_immutable` output: `jit_force_quasi_immutable(v_inst, descr1)`
+    /// with `descr1 = fielddescrof(STRUCT, 'mutate_' + name)`.
+    /// `v_inst` is an `AbstractValue` — a `Variable` (register operand) or a
+    /// `Constant` (prebuilt instance).  `LinkArg::Value`/`Const` mirrors that
+    /// union so a Constant ref stays inline as a pooled `r` operand
+    /// (`assembler.py` `emit_const`) instead of being hoisted into a
+    /// register; the opcode key stays `jit_force_quasi_immutable/rd`.
+    JitForceQuasiImmutable {
+        base: crate::model::LinkArg,
+        mutate_field: FieldDescriptor,
+    },
+
     /// Liveness marker — RPython `-live-` operation.
     /// Inserted by jtransform after calls that may need guard resumption.
     /// Expanded by compute_liveness() to include all values alive at

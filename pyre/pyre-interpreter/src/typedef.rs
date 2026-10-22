@@ -27875,18 +27875,40 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// `space.buffer_w(w_obj, space.BUF_SIMPLE)` does upstream, without treating a
 /// memoryview as bytes-like elsewhere.
 ///
-/// `external_buffer_view` is an Acquire load of a multi-word aggregate. This
-/// caller returns one exception-bridge word.
-#[majit_macros::dont_look_inside]
+/// Dispatch follows `ObjSpace._try_buffer_w`: the interpreter's own buffer
+/// types first, then the optional modules' through [`buffer_foreign_bytes_like`].
 pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
         return buffer_as_bytes_like(target?);
+    }
+    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
+        return Ok(Some(obj));
+    }
+    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
+        unsafe { crate::builtins::memoryview_check_released(obj) }?;
+        let data = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
+        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(&data)));
     }
     if unsafe { pyre_object::interp_array::is_array(obj) } {
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(unsafe {
             pyre_object::interp_array::w_array_bytes(obj)
         })));
     }
+    if let Some(src) = buffer_foreign_bytes_like(obj)? {
+        return Ok(Some(src));
+    }
+    Ok(None)
+}
+
+/// The `buffer_w` of objects whose type lives in an optional module (cffi
+/// `MiniBuffer`, ctypes `_CData`, `W_MMap`) — reached through hooks the
+/// module installs at import, so the call target is unknown when the
+/// interpreter is translated: `call.py guess_call_kind` makes such an
+/// `indirect_call` 'residual'. The fn-pointer hooks also return multi-word
+/// values the residual ABI cannot carry; this helper returns the one GCREF
+/// that `W_MMap.buffer_w`'s `SimpleView` stands for.
+#[majit_macros::dont_look_inside]
+fn buffer_foreign_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
     if let Some(hooks) = crate::importing::optional_module_hooks()
         && let Some((address, length)) = (hooks.mini_buffer_params)(obj)
     {
@@ -27912,14 +27934,6 @@ pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, cra
         let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
         let data = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
-    }
-    if unsafe { pyre_object::bytesobject::is_bytes_like(obj) } {
-        return Ok(Some(obj));
-    }
-    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        unsafe { crate::builtins::memoryview_check_released(obj) }?;
-        let data = unsafe { crate::builtins::memoryview_gather_bytes(obj) };
-        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(&data)));
     }
     Ok(None)
 }

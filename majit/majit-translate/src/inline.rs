@@ -860,6 +860,10 @@ pub(crate) fn remap_op_kind(
             field: field.clone(),
             mutate_field: mutate_field.clone(),
         },
+        OpKind::JitForceQuasiImmutable { base, mutate_field } => OpKind::JitForceQuasiImmutable {
+            base: base.map_value(remap_var),
+            mutate_field: mutate_field.clone(),
+        },
         OpKind::VableFieldRead {
             base,
             field_index,
@@ -1301,6 +1305,13 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
             v
         }
         OpKind::RecordQuasiImmutField { base, .. } => vec![clone_var(base)],
+        OpKind::JitForceQuasiImmutable { base, .. } => {
+            if let Some(var) = base.as_variable() {
+                vec![clone_var(var)]
+            } else {
+                Vec::new()
+            }
+        }
         OpKind::JitDebug { args, .. } => args.iter().map(&clone_var).collect(),
         OpKind::VableFieldRead { base, .. } => vec![clone_var(base)],
         OpKind::VableFieldWrite { base, value, .. } => {
@@ -1572,6 +1583,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::ConditionalCallValue { .. }
         | OpKind::RecordKnownResult { .. }
         | OpKind::RecordQuasiImmutField { .. }
+        | OpKind::JitForceQuasiImmutable { .. }
         | OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
         | OpKind::GuardValue { .. }

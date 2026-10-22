@@ -176,6 +176,7 @@ impl QuasiImmut {
 /// pointer. A minor collection memcpy's that word. The critical section
 /// allocates nothing GC-managed and crosses no safepoint, so it cannot
 /// park a mutator the collector is waiting for.
+#[repr(C)]
 pub struct QuasiImmutField {
     ptr: AtomicPtr<QuasiImmut>,
     lock: AtomicPtr<parking_lot::Mutex<()>>,
@@ -186,6 +187,8 @@ pub struct QuasiImmutField {
 /// (`heaptracker.py all_fielddescrs`).
 pub const QUASIIMMUT_FIELD_PTR_OFFSET: usize = std::mem::offset_of!(QuasiImmutField, ptr);
 pub const QUASIIMMUT_FIELD_LOCK_OFFSET: usize = std::mem::offset_of!(QuasiImmutField, lock);
+
+const _: () = assert!(std::mem::size_of::<QuasiImmutField>() == 2 * std::mem::size_of::<usize>());
 
 impl Default for QuasiImmutField {
     fn default() -> Self {
@@ -281,6 +284,14 @@ impl QuasiImmutField {
             return;
         };
         qmut.invalidate();
+    }
+
+    /// `quasiimmut.py make_invalidation_function` —
+    /// `if getattr(p, mutatefieldname): _invalidate_now(p)`.
+    pub fn invalidate_if_installed(&self) {
+        if self.is_installed() {
+            self.invalidate();
+        }
     }
 
     /// Unlink, sweep, then run `store`, all under this field's lock.

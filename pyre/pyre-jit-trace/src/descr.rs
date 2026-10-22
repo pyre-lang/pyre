@@ -2348,10 +2348,13 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// so the fold stays behind `record_quasiimmut_field` + `GUARD_NOT_INVALIDATED`
 /// exactly as `jtransform.py:895-903` sequences it.
 ///
-/// The write half these descriptors depend on is `function_notify_quasi_immut`
-/// (pyre-interpreter `function.rs`), called immediately before every store to
-/// one of the nine — RPython gets it from the rtyper rewriting writes to a `?`
-/// field, pyre spells it out.  `f.__defaults__ = ...` / `f.__code__ = ...`
+/// The write half these descriptors depend on is
+/// `Function::jit_force_quasi_immutable("mutate_<name>")`, called immediately
+/// before every store to one of the nine; it is the native shape
+/// `warmspot.py rewrite_force_quasi_immutable` leaves, and the codewriter
+/// turns it back into the `jit_force_quasi_immutable` llop
+/// (`jtransform.py rewrite_op_jit_force_quasi_immutable`) for traces.
+/// `f.__defaults__ = ...` / `f.__code__ = ...`
 /// therefore runs `QuasiImmut::invalidate()` and retires every loop that
 /// folded the field, which is the termination guarantee a value guard cannot
 /// give: a guard that can no longer pass is re-derived by the next trace
@@ -2462,18 +2465,62 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // needs the census entry that gets it NULLed behind the allocation.
             field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
             field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
-            // The `mutate_<name>` block pointer.  `Type::Ref` puts it in
-            // `gc_fielddescrs`, which is what `rewrite.py
-            // clear_gc_fields` walks, so a JIT-allocated function gets its NULL
-            // from the allocation clear — the same footing upstream's
-            // `mutate_<field>` sits on, that one being a real GC pointer.  The
-            // collector does NOT follow it: its census is the hand-maintained
-            // `FUNCTION_GC_PTR_OFFSETS`, which this word is deliberately absent
-            // from, so the `Box` behind it is never traced as a child.
-            field("mutate_slots", f::FUNCTION_MUTATE_SLOTS_OFFSET),
-            // `make_weakref_descr(Function)` `_lifeline_` follows `mutate_slots`
-            // in the struct, so it follows it here. Offset order is what the
-            // analyzer's `index_in_parent` matches.
+            // Hidden `mutate_<name>` words. `Type::Ref` puts both words of
+            // each `QuasiImmutField` in `gc_fielddescrs`, which is what
+            // `rewrite.py clear_gc_fields` walks, so a JIT-allocated function
+            // gets its NULLs from the allocation clear — the same footing
+            // upstream's `mutate_<field>` sits on. The collector does NOT
+            // follow them: its census is the hand-maintained
+            // `FUNCTION_GC_PTR_OFFSETS`, which these words are deliberately
+            // absent from.
+            field("mutate_code", f::FUNCTION_MUTATE_CODE_OFFSET),
+            field("mutate_code_lock", f::FUNCTION_MUTATE_CODE_OFFSET + WORD),
+            field(
+                "mutate_w_func_globals_obj",
+                f::FUNCTION_MUTATE_W_FUNC_GLOBALS_OBJ_OFFSET,
+            ),
+            field(
+                "mutate_w_func_globals_obj_lock",
+                f::FUNCTION_MUTATE_W_FUNC_GLOBALS_OBJ_OFFSET + WORD,
+            ),
+            field("mutate_closure", f::FUNCTION_MUTATE_CLOSURE_OFFSET),
+            field(
+                "mutate_closure_lock",
+                f::FUNCTION_MUTATE_CLOSURE_OFFSET + WORD,
+            ),
+            field("mutate_defs_w", f::FUNCTION_MUTATE_DEFS_W_OFFSET),
+            field(
+                "mutate_defs_w_lock",
+                f::FUNCTION_MUTATE_DEFS_W_OFFSET + WORD,
+            ),
+            field("mutate_name", f::FUNCTION_MUTATE_NAME_OFFSET),
+            field("mutate_name_lock", f::FUNCTION_MUTATE_NAME_OFFSET + WORD),
+            field("mutate_w_qualname", f::FUNCTION_MUTATE_W_QUALNAME_OFFSET),
+            field(
+                "mutate_w_qualname_lock",
+                f::FUNCTION_MUTATE_W_QUALNAME_OFFSET + WORD,
+            ),
+            field("mutate_w_objclass", f::FUNCTION_MUTATE_W_OBJCLASS_OFFSET),
+            field(
+                "mutate_w_objclass_lock",
+                f::FUNCTION_MUTATE_W_OBJCLASS_OFFSET + WORD,
+            ),
+            field(
+                "mutate_w_text_signature",
+                f::FUNCTION_MUTATE_W_TEXT_SIGNATURE_OFFSET,
+            ),
+            field(
+                "mutate_w_text_signature_lock",
+                f::FUNCTION_MUTATE_W_TEXT_SIGNATURE_OFFSET + WORD,
+            ),
+            field("mutate_w_kw_defs", f::FUNCTION_MUTATE_W_KW_DEFS_OFFSET),
+            field(
+                "mutate_w_kw_defs_lock",
+                f::FUNCTION_MUTATE_W_KW_DEFS_OFFSET + WORD,
+            ),
+            // `make_weakref_descr(Function)` `_lifeline_` follows the mutate
+            // fields in the struct, so it follows them here. Offset order is
+            // what the analyzer's `index_in_parent` matches.
             field("lifeline", f::FUNCTION_LIFELINE_OFFSET),
             // The inline emit can escape a guard and be materialized, so the
             // inherited Python class is a proper virtual field of this group —
@@ -2494,6 +2541,8 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         "function::Function",
     )
 });
+
+const _: () = assert!(std::mem::size_of::<pyre_object::quasiimmut::QuasiImmutField>() == 2 * WORD);
 
 /// Dict storage descriptors, read after a trace has pinned the live strategy.
 ///

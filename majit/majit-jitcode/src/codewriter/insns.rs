@@ -683,6 +683,12 @@ pub const BC_VTABLE_METHOD_PTR: u8 = 196;
 // Argcodes: `rdd` (struct ref + fielddescr + mutatefielddescr).
 pub const BC_RECORD_QUASIIMMUT_FIELD: u8 = 199;
 
+// `jit_force_quasi_immutable/rd` — RPython `blackhole.py
+// bhimpl_jit_force_quasi_immutable`.  Argcodes `rd`: struct ref +
+// mutate fielddescr.  Byte 39 is the first unused opcode number
+// (`wellknown_bh_insns` ∪ `extension_insns` fill 199-254).
+pub const BC_JIT_FORCE_QUASI_IMMUTABLE: u8 = 39;
+
 // `assert_not_none/r` — RPython `pyjitpl.py opimpl_assert_not_none`
 // + `blackhole.py bhimpl_assert_not_none`.  Records that `box` is
 // known non-null so subsequent nullity-aware sites
@@ -1198,6 +1204,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `bhimpl_record_quasiimmut_field`.  Argcodes `rdd`: struct ref +
     // field descr + mutate descr (no result).
     m.insert("record_quasiimmut_field/rdd", BC_RECORD_QUASIIMMUT_FIELD);
+    m.insert("jit_force_quasi_immutable/rd", BC_JIT_FORCE_QUASI_IMMUTABLE);
 
     // Heapcache hint markers — `pyjitpl.py:385-410`.
     // `assert_not_none/r` records that `box` is non-null;

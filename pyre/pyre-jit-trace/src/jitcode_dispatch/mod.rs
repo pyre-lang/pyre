@@ -14526,6 +14526,49 @@ fn handle<Sym: WalkSym>(
             walker_flush_guard_not_invalidated(ctx, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        // `pyjitpl.py opimpl_jit_force_quasi_immutable`:
+        //
+        // ```text
+        // mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R,
+        //                                     mutatefielddescr, box)
+        // if mutatebox.nonnull():
+        //     from rpython.jit.metainterp.quasiimmut import do_force_quasi_immutable
+        //     do_force_quasi_immutable(self.metainterp.cpu, box.getref_base(),
+        //                              mutatefielddescr)
+        //     raise SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)
+        // self.metainterp.generate_guard(rop.GUARD_ISNULL, mutatebox,
+        //                                resumepc=orgpc)
+        // ```
+        // `execute_with_descr` records and executes GETFIELD_GC_R; it does
+        // not consult or populate the heapcache (unlike
+        // `_opimpl_getfield_gc_any_pureornot`).
+        "jit_force_quasi_immutable/rd" => {
+            let obj = read_ref_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let mutatebox =
+                crate::state::execute_getfield_gc_r_uncached(ctx.trace_ctx, obj, descr.clone());
+            let installed = match ctx.trace_ctx.box_value(mutatebox) {
+                Some(majit_ir::Value::Ref(r)) => r.0 != 0,
+                _ => false,
+            };
+            if installed {
+                let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj) else {
+                    panic!(
+                        "jit_force_quasi_immutable/rd: box_value(obj) is not Some(Value::Ref(..))"
+                    );
+                };
+                let Some(fd) = descr.as_field_descr() else {
+                    panic!("jit_force_quasi_immutable/rd: descr.as_field_descr() is None");
+                };
+                let bh = majit_jitcode::jitcode::BhDescr::from_field_descr(fd);
+                majit_metainterp::quasiimmut::do_force_quasi_immutable(struct_ref.0 as i64, &bh);
+                crate::state::note_force_quasi_immut_abort();
+                prepare_force_quasi_immutable_abort(ctx, op.next_pc);
+                return Err(DispatchError::ForceQuasiImmutable { pc: op.next_pc });
+            }
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[mutatebox])?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow kind-flow territory and stay
         // unsupported.

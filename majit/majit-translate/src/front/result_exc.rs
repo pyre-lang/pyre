@@ -2137,6 +2137,13 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::VableFieldRead { base, .. }
         | OpKind::VableForce { base }
         | OpKind::RecordQuasiImmutField { base, .. } => vec![base.clone()],
+        OpKind::JitForceQuasiImmutable { base, .. } => {
+            if let Some(var) = base.as_variable() {
+                vec![var.clone()]
+            } else {
+                Vec::new()
+            }
+        }
         OpKind::Hint { value, .. } => vec![value.clone()],
         OpKind::FieldWrite { base, value, .. } => {
             // Only a `Variable` value contributes an SSA reference; a
