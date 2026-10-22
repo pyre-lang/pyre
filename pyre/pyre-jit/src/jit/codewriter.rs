@@ -1752,6 +1752,44 @@ fn make_next_block(
     newblock
 }
 
+/// `make_next_block` plus the can-raise op's result, without enqueueing.
+///
+/// `unsimplify.py split_block` threads Variables the successor still
+/// uses that `FrameState` does not list — here the residual `next()`
+/// result that feeds `ptr_nonzero` / `pushvalue`.  `framestate.py`
+/// `FrameState.copy` freshens so `model.py checkgraph` sees one
+/// definition per Variable (`"variable %r used in more than one
+/// block"`); `output_link` / `getoutputargs` map the predecessor's
+/// values onto the new inputargs.  The walker keeps emitting into the
+/// successor, so this does not push `pendingblocks`.
+fn make_residual_successor_block(
+    code: &CodeObject,
+    graph: &mut super::flow::FunctionGraph,
+    currentblock: &SpamBlockRef,
+    currentstate: &FrameState,
+    next_offset: usize,
+    residual: super::flow::Variable,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
+) -> (SpamBlockRef, FrameState, super::flow::Variable) {
+    let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+    let mut newstate = currentstate.copy(&mut fresh);
+    newstate.blocklist = frame_blocks_for_offset(code, next_offset);
+    newstate.next_offset = next_offset;
+    let residual_in_new = fresh(residual.kind);
+    let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
+    all_walker_blocks.push(newblock.clone());
+    let mut inputargs = newstate.getvariables();
+    inputargs.push(residual_in_new.into());
+    newblock.block().borrow_mut().inputargs = inputargs;
+    let mut link_args = currentstate.getoutputargs(&newstate);
+    link_args.push(residual.into());
+    append_exit(
+        &currentblock.block(),
+        super::flow::Link::new(link_args, Some(newblock.block()), None).into_ref(),
+    );
+    (newblock, newstate, residual_in_new)
+}
+
 fn mergeblock(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -7265,6 +7303,12 @@ impl CodeWriter {
         // `JumpBackward` opcodes and record their targets; each target PC
         // becomes a `loop_header` site.
         let loop_header_pcs = pyre_interpreter::find_loop_header_pcs(code);
+        // `dispatch` (`interp_jit.py`) calls `jit_merge_point` at every
+        // `next_instr`, including the PC a `FOR_ITER` exhaust jump lands
+        // on.  Blackhole `bhimpl_jit_merge_point` then
+        // `ContinueRunningNormally`s (`handle_jitexception`) so the
+        // interpreter's next `jump_absolute` still ticks `can_enter_jit`.
+        let foriter_exhaust_pcs = find_foriter_exhaust_pcs(code);
         // Pre-scanned set of every block-entry PC.  Used
         // by emit_mark_label_pc to force a block boundary (call
         // mergeblock to close current_block + create/match a fresh
@@ -9114,7 +9158,14 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    if loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator {
+                    let is_loop_header = loop_header_pcs.contains(&py_pc);
+                    // Exhaust of `FOR_ITER` is a forward jump; the next
+                    // `dispatch` merge is that target, not the outer
+                    // `while` header.  Without a portal merge here,
+                    // blackhole walks to the outer header, CRNs, and
+                    // skips `jump_absolute`.
+                    let is_foriter_exhaust = foriter_exhaust_pcs.contains(&py_pc);
+                    if (is_loop_header || is_foriter_exhaust) && !block_closed_by_terminator {
                         if is_true_portal {
                             // Diamond at loop-header start: the merge-point
                             // site cannot carry a branch, so the null test
@@ -9209,9 +9260,11 @@ impl CodeWriter {
                             ];
                             GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
                                 .serialize_op(&graph_op);
-                        } else {
+                        } else if is_loop_header {
                             // jtransform.py op3: -live- before
                             // jit_merge_point, "for inlined short preambles".
+                            // An exhaust-only target reuses the per-PC
+                            // `-live-` below.
                             emit_live_placeholder!(py_pc);
                         }
                     }
@@ -11686,22 +11739,16 @@ impl CodeWriter {
                             let next_result = next_value
                                 .as_variable()
                                 .expect("FOR_ITER residual result must be a Ref Variable");
-                            let mut next_state = current_state.clone();
-                            next_state.next_offset = py_pc;
-                            next_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                            let next_block = SpamBlockRef::new(
-                                graph.new_block(Vec::new()),
-                                Some(next_state.clone()),
-                            );
-                            all_walker_blocks.push(next_block.clone());
-                            let mut inputargs = next_state.getvariables();
-                            inputargs.push(next_result.into());
-                            next_block.block().borrow_mut().inputargs = inputargs.clone();
-                            append_exit(
-                                &current_block.block(),
-                                super::flow::Link::new(inputargs, Some(next_block.block()), None)
-                                    .into_ref(),
-                            );
+                            let (next_block, next_state, next_result_in_next) =
+                                make_residual_successor_block(
+                                    code,
+                                    &mut graph,
+                                    &current_block,
+                                    &current_state,
+                                    py_pc,
+                                    next_result,
+                                    &mut all_walker_blocks,
+                                );
                             restore_canraise_exit_order(&current_block.block());
 
                             let stop_match_state = stop_match
@@ -11824,7 +11871,7 @@ impl CodeWriter {
                             matched_source
                                 .last_exception
                                 .clone_from(&current_state.last_exception);
-                            let mut stop_match_args = matched_source.getoutputargs(&current_state);
+                            let mut stop_match_args = matched_source.getoutputargs(&next_state);
                             stop_match_args.push(null_stack_sentinel());
                             let matched_link = super::flow::Link::new(
                                 stop_match_args,
@@ -11836,6 +11883,7 @@ impl CodeWriter {
                             .into_ref();
                             append_exit(&stop_match.block(), matched_link);
                             current_block = next_block;
+                            current_state = next_state;
                             // Emit the exhaustion branch: ptr_nonzero(next)
                             // selects between the continue arm (non-null →
                             // push next, fall to PC+1) and the exhaustion arm
@@ -11849,53 +11897,49 @@ impl CodeWriter {
                                 delta.get(op_arg).as_usize(),
                             )
                             .min(num_instrs);
+                            let next_value_in_split: super::flow::FlowValue =
+                                next_result_in_next.into();
                             let truth = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
                                 "ptr_nonzero",
-                                vec![next_value.clone().into()],
+                                vec![next_value_in_split.clone().into()],
                                 Kind::Int,
                                 py_pc as i64,
                             );
                             let _scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                             current_block.block().borrow_mut().exitswitch =
                                 Some(super::flow::ExitSwitch::Value(truth.into()));
-                            // continue arm (non-null): push next, fall to PC+1.
-                            push_and_bump!(next_value, py_pc);
-                            let fallthrough_py_pc = py_pc + 1;
+                            // `FOR_ITER` (`pyopcode.py`) does
+                            // `self.pushvalue(w_nextitem)` only in the
+                            // `else` of the `StopIteration` catch — after
+                            // the `if`. The true successor holds that
+                            // push; the false (exhaust) edge leaves the
+                            // vable unchanged for the target's `POP_ITER`.
+                            let split_block = current_block.clone();
+                            let split_state = current_state.clone();
+                            let (success_block, success_state, next_result_in_success) =
+                                make_residual_successor_block(
+                                    code,
+                                    &mut graph,
+                                    &split_block,
+                                    &split_state,
+                                    py_pc,
+                                    next_result_in_next,
+                                    &mut all_walker_blocks,
+                                );
+                            set_last_bool_exitcase(&split_block.block(), true);
+                            current_block = success_block;
+                            current_state = success_state;
+                            push_and_bump!(next_result_in_success.into(), py_pc);
+                            emit_goto!(py_pc + 1);
                             mergeblock(
                                 code,
                                 &mut graph,
                                 &mut joinpoints,
-                                &current_block,
+                                &split_block,
                                 &{
-                                    let mut s = current_state.clone();
-                                    s.next_offset = fallthrough_py_pc;
-                                    s.blocklist = frame_blocks_for_offset(code, fallthrough_py_pc);
-                                    s
-                                },
-                                fallthrough_py_pc,
-                                &mut pendingblocks,
-                                &mut all_walker_blocks,
-                            );
-                            set_last_bool_exitcase(&current_block.block(), true);
-                            // exhaustion arm (null): next not pushed; the
-                            // iterator stays on the stack and the interpreter
-                            // re-runs FOR_ITER on side-exit to end the loop.
-                            mergeblock(
-                                code,
-                                &mut graph,
-                                &mut joinpoints,
-                                &current_block,
-                                &{
-                                    let mut s = current_state.clone();
-                                    // `push_and_bump!` above updated the
-                                    // continuing arm's shared walker state with
-                                    // the produced item.  The exhaustion arm did
-                                    // not produce that item, so remove only that
-                                    // speculative value; the iterator underneath
-                                    // stays for the target's POP_ITER.
-                                    s.stack.pop();
+                                    let mut s = split_state;
                                     s.next_offset = exhaust_target;
                                     s.blocklist = frame_blocks_for_offset(code, exhaust_target);
                                     s
@@ -11904,7 +11948,7 @@ impl CodeWriter {
                                 &mut pendingblocks,
                                 &mut all_walker_blocks,
                             );
-                            set_last_bool_exitcase(&current_block.block(), false);
+                            set_last_bool_exitcase(&split_block.block(), false);
                         }
 
                         Instruction::EndFor => {
@@ -16867,6 +16911,35 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
     targets
 }
 
+/// PCs `FOR_ITER` jumps to when the iterator is exhausted.
+///
+/// `interp_jit.py` `PyFrame.dispatch` calls `jit_merge_point` at every
+/// `next_instr`, including that exhaust target.  `bhimpl_jit_merge_point`
+/// (`blackhole.py`) then `ContinueRunningNormally`s, and
+/// `handle_jitexception` re-enters the portal so the next
+/// `jump_absolute` still calls `can_enter_jit`.  Per-function jitcode
+/// otherwise merges only at loop headers, and an exhaust path would
+/// CRN at the outer `while` header, skipping that back-edge.
+fn find_foriter_exhaust_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usize> {
+    let num_instrs = code.instructions.len();
+    let mut pcs: VecSet<usize> = VecSet::new();
+    let mut scan_state = OpArgState::default();
+    for scan_pc in 0..num_instrs {
+        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+        if let Instruction::ForIter { delta } = scan_instr {
+            let exhaust_target = pyre_interpreter::jump_target_forward(
+                &code.instructions,
+                scan_pc + 1,
+                delta.get(scan_arg).as_usize(),
+            );
+            if exhaust_target < num_instrs {
+                pcs.insert(exhaust_target);
+            }
+        }
+    }
+    pcs
+}
+
 // `liveness_regs_to_u8_sorted` tests removed alongside the helper.
 // The 256-register cap is now enforced inside `encode_liveness` and
 // covered by `majit_jitcode::liveness::encode_liveness*` tests.
@@ -17174,6 +17247,27 @@ mod tests {
             !ops.iter()
                 .any(|op| op.key == "goto_if_exception_mismatch/iL"),
             "FOR_ITER must not use the RPython-class typed catch opcode"
+        );
+
+        // `FOR_ITER` (`pyopcode.py`) pushes only on the success path.
+        // The `ptr_nonzero` split must therefore precede the continue
+        // arm's `setarrayitem_vable_r`; a push in the same block as the
+        // exitswitch would also run on the exhaustion edge.
+        let split_after_ptr = ops[ptr_nonzero_index + 1..]
+            .iter()
+            .position(|op| op.key.starts_with("goto_if_not"))
+            .expect("FOR_ITER ptr_nonzero must feed a bool split");
+        assert!(
+            !ops[ptr_nonzero_index + 1..ptr_nonzero_index + 1 + split_after_ptr]
+                .iter()
+                .any(|op| op.key.starts_with("setarrayitem_vable_r")),
+            "FOR_ITER pushvalue belongs on the continue successor, after the exhaustion split"
+        );
+        assert!(
+            ops[ptr_nonzero_index + 1 + split_after_ptr..]
+                .iter()
+                .any(|op| op.key.starts_with("setarrayitem_vable_r")),
+            "the continue successor must still push the next item"
         );
     }
 
@@ -19679,6 +19773,73 @@ def f(i):
             link.args,
             vec![Some(Variable::new(VariableId(0), Kind::Ref).into())]
         );
+    }
+
+    #[test]
+    fn residual_successor_freshens_inputargs_and_threads_the_result() {
+        // `framestate.py FrameState.copy` / `flowcontext.py make_next_block`:
+        // the successor's inputargs are fresh Variables; `getoutputargs`
+        // maps the predecessor's values onto them.  The residual is an
+        // extra pair (`unsimplify.py split_block`).
+        let code = first_nested_function_code("def f(a):\n    return a\n");
+        let mut graph = new_shadow_graph(&code);
+        let local = graph.fresh_variable(Kind::Ref);
+        let residual = graph.fresh_variable(Kind::Ref);
+        let current_state =
+            FrameState::new(vec![Some(local.into())], Vec::new(), None, Vec::new(), 0);
+        let current_block =
+            SpamBlockRef::new(graph.startblock.clone(), Some(current_state.clone()));
+        current_block.block().borrow_mut().inputargs = current_state.getvariables();
+        let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
+
+        let (next_block, next_state, residual_in_next) = make_residual_successor_block(
+            &code,
+            &mut graph,
+            &current_block,
+            &current_state,
+            0,
+            residual,
+            &mut all_walker_blocks,
+        );
+
+        let next_inputargs = next_block.block().borrow().inputargs.clone();
+        let source_ids: Vec<u32> = current_block
+            .block()
+            .borrow()
+            .inputargs
+            .iter()
+            .filter_map(FlowValue::as_variable)
+            .map(|v| v.id.0)
+            .collect();
+        let dest_ids: Vec<u32> = next_inputargs
+            .iter()
+            .filter_map(FlowValue::as_variable)
+            .map(|v| v.id.0)
+            .collect();
+        assert!(
+            source_ids.iter().all(|id| !dest_ids.contains(id)),
+            "checkgraph forbids a Variable defined in two blocks"
+        );
+        assert_ne!(residual_in_next.id, residual.id);
+        let residual_in_next_value: FlowValue = residual_in_next.into();
+        assert_eq!(
+            next_inputargs.last(),
+            Some(&residual_in_next_value),
+            "the residual result is the extra successor inputarg"
+        );
+        let mut expected_inputargs = next_state.getvariables();
+        expected_inputargs.push(residual_in_next.into());
+        assert_eq!(next_inputargs, expected_inputargs);
+
+        let exits = current_block.block().borrow().exits.clone();
+        assert_eq!(exits.len(), 1);
+        let link = exits[0].borrow();
+        assert_eq!(link.target, Some(next_block.block()));
+        let mut expected_args = current_state.getoutputargs(&next_state);
+        expected_args.push(residual.into());
+        let expected_link_args: Vec<_> = expected_args.into_iter().map(Some).collect();
+        assert_eq!(link.args, expected_link_args);
+        assert_eq!(all_walker_blocks.len(), 1);
     }
 
     #[test]

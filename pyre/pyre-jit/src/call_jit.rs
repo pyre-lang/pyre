@@ -1564,8 +1564,10 @@ impl BlackholeResult {
     /// its own `PyResult` — or one a nested frame absorbed before finishing —
     /// stays armed for whatever the caller does next, where a compiled
     /// `GUARD_NO_EXCEPTION` or a blackhole residual reads it as its own pending
-    /// raise.  `ContinueRunningNormally` and `BailToInterpreter` are not
-    /// hand-offs and keep the carriers, which is why this clears only where
+    /// raise.  `ContinueRunningNormally` drops those twins in
+    /// [`blackhole_resume_via_rd_numb`] (`blackhole.py` `cleanup_registers`
+    /// dies with the interpreter).  `BailToInterpreter` is not a hand-off and
+    /// keeps the carriers, which is why this clears only where
     /// [`to_pyresult`] answers `Some`.
     ///
     /// [`to_pyresult`]: Self::to_pyresult
@@ -3326,23 +3328,18 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         if let Some(majit_metainterp::blackhole::BhRunOutcome::ContinueRunningNormally(args)) =
             run_outcome
         {
-            // blackhole.py:1068: raise ContinueRunningNormally(*args)
-            //
-            // The blackhole reached a merge point with no pending exception
-            // (an unhandled raise would have propagated through the exception
-            // path above, not reached `run()`'s ContinueRunningNormally).  A
-            // residual call that raised AND was caught in-frame
-            // (`check_residual_call_exception_after` → `route_to_catch`) cleared
-            // only `BH_LAST_EXC_VALUE`; the backend `_store_exception` cells
-            // (`store_jit_exception` writes BOTH — see
-            // `publish_residual_call_exception`) keep the consumed exception.
-            // Re-entering compiled code via this ContinueRunningNormally would
-            // then have its first `GUARD_NO_EXCEPTION` read the stale cell as a
-            // spurious pending exception and deopt at a coordinate with no
-            // handler (the loop header), escaping the original try-block.  Drain
-            // the backend cells here so the re-entry starts pristine, mirroring
-            // the walker's `execute_raised` drain (`drain_backend_jit_exc`).
-            drain_backend_jit_exc();
+            // `bhimpl_jit_merge_point` raises ContinueRunningNormally on the
+            // outermost frame.  Upstream `blackhole.py cleanup_registers`
+            // drops `exception_last_value` with that interpreter, so
+            // `warmspot.py handle_jitexception` calls `portal_ptr` with a
+            // clean exception state.  Pyre's TLS `BH_LAST_EXC_VALUE` twin is
+            // written by `publish_residual_call_exception` and stays set when
+            // compiled code catches the raise (the except consumes only the
+            // backend `_store_exception` cell).  The merge is reached with no
+            // unhandled exception, so a value still in those twins is a
+            // consumed one.  Drop them here (`clear_residual_call_exception`);
+            // do not raise or deliver them.
+            clear_residual_call_exception();
             let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
 
             let mut red_ref: Vec<PyObjectRef> =
