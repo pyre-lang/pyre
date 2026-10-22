@@ -74,12 +74,16 @@ import shutil
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent.parent
 TARGET_RELEASE = ROOT / "target" / "release"
+
+sys.path.insert(0, str(HERE.parent.parent))
+import oracle_cache  # noqa: E402
 
 EXE = ".exe" if sys.platform == "win32" else ""
 
@@ -227,15 +231,14 @@ class Failure(NamedTuple):
     stderr: str
 
 
-def _run(
+def _invoke(
     cmd: list[str], script: Path, env: dict[str, str] | None
-) -> tuple[bool, str, str]:
-    """Whether the script passed, why it did not, and the child's stderr.
+) -> tuple[int, str, str, float]:
+    """Spawn *cmd* on *script*. Returns (returncode, stdout, stderr, elapsed).
 
-    The reason is kept apart from the stderr rather than formatted into it: a
-    `repr` of a whole traceback is one unreadable line, and the run wants the
-    short verdict beside the row and the traceback in the report at the end.
+    returncode 124 means the wall-clock timeout fired.
     """
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             cmd + [str(script)],
@@ -255,20 +258,82 @@ def _run(
         partial = expired.stderr or ""
         if isinstance(partial, bytes):
             partial = partial.decode("utf-8", "replace")
-        return False, f"timed out after {TIMEOUT}s", partial
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        return oracle_cache.TIMEOUT_CODE, "", partial, 0.0
+    return proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started
+
+
+def _verdict(code: int, stdout: str, stderr: str) -> tuple[bool, str, str]:
+    """Whether the script passed, why it did not, and the child's stderr.
+
+    The reason is kept apart from the stderr rather than formatted into it: a
+    `repr` of a whole traceback is one unreadable line, and the run wants the
+    short verdict beside the row and the traceback in the report at the end.
+    """
+    if code == oracle_cache.TIMEOUT_CODE:
+        return False, f"timed out after {TIMEOUT}s", stderr
+    lines = [line for line in stdout.splitlines() if line.strip()]
     last = lines[-1] if lines else ""
-    if proc.returncode == 0 and last == "OK":
+    if code == 0 and last == "OK":
         return True, "", ""
-    if proc.returncode == 0:
+    if code == 0:
         # The script ran to completion and never announced itself. Reporting
         # this as `rc=0 last=''` reads like an interpreter that produced
         # nothing, and it is reported once per runner, so three of them make a
         # sound fixture that forgot its last line look like a pyre failure.
         reason = f"exited 0 without a final 'OK' line (last non-empty line {last!r})"
     else:
-        reason = f"exited {proc.returncode} (last non-empty stdout line {last!r})"
-    return False, reason, proc.stderr
+        reason = f"exited {code} (last non-empty stdout line {last!r})"
+    return False, reason, stderr
+
+
+def _run(
+    cmd: list[str], script: Path, env: dict[str, str] | None
+) -> tuple[bool, str, str]:
+    code, stdout, stderr, _elapsed = _invoke(cmd, script, env)
+    return _verdict(code, stdout, stderr)
+
+
+def _run_cpython(
+    cmd: list[str],
+    script: Path,
+    env: dict[str, str] | None,
+    store: Path | None,
+    refresh: bool,
+) -> tuple[bool, str, str, bool]:
+    """CPython reference run, optionally served from the oracle cache."""
+    fixture = str(script)
+    key = None
+    if store is not None:
+        key = oracle_cache.entry_key(
+            kind="parity",
+            python=cmd[0],
+            argv=[fixture],
+            timeout=TIMEOUT,
+            fixture=fixture,
+            env=env,
+        )
+        if not refresh:
+            hit = oracle_cache.read_entry(store, key)
+            if hit is not None:
+                ok, reason, err = _verdict(hit["code"], hit["output"], "")
+                return ok, reason, err, True
+    code, stdout, stderr, elapsed = _invoke(cmd, script, env)
+    # Only a clean exit is stored. A parity timeout is a FAIL verdict, and one
+    # caused by a loaded machine must not stick to the script until it changes.
+    if store is not None and code == 0:
+        try:
+            oracle_cache.write_entry(
+                store,
+                key,
+                code=code,
+                output=stdout,
+                elapsed=elapsed,
+                fixture=oracle_cache.fixture_label(script),
+            )
+        except OSError as exc:
+            print(f"warning: oracle cache write failed: {exc}", file=sys.stderr)
+    ok, reason, err = _verdict(code, stdout, stderr)
+    return ok, reason, err, False
 
 
 PROBE = "import sys; print(sys.version_info[0], sys.version_info[1]); print(sys.executable)"
@@ -450,6 +515,11 @@ def main() -> int:
     parser.add_argument("--dynasm-only", action="store_true")
     parser.add_argument("--cranelift-only", action="store_true")
     parser.add_argument("--gc-poison", action="store_true")
+    parser.add_argument(
+        "--no-oracle-cache",
+        action="store_true",
+        help="do not read cached CPython reference results (still write them)",
+    )
     args = parser.parse_args()
 
     # A piped stdout is block-buffered, so without line buffering the rows
@@ -468,7 +538,9 @@ def main() -> int:
         print("no parity test scripts found", file=sys.stderr)
         return 1
 
+    store, cache_line = oracle_cache.resolve_store()
     print(f"runners: {[runner.name for runner in runners]}")
+    print(cache_line)
     if pypy is None:
         print(f"pypy cross-check: off — {pypy_off}")
     else:
@@ -486,8 +558,16 @@ def main() -> int:
         reasons: list[str] = []
         for runner in runners:
             merged = {**(runner.env or {}), **pinned}
-            ok, reason, err = _run(runner.cmd, script, merged or None)
-            row.append(f"{runner.name}={'OK' if ok else 'FAIL'}")
+            env = merged or None
+            if runner.name == "cpython":
+                ok, reason, err, cached = _run_cpython(
+                    runner.cmd, script, env, store, args.no_oracle_cache,
+                )
+            else:
+                ok, reason, err = _run(runner.cmd, script, env)
+                cached = False
+            tag = " (cached)" if cached else ""
+            row.append(f"{runner.name}={'OK' if ok else 'FAIL'}{tag}")
             if not ok:
                 failures.append(Failure(name, runner.name, reason, err))
                 reasons.append(f"      {runner.name}: {reason}")
@@ -541,6 +621,7 @@ def main() -> int:
             print(line)
 
     print()
+    oracle_cache.maybe_prune(store)
     if not failures:
         print("all parity tests pass")
         return 0

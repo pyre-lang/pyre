@@ -20,6 +20,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import oracle_cache
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -4076,6 +4078,8 @@ class Check:
         # Synthetic fixtures whose cpython reference run exceeded its budget,
         # so pypy alone was the baseline for them.
         self.cpython_reference_skips = []
+        self.oracle_store, self.oracle_cache_line = oracle_cache.resolve_store()
+        self.oracle_refresh = bool(getattr(args, "no_oracle_cache", False))
         self.cpython_declared_skips = []
         # Per-backend bookkeeping, keyed by backend name so any backend
         # (dynasm / cranelift / wasm / a single `--pyre-path` binary) is tracked
@@ -6029,9 +6033,39 @@ class Check:
             print(dim(t_cpython))
             self.cpython_declared_skips.append(name)
         else:
-            cpython_output, cpython_time, cpython_code, _ = run_timed(
-                [python3(), path], timeout_s=SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S,
-            )
+            # Output oracle and display-only time: `_run_backend_bench` is
+            # passed `vs_cpython=None`, so no gate reads `t_cpython`. The
+            # non-synthetic `run_bench` path does feed a gate and is not cached.
+            timeout_s = SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S
+
+            def _run_cpython_reference():
+                output, elapsed, code, _err = run_timed(
+                    [python3(), path], timeout_s=timeout_s,
+                )
+                return output, elapsed, code
+
+            if self.oracle_store is None:
+                cpython_output, cpython_time, cpython_code = _run_cpython_reference()
+                cpython_cached = False
+            else:
+                key = oracle_cache.entry_key(
+                    kind="synth",
+                    python=python3(),
+                    argv=[path],
+                    timeout=timeout_s,
+                    fixture=path,
+                    env=None,
+                )
+                cpython_output, cpython_time, cpython_code, cpython_cached = (
+                    oracle_cache.lookup_or_run(
+                        self.oracle_store,
+                        key,
+                        self.oracle_refresh,
+                        _run_cpython_reference,
+                        oracle_cache.fixture_label(path),
+                    )
+                )
+            cached_tag = " (cached)" if cpython_cached else ""
             if cpython_code == 124:
                 # Not a crash: the fixture is sized for the JITs and cpython is
                 # only the reference. Drop it and let pypy be the baseline the
@@ -6039,7 +6073,7 @@ class Check:
                 # whole timeout on an interpreter nothing is gated on.
                 cpython_output = None
                 t_cpython = f"skip (>{SYNTHETIC_CPYTHON_REFERENCE_TIMEOUT_S:g}s)"
-                print(dim(t_cpython))
+                print(dim(t_cpython + cached_tag))
                 self.cpython_reference_skips.append(name)
             elif cpython_code != 0:
                 print(f"{red('CRASH')} (exit {cpython_code})")
@@ -6050,7 +6084,7 @@ class Check:
                 return
             else:
                 t_cpython = cpython_time
-                print(f"{dim('done')}  {t_cpython:.2f}s")
+                print(f"{dim('done')}  {t_cpython:.2f}s{cached_tag}")
 
         sys.stdout.write(f"    {'pypy':<10s}")
         sys.stdout.flush()
@@ -6234,6 +6268,7 @@ class Check:
                 parts.append(f"{label}={self._pyre(b)}(x{self._timeout_scale(b)})")
         if parts:
             print(f"backend: {' '.join(parts)}")
+        print(self.oracle_cache_line)
 
     def print_comparison_table(self):
         if not self.comparisons:
@@ -6495,12 +6530,24 @@ def parse_args():
         help="read every synthetic fixture's `# pyre-check:` header, report the "
              "unusable ones and exit; builds and runs nothing",
     )
+    parser.add_argument(
+        "--no-oracle-cache",
+        action="store_true",
+        help="do not read cached CPython reference results (still write them)",
+    )
+    parser.add_argument(
+        "--prune-oracle-cache",
+        action="store_true",
+        help="prune stale CPython oracle-cache entries and exit",
+    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
     # Answered here, ahead of the backend resolution below: the check is over
     # the fixture files, and nothing about it needs a backend to exist.
     if args.check_headers:
         sys.exit(check_synthetic_headers(args.synthetic_pattern))
+    if args.prune_oracle_cache:
+        sys.exit(oracle_cache.prune_cli())
     try:
         args.backends = parse_backend_specs(args.backend)
     except argparse.ArgumentTypeError as e:
@@ -6748,6 +6795,7 @@ def main():
         chk.run_cpython_suite()
 
     rc = chk.print_summary()
+    oracle_cache.maybe_prune(chk.oracle_store)
     sys.exit(rc)
 
 

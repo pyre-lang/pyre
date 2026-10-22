@@ -289,6 +289,10 @@ comment at the site citing both sides.
   minutes. While it runs, continue useful independent work when any is
   available; otherwise wait for the five-minute boundary. Do not spend tokens
   on repetitive status-only updates.
+- CPython reference results for `pyre/check.py` synthetic fixtures and
+  `parity_tests/run.py` are cached at `<shared>/oracle-cache` (override with
+  `PYRE_ORACLE_CACHE`; `PYRE_ORACLE_CACHE=off` disables). `--no-oracle-cache`
+  refreshes entries without reading them.
 
 ## Iterate on the core; gate on the product
 
