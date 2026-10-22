@@ -2288,10 +2288,11 @@ mod tests {
         let _ = recorder.record_input_arg(Type::Int);
         let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, 0, sd);
 
-        let frame = MIFrame::setup(jitcode, 7, Some((0xfeed, None)), Some(&mut ctx));
+        let greenkey = crate::test_greens::portal_gk(0xfeed);
+        let frame = MIFrame::setup(jitcode, 7, Some(greenkey.clone()), Some(&mut ctx));
 
         assert_eq!(frame.pc, 7);
-        assert_eq!(frame.greenkey, Some((0xfeed, None)));
+        assert_eq!(frame.greenkey, Some(greenkey));
         assert_eq!(frame._result_argcode, b'v');
         assert_eq!(frame.parent_snapshot, -1);
         assert_eq!(frame.unroll_iterations, 1);

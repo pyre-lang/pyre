@@ -27,8 +27,8 @@ use majit_backend::{
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
-    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, HandleFailClass,
-    InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, RdVirtualInfo, Type, Value,
+    AccumInfo, Const, DescrRef, FailDescr, GcRef, GreenKey, GuardPendingFieldEntry,
+    HandleFailClass, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, RdVirtualInfo, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;
@@ -5794,19 +5794,20 @@ impl TraceCtx {
     /// (`pyjitpl.py` `_compile_and_run_once` `current_merge_points = [(original_boxes, start)]`);
     /// later header visits append the same jitdriver red+vable shape.
     /// `TraceCtx::new` does not seed; bridges stay empty.
-    pub fn has_merge_point_with_shape_assert(&self, key: u64, live_args_len: usize) -> bool {
-        self.has_merge_point_same_greenkey(key, None, live_args_len)
+    pub fn has_merge_point_with_shape_assert(&self, key: &GreenKey, live_args_len: usize) -> bool {
+        self.has_merge_point_same_greenkey(key.get_uhash(), Some(key), live_args_len)
     }
 
     /// pyjitpl.py `same_greenkey(original_boxes, live_arg_boxes, num_green_args)`.
     ///
     /// Typed greens compare with `GreenKey::eq` (`comparekey` /
-    /// `equal_whatever`). Hash equality is only the fallback when a
-    /// fixture never carried a typed key.
+    /// `equal_whatever`). Hash equality is only the fallback when the live
+    /// side has no typed key (`MetaInterp::cross_loop_cut_info` names the
+    /// cut by `cut_inner_green_key`, a cell key).
     pub fn has_merge_point_same_greenkey(
         &self,
         key: u64,
-        live_typed: Option<&majit_ir::GreenKey>,
+        live_typed: Option<&GreenKey>,
         live_args_len: usize,
     ) -> bool {
         // pyjitpl.py reverse scan:
@@ -5824,9 +5825,9 @@ impl TraceCtx {
                 live_args_len,
                 "same_greenkey: merge points in one trace share the jitdriver shape"
             );
-            let greens_match = match (mp.green_key_typed.as_ref(), live_typed) {
-                (Some(stored), Some(live)) => stored == live,
-                _ => mp.green_key == key,
+            let greens_match = match live_typed {
+                Some(live) => mp.green_key_typed == *live,
+                None => mp.green_key == key,
             };
             if greens_match {
                 return true;
@@ -5841,28 +5842,12 @@ impl TraceCtx {
     /// RPython allows multiple merge points with the same green key
     /// (representing different loop iterations or inlining depths).
     /// Always appends; has_merge_point checks if any match exists.
-    /// Hash-only form of [`Self::add_merge_point_with_key`], for a producer
-    /// that has not yet been migrated to pass the green key it hashed.
     ///
-    /// The entry it appends carries no typed key, so the trace-segmenting
-    /// consumers fall back to their hash-form warmstate calls — see
-    /// [`crate::trace_ctx::MergePoint::green_key_typed`] for what that costs.
-    pub fn add_merge_point(
-        &mut self,
-        key: u64,
-        green_boxes: Vec<crate::trace_ctx::GreenBox>,
-        header_pc: usize,
-    ) {
-        self.add_merge_point_with_key(key, None, green_boxes, header_pc);
-    }
-
     /// `key_typed` is the green key `key` is the `JitCell.get_uhash` of
     /// (warmstate.py `def get_uhash(*greenargs)`). It travels with the
     /// hash because the trace-segmenting consumers of this entry
-    /// (`mark_force_finish_tracing`, `disable_noninlinable_function`) reach a
-    /// cell to write flags on, and a cell reached by hash alone is installed
-    /// without a `comparekey` — invisible to every later typed lookup, so the
-    /// header can end up owning a second cell in the same bucket.
+    /// (`mark_force_finish_tracing`, `disable_noninlinable_function`) write
+    /// flags on a cell through `ensure_jit_cell_at_key(greenkey)`.
     ///
     /// `key` and `key_typed.get_uhash()` are NOT required to be equal. `key` is
     /// a cell key, which is the bucket hash only while that hash is unclaimed;
@@ -5873,7 +5858,7 @@ impl TraceCtx {
     pub fn add_merge_point_with_key(
         &mut self,
         key: u64,
-        key_typed: Option<majit_ir::GreenKey>,
+        key_typed: GreenKey,
         green_boxes: Vec<crate::trace_ctx::GreenBox>,
         header_pc: usize,
     ) {
@@ -5912,7 +5897,9 @@ impl TraceCtx {
     pub fn seed_compile_and_run_once_merge_point(&mut self) {
         let green_boxes = crate::trace_ctx::GreenBox::from_recorder_inputargs(&self.recorder);
         let key = self.green_key;
-        let key_typed = self.green_key_values().cloned();
+        let key_typed = self.green_key_values().cloned().expect(
+            "a primary trace starts with its greens: pyjitpl.py _compile_and_run_once original_boxes",
+        );
         let header_pc = self.header_pc;
         self.add_merge_point_with_key(key, key_typed, green_boxes, header_pc);
     }
@@ -5928,11 +5915,9 @@ impl TraceCtx {
     /// through two accessors: the callers that only move a counter
     /// (`trace_next_iteration`) need the hash, the callers that install flags
     /// on a cell (`mark_force_finish_tracing`, `disable_noninlinable_function`)
-    /// need the typed key, and reading one without the other is what puts a
-    /// comparekey-less cell in the chain.
-    pub fn current_merge_points_first_green_key_pair(
-        &self,
-    ) -> Option<(u64, Option<majit_ir::GreenKey>)> {
+    /// need the typed key so the flag lands on the cell `JitCell(*greenargs)`
+    /// installed.
+    pub fn current_merge_points_first_green_key_pair(&self) -> Option<(u64, GreenKey)> {
         self.current_merge_points
             .first()
             .map(|mp| (mp.green_key, mp.green_key_typed.clone()))
@@ -5956,18 +5941,20 @@ impl TraceCtx {
     /// [`MergePoint`] stays the guest pc of that visit, for the cut.
     ///
     /// Typed greens use `GreenKey::eq` (`comparekey`). Hash equality is the
-    /// fallback when either side never carried a typed key.
+    /// fallback when the live side has no typed key
+    /// (`MetaInterp::cross_loop_cut_info`).
     pub fn find_merge_point_same_greenkey(
         &self,
         key: u64,
-        live_typed: Option<&majit_ir::GreenKey>,
+        live_typed: Option<&GreenKey>,
     ) -> Option<&MergePoint> {
-        self.current_merge_points.iter().rev().find(|mp| {
-            match (mp.green_key_typed.as_ref(), live_typed) {
-                (Some(stored), Some(live)) => stored == live,
-                _ => mp.green_key == key,
-            }
-        })
+        self.current_merge_points
+            .iter()
+            .rev()
+            .find(|mp| match live_typed {
+                Some(live) => mp.green_key_typed == *live,
+                None => mp.green_key == key,
+            })
     }
 
     /// See [`TraceCtx::merge_point_resumed`] — pyjitpl.py:1570/1577
@@ -5994,11 +5981,13 @@ impl TraceCtx {
         self.merge_point_resumed = true;
     }
 
-    /// Hash-only [`Self::find_merge_point_same_greenkey`]. `header_pc` is not
-    /// part of `same_greenkey`; callers that still pass the trace-start pc
-    /// must not have that pc reject a point recorded under the loop's own pc.
-    pub fn has_merge_point_at(&self, key: u64, _header_pc: usize) -> bool {
-        self.find_merge_point_same_greenkey(key, None).is_some()
+    /// [`Self::find_merge_point_same_greenkey`] for a live typed key.
+    /// `header_pc` is not part of `same_greenkey`; callers that still pass
+    /// the trace-start pc must not have that pc reject a point recorded
+    /// under the loop's own pc.
+    pub fn has_merge_point_at(&self, key: &GreenKey, _header_pc: usize) -> bool {
+        self.find_merge_point_same_greenkey(key.get_uhash(), Some(key))
+            .is_some()
     }
 
     /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),

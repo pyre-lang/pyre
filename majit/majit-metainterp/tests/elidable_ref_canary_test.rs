@@ -36,9 +36,7 @@
 //! byte; checks 2-3 assert the cannot-raise fold — these are two
 //! separate facts about the same REF helper family.
 
-use majit_ir::{
-    EffectInfo, ExtraEffect, GcRef, GreenType, OopSpecIndex, OpCode, OpRef, Type, Value,
-};
+use majit_ir::{EffectInfo, ExtraEffect, GcRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 use majit_macros::elidable;
 use majit_metainterp::{BackEdgeAction, MetaInterp};
 
@@ -50,6 +48,10 @@ use majit_metainterp::{BackEdgeAction, MetaInterp};
 #[elidable]
 fn elidable_ref_canary(x: i64) -> *mut u8 {
     (x as usize) as *mut u8
+}
+
+fn gk(raw: i64) -> majit_ir::GreenKey {
+    majit_ir::GreenKey::new(vec![raw])
 }
 
 #[test]
@@ -87,10 +89,11 @@ fn elidable_ref_canary_traces_to_call_pure_r_when_args_not_all_const() {
     // Live Ref inputarg: seed the trace with a Ref start value so slot 0
     // is a Ref bank input (force_start_tracing's record_input_arg).
     let live_p: usize = 0xBEEF_0000;
+    let key = gk(0);
     let action = meta.force_start_tracing(
-        0,
+        key.get_uhash(),
         (0, 0),
-        Some((&[0], &[GreenType::Int])),
+        Some((&key.values, &key.types)),
         None,
         &[Value::Ref(GcRef(live_p))],
     );
@@ -159,7 +162,14 @@ fn elidable_ref_canary_all_const_args_fold_to_const_ptr_not_const_int() {
 
     let mut meta = MetaInterp::<()>::new(0);
     meta.finish_setup_descrs_for_jitdrivers();
-    let action = meta.force_start_tracing(0, (0, 0), Some((&[0], &[GreenType::Int])), None, &[]);
+    let key = gk(0);
+    let action = meta.force_start_tracing(
+        key.get_uhash(),
+        (0, 0),
+        Some((&key.values, &key.types)),
+        None,
+        &[],
+    );
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let effect = EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None);

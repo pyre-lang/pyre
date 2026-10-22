@@ -8,7 +8,6 @@
 //! nothing; AbortPermanent / Unsupported abort this frame. Loop close
 //! follows the arm chain.
 
-use majit_ir::GreenType;
 use majit_metainterp::jitcode::insns::{
     BC_ABORT, BC_GETARRAYITEM_GC_I_PURE, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
     BC_INT_RETURN, BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C, BC_LIVE, BC_STORE_STATE_FIELD,
@@ -95,6 +94,10 @@ fn count_op_in_dispatch_tree(jc: &JitCode, op: u8) -> usize {
     dispatch_tree(jc)
         .map(|code| code.code.iter().filter(|&&b| b == op).count())
         .sum()
+}
+
+fn gk(raw: i64) -> majit_ir::GreenKey {
+    majit_ir::GreenKey::new(vec![raw])
 }
 
 #[test]
@@ -679,9 +682,10 @@ fn a_trace_entry_takes_the_state_field_store_back_from_a_second_driver() {
     let program = [OP_INC_A, OP_END];
     let mut state = DispatchTestState { a: 0 };
     first.meta_interp_mut().finish_setup_descrs_for_jitdrivers();
+    let key = gk(0);
     first.force_start_tracing(
-        0,
-        Some((&[0], &[GreenType::Int])),
+        key.get_uhash(),
+        Some((&key.values, &key.types)),
         0,
         &mut state,
         &program[..],

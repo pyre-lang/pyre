@@ -43,7 +43,7 @@
 
 use std::sync::Arc;
 
-use majit_ir::{GreenType, OpRef, Type, Value};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::jitcode::JitCodeBuilder;
 use majit_metainterp::virtualizable::VirtualizableInfo;
 use majit_metainterp::{
@@ -170,10 +170,11 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     let mut meta = majit_metainterp::MetaInterp::<()>::new(200);
     meta.staticdata = Arc::new(staticdata);
     meta.finish_setup_descrs_for_jitdrivers();
+    let key = gk(0);
     meta.force_start_tracing(
-        0,
+        key.get_uhash(),
         (0, 0),
-        Some((&[0], &[GreenType::Int])),
+        Some((&key.values, &key.types)),
         None,
         &[Value::Ref(majit_ir::GcRef(2))],
     );
@@ -297,6 +298,10 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
 /// (`BC_GETARRAYITEM_VABLE_I`) with the `promoted_index` message below;
 /// restored, it passes. Anyone re-narrowing the decision has to reproduce that
 /// by the same route.
+fn gk(raw: i64) -> majit_ir::GreenKey {
+    majit_ir::GreenKey::new(vec![raw])
+}
+
 #[test]
 fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
     for arm in [Arm::Get, Arm::Set] {

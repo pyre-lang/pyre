@@ -13,7 +13,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use majit_ir::{GreenType, OpRef};
+use majit_ir::OpRef;
 use majit_metainterp::{
     Assembler, JitArgKind, JitCode, JitCodeBuilder, JitDriver, TraceAction, trace_jitcode_with_args,
 };
@@ -130,6 +130,10 @@ fn install_interleaved() -> JitCode {
     let _ = asm.ensure_canonical_liveness_offset();
     __dispatch_jitcode_dispatch_interleaved(&mut asm, 0i64)
         .expect("interleaved dispatch lower must succeed")
+}
+
+fn gk(raw: i64) -> majit_ir::GreenKey {
+    majit_ir::GreenKey::new(vec![raw])
 }
 
 #[test]
@@ -398,6 +402,7 @@ fn a_header_revisit_after_continue_rereads_kind() {
     let mut driver: JitDriver<KindResumeState> = JitDriver::new(1);
     let mut state = KindResumeState { acc: 0, cnt: 1 };
     let program = program();
+    let key = gk(0);
     {
         use majit_metainterp::JitState as _;
         state
@@ -405,8 +410,8 @@ fn a_header_revisit_after_continue_rereads_kind() {
             .install_canonical_liveness(&mut driver);
     }
     driver.force_start_tracing(
-        0,
-        Some((&[0], &[GreenType::Int])),
+        key.get_uhash(),
+        Some((&key.values, &key.types)),
         0,
         &mut state,
         &program[..],
@@ -472,6 +477,7 @@ fn a_header_revisit_close_matches_label_arity() {
     let mut driver: JitDriver<KindResumeState> = JitDriver::new(1);
     let mut state = KindResumeState { acc: 7, cnt: 3 };
     let program = program();
+    let key = gk(0);
     {
         use majit_metainterp::JitState as _;
         state
@@ -479,8 +485,8 @@ fn a_header_revisit_close_matches_label_arity() {
             .install_canonical_liveness(&mut driver);
     }
     driver.force_start_tracing(
-        0,
-        Some((&[0], &[GreenType::Int])),
+        key.get_uhash(),
+        Some((&key.values, &key.types)),
         0,
         &mut state,
         &program[..],

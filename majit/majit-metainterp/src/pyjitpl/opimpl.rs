@@ -4598,12 +4598,18 @@ where
                     // later read by consumers that install cell flags,
                     // and a hash alone reaches a cell only by bucket.
                     let (close_key, close_key_typed) = match ctx.close_green_key() {
-                        Some(k) => (k.get_uhash(), Some(k)),
-                        None => (ctx.green_key, ctx.green_key_values().cloned()),
+                        Some(k) => (k.get_uhash(), k),
+                        None => (
+                            ctx.green_key,
+                            ctx.green_key_values().cloned().expect(
+                                "bridge first-visit merge point keeps its greens: \
+                                 pyjitpl.py reached_loop_header live_arg_boxes",
+                            ),
+                        ),
                     };
                     if !already_compiled_here
                         && ctx
-                            .find_merge_point_same_greenkey(close_key, close_key_typed.as_ref())
+                            .find_merge_point_same_greenkey(close_key, Some(&close_key_typed))
                             .is_none()
                     {
                         let original_boxes = live_arg_boxes.to_vec();
@@ -4895,7 +4901,7 @@ where
                     }
                     ctx.add_merge_point_with_key(
                         inner_key,
-                        Some(inner_key_typed),
+                        inner_key_typed,
                         original_boxes,
                         Self::guest_pc_position(pc),
                     );

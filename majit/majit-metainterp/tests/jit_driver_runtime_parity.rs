@@ -1399,8 +1399,15 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
         DeclarativeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
     let green_key = GreenKey::new(vec![11, 22]);
-    let key = green_key.hash_u64();
     let mut driver = JitDriver::<TestState>::with_descriptor(2, descriptor.clone());
+    // Hash-form `back_edge_keyed` names an installed cell (`warmstate.py`
+    // `bound_reached` `JitCell(*greenargs)`). Install the typed cell first;
+    // the door itself still passes no structured greens.
+    driver
+        .meta_interp_mut()
+        .warm_state_for_driver(0)
+        .ensure_cell_for_key(&green_key);
+    let key = green_key.hash_u64();
     let mut state = TestState { frame: 3, stack: 4 };
 
     assert!(

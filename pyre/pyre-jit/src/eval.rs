@@ -8295,27 +8295,23 @@ fn drive_generatorentry_trace(
     }
 
     let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
-    // Same two greens as `genentry_green_key(pycode)`.
-    let values = [
-        pycode as i64,
-        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
-    ];
-    let types = [majit_ir::GreenType::Ref, majit_ir::GreenType::Int];
+    let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
     let action = {
         let (driver, _) = driver_pair();
         let meta = driver.meta_interp_mut();
         let mut descriptor =
             pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
         descriptor.index = jitcode.jitdriver_sd();
-        // The cell is created from the jd2 greens (`bound_reached`
-        // `JitCell(*greenargs)`), so the CALL_ASSEMBLER `genentry_green_key`
-        // lookup finds the same cell.
+        // The jd2 greens `(pycode, driver index)` go in as `greenargs`
+        // (`warmstate.py bound_reached` `JitCell(*greenargs)`); `(0, 0)`
+        // keeps the raw-pair rebinding to jd0's `(next_instr,
+        // is_being_profiled, pycode)` cell out.
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(meta);
         meta.force_start_tracing(
             green_key,
             (0, 0),
-            Some((&values, &types)),
+            Some((&gk.values, &gk.types)),
             Some(descriptor),
             &live_values,
         )
@@ -8905,14 +8901,11 @@ fn drive_unpack_iterable_trace(
     descriptor.index = jitcode.jitdriver_sd();
 
     // The `(code_ptr, pc)` pair `green_key` was hashed from, not `(0, 0)`: a
-    // zero `code_ptr` is the sentinel for "no raw pair available", and a
-    // force-start that trips it mints its cell through the bare-hash door,
-    // which stores no `comparekey`. A cell without one answers no typed lookup
-    // (`JitCell.comparekey` is what selects a cell within its bucket,
-    // warmstate.py `def comparekey(self, *greenargs2)`), so the same
-    // green key can go on to own a second cell in the same bucket, with its own
-    // token and flags. `green_key` is `make_green_key` at `(greenkey_raw, 0)` (above),
-    // so the pair reconstructs the identical hash.
+    // zero `code_ptr` is the sentinel for "no raw pair available". Passing
+    // `(0, 0)` would skip `with_typed_decision_key`'s rebinding; this pair
+    // reconstructs the pypyjit greens so the cell is `JitCell(*greenargs)`
+    // (`warmstate.py bound_reached`). `green_key` is `make_green_key` at
+    // `(greenkey_raw, 0)` (above), so the pair reconstructs the identical hash.
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(meta);
     let action = meta.force_start_tracing(
@@ -16608,7 +16601,7 @@ mod tests {
     }
 
     /// `interp_jit.PyPyJitDriver.greens` carries the PyCode object, not the
-    /// host CodeObject hidden behind pyre's wrapper.  The hash-only marker
+    /// host CodeObject hidden behind pyre's wrapper.  The hash-form marker
     /// path and typed `JitCell.comparekey` path must therefore agree with
     /// function-entry dispatch even when the wrapper's internal pointer is
     /// absent (the supported test-stub representation).

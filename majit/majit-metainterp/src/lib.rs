@@ -169,6 +169,9 @@ pub mod walkvirtual;
 pub mod warmspot;
 pub mod warmstate;
 
+#[cfg(test)]
+pub(crate) mod test_greens;
+
 pub use call_descr::{
     CANNOT_RAISE_NO_HEAP_EFFECT_INFO, ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
     ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO, ELIDABLE_EFFECT_INFO,
@@ -2045,11 +2048,9 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // names stay so later `mc_diag_bump(N)` indices do not shift.
     "guard_resume_decline_reserved_identity",
     "inline_frame_trim_blanked_live_int",
-    // A `confirm_enter_jit` hook was installed, but a hash-only compatibility
-    // door had no structured greens to pass it. The door declines rather than
-    // invoking the callback with a hash disguised as its argument; a nonzero
-    // value identifies compatibility callers that still need typed-key
-    // threading.
+    // A `confirm_enter_jit` hook was installed, but the caller had no greens
+    // to pass it. The door declines rather than inventing a tuple; a nonzero
+    // value identifies callers that still need the cell's stored greens.
     "confirm_enter_jit_missing_key",
     // A bridge close resolved a head target token that carries a virtual
     // state. `unroll.py jump_to_preamble` asserts the head has none before

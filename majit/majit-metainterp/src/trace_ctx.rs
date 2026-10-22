@@ -244,9 +244,9 @@ pub struct MergePoint {
     /// bare-hash entry point, `trace_next_iteration_hash`
     /// (warmstate.py), only moves a counter.
     ///
-    /// `None` only where a fixture builds a merge point from a bare number;
-    /// every production producer has the key it hashed.
-    pub green_key_typed: Option<majit_ir::GreenKey>,
+    /// The green boxes this merge point was registered with
+    /// (`pyjitpl.py` `current_merge_points.append((live_arg_boxes, start))`).
+    pub green_key_typed: majit_ir::GreenKey,
     /// Trace position when this loop header was first visited.
     pub position: crate::recorder::TracePosition,
     /// pyjitpl.py:2989: `original_boxes` — live variable boxes (OpRef +
@@ -8822,6 +8822,7 @@ mod tests {
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
         assert!(ctx.current_merge_points.is_empty());
+        ctx.set_green_key_values(crate::test_greens::gk(0));
         ctx.seed_compile_and_run_once_merge_point();
         let boxes = &ctx.current_merge_points[0].green_boxes;
         assert_eq!(boxes.len(), 2);
@@ -9766,7 +9767,7 @@ mod tests {
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
     }
 
-    /// `add_merge_point` must stamp the header snapshot with the virtualizable
+    /// `add_merge_point_with_key` must stamp the header snapshot with the virtualizable
     /// IDENTITY, not the synchronization target.
     ///
     /// A root portal seed points `virtualizable_heap_ptr` at the
@@ -9795,7 +9796,13 @@ mod tests {
         // Before the seed there is no snapshot to describe, so a header
         // registered here records nothing and the compile step keeps its
         // trace-start resolution.
-        ctx.add_merge_point(1, vec![GreenBox::new(box0, Type::Int)], 7);
+        let key1 = crate::test_greens::gk(1);
+        ctx.add_merge_point_with_key(
+            key1.get_uhash(),
+            key1,
+            vec![GreenBox::new(box0, Type::Int)],
+            7,
+        );
         assert_eq!(ctx.current_merge_points.last().unwrap().vable_ptr, 0);
 
         ctx.init_virtualizable_boxes(
@@ -9806,7 +9813,13 @@ mod tests {
             &[ph(Type::Int)],
             &[],
         );
-        ctx.add_merge_point(2, vec![GreenBox::new(box0, Type::Int)], 9);
+        let key2 = crate::test_greens::gk(2);
+        ctx.add_merge_point_with_key(
+            key2.get_uhash(),
+            key2,
+            vec![GreenBox::new(box0, Type::Int)],
+            9,
+        );
 
         assert_eq!(ctx.standard_virtualizable_ptr(), Some(LIVE_FRAME));
         assert_eq!(
