@@ -13840,6 +13840,41 @@ fn fused_goto_if_not_ptr<Sym: WalkSym>(
     goto_if_not_branch_on(code, op, ctx, condbox, switchcase, target)
 }
 
+/// `pyjitpl.py opimpl_record_exact_value_i/r` / `_record_exact_value`.
+///
+/// Record `RecordExactValueI/R` with `[box, const_box]` when `const_box` is
+/// a constant and `box` is not. Both constant and `same_constant`: no-op.
+/// Both constant and different: `SwitchToBlackhole(ABORT_BAD_LOOP)`.
+/// Non-constant second argument: ignored.
+fn trace_record_exact_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opnum: OpCode,
+    box_: OpRef,
+    const_box: OpRef,
+) -> DispatchOutcome {
+    use majit_metainterp::heapcache::SameConstantOracle;
+
+    let mut invalid = false;
+    if const_box.is_constant() {
+        if !box_.is_constant() {
+            ctx.trace_ctx
+                .execute_and_record(None, opnum, None, &[box_, const_box], None, 0);
+            return DispatchOutcome::Continue;
+        } else if majit_metainterp::history::ConstOprefOracle.same_constant(box_, const_box) {
+            return DispatchOutcome::Continue;
+        }
+        invalid = true;
+    }
+    if invalid {
+        DispatchOutcome::SwitchToBlackhole {
+            reason: majit_metainterp::counters::ABORT_BAD_LOOP,
+            raising_exception: false,
+        }
+    } else {
+        DispatchOutcome::Continue
+    }
+}
+
 /// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
 /// branching handlers (`goto/L`) override the linear `op.next_pc`
 /// advance; non-branching handlers return `op.next_pc` unchanged.
@@ -15082,6 +15117,20 @@ fn handle<Sym: WalkSym>(
             let cls = read_int_reg(code, op, 1, ctx)?;
             ctx.trace_ctx.trace_record_exact_class(opref, cls);
             Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // `pyjitpl.py opimpl_record_exact_value_i/r` / `_record_exact_value`.
+        // Operand layout `ii` / `rr`: two 1-byte regs (box, const_box).
+        "record_exact_value_i/ii" => {
+            let box_ = read_int_reg(code, op, 0, ctx)?;
+            let const_box = read_int_reg(code, op, 1, ctx)?;
+            let outcome = trace_record_exact_value(ctx, OpCode::RecordExactValueI, box_, const_box);
+            Ok((outcome, op.next_pc))
+        }
+        "record_exact_value_r/rr" => {
+            let box_ = read_ref_reg(code, op, 0, ctx)?;
+            let const_box = read_ref_reg(code, op, 1, ctx)?;
+            let outcome = trace_record_exact_value(ctx, OpCode::RecordExactValueR, box_, const_box);
+            Ok((outcome, op.next_pc))
         }
         // `pyjitpl.py` `_opimpl_isconstant` / `_opimpl_isvirtual`: write
         // `ConstInt(...)` and record no IR.  Operand layout `[src][dst]`.

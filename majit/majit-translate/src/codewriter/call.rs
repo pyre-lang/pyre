@@ -7331,10 +7331,12 @@ impl CallControl {
     /// [`Self::opname_graphs`] and allocates its `Arc<JitCode>` shell via
     /// [`Self::get_jitcode`] — which appends `path` to `unfinished_graphs`
     /// so the drain loop picks it up exactly like a rich-`OpKind` graph.
-    /// The drain routes it through `jtransform_opname::lower_graph` instead
-    /// of `Transformer::transform` because the helper has no rich-`OpKind`
-    /// twin in [`Self::function_graphs`].  Returns the shell so a caller can
-    /// hold a stable handle before the body is assembled.
+    /// The drain routes it through `jtransform_opname::lower_graph` then
+    /// `Transformer::transform` so leftover `Call` from `direct_call` is
+    /// classified (`jtransform.py rewrite_op_direct_call`). The helper has
+    /// no rich-`OpKind` twin in [`Self::function_graphs`] at registration.
+    /// Returns the shell so a caller can hold a stable handle before the
+    /// body is assembled.
     pub fn register_opname_helper_graph(
         &mut self,
         path: CallPath,

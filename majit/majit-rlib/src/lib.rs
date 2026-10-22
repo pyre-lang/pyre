@@ -45,6 +45,7 @@ pub mod rposix_stat;
 pub mod rsignal;
 #[cfg(any(unix, windows))]
 pub mod rsocket;
+pub mod rstring;
 #[cfg(unix)]
 pub mod rtermios;
 pub mod rthread;

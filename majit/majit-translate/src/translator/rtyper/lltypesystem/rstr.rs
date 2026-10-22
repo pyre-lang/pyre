@@ -52,8 +52,8 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, Array, ForwardReference, GcKind, LowLevelType, LowLevelValue, MallocFlavor,
-    Ptr, PtrTarget, Struct, malloc,
+    _ptr, _ptr_obj, Array, ForwardReference, FuncType, GcKind, LowLevelType, LowLevelValue,
+    MallocFlavor, Ptr, PtrTarget, Struct, functionptr, malloc,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -696,6 +696,7 @@ pub(crate) fn build_ll_utf8iter_helper_graph(
 }
 
 /// Synthesise `ll_utf8next` — inlined `Utf8StringIterator.next` (`rutf8.py`):
+/// `@always_inline` (`objectmodel.always_inline` sets `_always_inline_ = True`).
 /// `_pos == _end` raises StopIteration; else 1–4 byte decode with thresholds
 /// 0x7F / 0xDF / 0xEF and the same arithmetic as
 /// `pyre_object::rutf8::codepoint_at_pos` + `next_codepoint_pos`.
@@ -1241,10 +1242,13 @@ pub(crate) fn build_ll_utf8next_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `Utf8StringIterator.next` is decorated `@always_inline`
+    // (`rutf8.py` / `objectmodel.always_inline`).
+    func._always_inline_ = crate::flowspace::model::AlwaysInline::True;
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -1258,16 +1262,34 @@ pub(crate) fn build_ll_utf8next_helper_graph(
 ///
 /// ```python
 /// def unichr_as_utf8(code, allow_surrogates=False):
-///     if code <= 0x7F: return chr(code)
-///     if code <= 0x07FF: return chr(0xc0|(code>>6)) + chr(0x80|(code&0x3f))
-///     if code <= 0xFFFF: return 3-byte  # surrogates included when True
-///     if code <= 0x10FFFF: return 4-byte
+///     """Encode code (numeric value) as utf8 encoded string
+///     """
+///     assert code >= 0
+///     code = r_uint(code)
+///     if code <= r_uint(0x7F):
+///         # Encode ASCII
+///         return chr(code)
+///     if code <= r_uint(0x07FF):
+///         return chr((0xc0 | (code >> 6))) + chr((0x80 | (code & 0x3f)))
+///     if code <= r_uint(0xFFFF):
+///         if not allow_surrogates and 0xD800 <= code <= 0xDfff:
+///             raise OutOfRange(code)
+///         return (chr((0xe0 | (code >> 12))) +
+///                 chr((0x80 | ((code >> 6) & 0x3f))) +
+///                 chr((0x80 | (code & 0x3f))))
+///     if code <= r_uint(0x10FFFF):
+///         return (chr((0xf0 | (code >> 18))) +
+///                 chr((0x80 | ((code >> 12) & 0x3f))) +
+///                 chr((0x80 | ((code >> 6) & 0x3f))) +
+///                 chr((0x80 | (code & 0x3f))))
 ///     raise OutOfRange(code)
 /// ```
 ///
-/// The graph takes a Signed code point and returns `Ptr(STR)`. Surrogates
-/// take the 3-byte branch (no D800–DFFF check). `code > 0x10FFFF` raises
-/// ValueError (`unichr_as_utf8_append`).
+/// `allow_surrogates=True` omits the D800–DFFF check. `assert code >= 0`
+/// is `int_ge` + `debug_assert` (`removeassert.kill_assertion_link`; same
+/// form as `ll_newlist_hint` in `rlist.build_ll_newlist_helper_graph_inner`).
+/// `code = r_uint(code)` is `cast_int_to_uint`; every range test is `uint_le`
+/// (`rint.rtype_compare_template` with `unsigned_repr` prefix `uint_`).
 pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
 
@@ -1275,6 +1297,8 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
     let str_struct_lltype = struct_lltype_from_strptr(&STRPTR)?;
     let gc_flavor = gc_flavor_const()?;
     let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let unsigned_const =
+        |n: i64| constant_with_lltype(ConstValue::UInt(n as u64), LowLevelType::Unsigned);
     let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
     let chars_field_const =
         || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
@@ -1297,44 +1321,55 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
             Link::new(false_args, Some(false_tgt), Some(bool_const(false))).into_ref(),
         ]);
     };
+    // After `code = r_uint(code)`, shifts/masks/ors are `uint_*`
+    // (`rint.rtype_template` with prefix `uint_`). `chr` is
+    // `IntegerRepr.rtype_chr`: `hop.inputargs(Signed)` then
+    // `cast_int_to_char`, so Unsigned values go through `cast_uint_to_int`.
     let utf8_byte =
         |block: &BlockRef, src: &Variable, shift: i64, mask: i64, prefix: i64, tag: &str| {
             let mut cur = src.clone();
             if shift != 0 {
-                let shifted = variable_with_lltype(tag, LowLevelType::Signed);
+                let shifted = variable_with_lltype(tag, LowLevelType::Unsigned);
                 push(
                     block,
-                    "int_rshift",
+                    "uint_rshift",
                     vec![Hlvalue::Variable(cur), signed_const(shift)],
                     shifted.clone(),
                 );
                 cur = shifted;
             }
             if mask != !0 {
-                let masked = variable_with_lltype(tag, LowLevelType::Signed);
+                let masked = variable_with_lltype(tag, LowLevelType::Unsigned);
                 push(
                     block,
-                    "int_and",
-                    vec![Hlvalue::Variable(cur), signed_const(mask)],
+                    "uint_and",
+                    vec![Hlvalue::Variable(cur), unsigned_const(mask)],
                     masked.clone(),
                 );
                 cur = masked;
             }
             if prefix != 0 {
-                let orred = variable_with_lltype(tag, LowLevelType::Signed);
+                let orred = variable_with_lltype(tag, LowLevelType::Unsigned);
                 push(
                     block,
-                    "int_or",
-                    vec![signed_const(prefix), Hlvalue::Variable(cur)],
+                    "uint_or",
+                    vec![unsigned_const(prefix), Hlvalue::Variable(cur)],
                     orred.clone(),
                 );
                 cur = orred;
             }
+            let as_int = variable_with_lltype(tag, LowLevelType::Signed);
+            push(
+                block,
+                "cast_uint_to_int",
+                vec![Hlvalue::Variable(cur)],
+                as_int.clone(),
+            );
             let ch = variable_with_lltype(tag, LowLevelType::Char);
             push(
                 block,
                 "cast_int_to_char",
-                vec![Hlvalue::Variable(cur)],
+                vec![Hlvalue::Variable(as_int)],
                 ch.clone(),
             );
             ch
@@ -1361,59 +1396,82 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
         startblock.clone(),
         Hlvalue::Variable(return_var),
     );
+    // `unichr_as_utf8` raises `OutOfRange(code)` (`rutf8.OutOfRange`).
+    // Synthesized helpers only have `exception_args` (`rtyper.rs`), which
+    // looks up `HOST_ENV.lookup_exception_class` — builtin classes; that
+    // method has no rlib class registry. `ExceptionData.get_standard_ll_exc_instance_by_class`
+    // rejects anything outside `standardexceptions`. Minting `OutOfRange`
+    // would need `Bookkeeper::getuniqueclassdef` on an interned class plus
+    // instance `setfield` of `code`; neither exists for synthesized helpers.
+    // The raise edge is kept; the class is ValueError until that lands.
     let exc_args = exception_args("ValueError")?;
 
-    let too_large = variable_with_lltype("too_large", LowLevelType::Bool);
+    // `assert code >= 0` (`unichr_as_utf8`). Python `assert` becomes
+    // `debug_assert` in `removeassert.kill_assertion_link`; same `int_ge`
+    // + `debug_assert` pairing as `ll_newlist_hint`
+    // (`rlist.build_ll_newlist_helper_graph_inner`).
+    let ge0 = variable_with_lltype("ge0", LowLevelType::Bool);
     push(
         &startblock,
-        "int_gt",
-        vec![Hlvalue::Variable(code.clone()), signed_const(0x10FFFF)],
-        too_large.clone(),
+        "int_ge",
+        vec![Hlvalue::Variable(code.clone()), signed_const(0)],
+        ge0.clone(),
     );
-
-    let ascii_code = variable_with_lltype("code", LowLevelType::Signed);
-    let ascii = Block::shared(vec![Hlvalue::Variable(ascii_code.clone())]);
-    switch_bool(
+    let assert_void = variable_with_lltype("v", LowLevelType::Void);
+    push(
         &startblock,
-        too_large,
-        exc_args,
-        graph.exceptblock.clone(),
+        "debug_assert",
+        vec![
+            Hlvalue::Variable(ge0),
+            constant_with_lltype(
+                ConstValue::byte_str(format!("assertion failed in {name}")),
+                LowLevelType::Void,
+            ),
+        ],
+        assert_void,
+    );
+    // `code = r_uint(code)` (`unichr_as_utf8`); `rint.convert_from_to`
+    // Signed→Unsigned is `cast_int_to_uint`.
+    let code_u = variable_with_lltype("code", LowLevelType::Unsigned);
+    push(
+        &startblock,
+        "cast_int_to_uint",
         vec![Hlvalue::Variable(code)],
-        ascii.clone(),
+        code_u.clone(),
     );
 
     let is_ascii = variable_with_lltype("is_ascii", LowLevelType::Bool);
     push(
-        &ascii,
-        "int_le",
-        vec![Hlvalue::Variable(ascii_code.clone()), signed_const(0x7F)],
+        &startblock,
+        "uint_le",
+        vec![Hlvalue::Variable(code_u.clone()), unsigned_const(0x7F)],
         is_ascii.clone(),
     );
 
-    let alloc1_code = variable_with_lltype("code", LowLevelType::Signed);
+    let alloc1_code = variable_with_lltype("code", LowLevelType::Unsigned);
     let alloc1 = Block::shared(vec![Hlvalue::Variable(alloc1_code.clone())]);
-    let two_code = variable_with_lltype("code", LowLevelType::Signed);
+    let two_code = variable_with_lltype("code", LowLevelType::Unsigned);
     let two = Block::shared(vec![Hlvalue::Variable(two_code.clone())]);
     switch_bool(
-        &ascii,
+        &startblock,
         is_ascii,
-        vec![Hlvalue::Variable(ascii_code.clone())],
+        vec![Hlvalue::Variable(code_u.clone())],
         alloc1.clone(),
-        vec![Hlvalue::Variable(ascii_code)],
+        vec![Hlvalue::Variable(code_u)],
         two.clone(),
     );
 
     let is_two = variable_with_lltype("is_two", LowLevelType::Bool);
     push(
         &two,
-        "int_le",
-        vec![Hlvalue::Variable(two_code.clone()), signed_const(0x07FF)],
+        "uint_le",
+        vec![Hlvalue::Variable(two_code.clone()), unsigned_const(0x07FF)],
         is_two.clone(),
     );
 
-    let alloc2_code = variable_with_lltype("code", LowLevelType::Signed);
+    let alloc2_code = variable_with_lltype("code", LowLevelType::Unsigned);
     let alloc2 = Block::shared(vec![Hlvalue::Variable(alloc2_code.clone())]);
-    let three_code = variable_with_lltype("code", LowLevelType::Signed);
+    let three_code = variable_with_lltype("code", LowLevelType::Unsigned);
     let three = Block::shared(vec![Hlvalue::Variable(three_code.clone())]);
     switch_bool(
         &two,
@@ -1427,22 +1485,46 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
     let is_three = variable_with_lltype("is_three", LowLevelType::Bool);
     push(
         &three,
-        "int_le",
-        vec![Hlvalue::Variable(three_code.clone()), signed_const(0xFFFF)],
+        "uint_le",
+        vec![
+            Hlvalue::Variable(three_code.clone()),
+            unsigned_const(0xFFFF),
+        ],
         is_three.clone(),
     );
 
-    let alloc3_code = variable_with_lltype("code", LowLevelType::Signed);
+    let alloc3_code = variable_with_lltype("code", LowLevelType::Unsigned);
     let alloc3 = Block::shared(vec![Hlvalue::Variable(alloc3_code.clone())]);
-    let alloc4_code = variable_with_lltype("code", LowLevelType::Signed);
-    let alloc4 = Block::shared(vec![Hlvalue::Variable(alloc4_code.clone())]);
+    let four_code = variable_with_lltype("code", LowLevelType::Unsigned);
+    let four = Block::shared(vec![Hlvalue::Variable(four_code.clone())]);
     switch_bool(
         &three,
         is_three,
         vec![Hlvalue::Variable(three_code.clone())],
         alloc3.clone(),
         vec![Hlvalue::Variable(three_code)],
+        four.clone(),
+    );
+
+    let is_four = variable_with_lltype("is_four", LowLevelType::Bool);
+    push(
+        &four,
+        "uint_le",
+        vec![
+            Hlvalue::Variable(four_code.clone()),
+            unsigned_const(0x10FFFF),
+        ],
+        is_four.clone(),
+    );
+    let alloc4_code = variable_with_lltype("code", LowLevelType::Unsigned);
+    let alloc4 = Block::shared(vec![Hlvalue::Variable(alloc4_code.clone())]);
+    switch_bool(
+        &four,
+        is_four,
+        vec![Hlvalue::Variable(four_code.clone())],
         alloc4.clone(),
+        exc_args,
+        graph.exceptblock.clone(),
     );
 
     let malloc_str = |block: &BlockRef, n: i64| -> (Variable, Variable) {
@@ -7917,7 +7999,13 @@ pub(crate) fn build_ll_find_char_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
-    build_ll_findlike_char_helper_graph(name, ptr_lltype, FindLikeFlavor::Forward)
+    let mut py = build_ll_findlike_char_helper_graph(name, ptr_lltype, FindLikeFlavor::Forward)?;
+    // `rlib/jit.py elidable` sets `func._elidable_function_ = True`.
+    py.func._elidable_function_ = true;
+    if let Some(func) = py.graph.borrow_mut().func.as_mut() {
+        func._elidable_function_ = true;
+    }
+    Ok(py)
 }
 
 /// Synthesise the helper graph for `LLHelpers.ll_rfind_char`
@@ -8263,6 +8351,68 @@ fn build_ll_findlike_char_helper_graph(
     ))
 }
 
+fn named_helper_funcptr_constant(
+    name: &str,
+    args: Vec<LowLevelType>,
+    result: LowLevelType,
+) -> Hlvalue {
+    let ft = FuncType { args, result };
+    let funcptr = functionptr(ft.clone(), name, None, Some(name.to_string()));
+    constant_with_lltype(
+        ConstValue::LLPtr(Box::new(funcptr)),
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        })),
+    )
+}
+
+fn require_str_ptr(ptr_lltype: &LowLevelType, helper: &str) -> Result<(), TyperError> {
+    let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(ptr_lltype)?;
+    let LowLevelType::Ptr(chars_ptr) = &chars_array_ptr_lltype else {
+        return Err(TyperError::message(format!(
+            "{helper} expects Ptr(Array(Char)), got {chars_array_ptr_lltype:?}"
+        )));
+    };
+    let PtrTarget::Array(arr) = &chars_ptr.TO else {
+        return Err(TyperError::message(format!(
+            "{helper} Ptr.TO must be Array, got {:?}",
+            chars_ptr.TO
+        )));
+    };
+    if arr.OF != LowLevelType::Char {
+        return Err(TyperError::message(format!(
+            "{helper}: Ptr(UNICODE) requires rstring._search_normal, which is unported as a graph"
+        )));
+    }
+    Ok(())
+}
+
+fn emit_record_exact_value_and_return(
+    block: &crate::flowspace::model::BlockRef,
+    res: Variable,
+    end: Variable,
+    returnblock: crate::flowspace::model::BlockRef,
+) {
+    let lt = variable_with_lltype("lt", LowLevelType::Bool);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(res.clone()), Hlvalue::Variable(end)],
+        Hlvalue::Variable(lt.clone()),
+    ));
+    let void_res = variable_with_lltype("v", LowLevelType::Void);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "jit_record_exact_value",
+        vec![
+            Hlvalue::Variable(lt),
+            constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool),
+        ],
+        Hlvalue::Variable(void_res),
+    ));
+    block.closeblock(vec![
+        Link::new(vec![Hlvalue::Variable(res)], Some(returnblock), None).into_ref(),
+    ]);
+}
+
 /// Synthesise the helper graph for `LLHelpers.ll_find`
 /// (`rtyper/lltypesystem/rstr.py`):
 ///
@@ -8270,6 +8420,7 @@ fn build_ll_findlike_char_helper_graph(
 /// @staticmethod
 /// @signature(types.any(), types.any(), types.int(), types.int(), returns=types.int())
 /// def ll_find(s1, s2, start, end):
+///     from rpython.rlib.rstring import SEARCH_FIND
 ///     if start < 0:
 ///         start = 0
 ///     n = len(s1.chars)
@@ -8278,46 +8429,25 @@ fn build_ll_findlike_char_helper_graph(
 ///     if end - start < 0:
 ///         return -1
 ///     m = len(s2.chars)
-///     ...
+///     if m <= 1:
+///         if m == 0:
+///             return start
+///         res = LLHelpers.ll_find_char(s1, s2.chars[0], start, end)
+///         jit.record_exact_value(res < end, True)
+///         return res
+///     res = LLHelpers.ll_search(s1, s2, start, end, SEARCH_FIND)
+///     jit.record_exact_value(res < end, True)
+///     return res
 /// ```
 ///
-/// The m==0 / m==1 special cases (`ll_find_char` / empty needle at
-/// `start`) and the m>1 `ll_search` path are the same predicate as a
-/// nested scan: empty needle returns `start`; a match of all `m`
-/// chars at index `i` returns `i`; otherwise `-1`. The nested loop is
-/// the body `rtype_contains` calls (`gendirectcall(ll_find, ...)`).
-/// Later blocks thread the `STR` pointers and re-derive `s.chars` in
-/// the scan body so Spine B can fuse `getsubstruct`+`getarrayitem`
-/// (`jtransform_opname` block-local chars alias).
-///
-/// Polymorphic Ptr(STR)/Ptr(UNICODE); element op chosen from the
-/// chars Array element type, same as [`build_ll_startswith_helper_graph`].
+/// STR only. UNICODE would take `_search`'s `_search_normal` arm, which
+/// is unported as a graph.
 pub(crate) fn build_ll_find_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
+    require_str_ptr(&ptr_lltype, "ll_find")?;
     let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(&ptr_lltype)?;
-    let LowLevelType::Ptr(chars_ptr) = &chars_array_ptr_lltype else {
-        return Err(TyperError::message(format!(
-            "ll_find helper expects Ptr(Array(Char|UniChar)), got {chars_array_ptr_lltype:?}"
-        )));
-    };
-    let PtrTarget::Array(arr) = &chars_ptr.TO else {
-        return Err(TyperError::message(format!(
-            "ll_find helper Ptr.TO must be Array, got {:?}",
-            chars_ptr.TO
-        )));
-    };
-    let elem_lltype = arr.OF.clone();
-    let char_eq_op = match elem_lltype {
-        LowLevelType::Char => "char_eq",
-        LowLevelType::UniChar => "unichar_eq",
-        ref other => {
-            return Err(TyperError::message(format!(
-                "ll_find helper unsupported chars element type {other:?}"
-            )));
-        }
-    };
 
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
     let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
@@ -8342,101 +8472,74 @@ pub(crate) fn build_ll_find_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    let s1_for_end = variable_with_lltype("s1", ptr_lltype.clone());
-    let s2_for_end = variable_with_lltype("s2", ptr_lltype.clone());
-    let m_for_end = variable_with_lltype("m", LowLevelType::Signed);
-    let start_for_end = variable_with_lltype("start", LowLevelType::Signed);
-    let end_for_end = variable_with_lltype("end", LowLevelType::Signed);
-    let n_for_end = variable_with_lltype("n", LowLevelType::Signed);
-    let block_clamp_end = Block::shared(vec![
-        Hlvalue::Variable(s1_for_end.clone()),
-        Hlvalue::Variable(s2_for_end.clone()),
-        Hlvalue::Variable(m_for_end.clone()),
-        Hlvalue::Variable(start_for_end.clone()),
-        Hlvalue::Variable(end_for_end.clone()),
-        Hlvalue::Variable(n_for_end.clone()),
+    let s1_for_n = variable_with_lltype("s1", ptr_lltype.clone());
+    let s2_for_n = variable_with_lltype("s2", ptr_lltype.clone());
+    let start_for_n = variable_with_lltype("start", LowLevelType::Signed);
+    let end_for_n = variable_with_lltype("end", LowLevelType::Signed);
+    let block_n = Block::shared(vec![
+        Hlvalue::Variable(s1_for_n.clone()),
+        Hlvalue::Variable(s2_for_n.clone()),
+        Hlvalue::Variable(start_for_n.clone()),
+        Hlvalue::Variable(end_for_n.clone()),
     ]);
 
     let s1_for_range = variable_with_lltype("s1", ptr_lltype.clone());
     let s2_for_range = variable_with_lltype("s2", ptr_lltype.clone());
-    let m_for_range = variable_with_lltype("m", LowLevelType::Signed);
     let start_for_range = variable_with_lltype("start", LowLevelType::Signed);
     let end_for_range = variable_with_lltype("end", LowLevelType::Signed);
-    let block_check_range = Block::shared(vec![
+    let block_range = Block::shared(vec![
         Hlvalue::Variable(s1_for_range.clone()),
         Hlvalue::Variable(s2_for_range.clone()),
-        Hlvalue::Variable(m_for_range.clone()),
         Hlvalue::Variable(start_for_range.clone()),
         Hlvalue::Variable(end_for_range.clone()),
     ]);
 
-    let s1_for_outer = variable_with_lltype("s1", ptr_lltype.clone());
-    let s2_for_outer = variable_with_lltype("s2", ptr_lltype.clone());
-    let m_for_outer = variable_with_lltype("m", LowLevelType::Signed);
-    let i_for_outer = variable_with_lltype("i", LowLevelType::Signed);
-    let end_for_outer = variable_with_lltype("end", LowLevelType::Signed);
-    let block_outer_cond = Block::shared(vec![
-        Hlvalue::Variable(s1_for_outer.clone()),
-        Hlvalue::Variable(s2_for_outer.clone()),
-        Hlvalue::Variable(m_for_outer.clone()),
-        Hlvalue::Variable(i_for_outer.clone()),
-        Hlvalue::Variable(end_for_outer.clone()),
+    let s1_for_m = variable_with_lltype("s1", ptr_lltype.clone());
+    let s2_for_m = variable_with_lltype("s2", ptr_lltype.clone());
+    let start_for_m = variable_with_lltype("start", LowLevelType::Signed);
+    let end_for_m = variable_with_lltype("end", LowLevelType::Signed);
+    let block_m = Block::shared(vec![
+        Hlvalue::Variable(s1_for_m.clone()),
+        Hlvalue::Variable(s2_for_m.clone()),
+        Hlvalue::Variable(start_for_m.clone()),
+        Hlvalue::Variable(end_for_m.clone()),
     ]);
 
-    let s1_for_inner = variable_with_lltype("s1", ptr_lltype.clone());
-    let s2_for_inner = variable_with_lltype("s2", ptr_lltype.clone());
-    let m_for_inner = variable_with_lltype("m", LowLevelType::Signed);
-    let i_for_inner = variable_with_lltype("i", LowLevelType::Signed);
-    let j_for_inner = variable_with_lltype("j", LowLevelType::Signed);
-    let end_for_inner = variable_with_lltype("end", LowLevelType::Signed);
-    let block_inner_cond = Block::shared(vec![
-        Hlvalue::Variable(s1_for_inner.clone()),
-        Hlvalue::Variable(s2_for_inner.clone()),
-        Hlvalue::Variable(m_for_inner.clone()),
-        Hlvalue::Variable(i_for_inner.clone()),
-        Hlvalue::Variable(j_for_inner.clone()),
-        Hlvalue::Variable(end_for_inner.clone()),
+    let s1_for_le1 = variable_with_lltype("s1", ptr_lltype.clone());
+    let s2_for_le1 = variable_with_lltype("s2", ptr_lltype.clone());
+    let start_for_le1 = variable_with_lltype("start", LowLevelType::Signed);
+    let end_for_le1 = variable_with_lltype("end", LowLevelType::Signed);
+    let m_for_le1 = variable_with_lltype("m", LowLevelType::Signed);
+    let block_m_le_1 = Block::shared(vec![
+        Hlvalue::Variable(s1_for_le1.clone()),
+        Hlvalue::Variable(s2_for_le1.clone()),
+        Hlvalue::Variable(start_for_le1.clone()),
+        Hlvalue::Variable(end_for_le1.clone()),
+        Hlvalue::Variable(m_for_le1.clone()),
     ]);
 
-    let s1_for_body = variable_with_lltype("s1", ptr_lltype.clone());
-    let s2_for_body = variable_with_lltype("s2", ptr_lltype.clone());
-    let m_for_body = variable_with_lltype("m", LowLevelType::Signed);
-    let i_for_body = variable_with_lltype("i", LowLevelType::Signed);
-    let j_for_body = variable_with_lltype("j", LowLevelType::Signed);
-    let end_for_body = variable_with_lltype("end", LowLevelType::Signed);
-    let block_inner_body = Block::shared(vec![
-        Hlvalue::Variable(s1_for_body.clone()),
-        Hlvalue::Variable(s2_for_body.clone()),
-        Hlvalue::Variable(m_for_body.clone()),
-        Hlvalue::Variable(i_for_body.clone()),
-        Hlvalue::Variable(j_for_body.clone()),
-        Hlvalue::Variable(end_for_body.clone()),
+    let s1_for_char = variable_with_lltype("s1", ptr_lltype.clone());
+    let s2_for_char = variable_with_lltype("s2", ptr_lltype.clone());
+    let start_for_char = variable_with_lltype("start", LowLevelType::Signed);
+    let end_for_char = variable_with_lltype("end", LowLevelType::Signed);
+    let block_find_char = Block::shared(vec![
+        Hlvalue::Variable(s1_for_char.clone()),
+        Hlvalue::Variable(s2_for_char.clone()),
+        Hlvalue::Variable(start_for_char.clone()),
+        Hlvalue::Variable(end_for_char.clone()),
     ]);
 
-    let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getsubstruct",
-        vec![Hlvalue::Variable(s1.clone()), chars_field_const()],
-        Hlvalue::Variable(chars1.clone()),
-    ));
-    let n = variable_with_lltype("n", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getarraysize",
-        vec![Hlvalue::Variable(chars1)],
-        Hlvalue::Variable(n.clone()),
-    ));
-    let chars2 = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getsubstruct",
-        vec![Hlvalue::Variable(s2.clone()), chars_field_const()],
-        Hlvalue::Variable(chars2.clone()),
-    ));
-    let m = variable_with_lltype("m", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "getarraysize",
-        vec![Hlvalue::Variable(chars2.clone())],
-        Hlvalue::Variable(m.clone()),
-    ));
+    let s1_for_search = variable_with_lltype("s1", ptr_lltype.clone());
+    let s2_for_search = variable_with_lltype("s2", ptr_lltype.clone());
+    let start_for_search = variable_with_lltype("start", LowLevelType::Signed);
+    let end_for_search = variable_with_lltype("end", LowLevelType::Signed);
+    let block_search = Block::shared(vec![
+        Hlvalue::Variable(s1_for_search.clone()),
+        Hlvalue::Variable(s2_for_search.clone()),
+        Hlvalue::Variable(start_for_search.clone()),
+        Hlvalue::Variable(end_for_search.clone()),
+    ]);
+
     let start_neg = variable_with_lltype("start_neg", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
@@ -8449,12 +8552,10 @@ pub(crate) fn build_ll_find_helper_graph(
             vec![
                 Hlvalue::Variable(s1.clone()),
                 Hlvalue::Variable(s2.clone()),
-                Hlvalue::Variable(m.clone()),
                 signed_const(0),
                 Hlvalue::Variable(end_arg.clone()),
-                Hlvalue::Variable(n.clone()),
             ],
-            Some(block_clamp_end.clone()),
+            Some(block_n.clone()),
             Some(bool_true()),
         )
         .into_ref(),
@@ -8462,59 +8563,64 @@ pub(crate) fn build_ll_find_helper_graph(
             vec![
                 Hlvalue::Variable(s1),
                 Hlvalue::Variable(s2),
-                Hlvalue::Variable(m),
                 Hlvalue::Variable(start_arg),
                 Hlvalue::Variable(end_arg),
-                Hlvalue::Variable(n),
             ],
-            Some(block_clamp_end.clone()),
+            Some(block_n.clone()),
             Some(bool_false()),
         )
         .into_ref(),
     ]);
 
+    let chars1 = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
+    block_n.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![Hlvalue::Variable(s1_for_n.clone()), chars_field_const()],
+        Hlvalue::Variable(chars1.clone()),
+    ));
+    let n = variable_with_lltype("n", LowLevelType::Signed);
+    block_n.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(chars1)],
+        Hlvalue::Variable(n.clone()),
+    ));
     let end_too_big = variable_with_lltype("end_too_big", LowLevelType::Bool);
-    block_clamp_end
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_gt",
-            vec![
-                Hlvalue::Variable(end_for_end.clone()),
-                Hlvalue::Variable(n_for_end.clone()),
-            ],
-            Hlvalue::Variable(end_too_big.clone()),
-        ));
-    block_clamp_end.borrow_mut().exitswitch = Some(Hlvalue::Variable(end_too_big));
-    block_clamp_end.closeblock(vec![
+    block_n.borrow_mut().operations.push(SpaceOperation::new(
+        "int_gt",
+        vec![
+            Hlvalue::Variable(end_for_n.clone()),
+            Hlvalue::Variable(n.clone()),
+        ],
+        Hlvalue::Variable(end_too_big.clone()),
+    ));
+    block_n.borrow_mut().exitswitch = Some(Hlvalue::Variable(end_too_big));
+    block_n.closeblock(vec![
         Link::new(
             vec![
-                Hlvalue::Variable(s1_for_end.clone()),
-                Hlvalue::Variable(s2_for_end.clone()),
-                Hlvalue::Variable(m_for_end.clone()),
-                Hlvalue::Variable(start_for_end.clone()),
-                Hlvalue::Variable(n_for_end),
+                Hlvalue::Variable(s1_for_n.clone()),
+                Hlvalue::Variable(s2_for_n.clone()),
+                Hlvalue::Variable(start_for_n.clone()),
+                Hlvalue::Variable(n),
             ],
-            Some(block_check_range.clone()),
+            Some(block_range.clone()),
             Some(bool_true()),
         )
         .into_ref(),
         Link::new(
             vec![
-                Hlvalue::Variable(s1_for_end),
-                Hlvalue::Variable(s2_for_end),
-                Hlvalue::Variable(m_for_end),
-                Hlvalue::Variable(start_for_end),
-                Hlvalue::Variable(end_for_end),
+                Hlvalue::Variable(s1_for_n),
+                Hlvalue::Variable(s2_for_n),
+                Hlvalue::Variable(start_for_n),
+                Hlvalue::Variable(end_for_n),
             ],
-            Some(block_check_range.clone()),
+            Some(block_range.clone()),
             Some(bool_false()),
         )
         .into_ref(),
     ]);
 
     let span = variable_with_lltype("span", LowLevelType::Signed);
-    block_check_range
+    block_range
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
@@ -8526,7 +8632,7 @@ pub(crate) fn build_ll_find_helper_graph(
             Hlvalue::Variable(span.clone()),
         ));
     let span_neg = variable_with_lltype("span_neg", LowLevelType::Bool);
-    block_check_range
+    block_range
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
@@ -8534,8 +8640,8 @@ pub(crate) fn build_ll_find_helper_graph(
             vec![Hlvalue::Variable(span), signed_const(0)],
             Hlvalue::Variable(span_neg.clone()),
         ));
-    block_check_range.borrow_mut().exitswitch = Some(Hlvalue::Variable(span_neg));
-    block_check_range.closeblock(vec![
+    block_range.borrow_mut().exitswitch = Some(Hlvalue::Variable(span_neg));
+    block_range.closeblock(vec![
         Link::new(
             vec![signed_const(-1)],
             Some(graph.returnblock.clone()),
@@ -8546,201 +8652,253 @@ pub(crate) fn build_ll_find_helper_graph(
             vec![
                 Hlvalue::Variable(s1_for_range),
                 Hlvalue::Variable(s2_for_range),
-                Hlvalue::Variable(m_for_range),
                 Hlvalue::Variable(start_for_range),
                 Hlvalue::Variable(end_for_range),
             ],
-            Some(block_outer_cond.clone()),
+            Some(block_m.clone()),
             Some(bool_false()),
         )
         .into_ref(),
     ]);
 
-    let i_plus_m = variable_with_lltype("i_plus_m", LowLevelType::Signed);
-    block_outer_cond
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![
-                Hlvalue::Variable(i_for_outer.clone()),
-                Hlvalue::Variable(m_for_outer.clone()),
-            ],
-            Hlvalue::Variable(i_plus_m.clone()),
-        ));
-    let still_fits = variable_with_lltype("still_fits", LowLevelType::Bool);
-    block_outer_cond
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_le",
-            vec![
-                Hlvalue::Variable(i_plus_m),
-                Hlvalue::Variable(end_for_outer.clone()),
-            ],
-            Hlvalue::Variable(still_fits.clone()),
-        ));
-    block_outer_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(still_fits));
-    block_outer_cond.closeblock(vec![
+    let chars2 = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
+    block_m.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![Hlvalue::Variable(s2_for_m.clone()), chars_field_const()],
+        Hlvalue::Variable(chars2.clone()),
+    ));
+    let m = variable_with_lltype("m", LowLevelType::Signed);
+    block_m.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(chars2)],
+        Hlvalue::Variable(m.clone()),
+    ));
+    let m_le_1 = variable_with_lltype("m_le_1", LowLevelType::Bool);
+    block_m.borrow_mut().operations.push(SpaceOperation::new(
+        "int_le",
+        vec![Hlvalue::Variable(m.clone()), signed_const(1)],
+        Hlvalue::Variable(m_le_1.clone()),
+    ));
+    block_m.borrow_mut().exitswitch = Some(Hlvalue::Variable(m_le_1));
+    block_m.closeblock(vec![
         Link::new(
             vec![
-                Hlvalue::Variable(s1_for_outer.clone()),
-                Hlvalue::Variable(s2_for_outer.clone()),
-                Hlvalue::Variable(m_for_outer.clone()),
-                Hlvalue::Variable(i_for_outer.clone()),
-                signed_const(0),
-                Hlvalue::Variable(end_for_outer.clone()),
+                Hlvalue::Variable(s1_for_m.clone()),
+                Hlvalue::Variable(s2_for_m.clone()),
+                Hlvalue::Variable(start_for_m.clone()),
+                Hlvalue::Variable(end_for_m.clone()),
+                Hlvalue::Variable(m),
             ],
-            Some(block_inner_cond.clone()),
+            Some(block_m_le_1.clone()),
             Some(bool_true()),
         )
         .into_ref(),
         Link::new(
-            vec![signed_const(-1)],
-            Some(graph.returnblock.clone()),
+            vec![
+                Hlvalue::Variable(s1_for_m),
+                Hlvalue::Variable(s2_for_m),
+                Hlvalue::Variable(start_for_m),
+                Hlvalue::Variable(end_for_m),
+            ],
+            Some(block_search.clone()),
             Some(bool_false()),
         )
         .into_ref(),
     ]);
 
-    let j_lt_m = variable_with_lltype("j_lt_m", LowLevelType::Bool);
-    block_inner_cond
+    let m_eq_0 = variable_with_lltype("m_eq_0", LowLevelType::Bool);
+    block_m_le_1
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "int_lt",
-            vec![
-                Hlvalue::Variable(j_for_inner.clone()),
-                Hlvalue::Variable(m_for_inner.clone()),
-            ],
-            Hlvalue::Variable(j_lt_m.clone()),
+            "int_eq",
+            vec![Hlvalue::Variable(m_for_le1), signed_const(0)],
+            Hlvalue::Variable(m_eq_0.clone()),
         ));
-    block_inner_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(j_lt_m));
-    block_inner_cond.closeblock(vec![
+    block_m_le_1.borrow_mut().exitswitch = Some(Hlvalue::Variable(m_eq_0));
+    block_m_le_1.closeblock(vec![
         Link::new(
-            vec![
-                Hlvalue::Variable(s1_for_inner.clone()),
-                Hlvalue::Variable(s2_for_inner.clone()),
-                Hlvalue::Variable(m_for_inner.clone()),
-                Hlvalue::Variable(i_for_inner.clone()),
-                Hlvalue::Variable(j_for_inner.clone()),
-                Hlvalue::Variable(end_for_inner.clone()),
-            ],
-            Some(block_inner_body.clone()),
+            vec![Hlvalue::Variable(start_for_le1.clone())],
+            Some(graph.returnblock.clone()),
             Some(bool_true()),
         )
         .into_ref(),
         Link::new(
-            vec![Hlvalue::Variable(i_for_inner)],
-            Some(graph.returnblock.clone()),
+            vec![
+                Hlvalue::Variable(s1_for_le1),
+                Hlvalue::Variable(s2_for_le1),
+                Hlvalue::Variable(start_for_le1),
+                Hlvalue::Variable(end_for_le1),
+            ],
+            Some(block_find_char.clone()),
             Some(bool_false()),
         )
         .into_ref(),
     ]);
 
-    let idx = variable_with_lltype("idx", LowLevelType::Signed);
-    block_inner_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![
-                Hlvalue::Variable(i_for_body.clone()),
-                Hlvalue::Variable(j_for_body.clone()),
-            ],
-            Hlvalue::Variable(idx.clone()),
-        ));
-    let chars1_body = variable_with_lltype("chars1", chars_array_ptr_lltype.clone());
-    block_inner_body
+    let chars2_char = variable_with_lltype("chars2", chars_array_ptr_lltype);
+    block_find_char
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
             "getsubstruct",
-            vec![Hlvalue::Variable(s1_for_body.clone()), chars_field_const()],
-            Hlvalue::Variable(chars1_body.clone()),
+            vec![Hlvalue::Variable(s2_for_char.clone()), chars_field_const()],
+            Hlvalue::Variable(chars2_char.clone()),
         ));
-    let chars2_body = variable_with_lltype("chars2", chars_array_ptr_lltype);
-    block_inner_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "getsubstruct",
-            vec![Hlvalue::Variable(s2_for_body.clone()), chars_field_const()],
-            Hlvalue::Variable(chars2_body.clone()),
-        ));
-    let c1 = variable_with_lltype("c1", elem_lltype.clone());
-    block_inner_body
+    let ch = variable_with_lltype("ch", LowLevelType::Char);
+    block_find_char
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
             "getarrayitem",
-            vec![Hlvalue::Variable(chars1_body), Hlvalue::Variable(idx)],
-            Hlvalue::Variable(c1.clone()),
+            vec![Hlvalue::Variable(chars2_char), signed_const(0)],
+            Hlvalue::Variable(ch.clone()),
         ));
-    let c2 = variable_with_lltype("c2", elem_lltype);
-    block_inner_body
+    let find_char_ptr = named_helper_funcptr_constant(
+        "ll_find_char",
+        vec![
+            ptr_lltype.clone(),
+            LowLevelType::Char,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Signed,
+    );
+    let res_char = variable_with_lltype("res", LowLevelType::Signed);
+    block_find_char
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "getarrayitem",
+            "direct_call",
             vec![
-                Hlvalue::Variable(chars2_body),
-                Hlvalue::Variable(j_for_body.clone()),
+                find_char_ptr,
+                Hlvalue::Variable(s1_for_char),
+                Hlvalue::Variable(ch),
+                Hlvalue::Variable(start_for_char),
+                Hlvalue::Variable(end_for_char.clone()),
             ],
-            Hlvalue::Variable(c2.clone()),
+            Hlvalue::Variable(res_char.clone()),
         ));
-    let eq = variable_with_lltype("eq", LowLevelType::Bool);
-    block_inner_body
+    emit_record_exact_value_and_return(
+        &block_find_char,
+        res_char,
+        end_for_char,
+        graph.returnblock.clone(),
+    );
+
+    // `rlib/rstring.py` `SEARCH_FIND`. Named constant: `majit_rlib::rstring::SEARCH_FIND`.
+    let search_find = signed_const(1);
+    let search_ptr = named_helper_funcptr_constant(
+        "ll_search",
+        vec![
+            ptr_lltype.clone(),
+            ptr_lltype,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Signed,
+    );
+    let res_search = variable_with_lltype("res", LowLevelType::Signed);
+    block_search
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            char_eq_op,
-            vec![Hlvalue::Variable(c1), Hlvalue::Variable(c2)],
-            Hlvalue::Variable(eq.clone()),
+            "direct_call",
+            vec![
+                search_ptr,
+                Hlvalue::Variable(s1_for_search),
+                Hlvalue::Variable(s2_for_search),
+                Hlvalue::Variable(start_for_search),
+                Hlvalue::Variable(end_for_search.clone()),
+                search_find,
+            ],
+            Hlvalue::Variable(res_search.clone()),
         ));
-    let j_next = variable_with_lltype("j_next", LowLevelType::Signed);
-    block_inner_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![Hlvalue::Variable(j_for_body.clone()), signed_const(1)],
-            Hlvalue::Variable(j_next.clone()),
-        ));
-    let i_next = variable_with_lltype("i_next", LowLevelType::Signed);
-    block_inner_body
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![Hlvalue::Variable(i_for_body.clone()), signed_const(1)],
-            Hlvalue::Variable(i_next.clone()),
-        ));
-    block_inner_body.borrow_mut().exitswitch = Some(Hlvalue::Variable(eq));
-    block_inner_body.closeblock(vec![
+    emit_record_exact_value_and_return(
+        &block_search,
+        res_search,
+        end_for_search,
+        graph.returnblock.clone(),
+    );
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "s1".to_string(),
+            "s2".to_string(),
+            "start".to_string(),
+            "end".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise `LLHelpers.ll_search` (`rstr.py`) for STR.
+///
+/// `hlstr` is the identity on a low-level STR pointer. `_search` dispatches
+/// on `isinstance(value, str)`, a translation-time constant for STR, so the
+/// body is `direct_call _search_elidable(s1, s2, start, end, mode)`.
+/// UNICODE would take `_search_normal`, which is unported as a graph.
+pub(crate) fn build_ll_search_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    require_str_ptr(&ptr_lltype, "ll_search")?;
+
+    let s1 = variable_with_lltype("s1", ptr_lltype.clone());
+    let s2 = variable_with_lltype("s2", ptr_lltype.clone());
+    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
+    let end_arg = variable_with_lltype("end", LowLevelType::Signed);
+    let mode_arg = variable_with_lltype("mode", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(s1.clone()),
+        Hlvalue::Variable(s2.clone()),
+        Hlvalue::Variable(start_arg.clone()),
+        Hlvalue::Variable(end_arg.clone()),
+        Hlvalue::Variable(mode_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let elidable_ptr = named_helper_funcptr_constant(
+        "_search_elidable",
+        vec![
+            ptr_lltype.clone(),
+            ptr_lltype,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Signed,
+    );
+    let res = variable_with_lltype("res", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            elidable_ptr,
+            Hlvalue::Variable(s1),
+            Hlvalue::Variable(s2),
+            Hlvalue::Variable(start_arg),
+            Hlvalue::Variable(end_arg),
+            Hlvalue::Variable(mode_arg),
+        ],
+        Hlvalue::Variable(res.clone()),
+    ));
+    startblock.closeblock(vec![
         Link::new(
-            vec![
-                Hlvalue::Variable(s1_for_body.clone()),
-                Hlvalue::Variable(s2_for_body.clone()),
-                Hlvalue::Variable(m_for_body.clone()),
-                Hlvalue::Variable(i_for_body),
-                Hlvalue::Variable(j_next),
-                Hlvalue::Variable(end_for_body.clone()),
-            ],
-            Some(block_inner_cond.clone()),
-            Some(bool_true()),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                Hlvalue::Variable(s1_for_body),
-                Hlvalue::Variable(s2_for_body),
-                Hlvalue::Variable(m_for_body),
-                Hlvalue::Variable(i_next),
-                Hlvalue::Variable(end_for_body),
-            ],
-            Some(block_outer_cond.clone()),
-            Some(bool_false()),
+            vec![Hlvalue::Variable(res)],
+            Some(graph.returnblock.clone()),
+            None,
         )
         .into_ref(),
     ]);
@@ -8757,6 +8915,7 @@ pub(crate) fn build_ll_find_helper_graph(
             "s2".to_string(),
             "start".to_string(),
             "end".to_string(),
+            "mode".to_string(),
         ],
         func,
     ))
@@ -14053,6 +14212,10 @@ mod tests {
     fn build_ll_find_char_synthesizes_forward_loop_cfg_for_str() {
         let helper = build_ll_find_char_helper_graph("ll_find_char", STRPTR.clone())
             .expect("build_ll_find_char_helper_graph for STR");
+        assert!(
+            helper.func._elidable_function_,
+            "rlib/jit.py elidable stamps GraphFunc._elidable_function_"
+        );
         let inner = helper.graph.borrow();
 
         fn pick_exit_target(
@@ -14160,47 +14323,188 @@ mod tests {
         }
     }
 
-    /// `ll_find` substring helper used by `rtype_contains`: startblock
-    /// extracts both `chars` arrays, clamps start/end, then nested scan.
+    fn opnames(block: &crate::flowspace::model::BlockRef) -> Vec<String> {
+        block
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect()
+    }
+
+    fn pick_bool_exit(
+        block: &crate::flowspace::model::BlockRef,
+        want_true: bool,
+    ) -> crate::flowspace::model::BlockRef {
+        let target_value = ConstValue::Bool(want_true);
+        let block_borrow = block.borrow();
+        let link = block_borrow
+            .exits
+            .iter()
+            .find(|l| {
+                matches!(
+                    l.borrow().exitcase,
+                    Some(Hlvalue::Constant(ref c)) if c.value == target_value
+                )
+            })
+            .expect("matching bool exit");
+        link.borrow().target.as_ref().unwrap().clone()
+    }
+
+    fn funcptr_name(hlv: &Hlvalue) -> String {
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        let Hlvalue::Constant(c) = hlv else {
+            panic!("expected Constant funcptr, got {hlv:?}");
+        };
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr funcptr, got {:?}", c.value);
+        };
+        match ptr._obj0_value() {
+            Ok(Some(_ptr_obj::Func(func))) => func._name,
+            other => panic!("expected Func, got {other:?}"),
+        }
+    }
+
+    /// `LLHelpers.ll_find` (`rstr.py`): clamp start/end, then `m == 0`
+    /// return start, `m == 1` `ll_find_char` + `jit.record_exact_value`,
+    /// `m > 1` `ll_search(..., SEARCH_FIND)` + the same record.
     #[test]
-    fn build_ll_find_synthesizes_nested_scan_cfg_for_str() {
+    fn build_ll_find_synthesizes_find_char_and_search_arms() {
         let helper = build_ll_find_helper_graph("ll_find", STRPTR.clone())
             .expect("build_ll_find_helper_graph for STR");
         let inner = helper.graph.borrow();
-        let startblock = inner.startblock.borrow();
-        let start_ops: Vec<&str> = startblock
-            .operations
-            .iter()
-            .map(|op| op.opname.as_str())
-            .collect();
+        assert_eq!(opnames(&inner.startblock), vec!["int_lt"]);
+
+        let block_n = pick_bool_exit(&inner.startblock, false);
         assert_eq!(
-            start_ops,
+            opnames(&block_n),
+            vec!["getsubstruct", "getarraysize", "int_gt"]
+        );
+
+        let block_range = pick_bool_exit(&block_n, false);
+        assert_eq!(opnames(&block_range), vec!["int_sub", "int_lt"]);
+        {
+            let range_borrow = block_range.borrow();
+            let true_link = range_borrow
+                .exits
+                .iter()
+                .find(|l| {
+                    matches!(
+                        l.borrow().exitcase,
+                        Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
+                    )
+                })
+                .expect("span_neg true");
+            let args = &true_link.borrow().args;
+            assert!(
+                matches!(args.first(), Some(Some(Hlvalue::Constant(c))) if c.value == ConstValue::Int(-1)),
+                "empty range returns -1: {args:?}"
+            );
+        }
+
+        let block_m = pick_bool_exit(&block_range, false);
+        assert_eq!(
+            opnames(&block_m),
+            vec!["getsubstruct", "getarraysize", "int_le"]
+        );
+
+        let block_m_le_1 = pick_bool_exit(&block_m, true);
+        assert_eq!(opnames(&block_m_le_1), vec!["int_eq"]);
+        {
+            let le1_borrow = block_m_le_1.borrow();
+            let true_link = le1_borrow
+                .exits
+                .iter()
+                .find(|l| {
+                    matches!(
+                        l.borrow().exitcase,
+                        Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
+                    )
+                })
+                .expect("m == 0");
+            assert!(
+                matches!(
+                    true_link.borrow().args.first(),
+                    Some(Some(Hlvalue::Variable(_)))
+                ),
+                "m == 0 returns start"
+            );
+        }
+
+        let block_find_char = pick_bool_exit(&block_m_le_1, false);
+        assert_eq!(
+            opnames(&block_find_char),
             vec![
                 "getsubstruct",
-                "getarraysize",
-                "getsubstruct",
-                "getarraysize",
-                "int_lt"
+                "getarrayitem",
+                "direct_call",
+                "int_lt",
+                "jit_record_exact_value"
             ]
         );
-        drop(startblock);
-        assert!(
-            inner.iterblocks().iter().any(|block| {
-                let borrowed = block.borrow();
-                let ops: Vec<&str> = borrowed
-                    .operations
-                    .iter()
-                    .map(|op| op.opname.as_str())
-                    .collect();
-                ops.iter().any(|op| *op == "getsubstruct")
-                    && ops.iter().any(|op| *op == "getarrayitem")
-            }),
-            "scan body re-derives s.chars so Spine B can fuse getsubstruct+getarrayitem"
+        {
+            let borrowed = block_find_char.borrow();
+            let call = borrowed
+                .operations
+                .iter()
+                .find(|op| op.opname == "direct_call")
+                .expect("ll_find_char call");
+            assert_eq!(funcptr_name(&call.args[0]), "ll_find_char");
+        }
+
+        let block_search = pick_bool_exit(&block_m, false);
+        assert_eq!(
+            opnames(&block_search),
+            vec!["direct_call", "int_lt", "jit_record_exact_value"]
         );
+        {
+            let borrowed = block_search.borrow();
+            let call = borrowed
+                .operations
+                .iter()
+                .find(|op| op.opname == "direct_call")
+                .expect("ll_search call");
+            assert_eq!(funcptr_name(&call.args[0]), "ll_search");
+            assert!(
+                matches!(
+                    call.args.get(5),
+                    Some(Hlvalue::Constant(c)) if c.value == ConstValue::Int(1)
+                ),
+                "SEARCH_FIND is 1: {:?}",
+                call.args.get(5)
+            );
+        }
+
         drop(inner);
-        let unicode = build_ll_find_helper_graph("ll_unicode_find", UNICODEPTR.clone())
-            .expect("build_ll_find_helper_graph for UNICODE");
-        assert!(unicode.graph.borrow().startblock.borrow().operations.len() >= 5);
+        let err = build_ll_find_helper_graph("ll_unicode_find", UNICODEPTR.clone())
+            .expect_err("UNICODE ll_find needs _search_normal");
+        assert!(
+            err.to_string().contains("_search_normal"),
+            "UNICODE refusal names _search_normal: {err}"
+        );
+    }
+
+    /// `LLHelpers.ll_search` (`rstr.py`) STR arm: `hlstr` is identity,
+    /// `_search` picks `_search_elidable` at translation time.
+    #[test]
+    fn build_ll_search_calls_search_elidable_for_str() {
+        let helper = build_ll_search_helper_graph("ll_search", STRPTR.clone())
+            .expect("build_ll_search_helper_graph for STR");
+        let inner = helper.graph.borrow();
+        assert_eq!(opnames(&inner.startblock), vec!["direct_call"]);
+        let startblock = inner.startblock.borrow();
+        assert_eq!(
+            funcptr_name(&startblock.operations[0].args[0]),
+            "_search_elidable"
+        );
+        drop(startblock);
+        drop(inner);
+        let err = build_ll_search_helper_graph("ll_unicode_search", UNICODEPTR.clone())
+            .expect_err("UNICODE ll_search needs _search_normal");
+        assert!(
+            err.to_string().contains("_search_normal"),
+            "UNICODE refusal names _search_normal: {err}"
+        );
     }
 
     /// UNICODE variants substitute `unichar_eq` for the comparison op
@@ -14733,6 +15037,27 @@ mod tests {
     }
 
     #[test]
+    fn build_ll_utf8next_helper_marks_always_inline() {
+        let r = Utf8StringIteratorRepr::new(STRPTR.clone()).expect("Utf8StringIteratorRepr::new");
+        let helper =
+            build_ll_utf8next_helper_graph("ll_utf8next", r.lowleveltype().clone(), STRPTR.clone())
+                .expect("build_ll_utf8next_helper_graph");
+        assert_eq!(
+            helper.func._always_inline_,
+            crate::flowspace::model::AlwaysInline::True,
+        );
+        assert_eq!(
+            helper
+                .graph
+                .borrow()
+                .func
+                .as_ref()
+                .map(|f| f._always_inline_),
+            Some(crate::flowspace::model::AlwaysInline::True),
+        );
+    }
+
+    #[test]
     fn build_ll_unichr_as_utf8_helper_encodes_and_range_checks() {
         let helper = build_ll_unichr_as_utf8_helper_graph("ll_unichr_as_utf8")
             .expect("build_ll_unichr_as_utf8_helper_graph");
@@ -14746,18 +15071,47 @@ mod tests {
                 .iter()
                 .map(|op| op.opname.clone())
                 .collect();
-            assert_eq!(start_ops, vec!["int_gt".to_string()]);
-            let raises = start.exits.iter().any(|lnk| {
+            assert_eq!(
+                start_ops,
+                vec![
+                    "int_ge".to_string(),
+                    "debug_assert".to_string(),
+                    "cast_int_to_uint".to_string(),
+                    "uint_le".to_string(),
+                ]
+            );
+            let start_raises = start.exits.iter().any(|lnk| {
                 lnk.borrow()
                     .target
                     .as_ref()
                     .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
             });
             assert!(
-                raises,
-                "startblock must raise ValueError when code > 0x10FFFF"
+                !start_raises,
+                "startblock holds assert + r_uint; the last uint_le raises"
             );
         }
+        let too_large_raises = inner.iterblocks().iter().any(|block| {
+            let b = block.borrow();
+            let le_max = b.operations.iter().any(|op| {
+                op.opname == "uint_le"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c)) if c.value == ConstValue::UInt(0x10FFFF)
+                    )
+            });
+            let raises = b.exits.iter().any(|lnk| {
+                lnk.borrow()
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
+            });
+            le_max && raises
+        });
+        assert!(
+            too_large_raises,
+            "false arm of code <= r_uint(0x10FFFF) must raise"
+        );
         let mut opnames = Vec::new();
         for block in inner.iterblocks() {
             for op in &block.borrow().operations {
@@ -14768,10 +15122,11 @@ mod tests {
             "malloc_varsize",
             "getsubstruct",
             "setarrayitem",
-            "int_le",
-            "int_rshift",
-            "int_and",
-            "int_or",
+            "uint_le",
+            "uint_rshift",
+            "uint_and",
+            "uint_or",
+            "cast_uint_to_int",
             "cast_int_to_char",
         ] {
             assert!(

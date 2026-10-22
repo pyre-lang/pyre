@@ -1268,6 +1268,7 @@ fn build_object_descr_group_inlining_parent(
                 // it sits ahead of the real header in the field list.
                 is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
                 index_in_parent,
+                load_is_acquire: false,
             },
         )
         .collect();
@@ -1371,6 +1372,7 @@ fn build_bare_gcstruct_descr_group(
                 // A bare GcStruct has no class word.
                 is_class_word: Some(false),
                 index_in_parent,
+                load_is_acquire: false,
             },
         )
         .collect();
@@ -8402,6 +8404,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         is_class_word: Some(false),
         // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
+        load_is_acquire: false,
     };
     // The activation counters.  `field_size` is derived from the field's own
     // type rather than spelled, so the 32-bit target reads the same four bytes
@@ -8419,6 +8422,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         virtualizable: false,
         is_class_word: Some(false),
         index_in_parent: 0,
+        load_is_acquire: false,
     };
     let mut w_tracefunc = field(2, "w_tracefunc", pyre_interpreter::EC_W_TRACEFUNC_OFFSET);
     // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`:
@@ -8510,6 +8514,7 @@ static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Lazy
         virtualizable: false,
         index_in_parent: 0,
         is_class_word: Some(false),
+        load_is_acquire: false,
     };
     // `descr.py get_field_descr` caches `(STRUCT, fieldname)`. The opcode
     // EffectInfo member names this STRUCT by `path_hash("gil_ready::GilReadyState")`.
@@ -10339,6 +10344,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent,
                 is_class_word: Some(is_class_word),
+                load_is_acquire: false,
             }
         };
         let group = majit_ir::descr::make_simple_descr_group(
@@ -12080,6 +12086,7 @@ fn simple_field_spec_from_bh(
         // name fallback instead of arriving as a declaration of a guess.
         is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
+        load_is_acquire: spec.load_is_acquire,
     };
     stamp_vtable_method_field_spec(&mut out);
     out
@@ -12775,6 +12782,7 @@ fn field_spec_from_owned_bh(
         virtualizable: false,
         is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
+        load_is_acquire: spec.load_is_acquire,
     };
     stamp_vtable_method_field_spec(&mut out);
     out
@@ -13076,7 +13084,8 @@ fn field_descr_from_bh_field(
         field.name.clone(),
         field.field_key().to_string(),
     )
-    .with_quasi_immutable(field.is_quasi_immutable);
+    .with_quasi_immutable(field.is_quasi_immutable)
+    .with_load_is_acquire(field.load_is_acquire);
     // `new_with_name` seeded the answer from the display name; a spec that
     // declared one replaces that guess. A spec that declared nothing leaves it.
     if let Some(is_class_word) = field.is_class_word {

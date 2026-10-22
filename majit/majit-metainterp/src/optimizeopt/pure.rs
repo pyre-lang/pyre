@@ -2617,6 +2617,7 @@ mod tests {
                 flag,
                 virtualizable: false,
                 index_in_parent: 0,
+                load_is_acquire: false,
             }],
         );
         let descr = group.field_descrs[0].clone() as majit_ir::DescrRef;

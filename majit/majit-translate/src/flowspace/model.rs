@@ -4804,6 +4804,11 @@ pub struct GraphFunc {
     /// loop. `false` mirrors the "attribute absent" default
     /// (`getattr(func, '_jit_unroll_safe_', False)`).
     pub _jit_unroll_safe_: bool,
+    /// Upstream function attribute set by `rlib/jit.py elidable`
+    /// (`func._elidable_function_ = True`). `call.py getcalldescr` reads
+    /// it to pick `EF_ELIDABLE_*`. `false` mirrors the "attribute absent"
+    /// default (`getattr(func, '_elidable_function_', False)`).
+    pub _elidable_function_: bool,
     /// Upstream function attribute consulted by
     /// `description.py:222-224`.
     ///
@@ -4942,6 +4947,7 @@ impl GraphFunc {
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
             _jit_unroll_safe_: false,
+            _elidable_function_: false,
             relax_sig_check: None,
             _dont_reach_me_in_del_: false,
             _always_inline_: AlwaysInline::Absent,

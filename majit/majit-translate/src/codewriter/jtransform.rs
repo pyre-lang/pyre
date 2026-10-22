@@ -3799,6 +3799,11 @@ impl<'a> Transformer<'a> {
             OpKind::Call { target, args, .. } if is_jit_force_quasi_immutable_target(target) => {
                 self.rewrite_op_jit_force_quasi_immutable(target, args, graph, graph_name)
             }
+            // `jtransform.py rewrite_op_jit_record_exact_value`: the rtyper
+            // llop, dispatched the same way as `jit_force_virtualizable`.
+            OpKind::Call { target, args, .. } if is_jit_record_exact_value_target(target) => {
+                self.rewrite_op_jit_record_exact_value(args, graph, graph_name)
+            }
             // RPython `Transformer.rewrite_op_same_as` / `rewrite_op_cast_*`
             // drop the op and alias the result to the operand. `deref` is
             // the `&mut *p` reborrow of the same pointer.
@@ -8711,6 +8716,18 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_operation(&helper_call, graph_name, graph);
         }
+        // `rffi.get_raw_address_of_string` (`rffi.py`): `@jit.dont_look_inside`.
+        // The skip-spine leftover is `__majit_get_raw_address_of_string(s)`;
+        // a rtyped graph `direct_call`s `ll_get_raw_address_of_string`. Mint
+        // the residual family before `guess_call_kind` so the call is a
+        // registered, non-candidate graph with a real `HELPER_FNADDRS`
+        // fnaddr (`codewriter::get_raw_address`).
+        if let CallTarget::FunctionPath { segments, .. } = target
+            && crate::codewriter::get_raw_address::is_get_raw_address_path(segments)
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let _ = crate::codewriter::get_raw_address::ll_get_raw_address_of_string_path(cc);
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call;
         if self.callcontrol.is_some() {
             let kind = self.callcontrol.as_mut().unwrap().guess_call_kind(op);
@@ -12185,6 +12202,99 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(ops)
     }
 
+    /// `jtransform.py Transformer.rewrite_op_jit_record_exact_value`.
+    ///
+    /// `getkind(op.args[0].concretetype)`: int → `record_exact_value_i`,
+    /// ref → `record_exact_value_r`, no result.
+    fn rewrite_op_jit_record_exact_value(
+        &mut self,
+        args: &[LinkArg],
+        graph: &mut FunctionGraph,
+        graph_name: &str,
+    ) -> RewriteResult {
+        assert!(
+            args.len() >= 2,
+            "rewrite_op_jit_record_exact_value: expected value and const operands"
+        );
+        let kind0 = self.record_exact_value_arg_kind(&args[0]);
+        let kind1 = self.record_exact_value_arg_kind(&args[1]);
+        let opname = if kind0 == 'i' {
+            assert_eq!(kind1, 'i', "record_exact_value int pair");
+            "record_exact_value_i"
+        } else {
+            assert_eq!(kind0, 'r', "record_exact_value ref pair");
+            assert_eq!(kind1, 'r', "record_exact_value ref pair");
+            "record_exact_value_r"
+        };
+        let mut ops = Vec::new();
+        let arg0 = self.record_exact_value_arg_var(&args[0], graph, &mut ops);
+        let arg1 = self.record_exact_value_arg_var(&args[1], graph, &mut ops);
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!("rewrite: jit_record_exact_value → {opname}"),
+        });
+        ops.push(SpaceOperation {
+            result: None,
+            kind: OpKind::LoweredBlackholeOp {
+                opname: opname.to_string(),
+                args: vec![arg0, arg1],
+            },
+        });
+        RewriteResult::Replace(ops)
+    }
+
+    fn record_exact_value_arg_kind(&self, arg: &LinkArg) -> char {
+        match arg {
+            LinkArg::Value(v) => self.get_value_kind_var(v),
+            LinkArg::Const(c) => {
+                let Some(ty) = c.concretetype.as_ref() else {
+                    panic!("rewrite_op_jit_record_exact_value: constant has no concretetype")
+                };
+                match crate::model::getkind(ty) {
+                    crate::model::ConcreteType::Signed => 'i',
+                    crate::model::ConcreteType::GcRef => 'r',
+                    crate::model::ConcreteType::Float => 'f',
+                    crate::model::ConcreteType::Void => 'v',
+                    crate::model::ConcreteType::Unknown => 'r',
+                }
+            }
+        }
+    }
+
+    fn record_exact_value_arg_var(
+        &self,
+        arg: &LinkArg,
+        graph: &mut FunctionGraph,
+        prefix: &mut Vec<SpaceOperation>,
+    ) -> crate::flowspace::model::Variable {
+        match arg {
+            LinkArg::Value(v) => v.clone(),
+            LinkArg::Const(c) => {
+                let kind = match &c.value {
+                    crate::flowspace::model::ConstValue::Bool(b) => OpKind::ConstBool(*b),
+                    crate::flowspace::model::ConstValue::Int(n) => OpKind::ConstInt(*n),
+                    crate::flowspace::model::ConstValue::UInt(n) => OpKind::ConstUInt(*n),
+                    crate::flowspace::model::ConstValue::None => OpKind::ConstRefNull,
+                    other => {
+                        panic!("rewrite_op_jit_record_exact_value: unsupported constant {other:?}")
+                    }
+                };
+                let ty = match self.record_exact_value_arg_kind(arg) {
+                    'i' => crate::model::ConcreteType::Signed,
+                    'r' => crate::model::ConcreteType::GcRef,
+                    'f' => crate::model::ConcreteType::Float,
+                    _ => crate::model::ConcreteType::Void,
+                };
+                let var = graph.alloc_value_var_with_type(ty);
+                prefix.push(SpaceOperation {
+                    result: Some(var.clone()),
+                    kind,
+                });
+                var
+            }
+        }
+    }
+
     /// RPython: `Transformer.handle_residual_call(op)` (jtransform.py).
     /// Call that the JIT should NOT look inside — emit residual_call_*.
     /// Args are split by kind via `rewrite_call()` → `make_three_lists()`.
@@ -14557,6 +14667,17 @@ fn link_arg_const_str_in_graph(
             None
         }
     }
+}
+
+/// `jtransform.py rewrite_op_jit_record_exact_value` Call-target match.
+/// Last segment is the ExtRegistry llop / `ll_record_exact_value` helper.
+fn is_jit_record_exact_value_target(target: &CallTarget) -> bool {
+    matches!(target, CallTarget::FunctionPath { segments, .. }
+    if segments.last().is_some_and(|name| {
+        name == "jit_record_exact_value"
+            || name == "record_exact_value"
+            || name == "ll_record_exact_value"
+    }))
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
@@ -18914,6 +19035,105 @@ mod tests {
         );
     }
 
+    /// Skip-spine leftover of `str::as_ptr`: `__majit_get_raw_address_of_string(s)`
+    /// is `rffi.get_raw_address_of_string` (`rffi.py`). Minted lazily as a
+    /// `dont_look_inside` residual with the native `HELPER_FNADDRS` fnaddr.
+    #[test]
+    fn get_raw_address_of_string_lowers_to_residual_not_a_candidate() {
+        use crate::codewriter::call::{CallKind, is_symbolic_fnaddr};
+        use crate::runtime_names::shims;
+
+        let mut cc = crate::call::CallControl::new();
+        cc.register_macro_helper_trace_fnaddr(
+            "majit_rlib::lltypesystem::rffi::get_raw_address_of_string",
+            0x1000,
+        );
+        // do NOT call ll_get_raw_address_of_string_path here — transform mints
+
+        for name in [
+            shims::GET_RAW_ADDRESS_OF_STRING,
+            crate::codewriter::get_raw_address::LL_GET_RAW_ADDRESS_OF_STRING,
+        ] {
+            let mut graph = FunctionGraph::new(name);
+            let s = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "s".into(),
+                        ty: ValueType::Str,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Call {
+                        target: CallTarget::function_path([name]),
+                        args: crate::model::call_args(vec![s.clone()]),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result.clone()));
+            FunctionGraph::set_concretetype_of_inline(&s, ConcreteType::GcRef);
+            FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::Signed);
+
+            let transformed = Transformer::new(&GraphTransformConfig::default())
+                .with_callcontrol(&mut cc)
+                .transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            assert!(
+                !ops.iter()
+                    .any(|op| matches!(op.kind, OpKind::InlineCall { .. })),
+                "{name}: dont_look_inside residual is not an inline_call: {ops:?}"
+            );
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::ConstFnAddr {
+                        value: 0x1000,
+                        symbolic: false,
+                        ..
+                    }
+                )),
+                "{name}: fnaddr is the HELPER_FNADDRS binding: {ops:?}"
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+                "{name}: call is residual_call_*: {ops:?}"
+            );
+
+            let path = crate::parse::CallPath::from_segments([name]);
+            assert!(cc.has_function_graph(&path), "missing graph {name}");
+            assert!(
+                !cc.is_candidate(&path),
+                "look_inside_graph refuses `_jit_look_inside_ = False` for {name}"
+            );
+            let call = SpaceOperation {
+                result: Some(crate::flowspace::model::Variable::new()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path([name]),
+                    args: crate::model::call_args(vec![crate::flowspace::model::Variable::new()]),
+                    result_ty: ValueType::Int,
+                },
+            };
+            assert!(cc.graphs_from(&call).is_none());
+            assert_eq!(cc.guess_call_kind(&call), CallKind::Residual);
+            assert_eq!(cc.lookup_function_fnaddr(&path), Some(0x1000));
+            let OpKind::Call { target, .. } = &call.kind else {
+                panic!("call is a Call");
+            };
+            let binding = cc.fnaddr_binding_for_target(target);
+            assert!(!binding.symbolic, "{name} residual must be executable");
+            assert!(!is_symbolic_fnaddr(binding.addr));
+            assert_eq!(binding.addr, 0x1000);
+        }
+    }
+
     fn rust_heap_string_contains_graph() -> FunctionGraph {
         use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
         let mut graph = FunctionGraph::new("rust_heap_contains");
@@ -22208,6 +22428,65 @@ mod tests {
             ops[1].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
         ));
+    }
+
+    #[test]
+    fn transform_graph_lowers_jit_record_exact_value_int_to_record_exact_value_i() {
+        let mut graph = FunctionGraph::new("record_exact_value_i_demo");
+        let lhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let rhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, lhs.clone());
+        graph.push_inputarg_var(graph.startblock, rhs.clone());
+        let lt = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::BinOp {
+                op: "lt".to_string(),
+                lhs,
+                rhs,
+                result_ty: ValueType::Int,
+            },
+            lt.clone(),
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_record_exact_value"]),
+                args: vec![
+                    LinkArg::from(lt.clone()),
+                    LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
+                        crate::flowspace::model::ConstValue::Bool(true),
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                    )),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::ConstBool(true))),
+            "Constant(True) materialises as ConstBool: {ops:?}"
+        );
+        let rec = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::LoweredBlackholeOp { opname, .. } if opname == "record_exact_value_i"
+                )
+            })
+            .unwrap_or_else(|| panic!("expected record_exact_value_i, got {ops:?}"));
+        assert!(rec.result.is_none(), "record_exact_value_i is void");
+        let OpKind::LoweredBlackholeOp { args, .. } = &rec.kind else {
+            unreachable!();
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], lt);
     }
 
     fn mark_instance_flags(

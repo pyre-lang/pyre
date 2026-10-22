@@ -226,6 +226,8 @@ where
         table[jitcode::insns::BC_INT_GUARD_VALUE as usize] = Self::opimpl_int_guard_value;
         table[jitcode::insns::BC_ASSERT_NOT_NONE as usize] = Self::opimpl_assert_not_none;
         table[jitcode::insns::BC_RECORD_EXACT_CLASS as usize] = Self::opimpl_record_exact_class;
+        table[jitcode::insns::BC_RECORD_EXACT_VALUE_I as usize] = Self::opimpl_record_exact_value_i;
+        table[jitcode::insns::BC_RECORD_EXACT_VALUE_R as usize] = Self::opimpl_record_exact_value_r;
         table[jitcode::insns::BC_REF_GUARD_VALUE as usize] = Self::opimpl_ref_guard_value;
         table[jitcode::insns::BC_FLOAT_GUARD_VALUE as usize] = Self::opimpl_float_guard_value;
         table[jitcode::insns::BC_GUARD_CLASS as usize] = Self::opimpl_guard_class;
@@ -8528,6 +8530,90 @@ where
         let (box_opref, _) = self.read_ref_reg(ctx, src);
         let (cls_opref, _) = self.read_int_reg(ctx, cls);
         ctx.trace_record_exact_class(box_opref, cls_opref);
+        TraceAction::Continue
+    }
+
+    // pyjitpl.py opimpl_record_exact_value_i
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_record_exact_value_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let box_reg = self.frames.current_mut().next_reg() as usize;
+        let const_reg = self.frames.current_mut().next_reg() as usize;
+        let (box_opref, _) = self.read_int_reg(ctx, box_reg);
+        let (const_opref, _) = self.read_int_reg(ctx, const_reg);
+        self._record_exact_value(ctx, OpCode::RecordExactValueI, box_opref, const_opref)
+    }
+
+    // pyjitpl.py opimpl_record_exact_value_r
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_record_exact_value_r(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        let box_reg = self.frames.current_mut().next_reg() as usize;
+        let const_reg = self.frames.current_mut().next_reg() as usize;
+        let (box_opref, _) = self.read_ref_reg(ctx, box_reg);
+        let (const_opref, _) = self.read_ref_reg(ctx, const_reg);
+        self._record_exact_value(ctx, OpCode::RecordExactValueR, box_opref, const_opref)
+    }
+
+    // pyjitpl.py `_record_exact_value`.
+    fn _record_exact_value(
+        &mut self,
+        ctx: &mut TraceCtx,
+        opnum: OpCode,
+        box_opref: OpRef,
+        const_box: OpRef,
+    ) -> TraceAction {
+        let mut invalid = false;
+        if const_box.is_constant() {
+            if !box_opref.is_constant() {
+                ctx.execute_and_record(None, opnum, None, &[box_opref, const_box], None, 0);
+                return TraceAction::Continue;
+            }
+            use crate::heapcache::SameConstantOracle;
+            let oracle: &dyn SameConstantOracle = &crate::history::ConstOprefOracle;
+            if oracle.same_constant(box_opref, const_box) {
+                return TraceAction::Continue;
+            }
+            invalid = true;
+        }
+        let error = if invalid {
+            "record_exact_value with two different constant, this is a bug!"
+        } else {
+            "record_exact_value with non-constant second argument, ignored"
+        };
+        if crate::debug::have_debug_prints() {
+            let name = if self.frames.frames.len() >= 2 {
+                self.frames.frames[self.frames.frames.len() - 2]
+                    .jitcode
+                    .name()
+                    .to_string()
+            } else {
+                self.frames
+                    .frames
+                    .last()
+                    .map(|f| f.jitcode.name().to_string())
+                    .unwrap_or_default()
+            };
+            // `jd_sd.warmstate.get_location_str(greenkey)` is not on this
+            // jitcode machine; empty merge points share that string.
+            let loc = "unknown language location";
+            crate::debug::debug_print(&format!("{error} {name} {loc}"));
+        }
+        if invalid {
+            return TraceAction::SwitchToBlackhole(crate::pyjitpl::SwitchToBlackhole::bad_loop());
+        }
         TraceAction::Continue
     }
 

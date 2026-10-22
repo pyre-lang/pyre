@@ -11203,6 +11203,14 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         majit_jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V,
     );
     insns.insert(
+        "record_exact_value_i/ii".to_string(),
+        majit_jitcode::insns::BC_RECORD_EXACT_VALUE_I,
+    );
+    insns.insert(
+        "record_exact_value_r/rr".to_string(),
+        majit_jitcode::insns::BC_RECORD_EXACT_VALUE_R,
+    );
+    insns.insert(
         "residual_call_ir_i/iIRd>i".to_string(),
         majit_jitcode::insns::BC_RESIDUAL_CALL_IR_I,
     );

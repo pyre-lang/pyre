@@ -947,6 +947,19 @@ fn block_observes_var(block: &crate::model::Block, var: &Variable) -> bool {
 /// normal path; every Some-arm-reachable `__pos_0` of that value is the
 /// element, including a later payload-compare or `Some(x) if` guard.
 ///
+/// A successor slot joins that set only when every incoming link into
+/// the block passes, at that position, a variable that is already a
+/// member slot's payload.  Dominance of the successor by the Some arm
+/// does not prove the other predecessors carry the same value: a
+/// Some-arm diamond can merge the iterator Option with a freshly
+/// constructed `Some(k)`, and collapsing `.__pos_0` would then rewrite
+/// both paths to identity.  `ListIteratorRepr.rtype_next` /
+/// `ll_listnext` return the iteration value directly and never
+/// reinterpret an unrelated Option.  The Some-arm seed stays: its
+/// incoming from the discriminant switch is the definition of the
+/// payload, not a join.  A removed successor whose variable is still
+/// read by a payload projection declines the whole lowering.
+///
 /// A block reachable from both the normal link and the StopIteration
 /// link is the `Some(_) | None` merge: it must not read the payload
 /// (the None arm carries no value).  A read there declines, fail-safe.
@@ -1011,7 +1024,72 @@ fn plan_normal_link_payload_slots(
             }
         }
     }
+    // Compute candidates as the one-incoming expansion above, then drop
+    // any successor that has an incoming link whose arg at `j` is not a
+    // member slot's variable, until the set is closed.
+    let seed = (some, pos);
+    loop {
+        let mut keep: Vec<(usize, usize)> = Vec::new();
+        for &(t, j) in &slots {
+            if (t, j) == seed || incoming_links_all_pass_member_payload(graph, t, j, &slots) {
+                keep.push((t, j));
+                continue;
+            }
+            let v = graph.blocks[t]
+                .inputargs
+                .get(j)
+                .cloned()
+                .ok_or_else(|| format!("{name}: block {t} lacks payload slot {j}"))?;
+            let projections =
+                collect_option_payload_projections(&graph.blocks[t].operations, &v)
+                    .map_err(|reason| format!("{name}: Some-arm-dominated block {t} {reason}"))?;
+            if !projections.is_empty() {
+                return Err(format!(
+                    "{name}: Some-arm join slot {j} of block {t} is not the iterator \
+                     element on every incoming link — payload collapse is not fail-safe"
+                ));
+            }
+        }
+        if keep.len() == slots.len() {
+            break;
+        }
+        slots = keep;
+    }
     Ok(slots)
+}
+
+/// `true` iff every link into block `t` passes, at position `j`, a
+/// variable that is the payload inputarg of a member slot of that
+/// link's source block.  A constant, a missing arg, a foreign variable,
+/// or a predecessor that is not itself a member all disqualify.
+fn incoming_links_all_pass_member_payload(
+    graph: &FunctionGraph,
+    t: usize,
+    j: usize,
+    slots: &[(usize, usize)],
+) -> bool {
+    let mut saw_incoming = false;
+    for (src, block) in graph.blocks.iter().enumerate() {
+        for link in &block.exits {
+            if link.target.0 != t {
+                continue;
+            }
+            saw_incoming = true;
+            let Some(arg) = link.args.get(j) else {
+                return false;
+            };
+            let LinkArg::Value(x) = arg else {
+                return false;
+            };
+            let from_source_member = slots.iter().any(|&(b, s)| {
+                b == src && graph.blocks[b].inputargs.get(s).is_some_and(|v| v == x)
+            });
+            if !from_source_member {
+                return false;
+            }
+        }
+    }
+    saw_incoming
 }
 
 fn rewire_one_next_site(
@@ -2287,5 +2365,261 @@ mod tests {
             })
             .count();
         assert_eq!(native, 1, "native [__iter_next] replaces Chars::next");
+    }
+
+    /// Residual `next()` Option match whose Some arm is still open.
+    /// The None arm returns. Callers close `some_t`.
+    fn open_some_arm_next_graph(
+        name: &str,
+    ) -> (FunctionGraph, Variable, BlockId, Variable, BlockId) {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let mut g = FunctionGraph::new(name);
+        let n = g.startblock;
+        let s = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![s]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (a, a_args) = g.create_block_with_arg_vars(1);
+        let it_a = a_args[0].clone();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: chars_next_target(),
+                    args: crate::model::call_args(vec![it_a]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::FieldRead {
+                    base: opt_c.clone(),
+                    field: FieldDescriptor::new("__discriminant", None),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, some_args) = g.create_block_with_arg_vars(1);
+        let some_opt = some_args[0].clone();
+        let (none_t, _none_args) = g.create_block_with_arg_vars(0);
+        g.set_return(none_t, None);
+
+        g.set_goto(n, a, vec![it]);
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.block_mut(c).exitswitch = Some(ExitSwitch::Value(disc));
+        g.block_mut(c).exits = vec![
+            Link::new_mixed(
+                Vec::new(),
+                none_t,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            )
+            .with_prevblock(c),
+            Link::new_mixed(
+                vec![LinkArg::Value(opt_c)],
+                some_t,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            )
+            .with_prevblock(c),
+        ];
+        (g, opt, some_t, some_opt, none_t)
+    }
+
+    fn pos0_read_count(g: &FunctionGraph) -> usize {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+                )
+            })
+            .count()
+    }
+
+    fn native_iter_next_count(g: &FunctionGraph) -> usize {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if is_iter_next_segments(segments)
+                )
+            })
+            .count()
+    }
+
+    /// Some-arm diamond: one predecessor forwards the iterator Option,
+    /// the other passes a freshly constructed `Some(k)` into the same
+    /// join slot, and the join reads `.__pos_0`.  Collapse would rewrite
+    /// both paths to identity; the lowering declines and leaves the
+    /// graph untouched.  `ll_listnext` never reinterprets an unrelated
+    /// Option as the iteration value.
+    #[test]
+    fn some_arm_mixed_option_join_declines_payload_collapse() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let (mut g, opt, some_t, some_opt, _none_t) =
+            open_some_arm_next_graph("test_iter_next_mixed_some_join");
+        let (right, _right_args) = g.create_block_with_arg_vars(0);
+        let (join, join_args) = g.create_block_with_arg_vars(1);
+        let join_opt = join_args[0].clone();
+        g.push_op_var(
+            join,
+            OpKind::FieldRead {
+                base: join_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        );
+        g.set_return(join, None);
+
+        let k = g.push_op_var(right, OpKind::ConstInt(7), true).unwrap();
+        let constructed = g
+            .push_op_var(
+                right,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["core", "option", "Option", "Some"]
+                            .iter()
+                            .map(|s| (*s).to_string())
+                            .collect(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![k]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_goto(right, join, vec![constructed]);
+
+        let flag = g
+            .push_op_var(some_t, OpKind::ConstBool(true), true)
+            .unwrap();
+        g.block_mut(some_t).exitswitch = Some(ExitSwitch::Value(flag));
+        g.block_mut(some_t).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(some_opt)],
+                join,
+                Some(ExitCase::Bool(true)),
+            )
+            .with_prevblock(some_t),
+            Link::new_mixed(Vec::new(), right, Some(ExitCase::Bool(false))).with_prevblock(some_t),
+        ];
+
+        let before = g.clone();
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 0, "mixed Some-arm Option join must decline");
+        assert_eq!(
+            g, before,
+            "declined lowering must leave the graph untouched"
+        );
+        assert_eq!(
+            residual_iterator_next_count(&g),
+            1,
+            "residual Chars::next must remain"
+        );
+        assert_eq!(native_iter_next_count(&g), 0);
+        assert_eq!(pos0_read_count(&g), 1, "join __pos_0 must not collapse");
+    }
+
+    /// Some-arm diamond where both predecessors pass the iterator
+    /// Option into the join slot.  The join `.__pos_0` is the element
+    /// on every path and still collapses.
+    #[test]
+    fn some_arm_uniform_option_join_still_collapses() {
+        use crate::model::{ExitCase, ExitSwitch, FieldDescriptor, Link};
+
+        let (mut g, opt, some_t, some_opt, _none_t) =
+            open_some_arm_next_graph("test_iter_next_uniform_some_join");
+        let (right, right_args) = g.create_block_with_arg_vars(1);
+        let right_opt = right_args[0].clone();
+        let (join, join_args) = g.create_block_with_arg_vars(1);
+        let join_opt = join_args[0].clone();
+        g.push_op_var(
+            join,
+            OpKind::FieldRead {
+                base: join_opt,
+                field: FieldDescriptor::new("__pos_0", None),
+                ty: ValueType::Int,
+                pure: true,
+            },
+            true,
+        );
+        g.set_return(join, None);
+        g.set_goto(right, join, vec![right_opt]);
+
+        let flag = g
+            .push_op_var(some_t, OpKind::ConstBool(true), true)
+            .unwrap();
+        g.block_mut(some_t).exitswitch = Some(ExitSwitch::Value(flag));
+        g.block_mut(some_t).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(some_opt.clone())],
+                join,
+                Some(ExitCase::Bool(true)),
+            )
+            .with_prevblock(some_t),
+            Link::new_mixed(
+                vec![LinkArg::Value(some_opt)],
+                right,
+                Some(ExitCase::Bool(false)),
+            )
+            .with_prevblock(some_t),
+        ];
+
+        let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Int)]);
+        assert_eq!(rewritten, 1, "uniform Some-arm Option join must fold");
+        assert_eq!(
+            residual_iterator_next_count(&g),
+            0,
+            "residual Chars::next must be gone"
+        );
+        assert_eq!(native_iter_next_count(&g), 1);
+        assert_eq!(
+            pos0_read_count(&g),
+            0,
+            "join __pos_0 must collapse to the element"
+        );
     }
 }

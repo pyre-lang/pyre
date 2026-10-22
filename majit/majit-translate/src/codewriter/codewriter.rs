@@ -829,12 +829,12 @@ impl CodeWriter {
     /// Spine A (`transform_graph_to_jitcode`) reaches here after the rtyper
     /// dual-gate + `Transformer::transform` produced a rewritten rich-`OpKind`
     /// graph; Spine B (`transform_opname_graph_to_jitcode`) reaches here after
-    /// `jtransform_opname::lower_graph` produced an equivalent rich-`OpKind`
-    /// graph from the rtyper's opname `SpaceOperation`s.  From this point the
-    /// pipeline is identical — Steps 2-4 (codewriter.py): regalloc →
-    /// flatten → liveness/assemble → `get_jitcode_calldescr` → commit body →
-    /// assign `jitcode.index`.  Each Variable's `.concretetype` cell is the
-    /// kind source (the upstream `getkind(v.concretetype)` access).
+    /// `jtransform_opname::lower_graph` plus `Transformer::transform` classified
+    /// leftover `Call` from `direct_call` (`rewrite_op_direct_call`).  From
+    /// this point the pipeline is identical — Steps 2-4 (codewriter.py):
+    /// regalloc → flatten → liveness/assemble → `get_jitcode_calldescr` →
+    /// commit body → assign `jitcode.index`.  Each Variable's `.concretetype`
+    /// cell is the kind source (the upstream `getkind(v.concretetype)` access).
     fn finalize_rewritten_graph_to_jitcode(
         &mut self,
         rewritten_graph: &mut crate::model::FunctionGraph,
@@ -1053,17 +1053,25 @@ impl CodeWriter {
     /// `transform_graph_to_jitcode`) when `CallControl::take_opname_graph`
     /// yields the registered `crate::flowspace::model::FunctionGraph`.
     /// `jtransform_opname::lower_graph` transduces it to an equivalent
-    /// rich-`OpKind` `crate::model::FunctionGraph`, which then re-enters the
-    /// shared `finalize_rewritten_graph_to_jitcode` tail.  None of the
-    /// Spine-A front steps (dual-gate concretetype publish,
-    /// `lower_indirect_calls`, unit-variant fold, classdef-hint stamping) run:
-    /// the helper graph is already low-level and fully typed on each
-    /// `Variable.concretetype` cell.
+    /// rich-`OpKind` `crate::model::FunctionGraph`. Leftover `Call` from
+    /// `direct_call` (this transducer has no CallControl) is then classified
+    /// by `Transformer.rewrite_op_direct_call` (`jtransform.py`):
+    /// `guess_call_kind` → `handle_regular_call` / `handle_residual_call`.
+    /// The same leftover path is what `int_floordiv` / `int_mod` take into
+    /// `_do_builtin_call`. None of the Spine-A front steps (dual-gate
+    /// concretetype publish, `lower_indirect_calls`, unit-variant fold,
+    /// classdef-hint stamping) run: the helper graph is already low-level
+    /// and fully typed on each `Variable.concretetype` cell.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors transform_graph_to_jitcode; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
     fn transform_opname_graph_to_jitcode(
         &mut self,
         flow_graph: &crate::flowspace::model::FunctionGraph,
         path: &crate::parse::CallPath,
         callcontrol: &mut CallControl,
+        config: &GraphTransformConfig,
         jitcode: &std::sync::Arc<JitCode>,
         verbose: bool,
         index: usize,
@@ -1078,9 +1086,27 @@ impl CodeWriter {
             let matcher = ed.fn_exception_match.borrow();
             crate::jtransform::constant_fold_ll_issubclass_flowgraph(flow_graph, matcher.as_ref());
         }
-        let mut lowered = crate::codewriter::jtransform_opname::lower_graph(flow_graph);
+        let lowered = crate::codewriter::jtransform_opname::lower_graph(flow_graph);
+        // `lower_graph` leaves `direct_call` as `OpKind::Call`. Assembler
+        // encodes a leftover Call as `direct_call_*`; there is no such
+        // opcode in a jitcode (`jtransform.py rewrite_op_direct_call`).
+        let mut rewritten =
+            crate::codewriter::transform_profile::time_phase("step1_jtransform_transform", || {
+                let mut transformer =
+                    crate::jtransform::Transformer::new(config).with_callcontrol(callcontrol);
+                transformer.transform_owned(lowered)
+            });
+        let post_result_types = crate::codewriter::transform_profile::time_phase(
+            "step1b_authoritative_result_types",
+            || crate::codewriter::type_state::authoritative_result_types(&rewritten.graph),
+        );
+        for (var, kind) in &post_result_types {
+            if !matches!(kind, crate::model::ConcreteType::Unknown) {
+                crate::model::FunctionGraph::set_concretetype_of_inline(var, *kind);
+            }
+        }
         self.finalize_rewritten_graph_to_jitcode(
-            &mut lowered,
+            &mut rewritten.graph,
             path,
             callcontrol,
             jitcode,
@@ -1157,6 +1183,7 @@ impl CodeWriter {
                     &flow_graph,
                     &path,
                     callcontrol,
+                    config,
                     &jitcode,
                     /* verbose = */ false,
                     index,

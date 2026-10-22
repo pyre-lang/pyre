@@ -7,4 +7,5 @@ pub mod llmemory;
 pub mod module;
 pub mod rffi;
 pub mod rlist;
+pub mod rstr;
 pub mod rvec;

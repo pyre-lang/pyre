@@ -25580,9 +25580,11 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // Trait `Clone::clone` of `Vec<T>` / a tuple of Copy and
-                // `Vec` fields, specialized on the receiver before the
-                // call becomes residual `["Clone","clone"]`.
+                // Trait `Clone::clone` of `Vec<T>` whose T-clone is
+                // identity (`rlist.py` `ll_copy` / `ll_arraycopy`), or a
+                // tuple of Copy and such `Vec` fields, specialized on the
+                // receiver before the call becomes residual
+                // `["Clone","clone"]`.
                 if args.len() == 1
                     && self.try_lower_trait_clone(
                         mir_bb,
@@ -32595,10 +32597,11 @@ impl<'a> Lowering<'a> {
                 if let Some(target) = self.specialized_trait_target(v) {
                     return Ok(target);
                 }
-                // `Vec<T>` as `Clone::clone` is `rlist.py` `ll_copy`, the
-                // same `list` builtin `<[T]>::to_vec` retargets to. Bind
-                // it here so the call never becomes `["Clone","clone"]`.
-                if let Some(target) = self.specialized_trait_clone_list_target(v) {
+                // `Vec<T>` as `Clone::clone` is `rlist.py` `ll_copy` when
+                // T's clone is identity (`ll_arraycopy` never calls
+                // `T::clone`). Bind it here so the call never becomes
+                // `["Clone","clone"]`.
+                if let Some(target) = specialized_trait_clone_list_target(v, self.llbc) {
                     return Ok(target);
                 }
                 // `description.py` `ClassDesc.lookup` / `MethodDesc`: a
@@ -36148,25 +36151,13 @@ impl<'a> Lowering<'a> {
         serde_json::from_value(node.clone()).ok()
     }
 
-    /// `Vec<T>` as trait `Clone::clone` → the `list` builtin
-    /// (`rtype_bltn_list` / `rlist.py` `ll_copy`).
-    fn specialized_trait_clone_list_target(
-        &self,
-        v: &serde_json::Value,
-    ) -> Option<(Vec<String>, Option<(String, String)>)> {
-        if !is_trait_clone_clone(v, self.llbc) {
-            return None;
-        }
-        let node = trait_clone_self_node(v, self.llbc)?;
-        let self_ty = serde_json::from_value::<TyRef>(node.clone()).ok()?;
-        tyref_is_vec_value(&self_ty, self.llbc).then(|| (vec!["list".to_string()], None))
-    }
-
     /// Trait `Clone::clone` of `Vec<T>` is `rlist.py` `ll_copy` (the `list`
-    /// builtin `<[T]>::to_vec` retargets to).  A tuple of Copy/ZST and
-    /// `Vec` fields is field-wise clone plus the tuple Aggregate ctor —
-    /// `KwargsDictStrategy.copy` `self.erase((keys_w[:], values_w[:]))`
-    /// (`kwargsdict.py`).  Anything else stays residual.
+    /// builtin `<[T]>::to_vec` retargets to) when T's clone is the identity
+    /// copy — `ll_arraycopy` never calls `T::clone`.  A tuple of Copy/ZST
+    /// and such `Vec` fields is field-wise clone plus the tuple Aggregate
+    /// ctor — `KwargsDictStrategy.copy`
+    /// `self.erase((keys_w[:], values_w[:]))` (`kwargsdict.py`).  Anything
+    /// else stays residual.
     fn try_lower_trait_clone(
         &mut self,
         mir_bb: usize,
@@ -36189,7 +36180,7 @@ impl<'a> Lowering<'a> {
         let Some(self_ty) = self.trait_clone_receiver_ty(reg, first_arg_ty) else {
             return Ok(false);
         };
-        if tyref_is_vec_value(&self_ty, self.llbc) {
+        if tyref_vec_clone_is_ll_copy(&self_ty, self.llbc) {
             self.emit_vec_list_clone(mir_bb, dest_local, recv, dest_ty, target)?;
             return Ok(true);
         }
@@ -36218,7 +36209,7 @@ impl<'a> Lowering<'a> {
     }
 
     fn ty_is_copy_or_vec_clone(&self, ty: &TyRef) -> bool {
-        if tyref_is_vec_value(ty, self.llbc) {
+        if tyref_vec_clone_is_ll_copy(ty, self.llbc) {
             return true;
         }
         tyref_node(ty, self.llbc)
@@ -69967,6 +69958,22 @@ fn trait_payload_owner(v: &serde_json::Value, llbc: &Llbc) -> Option<(String, St
     Some((trait_leaf, method_leaf))
 }
 
+/// `Vec<T>` as trait `Clone::clone` → the `list` builtin
+/// (`rtype_bltn_list` / `rlist.py` `ll_copy`) when T's clone is the
+/// identity copy. `ll_arraycopy` never calls `T::clone`, so a
+/// non-identity element (`Vec<Vec<U>>`, `Vec<String>`) stays residual.
+fn specialized_trait_clone_list_target(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<(Vec<String>, Option<(String, String)>)> {
+    if !is_trait_clone_clone(v, llbc) {
+        return None;
+    }
+    let node = trait_clone_self_node(v, llbc)?;
+    let self_ty = serde_json::from_value::<TyRef>(node.clone()).ok()?;
+    tyref_vec_clone_is_ll_copy(&self_ty, llbc).then(|| (vec!["list".to_string()], None))
+}
+
 /// `CallKind::Trait` payload of `Clone::clone`.
 fn is_trait_clone_clone(v: &serde_json::Value, llbc: &Llbc) -> bool {
     if let Some((trait_leaf, method_leaf)) = trait_payload_owner(v, llbc)
@@ -76520,6 +76527,29 @@ fn tyref_is_vec_value(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc).as_deref() == Some("alloc::vec::Vec")
 }
 
+/// `Vec<T>` whose `Clone` is `rlist.py` `ll_copy` (`ll_arraycopy`).
+/// `ll_copy` copies element words and never calls `T::clone`, so this
+/// matches `Vec<T>::clone` only when T's clone is the identity copy: T
+/// is Copy, or T is a GC reference whose Clone is identity
+/// (`json_ty_is_copy_or_zst_clone_identity`). Nested `Vec` and `String`
+/// stay residual.
+fn tyref_vec_clone_is_ll_copy(ty: &TyRef, llbc: &Llbc) -> bool {
+    if !tyref_is_vec_value(ty, llbc) {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
+        return false;
+    };
+    let Some(elem) = node
+        .pointer("/Adt/generics/types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+    else {
+        return false;
+    };
+    json_ty_is_copy_or_zst_clone_identity(elem, llbc)
+}
+
 /// One `&` / `&mut` / `*const` / `*mut` whose pointee is `alloc::vec::Vec`.
 /// The value is the header address (`RustVecRepr`); `as usize` is a
 /// pointer-to-integer cast, not an integer retype. A `Vec` by value is the
@@ -80241,9 +80271,12 @@ fn can_thread_var_to_block(graph: &FunctionGraph, block: BlockId, var: &Variable
 }
 
 /// `alloc::fmt::format`, `fmt::Arguments` constructors, `fmt::rt::Argument::new_*`,
-/// and the pure helpers that exist only to fill those operands (`kind_name`,
-/// `expected_fmt_arg`, `__len`).  `rtyper/debug.py` `ll_assert` takes a
-/// constant message; rustc still evaluates these before `panic_fmt`.
+/// and `__str_const`.  Graph-less std externs analogous to
+/// `simplify.py` `CanRemoveBuiltins`; rustc still evaluates them before
+/// `panic_fmt`.  Interpreter functions with graphs (`kind_name`,
+/// `expected_fmt_arg`) are not listed: `has_no_side_effects` walks a
+/// flowspace graph under a rtyper and is not reachable from this
+/// `FunctionGraph`-only pass, so those calls stay.
 fn is_abort_message_call(segments: &[String]) -> bool {
     if segments.first().map(String::as_str) == Some("__str_const") {
         return true;
@@ -80255,9 +80288,6 @@ fn is_abort_message_call(segments: &[String]) -> bool {
         return false;
     };
     let leaf = crate::front::clause_spec::unspecialized_leaf(raw_leaf);
-    if is_abort_message_helper_leaf(leaf) {
-        return true;
-    }
     if segments.iter().any(|s| s == "Argument") && leaf.starts_with("new_") {
         return true;
     }
@@ -80269,30 +80299,31 @@ fn is_abort_message_call(segments: &[String]) -> bool {
     {
         return true;
     }
-    // `core::fmt::<Impl>::new` when the owner stayed an `<Impl>` placeholder.
+    // `core::fmt::<Impl>::new` when the owner stayed an `<Impl>` placeholder
+    // (`is_arguments_from_str`: inherent-impl `name_path` carries `<Impl>`,
+    // not `Arguments`).  Needed for that Charon spelling of `Arguments::new`.
     leaf == "new"
         && segments.iter().any(|s| s == "fmt")
         && !segments.iter().any(|s| s == "Argument")
 }
 
-fn is_abort_message_helper_leaf(leaf: &str) -> bool {
-    matches!(leaf, "kind_name" | "expected_fmt_arg" | "__len")
+/// Front-end synthetic `__len` (`Rvalue::Len` / `<str>::is_empty` / vec
+/// length): the `len` of `simplify.py` `CanRemove`.  `can_remove_op` does
+/// not classify a `Call` as removable, so the exact single-segment
+/// `FunctionPath` the front emits is matched here.  Never a Method name.
+fn is_abort_message_synthetic_len(segments: &[String]) -> bool {
+    segments.len() == 1 && segments[0] == "__len"
 }
 
 fn abort_message_call_target(target: &crate::model::CallTarget) -> bool {
     use crate::model::CallTarget;
     match target {
-        CallTarget::FunctionPath { segments, .. } => is_abort_message_call(segments),
-        CallTarget::Method {
-            name,
-            resolved_path,
-            ..
-        } => {
-            resolved_path
-                .as_ref()
-                .is_some_and(|p| is_abort_message_call(&p.segments))
-                || is_abort_message_helper_leaf(name)
+        CallTarget::FunctionPath { segments, .. } => {
+            is_abort_message_call(segments) || is_abort_message_synthetic_len(segments)
         }
+        CallTarget::Method { resolved_path, .. } => resolved_path
+            .as_ref()
+            .is_some_and(|p| is_abort_message_call(&p.segments)),
         CallTarget::SyntheticTransparentCtor { name, .. } => {
             matches!(name.as_str(), "Tuple" | "Array" | "Some")
         }
@@ -80300,17 +80331,25 @@ fn abort_message_call_target(target: &crate::model::CallTarget) -> bool {
     }
 }
 
-fn block_produced_var_ids(block: &crate::model::Block) -> std::collections::HashSet<u64> {
-    block
-        .operations
+/// Result ids of `is_fresh_aggregate_ctor` producers in the abort region.
+/// A ctor in a predecessor region block filling the pieces array counts.
+fn region_fresh_aggregate_ids(
+    graph: &FunctionGraph,
+    region: &std::collections::HashSet<BlockId>,
+) -> std::collections::HashSet<u64> {
+    graph
+        .blocks
         .iter()
+        .filter(|block| region.contains(&block.id))
+        .flat_map(|block| &block.operations)
+        .filter(|op| crate::model::is_fresh_aggregate_ctor(&op.kind))
         .filter_map(|op| op.result.as_ref().map(|r| r.id()))
         .collect()
 }
 
 fn is_abort_message_op(
     kind: &crate::model::OpKind,
-    produced_in_block: &std::collections::HashSet<u64>,
+    fresh_aggregates: &std::collections::HashSet<u64>,
 ) -> bool {
     use crate::model::OpKind;
     match kind {
@@ -80321,18 +80360,22 @@ fn is_abort_message_op(
         // melted message.
         OpKind::Input { .. } => false,
         OpKind::Call { target, .. } => abort_message_call_target(target),
-        OpKind::FieldWrite { base, .. } => produced_in_block.contains(&base.id()),
+        // `remove_simple_mallocs`: a `setfield` is dropped only when its
+        // base is a fresh malloc in the region.  A store through an Input,
+        // a FieldRead, a cast, or any other base is a heap side effect
+        // (`transform_dead_op_vars` never removes `setfield`).
+        OpKind::FieldWrite { base, .. } => fresh_aggregates.contains(&base.id()),
         _ => crate::inline::can_remove_op(kind),
     }
 }
 
 fn abort_message_op_is_live(
     op: &crate::model::SpaceOperation,
-    produced_in_block: &std::collections::HashSet<u64>,
+    fresh_aggregates: &std::collections::HashSet<u64>,
     live: &std::collections::HashSet<u64>,
 ) -> bool {
     use crate::model::OpKind;
-    if !is_abort_message_op(&op.kind, produced_in_block) {
+    if !is_abort_message_op(&op.kind, fresh_aggregates) {
         return false;
     }
     match &op.kind {
@@ -80409,14 +80452,14 @@ fn melt_abort_message_chain(graph: &mut FunctionGraph, abort: BlockId) -> usize 
             }
         }
     }
+    let fresh_aggregates = region_fresh_aggregate_ids(graph, &region_set);
     let mut live = outside_used;
     for block in &graph.blocks {
         if !region_set.contains(&block.id) {
             continue;
         }
-        let produced = block_produced_var_ids(block);
         for op in &block.operations {
-            if is_abort_message_op(&op.kind, &produced) {
+            if is_abort_message_op(&op.kind, &fresh_aggregates) {
                 continue;
             }
             for v in crate::inline::op_variable_refs(&op.kind) {
@@ -80457,11 +80500,10 @@ fn melt_abort_message_chain(graph: &mut FunctionGraph, abort: BlockId) -> usize 
                     }
                 }
             }
-            let produced = block_produced_var_ids(&graph.blocks[bi]);
             let pull: Vec<u64> = graph.blocks[bi]
                 .operations
                 .iter()
-                .filter(|op| abort_message_op_is_live(op, &produced, &live))
+                .filter(|op| abort_message_op_is_live(op, &fresh_aggregates, &live))
                 .flat_map(|op| crate::inline::op_variable_refs(&op.kind))
                 .map(|v| v.id())
                 .collect();
@@ -80477,14 +80519,13 @@ fn melt_abort_message_chain(graph: &mut FunctionGraph, abort: BlockId) -> usize 
         if !region_set.contains(&block.id) {
             continue;
         }
-        let produced = block_produced_var_ids(block);
         let dead: Vec<usize> = block
             .operations
             .iter()
             .enumerate()
             .filter(|(_, op)| {
-                is_abort_message_op(&op.kind, &produced)
-                    && !abort_message_op_is_live(op, &produced, &live)
+                is_abort_message_op(&op.kind, &fresh_aggregates)
+                    && !abort_message_op_is_live(op, &fresh_aggregates, &live)
             })
             .map(|(i, _)| i)
             .collect();
@@ -92378,52 +92419,183 @@ mod tests {
         );
     }
 
-    #[test]
-    fn trait_clone_of_vec_is_list_builtin() {
-        let vec_ty = named_adt(0, vec![named_adt(1, vec![])]);
-        let llbc = trait_clone_call_fixture(
-            "clone_vec",
-            vec_ty,
-            vec![
-                type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
-                type_decl_struct(1, &["pyre_object", "object", "PyObjectRef"], vec![]),
-            ],
-        );
-        let graph = super::lower_function(&llbc, "clone_vec").expect("lower Vec Clone");
-        let ops = graph_ops(&graph);
-        let leaves = call_leafs(&ops);
-        assert!(
-            leaves.iter().any(|leaf| *leaf == "list"),
-            "Vec Clone::clone must become the list builtin; ops={ops:?}"
-        );
-        assert!(
-            !leaves.iter().any(|leaf| *leaf == "clone"),
-            "Vec Clone::clone must not residualize; ops={ops:?}"
-        );
+    fn i64_ty() -> serde_json::Value {
+        serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})
     }
 
-    #[test]
-    fn trait_clone_of_vec_pair_is_two_list_copies_and_tuple() {
-        let vec_ty = named_adt(0, vec![named_adt(1, vec![])]);
-        let tuple_ty = serde_json::json!({
+    fn vec_of(elem: serde_json::Value) -> serde_json::Value {
+        named_adt(0, vec![elem])
+    }
+
+    fn gc_ref_ty() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [named_adt(1, vec![]), "Mut"]})
+    }
+
+    fn string_ty() -> serde_json::Value {
+        named_adt(1, vec![])
+    }
+
+    fn vec_type_decls() -> Vec<serde_json::Value> {
+        vec![type_decl_struct(0, &["alloc", "vec", "Vec"], vec![])]
+    }
+
+    fn vec_gcref_type_decls() -> Vec<serde_json::Value> {
+        vec![
+            type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(1, &["pyre_object", "pyobject", "PyObject"], vec![]),
+        ]
+    }
+
+    fn vec_string_type_decls() -> Vec<serde_json::Value> {
+        let ptr = serde_json::json!({
+            "name": "ptr",
+            "ty": {"Scalar": {"Integer": {"Unsigned": "Usize"}}},
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            }
+        });
+        vec![
+            type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
+            type_decl_struct(1, &["alloc", "string", "String"], vec![ptr]),
+        ]
+    }
+
+    fn trait_clone_kind_payload(self_ty: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([
+            {
+                "kind": {"BuiltinOrAuto": {"builtin_data": "Clone"}},
+                "trait_decl_ref": {
+                    "skip_binder": {
+                        "id": 0,
+                        "generics": {
+                            "regions": [],
+                            "types": [self_ty],
+                            "const_generics": [],
+                            "trait_refs": []
+                        }
+                    }
+                }
+            },
+            0
+        ])
+    }
+
+    fn tuple_ty(elems: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
             "Adt": {
                 "builtin": "Tuple",
                 "generics": {
                     "regions": [],
-                    "types": [vec_ty.clone(), vec_ty.clone()],
+                    "types": elems,
                     "const_generics": [],
                     "trait_refs": []
                 }
             }
-        });
-        let llbc = trait_clone_call_fixture(
-            "clone_vec_pair",
-            tuple_ty,
-            vec![
-                type_decl_struct(0, &["alloc", "vec", "Vec"], vec![]),
-                type_decl_struct(1, &["pyre_object", "object", "PyObjectRef"], vec![]),
-            ],
+        })
+    }
+
+    fn assert_trait_clone_is_list(
+        caller: &str,
+        self_ty: serde_json::Value,
+        decls: Vec<serde_json::Value>,
+    ) {
+        let llbc = trait_clone_call_fixture(caller, self_ty, decls);
+        let graph = super::lower_function(&llbc, caller).expect("lower identity-element Vec Clone");
+        let ops = graph_ops(&graph);
+        let leaves = call_leafs(&ops);
+        assert!(
+            leaves.iter().any(|leaf| *leaf == "list"),
+            "Vec Clone::clone with identity-copy T must become the list builtin; ops={ops:?}"
         );
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "clone"),
+            "Vec Clone::clone with identity-copy T must not residualize; ops={ops:?}"
+        );
+    }
+
+    fn assert_trait_clone_stays_residual(
+        caller: &str,
+        self_ty: serde_json::Value,
+        decls: Vec<serde_json::Value>,
+    ) {
+        let llbc = trait_clone_call_fixture(caller, self_ty.clone(), decls);
+        let payload = trait_clone_kind_payload(self_ty);
+        assert!(
+            super::specialized_trait_clone_list_target(&payload, &llbc).is_none(),
+            "CallKind::Trait retarget must not intercept a non-identity-element Vec"
+        );
+        let graph = super::lower_function(&llbc, caller).expect("lower non-identity Vec Clone");
+        let ops = graph_ops(&graph);
+        let leaves = call_leafs(&ops);
+        assert!(
+            leaves.iter().any(|leaf| *leaf == "clone"),
+            "non-identity-element Vec Clone::clone must stay residual; ops={ops:?}"
+        );
+        assert!(
+            !leaves.iter().any(|leaf| *leaf == "list"),
+            "non-identity-element Vec Clone::clone must not become list; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_vec_i64_is_list_builtin() {
+        let vec_ty = vec_of(i64_ty());
+        let payload = trait_clone_kind_payload(vec_ty.clone());
+        let llbc = trait_clone_call_fixture("clone_vec_i64", vec_ty.clone(), vec_type_decls());
+        assert_eq!(
+            super::specialized_trait_clone_list_target(&payload, &llbc).map(|(path, _)| path),
+            Some(vec!["list".to_string()]),
+            "CallKind::Trait retarget must send Vec<i64>::clone to list"
+        );
+        assert_trait_clone_is_list("clone_vec_i64", vec_ty, vec_type_decls());
+    }
+
+    #[test]
+    fn trait_clone_of_vec_gcref_is_list_builtin() {
+        let vec_ty = vec_of(gc_ref_ty());
+        let payload = trait_clone_kind_payload(vec_ty.clone());
+        let llbc =
+            trait_clone_call_fixture("clone_vec_gcref", vec_ty.clone(), vec_gcref_type_decls());
+        assert_eq!(
+            super::specialized_trait_clone_list_target(&payload, &llbc).map(|(path, _)| path),
+            Some(vec!["list".to_string()]),
+            "CallKind::Trait retarget must send Vec<GC-ref>::clone to list"
+        );
+        assert_trait_clone_is_list("clone_vec_gcref", vec_ty, vec_gcref_type_decls());
+    }
+
+    #[test]
+    fn trait_clone_of_vec_of_vec_is_not_list() {
+        assert_trait_clone_stays_residual(
+            "clone_vec_of_vec",
+            vec_of(vec_of(i64_ty())),
+            vec_type_decls(),
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_vec_of_string_is_not_list() {
+        assert_trait_clone_stays_residual(
+            "clone_vec_of_string",
+            vec_of(string_ty()),
+            vec_string_type_decls(),
+        );
+    }
+
+    #[test]
+    fn trait_clone_of_nested_vec_tuple_is_not_list() {
+        let self_ty = tuple_ty(vec![vec_of(vec_of(i64_ty())), i64_ty()]);
+        assert_trait_clone_stays_residual("clone_nested_vec_tuple", self_ty, vec_type_decls());
+    }
+
+    #[test]
+    fn trait_clone_of_vec_pair_is_two_list_copies_and_tuple() {
+        let vec_ty = vec_of(i64_ty());
+        let tuple = tuple_ty(vec![vec_ty.clone(), vec_ty]);
+        let llbc = trait_clone_call_fixture("clone_vec_pair", tuple, vec_type_decls());
         let graph = super::lower_function(&llbc, "clone_vec_pair").expect("lower (Vec, Vec) Clone");
         let ops = graph_ops(&graph);
         let list_calls = call_leafs(&ops)
@@ -113658,6 +113830,273 @@ mod tests {
         assert!(
             !has_implicit_assertion_error(&graph),
             "live format! must not become RaiseImplicit(AssertionError): {graph:#?}"
+        );
+    }
+
+    fn melt_abort_fixture_input(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        name: &str,
+    ) -> crate::flowspace::model::Variable {
+        let var = graph
+            .push_op_var(
+                block,
+                OpKind::Input {
+                    name: name.into(),
+                    ty: ValueType::Ref(Some("Obj".into())),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(block, var.clone());
+        var
+    }
+
+    fn melt_abort_field_write(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        base: crate::flowspace::model::Variable,
+        field: &str,
+        value: crate::flowspace::model::Variable,
+    ) {
+        graph.push_op_var(
+            block,
+            OpKind::FieldWrite {
+                base,
+                field: FieldDescriptor::new(field, Some("Obj".into())),
+                value: LinkArg::Value(value),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+    }
+
+    fn melt_abort_format_of(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        x: crate::flowspace::model::Variable,
+    ) {
+        let arg = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path(["fmt", "rt", "Argument", "new_display"]),
+                    args: crate::model::call_args(vec![x]),
+                    result_ty: ValueType::Ref(Some("Argument".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let args = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path(["fmt", "Arguments", "new"]),
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: ValueType::Ref(Some("Arguments".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            block,
+            OpKind::Call {
+                target: CallTarget::function_path(["alloc", "fmt", "format"]),
+                args: crate::model::call_args(vec![args]),
+                result_ty: ValueType::Str,
+            },
+            true,
+        );
+    }
+
+    fn melt_abort_field_names(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } => Some(field.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `input obj; obj.field = v; panic!("{}", x)` — the store is a heap
+    /// side effect (`transform_dead_op_vars` never removes `setfield`).
+    #[test]
+    fn melt_keeps_field_write_into_input_object() {
+        let mut graph = FunctionGraph::new("melt_input_store");
+        let entry = graph.startblock;
+        let obj = melt_abort_fixture_input(&mut graph, entry, "obj");
+        let x = melt_abort_fixture_input(&mut graph, entry, "x");
+        let v = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        melt_abort_field_write(&mut graph, entry, obj, "field", v);
+        melt_abort_format_of(&mut graph, entry, x);
+        graph.set_raise_implicit(entry, "AssertionError");
+
+        super::melt_abort_message_chain(&mut graph, entry);
+
+        assert!(
+            melt_abort_field_names(&graph).iter().any(|n| n == "field"),
+            "store into an Input object must survive: {graph:#?}"
+        );
+        assert!(
+            leftover_fmt_message_paths(&graph).is_empty(),
+            "panic! format operands must still melt: leftover={:?} graph={graph:#?}",
+            leftover_fmt_message_paths(&graph)
+        );
+    }
+
+    /// `let inner = obj.inner; inner.f = v; panic!` — the base is a
+    /// FieldRead, not a fresh malloc, so the store stays.
+    #[test]
+    fn melt_keeps_field_write_through_field_read_base() {
+        let mut graph = FunctionGraph::new("melt_field_read_store");
+        let entry = graph.startblock;
+        let obj = melt_abort_fixture_input(&mut graph, entry, "obj");
+        let v = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let inner = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: obj,
+                    field: FieldDescriptor::new("inner", Some("Obj".into())),
+                    ty: ValueType::Ref(Some("Inner".into())),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        melt_abort_field_write(&mut graph, entry, inner, "f", v);
+        graph.set_raise_implicit(entry, "AssertionError");
+
+        super::melt_abort_message_chain(&mut graph, entry);
+
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "inner"
+            )),
+            "FieldRead that feeds a live store must survive: {graph:#?}"
+        );
+        assert!(
+            melt_abort_field_names(&graph).iter().any(|n| n == "f"),
+            "store through a FieldRead base must survive: {graph:#?}"
+        );
+    }
+
+    /// Pieces array constructed in a predecessor region block, filled,
+    /// then fed only to `Arguments::new` on the abort — melted
+    /// (`remove_simple_mallocs` of a fresh aggregate).
+    #[test]
+    fn melt_drops_field_writes_into_fresh_pieces_array() {
+        let mut graph = FunctionGraph::new("melt_pieces_array");
+        let pred = graph.startblock;
+        let abort = graph.create_block();
+        let byte = graph
+            .push_op_var(pred, OpKind::ConstInt(b'x' as i64), true)
+            .unwrap();
+        let pieces = graph
+            .push_op_var(
+                pred,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Array"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("Array".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            pred,
+            OpKind::FieldWrite {
+                base: pieces.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Array".into())),
+                value: LinkArg::Value(byte),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let pieces_in = graph.alloc_value_var();
+        graph.push_inputarg_var(abort, pieces_in.clone());
+        graph.set_goto(pred, abort, vec![pieces]);
+        graph
+            .push_op_var(
+                abort,
+                OpKind::Call {
+                    target: CallTarget::function_path(["fmt", "Arguments", "new"]),
+                    args: crate::model::call_args(vec![pieces_in]),
+                    result_ty: ValueType::Ref(Some("Arguments".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_raise_implicit(abort, "AssertionError");
+
+        super::melt_abort_message_chain(&mut graph, abort);
+
+        let leftover = leftover_fmt_message_paths(&graph);
+        assert!(
+            leftover.is_empty(),
+            "Arguments::new of a dead pieces array must melt: leftover={leftover:?} graph={graph:#?}"
+        );
+        assert!(
+            melt_abort_field_names(&graph).is_empty(),
+            "stores into the fresh pieces array must melt: {graph:#?}"
+        );
+        let has_array_ctor = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == "Array"
+            )
+        });
+        assert!(
+            !has_array_ctor,
+            "dead pieces Array ctor must melt: {graph:#?}"
+        );
+    }
+
+    /// A user method named `kind_name` whose result is unused before a
+    /// panic is not a `CanRemoveBuiltins` extern; the call stays.
+    #[test]
+    fn melt_keeps_user_method_named_kind_name() {
+        let mut graph = FunctionGraph::new("melt_kind_name_method");
+        let entry = graph.startblock;
+        let obj = melt_abort_fixture_input(&mut graph, entry, "obj");
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::method("kind_name", Some("Obj".into())),
+                args: crate::model::call_args(vec![obj]),
+                result_ty: ValueType::Str,
+            },
+            true,
+        );
+        graph.set_raise_implicit(entry, "AssertionError");
+
+        super::melt_abort_message_chain(&mut graph, entry);
+
+        let has_kind_name = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "kind_name"
+            )
+        });
+        assert!(
+            has_kind_name,
+            "user method kind_name must survive: {graph:#?}"
         );
     }
 

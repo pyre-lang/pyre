@@ -49,6 +49,8 @@ pub mod minmax;
 // `str.contains` for the rich-`OpKind` spine — mints `ll_find` (`rstr.py`
 // `rtype_contains`).
 pub mod strfind;
+// `str::as_ptr` residual of `rffi.get_raw_address_of_string`.
+pub mod get_raw_address;
 // Opname-dispatch transducer ("Spine B"): lowers rtyper low-level helper
 // graphs (opname `SpaceOperation`s) to rich-`OpKind` graphs that re-enter the
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s

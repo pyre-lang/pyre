@@ -221,14 +221,15 @@ pub const BC_SETARRAYITEM_RAW_F: u8 = 37;
 /// are u16, so a PC green fits this form and stays a `ConstInt` at the
 /// merge without consuming the shared one-byte pool.
 pub const BC_MOVE_I_D: u8 = 38;
-// slots 39..=40 (formerly BC_CALL_MAY_FORCE_{REF,FLOAT}) freed —
-// the may_force policy now rides on
-// `EffectInfo.extraeffect = EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE` carried
-// by the canonical `BC_RESIDUAL_CALL_{R,IR,IRF}_{I,R,F}` family
-// (`effectinfo.py`). Slot 38 (formerly BC_CALL_MAY_FORCE_INT) is
-// `BC_MOVE_I_D`.
-// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed — same
-// EffectInfo-carries-policy rationale as above; see slots 39..=40.
+// `record_exact_value_i/ii` / `record_exact_value_r/rr` —
+// `jtransform.py rewrite_op_jit_record_exact_value` +
+// `pyjitpl.py opimpl_record_exact_value_{i,r}` +
+// `blackhole.py bhimpl_record_exact_value_{i,r}`. Argcodes `ii` / `rr`
+// (value + expected const, no result).
+pub const BC_RECORD_EXACT_VALUE_I: u8 = 39;
+pub const BC_RECORD_EXACT_VALUE_R: u8 = 40;
+// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed — release/may-force
+// policy rides on `EffectInfo.extraeffect`.
 // slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed
 // — release-GIL policy rides on
 // `EffectInfo.call_release_gil_target` (`effectinfo.py
@@ -1225,6 +1226,10 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("ref_isvirtual/r>i", BC_REF_ISVIRTUAL);
     m.insert("int_isvirtual/i>i", BC_INT_ISVIRTUAL);
     m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
+    // `record_exact_value_{i,r}` — `jtransform.py rewrite_op_jit_record_exact_value`.
+    // Void at blackhole resume (`bhimpl_record_exact_value_{i,r}`).
+    m.insert("record_exact_value_i/ii", BC_RECORD_EXACT_VALUE_I);
+    m.insert("record_exact_value_r/rr", BC_RECORD_EXACT_VALUE_R);
     // `guard_class` — `blackhole.py bhimpl_guard_class`; see `BC_GUARD_CLASS`.
     m.insert("guard_class/r>i", BC_GUARD_CLASS);
     m.insert("guard_class/r>r", BC_GUARD_CLASS_R);

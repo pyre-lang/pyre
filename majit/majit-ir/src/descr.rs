@@ -7453,6 +7453,10 @@ pub struct SimpleFieldDescrSpec {
     /// pre-applied guess, so a producer that only guessed does not outrank one
     /// that knows.
     pub is_class_word: Option<bool>,
+    /// Stored Acquire stamp. Unioned with the `w_globals` name predicate in
+    /// `FieldDescr::load_is_acquire`. `descr.py` `get_field_descr` keeps one
+    /// descr object per `(STRUCT, fieldname)`; the bit is part of that mint.
+    pub load_is_acquire: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -7612,7 +7616,7 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
                 // themselves — the deserialized-`BhDescr::Field` path.
                 Some(spec.index_in_parent + leading_len),
                 spec.is_class_word,
-                false,
+                spec.load_is_acquire,
             )
         })
         .collect();
@@ -8039,7 +8043,7 @@ fn make_simple_descr_group_inner(
                         )),
                     } as u8),
                     index_in_parent: spec.index_in_parent,
-                    load_is_acquire: false,
+                    load_is_acquire: spec.load_is_acquire,
                     parent_descr: RwLock::new(Some(parent_descr.clone())),
                     vinfo: RwLock::new(None),
                 })
@@ -9642,6 +9646,7 @@ mod register_keyed_size_authority_tests {
             virtualizable: false,
             index_in_parent,
             is_class_word: Some(false),
+            load_is_acquire: false,
         };
         let stamped = make_simple_descr_group_keyed_with_headerless(
             7,
@@ -9737,6 +9742,7 @@ mod register_keyed_size_authority_tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 is_class_word: Some(false),
+                load_is_acquire: false,
             }],
             &[],
         );
@@ -9763,6 +9769,7 @@ mod register_keyed_size_authority_tests {
             virtualizable: false,
             index_in_parent: 0,
             is_class_word: Some(false),
+            load_is_acquire: false,
         };
         let first = make_simple_descr_group_keyed_with_headerless(
             3,
@@ -9828,6 +9835,7 @@ mod register_keyed_size_authority_tests {
             virtualizable: false,
             index_in_parent: 0,
             is_class_word: Some(false),
+            load_is_acquire: false,
         };
         let class_word: Arc<dyn FieldDescr> = Arc::new(
             SimpleFieldDescr::new_with_name(
@@ -10513,6 +10521,7 @@ mod register_keyed_size_authority_tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 is_class_word: Some(false),
+                load_is_acquire: false,
             };
             let group = make_simple_descr_group_keyed_with_headerless(
                 u32::MAX,
@@ -10607,6 +10616,7 @@ mod register_keyed_size_authority_tests {
             virtualizable: false,
             index_in_parent: 0,
             is_class_word: Some(false),
+            load_is_acquire: false,
         };
         let group = make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
@@ -11277,6 +11287,7 @@ mod tests {
             virtualizable: false,
             index_in_parent: idx,
             is_class_word: Some(false),
+            load_is_acquire: false,
         };
         let header: Arc<dyn FieldDescr> = Arc::new(
             SimpleFieldDescr::new_with_name(
@@ -11361,6 +11372,7 @@ mod tests {
             virtualizable: false,
             index_in_parent: idx,
             is_class_word: Some(false),
+            load_is_acquire: false,
         };
         let header: Arc<dyn FieldDescr> = Arc::new(
             SimpleFieldDescr::new_with_name(
