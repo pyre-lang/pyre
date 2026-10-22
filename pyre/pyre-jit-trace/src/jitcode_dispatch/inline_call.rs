@@ -16086,25 +16086,29 @@ fn descend_generatorentry<Sym: WalkSym>(
     }
     // `next()` sends `w_None`. Same object the portal red `w_arg` carries.
     let w_arg = pyre_object::w_none();
-    // Same cell key `genentry_merge_point_jit` resolves (`warmstate.py
-    // JitCell`): `(pycode, jd index)` on `jitdrivers_sd[2].warmstate`,
-    // not jd0's `make_green_key(pycode, 0, false)`.
+    // Same cell as `genentry_merge_point_jit` (`warmstate.py JitCell`):
+    // greens are `pycode` (`_green_args_spec`); the warmstate is
+    // `jitdrivers_sd[GENERATORENTRY_JD_INDEX]`. jd0's
+    // `(next_instr, is_being_profiled, pycode)` cell is another driver
+    // (`BaseJitCell.jitdriver_sd`).
     let typed_key = crate::genentry_state::genentry_green_key(pycode);
     let green_key = {
         let (driver, _) = crate::driver::driver_pair();
         crate::genentry_state::genentry_resolved_cell_key(
-            &driver.meta_interp_mut().warm_state_for_driver(2),
+            &driver
+                .meta_interp_mut()
+                .warm_state_for_driver(crate::genentry_state::GENERATORENTRY_JD_INDEX),
             pycode,
         )
     };
     let (driver, _) = crate::driver::driver_pair();
     let greenboxes = [majit_ir::Value::Ref(majit_ir::GcRef(pycode as usize))];
     let red_types = [majit_ir::Type::Ref, majit_ir::Type::Ref];
-    // `jitdrivers_sd[2]` is `generatorentry` (registered immediately after jd1).
+    // `jitdrivers_sd[GENERATORENTRY_JD_INDEX]` is `generatorentry`.
     let Some(token) = driver
         .meta_interp_mut()
         .get_or_make_jitdriver_assembler_token_arc(
-            2,
+            crate::genentry_state::GENERATORENTRY_JD_INDEX,
             green_key,
             Some(&typed_key),
             &greenboxes,

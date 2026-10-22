@@ -59,25 +59,17 @@ pub struct GenEntryJitState {
     pub pycode: PyObjectRef,
 }
 
-/// `jitdrivers_sd` index of `generatorentry_driver`. Part of the cell
-/// identity: jd0's cell for `(next_instr=0, is_being_profiled=false, pycode)`
-/// is a different `JitCell` (`warmstate.py`).
-pub const GENERATORENTRY_JD_INDEX: i64 = 2;
+/// `jitdrivers_sd` index of `generatorentry_driver`.
+pub const GENERATORENTRY_JD_INDEX: usize = 2;
 
-/// jd2 greens `(pycode, driver index)` as a `GreenKey`.
+/// jd2 greens `(pycode)` as a `GreenKey` (`generator.py` `greens=['pycode']`).
 pub fn genentry_green_key(pycode: PyObjectRef) -> GreenKey {
-    GreenKey::with_types(
-        vec![pycode as i64, GENERATORENTRY_JD_INDEX],
-        vec![GreenType::Ref, GreenType::Int],
-    )
+    GreenKey::with_types(vec![pycode as i64], vec![GreenType::Ref])
 }
 
-/// Hash of the jd2 greens `(pycode, driver index)`.
+/// Hash of the jd2 greens `(pycode)`.
 pub fn genentry_green_hash(pycode: PyObjectRef) -> u64 {
-    majit_metainterp::green_key_hash_typed(
-        &[pycode as i64, GENERATORENTRY_JD_INDEX],
-        &[GreenType::Ref, GreenType::Int],
-    )
+    majit_metainterp::green_key_hash_typed(&[pycode as i64], &[GreenType::Ref])
 }
 
 /// `warmstate.py JitCell.get_jitcell`: resolve once and carry the cell key.
@@ -173,29 +165,18 @@ mod tests {
     #[test]
     fn genentry_resolved_cell_key_reads_the_warmstate_it_is_handed() {
         // several_yields CALL_ASSEMBLER and eval.rs genentry_merge_point
-        // resolve on jitdrivers_sd[2].warmstate. A colliding typed squatter
-        // occupies the bucket so the genentry cell is minted (cell_key != hash).
-        // Portal slot 0 has no such cell, so it still answers the raw hash.
+        // resolve on jitdrivers_sd[GENERATORENTRY_JD_INDEX].warmstate. A
+        // colliding typed squatter occupies the bucket so the genentry cell
+        // is minted (cell_key != hash). Portal slot 0 has no such cell, so
+        // it still answers the raw hash.
         let portal = WarmEnterState::new(1039);
         let mut jd2 = WarmEnterState::new(1039);
         let pycode = 0x51ED as PyObjectRef;
         let typed = genentry_green_key(pycode);
         let hash = typed.get_uhash();
-        // Occupy the production hash with a different key so `typed` mints.
-        // Same two-green shape as `genentry_green_key`; the last Int is the
-        // xor that makes `get_uhash` agree (`warmstate.py` fold).
-        let squatter = {
-            use majit_ir::{GREEN_UHASH_SEED, green_uhash_step};
-            let other_prefix = green_uhash_step(GREEN_UHASH_SEED, typed.types[0], typed.values[0]);
-            let this_prefix = green_uhash_step(GREEN_UHASH_SEED, GreenType::Ref, 1);
-            GreenKey::with_types(
-                vec![
-                    1,
-                    (this_prefix ^ other_prefix ^ (typed.values[1] as u64)) as i64,
-                ],
-                vec![GreenType::Ref, GreenType::Int],
-            )
-        };
+        // Occupy the production hash with a two-Int squatter so `typed`
+        // mints. Same get_uhash, different comparekey (`warmstate.py` fold).
+        let squatter = colliding_squatter_key(&typed);
         assert_eq!(squatter.get_uhash(), hash);
         assert_ne!(squatter, typed);
         jd2.disable_noninlinable_function_for_key(&squatter);
@@ -213,6 +194,38 @@ mod tests {
             genentry_resolved_cell_key(&portal, pycode),
             hash,
             "portal slot 0 has no genentry cell for these greens"
+        );
+    }
+
+    /// Two-Int key whose `get_uhash` equals `typed`'s.
+    ///
+    /// The multiplicative inverse of `GREEN_UHASH_MULT` undoes the last
+    /// `green_uhash_step`, so the genentry cell mints a cell key. The
+    /// squatter's shape need not match: the cell chain is bucketed by
+    /// hash and filtered by `comparekey`.
+    fn colliding_squatter_key(typed: &GreenKey) -> GreenKey {
+        use majit_ir::{GREEN_UHASH_MULT, GREEN_UHASH_SEED, green_uhash_step};
+        let hash = typed.get_uhash();
+        let mut inverse: u64 = 1;
+        for _ in 0..6 {
+            inverse =
+                inverse.wrapping_mul(2u64.wrapping_sub(GREEN_UHASH_MULT.wrapping_mul(inverse)));
+        }
+        let first = 1i64;
+        let prefix = green_uhash_step(GREEN_UHASH_SEED, GreenType::Int, first);
+        GreenKey::new(vec![first, (prefix ^ hash.wrapping_mul(inverse)) as i64])
+    }
+
+    #[test]
+    fn genentry_green_key_matches_descriptor_green_args_spec() {
+        // `descend_generatorentry` types the cell as `genentry_green_key(p)`;
+        // `recursive_call_inline_or_assembler` builds the same `GreenKey`
+        // from `jd.green_args_spec()` (`_green_args_spec` / `pycode`).
+        let p = 0x51ED as PyObjectRef;
+        let jd2 = GenEntryJitState::generatorentry_driver_descriptor();
+        assert_eq!(
+            genentry_green_key(p),
+            GreenKey::with_types(vec![p as i64], jd2.green_args_spec()),
         );
     }
 }

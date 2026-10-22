@@ -6097,7 +6097,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd2.handle_jitexc_from_bh = Some(generatorentry_portal_runner);
     d.meta_interp_mut().register_jitdriver_sd(jd2);
     d.meta_interp_mut()
-        .jitdriver_sd_mut(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize)
+        .jitdriver_sd_mut(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX)
         .expect("generatorentry jitdrivers_sd slot")
         .mainjitcode_loader = Some(load_genentry_portal_mainjitcode);
     // rlib/jit.py `set_param(driver, 'threshold', n)` on that driver's
@@ -6105,7 +6105,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     let extra_threshold = i64::from(jd1_trace_threshold());
     for jd_no in [
         pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
-        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize,
+        pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
     ] {
         d.meta_interp_mut()
             .warm_state_for_driver(jd_no)
@@ -8215,9 +8215,11 @@ fn genentry_merge_point_jit(
         }
         return None;
     };
-    // The resume pc is not a green. `pycode` plus the driver index keys
-    // the loop (`warmstate.py JitCell`); jd0's `(pycode, 0, false)` cell
-    // is a different key. The red frame's `last_instr` distinguishes yields.
+    // The resume pc is not a green. `pycode` keys the loop
+    // (`warmstate.py JitCell`); jd0's `(next_instr, is_being_profiled,
+    // pycode)` cell is another driver (`isinstance` /
+    // `BaseJitCell.jitdriver_sd`). The red frame's `last_instr`
+    // distinguishes yields.
     let green_key = genentry_resolved_cell_key(pycode);
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
@@ -8228,7 +8230,7 @@ fn genentry_merge_point_jit(
         driver
             .meta_interp_mut()
             .maybe_compile_and_run_step_on_driver(
-                pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize,
+                pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
                 green_key,
                 (0, 0),
             )
@@ -8254,12 +8256,14 @@ fn genentry_merge_point_jit(
     driven
 }
 
-/// Cell key for `jitdrivers_sd[2]`. Resolved on that driver's
-/// `WarmEnterState` (`warmstate.py JitCell`).
+/// Cell key for `jitdrivers_sd[GENERATORENTRY_JD_INDEX]`. Resolved on that
+/// driver's `WarmEnterState` (`warmstate.py JitCell`).
 fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
     let (driver, _) = driver_pair();
     pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
-        &driver.meta_interp_mut().warm_state_for_driver(2),
+        &driver
+            .meta_interp_mut()
+            .warm_state_for_driver(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX),
         pycode,
     )
 }
@@ -8327,10 +8331,10 @@ fn drive_generatorentry_trace(
         let mut descriptor =
             pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
         descriptor.index = jitcode.jitdriver_sd();
-        // The jd2 greens `(pycode, driver index)` go in as `greenargs`
-        // (`warmstate.py bound_reached` `JitCell(*greenargs)`); `(0, 0)`
-        // keeps the raw-pair rebinding to jd0's `(next_instr,
-        // is_being_profiled, pycode)` cell out.
+        // greenargs are `JitCell(*greenargs)` of `_green_args_spec`
+        // (`pycode`); `(0, 0)` is the no-raw-pair sentinel.
+        // `force_start_tracing` keeps passing `Some((&gk.values, &gk.types))`
+        // so that pair never rebuilds the pypyjit 3-tuple.
         publish_kind0_descrs_before_trace();
         install_build_time_liveness_before_trace(meta);
         meta.force_start_tracing(
@@ -8626,20 +8630,25 @@ fn run_compiled_generatorentry(
         let extracted = {
             let (driver, _) = driver_pair();
             let meta = driver.meta_interp_mut();
-            meta.run_compiled_detailed_with_values_on_driver(2, green_key, &live_values, 0)
-                .map(|r| {
-                    (
-                        r.is_finish,
-                        r.is_exit_frame_with_exception,
-                        r.fail_index,
-                        r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
-                        majit_metainterp::raw_exit_values(&r.typed_values),
-                        r.exit_layout.clone(),
-                        r.exception.exc_value,
-                        r.descr_arc.clone(),
-                        r.guard_value_operand,
-                    )
-                })
+            meta.run_compiled_detailed_with_values_on_driver(
+                pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
+                green_key,
+                &live_values,
+                0,
+            )
+            .map(|r| {
+                (
+                    r.is_finish,
+                    r.is_exit_frame_with_exception,
+                    r.fail_index,
+                    r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
+                    majit_metainterp::raw_exit_values(&r.typed_values),
+                    r.exit_layout.clone(),
+                    r.exception.exc_value,
+                    r.descr_arc.clone(),
+                    r.guard_value_operand,
+                )
+            })
         };
         let Some((
             is_finish,
