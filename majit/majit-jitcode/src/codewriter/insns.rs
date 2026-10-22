@@ -225,11 +225,12 @@ pub const BC_MOVE_I_D: u8 = 38;
 // `jtransform.py rewrite_op_jit_record_exact_value` +
 // `pyjitpl.py opimpl_record_exact_value_{i,r}` +
 // `blackhole.py bhimpl_record_exact_value_{i,r}`. Argcodes `ii` / `rr`
-// (value + expected const, no result).
-pub const BC_RECORD_EXACT_VALUE_I: u8 = 39;
+// (value + expected const, no result).  The `i` form takes 41, the
+// lowest unused byte (`BC_JIT_FORCE_QUASI_IMMUTABLE` holds 39; the `r`
+// sibling holds 40). Slot 41 was the former `CALL_MAY_FORCE_VOID` byte;
+// release/may-force policy rides on `EffectInfo.extraeffect`.
+pub const BC_RECORD_EXACT_VALUE_I: u8 = 41;
 pub const BC_RECORD_EXACT_VALUE_R: u8 = 40;
-// slot 41 (formerly BC_CALL_MAY_FORCE_VOID) freed — release/may-force
-// policy rides on `EffectInfo.extraeffect`.
 // slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed
 // — release-GIL policy rides on
 // `EffectInfo.call_release_gil_target` (`effectinfo.py
