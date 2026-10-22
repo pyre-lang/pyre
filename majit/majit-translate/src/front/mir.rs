@@ -25743,19 +25743,6 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
-                // A `default()` whose destination is zero-sized, or a struct
-                // declared with no fields and no recorded non-zero size, is
-                // the unit value. Any other `default` — one whose body draws
-                // keys, in particular — stays the ordinary call below.
-                if args.len() <= 1
-                    && self.is_zero_sized_or_fieldless_default(mir_bb, &reg, &call.dest.ty)
-                {
-                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `<(A, B, …) as Default>::default` is `TupleRepr.newtuple`
                 // of each element's default: malloc of the tuple GcStruct
                 // plus one setfield per item. A residual
@@ -36811,32 +36798,6 @@ impl<'a> Lowering<'a> {
             },
         });
         res
-    }
-
-    /// A `default` whose destination is zero-sized, or a struct declared
-    /// with no fields whose layout does not record a non-zero size. The
-    /// decision is the type, not its name. Any other `default` stays the
-    /// ordinary call (`call_target_segments`).
-    fn is_zero_sized_or_fieldless_default(
-        &self,
-        mir_bb: usize,
-        reg: &RegularCall,
-        dest_ty: &TyRef,
-    ) -> bool {
-        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg, None) else {
-            return false;
-        };
-        if emitted.last().map(String::as_str) != Some("default") {
-            return false;
-        }
-        if tyref_keeps_empty_class_instance(dest_ty, self.llbc, self.tombstoned_leaves) {
-            return false;
-        }
-        if tyref_is_zero_sized(dest_ty, self.llbc) {
-            return true;
-        }
-        tyref_is_fieldless_struct(dest_ty, self.llbc)
-            && !tyref_has_nonzero_layout_size(dest_ty, self.llbc)
     }
 
     fn is_slice_iter_copied(&self, mir_bb: usize, reg: &RegularCall) -> bool {
@@ -63514,28 +63475,6 @@ fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
         .and_then(|def_id| llbc.type_by_id(def_id))
         .and_then(|td| td.layout_for_target(llbc, &target))
         .is_some_and(|layout| layout.size == Some(0))
-}
-
-/// A struct whose declaration lists no fields. A reference is not peeled:
-/// the predicate is about the value `default` returns.
-fn tyref_is_fieldless_struct(ty: &TyRef, llbc: &Llbc) -> bool {
-    let Some(def_id) = tyref_adt_def_id_of(ty, llbc) else {
-        return false;
-    };
-    let Some(td) = llbc.type_by_id(def_id) else {
-        return false;
-    };
-    matches!(&td.kind, TypeDeclKind::Struct(fields) if fields.is_empty())
-}
-
-/// The recorded layout size is present and not zero. A missing layout
-/// does not contradict a field-less declaration.
-fn tyref_has_nonzero_layout_size(ty: &TyRef, llbc: &Llbc) -> bool {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    tyref_adt_def_id_of(ty, llbc)
-        .and_then(|def_id| llbc.type_by_id(def_id))
-        .and_then(|td| td.layout_for_target(llbc, &target))
-        .is_some_and(|layout| layout.size.is_some_and(|size| size != 0))
 }
 
 /// Free-function form of [`Lowering::tyref_is_fieldless_enum`] for the
@@ -93691,6 +93630,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fixture_fn_default_returning_unit_keeps_the_call() {
+        let unit = serde_json::json!({"Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }});
+        let llbc = std_extern_call_fixture("call_default", &["fixture", "default"], &[], unit);
+        let graph =
+            super::lower_function(&llbc, "call_default").expect("lower fixture fn default() -> ()");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "a fixture fn default() -> () keeps its call op; ops={ops:?}"
+        );
+    }
+
     fn std_trait_call_fixture(
         caller_name: &str,
         trait_path: &[&str],
@@ -122079,17 +122035,19 @@ mod tests {
         assert_eq!(super::mem_size_align(&rustc_offset, &adt0(), &[], 0), None);
     }
 
-    fn default_call_llbc(kind: serde_json::Value, layout_value: serde_json::Value) -> Llbc {
+    fn default_call_llbc(kind: serde_json::Value, layout_value: Option<serde_json::Value>) -> Llbc {
         let dest_ty = serde_json::json!({"Adt": {
             "id": 0,
             "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
         }});
-        let decl = serde_json::json!({
+        let mut decl = serde_json::json!({
             "def_id": 0,
             "item_meta": item_meta_json(&["fixture", "RandomState"], "", false),
-            "kind": kind,
-            "layout": [{"key": "fixture-one-target", "value": layout_value}]
+            "kind": kind
         });
+        if let Some(value) = layout_value {
+            decl["layout"] = serde_json::json!([{"key": "fixture-one-target", "value": value}]);
+        }
         let caller = serde_json::json!({
             "def_id": 0,
             "item_meta": item_meta_json(&["fixture", "call_default"], "", true),
@@ -122132,20 +122090,19 @@ mod tests {
     }
 
     #[test]
-    fn default_unit_follows_size_not_the_type_name() {
-        // The name says `RandomState`. Two integer fields and a non-zero
-        // size keep the ordinary call.
+    fn default_call_stays_a_call_regardless_of_dest_layout() {
+        // The name says `RandomState`. Result size does not drop the call.
         let two_words = default_call_llbc(
             serde_json::json!({"Struct": [
                 {"name": "k0", "ty": scalar_ty("U64"), "attr_info": null},
                 {"name": "k1", "ty": scalar_ty("U64"), "attr_info": null}
             ]}),
-            serde_json::json!({
+            Some(serde_json::json!({
                 "size": 16,
                 "align": 8,
                 "variant_layouts": [{"field_offsets": [0, 8]}],
                 "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
-            }),
+            })),
         );
         let graph = super::lower_function(&two_words, "call_default").expect("two-word default");
         assert!(
@@ -122155,33 +122112,41 @@ mod tests {
 
         let zst = default_call_llbc(
             serde_json::json!({"Struct": []}),
-            serde_json::json!({
+            Some(serde_json::json!({
                 "size": 0,
                 "align": 1,
                 "variant_layouts": [{"field_offsets": []}],
                 "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
-            }),
+            })),
         );
         let graph = super::lower_function(&zst, "call_default").expect("zero-sized default");
         assert!(
             graph_calls_leaf(&graph, "default"),
-            "a named empty class default is an instance, graph: {graph:#?}"
+            "a named empty class default stays a call, graph: {graph:#?}"
         );
 
         let aligned = default_call_llbc(
             serde_json::json!({"Struct": []}),
-            serde_json::json!({
+            Some(serde_json::json!({
                 "size": 8,
                 "align": 8,
                 "variant_layouts": [{"field_offsets": []}],
                 "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
-            }),
+            })),
         );
         let graph =
             super::lower_function(&aligned, "call_default").expect("aligned field-less default");
         assert!(
             graph_calls_leaf(&graph, "default"),
             "a field-less struct with a non-zero size stays a call, graph: {graph:#?}"
+        );
+
+        let no_layout = default_call_llbc(serde_json::json!({"Struct": []}), None);
+        let graph = super::lower_function(&no_layout, "call_default")
+            .expect("fieldless default without layout");
+        assert!(
+            graph_calls_leaf(&graph, "default"),
+            "a fieldless default without a recorded size stays a call, graph: {graph:#?}"
         );
     }
 
