@@ -15028,6 +15028,45 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     Ok(inlined)
 }
 
+/// `descroperation.py iter` after `get_and_call_function`:
+/// `w_next = space.lookup(w_iter, '__next__')`; None raises TypeError.
+///
+/// Returns nothing, matching the `'v'` result the calldescr declares —
+/// `bh_call_v_dispatch` transmutes the address to a `()`-returning
+/// `extern "C"` fn.  A refusal publishes through
+/// `ResidualError::publish_residual` (`jit_publish_residual_error`).
+/// Recorded after an effectful identity-fail dest-keep so compiled GET_ITER
+/// still runs the check `iter` would have run on that dest.
+pub extern "C" fn bh_check_iter_returned_iterator(
+    w_obj: pyre_object::PyObjectRef,
+    w_iter: pyre_object::PyObjectRef,
+) {
+    if let Err(err) = pyre_interpreter::baseobjspace::check_iter_returned_iterator(w_obj, w_iter) {
+        use majit_ir::helper_fnaddr::ResidualError;
+        err.publish_residual();
+    }
+}
+
+#[cfg(test)]
+mod iter_dest_check_tests {
+    use super::*;
+
+    #[test]
+    fn the_iter_check_publishes_through_the_blackhole_exception_channel() {
+        let cell = &majit_metainterp::blackhole::BH_LAST_EXC_VALUE;
+        cell.with(|c| c.set(0));
+        let w_int = pyre_object::w_int_new(42);
+        bh_check_iter_returned_iterator(w_int, w_int);
+        assert_ne!(
+            cell.with(|c| c.get()),
+            0,
+            "a non-iterator dest must publish the TypeError where \
+             `handler_residual_call_r_v` reads it",
+        );
+        cell.with(|c| c.set(0));
+    }
+}
+
 /// Inline a user instance's Python `__iter__` directly under GET_ITER.
 ///
 /// `iter`'s instance arm dispatches the method and then runs
@@ -15041,10 +15080,12 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
 /// Returning the receiver is the shortcut shape whose `__next__` lookup is
 /// decided on the receiver class the guard pins.  A different dest is still
 /// `get_and_call_function`'s return (`descroperation.py iter`); residualizing
-/// would re-run `__iter__` once the body has executed an effect, so dest
-/// stays and the walk continues.  GET_ITER's caller image carries its
-/// consumed iterable as the one proof operand, so a seeded callee guard
-/// resumes after GET_ITER with the result slot pending just like LOAD_ATTR.
+/// the GET_ITER would re-run `__iter__` once the body has executed an effect,
+/// so dest stays and `bh_check_iter_returned_iterator` records that lookup
+/// (`ctor_continuation` `bh_check_init_returned_none`).  GET_ITER's caller
+/// image carries its consumed iterable as the one proof operand, so a seeded
+/// callee guard resumes after GET_ITER with the result slot pending just
+/// like LOAD_ATTR.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -15184,17 +15225,62 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     }
 
     // dest is `get_and_call_function`'s return (`descroperation.py iter`).
-    // Residualizing after an effect would re-run `__iter__`.  Keep dest and
-    // continue.  A non-concrete dest cannot be published, so convert.
+    // Residualizing GET_ITER after an effect would re-run `__iter__`.  Keep
+    // dest and record `space.lookup(w_iter, '__next__')` as residual, the
+    // same way `descr_call` records `bh_check_init_returned_none` after
+    // `CALL_ASSEMBLER`.  Tracing-time only chooses GuardException vs
+    // GuardNoException; the residual itself is not gated, so a later
+    // compiled iteration that returns a non-iterator still raises.
     if ctx.registers_r.get(dst).expect("ref register in range") != obj_op {
         if fbw_executed_effect_count() != executed_effects_before {
             let result_op = ctx.registers_r.get(dst).expect("ref register in range");
-            let Some(result_obj) = walker_concrete_ref_object(ctx, result_op) else {
-                return Err(DispatchError::callee_inline_abort(op.pc, true));
+            let result_obj = match ctx.trace_ctx.concrete_of_opref(result_op) {
+                Some(majit_ir::Value::Ref(r))
+                    if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 =>
+                {
+                    r.as_usize() as pyre_object::PyObjectRef
+                }
+                _ => std::ptr::null_mut(),
             };
-            if result_obj.is_null() {
-                return Err(DispatchError::callee_inline_abort(op.pc, true));
+            let concrete_obj = pyre_object::gc_roots::shadow_stack_get(obj_root);
+            // Do not invoke the helper at trace time:
+            // `check_iter_returned_iterator` already computed the error, and
+            // a concrete `bh_check_iter_returned_iterator` would publish into
+            // `BH_LAST_EXC_VALUE` without `execute_residual_call` consuming it.
+            let mut iter_type_error = None;
+            if !result_obj.is_null()
+                && let Err(e) = pyre_interpreter::baseobjspace::check_iter_returned_iterator(
+                    concrete_obj,
+                    result_obj,
+                )
+            {
+                iter_type_error = Some(e);
             }
+            ctx.trace_ctx.call_void_typed_with_effect(
+                pyre_interpreter::residual_word_addr!(2, bh_check_iter_returned_iterator)
+                    as *const (),
+                &[obj_op, result_op],
+                &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+                majit_metainterp::default_effect_info(),
+            );
+            if let Some(mut err) = iter_type_error {
+                let exc = err.to_exc_object();
+                ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
+                ctx.fbw_mode.class_of_last_exc_is_const = false;
+                walker_record_guard_exception(ctx, op.pc)?;
+                let exc_box = ctx
+                    .last_exc_value()
+                    .expect("guard_exception seeds last_exc_value");
+                return Ok(Some((
+                    DispatchOutcome::SubRaise {
+                        exc: exc_box,
+                        exc_concrete: ConcreteValue::Ref(exc),
+                    },
+                    op.next_pc,
+                )));
+            }
+            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             ctx.frame_state.borrow_mut().vstack_last_ref = result_op;
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
         }

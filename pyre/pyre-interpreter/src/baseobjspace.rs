@@ -19013,6 +19013,19 @@ unsafe fn iter_check_is_iterator(mut w_obj: PyObjectRef, mut w_iterator: PyObjec
     }
 }
 
+/// `descroperation.py iter` after `get_and_call_function`: `space.lookup(w_iter,
+/// '__next__')` is None.  The message names both types
+/// (`X.__iter__() must return an iterator, not Y`).
+pub fn check_iter_returned_iterator(
+    w_obj: PyObjectRef,
+    w_iterator: PyObjectRef,
+) -> Result<(), PyError> {
+    if w_iterator.is_null() {
+        return Err(PyError::type_error("iter() returned non-iterator"));
+    }
+    unsafe { iter_check_is_iterator(w_obj, w_iterator) }.map(|_| ())
+}
+
 /// `objspace.py _uses_list_iter` / `_uses_tuple_iter` /
 /// `_uses_unicode_iter` — the concrete storage iterator is only correct while
 /// the receiver's `__iter__` is still the one `base` defines.  `Some(method)`
