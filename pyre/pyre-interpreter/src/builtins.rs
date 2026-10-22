@@ -14115,7 +14115,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // intobject.py:994: space.lookup(w_value, '__int__')
         if unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some() {
             // intobject.py: w_intvalue = space.int(w_value)
-            let w_intvalue = pyre_object::with_roots!(obj => crate::baseobjspace::space_int(obj))?;
+            let w_intvalue = crate::baseobjspace::space_int(obj)?;
             return ensure_baseint_result(w_intvalue);
         }
         // Python 3.14 difference: the deprecated `__trunc__` delegation in
@@ -14124,7 +14124,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // intobject.py: space.lookup(w_value, '__index__')
         if unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_some() {
             // intobject.py:1016: w_obj = space.index(w_value)
-            let w_obj = pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj))?;
+            let w_obj = crate::baseobjspace::space_index(obj)?;
             return ensure_baseint_result(w_obj);
         }
         // intobject.py:1047 — unicode is normalized through
@@ -14168,7 +14168,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     ))
 }
 
-/// intobject.py _ensure_baseint
+/// intobject.py `_ensure_baseint(space, w_intvalue)`
 fn ensure_baseint_result(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // intobject.py `_ensure_baseint`: an object whose interp-level class is
     // `W_IntObject` / `W_LongObject` is returned as is; a `W_BoolObject` or a
