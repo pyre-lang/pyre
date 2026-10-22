@@ -235,8 +235,9 @@ pub(crate) fn kept_stack_has_boxed_int_hazard(
                 continue;
             }
             // Ref constant slot (the hoisted boxed int): inspect the raw value.
-            if let Some(raw) =
-                consts.and_then(|e| e.iter().find_map(|&(sl, raw)| (sl == slot).then_some(raw)))
+            if let Some(raw) = consts
+                .as_ref()
+                .and_then(|e| e.iter().find_map(|&(sl, raw)| (sl == slot).then_some(raw)))
             {
                 if raw_is_boxed_int(raw as pyre_object::PyObjectRef) {
                     return true;

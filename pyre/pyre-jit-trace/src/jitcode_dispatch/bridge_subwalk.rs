@@ -995,7 +995,8 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         OuterActiveBoxesEntryTwin::Trivia,
         "bridge_root_parent",
         None,
-    );
+    )
+    .ok()?;
     // The concrete image this paused root resumes from when a descendant
     // sub-walk aborts and the drain converts the chain instead of rewinding to
     // the guard. Each bank skips the call-result color for the same reason it
@@ -1807,7 +1808,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     }
     if let Some(result) = child_result {
         // `_setup_return_value_*` (`blackhole.py`): the callee's result
-        // lands in `code[position - 1]` of the call it paused in.
+        // lands in `code[position - 1]` of the call it paused in, in the
+        // result bank of that call. Helper jitcodes return int/float as
+        // well as ref (`compare_value_from_tag`, range length).
         match super::call_result_register_in(jc.code.as_slice(), entry) {
             super::CallResultRegister::Void => {}
             super::CallResultRegister::Reg('r', call_dst_reg) => {
@@ -1858,7 +1861,27 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let outer_active_boxes = root_frame.boxes.clone();
 
     let callee_code = jc.code.as_slice();
-    let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
+    // Build-time helpers (`JitCode::from_canonical`) resolve `d`/`j` through
+    // `ALL_DESCRS` and leave `exec.descrs` empty. Walking one as a per-fn
+    // carrier aborts every descr operand (`DescrIndexOutOfRange { len: 0 }`).
+    let uses_global_descr_pool =
+        callee_pjc.jitcode.uses_global_descr_pool() || callee_pjc.code_ptr.is_null();
+    let global_descrs = crate::jitcode_runtime::descr_ref_table();
+    let descr_refs: &dyn DescrRefTable = if uses_global_descr_pool {
+        global_descrs
+    } else {
+        &perfn_descr_refs
+    };
+    let raw_descrs = if uses_global_descr_pool {
+        RawDescrPool::Global
+    } else {
+        RawDescrPool::PerFn(perfn_descrs)
+    };
+    let lookup_ref: &SubJitCodeLookup = if uses_global_descr_pool {
+        &GLOBAL_SUB_JITCODE_LOOKUP_FN
+    } else {
+        &sub_jitcode_lookup
+    };
     // `callee_w_code` is the callee frame's `pycode` red — a
     // `W_Code` object.  `callee_code_key` is the raw compiled-code pointer the
     // recipe carries, which is the JIT-side key, not that object; the live
@@ -1877,6 +1900,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     if callee_w_code == 0 && !callee_pjc.code_ptr.is_null() {
         return None;
     }
+    let is_helper = callee_w_code == 0 && callee_pjc.code_ptr.is_null();
 
     // Deepest recipe only (`child_result` is the middle `finishframe`
     // path; `handler_entry` is an already-routed ChangeFrame). A paused
@@ -1930,11 +1954,15 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     for parent_recipe in paused_parent_recipes {
         if parent_recipe.len_tail
             || parent_recipe.ctor_tail
+            || crate::state::recipe_is_helper_mi_frame(parent_recipe)
             || crate::state::jitcode_is_transparent_helper(parent_recipe.jitcode_index)
         {
             // The recipe's jitcode is the operator tail that was paused
             // (`bh_len_tail` or `bh_truth_bool_tail`), `descr_call`'s tail,
-            // or a descended helper paused past its CALL. Rebuilding `Len`
+            // or a helper `MIFrame` paused past its CALL: no Python code
+            // object. Rebuild it as a parent so a guard inside the resumed
+            // callee encodes it (`capture_resumedata` keeps every
+            // `inline_call` on the framestack). Rebuilding `Len`
             // unconditionally would run the length check on a `__bool__`
             // result.
             if parent_recipe.jitcode_pc < 0 {
@@ -2792,6 +2820,7 @@ mod bridge_seed_tests {
             registers_f: Vec::new(),
             concrete_r: vec![captured],
             registers_r_color: Vec::new(),
+            concrete_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
             ctor_tail: false,

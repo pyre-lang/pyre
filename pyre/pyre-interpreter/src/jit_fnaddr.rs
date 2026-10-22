@@ -1616,6 +1616,11 @@ macro_rules! p5 {
         publish_p5($e, $p, |a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f);
     };
 }
+macro_rules! pa5 {
+    ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
+        publish_pa5($e, $m, $r, $f, $f);
+    };
+}
 macro_rules! cpa5 {
     ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
         publish_cpa5($e, $m, $r, |a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f);
@@ -2872,8 +2877,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
     // typeobject.py), run under the JIT inside `_pure_issubtype`
-    // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
-    // residualises the call. `CallDescr.create_call_stub` calls a boolean
+    // (`@elidable_promote`). `CallDescr.create_call_stub` calls a boolean
     // RESULT before widening to Signed: bind the word-ABI bridge, never the
     // raw Rust function whose upper result-register bits are undefined.
     cpa2!(
@@ -3367,6 +3371,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::_pure_version_tag",
         "pyre_interpreter::_pure_version_tag",
         crate::baseobjspace::__majit_call_target__orig__pure_version_tag_unlikely_name,
+    );
+    cpa4!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_pure_issubtype",
+        "pyre_interpreter::_pure_issubtype",
+        crate::baseobjspace::__majit_call_target__orig__pure_issubtype_unlikely_name,
     );
     cpa3!(
         &mut entries,
@@ -5323,6 +5333,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::functional::jit_range_iter_new",
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new,
+    );
+    pa4!(
+        &mut entries,
+        "pyre_object::functional::w_range_finish",
+        "pyre_object::w_range_finish",
+        pyre_object::functional::w_range_finish,
+    );
+    pa5!(
+        &mut entries,
+        "pyre_object::functional::w_range_alloc_i64",
+        "pyre_object::w_range_alloc_i64",
+        pyre_object::functional::w_range_alloc_i64,
     );
     // The lowered raise path's exception materialisation, opaque so that its
     // body stays out of every JitCode that can raise.
@@ -9218,6 +9240,14 @@ mod tests {
         assert!(are_alias_spellings(
             "pyre_interpreter::_pure_version_tag",
             "pyre_interpreter::baseobjspace::_orig__pure_version_tag_unlikely_name",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_interpreter::baseobjspace::_pure_issubtype",
+            "pyre_interpreter::baseobjspace::_orig__pure_issubtype_unlikely_name",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_interpreter::_pure_issubtype",
+            "pyre_interpreter::baseobjspace::_orig__pure_issubtype_unlikely_name",
         ));
         assert!(!are_alias_spellings(
             "pyre_interpreter::baseobjspace::_orig_should_not_inline_unlikely_name",

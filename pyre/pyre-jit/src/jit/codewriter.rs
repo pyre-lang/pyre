@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 ///
 /// The Assembler (majit JitCodeBuilder) is RPython's assembler.py equivalent.
 use std::cell::{RefCell, UnsafeCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -29,8 +29,8 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState,
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallDescrStub, CallFlavor, GraphFlattener, Kind, ResKind, SSARepr, fully_bound_callee_body,
-    inline_call_targets, slot_for_call_flavor,
+    CallDescrStub, CallFlavor, GraphFlattener, Kind, OPNAME_PORTAL_MERGE_GREENS, ResKind, SSARepr,
+    fully_bound_callee_body, inline_call_targets, slot_for_call_flavor,
 };
 
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
@@ -233,14 +233,25 @@ fn portal_jit_merge_point_graph_args(
 ) -> Vec<super::flow::SpaceOperationArg> {
     let (frame, ec) = portal_graph_inputvars_from_startblock(graph);
     // `pypyjit/interp_jit.py` PyPyJitDriver greens =
-    // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is the
-    // `PyFrame.dispatch` argument, a Constant of this per-code jitcode;
-    // `jtransform.py promote_greens` skips Constant greens, so no
-    // `ref_guard_value` is emitted for it.  `getcode()`
-    // (`pyframe.py PyFrame.getcode`) is the `jump_absolute` back-edge's.
-    // `is_being_profiled` is the Int phi of
-    // `pyframe.py PyFrame.get_is_being_profiled` on that same frame
-    // (`interp_jit.py PyFrame.dispatch`): 0 when `debugdata` is null,
+    // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is
+    // recovered from the live frame at every merge point via the
+    // `getfield_vable_r frame, PYCODE_FIELD_IDX → pycode_var` dual-
+    // write emitted immediately upstream in the walker; reference
+    // that per-SpaceOp Variable here so the canonical
+    // `flatten_graph` driver sees no unresolved `Opaque(Ref)`
+    // constants.
+    //
+    // `next_instr` is the dest of an `int_copy` of the instruction-start
+    // PC, recorded immediately upstream. A `ConstInt` in this list would
+    // go through `add_const_i` (`assembler.py` ListOfKind never
+    // `allow_short`); a body with more than 256 unique PCs then failed
+    // `try_finish` and latched `ConstEncodingOverflow`. `int_copy/c>i`
+    // or `int_copy/d>i` writes `ConstInt` into a register without a pool
+    // slot, which is what `verify_green_args` asserts at the merge.
+    //
+    // `is_being_profiled` is the Int result of `portal_merge_greens`
+    // (`pyframe.py PyFrame.get_is_being_profiled` on that same frame,
+    // `interp_jit.py PyFrame.dispatch`): 0 when `debugdata` is null,
     // else `FrameDebugData.is_being_profiled`.
     let greens = vec![next_instr.into(), is_being_profiled.into(), pycode];
     let reds = vec![frame.into(), ec.into()];
@@ -262,20 +273,62 @@ fn portal_jit_merge_point_graph_args(
 /// lets `blackhole.py BlackholeInterpreter.bhimpl_jit_merge_point` CRN
 /// before the opcode's `last_instr` store.
 ///
-/// Pyre materializes the merge's greens in front of the marker: the
-/// debugdata diamond (`get_is_being_profiled`), `int_copy` of `next_instr`,
-/// `promote_greens` (`-live-` + `{kind}_guard_value`), then op3 `-live-`
-/// and the stack writes. Skip that prefix so the sandwich still matches.
-fn portal_merge_prefix_op(opname: &str) -> bool {
-    opname == "live"
-        || opname == "int_copy"
-        || opname == "int_guard_value"
-        || opname == "ref_guard_value"
-        || opname == "getfield_gc_i"
-        || opname == "goto_if_not_ptr_iszero"
-        || opname.starts_with("getfield_vable")
-        || opname.starts_with("setarrayitem_vable")
-        || opname.starts_with("setfield_vable")
+/// Pyre materializes the merge's greens in front of the marker: a
+/// leading `-live-`, `int_copy` of `next_instr`, `goto pmg_shared`
+/// (the shared `get_is_being_profiled` + `promote_greens` block;
+/// labels emit no bytes), then op3 `-live-` and the vsd
+/// `setfield_vable`. Entry / loop-header merges also reload `pycode`
+/// with `getfield_vable_r` before the copy. Skip that prefix so the
+/// sandwich still matches. A guard inside `pmg_shared` resumes at its
+/// own `-live-`; do not treat that block's ops as prefix.
+fn portal_merge_prefix_op(code: &[u8], op: &pyre_jit_trace::jitcode_runtime::DecodedOp) -> bool {
+    match op.opname {
+        "live" | "int_copy" => true,
+        "goto" => {
+            goto_label_target(code, op).is_some_and(|target| is_pmg_shared_entry(code, target))
+        }
+        name if name.starts_with("getfield_vable") => true,
+        name if name.starts_with("setfield_vable") => true,
+        _ => false,
+    }
+}
+
+fn goto_label_target(
+    code: &[u8],
+    op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+) -> Option<usize> {
+    if op.opname != "goto" {
+        return None;
+    }
+    let lo = *code.get(op.pc + 1)?;
+    let hi = *code.get(op.pc + 2)?;
+    Some(u16::from_le_bytes([lo, hi]) as usize)
+}
+
+/// `pmg_shared` starts with `-live-`, `getfield_vable_r` of debugdata,
+/// the branch `-live-`, then `goto_if_not_ptr_iszero`. The we_are_jitted
+/// shared block starts with `getfield_vable_r` and no leading `-live-`.
+fn is_pmg_shared_entry(code: &[u8], pc: usize) -> bool {
+    let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc) else {
+        return false;
+    };
+    if live.opname != "live" {
+        return false;
+    }
+    let Some(getfield) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, live.next_pc) else {
+        return false;
+    };
+    if getfield.opname != "getfield_vable_r" {
+        return false;
+    }
+    let mut pc = getfield.next_pc;
+    if let Some(op) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc) {
+        if op.opname == "live" {
+            pc = op.next_pc;
+        }
+    }
+    pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc)
+        .is_some_and(|op| op.opname == "goto_if_not_ptr_iszero")
 }
 
 fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
@@ -296,7 +349,7 @@ fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
             };
             return if op2.opname == "live" { op2.pc } else { marker };
         }
-        if !portal_merge_prefix_op(op.opname) {
+        if !portal_merge_prefix_op(code, &op) {
             return marker;
         }
         if op.next_pc <= pc {
@@ -306,14 +359,80 @@ fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
     }
 }
 
+/// `warmspot.py split_before_jit_merge_point`: a trace starts at the
+/// portal `jit_merge_point`. An opcode's op3 `-live-` here precedes
+/// `goto pmg_shared` (the next-greens diamond `interp_jit.py
+/// PyFrame.dispatch` evaluates before the merge); its `pmgN` body
+/// is `-live-; …; jit_merge_point`. Return that body's leading
+/// `-live-`, or `marker` when the floor has no `pmgN` body.
+fn trace_entry_at_portal_merge(code: &[u8], marker: usize) -> usize {
+    let mut pc = marker;
+    loop {
+        let Some(op) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc) else {
+            return marker;
+        };
+        if op.opname == "jit_merge_point" {
+            return marker;
+        }
+        if op.opname == "goto" {
+            if goto_label_target(code, &op).is_some_and(|target| is_pmg_shared_entry(code, target))
+            {
+                return portal_merge_body_live_after_goto(code, op.next_pc).unwrap_or(marker);
+            }
+            return marker;
+        }
+        if portal_trace_entry_control_flow(op.opname) {
+            return marker;
+        }
+        if op.next_pc <= pc {
+            return marker;
+        }
+        pc = op.next_pc;
+    }
+}
+
+/// `attach_portal_merge_greens_gotos` lays the `pmgN` body out immediately
+/// after `goto pmg_shared` (the Label emits no bytes). Confirm that the
+/// next op is a `-live-` whose straight-line suffix reaches
+/// `jit_merge_point` before any other control-flow op.
+fn portal_merge_body_live_after_goto(code: &[u8], body_pc: usize) -> Option<usize> {
+    let live = pyre_jit_trace::jitcode_runtime::decode_op_at(code, body_pc)?;
+    if live.opname != "live" {
+        return None;
+    }
+    let mut pc = live.next_pc;
+    loop {
+        let op = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc)?;
+        if op.opname == "jit_merge_point" {
+            return Some(live.pc);
+        }
+        if portal_trace_entry_control_flow(op.opname) {
+            return None;
+        }
+        if op.next_pc <= pc {
+            return None;
+        }
+        pc = op.next_pc;
+    }
+}
+
+fn portal_trace_entry_control_flow(opname: &str) -> bool {
+    opname == "goto"
+        || opname == "switch"
+        || opname.starts_with("goto_if")
+        || opname.ends_with("_return")
+        || opname == "raise"
+        || opname == "reraise"
+}
+
 /// Advance a block-head `-live-` onto op3, the last `-live-` before the
 /// portal `jit_merge_point`.
 ///
-/// After-residual resume leaves the blackhole on that word so it replays
-/// the dispatch-top stack materialize writes, then
-/// `bhimpl_jit_merge_point` CRNs. The diamond / `promote_greens` prefix
-/// inserts extra `-live-`s in front of op3; skip them the same way
-/// [`guard_resume_live_after_portal_merge`] skips them to reach op2.
+/// After-residual resume leaves the blackhole on that word so
+/// `bhimpl_jit_merge_point` CRNs with the operand stack restored from
+/// the vable section. The per-instruction prefix is `int_copy` then
+/// `goto pmg_shared`; skip it the same way
+/// [`guard_resume_live_after_portal_merge`] skips it to reach op2.
 fn after_residual_live_before_portal_merge(code: &[u8], marker: usize) -> usize {
     let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, marker) else {
         return marker;
@@ -330,7 +449,7 @@ fn after_residual_live_before_portal_merge(code: &[u8], marker: usize) -> usize 
         if op.opname == "jit_merge_point" {
             return last_live;
         }
-        if !portal_merge_prefix_op(op.opname) {
+        if !portal_merge_prefix_op(code, &op) {
             return marker;
         }
         if op.opname == "live" {
@@ -1157,15 +1276,16 @@ fn derive_pc_live_indices_from_sparse(
         }
     };
     // Branch guards (`goto_if_not` / `goto_if_not_*` / `switch`) resume at
-    // orgpc = the guard's OWN bytecode pc — i.e. the opcode START,
-    // which is exactly the PC's first-insn keying (the default above).  The
-    // guard's leading `-live-` (immediately before the terminator) follows
-    // the mid-opcode `truth` call that produces the unboxed `Int` condition.
-    // Resuming at the opcode-start marker keeps the boxed operand (the compare
-    // result the `truth` consumes) live, so re-executing the opcode
-    // forward re-derives the condition correctly — mirroring the blackhole
-    // re-running the bytecode opcode from orgpc.  So leave `pos_for_pc` at
-    // the PC's first insn; no branch-guard re-key.
+    // orgpc = the guard's OWN bytecode pc (`pyjitpl.py generate_guard`
+    // `resumepc=orgpc`).  `liveness.py` `compute_liveness` walks backward
+    // from the terminator, sees the `goto_if_not` Int operand, and puts
+    // that register on the leading `-live-` immediately before it;
+    // `assembler.py get_liveness_info(..., 'int')` encodes it.  The splice
+    // keeps that Int bank (`filter_liveness_in_place`).  Capture stores
+    // `live_before_jit_pc` at that leading marker, so a bridge walk that
+    // enters there reads the condition color.  `pos_for_pc` still keys
+    // the PC's first insn (the opcode-start `-live-`); no branch-guard
+    // re-key.
     // Can-raise fallthrough re-key: a can-raise `residual_call` at
     // stream position `q` carries a TRAILING `-live-` at `q+1`
     // (jtransform.py:467-482, `flatten.rs`'s `serialize_op`).  When the call
@@ -2202,24 +2322,6 @@ fn pop_and_decr_depth(state: &mut FrameState, depth: &mut u16) {
     *depth = depth.saturating_sub(1);
 }
 
-/// PEEK(oparg) the accumulator container without popping it — the
-/// residual mutates it in place and it stays live on the stack.  Mirrors
-/// the ListExtend inline peek: after the operands are popped, the
-/// container sits at `len - oparg` (oparg counts from the new TOS).
-/// Returns a fresh Ref when the shadow stack is too shallow.
-fn peek_container_or_fresh(
-    state: &FrameState,
-    oparg: usize,
-    graph: &mut super::flow::FunctionGraph,
-) -> super::flow::FlowValue {
-    let len = state.stack.len();
-    if oparg >= 1 && oparg <= len {
-        state.stack[len - oparg].clone()
-    } else {
-        fresh_ref_value(graph)
-    }
-}
-
 fn null_stack_sentinel() -> super::flow::FlowValue {
     // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker.  The
     // runtime side emits `PY_NULL = 0` via `emit_pushvalue_ref_const!`;
@@ -2231,6 +2333,25 @@ fn null_stack_sentinel() -> super::flow::FlowValue {
     super::flow::Constant::none().into()
 }
 
+/// Drop local SSA Variables that a later Python instruction must not read.
+///
+/// `pyopcode.py` STORE_FAST writes `locals_cells_stack_w`; LOAD_FAST reads
+/// it (`emit_load_fast_ref!` / `getarrayitem_vable_r`).  Clearing the
+/// FrameState local so the next opcode cannot inherit the producer's
+/// dest keeps that dest from staying SSA-live-through a later residual
+/// `-live-`.  Operand-stack slots stay: consumers already `peekvalue` /
+/// `popvalue` the virtualizable, and the PRE-dispatch pcdep snapshot
+/// still needs those Variables so a guard resume can name pre-pop
+/// depths.  Portal reds (`portal_extras`) and the exception-edge pair
+/// stay.
+fn forget_ssa_across_instruction(state: &mut FrameState) {
+    for slot in &mut state.locals_w {
+        if matches!(slot, Some(super::flow::FlowValue::Variable(_))) {
+            *slot = None;
+        }
+    }
+}
+
 fn pyobject_const_ref_value(w_obj: pyre_object::PyObjectRef) -> super::flow::FlowValue {
     super::flow::Constant::new(
         super::flow::ConstantValue::Signed(w_obj as i64),
@@ -2239,6 +2360,7 @@ fn pyobject_const_ref_value(w_obj: pyre_object::PyObjectRef) -> super::flow::Flo
     .into()
 }
 
+#[cfg(test)]
 fn duplicate_shadow_tos(
     graph: &mut super::flow::FunctionGraph,
     state: &mut FrameState,
@@ -2633,6 +2755,18 @@ fn emit_do_promote(
 ) {
     record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
     let _ = emit_graph_op_void(block, guard_opname, vec![green.into()], offset);
+}
+
+/// `jtransform.py handle_regular_indirect_call`: `-live-` immediately
+/// before the residual, after argument setup. Fold GuardValue/GuardClass
+/// on a residual operand, and fold GuardIsnull/GuardNonnull carrying
+/// `live_before_jit_pc`, record at the residual's op_pc; `jitcode.py
+/// JitCode.get_live_vars_info` accepts the `-live-` at that pc or
+/// `OFFSET_SIZE + 1` before it. Empty args: `liveness.py compute_liveness`
+/// fills the marker from SSA uses (the residual reads the receiver /
+/// callable).
+fn emit_live_before_residual_call(block: &super::flow::BlockRef, offset: i64) {
+    record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
 }
 
 /// `pyframe.py PyFrame.getcode`: `jit.promote(self.pycode)`, a vable
@@ -3143,10 +3277,10 @@ fn emit_action_ticker_ops(
         Kind::Int,
         py_pc as i64,
     );
-    let ticker_descr = majit_ir::make_array_descr_signed(
-        0,
-        majit_ir::eval_breaker_word::ACTION_TICKER_WORD_SIZE,
+    // Same raw word shape as the eval breaker read.
+    let ticker_descr = pyre_jit_trace::descr::raw_carray_descr(
         majit_ir::Type::Int,
+        majit_ir::eval_breaker_word::ACTION_TICKER_WORD_SIZE,
         true,
     );
     let old = emit_graph_op_with_result(
@@ -3216,10 +3350,14 @@ fn emit_eval_breaker_diamond(
         Kind::Int,
         py_pc as i64,
     );
-    let descr = majit_ir::make_array_descr_signed(
-        0,
-        majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE,
+    // `cpu.arraydescrof(rffi.CArray(Signed))` — header-less raw word,
+    // matching `Assembler::add_raw_int_array_descr_signed`. A GC array descr
+    // here makes `ArrayPtrInfo::make_guards` emit `GUARD_GC_TYPE` at
+    // `addr - GcHeader::SIZE` and lets the backend treat the address as a
+    // `Type::Ref`.
+    let descr = pyre_jit_trace::descr::raw_carray_descr(
         majit_ir::Type::Int,
+        majit_ir::eval_breaker_word::EVAL_BREAKER_WORD_SIZE,
         true,
     );
     let word = emit_graph_op_with_result(
@@ -3450,9 +3588,23 @@ fn emit_jump_absolute_tick(
     // split the portal header uses, so `flatten_graph` emits the diamond
     // before the marker.
     let goto_block = if emit_header {
-        let header_state = header_block
-            .framestate()
-            .unwrap_or_else(|| current_state.clone());
+        // Unpublished breaker: `header_block` is the walker's current egg.
+        // `SpamBlock.framestate` is the joinpoint *entry* snapshot
+        // (`make_next_block`); ops since then mutated the live
+        // `current_state` (STORE_FAST pops). Copying the entry snapshot
+        // into the profiled diamond would grow the join's stack each
+        // back-edge and `FrameState.union` would reject it forever
+        // (`flowcontext.py mergeblock`). The live state is what
+        // `jump_absolute` sees. The tick path's `header_block` is `hot`,
+        // whose stored FrameState already matches its freshened
+        // inputargs — use that so the diamond links typecheck.
+        let header_state = if eb_addr == 0 {
+            current_state.clone()
+        } else {
+            header_block
+                .framestate()
+                .unwrap_or_else(|| current_state.clone())
+        };
         let _ = emit_getcode(graph, &header_block.block(), frame_var, py_pc as i64);
         let (join, _) = emit_portal_is_being_profiled_read(
             graph,
@@ -3876,8 +4028,8 @@ fn emit_frontend_accumulate_3(
 /// not a live register inside the resident loop.  Read the container back out
 /// of the vable image on every iteration — the same per-iteration
 /// re-materialization the `FOR_ITER` iterator reload uses — so the accumulate
-/// residual has a genuine in-loop reader for its receiver.  The symbolic peek
-/// (`peek_container_or_fresh`) leaves it reading an unbound register instead.
+/// residual has a genuine in-loop reader for its receiver.  Cloning the
+/// joinpoint FrameState slot leaves it reading a peel constant instead.
 ///
 /// `depth_after_pops` is the operand depth once the accumulate opcode's own
 /// operands have been popped, so its `PEEK(oparg)` container sits at
@@ -3893,6 +4045,28 @@ fn emit_accumulator_reload(
 ) -> super::flow::FlowValue {
     let slot_depth = depth_after_pops.saturating_sub(oparg as u16);
     let abs_slot = (stack_base_absolute + slot_depth as usize) as i64;
+    let v_idx: super::flow::FlowValue = super::flow::Constant::signed(abs_slot).into();
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "getarrayitem_vable_r",
+        vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.into()),
+        Kind::Ref,
+        offset,
+    )
+    .into()
+}
+
+/// `pyframe.py peekvalue` of the operand slot at `slot_index` (0 = stack[0]).
+fn peek_stack_slot_from_vable(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame_var: super::flow::Variable,
+    stack_base_absolute: usize,
+    slot_index: usize,
+    offset: i64,
+) -> super::flow::FlowValue {
+    let abs_slot = (stack_base_absolute + slot_index) as i64;
     let v_idx: super::flow::FlowValue = super::flow::Constant::signed(abs_slot).into();
     emit_graph_op_with_result(
         graph,
@@ -4936,6 +5110,7 @@ struct FnPtrIndices {
     load_from_dict_or_globals_fn: HelperHandle,
     call_function_ex_fn: HelperHandle,
     unary_not_fn: HelperHandle,
+    to_bool_fn: HelperHandle,
     load_fast_check_fn: HelperHandle,
     list_extend_fn: HelperHandle,
     set_add_fn: HelperHandle,
@@ -5368,6 +5543,14 @@ fn register_helper_fn_pointers(
         assembler,
         cpu.unary_not_fn as *const (),
         CallFlavor::MayForce,
+    );
+    // `bh_to_bool_fn` is `space.newbool` (`baseobjspace.py newbool`):
+    // `w_True` / `w_False` from a raw truth Int. Cannot raise, no user
+    // code — `PlainCannotRaise`. Appended last to preserve fn_ptr indices.
+    let to_bool_fn = bind(
+        assembler,
+        cpu.to_bool_fn as *const (),
+        CallFlavor::PlainCannotRaise,
     );
     // `bh_load_fast_check_fn` null-checks the local it is handed and, when
     // unbound, reads the code object's immutable `co_varnames` to name the
@@ -5813,6 +5996,7 @@ fn register_helper_fn_pointers(
         unary_negative_fn,
         unary_invert_fn,
         unary_not_fn,
+        to_bool_fn,
         load_fast_check_fn,
         list_extend_fn,
         list_append_fn,
@@ -6258,10 +6442,287 @@ fn catch_live_coverage_census(
 /// `LivenessIterator`, so the post-rename `-live-` marker is the
 /// sole source.
 ///
+/// INV: a portal `body_N` (the label the shared `switch last_instr`
+/// enters after `jit_merge_point`) and every exception-handler entry
+/// block have live-in ⊆ portal reds ∪ greens ∪ constants.
+/// `pyopcode.py` lets a value-stack value cross an instruction
+/// boundary only through the virtualizable (`pushvalue` / `popvalue` /
+/// `peekvalue` / `settopvalue` on `locals_cells_stack_w`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BodyLiveInViolation {
+    py_pc: usize,
+    opname: String,
+    register: super::flatten::Register,
+    defining_ops: Vec<String>,
+}
+
+impl std::fmt::Display for BodyLiveInViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pc={} {} %{}{} defs=[{}]",
+            self.py_pc,
+            self.opname,
+            self.register.kind.first_char(),
+            self.register.index,
+            self.defining_ops.join(", ")
+        )
+    }
+}
+
+fn collect_registers_from_operand(
+    op: &super::flatten::Operand,
+    out: &mut HashSet<super::flatten::Register>,
+) {
+    match op {
+        super::flatten::Operand::Register(reg) => {
+            out.insert(*reg);
+        }
+        super::flatten::Operand::ListOfKind(list) => {
+            for item in &list.content {
+                collect_registers_from_operand(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn portal_merge_allowed_registers(
+    ssarepr: &super::flatten::SSARepr,
+) -> HashSet<super::flatten::Register> {
+    let mut allowed = HashSet::new();
+    for insn in &ssarepr.insns {
+        let super::flatten::Insn::Op { opname, args, .. } = insn else {
+            continue;
+        };
+        if opname != "jit_merge_point" {
+            continue;
+        }
+        for arg in args {
+            collect_registers_from_operand(arg, &mut allowed);
+        }
+    }
+    allowed
+}
+
+fn is_shared_pmg_body_label(name: &str) -> bool {
+    let prefix = "pmg";
+    name.starts_with(prefix)
+        && name
+            .as_bytes()
+            .get(prefix.len())
+            .is_some_and(|b| b.is_ascii_digit())
+}
+
+fn instruction_opname_at(code: &CodeObject, py_pc: usize) -> String {
+    match pyre_interpreter::decode_instruction_at(code, py_pc) {
+        Some((inst, _)) => {
+            let debug = format!("{inst:?}");
+            debug
+                .split(|c: char| c == ' ' || c == '{')
+                .next()
+                .unwrap_or("?")
+                .to_string()
+        }
+        None => format!("pc{py_pc}"),
+    }
+}
+
+fn unique_defining_ops(
+    ssarepr: &super::flatten::SSARepr,
+    reg: super::flatten::Register,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for insn in &ssarepr.insns {
+        let super::flatten::Insn::Op {
+            opname,
+            result: Some(result),
+            ..
+        } = insn
+        else {
+            continue;
+        };
+        if *result == reg && seen.insert(opname.clone()) {
+            names.push(opname.clone());
+        }
+    }
+    names
+}
+
+fn py_pc_for_label_index(ssarepr: &super::flatten::SSARepr, label_idx: usize) -> usize {
+    let mut best: Option<(usize, i64)> = None;
+    for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
+        if pos >= label_idx {
+            match best {
+                None => best = Some((pos, py_pc)),
+                Some((prev, _)) if pos < prev => best = Some((pos, py_pc)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(_, pc)| pc as usize).unwrap_or(0)
+}
+
+fn is_rename_or_live_op(opname: &str) -> bool {
+    opname == super::flatten::OPNAME_LIVE
+        || opname.ends_with("_copy")
+        || opname.ends_with("_push")
+        || opname.ends_with("_pop")
+}
+
+fn is_last_exc_op(opname: &str) -> bool {
+    opname == "last_exc_value" || opname == "last_exception"
+}
+
+fn handler_entry_label_names(ssarepr: &super::flatten::SSARepr) -> Vec<String> {
+    let mut names = Vec::new();
+    // flatten.py `insert_renamings` order: last_exc then Label/goto.
+    for (i, insn) in ssarepr.insns.iter().enumerate() {
+        let super::flatten::Insn::Op { opname, .. } = insn else {
+            continue;
+        };
+        if !is_last_exc_op(opname) {
+            continue;
+        }
+        for later in ssarepr.insns.iter().skip(i + 1) {
+            match later {
+                super::flatten::Insn::Op { opname, .. } if is_rename_or_live_op(opname) => {
+                    continue;
+                }
+                super::flatten::Insn::Label(label) => {
+                    names.push(label.name.clone());
+                    break;
+                }
+                super::flatten::Insn::Op { opname, args, .. } if opname == "goto" => {
+                    if let Some(super::flatten::Operand::TLabel(lbl)) = args.first() {
+                        names.push(lbl.name.clone());
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    // INV order: Label then last_exc inside the landing
+    // (`pyopcode.py handle_operation_error` reads the exception in the
+    // handler, then `pushvalue(w_exc)`).
+    for (i, insn) in ssarepr.insns.iter().enumerate() {
+        let super::flatten::Insn::Label(label) = insn else {
+            continue;
+        };
+        for later in ssarepr.insns.iter().skip(i + 1) {
+            match later {
+                super::flatten::Insn::Op { opname, .. } if is_rename_or_live_op(opname) => {
+                    continue;
+                }
+                super::flatten::Insn::Op { opname, .. } if is_last_exc_op(opname) => {
+                    names.push(label.name.clone());
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Live-in of every shared-switch `body_N` and every handler-entry
+/// label, minus the portal `jit_merge_point` reds and greens.
+fn collect_body_live_in_violations(
+    ssarepr: &super::flatten::SSARepr,
+    label2alive: &HashMap<String, HashSet<super::flatten::Register>>,
+    code: &CodeObject,
+) -> Vec<BodyLiveInViolation> {
+    let allowed = portal_merge_allowed_registers(ssarepr);
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut label_index: HashMap<String, usize> = HashMap::new();
+    for (i, insn) in ssarepr.insns.iter().enumerate() {
+        if let super::flatten::Insn::Label(label) = insn {
+            label_index.insert(label.name.clone(), i);
+        }
+    }
+
+    let mut checked: HashSet<String> = HashSet::new();
+    let mut violations = Vec::new();
+    let mut push_violations = |name: &str, py_pc: usize, opname: String| {
+        if !checked.insert(name.to_string()) {
+            return;
+        }
+        let Some(live_in) = label2alive.get(name) else {
+            return;
+        };
+        let mut extra: Vec<super::flatten::Register> = live_in
+            .iter()
+            .copied()
+            .filter(|reg| !allowed.contains(reg))
+            .collect();
+        extra.sort_by_key(|reg| (reg.kind as u8, reg.index));
+        for register in extra {
+            violations.push(BodyLiveInViolation {
+                py_pc,
+                opname: opname.clone(),
+                register,
+                defining_ops: unique_defining_ops(ssarepr, register),
+            });
+        }
+    };
+
+    for insn in &ssarepr.insns {
+        let super::flatten::Insn::Op { args, .. } = insn else {
+            continue;
+        };
+        for arg in args {
+            let super::flatten::Operand::Descr(descr) = arg else {
+                continue;
+            };
+            let super::flatten::DescrOperand::SwitchDict(switch) = descr.as_ref() else {
+                continue;
+            };
+            for (pc, lbl) in &switch.labels {
+                if !is_shared_pmg_body_label(&lbl.name) {
+                    continue;
+                }
+                let py_pc = *pc as usize;
+                push_violations(&lbl.name, py_pc, instruction_opname_at(code, py_pc));
+            }
+        }
+    }
+
+    let handler_names = handler_entry_label_names(ssarepr);
+    for name in handler_names {
+        let py_pc = label_index
+            .get(&name)
+            .map(|&idx| py_pc_for_label_index(ssarepr, idx))
+            .unwrap_or(0);
+        let opname = if py_pc < code.instructions.len() {
+            format!("handler_entry:{}", instruction_opname_at(code, py_pc))
+        } else {
+            "handler_entry".to_string()
+        };
+        push_violations(&name, py_pc, opname);
+    }
+
+    violations.sort_by_key(|v| {
+        (
+            v.py_pc,
+            v.opname.clone(),
+            v.register.kind as u8,
+            v.register.index,
+        )
+    });
+    violations
+}
+
 /// `live_i` and `live_f` are emitted line-by-line parity with
 /// upstream — RPython's `liveness.py compute_liveness`
 /// produces one SSA-driven alive set as the sole authority, and
-/// `assembler.py:150-152` only splits that set by kind.
+/// `assembler.py Assembler.write_insn` only splits that set by kind.
 ///
 /// `live_r` is the SSA bank plus the frame-live colors backward
 /// liveness cannot reach — the portal reds and the FOR_ITER
@@ -6292,6 +6753,7 @@ fn filter_liveness_in_place(
     Vec<Option<usize>>,
     Vec<Option<usize>>,
     Vec<Vec<(u8, u16, u16)>>,
+    Vec<BodyLiveInViolation>,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     // Per-PC `-live-` positions are required: the post-merge
@@ -6307,30 +6769,6 @@ fn filter_liveness_in_place(
             "filter_liveness_in_place: walker_tracked_pc_live_indices must be Some with one \
              entry per Python PC since label retirement retired per-PC label emission",
         );
-    // FOR_ITER body PCs: used to scope the per-PC frame-live
-    // re-add below. While-loop body PCs are excluded to prevent
-    // perf regressions (wider liveness → more live-across-loop colors
-    // → more spills).
-    let foriter_body_pcs = {
-        let n = code.instructions.len();
-        let mut pcs = bit_set::BitSet::with_capacity(n);
-        let mut scan_state = pyre_interpreter::OpArgState::default();
-        for scan_pc in 0..n {
-            let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
-            if let pyre_interpreter::Instruction::ForIter { delta } = scan_instr {
-                let exhaust_target = pyre_interpreter::jump_target_forward(
-                    &code.instructions,
-                    scan_pc + 1,
-                    delta.get(scan_arg).as_usize(),
-                );
-                pcs.insert(scan_pc);
-                for body_pc in (scan_pc + 1)..exhaust_target.min(n) {
-                    pcs.insert(body_pc);
-                }
-            }
-        }
-        pcs
-    };
     // Run `compute_liveness` + `remove_repeated_live` and resolve each
     // Python PC's `-live-` marker to its POST-merge SSARepr index.
     // `liveness.rs`'s public API (`compute_liveness`,
@@ -6364,6 +6802,10 @@ fn filter_liveness_in_place(
             walker_tracked,
             &after_call_anchors,
         );
+    // INV uses the pre-filter `label2alive` snapshot: `filter_liveness_in_place`
+    // rewrites `-live-` args after this, and those rewritten markers are not
+    // the body_N live-in set.
+    let body_live_in_violations = collect_body_live_in_violations(ssarepr, &label2alive, code);
     let first_insn_post_merge: Vec<Option<usize>> = first_insn_pre_merge
         .iter()
         .map(|entry| entry.map(|old| remap[old]))
@@ -6600,19 +7042,18 @@ fn filter_liveness_in_place(
                 s
             };
             // Re-add the per-PC frame-live colors backward liveness
-            // omitted — FOR_ITER body PCs only.  A loop-carried operand-
-            // stack value (the iterator) is frame-live at a body PC but
-            // SSA-backward-DEAD there, so `pc_live_r` omits it and the
-            // guard snapshot leaves the slot `OpRef::NONE`.  Re-adding
-            // `lv_live` names the full restorable set for FOR_ITER body
-            // guards.  While-loop body PCs are excluded: widening their
-            // liveness changes the resume layout and causes perf
-            // regressions (int_loop/float_loop/nested_loop).
-            if foriter_body_pcs.contains(py_pc) {
-                for &idx in lv_live.iter() {
-                    if !pc_live_r.contains(&idx) {
-                        pc_live_r.push(idx);
-                    }
+            // omitted.  A loop-carried operand-stack value is frame-live
+            // at the opcode-start `-live-` but SSA-backward-DEAD there
+            // once the portal sandwich spills it into the virtualizable
+            // and `jit_merge_point` kills the SSA copies
+            // (`handle_jit_marker__jit_merge_point`).  Without the
+            // re-add the guard snapshot drops those colors and blackhole
+            // COMPARE / POP_JUMP resumes with an empty stack.
+            // `liveness.py compute_liveness` keeps every alive value; this restores
+            // the frame-live subset the SSA pass cannot see.
+            for &idx in lv_live.iter() {
+                if !pc_live_r.contains(&idx) {
+                    pc_live_r.push(idx);
                 }
             }
 
@@ -6826,6 +7267,7 @@ fn filter_liveness_in_place(
         after_call_post_merge,
         first_insn_post_merge,
         marker_pcdep,
+        body_live_in_violations,
     )
 }
 
@@ -7209,6 +7651,9 @@ pub struct CodeWriter {
     /// → `result_type` mapping.
     call_descr_stub_cache:
         Mutex<HashMap<(majit_ir::EffectInfo, Vec<Kind>, Option<Kind>), Arc<CallDescrStub>>>,
+    /// Debug/test INV census: body_N and handler-entry live-in that
+    /// escape the portal reds/greens. Filled by `transform_graph_to_jitcode`.
+    body_live_in_violations: RefCell<Vec<BodyLiveInViolation>>,
 }
 
 impl CodeWriter {
@@ -7228,7 +7673,15 @@ impl CodeWriter {
             assembler: RefCell::new(Assembler::resuming_build_time_liveness()),
             callcontrol: UnsafeCell::new(super::call::CallControl::new(cpu, Vec::new())),
             call_descr_stub_cache: Mutex::new(HashMap::new()),
+            body_live_in_violations: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Portal `body_N` / handler-entry live-in that escape the merge
+    /// reds and greens. Populated by the last `transform_graph_to_jitcode`.
+    #[cfg(test)]
+    fn body_live_in_violations(&self) -> Vec<BodyLiveInViolation> {
+        self.body_live_in_violations.borrow().clone()
     }
 
     /// Intern a [`CallDescrStub`] by `(effect_info, arg_kinds,
@@ -7501,6 +7954,23 @@ impl CodeWriter {
         // killing the cross-arm conflated Variable that previously caused
         // scratch slots to appear "alive" at unrelated `-live-` markers.
         let scratch_ref_base: u16 = portal_ec_reg + 1;
+        // `interp_jit.py` carries `pycode` as a loop green.  Traces start
+        // at function entry and loop headers (`merge_entry_by_green`),
+        // and CloseLoop compares that green at the header.  A getfield
+        // in those merge blocks reloads it from the live frame; body
+        // merges reuse the entry Variable so the extra ops do not push
+        // label targets past `0xFFFF` (`assembler.py`).  Every getfield
+        // result is pinned to one Ref color above the allocator range
+        // (same post-color reservation as `frame`/`ec`) so a local cannot
+        // coalesce with it — otherwise `opimpl_jit_merge_point` records
+        // a live box as the pycode green.
+        let mut portal_pycode_var: Option<super::flow::Variable> = None;
+        let mut portal_pycode_vars: Vec<super::flow::Variable> = Vec::new();
+        let mut portal_pycode_reg: Option<u16> = None;
+        let mut portal_next_instr_reg: Option<u16> = None;
+        let mut portal_profiled_reg: Option<u16> = None;
+        let mut portal_next_instr_vars: Vec<super::flow::Variable> = Vec::new();
+        let mut portal_profiled_vars: Vec<super::flow::Variable> = Vec::new();
 
         // regalloc.py: compile-time stack depth counter — tracks which
         // stack register (stack_base + depth) is the current TOS.
@@ -7917,6 +8387,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: unary_not_fn_idx,
                     flavor: _unary_not_fn_flavor,
+                },
+            to_bool_fn:
+                HelperHandle {
+                    idx: to_bool_fn_idx,
+                    flavor: _to_bool_fn_flavor,
                 },
             load_fast_check_fn:
                 HelperHandle {
@@ -8666,11 +9141,13 @@ impl CodeWriter {
         // switchover. `dispatch_op` in `assembler.rs` already routes
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
-        // The value stack as the opcode being walked was entered, refreshed per
-        // PC below and read by `emit_abort_permanent!`.  Declared out here
-        // rather than beside the refresh because a `macro_rules!` body resolves
-        // a non-parameter identifier in the macro's DEFINITION scope.
-        let mut pre_opcode_stack: Vec<super::flow::FlowValue> = Vec::new();
+        // Entry valuestackdepth as the opcode being walked was entered,
+        // refreshed per PC below and read by `emit_abort_permanent!`.
+        // Declared out here rather than beside the refresh because a
+        // `macro_rules!` body resolves a non-parameter identifier in the
+        // macro's DEFINITION scope.  Only the length is needed: producers
+        // already stored every slot, and pops store NULL.
+        let mut pre_opcode_len: usize = 0;
 
         macro_rules! emit_abort_permanent {
             // Straight-line form: the arm has modelled this opcode's stack
@@ -8688,37 +9165,17 @@ impl CodeWriter {
                 emit_abort_permanent!(@emit $py_pc, true)
             }};
             (@emit $py_pc:expr, $closes_block:expr) => {{
-                // Materialize the value stack the interpreter resumes on.
-                // `pyframe.py`'s `pushvalue` lowers every push to a
-                // `setarrayitem_vable_r` (`jtransform.py`'s
-                // `do_fixed_list_setitem`), but pyre's `push_and_bump!` keeps
-                // the pushed value in its SSA register and syncs only
-                // `valuestackdepth`, so a slot last written that way still
-                // reads PY_NULL out of the vable.  Every stack slot the
-                // resumed opcode reads has to be a real one, and the walk
-                // reaches the marker only on a run that is bailing, so nothing
-                // that keeps executing pays for these stores.
-                //
-                // The snapshot, not `current_state`: the marker resumes AT this
-                // opcode, and the arms model the opcode's stack effect before
-                // they bail, so `current_state` here is the state AFTER an
-                // opcode that has not run.
-                for (slot, value) in pre_opcode_stack.iter().enumerate() {
-                    let v_idx: super::flow::FlowValue =
-                        super::flow::Constant::signed((stack_base_absolute + slot) as i64).into();
-                    record_graph_op(
-                        &current_block.block(),
-                        "setarrayitem_vable_r",
-                        vable_setarrayitem_ref_graph_args(
-                            frame_var.into(),
-                            v_idx.into(),
-                            value.clone().into(),
-                        ),
-                        None,
-                        ($py_pc) as i64,
-                    );
-                }
-                emit_vsd!(pre_opcode_stack.len(), $py_pc);
+                // Restore `valuestackdepth` to the entry depth.  Producers
+                // already stored every live slot (`emit_pushvalue_ref!` /
+                // `push_and_bump!` / `emit_load_fast_ref!`; `pyframe.py`
+                // `pushvalue` → `jtransform.py` `do_fixed_list_setitem`
+                // vable branch); pops store NULL (`emit_popvalue_ref!`).
+                // The marker resumes AT this opcode, and the arms model
+                // the opcode's stack effect on `current_state` before they
+                // bail, so `current_state` here is AFTER an opcode that
+                // has not run — only the snapshotted length is the BEFORE
+                // image the interpreter must see.
+                emit_vsd!(pre_opcode_len, $py_pc);
                 // Publish `last_instr` to the vable before the bail so the
                 // blackhole hands the interpreter the right resume
                 // coordinate.  The blackhole replays codewriter jitcode that
@@ -9675,6 +10132,31 @@ impl CodeWriter {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx: super::flow::FlowValue =
                         super::flow::Constant::signed(depth_value).into();
+                    // `pyframe.py popvalue` reads the slot, then writes
+                    // None.  The loaded SSA is what STORE_FAST / binary
+                    // consume: FrameState at a joinpoint still names the
+                    // block inputarg (a peel constant), while this slot
+                    // already holds the value `pushvalue` stored.
+                    let loaded = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "getarrayitem_vable_r",
+                        vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.clone().into()),
+                        Kind::Ref,
+                        popvalue_ref_py_pc,
+                    );
+                    // `pop_ref_or_fresh` pops the Vec tail.  If FrameState
+                    // is longer than `valuestackdepth`, that tail is a
+                    // stale extra, not the slot just loaded.  Trim to the
+                    // live TOS, then name the vable read there so the
+                    // caller consumes `loaded` (`pyframe.py popvalue`).
+                    let tos_len = $depth as usize + 1;
+                    if current_state.stack.len() > tos_len {
+                        current_state.stack.truncate(tos_len);
+                    }
+                    if let Some(tos) = current_state.stack.get_mut($depth as usize) {
+                        *tos = loaded.into();
+                    }
                     record_graph_op(
                         &current_block.block(),
                         "setarrayitem_vable_r",
@@ -9946,6 +10428,20 @@ impl CodeWriter {
             }};
         }
 
+        // Every Python operand-stack push stores the slot (`pyframe.py`
+        // `pushvalue`): `emit_pushvalue_ref!` / `emit_pushvalue_ref_const!` /
+        // `emit_load_fast_ref!` / `push_and_bump!`.  BUILD_LIST already
+        // stores, so a later SWAP `peekvalue` of that slot reads the stored
+        // list.  Sites that push without a vable store:
+        // * UnpackSequence / UnpackEx: a temporary graph-edge tuple, popped
+        //   immediately, not a Python `pushvalue`.
+        // * abort-path stack model (resume AT the opcode; vsd restore must
+        //   not re-include NULLed or newly-written slots): CheckEgMatch,
+        //   CallKw nargs>13, EndSend, Send, YieldValue (after the marker),
+        //   GetYieldFromIter / GetAiter / GetAwaitable, LoadFromDictOrDeref,
+        //   BuildInterpolation / BuildTemplate, CallIntrinsic1/2 else,
+        //   LoadSpecial AEnter/AExit.
+
         // Seed the outer walker queue.  Matches
         // `flowcontext.py:401` `pendingblocks = deque([startblock])`.
         pendingblocks.push_back(current_block.clone());
@@ -10133,6 +10629,79 @@ impl CodeWriter {
                         // `getarrayitem_vable_r`), not a second
                         // `last_exc_value` producer.
                     }
+                    // The merge belongs to the block that legitimately
+                    // STARTS at this PC — the one entered via its own
+                    // back-edge / pending-block pop (`flatten.py
+                    // make_bytecode_block` enters a block only via its
+                    // own links).  Pyre's PC-sequential walker can also
+                    // reach a PC by sequentially advancing off the
+                    // PC-adjacent predecessor block AFTER that predecessor
+                    // was closed by an unconditional terminator
+                    // (`emit_goto!` / `emit_ref_return!` / `emit_raise!`
+                    // cleared `needs_fallthrough` so `emit_mark_label_pc!`
+                    // could not switch away, and no joinpoint is registered
+                    // at the PC yet because its back-edge lies at a higher,
+                    // not-yet-walked PC).  In that case `current_block` is
+                    // the terminator-closed predecessor, NOT the target
+                    // block:
+                    //   - a JumpBackward block carrying `loop_header` +
+                    //     `goto` whose PC-adjacent next PC is a DIFFERENT
+                    //     loop's header (the word-drop bug: the merge lands
+                    //     after the `goto`, so `insert_exits` serialises it
+                    //     BEFORE the goto target and a blackhole
+                    //     guard-resume reaches the `jit_merge_point` first,
+                    //     `ContinueRunningNormally`s at the loop-header PC
+                    //     without the predecessor's state reset → truncated
+                    //     / duplicated output);
+                    //   - an explicit `raise X` block whose fall-through
+                    //     PC is a loop header (merge serialised before the
+                    //     `raise`, dropping the handler).
+                    // In every terminator-closed case the merge belongs to
+                    // the real block, emitted when that PC is walked
+                    // through its own entry.  Suppress it here on any
+                    // terminator-closed block — the same guard the
+                    // op-dispatch `block_closed_by_terminator` gate applies
+                    // below.  Computed once here and reused at that gate.
+                    let block_closed_by_terminator = {
+                        let block_rc = current_block.block();
+                        let block = block_rc.borrow();
+                        let has_explicit_raise =
+                            block.raising_op().is_some_and(|op| op.opname == "raise");
+                        !block.exits.is_empty()
+                            && (has_explicit_raise
+                                || !matches!(
+                                    block.exitswitch,
+                                    Some(super::flow::ExitSwitch::Value(super::flow::FlowValue::Constant(
+                                        ref c,
+                                    ))) if matches!(
+                                        c.value,
+                                        super::flow::ConstantValue::Atom(super::flow::Atom::LastException)
+                                    )
+                                ))
+                    };
+                    let at_instruction_start = !matches!(
+                        pyre_interpreter::decode_instruction_at(code, py_pc),
+                        None | Some((
+                            Instruction::Cache
+                                | Instruction::ExtendedArg
+                                | Instruction::NotTaken
+                                | Instruction::Resume { .. }
+                                | Instruction::Nop,
+                            _
+                        ))
+                    );
+
+                    // Forget the previous instruction's local SSA so this
+                    // opcode's PRE snapshot does not name STORE_FAST dests.
+                    // Trivia units keep the predecessor FrameState
+                    // (`skip_python_trivia_forward`).  Stack Variables stay
+                    // for the resume-depth pcdep map; the opcode body
+                    // re-reads them with `getarrayitem_vable_r`
+                    // (`pyframe.py` peekvalue / popvalue).
+                    if at_instruction_start && !block_closed_by_terminator {
+                        forget_ssa_across_instruction(&mut current_state);
+                    }
+
                     // The walker emits one block-identity `Label(block)`
                     // at block entry (`flatten.py` parity).  Per-PC
                     // `-live-` positions for `pc_map` population are
@@ -10269,50 +10838,159 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    // Logical start: first `ExtendedArg` of a prefix run, or
-                    // an unprefixed real opcode. `Cache` and the real opcode
-                    // after a prefix are not merge greens. `Resume` / `Nop` /
-                    // `NotTaken` are dispatched opcodes. The `last_instr`
-                    // store below still names the trivia-normalized opcode
-                    // pc (`skip_python_trivia_forward`).
-                    let at_instruction_start = is_python_instruction_start(code, py_pc);
-                    // `interp_jit.py PyFrame.dispatch` evaluates the portal
-                    // `jit_merge_point` before every `handle_bytecode`, so a
-                    // blackhole resumed from a guard (`blackhole.py
-                    // bhimpl_jit_merge_point`) raises `ContinueRunningNormally`
-                    // at the next opcode boundary (last-level) or runs
-                    // `ll_portal_runner` (inner recursive_call).  pyre's
-                    // per-code jitcode is that dispatch specialized to one
-                    // CodeObject, so every instruction start — true portal
-                    // and drained callee — carries the same marker.
-                    // Tracing treats a merge no `loop_header` stamped as
-                    // inert (`pyjitpl.py opimpl_jit_merge_point`).
-                    // `loop_header` is `jump_absolute` / `can_enter_jit` on
-                    // that dispatch. Extra `trace_entry_pcs` (every
-                    // instruction) stay off generator bodies: a yield-resume
-                    // must not walk into the `abort_permanent` the yield
-                    // bakes (`should_unroll_one_iteration`).
-                    let emit_merge = at_instruction_start;
-                    if emit_merge && !block_closed_by_terminator {
-                        // Diamond at the merge-point start: the merge-point
-                        // site cannot carry a branch, so the null test
-                        // joins here before the merge-point `-live-`.
-                        // `goto_if_not` records a data guard;
-                        // `pyjitpl.py get_list_of_active_boxes` reads
-                        // the terminator's own `-live-`, so the header
-                        // carries one before the diamond.
-                        emit_live_placeholder!(py_pc);
-                        let (join_block, profiled_var) = emit_portal_is_being_profiled_read(
-                            &mut graph,
-                            &current_block,
-                            &current_state,
-                            frame_var,
-                            py_pc,
-                            &mut all_walker_blocks,
-                        );
-                        current_block = join_block;
-                        if let Some(state) = current_block.framestate() {
-                            current_state = state;
+                    // interp_jit.py PyFrame.dispatch calls jit_merge_point
+                    // at every next_instr, including the PC a FOR_ITER
+                    // exhaust jump lands on (#78). Trivia units are not
+                    // dispatch iterations.
+                    let at_instruction_start = !matches!(
+                        pyre_interpreter::decode_instruction_at(code, py_pc),
+                        None | Some((
+                            Instruction::Cache
+                                | Instruction::ExtendedArg
+                                | Instruction::NotTaken
+                                | Instruction::Resume { .. }
+                                | Instruction::Nop,
+                            _
+                        ))
+                    );
+                    let is_foriter_exhaust = foriter_exhaust_pcs.contains(&py_pc);
+                    let emit_portal_merge = is_true_portal
+                        && !block_closed_by_terminator
+                        && (at_instruction_start || is_foriter_exhaust);
+                    if emit_portal_merge
+                        || (loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator)
+                    {
+                        if emit_portal_merge {
+                            // Leading `-live-` so `derive_pc_live_indices_from_sparse`
+                            // keys this PC's resume marker at-or-before
+                            // `int_copy`, not the previous opcode's op2.
+                            emit_live_placeholder!(py_pc);
+                            let jdindex = PYTHON_PORTAL_JD_INDEX;
+                            // Reload `pycode` at function entry and at each
+                            // loop header so a header-started trace writes
+                            // the green before `jit_merge_point`.  Body
+                            // merges reuse that Variable: they do not close
+                            // (`pyjitpl.py` `if not has_targets: return`).
+                            let reload_pycode =
+                                portal_pycode_var.is_none() || loop_header_pcs.contains(&py_pc);
+                            let scratch_pycode_reg = *portal_pycode_reg.get_or_insert_with(|| {
+                                ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0
+                            });
+                            let scratch_next_instr_reg =
+                                *portal_next_instr_reg.get_or_insert_with(|| {
+                                    ssarepr.fresh_var(Kind::Int, scratch_int_base).0
+                                });
+                            let scratch_profiled_reg =
+                                *portal_profiled_reg.get_or_insert_with(|| {
+                                    ssarepr.fresh_var(Kind::Int, scratch_int_base).0
+                                });
+                            let pycode_var = if reload_pycode {
+                                let loaded = emit_vable_getfield_ref(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    frame_var,
+                                    VABLE_CODE_FIELD_IDX,
+                                    py_pc as i64,
+                                );
+                                portal_pycode_vars.push(loaded);
+                                if portal_pycode_var.is_none() {
+                                    portal_pycode_var = Some(loaded);
+                                }
+                                loaded
+                            } else {
+                                portal_pycode_var.expect(
+                                    "body merge reuses the entry `pycode` getfield Variable",
+                                )
+                            };
+                            // `verify_green_args` requires a Const at the
+                            // merge. ListOfKind items always pool
+                            // (`assembler.py` `emit_const` without
+                            // `allow_short`), so a `ConstInt` PC per
+                            // instruction overflows `constants_i`. Copy the
+                            // PC into a register with `int_copy/c>i` or
+                            // `int_copy/d>i` instead: dest is ConstInt, and
+                            // unique offsets do not take a pool slot.
+                            let next_instr_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_copy",
+                                vec![super::flow::Constant::signed(py_pc as i64).into()],
+                                Kind::Int,
+                                py_pc as i64,
+                            );
+                            portal_next_instr_vars.push(next_instr_var);
+                            // One `portal_merge_greens` per instruction;
+                            // flatten shares `get_is_being_profiled` +
+                            // `promote_greens` as `goto pmg_shared`.
+                            let profiled_var = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                OPNAME_PORTAL_MERGE_GREENS,
+                                vec![frame_var.into(), next_instr_var.into(), pycode_var.into()],
+                                Kind::Int,
+                                py_pc as i64,
+                            );
+                            portal_profiled_vars.push(profiled_var);
+                            emit_live_placeholder!(py_pc);
+                            // The producer's `setarrayitem_vable_r`
+                            // (`emit_pushvalue_ref!` / `push_and_bump!` /
+                            // `emit_load_fast_ref!`) is the only operand-stack
+                            // store. Resume restores `locals_cells_stack_w`
+                            // from the vable section (`consume_vref_and_vable`
+                            // / `write_from_resume_data_partial`) before
+                            // `bhimpl_jit_merge_point` raises
+                            // ContinueRunningNormally.
+                            emit_vsd!(current_state.stack.len(), py_pc);
+                            let graph_args = portal_jit_merge_point_graph_args(
+                                &graph,
+                                next_instr_var.into(),
+                                profiled_var,
+                                pycode_var,
+                                jdindex,
+                            );
+                            let graph_op = emit_graph_op_void(
+                                &current_block.block(),
+                                "jit_merge_point",
+                                graph_args,
+                                py_pc as i64,
+                            );
+                            // Ad hoc regallocs for the walk-time serialize of
+                            // `jit_merge_point`: Int `next_instr` and
+                            // `is_being_profiled` plus the three portal Refs
+                            // (frame / ec / pycode). Canonical `flatten_graph`
+                            // recolors the same Variables from the graph; this
+                            // map exists because the walker serializes the
+                            // marker outside that pass.
+                            let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
+                            portal_int_coloring.insert(next_instr_var.id, scratch_next_instr_reg);
+                            portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
+                            let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
+                            portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
+                            portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
+                            portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
+                            let mut portal_regallocs = [
+                                super::regalloc::GraphAllocationResult {
+                                    coloring: portal_int_coloring,
+                                    num_colors: scratch_next_instr_reg.max(scratch_profiled_reg)
+                                        + 1,
+                                },
+                                super::regalloc::GraphAllocationResult {
+                                    coloring: portal_ref_coloring,
+                                    num_colors: 3,
+                                },
+                                super::regalloc::GraphAllocationResult {
+                                    coloring: crate::jit::regalloc::Coloring::default(),
+                                    num_colors: 0,
+                                },
+                            ];
+                            GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
+                                .serialize_op(&graph_op);
+                        } else {
+                            // jtransform.py op3: -live- before
+                            // jit_merge_point, "for inlined short preambles".
+                            // An exhaust-only target reuses the per-PC
+                            // `-live-` below.
+                            emit_live_placeholder!(py_pc);
                         }
                         needs_fallthrough = true;
                         let jdindex = PYTHON_PORTAL_JD_INDEX;
@@ -10411,7 +11089,7 @@ impl CodeWriter {
                         emit_live_placeholder!(py_pc);
                     }
 
-                    if emit_merge && !block_closed_by_terminator {
+                    if emit_portal_merge {
                         // `interp_jit.py PyFrame.dispatch` promotes the live
                         // valuestackdepth after jit_merge_point, before
                         // handle_bytecode. Use the same getfield/hint lowering
@@ -10472,10 +11150,10 @@ impl CodeWriter {
                     // loop headers behind an unsupported opcode.
                     //
                     // Reuses `block_closed_by_terminator` computed above the
-                    // per-opcode `jit_merge_point` gate. The debugdata diamond
-                    // closes the block and switches `current_block` to the
-                    // join, which has no exits, so the cached `false` still
-                    // matches the block opcode dispatch writes into.
+                    // per-opcode `jit_merge_point` gate. `portal_merge_greens`
+                    // is a graph op flatten lowers to `goto pmg_shared`; it
+                    // does not close `current_block`, so the cached `false`
+                    // still matches the block opcode dispatch writes into.
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
                         current_state.blocklist =
@@ -10569,13 +11247,11 @@ impl CodeWriter {
                         needs_fallthrough = true;
                     }
 
-                    // Snapshot the entry stack for `emit_abort_permanent!`.  The
-                    // marker resumes the interpreter AT this opcode, so what it
-                    // has to hand back is the frame the opcode has not run yet —
-                    // and an arm that aborts has usually already modelled the
-                    // opcode's stack effect on `current_state`.
-                    pre_opcode_stack.clear();
-                    pre_opcode_stack.extend(current_state.stack.iter().cloned());
+                    // Snapshot the entry valuestackdepth for
+                    // `emit_abort_permanent!`.  The marker resumes AT this
+                    // opcode, and an arm that aborts has usually already
+                    // modelled the opcode's stack effect on `current_state`.
+                    pre_opcode_len = current_state.stack.len();
 
                     // RPython jtransform.py: rewrite_operation() dispatches per opname.
                     // Each match arm is the pyre equivalent of rewrite_op_*.
@@ -10778,15 +11454,15 @@ impl CodeWriter {
                             // Inputs are read by the backend ABI into call regs
                             // before the call executes; no write-back conflicts
                             // because ResKind::Void.
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_setitem(
                                 &mut graph,
                                 &current_block.block(),
@@ -10826,37 +11502,30 @@ impl CodeWriter {
                             let _ = binary_op_tag(op_kind)
                                 .expect("unsupported binary op tag in jitcode lowering")
                                 as i64;
-                            let operands_are_local_loads = {
-                                let block = current_block.block();
-                                let block = block.borrow();
-                                current_state.stack.len() >= 2
-                                    && current_state.stack.iter().rev().take(2).all(|value| {
-                                        block.operations.iter().rev().any(|operation| {
-                                            operation.opname == "getarrayitem_vable_r"
-                                                && operation.result.as_ref() == Some(value)
-                                        })
-                                    })
-                            };
-                            // RPython puts a live marker immediately before
-                            // overflowing integer arithmetic.  Python bytecode
-                            // is dynamically typed, so preserve that boundary
-                            // for the local-load shape handled by the integer
-                            // fast path.
-                            if operands_are_local_loads {
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "-live-",
-                                    Vec::new(),
-                                    None,
-                                    py_pc as i64,
-                                );
-                            }
                             // Pop rhs (blackhole will see vsd reflect this pop).
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // Pop lhs.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `rewrite_op_int_add_ovf`: `-live-` then the ovf
+                            // op, after the pops, so the marker names GET dest
+                            // colors for blackhole continue.
+                            if matches!(
+                                op_kind,
+                                pyre_interpreter::bytecode::BinaryOperator::Add
+                                    | pyre_interpreter::bytecode::BinaryOperator::Subtract
+                                    | pyre_interpreter::bytecode::BinaryOperator::Multiply
+                            ) {
+                                emit_live_placeholder!(py_pc);
+                            }
+                            // `jtransform.py handle_regular_indirect_call`:
+                            // `-live-` after argument setup (the pops) and
+                            // before the residual. FloorDiv/Remainder fold
+                            // GuardTrue records at that residual pc; resume
+                            // must start after `popvalue` so the blackhole
+                            // does not re-pop a NULL TOS.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_binary(
                                 &mut graph,
                                 &current_block.block(),
@@ -10873,24 +11542,13 @@ impl CodeWriter {
                             // Same stack-direct pattern as BinaryOp — see its comment.
                             let op_kind = opname.get(op_arg);
                             let _ = compare_op_tag(op_kind);
-                            // `MIFrame.generate_guard()` captures resumedata at
-                            // the current jitcode pc (`pyjitpl.py`).
-                            // CompareOp specialization emits class/value guards
-                            // after consuming both Python operands, so retain
-                            // the opcode-start `-live-`; the pre-dispatch pcdep
-                            // snapshot supplies those operands on guard failure,
-                            // matching PyPy's per-frame register snapshot.
-                            record_graph_op(
-                                &current_block.block(),
-                                "-live-",
-                                Vec::new(),
-                                None,
-                                py_pc as i64,
-                            );
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_compare(
                                 &mut graph,
                                 &current_block.block(),
@@ -10922,6 +11580,9 @@ impl CodeWriter {
                             // `goto_if_not`.
                             let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let bool_value = emit_frontend_bool(
                                 &mut graph,
                                 &current_block.block(),
@@ -11010,6 +11671,9 @@ impl CodeWriter {
                             // needed; the residual call reads the popped stack slot.
                             let _cond_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cond_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let bool_value = emit_frontend_bool(
                                 &mut graph,
                                 &current_block.block(),
@@ -11395,87 +12059,21 @@ impl CodeWriter {
                             // mirror the interpreter exactly or a pre-call
                             // resume reads the null slot as the callable.
                             //
-                            // When the abstract stack carries the LoadAttr/
-                            // LoadGlobal null sentinel as a graph Constant, the
-                            // slot value exists ONLY in the vable array
-                            // (`emit_pushvalue_ref_const!` writes no stack
-                            // register), and it must NOT const-fold to
-                            // ConstRef(0): a pre-call resume seeds the slot
-                            // from the tracer, which may hold a real receiver
-                            // (load_method_fast_path pushes `[w_descr, w_obj]`,
-                            // callmethod.py:60-68).  Materialize the slot value
-                            // with the upstream popvalue read
-                            // (`pyframe.py` reads
-                            // `locals_cells_stack_w[depth]` BEFORE clearing it,
-                            // `jtransform.py do_fixed_list_getitem`) so the
-                            // stack register has a producer on the straight-line
-                            // jitcode path; a producer-less pinned variable
-                            // leaves the register unbound for any execution that
-                            // is not rd_numb-seeded (walker full-body walk,
-                            // blackhole entry upstream of the push).
-                            let null_or_self_needs_read = !matches!(
-                                current_state.stack.last(),
-                                Some(super::flow::FlowValue::Variable(_))
-                            );
-                            let null_or_self_read = if null_or_self_needs_read {
-                                let slot =
-                                    (stack_base_absolute + current_depth as usize - 1) as i64;
-                                let v_idx: super::flow::FlowValue =
-                                    super::flow::Constant::signed(slot).into();
-                                Some(emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "getarrayitem_vable_r",
-                                    vable_getarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        v_idx.into(),
-                                    ),
-                                    Kind::Ref,
-                                    py_pc as i64,
-                                ))
-                            } else {
-                                None
-                            };
-                            let null_or_self_reg = emit_popvalue_ref!(current_depth, py_pc);
-                            let null_or_self_value: super::flow::FlowValue =
-                                match pop_ref_or_fresh(&mut current_state, &mut graph) {
-                                    super::flow::FlowValue::Variable(v) => {
-                                        super::flow::FlowValue::Variable(v)
-                                    }
-                                    _ => match null_or_self_read {
-                                        Some(v) => super::flow::FlowValue::Variable(v),
-                                        None => {
-                                            // Non-portal plain-call PY_NULL
-                                            // self-slot.  Pass the constant null
-                                            // directly as the call's
-                                            // `null_or_self` instead of
-                                            // materializing a `ref_copy(
-                                            // ConstRef(0))` into the popped stack
-                                            // register: the splice can coalesce
-                                            // that stack slot onto the call's
-                                            // live arg0 register, and the
-                                            // null-init would then clobber the
-                                            // argument (`f(g(x), x)` nulls `x`
-                                            // before the inner call).  A constant
-                                            // `null_or_self` lowers to a
-                                            // `ConstRef(0)` arglist entry in the
-                                            // const window, leaving the arg
-                                            // register intact.  Only the PY_NULL
-                                            // sentinel reaches here — a real
-                                            // receiver is a Variable (handled
-                                            // above) and a portal reads the slot
-                                            // from the vable mirror.  The slot is
-                                            // consumed by this call (popped), so
-                                            // no downstream read needs a
-                                            // producer; a pre-call resume seeds
-                                            // it from rd_numb.
-                                            let _ = null_or_self_reg;
-                                            super::flow::Constant::none().into()
-                                        }
-                                    },
-                                };
+                            // `callmethod.py` `CALL_METHOD` reads this slot
+                            // (`w_self = f.peekvalue_maybe_none(n_args)`);
+                            // `load_method_fast_path` leaves `[w_descr, w_obj]`
+                            // so a pre-call resume can seed a real receiver.
+                            // Graph TOS `Constant::none()` is the PUSH_NULL
+                            // producer, not the live slot, so do not
+                            // const-fold it to `ConstRef(0)`.  `popvalue`
+                            // (`emit_popvalue_ref!`) GETs `locals_cells_stack_w`
+                            // and that GET is the operand `simple_call` sees.
+                            let _null_or_self_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let null_or_self_value =
+                                pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
 
                             // RPython blackhole.py: call_int_function transmutes
                             // to the correct arity. Each nargs needs a matching
@@ -11514,10 +12112,56 @@ impl CodeWriter {
                             push_and_bump!(call_result_value, py_pc);
                         }
 
-                        // Python 3.13: ToBool converts TOS to bool before branch.
-                        // No-op in JitCode: the value is already truthy/falsy and
-                        // the following PopJumpIfFalse guards on it.
-                        Instruction::ToBool => {}
+                        // `eval.rs` `to_bool` / `flowcontext.rs` ToBool /
+                        // `baseobjspace.py newbool`: popvalue, `is_true`,
+                        // push `w_bool_from(truth)`. Net 0.
+                        // `truth_fn` is `space.is_true` (`descroperation.py
+                        // is_true`, Int, MayForce). `bh_to_bool_fn` is
+                        // `space.newbool` (Ref, CannotRaise). The split
+                        // is load-bearing for blackhole:
+                        // `_setup_return_value_i` (`blackhole.py`) writes
+                        // the Int dest of `residual_call_r_i`; a fused
+                        // `residual_call_r_r` left the r-dest empty when a
+                        // `py_type_check` guard failed inside
+                        // `truth_value`.
+                        Instruction::ToBool => {
+                            let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`:
+                            // `-live-` after argument setup (the pop) and
+                            // before the residual. Truth fold GuardTrue/GuardFalse
+                            // records at that residual pc; resume must start
+                            // after `popvalue` so the blackhole does not re-pop
+                            // a NULL TOS.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
+                            let truth_int = residual_call!(
+                                truth_fn_idx,
+                                CallFlavor::MayForce,
+                                majit_ir::RuntimeHelperKind::Truth,
+                                vec![],
+                                vec![val_value],
+                                vec![],
+                                vec![Kind::Ref],
+                                ResKind::Int,
+                                py_pc as i64,
+                            )
+                            .map(super::flow::FlowValue::from)
+                            .unwrap_or_else(|| graph.fresh_variable(Kind::Int).into());
+                            let result_value = residual_call!(
+                                to_bool_fn_idx,
+                                CallFlavor::PlainCannotRaise,
+                                majit_ir::RuntimeHelperKind::Truth,
+                                vec![truth_int],
+                                vec![],
+                                vec![],
+                                vec![Kind::Int],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            )
+                            .map(super::flow::FlowValue::from)
+                            .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
+                            push_and_bump!(result_value, py_pc);
+                        }
 
                         // UNARY_NEGATIVE: pops `value`, pushes `-value` (net 0).
                         // The graph records the flowspace `neg(value)` op
@@ -11530,6 +12174,9 @@ impl CodeWriter {
                         Instruction::UnaryNegative => {
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_neg(
                                 &mut graph,
                                 &current_block.block(),
@@ -11598,6 +12245,9 @@ impl CodeWriter {
                             // reverse the pop order.
                             let items: Vec<super::flow::FlowValue> =
                                 item_values_rev.into_iter().rev().collect();
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_newlist(
                                 &mut graph,
                                 &current_block.block(),
@@ -11633,6 +12283,9 @@ impl CodeWriter {
                         Instruction::BuildListFromArg => {
                             let _iter_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let iter_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let list_var = residual_call!(
                                 newlist_from_iter_hint_fn_idx,
                                 CallFlavor::MayForce,
@@ -11675,6 +12328,9 @@ impl CodeWriter {
                             let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_buildslice_shadow_graph(
                                 &mut graph,
                                 &current_block.block(),
@@ -11704,8 +12360,8 @@ impl CodeWriter {
                                     super::flatten::Operand,
                                     super::flow::FlowValue,
                                 ) = if n >= 2 {
-                                    let cause_fv = pop_ref_or_fresh(&mut current_state, &mut graph);
                                     let cause_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                    let cause_fv = pop_ref_or_fresh(&mut current_state, &mut graph);
                                     (
                                         super::flatten::Operand::Register(
                                             super::flatten::Register::new(
@@ -11744,8 +12400,8 @@ impl CodeWriter {
                                 // rewrite `raise SomeExcClass` into a fresh
                                 // instance, so the exception edge must carry a
                                 // NEW FlowValue representing the normalized result.
-                                let exc_fv = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let exc_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let exc_fv = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 // pyopcode.py:711 `exception_is_valid_obj_as_class_w`
                                 // normalization + `set_cause` attachment.  Call ABI
                                 // reads inputs before writing the result; the
@@ -11774,6 +12430,12 @@ impl CodeWriter {
                                 // canonical `flatten_graph` driver sees the same
                                 // op via passthrough.  `normalize_raise_varargs_fn`
                                 // takes `(frame:Ref, exc:Ref, cause:Ref) → Ref` MayForce.
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after the pops and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let normalized_var = residual_call!(
                                     normalize_raise_varargs_fn_idx,
                                     CallFlavor::MayForce,
@@ -12058,6 +12720,9 @@ impl CodeWriter {
                             // call so the guard snapshot could name it.
                             let _ = current_state.stack.pop();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let _ = residual_call!(
                                 set_current_exception_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
@@ -12137,14 +12802,22 @@ impl CodeWriter {
                             // the check.
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let match_type_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            // Peek (don't pop) the exception value for the graph
-                            // dual-write — net stack effect is zero (pop match
-                            // type, peek exception, push bool result).
-                            let exc_value = current_state
-                                .stack
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph).into());
+                            // Peek (don't pop) the exception: `pyframe.py
+                            // peekvalue()` reads `locals_cells_stack_w`.
+                            // FrameState at a joinpoint still names the block
+                            // inputarg (a peel constant), so SSA `last()` is
+                            // not the slot PUSH_EXC_INFO / the landing stored.
+                            let exc_value = peek_stack_slot_from_vable(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth.saturating_sub(1) as usize,
+                                py_pc as i64,
+                            );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             // CheckExcMatch
                             // compare_fn factor refactor.  `compare_fn` is
                             // the same helper used by COMPARE_OP — the
@@ -12229,6 +12902,9 @@ impl CodeWriter {
                                 ));
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let _ = current_state.stack.pop();
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let _ = residual_call!(
                                 restore_exc_info_fn_idx,
                                 CallFlavor::PlainCannotRaiseNoHeap,
@@ -12401,37 +13077,31 @@ impl CodeWriter {
                         }
 
                         Instruction::Copy { i } => {
-                            let d = i.get(op_arg) as usize;
-                            if d == 1 {
-                                let duplicated =
-                                    duplicate_shadow_tos(&mut graph, &mut current_state);
-                                emit_pushvalue_ref!(
-                                    current_depth,
-                                    stack_base + current_depth - 1,
-                                    duplicated,
-                                    py_pc
-                                );
-                            } else {
-                                // CPython COPY n (n>1): pushes PEEK(n) where
-                                // PEEK(1)=TOS.  Source value is
-                                // `stack[len-n]`; source register is
-                                // `stack_base + current_depth - n`.  Generated
-                                // by `Python/compile.c` for try-except cleanup
-                                // handlers (L9 reraise shape) to duplicate the
-                                // pushed exception before POP_EXCEPT clears
-                                // the saved state.  `emit_pushvalue_ref!`
-                                // increments `current_depth` internally;
-                                // explicit `current_depth += 1` is unnecessary.
-                                let stack_idx = current_state.stack.len().saturating_sub(d);
-                                let src_value = current_state
-                                    .stack
-                                    .get(stack_idx)
-                                    .cloned()
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                current_state.stack.push(src_value.clone());
-                                let src_reg = stack_base + current_depth.saturating_sub(d as u16);
-                                emit_pushvalue_ref!(current_depth, src_reg, src_value, py_pc);
-                            }
+                            // `pyframe.py peekvalue(oparg)` reads
+                            // `locals_cells_stack_w` (`jtransform.py
+                            // do_fixed_list_getitem` → `getarrayitem_vable_r`).
+                            // COPY n pushes PEEK(n) with PEEK(1)=TOS.
+                            let d = i.get(op_arg) as u16;
+                            let peek_depth = current_depth.saturating_sub(d);
+                            let abs_slot = (stack_base_absolute + peek_depth as usize) as i64;
+                            let v_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(abs_slot).into();
+                            let peeked = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getarrayitem_vable_r",
+                                vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.into()),
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            let peeked_fv: super::flow::FlowValue = peeked.into();
+                            current_state.stack.push(peeked_fv.clone());
+                            emit_pushvalue_ref!(
+                                current_depth,
+                                stack_base + peek_depth,
+                                peeked_fv,
+                                py_pc
+                            );
                         }
 
                         // Stack-effect-aware abort_permanent for unsupported ops.
@@ -12506,6 +13176,9 @@ impl CodeWriter {
                                 super::flow::Constant::string(code.names[name_idx].as_str());
                             let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_store_name(
                                 &mut graph,
                                 &current_block.block(),
@@ -12528,6 +13201,9 @@ impl CodeWriter {
                                 super::flow::Constant::string(code.names[name_idx].as_str());
                             let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_store_global(
                                 &mut graph,
                                 &current_block.block(),
@@ -12603,6 +13279,9 @@ impl CodeWriter {
                                     py_pc as i64,
                                 )
                                 .into();
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -12635,12 +13314,13 @@ impl CodeWriter {
                             .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_store_attr(
                                 &current_block.block(),
                                 obj_value,
@@ -12684,6 +13364,7 @@ impl CodeWriter {
                                 super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_getattr(
                                 &mut graph,
                                 &current_block.block(),
@@ -12701,6 +13382,10 @@ impl CodeWriter {
                                 py_pc
                             );
                             if attr.is_method() {
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let bound_value = emit_frontend_load_method_self(
                                     &mut graph,
                                     &current_block.block(),
@@ -12775,6 +13460,9 @@ impl CodeWriter {
                             // → user `__iter__`/`__next__`), which can run Python and
                             // force the virtualizable → `CallFlavor::MayForce` (emits
                             // `GUARD_NOT_FORCED`).
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let tuple_var = residual_call!(
                                 unpack_sequence_fn_idx,
                                 CallFlavor::MayForce,
@@ -12870,6 +13558,12 @@ impl CodeWriter {
                                 let _iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let iterable_value =
                                     pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after the pop and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let iter_var = residual_call!(
                                     get_iter_fn_idx,
                                     CallFlavor::MayForce,
@@ -13333,6 +14027,9 @@ impl CodeWriter {
                             let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_binary_slice(
                                 &mut graph,
                                 &current_block.block(),
@@ -13353,6 +14050,9 @@ impl CodeWriter {
                             let container_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_contains(
                                 &mut graph,
                                 &current_block.block(),
@@ -13406,11 +14106,18 @@ impl CodeWriter {
                                         pop_ref_or_fresh(&mut current_state, &mut graph);
                                     arg_values_rev.push(arg_value);
                                 }
+                                // Same slot-read as `Instruction::Call`:
+                                // `callmethod.py` `CALL_METHOD_KW`
+                                // `peekvalue_maybe_none(n_arguments + 1)`.
                                 let _self_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let callable_value =
                                     pop_ref_or_fresh(&mut current_state, &mut graph);
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 // Graph op args: callable, null_or_self, kwnames,
                                 // arg0..argN-1 (pops were top-first, so reverse).
                                 let mut op_args: Vec<super::flow::SpaceOperationArg> =
@@ -13434,33 +14141,43 @@ impl CodeWriter {
                         }
 
                         Instruction::Swap { i } => {
-                            // SWAP(n): exchange TOS with the value n
-                            // slots below it.  Stack values flow by symbolic
-                            // `FlowValue` identity — every consumer reads the
-                            // FlowValue, not the positional register (see
-                            // `emit_ref_return!` / `emit_pushvalue_ref!`'s
-                            // `let _ = $src`), and regalloc colors by Variable,
-                            // not by stack position — so the symbolic swap below
-                            // carries the value exchange for the compiled trace.
-                            // The two affected stack slots also mirror to the
-                            // virtualizable array at `stack_base_absolute + depth`
-                            // (jtransform.py `do_fixed_list_setitem`, vable
-                            // branch); a guard-failure resume walk reconstructs
-                            // the live frame from those slots, so emit the crossed
-                            // `setarrayitem_vable_r` writes that keep the mirror
-                            // consistent.  Previously this arm emitted
-                            // `abort_permanent`, which made any resume walk that
-                            // reached a SWAP (e.g. the `return`-from-`except`
-                            // cleanup `SWAP 2; POP_EXCEPT; RETURN_VALUE`) fail.
+                            // pyopcode.py SWAP: `w_top = peekvalue(0)`,
+                            // `w_i = peekvalue(oparg - 1)`,
+                            // `settopvalue(w_i, 0)`,
+                            // `settopvalue(w_top, oparg - 1)`.
+                            // `peekvalue` / `settopvalue` read and write
+                            // `locals_cells_stack_w` (`jtransform.py`
+                            // `do_fixed_list_getitem` /
+                            // `do_fixed_list_setitem` vable branch →
+                            // `getarrayitem_vable_r` /
+                            // `setarrayitem_vable_r`).  The two gets
+                            // produce fresh Variables; those become the
+                            // body's stack values.  Pre-merge FlowValues
+                            // are not named after the merge — leftover
+                            // stack SSA would otherwise union through the
+                            // shared `switch last_instr` into every op2.
                             let depth = i.get(op_arg) as usize;
                             let stack_len = current_state.stack.len();
                             if depth > 0 && depth <= stack_len {
                                 let tos_idx = stack_len - 1;
                                 let other_idx = stack_len - depth;
-                                current_state.stack.swap(tos_idx, other_idx);
                                 if tos_idx != other_idx {
-                                    let tos_value = current_state.stack[tos_idx].clone();
-                                    let other_value = current_state.stack[other_idx].clone();
+                                    let tos_reloaded = peek_stack_slot_from_vable(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        frame_var,
+                                        stack_base_absolute,
+                                        tos_idx,
+                                        py_pc as i64,
+                                    );
+                                    let other_reloaded = peek_stack_slot_from_vable(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        frame_var,
+                                        stack_base_absolute,
+                                        other_idx,
+                                        py_pc as i64,
+                                    );
                                     let tos_slot: super::flow::FlowValue =
                                         super::flow::Constant::signed(
                                             (stack_base_absolute + tos_idx) as i64,
@@ -13477,7 +14194,7 @@ impl CodeWriter {
                                         vable_setarrayitem_ref_graph_args(
                                             frame_var.into(),
                                             tos_slot.into(),
-                                            tos_value.into(),
+                                            other_reloaded.clone().into(),
                                         ),
                                         None,
                                         py_pc as i64,
@@ -13488,11 +14205,13 @@ impl CodeWriter {
                                         vable_setarrayitem_ref_graph_args(
                                             frame_var.into(),
                                             other_slot.into(),
-                                            other_value.into(),
+                                            tos_reloaded.clone().into(),
                                         ),
                                         None,
                                         py_pc as i64,
                                     );
+                                    current_state.stack[tos_idx] = other_reloaded;
+                                    current_state.stack[other_idx] = tos_reloaded;
                                 }
                             }
                         }
@@ -13549,8 +14268,7 @@ impl CodeWriter {
                             // (else the residual runs, identical to the trait
                             // tracer's `jit_list_append`).
                             let oparg = i.get(op_arg) as usize;
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // PEEK(oparg): after popping the value, the list sits
                             // at operand-stack depth `current_depth - oparg`.
@@ -13568,6 +14286,9 @@ impl CodeWriter {
                                 oparg,
                                 py_pc as i64,
                             );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let _ = residual_call!(
                                 list_append_fn_idx,
                                 CallFlavor::Plain,
@@ -13698,11 +14419,9 @@ impl CodeWriter {
                         // dict = peek_at(i - 1).
                         Instruction::MapAdd { i } => {
                             let oparg = i.get(op_arg) as usize;
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let key = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // PEEK(oparg) is the comprehension accumulator, so it
                             // comes from its value-stack slot rather than the
@@ -13716,6 +14435,9 @@ impl CodeWriter {
                                 oparg,
                                 py_pc as i64,
                             );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_accumulate_3(
                                 &current_block.block(),
                                 "map_add",
@@ -13740,6 +14462,9 @@ impl CodeWriter {
                             let rhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let lhs_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_is_op(
                                 &mut graph,
                                 &current_block.block(),
@@ -13772,6 +14497,9 @@ impl CodeWriter {
                             // so reverse the pop order.
                             let items: Vec<super::flow::FlowValue> =
                                 item_values_rev.into_iter().rev().collect();
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_frontend_newtuple(
                                 &mut graph,
                                 &current_block.block(),
@@ -13959,6 +14687,7 @@ impl CodeWriter {
                             let self_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _callable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let callable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -13977,12 +14706,13 @@ impl CodeWriter {
 
                         // DeleteSubscr: pops 2 (index, obj). Net: -2.
                         Instruction::DeleteSubscr => {
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let key_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_delsubscr(
                                 &mut graph,
                                 &current_block.block(),
@@ -14008,9 +14738,11 @@ impl CodeWriter {
                             .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_delete_attr(
                                 &current_block.block(),
                                 obj_value,
@@ -14109,8 +14841,7 @@ impl CodeWriter {
                         // residual (`set.add(value)` / `list.append`).
                         Instruction::SetAdd { i } => {
                             let oparg = i.get(op_arg) as usize;
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             // PEEK(oparg) is the comprehension accumulator, so it
                             // comes from its value-stack slot rather than the
@@ -14124,6 +14855,9 @@ impl CodeWriter {
                                 oparg,
                                 py_pc as i64,
                             );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_accumulate_2(
                                 &current_block.block(),
                                 "set_add",
@@ -14138,21 +14872,20 @@ impl CodeWriter {
                         // `list.extend(iterable)` via the `list_extend` residual.
                         Instruction::ListExtend { i } => {
                             let oparg = i.get(op_arg) as usize;
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            // PEEK(oparg): after popping the iterable, PEEK(1) is
-                            // the new TOS, so the list sits at `len - oparg`.
-                            // Clone its FlowValue without popping — the residual
-                            // mutates it in place and it stays live for STORE_FAST.
-                            let list_value = {
-                                let len = current_state.stack.len();
-                                if oparg >= 1 && oparg <= len {
-                                    current_state.stack[len - oparg].clone()
-                                } else {
-                                    fresh_ref_value(&mut graph)
-                                }
-                            };
+                            let list_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg,
+                                py_pc as i64,
+                            );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_list_extend(
                                 &current_block.block(),
                                 list_value,
@@ -14167,11 +14900,20 @@ impl CodeWriter {
                         // `set_update` residual (`set.update` / `list.extend`).
                         Instruction::SetUpdate { i } => {
                             let oparg = i.get(op_arg) as usize;
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let iterable = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let set_value =
-                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            let set_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg,
+                                py_pc as i64,
+                            );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_accumulate_2(
                                 &current_block.block(),
                                 "set_update",
@@ -14187,11 +14929,20 @@ impl CodeWriter {
                         // gate).
                         Instruction::DictUpdate { i } => {
                             let oparg = i.get(op_arg) as usize;
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let source = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let dict_value =
-                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            let dict_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg,
+                                py_pc as i64,
+                            );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_accumulate_2(
                                 &current_block.block(),
                                 "dict_update",
@@ -14208,15 +14959,31 @@ impl CodeWriter {
                         // 3-Ref `dict_merge` residual.  `pyopcode.py:1514`.
                         Instruction::DictMerge { i } => {
                             let oparg = i.get(op_arg) as usize;
-                            current_depth = current_depth.saturating_sub(1);
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let source = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let dict_value =
-                                peek_container_or_fresh(&current_state, oparg, &mut graph);
+                            let dict_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg,
+                                py_pc as i64,
+                            );
                             // callable = peekvalue(oparg + 2) after the source pop
                             // → stack offset (oparg + 3) from the new TOS.
-                            let callable_value =
-                                peek_container_or_fresh(&current_state, oparg + 3, &mut graph);
+                            let callable_value = emit_accumulator_reload(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                current_depth,
+                                oparg + 3,
+                                py_pc as i64,
+                            );
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_accumulate_3(
                                 &current_block.block(),
                                 "dict_merge",
@@ -14250,6 +15017,9 @@ impl CodeWriter {
                             let func_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let attr_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -14331,6 +15101,12 @@ impl CodeWriter {
                             let can_go_lazy = (import_flags & 2) == 0
                                 && !code.flags.contains(CodeFlags::NEWLOCALS);
                             if can_go_lazy {
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after the pops and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let result_value = residual_call!(
                                     eval_lazy_import_name_fn_idx,
                                     CallFlavor::MayForce,
@@ -14391,6 +15167,12 @@ impl CodeWriter {
                                     frame_var.into(),
                                     py_pc as i64,
                                 );
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after argument setup and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let result_value = emit_frontend_simple_call(
                                     &mut graph,
                                     &current_block.block(),
@@ -14434,11 +15216,24 @@ impl CodeWriter {
                             .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
-                            let module_value = current_state
-                                .stack
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // pyopcode.py IMPORT_FROM: `w_mod = peekvalue(0)`
+                            // then `pushvalue(import_from(w_mod, name))`.
+                            // Peek from the vable in this same body
+                            // (`pyframe.py peekvalue` → `getarrayitem_vable_r`);
+                            // the leftover TOS FlowValue was pushed by
+                            // IMPORT_NAME before this merge.
+                            let module_value = if current_depth > 0 {
+                                peek_stack_slot_from_vable(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    frame_var,
+                                    stack_base_absolute,
+                                    current_depth.saturating_sub(1) as usize,
+                                    py_pc as i64,
+                                )
+                            } else {
+                                fresh_ref_value(&mut graph)
+                            };
                             let result_value = emit_frontend_import_from(
                                 &mut graph,
                                 &current_block.block(),
@@ -14463,18 +15258,17 @@ impl CodeWriter {
                         // call regs before the call executes; no write-back
                         // conflicts because ResKind::Void.
                         Instruction::StoreSlice => {
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let stop_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let start_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let container_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            current_depth -= 1;
-                            emit_vsd!(current_depth, py_pc);
+                            let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             emit_frontend_store_slice(
                                 &mut graph,
                                 &current_block.block(),
@@ -14498,6 +15292,9 @@ impl CodeWriter {
                             let spec_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -14557,6 +15354,9 @@ impl CodeWriter {
                             let cls_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
                             let global_super = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let raw_value = if is_two_arg {
                                 // `super(C, self).name` is a call and an
                                 // attribute load, and spelling it as those two
@@ -14653,6 +15453,9 @@ impl CodeWriter {
                             // (`collect_iterable` → user `__iter__`/`__next__`),
                             // which can run Python and force the virtualizable →
                             // `CallFlavor::MayForce` (emits `GUARD_NOT_FORCED`).
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let tuple_var = residual_call!(
                                 unpack_ex_fn_idx,
                                 CallFlavor::MayForce,
@@ -14797,6 +15600,12 @@ impl CodeWriter {
                             } else if let Some(opname) = opname {
                                 let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after the pop and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let result_value = emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -14842,11 +15651,20 @@ impl CodeWriter {
                         // GetLen: peeks obj (does NOT pop), pushes len. Net: +1.
                         // `get_len(subject)` HLOp → `bh_get_len_fn` residual.
                         Instruction::GetLen => {
-                            let subject = current_state
-                                .stack
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            // `pyframe.py peekvalue()` — TOS stays on the
+                            // stack; GET_LEN pushes `len(TOS)` above it.
+                            let tos_depth = current_depth.saturating_sub(1);
+                            let abs_slot = (stack_base_absolute + tos_depth as usize) as i64;
+                            let v_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(abs_slot).into();
+                            let subject = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getarrayitem_vable_r",
+                                vable_getarrayitem_ref_graph_args(frame_var.into(), v_idx.into()),
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -14871,6 +15689,12 @@ impl CodeWriter {
                                     super::flow::Constant::signed(u32::from(op_arg) as i64).into();
                                 let _ = emit_popvalue_ref!(current_depth, py_pc);
                                 let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after the pop and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let result_value = emit_frontend_load_special(
                                     &mut graph,
                                     &current_block.block(),
@@ -14931,6 +15755,9 @@ impl CodeWriter {
                             .into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -14989,6 +15816,9 @@ impl CodeWriter {
                             emit_load_fast_ref!(current_depth, deref_idx, py_pc);
                             let _cell_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let cell_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15073,6 +15903,9 @@ impl CodeWriter {
                         Instruction::FormatSimple => {
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15099,6 +15932,9 @@ impl CodeWriter {
                             );
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15127,6 +15963,9 @@ impl CodeWriter {
                         Instruction::UnaryInvert => {
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15147,6 +15986,9 @@ impl CodeWriter {
                         Instruction::UnaryNot => {
                             let _val_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let val_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15205,6 +16047,12 @@ impl CodeWriter {
                                 let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                                 let name = super::flow::Constant::string("__class__");
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after the pop and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 emit_frontend_store_name(
                                     &mut graph,
                                     &current_block.block(),
@@ -15217,6 +16065,12 @@ impl CodeWriter {
                                 let cell_value = emit_read_local_ref!(idx, py_pc);
                                 let _value_reg = emit_popvalue_ref!(current_depth, py_pc);
                                 let value_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                // `jtransform.py handle_regular_indirect_call`: `-live-`
+                                // after the pop and before the residual.
+                                emit_live_before_residual_call(
+                                    &current_block.block(),
+                                    py_pc as i64,
+                                );
                                 let result_value = emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
@@ -15269,6 +16123,9 @@ impl CodeWriter {
                             emit_load_fast_ref!(current_depth, idx, py_pc);
                             let _current_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let current_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pop and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15624,11 +16481,15 @@ impl CodeWriter {
                             } else {
                                 "match_mapping"
                             };
-                            let subject = current_state
-                                .stack
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let tos_idx = current_depth.saturating_sub(1) as usize;
+                            let subject = peek_stack_slot_from_vable(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                tos_idx,
+                                py_pc as i64,
+                            );
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15644,16 +16505,24 @@ impl CodeWriter {
                         // values tuple or None. Net: +1.  `match_keys(subject,
                         // keys)` HLOp → `bh_match_keys_fn` residual.
                         Instruction::MatchKeys => {
-                            let depth = current_state.stack.len();
-                            let keys = current_state
-                                .stack
-                                .last()
-                                .cloned()
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let subject = depth
-                                .checked_sub(2)
-                                .and_then(|i| current_state.stack.get(i).cloned())
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            let keys_idx = current_depth.saturating_sub(1) as usize;
+                            let subject_idx = current_depth.saturating_sub(2) as usize;
+                            let keys = peek_stack_slot_from_vable(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                keys_idx,
+                                py_pc as i64,
+                            );
+                            let subject = peek_stack_slot_from_vable(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                stack_base_absolute,
+                                subject_idx,
+                                py_pc as i64,
+                            );
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15679,6 +16548,9 @@ impl CodeWriter {
                             let subject = pop_ref_or_fresh(&mut current_state, &mut graph);
                             let v_count: super::flow::FlowValue =
                                 super::flow::Constant::signed(count).into();
+                            // `jtransform.py handle_regular_indirect_call`: `-live-`
+                            // after the pops and before the residual.
+                            emit_live_before_residual_call(&current_block.block(), py_pc as i64);
                             let result_value = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -15886,10 +16758,17 @@ impl CodeWriter {
                         // later operation belongs to the normal-flow
                         // successor.  Find the last can-raise op this
                         // opcode recorded (`record_graph_op` appended its
-                        // `-live-`); a covered PC whose opcode recorded no
-                        // can-raise op attaches no exception edge — same
-                        // set of catch edges the flatten early-return used
-                        // to drop post-hoc.
+                        // `-live-`).  A covered PC whose opcode recorded
+                        // no can-raise op still seeds the handler when
+                        // `unwind_memo` has no entry for it: the Python
+                        // exception table is reachable
+                        // (`pyopcode.py handle_operation_error` /
+                        // `pycode.py lookup_exceptiontable`) even when
+                        // the range has no can-raise op (`YieldValue` is
+                        // not can-raise).  `flowcontext.py build_flow`
+                        // `pendingblocks` drains that handler after
+                        // `closeblock` / `StopFlowing`; without a graph
+                        // edge the sequential walker skips it as dead.
                         let split_at = if block_already_closed {
                             None
                         } else {
@@ -16008,6 +16887,60 @@ impl CodeWriter {
                                 super::flow::push_op(&next_block.block(), op);
                             }
                             current_block = next_block;
+                        } else if !block_already_closed && at_instruction_start {
+                            // Same catch-landing / `unwind_memo` entry a
+                            // can-raise `guessexception` attach would seed.
+                            // Wait until the last instruction start of this
+                            // range so a later can-raise still attaches the
+                            // orthodox edge; only a range with no can-raise
+                            // (`YieldValue`) reaches here. Trailing `-live-`
+                            // is the `flatten.py insert_exits`
+                            // keep-the-exception-edge shape;
+                            // `bhimpl_catch_exception` is a no-op when the
+                            // preceding op does not raise.
+                            let handler_py_pc = catch_sites
+                                .iter()
+                                .find(|s| s.landing_label == catch_label)
+                                .expect("catch_sites entry for catch_label")
+                                .handler_py_pc;
+                            let handler_already_queued = unwind_memo
+                                .iter()
+                                .any(|entry| entry.handler_py_pc == handler_py_pc);
+                            let has_later_start = ((py_pc + 1)..num_instrs).any(|pc| {
+                                catch_for_pc
+                                    .get(pc)
+                                    .copied()
+                                    .flatten()
+                                    .is_some_and(|label| {
+                                        is_python_instruction_start(code, pc)
+                                            && catch_sites.iter().any(|site| {
+                                                site.landing_label == label
+                                                    && site.handler_py_pc == handler_py_pc
+                                            })
+                                    })
+                            });
+                            if !handler_already_queued && !has_later_start {
+                                let needs_live = current_block
+                                    .block()
+                                    .borrow()
+                                    .operations
+                                    .last()
+                                    .map_or(true, |op| op.opname != super::flatten::OPNAME_LIVE);
+                                if needs_live {
+                                    record_graph_op(
+                                        &current_block.block(),
+                                        super::flatten::OPNAME_LIVE,
+                                        Vec::new(),
+                                        None,
+                                        py_pc as i64,
+                                    );
+                                }
+                                emit_catch_exception_and_split!(
+                                    catch_label,
+                                    py_pc,
+                                    std::iter::empty::<super::flow::FlowValue>()
+                                );
+                            }
                         }
                     }
                 }
@@ -16479,7 +17412,34 @@ impl CodeWriter {
                 let ec_color = frame_color + 1;
                 ref_alloc.coloring.insert(frame_var.id, frame_color);
                 ref_alloc.coloring.insert(ec_var.id, ec_color);
-                ref_alloc.num_colors = ec_color + 1;
+                let mut next_color = ec_color + 1;
+                if !portal_pycode_vars.is_empty() {
+                    let pycode_color = next_color;
+                    for v in &portal_pycode_vars {
+                        ref_alloc.coloring.insert(v.id, pycode_color);
+                    }
+                    next_color += 1;
+                }
+                ref_alloc.num_colors = next_color;
+            }
+            {
+                let int_alloc = &mut splice_regallocs[Kind::Int.index()];
+                let mut next_color = int_alloc.num_colors;
+                if !portal_next_instr_vars.is_empty() {
+                    let color = next_color;
+                    for v in &portal_next_instr_vars {
+                        int_alloc.coloring.insert(v.id, color);
+                    }
+                    next_color += 1;
+                }
+                if !portal_profiled_vars.is_empty() {
+                    let color = next_color;
+                    for v in &portal_profiled_vars {
+                        int_alloc.coloring.insert(v.id, color);
+                    }
+                    next_color += 1;
+                }
+                int_alloc.num_colors = next_color;
             }
             let ssarepr = super::flatten::flatten_graph_after_input_enforcement(
                 &graph,
@@ -16923,6 +17883,7 @@ impl CodeWriter {
             after_call_post_merge,
             first_insn_post_merge,
             marker_pcdep_color_slots,
+            body_live_in_violations,
         ) = filter_liveness_in_place(
             &mut ssarepr,
             code,
@@ -16933,6 +17894,24 @@ impl CodeWriter {
             walker_after_call_pc_indices_out.as_deref(),
             true,
         );
+        let pmg_remap = super::flatten::attach_portal_merge_greens_gotos(&mut ssarepr);
+        let remap_pmg = |pos: usize| pmg_remap.get(pos).copied().unwrap_or(pos);
+        let post_remove_live_indices: Vec<usize> = post_remove_live_indices
+            .into_iter()
+            .map(remap_pmg)
+            .collect();
+        let after_call_post_merge: Vec<Option<usize>> = after_call_post_merge
+            .into_iter()
+            .map(|pos| pos.map(remap_pmg))
+            .collect();
+        let first_insn_post_merge: Vec<Option<usize>> = first_insn_post_merge
+            .into_iter()
+            .map(|pos| pos.map(remap_pmg))
+            .collect();
+        if is_true_portal {
+            self.body_live_in_violations
+                .replace(body_live_in_violations);
+        }
         // #348 Part (2): ship the marker-consistent per-PC map (the fold-group
         // union) so the runtime inversion covers every color the (possibly
         // folded) `-live-` marker carries.
@@ -17633,33 +18612,11 @@ impl CodeWriter {
                 if !covered {
                     return None;
                 }
-                // The guard-resume marker of a true-portal PC is the op2
-                // `-live-` after its `jit_merge_point`.  A trace entry is the
-                // portal reaching that merge point instead (`pyjitpl.py`
-                // `initialize_state_from_start`), so it starts at the PC's own
-                // first op, before the merge point and its greens.  The
-                // `-live-` ahead of that op is shared with the previous PC's
-                // tail and back-translates to it.
-                let off = resolve_marker(py_pc)?;
-                let start = first_jit_pc_by_py_pc[py_pc];
-                let merge_before_off = start != usize::MAX && {
-                    let i = merge_pcs.partition_point(|&pc| pc < start);
-                    i < merge_pcs.len() && merge_pcs[i] < off
-                };
-                let off = if merge_before_off {
-                    start
-                } else if code_entry_pc == Some(py_pc) || loop_header_pcs.contains(&py_pc) {
-                    // Function entry and loop headers still publish the
-                    // resume marker when the merge sandwich is not between
-                    // first op and op2 (older layout / suppressed merge).
-                    off
-                } else {
-                    // A body instruction without a merge sandwich is a
-                    // guard-resume coordinate, not a walk entry
-                    // (`pyjitpl.py initialize_state_from_start`).
-                    return None;
-                };
-                Some((py_pc as u32, off as u32))
+                let off = resolve_marker(py_pc);
+                off.map(|off| {
+                    let entry = trace_entry_at_portal_merge(jitcode.code.as_slice(), off);
+                    (py_pc as u32, entry as u32)
+                })
             })
             .collect();
         let loop_header_by_green: Vec<(u32, u32)> = merge_entry_by_green
@@ -17862,8 +18819,9 @@ impl CodeWriter {
             // `pc_first_insn_pos` records as the first non-live). Resuming
             // there lets `blackhole.py BlackholeInterpreter.bhimpl_jit_merge_point`
             // CRN before the opcode's `last_instr` store. Advance onto op2.
-            // `merge_entry_by_green` keeps the unwrapped marker so traces
-            // still start at op3 and record the header merge.
+            // `merge_entry_by_green` maps the unwrapped marker onto the
+            // `pmgN` `-live-` before the header merge, so traces start at
+            // the portal `jit_merge_point` (`split_before_jit_merge_point`).
             for &(off, py) in &block_head_py_by_jit_pc {
                 let skipped_py =
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
@@ -17891,11 +18849,11 @@ impl CodeWriter {
             // fallthrough before resolving the resume marker.
             //
             // Fallthrough's first insn is the portal merge sandwich.
-            // `resolve_marker(ft)` is the first `-live-` of that PC, which
-            // is now the diamond's terminator `-live-`. Advance onto op3,
-            // the last `-live-` before `jit_merge_point`: blackhole
-            // replays the dispatch-top stack materialize writes, then
-            // `bhimpl_jit_merge_point` CRNs with a complete frame.
+            // `resolve_marker(ft)` is the first `-live-` of that PC, the
+            // leading marker before `int_copy` / `goto pmg_shared`.
+            // Advance onto op3, the last `-live-` before `jit_merge_point`:
+            // `bhimpl_jit_merge_point` CRNs with the operand stack restored
+            // from the vable section.
             // `ContinueRunningNormally` already carries `next_instr` as a
             // green, so the portal runner publishes `last_instr` without
             // needing op2.
@@ -18099,8 +19057,12 @@ impl CodeWriter {
             depth_block_head_by_jit_pc,
             pcdep_trivia_marker_by_jit_pc,
             pcdep_trivia_pred_by_jit_pc,
-            const_ref_trivia_marker_by_jit_pc,
-            const_ref_trivia_pred_by_jit_pc,
+            const_ref_trivia_marker_by_jit_pc: PyJitCodeMetadata::wrap_const_ref_table(
+                const_ref_trivia_marker_by_jit_pc,
+            ),
+            const_ref_trivia_pred_by_jit_pc: PyJitCodeMetadata::wrap_const_ref_table(
+                const_ref_trivia_pred_by_jit_pc,
+            ),
             result_color_trivia_marker_by_jit_pc,
             result_color_trivia_pred_by_jit_pc,
             resume_marker_marker_by_jit_pc,
@@ -18123,7 +19085,9 @@ impl CodeWriter {
             built_as_portal: true,
             stack_base: frame_stack_base,
             max_stackdepth: code.max_stackdepth as usize,
-            const_ref_slots_by_jit_pc,
+            const_ref_slots_by_jit_pc: PyJitCodeMetadata::wrap_const_ref_table(
+                const_ref_slots_by_jit_pc,
+            ),
             is_drained: true,
         };
 
@@ -18656,6 +19620,17 @@ pub fn find_branch_target_pcs(code: &pyre_interpreter::CodeObject) -> VecSet<usi
             }
         }
     }
+    // `pycode.py lookup_exceptiontable` targets are block entries
+    // (`pyopcode.py handle_operation_error`).  A try around yield has
+    // no can-raise graph edge, so the sequential walker would skip
+    // them; `flowcontext.py build_flow pendingblocks` still drains
+    // every reachable handler after `closeblock`.
+    for entry in pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable) {
+        let target = entry.target as usize / 2;
+        if target < num_instrs {
+            targets.insert(target);
+        }
+    }
     targets
 }
 
@@ -18855,6 +19830,20 @@ mod tests {
             }
             None
         };
+        // `goto pmg_shared` / `goto arm_shared` are the shared merge-green
+        // and dispatch_bytecode copies; the instruction body is the bytes
+        // after those gotos (`portal_merge_prefix_op`,
+        // `live_after_arm_shared_prefix`). Following the goto lands inside
+        // the switch (py of the portal entry) and never sees STORE_FAST.
+        let body_after_shared_goto =
+            |op: &pyre_jit_trace::jitcode_runtime::DecodedOp| -> Option<usize> {
+                let target = jit_label_at(op)?;
+                if is_pmg_shared_entry(jitcode, target) || is_arm_shared_entry(jitcode, target) {
+                    Some(op.next_pc)
+                } else {
+                    None
+                }
+            };
         let follow_trampoline = |start: usize| -> usize {
             let mut pc = start;
             for _ in 0..32 {
@@ -18863,7 +19852,11 @@ mod tests {
                 };
                 match op.opname {
                     "live" | "ref_copy" => pc = op.next_pc,
-                    "goto" => pc = jit_label_at(&op).unwrap_or(pc),
+                    "goto" => {
+                        pc = body_after_shared_goto(&op)
+                            .or_else(|| jit_label_at(&op))
+                            .unwrap_or(pc);
+                    }
                     _ => return pc,
                 }
             }
@@ -18905,7 +19898,9 @@ mod tests {
                 continue;
             };
             if op.opname == "goto" {
-                if let Some(target) = jit_label_at(&op) {
+                if let Some(body) = body_after_shared_goto(&op) {
+                    work.push(body);
+                } else if let Some(target) = jit_label_at(&op) {
                     work.push(follow_trampoline(target));
                 }
                 continue;
@@ -18941,10 +19936,12 @@ mod tests {
     }
 
     fn assemble_portal(code: &CodeObject) -> std::sync::Arc<PyJitCode> {
+        assemble_portal_with_writer(code).0
+    }
+
+    fn assemble_portal_with_writer(code: &CodeObject) -> (std::sync::Arc<PyJitCode>, CodeWriter) {
         let w_code = pyre_interpreter::box_code_constant(code);
-        let code_ptr = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
-        };
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let code = unsafe { &*code_ptr };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
@@ -18952,7 +19949,7 @@ mod tests {
             mainjitcode: None,
         });
         writer.make_jitcodes();
-        writer
+        let pyjit = writer
             .callcontrol()
             .find_compiled_jitcode_arc(code_ptr)
             .unwrap_or_else(|| {
@@ -18961,7 +19958,49 @@ mod tests {
                     code.obj_name,
                     code.instructions.len()
                 )
-            })
+            });
+        (pyjit, writer)
+    }
+
+    fn jit_merge_point_red_refs(code_bytes: &[u8], merge_pc: usize) -> Vec<u32> {
+        // `jit_merge_point/{c,i}IRFIRF`: opcode, jd, then greens I/R/F
+        // and reds I/R/F length-prefixed lists. reds_r is list index 4.
+        let mut off = merge_pc + 2;
+        for _ in 0..4 {
+            let len = code_bytes[off] as usize;
+            off += 1 + len;
+        }
+        let len = code_bytes[off] as usize;
+        code_bytes[off + 1..off + 1 + len]
+            .iter()
+            .map(|&b| b as u32)
+            .collect()
+    }
+
+    fn live_ref_colors_at(code_bytes: &[u8], live_pc: usize, all_liveness: &[u8]) -> Vec<u32> {
+        assert_eq!(
+            code_bytes[live_pc],
+            majit_jitcode::insns::BC_LIVE,
+            "expected live/ at {live_pc}"
+        );
+        let offset =
+            u16::from_le_bytes([code_bytes[live_pc + 1], code_bytes[live_pc + 2]]) as usize;
+        assert!(
+            offset + 2 < all_liveness.len(),
+            "live offset {offset} past all_liveness {}",
+            all_liveness.len()
+        );
+        let mut live_r = Vec::new();
+        unsafe {
+            majit_jitcode::jitcode::enumerate_vars(
+                offset,
+                all_liveness,
+                |_| {},
+                |r| live_r.push(r),
+                |_| {},
+            );
+        }
+        live_r
     }
 
     #[test]
@@ -19021,6 +20060,1101 @@ mod tests {
                 }),
                 "the residual must read this callee's frame register"
             );
+        }
+    }
+
+    fn residual_call_first_ref_reg(
+        code: &[u8],
+        op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+    ) -> Option<u32> {
+        if !op.opname.starts_with("residual_call") {
+            return None;
+        }
+        opcode_call_first_ref_reg(code, op)
+    }
+
+    fn opcode_call_first_ref_reg(
+        code: &[u8],
+        op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+    ) -> Option<u32> {
+        if !(op.opname.starts_with("residual_call") || op.opname.starts_with("inline_call")) {
+            return None;
+        }
+        let mut off = op.pc + 1;
+        for c in op.argcodes.chars() {
+            match c {
+                'i' | 'c' | 'r' | 'f' => off += 1,
+                'd' | 'j' => off += 2,
+                'R' => {
+                    let len = *code.get(off)? as usize;
+                    if len == 0 {
+                        return None;
+                    }
+                    return Some(*code.get(off + 1)? as u32);
+                }
+                'I' | 'F' => {
+                    let len = *code.get(off)? as usize;
+                    off += 1 + len;
+                }
+                '>' => break,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn opcode_call_ref_regs(
+        code: &[u8],
+        op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+    ) -> Vec<u32> {
+        if !(op.opname.starts_with("residual_call") || op.opname.starts_with("inline_call")) {
+            return Vec::new();
+        }
+        let mut off = op.pc + 1;
+        for c in op.argcodes.chars() {
+            match c {
+                'i' | 'c' | 'r' | 'f' => off += 1,
+                'd' | 'j' => off += 2,
+                'R' => {
+                    let Some(&len_b) = code.get(off) else {
+                        return Vec::new();
+                    };
+                    let len = len_b as usize;
+                    let start = off + 1;
+                    let end = start + len;
+                    if end > code.len() {
+                        return Vec::new();
+                    }
+                    return code[start..end].iter().map(|&b| b as u32).collect();
+                }
+                'I' | 'F' => {
+                    let Some(&len_b) = code.get(off) else {
+                        return Vec::new();
+                    };
+                    off += 1 + len_b as usize;
+                }
+                '>' => break,
+                _ => return Vec::new(),
+            }
+        }
+        Vec::new()
+    }
+
+    fn opcode_result_ref_reg(
+        code: &[u8],
+        op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+    ) -> Option<u32> {
+        if !op.argcodes.contains('>') {
+            return None;
+        }
+        let mut off = op.pc + 1;
+        for c in op.argcodes.chars() {
+            match c {
+                'i' | 'c' | 'r' | 'f' => off += 1,
+                'd' | 'j' => off += 2,
+                'R' | 'I' | 'F' => {
+                    let len = *code.get(off)? as usize;
+                    off += 1 + len;
+                }
+                'X' => {}
+                '>' => return code.get(off).map(|&b| b as u32),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    fn py_pc_owns_jit_pc(pyjit: &PyJitCode, jit_pc: usize) -> Option<usize> {
+        let jit_pc = jit_pc as u32;
+        pyjit
+            .metadata
+            .py_exact_by_jit_pc
+            .iter()
+            .rev()
+            .find(|&&(off, _)| off <= jit_pc)
+            .map(|&(_, py)| py as usize)
+    }
+
+    /// `jtransform.py handle_regular_indirect_call` puts `-live-` immediately
+    /// before the residual, after argument setup. Python CALL / CALL_KW /
+    /// CALL_FUNCTION_EX fold GuardValue on the callable at that residual pc;
+    /// `get_live_vars_info` / `preceding_live_marker` need the adjacent marker
+    /// whose SSA-live set includes the callable register.
+    #[test]
+    fn call_residual_has_live_immediately_before_with_callable_register() {
+        use pyre_interpreter::bytecode::Instruction;
+        let cases: &[(&str, &str, fn(&Instruction) -> bool)] = &[
+            ("f", "def f(g):\n    return g()\n", |instr| {
+                matches!(instr, Instruction::Call { .. })
+            }),
+            ("kw", "def kw(g):\n    return g(x=1)\n", |instr| {
+                matches!(instr, Instruction::CallKw { .. })
+            }),
+            ("ex", "def ex(g, xs):\n    return g(*xs)\n", |instr| {
+                matches!(instr, Instruction::CallFunctionEx)
+            }),
+        ];
+        for &(name, source, is_call) in cases {
+            let code = nested_function_code_named(source, name);
+            let call_py_pcs: Vec<usize> = (0..code.instructions.len())
+                .filter(|&pc| {
+                    pyre_interpreter::decode_instruction_at(&code, pc)
+                        .is_some_and(|(instr, _)| is_call(&instr))
+                })
+                .collect();
+            assert!(
+                !call_py_pcs.is_empty(),
+                "{name}: fixture must contain the call opcode"
+            );
+            let pyjit = assemble_portal(&code);
+            assert!(!pyjit.has_abort, "{name} must lower");
+            let bytes = pyjit.jitcode.code.as_slice();
+            let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+            let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+            let mut n_checked = 0usize;
+            for i in 0..ops.len() {
+                let op = &ops[i];
+                if !op.opname.starts_with("residual_call") {
+                    continue;
+                }
+                let Some(py_pc) = py_pc_owns_jit_pc(&pyjit, op.pc) else {
+                    continue;
+                };
+                if !call_py_pcs.contains(&py_pc) {
+                    continue;
+                }
+                assert!(
+                    i > 0 && ops[i - 1].opname == "live",
+                    "{name}: residual_call at {} must be immediately preceded by -live- (got {:?})",
+                    op.pc,
+                    ops.get(i.wrapping_sub(1)).map(|prev| prev.opname),
+                );
+                let live_pc = ops[i - 1].pc;
+                assert_eq!(
+                    ops[i - 1].next_pc,
+                    op.pc,
+                    "{name}: preceding -live- next_pc must be the residual"
+                );
+                let op_live = pyre_jit_trace::state::op_live();
+                assert!(
+                    pyjit.jitcode.can_decode_live_vars(op.pc, op_live),
+                    "{name}: residual pc {} must decode live vars via the adjacent -live-",
+                    op.pc
+                );
+                let callable = residual_call_first_ref_reg(bytes, op)
+                    .unwrap_or_else(|| panic!("{name}: residual ListR[0] is the callable"));
+                let live_r = live_ref_colors_at(bytes, live_pc, &all_liveness);
+                assert!(
+                    live_r.contains(&callable),
+                    "{name}: -live- at {live_pc} live_r={live_r:?} must include callable r{callable}"
+                );
+                n_checked += 1;
+            }
+            assert!(
+                n_checked > 0,
+                "{name}: expected a residual_call in the call opcode floor"
+            );
+        }
+    }
+
+    /// `jtransform.py handle_regular_indirect_call` puts `-live-` immediately
+    /// before the residual, after the operand pop. LOAD_ATTR fold GuardIsnull
+    /// (e.g. `tb_next`) records at that residual pc; resume must start after
+    /// `popvalue` so the blackhole does not re-pop a NULL TOS.
+    #[test]
+    fn load_attr_residual_has_live_immediately_before_with_receiver_register() {
+        use pyre_interpreter::bytecode::Instruction;
+        let cases: &[(&str, &str, fn(&Instruction) -> bool)] = &[
+            ("attr", "def attr(x):\n    return x.foo\n", |instr| {
+                matches!(instr, Instruction::LoadAttr { .. })
+            }),
+            ("method", "def method(x):\n    return x.foo()\n", |instr| {
+                matches!(instr, Instruction::LoadAttr { .. })
+            }),
+        ];
+        for &(name, source, is_load_attr) in cases {
+            let code = nested_function_code_named(source, name);
+            let attr_py_pcs: Vec<usize> = (0..code.instructions.len())
+                .filter(|&pc| {
+                    pyre_interpreter::decode_instruction_at(&code, pc)
+                        .is_some_and(|(instr, _)| is_load_attr(&instr))
+                })
+                .collect();
+            assert!(
+                !attr_py_pcs.is_empty(),
+                "{name}: fixture must contain LOAD_ATTR"
+            );
+            let pyjit = assemble_portal(&code);
+            assert!(!pyjit.has_abort, "{name} must lower");
+            let bytes = pyjit.jitcode.code.as_slice();
+            let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+            let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+            let mut n_checked = 0usize;
+            for i in 0..ops.len() {
+                let op = &ops[i];
+                if !op.opname.starts_with("residual_call") {
+                    continue;
+                }
+                let Some(py_pc) = py_pc_owns_jit_pc(&pyjit, op.pc) else {
+                    continue;
+                };
+                if !attr_py_pcs.contains(&py_pc) {
+                    continue;
+                }
+                assert!(
+                    i > 0 && ops[i - 1].opname == "live",
+                    "{name}: residual_call at {} must be immediately preceded by -live- (got {:?})",
+                    op.pc,
+                    ops.get(i.wrapping_sub(1)).map(|prev| prev.opname),
+                );
+                let live_pc = ops[i - 1].pc;
+                assert_eq!(
+                    ops[i - 1].next_pc,
+                    op.pc,
+                    "{name}: preceding -live- next_pc must be the residual"
+                );
+                let pop_before_live = ops.iter().any(|prev| {
+                    prev.pc < live_pc
+                        && py_pc_owns_jit_pc(&pyjit, prev.pc) == Some(py_pc)
+                        && prev.opname.starts_with("getarrayitem_vable")
+                });
+                assert!(
+                    pop_before_live,
+                    "{name}: -live- at {live_pc} must sit after LOAD_ATTR's operand pop"
+                );
+                let op_live = pyre_jit_trace::state::op_live();
+                assert!(
+                    pyjit.jitcode.can_decode_live_vars(op.pc, op_live),
+                    "{name}: residual pc {} must decode live vars via the adjacent -live-",
+                    op.pc
+                );
+                let receiver = residual_call_first_ref_reg(bytes, op)
+                    .unwrap_or_else(|| panic!("{name}: residual ListR[0] is the receiver"));
+                let live_r = live_ref_colors_at(bytes, live_pc, &all_liveness);
+                assert!(
+                    live_r.contains(&receiver),
+                    "{name}: -live- at {live_pc} live_r={live_r:?} must include receiver r{receiver}"
+                );
+                n_checked += 1;
+            }
+            assert!(
+                n_checked > 0,
+                "{name}: expected a residual_call in the LOAD_ATTR opcode floor"
+            );
+        }
+    }
+
+    /// `jtransform.py handle_regular_indirect_call` puts `-live-` immediately
+    /// before the residual, after the operand pops. BINARY_OP FloorDiv fold
+    /// GuardTrue (`int_eq(divisor, 0)`) records at that call pc; resume must
+    /// start after `popvalue` so the blackhole does not re-pop a NULL TOS.
+    #[test]
+    fn binary_op_residual_has_live_immediately_before_with_operand_registers() {
+        use pyre_interpreter::bytecode::Instruction;
+        let cases: &[(&str, &str, fn(&Instruction) -> bool)] = &[
+            (
+                "floordiv",
+                "def floordiv(a, b):\n    return a // b\n",
+                |instr| matches!(instr, Instruction::BinaryOp { .. }),
+            ),
+            ("add", "def add(a, b):\n    return a + b\n", |instr| {
+                matches!(instr, Instruction::BinaryOp { .. })
+            }),
+            ("subscr", "def subscr(a, b):\n    return a[b]\n", |instr| {
+                matches!(instr, Instruction::BinaryOp { .. })
+            }),
+        ];
+        for &(name, source, is_binary_op) in cases {
+            let code = nested_function_code_named(source, name);
+            let bin_py_pcs: Vec<usize> = (0..code.instructions.len())
+                .filter(|&pc| {
+                    pyre_interpreter::decode_instruction_at(&code, pc)
+                        .is_some_and(|(instr, _)| is_binary_op(&instr))
+                })
+                .collect();
+            assert!(
+                !bin_py_pcs.is_empty(),
+                "{name}: fixture must contain BINARY_OP"
+            );
+            let pyjit = assemble_portal(&code);
+            assert!(!pyjit.has_abort, "{name} must lower");
+            let bytes = pyjit.jitcode.code.as_slice();
+            let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+            let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+            let mut n_checked = 0usize;
+            for i in 0..ops.len() {
+                let op = &ops[i];
+                if !(op.opname.starts_with("residual_call") || op.opname.starts_with("inline_call"))
+                {
+                    continue;
+                }
+                let Some(py_pc) = py_pc_owns_jit_pc(&pyjit, op.pc) else {
+                    continue;
+                };
+                if !bin_py_pcs.contains(&py_pc) {
+                    continue;
+                }
+                assert!(
+                    i > 0 && ops[i - 1].opname == "live",
+                    "{name}: call at {} must be immediately preceded by -live- (got {:?})",
+                    op.pc,
+                    ops.get(i.wrapping_sub(1)).map(|prev| prev.opname),
+                );
+                let live_pc = ops[i - 1].pc;
+                assert_eq!(
+                    ops[i - 1].next_pc,
+                    op.pc,
+                    "{name}: preceding -live- next_pc must be the call"
+                );
+                let pop_before_live = ops.iter().any(|prev| {
+                    prev.pc < live_pc
+                        && py_pc_owns_jit_pc(&pyjit, prev.pc) == Some(py_pc)
+                        && prev.opname.starts_with("getarrayitem_vable")
+                });
+                assert!(
+                    pop_before_live,
+                    "{name}: -live- at {live_pc} must sit after BINARY_OP's operand pops"
+                );
+                let op_live = pyre_jit_trace::state::op_live();
+                assert!(
+                    pyjit.jitcode.can_decode_live_vars(op.pc, op_live),
+                    "{name}: call pc {} must decode live vars via the adjacent -live-",
+                    op.pc
+                );
+                let operand = opcode_call_first_ref_reg(bytes, op)
+                    .unwrap_or_else(|| panic!("{name}: call ListR[0] is an operand"));
+                let live_r = live_ref_colors_at(bytes, live_pc, &all_liveness);
+                assert!(
+                    live_r.contains(&operand),
+                    "{name}: -live- at {live_pc} live_r={live_r:?} must include operand r{operand}"
+                );
+                n_checked += 1;
+            }
+            assert!(
+                n_checked > 0,
+                "{name}: expected a residual_call or inline_call in the BINARY_OP opcode floor"
+            );
+        }
+    }
+
+    /// `jtransform.py handle_regular_indirect_call` puts `-live-` immediately
+    /// before the residual, after the operand pop. TO_BOOL Truth fold
+    /// GuardTrue/GuardFalse records at that call pc; resume must start
+    /// after `popvalue` so the blackhole does not re-pop a NULL TOS.
+    ///
+    /// `eval.rs` `to_bool` is `is_true` then `newbool`: jitcode is
+    /// `residual_call_r_i` (`truth_fn`) then `residual_call_ir_r`
+    /// (`bh_to_bool_fn`). A blackhole that finishes `truth_value` with
+    /// `_setup_return_value_i` (`blackhole.py`) continues into the
+    /// boxing residual.
+    #[test]
+    fn to_bool_residual_has_live_immediately_before_with_operand_register() {
+        use pyre_interpreter::bytecode::Instruction;
+        let source = "def f(x):\n    if x:\n        return 1\n    return 0\n";
+        let code = nested_function_code_named(source, "f");
+        let to_bool_py_pcs: Vec<usize> = (0..code.instructions.len())
+            .filter(|&pc| {
+                pyre_interpreter::decode_instruction_at(&code, pc)
+                    .is_some_and(|(instr, _)| matches!(instr, Instruction::ToBool))
+            })
+            .collect();
+        assert!(!to_bool_py_pcs.is_empty(), "fixture must contain TO_BOOL");
+        let pyjit = assemble_portal(&code);
+        assert!(!pyjit.has_abort, "f must lower");
+        let bytes = pyjit.jitcode.code.as_slice();
+        let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+        let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+        let mut n_checked = 0usize;
+        let mut n_truth = 0usize;
+        let mut n_newbool = 0usize;
+        for i in 0..ops.len() {
+            let op = &ops[i];
+            if !op.opname.starts_with("residual_call") {
+                continue;
+            }
+            let Some(py_pc) = py_pc_owns_jit_pc(&pyjit, op.pc) else {
+                continue;
+            };
+            if !to_bool_py_pcs.contains(&py_pc) {
+                continue;
+            }
+            if op.opname == "residual_call_r_i" {
+                n_truth += 1;
+            }
+            if op.opname == "residual_call_ir_r" {
+                n_newbool += 1;
+            }
+            let Some(operand) = residual_call_first_ref_reg(bytes, op) else {
+                continue;
+            };
+            assert!(
+                i > 0 && ops[i - 1].opname == "live",
+                "call at {} must be immediately preceded by -live- (got {:?})",
+                op.pc,
+                ops.get(i.wrapping_sub(1)).map(|prev| prev.opname),
+            );
+            let live_pc = ops[i - 1].pc;
+            assert_eq!(
+                ops[i - 1].next_pc,
+                op.pc,
+                "preceding -live- next_pc must be the call"
+            );
+            let pop_before_live = ops.iter().any(|prev| {
+                prev.pc < live_pc
+                    && py_pc_owns_jit_pc(&pyjit, prev.pc) == Some(py_pc)
+                    && prev.opname.starts_with("getarrayitem_vable")
+            });
+            assert!(
+                pop_before_live,
+                "-live- at {live_pc} must sit after TO_BOOL's operand pop"
+            );
+            let op_live = pyre_jit_trace::state::op_live();
+            assert!(
+                pyjit.jitcode.can_decode_live_vars(op.pc, op_live),
+                "call pc {} must decode live vars via the adjacent -live-",
+                op.pc
+            );
+            let live_r = live_ref_colors_at(bytes, live_pc, &all_liveness);
+            assert!(
+                live_r.contains(&operand),
+                "-live- at {live_pc} live_r={live_r:?} must include operand r{operand}"
+            );
+            n_checked += 1;
+        }
+        assert!(
+            n_checked > 0,
+            "expected a residual_call in the TO_BOOL opcode floor"
+        );
+        assert!(
+            n_truth > 0 && n_newbool > 0,
+            "TO_BOOL must emit truth_fn (residual_call_r_i) then newbool (residual_call_ir_r); got truth={n_truth} newbool={n_newbool}"
+        );
+    }
+
+    /// `jtransform.py handle_regular_indirect_call` puts `-live-` immediately
+    /// before the residual, after the operand pop. UNPACK_SEQUENCE / UNPACK_EX
+    /// fold GuardClass records at that residual pc; resume must start after
+    /// `popvalue` so the blackhole does not re-pop a NULL TOS.
+    #[test]
+    fn unpack_sequence_residual_has_live_immediately_before_with_operand_register() {
+        use pyre_interpreter::bytecode::Instruction;
+        let cases: &[(&str, &str, fn(&Instruction) -> bool)] = &[
+            (
+                "unpack",
+                "def unpack(x):\n    a, b, c = x\n    return a\n",
+                |instr| matches!(instr, Instruction::UnpackSequence { .. }),
+            ),
+            (
+                "unpack_ex",
+                "def unpack_ex(x):\n    a, *b = x\n    return a\n",
+                |instr| matches!(instr, Instruction::UnpackEx { .. }),
+            ),
+        ];
+        for &(name, source, is_unpack) in cases {
+            let code = nested_function_code_named(source, name);
+            let unpack_py_pcs: Vec<usize> = (0..code.instructions.len())
+                .filter(|&pc| {
+                    pyre_interpreter::decode_instruction_at(&code, pc)
+                        .is_some_and(|(instr, _)| is_unpack(&instr))
+                })
+                .collect();
+            assert!(
+                !unpack_py_pcs.is_empty(),
+                "{name}: fixture must contain the unpack opcode"
+            );
+            let pyjit = assemble_portal(&code);
+            assert!(!pyjit.has_abort, "{name} must lower");
+            let bytes = pyjit.jitcode.code.as_slice();
+            let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+            let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+            let mut n_checked = 0usize;
+            for i in 0..ops.len() {
+                let op = &ops[i];
+                if !op.opname.starts_with("residual_call") {
+                    continue;
+                }
+                let Some(py_pc) = py_pc_owns_jit_pc(&pyjit, op.pc) else {
+                    continue;
+                };
+                if !unpack_py_pcs.contains(&py_pc) {
+                    continue;
+                }
+                // The unpack helper is the first residual after the pop.
+                // Later `unpack_item_fn` residuals at the same py_pc read the
+                // already-normalized tuple and are not this contract.
+                if n_checked > 0 {
+                    continue;
+                }
+                assert!(
+                    i > 0 && ops[i - 1].opname == "live",
+                    "{name}: residual_call at {} must be immediately preceded by -live- (got {:?})",
+                    op.pc,
+                    ops.get(i.wrapping_sub(1)).map(|prev| prev.opname),
+                );
+                let live_pc = ops[i - 1].pc;
+                assert_eq!(
+                    ops[i - 1].next_pc,
+                    op.pc,
+                    "{name}: preceding -live- next_pc must be the residual"
+                );
+                let pop_before_live = ops.iter().any(|prev| {
+                    prev.pc < live_pc
+                        && py_pc_owns_jit_pc(&pyjit, prev.pc) == Some(py_pc)
+                        && prev.opname.starts_with("getarrayitem_vable")
+                });
+                assert!(
+                    pop_before_live,
+                    "{name}: -live- at {live_pc} must sit after UNPACK's operand pop"
+                );
+                let op_live = pyre_jit_trace::state::op_live();
+                assert!(
+                    pyjit.jitcode.can_decode_live_vars(op.pc, op_live),
+                    "{name}: residual pc {} must decode live vars via the adjacent -live-",
+                    op.pc
+                );
+                let operand = opcode_call_first_ref_reg(bytes, op)
+                    .unwrap_or_else(|| panic!("{name}: residual ListR[0] is the sequence"));
+                let live_r = live_ref_colors_at(bytes, live_pc, &all_liveness);
+                assert!(
+                    live_r.contains(&operand),
+                    "{name}: -live- at {live_pc} live_r={live_r:?} must include operand r{operand}"
+                );
+                n_checked += 1;
+            }
+            assert!(
+                n_checked > 0,
+                "{name}: expected a residual_call in the unpack opcode floor"
+            );
+        }
+    }
+
+    /// `jtransform.py handle_regular_indirect_call` puts `-live-` immediately
+    /// before the residual, after the operand pops. A fold GuardClass/GuardValue
+    /// recorded at that residual pc must resume after `popvalue` so the
+    /// blackhole does not re-pop a NULL TOS.
+    #[test]
+    fn pop_then_residual_arms_have_live_immediately_before() {
+        use pyre_interpreter::bytecode::Instruction;
+        struct Case {
+            name: &'static str,
+            source: &'static str,
+            fn_name: Option<&'static str>,
+            is_instr: fn(&Instruction) -> bool,
+            residual_index: usize,
+        }
+        let cases: &[Case] = &[
+            Case {
+                name: "compare",
+                source: "def compare(a, b):\n    return a < b\n",
+                fn_name: Some("compare"),
+                is_instr: |instr| matches!(instr, Instruction::CompareOp { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "contains",
+                source: "def contains(a, b):\n    return a in b\n",
+                fn_name: Some("contains"),
+                is_instr: |instr| matches!(instr, Instruction::ContainsOp { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "is_op",
+                source: "def is_op(a, b):\n    return a is b\n",
+                fn_name: Some("is_op"),
+                is_instr: |instr| matches!(instr, Instruction::IsOp { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "store_subscr",
+                source: "def store_subscr(x, k, v):\n    x[k] = v\n",
+                fn_name: Some("store_subscr"),
+                is_instr: |instr| matches!(instr, Instruction::StoreSubscr),
+                residual_index: 0,
+            },
+            Case {
+                name: "list_append",
+                source: "def list_append(xs, f):\n    return [f(i) for i in xs]\n",
+                fn_name: Some("list_append"),
+                is_instr: |instr| matches!(instr, Instruction::ListAppend { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "get_iter",
+                source: "def get_iter(xs, f):\n    return [f(i) for i in xs]\n",
+                fn_name: Some("get_iter"),
+                is_instr: |instr| matches!(instr, Instruction::GetIter { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "build_list_from_arg",
+                source: "def build_list_from_arg(xs, f):\n    return [f(i) for i in xs]\n",
+                fn_name: Some("build_list_from_arg"),
+                is_instr: |instr| matches!(instr, Instruction::BuildListFromArg),
+                residual_index: 0,
+            },
+            Case {
+                name: "check_exc_match",
+                source: "def check_exc(x):\n    try:\n        raise ValueError(x)\n    except ValueError:\n        return x\n",
+                fn_name: Some("check_exc"),
+                is_instr: |instr| matches!(instr, Instruction::CheckExcMatch),
+                residual_index: 0,
+            },
+            Case {
+                name: "push_exc_info",
+                source: "def push_exc(x):\n    try:\n        raise ValueError(x)\n    except ValueError:\n        return x\n",
+                fn_name: Some("push_exc"),
+                is_instr: |instr| matches!(instr, Instruction::PushExcInfo),
+                residual_index: 1,
+            },
+            Case {
+                name: "pop_except",
+                source: "def pop_except(x):\n    try:\n        raise ValueError(x)\n    except ValueError:\n        return x\n",
+                fn_name: Some("pop_except"),
+                is_instr: |instr| matches!(instr, Instruction::PopExcept),
+                residual_index: 0,
+            },
+            Case {
+                name: "raise_varargs",
+                source: "def raise_e(x):\n    raise ValueError(x)\n",
+                fn_name: Some("raise_e"),
+                is_instr: |instr| matches!(instr, Instruction::RaiseVarargs { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "import_name",
+                source: "import os\n",
+                fn_name: None,
+                is_instr: |instr| matches!(instr, Instruction::ImportName { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "unary_neg",
+                source: "def unary_neg(a):\n    return -a\n",
+                fn_name: Some("unary_neg"),
+                is_instr: |instr| matches!(instr, Instruction::UnaryNegative),
+                residual_index: 0,
+            },
+            Case {
+                name: "unary_invert",
+                source: "def unary_invert(a):\n    return ~a\n",
+                fn_name: Some("unary_invert"),
+                is_instr: |instr| matches!(instr, Instruction::UnaryInvert),
+                residual_index: 0,
+            },
+            Case {
+                name: "unary_not",
+                source: "def unary_not(a):\n    return not a\n",
+                fn_name: Some("unary_not"),
+                is_instr: |instr| matches!(instr, Instruction::UnaryNot),
+                residual_index: 0,
+            },
+            Case {
+                name: "format_simple",
+                source: "def format_simple(a):\n    return f\"{a}\"\n",
+                fn_name: Some("format_simple"),
+                is_instr: |instr| matches!(instr, Instruction::FormatSimple),
+                residual_index: 0,
+            },
+            Case {
+                name: "store_attr",
+                source: "def store_attr(a, b):\n    a.x = b\n",
+                fn_name: Some("store_attr"),
+                is_instr: |instr| matches!(instr, Instruction::StoreAttr { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "delete_subscr",
+                source: "def delete_subscr(a, k):\n    del a[k]\n",
+                fn_name: Some("delete_subscr"),
+                is_instr: |instr| matches!(instr, Instruction::DeleteSubscr),
+                residual_index: 0,
+            },
+            Case {
+                name: "binary_slice",
+                source: "def binary_slice(a, b, c):\n    return a[b:c]\n",
+                fn_name: Some("binary_slice"),
+                is_instr: |instr| matches!(instr, Instruction::BinarySlice),
+                residual_index: 0,
+            },
+            Case {
+                name: "store_slice",
+                source: "def store_slice(a, b, c, d):\n    a[b:c] = d\n",
+                fn_name: Some("store_slice"),
+                is_instr: |instr| matches!(instr, Instruction::StoreSlice),
+                residual_index: 0,
+            },
+            Case {
+                name: "list_extend",
+                source: "def list_extend(xs):\n    return [1, *xs]\n",
+                fn_name: Some("list_extend"),
+                is_instr: |instr| matches!(instr, Instruction::ListExtend { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "set_add",
+                source: "def set_add(xs):\n    return {i for i in xs}\n",
+                fn_name: Some("set_add"),
+                is_instr: |instr| matches!(instr, Instruction::SetAdd { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "map_add",
+                source: "def map_add(xs):\n    return {i: i for i in xs}\n",
+                fn_name: Some("map_add"),
+                is_instr: |instr| matches!(instr, Instruction::MapAdd { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "pop_jump_if_false",
+                source: "def pop_jump_if_false(a):\n    if a:\n        return 1\n    return 0\n",
+                fn_name: Some("pop_jump_if_false"),
+                is_instr: |instr| matches!(instr, Instruction::PopJumpIfFalse { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "format_with_spec",
+                source: "def format_with_spec(a):\n    return f\"{a:.1f}\"\n",
+                fn_name: Some("format_with_spec"),
+                is_instr: |instr| matches!(instr, Instruction::FormatWithSpec),
+                residual_index: 0,
+            },
+            Case {
+                name: "convert_value",
+                source: "def convert_value(a):\n    return f\"{a!r}\"\n",
+                fn_name: Some("convert_value"),
+                is_instr: |instr| matches!(instr, Instruction::ConvertValue { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "delete_attr",
+                source: "def delete_attr(a):\n    del a.x\n",
+                fn_name: Some("delete_attr"),
+                is_instr: |instr| matches!(instr, Instruction::DeleteAttr { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "store_global",
+                source: "def store_global(v):\n    global g\n    g = v\n",
+                fn_name: Some("store_global"),
+                is_instr: |instr| matches!(instr, Instruction::StoreGlobal { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "unary_pos",
+                source: "def unary_pos(a):\n    return +a\n",
+                fn_name: Some("unary_pos"),
+                is_instr: |instr| matches!(instr, Instruction::CallIntrinsic1 { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "store_name",
+                source: "x = 1\n",
+                fn_name: None,
+                is_instr: |instr| matches!(instr, Instruction::StoreName { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "build_slice",
+                source: "def build_slice(a, b, c, d):\n    return a[b:c:d]\n",
+                fn_name: Some("build_slice"),
+                is_instr: |instr| matches!(instr, Instruction::BuildSlice { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "make_function",
+                source: "def make_function():\n    def inner():\n        return 1\n    return inner\n",
+                fn_name: Some("make_function"),
+                is_instr: |instr| matches!(instr, Instruction::MakeFunction { .. }),
+                residual_index: 1,
+            },
+            Case {
+                name: "set_function_attribute",
+                source: "def set_fn_attr():\n    def inner(x=1):\n        return x\n    return inner\n",
+                fn_name: Some("set_fn_attr"),
+                is_instr: |instr| matches!(instr, Instruction::SetFunctionAttribute { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "load_special",
+                source: "def load_special(a):\n    with a:\n        return 1\n",
+                fn_name: Some("load_special"),
+                is_instr: |instr| matches!(instr, Instruction::LoadSpecial { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "store_deref",
+                source: "def store_deref():\n    x = 1\n    def inner():\n        nonlocal x\n        x = 2\n    return inner\n",
+                fn_name: Some("inner"),
+                is_instr: |instr| matches!(instr, Instruction::StoreDeref { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "load_deref",
+                source: "def load_deref():\n    x = 1\n    def inner():\n        return x\n    return inner\n",
+                fn_name: Some("inner"),
+                is_instr: |instr| matches!(instr, Instruction::LoadDeref { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "match_class",
+                source: "def match_class(x):\n    match x:\n        case int():\n            return 1\n        case _:\n            return 0\n",
+                fn_name: Some("match_class"),
+                is_instr: |instr| matches!(instr, Instruction::MatchClass { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "set_update",
+                source: "def set_update(xs):\n    return {1, *xs}\n",
+                fn_name: Some("set_update"),
+                is_instr: |instr| matches!(instr, Instruction::SetUpdate { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "dict_merge",
+                source: "def dict_merge(f, kwargs):\n    return f(**kwargs)\n",
+                fn_name: Some("dict_merge"),
+                is_instr: |instr| matches!(instr, Instruction::DictMerge { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "pop_jump_if_true",
+                source: "def pop_jump_if_true(a, b):\n    return a or b\n",
+                fn_name: Some("pop_jump_if_true"),
+                is_instr: |instr| matches!(instr, Instruction::PopJumpIfTrue { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "load_super_attr",
+                source: "class C:\n    def load_super(self):\n        return super().x\n",
+                fn_name: Some("load_super"),
+                is_instr: |instr| matches!(instr, Instruction::LoadSuperAttr { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "make_cell",
+                source: "def make_cell():\n    x = 1\n    def inner():\n        return x\n    return inner\n",
+                fn_name: Some("make_cell"),
+                is_instr: |instr| matches!(instr, Instruction::MakeCell { .. }),
+                residual_index: 0,
+            },
+            Case {
+                name: "dict_update",
+                source: "def dict_update(xs):\n    return {1: 2, **xs}\n",
+                fn_name: Some("dict_update"),
+                is_instr: |instr| matches!(instr, Instruction::DictUpdate { .. }),
+                residual_index: 0,
+            },
+        ];
+        let _ = pyre_interpreter::builtins::new_builtin_module_dict();
+        for case in cases {
+            let code = match case.fn_name {
+                Some(name) => nested_function_code_named(case.source, name),
+                None => compile_exec(case.source).expect("compile failed"),
+            };
+            let target_py_pcs: Vec<usize> = (0..code.instructions.len())
+                .filter(|&pc| {
+                    pyre_interpreter::decode_instruction_at(&code, pc)
+                        .is_some_and(|(instr, _)| (case.is_instr)(&instr))
+                })
+                .collect();
+            assert!(
+                !target_py_pcs.is_empty(),
+                "{}: fixture must contain the opcode",
+                case.name
+            );
+            let pyjit = assemble_portal(&code);
+            assert!(!pyjit.has_abort, "{} must lower", case.name);
+            let bytes = pyjit.jitcode.code.as_slice();
+            let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+            let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+            let mut n_seen = 0usize;
+            let mut n_checked = 0usize;
+            for i in 0..ops.len() {
+                let op = &ops[i];
+                if !(op.opname.starts_with("residual_call") || op.opname.starts_with("inline_call"))
+                {
+                    continue;
+                }
+                let Some(py_pc) = py_pc_owns_jit_pc(&pyjit, op.pc) else {
+                    continue;
+                };
+                if !target_py_pcs.contains(&py_pc) {
+                    continue;
+                }
+                if n_seen < case.residual_index {
+                    n_seen += 1;
+                    continue;
+                }
+                n_seen += 1;
+                if n_checked > 0 {
+                    continue;
+                }
+                assert!(
+                    i > 0 && ops[i - 1].opname == "live",
+                    "{}: call at {} must be immediately preceded by -live- (got {:?})",
+                    case.name,
+                    op.pc,
+                    ops.get(i.wrapping_sub(1)).map(|prev| prev.opname),
+                );
+                let live_pc = ops[i - 1].pc;
+                assert_eq!(
+                    ops[i - 1].next_pc,
+                    op.pc,
+                    "{}: preceding -live- next_pc must be the call",
+                    case.name
+                );
+                let pop_before_live = ops.iter().any(|prev| {
+                    prev.pc < live_pc
+                        && py_pc_owns_jit_pc(&pyjit, prev.pc) == Some(py_pc)
+                        && prev.opname.starts_with("getarrayitem_vable")
+                });
+                assert!(
+                    pop_before_live,
+                    "{}: -live- at {live_pc} must sit after the operand pop",
+                    case.name
+                );
+                let op_live = pyre_jit_trace::state::op_live();
+                assert!(
+                    pyjit.jitcode.can_decode_live_vars(op.pc, op_live),
+                    "{}: call pc {} must decode live vars via the adjacent -live-",
+                    case.name,
+                    op.pc
+                );
+                let live_r = live_ref_colors_at(bytes, live_pc, &all_liveness);
+                let popped_regs: Vec<u32> = ops
+                    .iter()
+                    .filter(|prev| {
+                        prev.pc < live_pc
+                            && py_pc_owns_jit_pc(&pyjit, prev.pc) == Some(py_pc)
+                            && prev.opname.starts_with("getarrayitem_vable")
+                    })
+                    .filter_map(|prev| opcode_result_ref_reg(bytes, prev))
+                    .collect();
+                assert!(
+                    !popped_regs.is_empty(),
+                    "{}: operand pop must produce a ref register before -live- at {live_pc}",
+                    case.name
+                );
+                let call_regs = opcode_call_ref_regs(bytes, op);
+                let needed: Vec<u32> = popped_regs
+                    .iter()
+                    .copied()
+                    .filter(|r| call_regs.contains(r))
+                    .collect();
+                let operands = if needed.is_empty() {
+                    let frame = pyjit.metadata.portal_frame_reg as u32;
+                    let ec = pyjit.metadata.portal_ec_reg as u32;
+                    call_regs
+                        .iter()
+                        .copied()
+                        .filter(|r| *r != frame && *r != ec)
+                        .collect::<Vec<_>>()
+                } else {
+                    needed
+                };
+                assert!(
+                    !operands.is_empty(),
+                    "{}: residual ListR={call_regs:?} must name a popped operand",
+                    case.name
+                );
+                for operand in &operands {
+                    assert!(
+                        live_r.contains(operand),
+                        "{}: -live- at {live_pc} live_r={live_r:?} must include popped operand r{operand}",
+                        case.name
+                    );
+                }
+                n_checked += 1;
+            }
+            assert!(
+                n_checked > 0,
+                "{}: expected a residual_call or inline_call in the opcode floor",
+                case.name
+            );
+        }
+    }
+
+    /// BUILD_LIST / BUILD_TUPLE pop then `emit_frontend_newlist` /
+    /// `emit_frontend_newtuple`. Flattening expands those to
+    /// `new_array_clear` + `setarrayitem_gc_r` + `*_from_array`, so the
+    /// residual is not adjacent to `-live-`. The post-pop marker still has
+    /// to name the popped item registers.
+    #[test]
+    fn build_list_and_tuple_live_after_pops_includes_operand_registers() {
+        use pyre_interpreter::bytecode::Instruction;
+        let cases: &[(&str, &str, fn(&Instruction) -> bool)] = &[
+            (
+                "build_list",
+                "def build_list(a, b):\n    return [a, b]\n",
+                |instr| matches!(instr, Instruction::BuildList { .. }),
+            ),
+            (
+                "build_tuple",
+                "def build_tuple(a, b):\n    return (a, b)\n",
+                |instr| matches!(instr, Instruction::BuildTuple { .. }),
+            ),
+        ];
+        for &(name, source, is_instr) in cases {
+            let code = nested_function_code_named(source, name);
+            let target_py_pcs: Vec<usize> = (0..code.instructions.len())
+                .filter(|&pc| {
+                    pyre_interpreter::decode_instruction_at(&code, pc)
+                        .is_some_and(|(instr, _)| is_instr(&instr))
+                })
+                .collect();
+            assert!(
+                !target_py_pcs.is_empty(),
+                "{name}: fixture must contain the opcode"
+            );
+            let pyjit = assemble_portal(&code);
+            assert!(!pyjit.has_abort, "{name} must lower");
+            let bytes = pyjit.jitcode.code.as_slice();
+            let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+            let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+            let mut n_checked = 0usize;
+            for &py_pc in &target_py_pcs {
+                let last_pop_pc = ops
+                    .iter()
+                    .filter(|op| {
+                        py_pc_owns_jit_pc(&pyjit, op.pc) == Some(py_pc)
+                            && op.opname.starts_with("getarrayitem_vable")
+                    })
+                    .map(|op| op.pc)
+                    .max();
+                let Some(last_pop_pc) = last_pop_pc else {
+                    continue;
+                };
+                let Some(live_op) = ops.iter().find(|op| {
+                    op.opname == "live"
+                        && op.pc > last_pop_pc
+                        && py_pc_owns_jit_pc(&pyjit, op.pc) == Some(py_pc)
+                }) else {
+                    panic!("{name}: expected -live- after the operand pops");
+                };
+                let popped_regs: Vec<u32> = ops
+                    .iter()
+                    .filter(|prev| {
+                        prev.pc <= last_pop_pc
+                            && py_pc_owns_jit_pc(&pyjit, prev.pc) == Some(py_pc)
+                            && prev.opname.starts_with("getarrayitem_vable")
+                    })
+                    .filter_map(|prev| opcode_result_ref_reg(bytes, prev))
+                    .collect();
+                assert!(
+                    !popped_regs.is_empty(),
+                    "{name}: operand pop must produce a ref register"
+                );
+                let live_r = live_ref_colors_at(bytes, live_op.pc, &all_liveness);
+                for operand in &popped_regs {
+                    assert!(
+                        live_r.contains(operand),
+                        "{name}: -live- at {} live_r={live_r:?} must include popped operand r{operand}",
+                        live_op.pc
+                    );
+                }
+                n_checked += 1;
+            }
+            assert!(n_checked > 0, "{name}: expected a post-pop -live-");
         }
     }
 
@@ -20122,6 +22256,55 @@ mod tests {
     }
 
     #[test]
+    fn frontend_load_const_none_is_w_none_singleton() {
+        // `x[:n]` / `LOAD_CONST None` must push `space.w_None`, never the
+        // `PUSH_NULL` PY_NULL sentinel. `flatten_constant_operand` maps
+        // `(None, Ref)` to `ConstRef(0)`, which `eval_slice_index` refuses.
+        let code = compile_exec("x = None\n").expect("compile failed");
+        let idx = code
+            .constants
+            .iter()
+            .position(|constant| matches!(constant, ConstantData::None))
+            .expect("None constant");
+
+        let value = frontend_load_const_flow_value(std::ptr::null(), &code, idx);
+        match value {
+            FlowValue::Constant(c) => {
+                assert_eq!(c.kind, Some(Kind::Ref));
+                assert_eq!(
+                    c.value,
+                    super::super::flow::ConstantValue::Signed(pyre_object::w_none() as i64),
+                    "LOAD_CONST None must carry w_none(), not PY_NULL",
+                );
+                assert_ne!(pyre_object::w_none() as i64, 0);
+            }
+            other => panic!("LOAD_CONST None must be a Ref constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binary_slice_omitted_start_interns_w_none_not_py_null() {
+        // `x[:n]` is LOAD_CONST None + BINARY_SLICE (a constant stop such as
+        // `x[:1]` folds to a `slice` constant + BINARY_SUBSCR instead).
+        // The residual's start operand and the pushvalue store must intern
+        // the None singleton, because popvalue reads the live vable slot.
+        let code = first_nested_function_code("def f(x, n):\n    return x[:n]\n");
+        let pyjit = assemble_portal(&code);
+        let w_none = pyre_object::w_none() as i64;
+        assert_ne!(w_none, 0, "w_none singleton must be a real object");
+        assert!(
+            pyjit.jitcode.constants_r.iter().any(|c| c.get() == w_none),
+            "LOAD_CONST None must intern w_none() in constants_r, got {:?}",
+            pyjit
+                .jitcode
+                .constants_r
+                .iter()
+                .map(|c| c.get())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
     fn frontend_load_const_flow_value_returns_ref_constant() {
         let code = compile_exec("x = 'hello'\n").expect("compile failed");
         let idx = code
@@ -20386,7 +22569,7 @@ mod tests {
         // maps to nothing, so it stands in for an SSA-live scratch temp.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
             vec![vec![(1, 0, 0)]; code.instructions.len()];
-        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
                 &code,
@@ -20611,7 +22794,7 @@ mod tests {
         // assert the splice path keeps the live Int/Float registers.
         let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
             vec![vec![(1, 0, 0)]; code.instructions.len()];
-        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _) =
+        let (post_remove_live_indices, _after_call_post_merge, _first_insn_post_merge, _, _) =
             filter_liveness_in_place(
                 &mut ssarepr,
                 &code,
@@ -21007,9 +23190,9 @@ mod tests {
             .callcontrol()
             .find_compiled_jitcode_arc(code_ptr)
             .expect("portal while-loop must produce a jitcode");
-        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
-            .map(|op| op.opname)
-            .collect();
+        let bytes = pyjit.jitcode.code.as_slice();
+        let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+        let opnames: Vec<_> = ops.iter().map(|op| op.opname).collect();
         assert!(
             opnames.contains(&"goto_if_not_ptr_iszero"),
             "get_is_being_profiled null-tests debugdata, got {opnames:?}"
@@ -21034,17 +23217,53 @@ mod tests {
             merge_count > 1,
             "interp_jit.py PyFrame.dispatch merges at every bytecode, got {merge_count} in {opnames:?}"
         );
-        let guard_pos = opnames
-            .iter()
-            .position(|&name| name == "int_guard_value")
-            .expect("int_guard_value present");
         let merge_pos = opnames
             .iter()
             .position(|&name| name == "jit_merge_point")
             .expect("jit_merge_point present");
+        // Layout: each merge's op3 is reached by `goto pmg_shared`;
+        // promote_greens (`int_guard_value` / `ref_guard_value`) lives
+        // in that shared block, before its `switch` back to the body.
+        let mut pmg_shared = None;
+        for (i, op) in ops.iter().enumerate() {
+            if op.opname != "jit_merge_point" {
+                continue;
+            }
+            let op3 = ops[..i]
+                .iter()
+                .rev()
+                .find(|op| op.opname == "live")
+                .expect("op3 -live- precedes jit_merge_point");
+            let op3_idx = ops.iter().position(|op| op.pc == op3.pc).expect("op3 idx");
+            assert!(
+                op3_idx > 0 && ops[op3_idx - 1].opname == "goto",
+                "op before each merge's op3 must be goto pmg_shared, got {:?}",
+                ops.get(op3_idx.saturating_sub(1)).map(|op| op.opname)
+            );
+            let goto = &ops[op3_idx - 1];
+            let target = u16::from_le_bytes([bytes[goto.pc + 1], bytes[goto.pc + 2]]) as usize;
+            assert!(
+                is_pmg_shared_entry(bytes, target),
+                "goto before op3 must target pmg_shared at {target}"
+            );
+            match pmg_shared {
+                None => pmg_shared = Some(target),
+                Some(prev) => assert_eq!(prev, target, "all prefix gotos share pmg_shared"),
+            }
+        }
+        let pmg_shared = pmg_shared.expect("expected goto pmg_shared before op3");
+        let switch = ops
+            .iter()
+            .find(|op| op.pc >= pmg_shared && op.opname == "switch")
+            .expect("pmg_shared ends in switch");
+        let pmg_names: Vec<_> = ops
+            .iter()
+            .filter(|op| op.pc >= pmg_shared && op.pc < switch.pc)
+            .map(|op| op.opname)
+            .collect();
         assert!(
-            guard_pos < merge_pos,
-            "promote_greens must precede jit_merge_point, got {opnames:?}"
+            pmg_names.contains(&"int_guard_value") && pmg_names.contains(&"ref_guard_value"),
+            "pmg_shared must promote_greens before switch, got {pmg_names:?}"
         );
         assert!(
             !opnames[..merge_pos].contains(&"ref_guard_value"),
@@ -21200,9 +23419,7 @@ mod tests {
             "def f(n):\n    while n > 0:\n        n -= 1\n    return n\n",
         );
         let w_code = pyre_interpreter::box_code_constant(&code);
-        let code_ptr = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
-        };
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
@@ -21248,9 +23465,7 @@ mod tests {
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
         let w_code = pyre_interpreter::box_code_constant(&code);
-        let code_ptr = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
-        };
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
         let writer = CodeWriter::new();
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: code_ptr,
@@ -21468,59 +23683,633 @@ mod tests {
     }
 
     #[test]
-    fn true_portal_merge_entry_covers_instruction_start_greens() {
-        // interp_jit.py PyFrame.dispatch: jit_merge_point before every
-        // handle_bytecode. warmstate.py maybe_compile_and_run keys the cell
-        // by next_instr, so a mid-function portal entry is a real green.
+    fn guard_resume_skips_portal_merge_onto_op2_live() {
+        // `[op3=-live-, op1=jit_merge_point, op2=-live-]`: empty-list
+        // `jit_merge_point/cIRFIRF` between two `live/` ops.
+        let mut code = vec![majit_jitcode::insns::BC_LIVE, 0, 0];
+        code.push(majit_jitcode::insns::BC_JIT_MERGE_POINT_C);
+        code.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+        code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
+        assert_eq!(guard_resume_live_after_portal_merge(&code, 0), 11);
+        assert_eq!(guard_resume_live_after_portal_merge(&code, 11), 11);
+        assert_eq!(guard_resume_live_after_portal_merge(&code, 3), 3);
+        assert_eq!(guard_resume_live_after_portal_merge(&[], 0), 0);
+        assert_eq!(
+            trace_entry_at_portal_merge(&code, 0),
+            0,
+            "upstream-shaped floor keeps the op3 -live-"
+        );
+        assert_eq!(trace_entry_at_portal_merge(&[], 0), 0);
+    }
+
+    #[test]
+    fn trace_entry_at_portal_merge_skips_pmg_shared_onto_body_live() {
+        // Floor: `-live-; goto pmg_shared`. Body immediately after:
+        // `-live-; jit_merge_point`. pmg_shared: `-live-; getfield_vable_r;
+        // -live-; goto_if_not_ptr_iszero`.
+        let mut code = Vec::new();
+        code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
+        let goto_pc = code.len();
+        code.push(majit_jitcode::insns::BC_JUMP);
+        code.extend_from_slice(&[0, 0]);
+        let body_live = code.len();
+        code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
+        code.push(majit_jitcode::insns::BC_JIT_MERGE_POINT_C);
+        code.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
+        let pmg_shared = code.len();
+        code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
+        code.push(majit_jitcode::insns::BC_GETFIELD_VABLE_R);
+        code.extend_from_slice(&[0, 0, 0, 0]);
+        code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
+        code.push(majit_jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO);
+        code.extend_from_slice(&[0, 0, 0]);
+        let target = u16::try_from(pmg_shared).unwrap().to_le_bytes();
+        code[goto_pc + 1] = target[0];
+        code[goto_pc + 2] = target[1];
+        assert_eq!(trace_entry_at_portal_merge(&code, 0), body_live);
+        assert_eq!(
+            trace_entry_at_portal_merge(&code, body_live),
+            body_live,
+            "a body already at pmgN is upstream-shaped from there"
+        );
+    }
+
+    #[test]
+    fn portal_shared_merge_greens_guard_resume_reaches_body() {
+        // A guard inside pmg_shared resumes at its own `-live-`. The
+        // blackhole then runs forward through the switch onto the
+        // body's op3 / jit_merge_point.
         let code = first_nested_function_code(
-            "def rec(n):\n    if n <= 1:\n        return n\n    return rec(n - 1) + n\n",
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
-        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
-        let writer = CodeWriter::new();
-        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
-            portal_graph: code_ptr,
-            mainjitcode: None,
-        });
-        writer.make_jitcodes();
-        let pyjit = writer
-            .callcontrol()
-            .find_compiled_jitcode_arc(code_ptr)
-            .expect("portal rec must produce a jitcode");
-        let greens: Vec<u32> = pyjit
-            .metadata
-            .merge_entry_by_green
+        let pyjit = assemble_portal(&code);
+        let bytes = pyjit.jitcode.code.as_slice();
+        let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+        let mut pmg_shared = None;
+        let mut body_pcs = Vec::new();
+        for (i, op) in ops.iter().enumerate() {
+            if op.opname != "goto" {
+                continue;
+            }
+            if i == 0 || ops[i - 1].opname != "int_copy" {
+                continue;
+            }
+            let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+            if !is_pmg_shared_entry(bytes, target) {
+                continue;
+            }
+            match pmg_shared {
+                None => pmg_shared = Some(target),
+                Some(prev) => assert_eq!(prev, target, "prefix gotos must share pmg_shared"),
+            }
+            let floor = ops[..i]
+                .iter()
+                .rev()
+                .find(|prev| prev.opname == "live")
+                .map(|prev| prev.pc)
+                .expect("instruction-start -live- before goto pmg_shared");
+            assert_eq!(
+                trace_entry_at_portal_merge(bytes, floor),
+                op.next_pc,
+                "trace entry maps the floor -live- onto the pmgN body"
+            );
+            body_pcs.push(op.next_pc);
+        }
+        let pmg_shared = pmg_shared.expect("expected goto pmg_shared after int_copy");
+        assert_eq!(
+            guard_resume_live_after_portal_merge(bytes, pmg_shared),
+            pmg_shared,
+            "a guard at pmg_shared's entry -live- resumes there"
+        );
+        let switch = ops
             .iter()
-            .map(|&(py, _)| py)
-            .collect();
-        assert!(
-            greens.contains(&0),
-            "RESUME at pc 0 must be a merge green (interp_jit.py dispatch), got {greens:?}"
+            .find(|op| op.pc >= pmg_shared && op.opname == "switch")
+            .expect("pmg_shared ends in switch");
+        let promote_live = ops
+            .iter()
+            .find(|op| {
+                op.opname == "live"
+                    && op.pc > pmg_shared
+                    && op.pc < switch.pc
+                    && pyre_jit_trace::jitcode_runtime::decode_op_at(bytes, op.next_pc)
+                        .is_some_and(|next| next.opname == "int_guard_value")
+            })
+            .expect("promote_greens -live- before int_guard_value");
+        assert_eq!(
+            guard_resume_live_after_portal_merge(bytes, promote_live.pc),
+            promote_live.pc,
+            "a guard inside pmg_shared resumes at its own -live-"
         );
-        let first = pyre_interpreter::decode_instruction_at(&code, 0);
         assert!(
-            matches!(first, Some((Instruction::Resume { .. }, _))),
-            "fixture prologue must be RESUME, got {first:?}"
+            !body_pcs.is_empty(),
+            "expected at least one body label after goto pmg_shared"
         );
-        assert!(
-            greens.len() > 1,
-            "true-portal instruction starts must be merge greens, got {greens:?}"
-        );
-        for &py in &greens {
+        for &(green, off) in &pyjit.metadata.merge_entry_by_green {
             assert!(
-                pyjit.merge_entry_for(py as usize).is_some(),
-                "merge_entry_for({py}) must resolve"
+                body_pcs.contains(&(off as usize)),
+                "merge_entry green {green} off {off} must be a pmgN body -live-, body_pcs={body_pcs:?}"
+            );
+        }
+        for body_pc in body_pcs {
+            let op3 = pyre_jit_trace::jitcode_runtime::decode_op_at(bytes, body_pc)
+                .expect("body after goto pmg_shared");
+            assert_eq!(op3.opname, "live", "switch returns to op3 -live-");
+            assert_eq!(
+                after_residual_live_before_portal_merge(bytes, op3.pc),
+                op3.pc,
+                "op3 is the last -live- before the merge"
+            );
+            let op2 = guard_resume_live_after_portal_merge(bytes, op3.pc);
+            let op2_op =
+                pyre_jit_trace::jitcode_runtime::decode_op_at(bytes, op2).expect("op2 decode");
+            assert_eq!(op2_op.opname, "live");
+            assert_ne!(op2, op3.pc, "guard resume from op3 advances onto op2");
+            let mut pc = op3.next_pc;
+            loop {
+                let op = pyre_jit_trace::jitcode_runtime::decode_op_at(bytes, pc)
+                    .expect("walk to merge");
+                if op.opname == "jit_merge_point" {
+                    break;
+                }
+                assert!(
+                    portal_merge_prefix_op(bytes, &op),
+                    "ops between op3 and merge must be the vsd prefix, got {}",
+                    op.opname
+                );
+                pc = op.next_pc;
+            }
+        }
+        let descr_idx = u16::from_le_bytes([bytes[switch.pc + 2], bytes[switch.pc + 3]]) as usize;
+        let keys: Vec<i64> = match pyjit.jitcode.descr_at(descr_idx) {
+            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
+                descr.switch_const_keys_in_order().to_vec()
+            }
+            other => panic!("pmg_shared switch descr {descr_idx} is not Switch: {other:?}"),
+        };
+        assert!(
+            !keys.is_empty(),
+            "pmg_shared switch must send next_instr back to body labels"
+        );
+    }
+
+    #[test]
+    fn portal_shared_merge_greens_lives_keep_portal_reds() {
+        // `pmg_shared` `-live-` markers force the portal reds alive
+        // (`liveness.py` args-on-`-live-`) so a guard resume inside the
+        // shared block still restores frame/ec.
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+        let pyjit = assemble_portal(&code);
+        let bytes = pyjit.jitcode.code.as_slice();
+        let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+        let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+        let mut pmg_shared = None;
+        for (i, op) in ops.iter().enumerate() {
+            if op.opname != "goto" {
+                continue;
+            }
+            if i == 0 || ops[i - 1].opname != "int_copy" {
+                continue;
+            }
+            let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+            if !is_pmg_shared_entry(bytes, target) {
+                continue;
+            }
+            match pmg_shared {
+                None => pmg_shared = Some(target),
+                Some(prev) => assert_eq!(prev, target, "prefix gotos must share pmg_shared"),
+            }
+        }
+        let pmg_shared = pmg_shared.expect("expected goto pmg_shared after int_copy");
+        let switch = ops
+            .iter()
+            .find(|op| op.pc >= pmg_shared && op.opname == "switch")
+            .expect("pmg_shared ends in switch");
+        let frame = pyjit.metadata.portal_frame_reg;
+        let ec = pyjit.metadata.portal_ec_reg;
+        let merge = ops
+            .iter()
+            .find(|op| op.opname == "jit_merge_point")
+            .expect("portal emits jit_merge_point");
+        let merge_reds_r = jit_merge_point_red_refs(bytes, merge.pc);
+        let mut expected_r: Vec<u32> = Vec::new();
+        if frame != u16::MAX {
+            assert!(
+                merge_reds_r.contains(&(frame as u32)),
+                "jit_merge_point reds {merge_reds_r:?} must include portal frame r{frame}"
+            );
+            expected_r.push(frame as u32);
+        }
+        if ec != u16::MAX {
+            assert!(
+                merge_reds_r.contains(&(ec as u32)),
+                "jit_merge_point reds {merge_reds_r:?} must include portal ec r{ec}"
+            );
+            expected_r.push(ec as u32);
+        }
+        if expected_r.is_empty() {
+            expected_r = merge_reds_r;
+        }
+        assert!(
+            !expected_r.is_empty(),
+            "portal reds must be named on jit_merge_point or metadata"
+        );
+        let mut n_lives = 0usize;
+        for op in &ops {
+            if op.opname != "live" || op.pc < pmg_shared || op.pc >= switch.pc {
+                continue;
+            }
+            let live_r = live_ref_colors_at(bytes, op.pc, &all_liveness);
+            for &reg in &expected_r {
+                assert!(
+                    live_r.contains(&reg),
+                    "pmg_shared -live- at {} missing portal red r{reg}; live_r={live_r:?} expected={expected_r:?}",
+                    op.pc
+                );
+            }
+            n_lives += 1;
+        }
+        assert!(
+            n_lives > 0,
+            "pmg_shared must emit -live- markers before switch"
+        );
+    }
+
+    #[test]
+    fn portal_jitcode_emits_merge_at_every_instruction_start() {
+        for source in [
+            "\
+def f(n):
+    i = 0
+    while i < n:
+        i = i + 1
+    return i
+",
+            "\
+class C:
+    i = 0
+    while i < 3:
+        i = i + 1
+",
+        ] {
+            let code = first_nested_function_code(source);
+            let w_code = pyre_interpreter::box_code_constant(&code);
+            let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+            let code = unsafe { &*code_ptr };
+            let writer = CodeWriter::new();
+            writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+                portal_graph: code_ptr,
+                mainjitcode: None,
+            });
+            writer.make_jitcodes();
+            let pyjit = writer
+                .callcontrol()
+                .find_compiled_jitcode_arc(code_ptr)
+                .expect("portal must produce a jitcode");
+            let ops: Vec<_> =
+                pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+            let merge_indices: Vec<usize> = ops
+                .iter()
+                .enumerate()
+                .filter_map(|(i, op)| (op.opname == "jit_merge_point").then_some(i))
+                .collect();
+            assert!(
+                merge_indices.len() > 1,
+                "true portal must emit jit_merge_point at every instruction start, got {}",
+                merge_indices.len()
+            );
+            let op3_pcs: Vec<usize> = merge_indices
+                .iter()
+                .filter_map(|&i| {
+                    ops[..i]
+                        .iter()
+                        .rev()
+                        .find(|op| op.opname == "live")
+                        .map(|op| op.pc)
+                })
+                .collect();
+            let mut pycode_regs = std::collections::HashSet::new();
+            let mut saw_stack_materialize = false;
+            for &i in &merge_indices {
+                assert!(
+                    ops[..i].iter().rev().any(|op| op.opname == "live"),
+                    "op3 -live- must precede the merge (getfield of pycode may sit between)"
+                );
+                assert_eq!(ops[i + 1].opname, "live", "op2 -live- after merge");
+                let op2 = ops[i + 1].pc;
+                // After op2: the link to the shared dispatch head (which
+                // stores `last_instr` from the merge green).  Resume of
+                // that store is still op2.
+                let body_pc = ops[i + 2].pc;
+                assert_eq!(
+                    pyjit.resume_marker_for_jitcode_pc(body_pc),
+                    Some(op2),
+                    "guard resume must land on op2 (jtransform handle_jit_marker__jit_merge_point)"
+                );
+                if let Some(ar) = pyjit.after_residual_marker_for_jitcode_pc(body_pc) {
+                    assert!(
+                        op3_pcs.contains(&ar),
+                        "after_residual {ar} must land on op3 so blackhole CRNs at the merge; op2 is {op2}"
+                    );
+                }
+                let sandwich_ops: Vec<_> = ops[..i]
+                    .iter()
+                    .rev()
+                    .take_while(|op| op.opname != "live")
+                    .collect();
+                let sandwich: Vec<&str> = sandwich_ops.iter().map(|op| op.opname).collect();
+                assert!(
+                    sandwich.iter().all(|n| n.starts_with("setfield_vable")),
+                    "ops between op3 -live- and merge must be the vsd setfield"
+                );
+                assert!(
+                    sandwich
+                        .iter()
+                        .all(|name| !name.starts_with("setarrayitem_vable")),
+                    "no setarrayitem_vable_r between op3 and merge, got {sandwich:?}"
+                );
+                saw_stack_materialize |= sandwich
+                    .iter()
+                    .any(|name| name.starts_with("setarrayitem_vable"));
+                let int_copy = ops[..i]
+                    .iter()
+                    .rev()
+                    .find(|op| op.opname == "int_copy")
+                    .expect("next_instr green must be int_copy of the PC constant");
+                let code_bytes = pyjit.jitcode.code.as_slice();
+                let (copy_dest, copy_imm) = match int_copy.key {
+                    "int_copy/c>i" => (
+                        code_bytes[int_copy.pc + 2],
+                        code_bytes[int_copy.pc + 1] as i8 as i64,
+                    ),
+                    "int_copy/d>i" => (
+                        code_bytes[int_copy.pc + 3],
+                        u16::from_le_bytes([
+                            code_bytes[int_copy.pc + 1],
+                            code_bytes[int_copy.pc + 2],
+                        ]) as i64,
+                    ),
+                    other => panic!("next_instr int_copy must be /c>i or /d>i, got {other}"),
+                };
+                assert!(
+                    copy_imm >= 0 && u16::try_from(copy_imm).is_ok(),
+                    "next_instr immediate must be a bytecode offset, got {copy_imm}"
+                );
+                let merge = &ops[i];
+                assert!(
+                    merge.key == "jit_merge_point/cIRFIRF"
+                        || merge.key == "jit_merge_point/iIRFIRF",
+                    "portal merge key {}",
+                    merge.key
+                );
+                let gi_len = code_bytes[merge.pc + 2];
+                assert!(gi_len >= 1, "greens_i must hold next_instr");
+                let gi0 = code_bytes[merge.pc + 3];
+                assert_eq!(
+                    copy_dest, gi0,
+                    "int_copy dest must be the merge next_instr green register at merge pc {}",
+                    merge.pc
+                );
+                let gr_off = merge.pc + 3 + gi_len as usize;
+                let gr_len = code_bytes[gr_off];
+                assert_eq!(gr_len, 1, "greens_r must hold pycode");
+                pycode_regs.insert(code_bytes[gr_off + 1]);
+            }
+            assert_eq!(
+                pycode_regs.len(),
+                1,
+                "body merges must reuse the pinned pycode register, got {pycode_regs:?}"
+            );
+            assert!(
+                !saw_stack_materialize,
+                "no setarrayitem_vable between op3 and jit_merge_point (producer pushvalue is the only stack store)"
+            );
+            let n_starts = (0..code.instructions.len())
+                .filter(|&py_pc| {
+                    !matches!(
+                        pyre_interpreter::decode_instruction_at(code, py_pc),
+                        None | Some((
+                            Instruction::Cache
+                                | Instruction::ExtendedArg
+                                | Instruction::NotTaken
+                                | Instruction::Resume { .. }
+                                | Instruction::Nop,
+                            _
+                        ))
+                    )
+                })
+                .count();
+            assert!(
+                merge_indices.len() <= n_starts,
+                "merges={} instruction-starts={}",
+                merge_indices.len(),
+                n_starts
+            );
+            let header_greens: std::collections::HashSet<u32> = pyjit
+                .metadata
+                .merge_entry_by_green
+                .iter()
+                .map(|&(green, _)| green)
+                .collect();
+            assert!(
+                header_greens.contains(&0),
+                "function entry stays a merge_entry green"
+            );
+            assert!(
+                header_greens.len() >= 2,
+                "merge_entry_by_green stays function entry plus loop headers, got {header_greens:?}"
             );
         }
     }
 
     #[test]
-    fn first_loop_header_merge_point_is_the_loop_header_not_the_first_insn() {
-        // interp_jit.py PyFrame.dispatch: every instruction start is a
-        // merge green. first_loop_header_merge_point must still key off
-        // find_loop_header_pcs (PyFrame.jump_absolute / can_enter_jit).
-        let code = first_nested_function_code(
-            "def f():\n    x = 1\n    while x < 10: x += 1\n    return x\n",
+    fn portal_body_live_in_is_reds_and_greens() {
+        // INV: `pyopcode.py` value-stack / locals cross an instruction
+        // boundary only through `locals_cells_stack_w`. Every portal
+        // `body_N` and every handler-entry live-in is ⊆ reds ∪ greens.
+        pyre_interpreter::module::thread::ensure_runtime_thread();
+        let _builtins = pyre_interpreter::builtins::new_builtin_module_dict();
+        let cases: &[(&str, &str)] = &[
+            (
+                "exception_args_virtual",
+                "\
+def f():
+    try:
+        {}[0]
+    except KeyError as e:
+        _ = e.args
+        raise
+",
+            ),
+            (
+                "exception_value_op_caught",
+                "\
+def f():
+    try:
+        raise TypeError(1)
+    except TypeError as e:
+        raise
+",
+            ),
+            (
+                "finally_bare_raise",
+                "\
+def f():
+    try:
+        x = 1
+    finally:
+        if x < 0:
+            raise
+    return x
+",
+            ),
+            (
+                "seqiter",
+                "\
+def f(it):
+    out = []
+    for x in it:
+        out.append(x)
+    return out
+",
+            ),
+            (
+                "sre_wasm_min",
+                "\
+def f(pat, subject):
+    n = 0
+    for m in pat.finditer(subject):
+        n = n + 1
+    return n
+",
+            ),
+            (
+                "lineno_chain",
+                "\
+def f(seen, t, name):
+    seen[t] = 1
+    print(name)
+",
+            ),
+            (
+                "profile_hook",
+                "\
+def f(n, rec, D):
+    for _ in range(n):
+        rec(D)
+",
+            ),
+        ];
+        let mut all = Vec::new();
+        for &(name, source) in cases {
+            let code = first_nested_function_code(source);
+            let (_pyjit, writer) = assemble_portal_with_writer(&code);
+            let violations = writer.body_live_in_violations();
+            for v in violations {
+                all.push(format!("{name}: {v}"));
+            }
+        }
+        assert!(
+            all.iter().all(|line| !line.contains(" defs=")),
+            "INV body_N live-in ⊆ reds ∪ greens; violations:\n{}",
+            all.join("\n")
+        );
+    }
+
+    #[test]
+    fn portal_merge_op2_live_r_is_portal_reds_and_pycode() {
+        // SWAP (try/except return cleanup) + FOR_ITER.  Operand-stack
+        // SSA must not cross a portal merge: every op2 Ref live set is
+        // the portal reds plus the pycode green (`pyopcode.py` SWAP
+        // peekvalue/settopvalue; `pyframe.py` pushvalue stores the
+        // vable so leftover stack colors are not live-in of the shared
+        // `switch last_instr`).
+        let source = "\
+def f(xs):
+    n = 0
+    try:
+        for x in xs:
+            n = n + x
+        return n
+    except ValueError:
+        return n
+";
+        pyre_interpreter::module::thread::ensure_runtime_thread();
+        let _builtins = pyre_interpreter::builtins::new_builtin_module_dict();
+        let code = first_nested_function_code(source);
+        let has_swap = (0..code.instructions.len()).any(|py_pc| {
+            matches!(
+                pyre_interpreter::decode_instruction_at(&code, py_pc),
+                Some((Instruction::Swap { .. }, _))
+            )
+        });
+        let has_for_iter = (0..code.instructions.len()).any(|py_pc| {
+            matches!(
+                pyre_interpreter::decode_instruction_at(&code, py_pc),
+                Some((Instruction::ForIter { .. }, _))
+            )
+        });
+        assert!(has_swap, "fixture must contain SWAP");
+        assert!(has_for_iter, "fixture must contain FOR_ITER");
+        let pyjit = assemble_portal(&code);
+        let all_liveness = pyre_jit_trace::assembler::all_liveness_snapshot();
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let code_bytes = pyjit.jitcode.code.as_slice();
+        let frame = pyjit.metadata.portal_frame_reg as u32;
+        let ec = pyjit.metadata.portal_ec_reg as u32;
+        assert_ne!(frame, u16::MAX as u32);
+        assert_ne!(ec, u16::MAX as u32);
+        let mut n_op2 = 0usize;
+        for (i, op) in ops.iter().enumerate() {
+            if op.opname != "jit_merge_point" {
+                continue;
+            }
+            assert!(
+                i + 1 < ops.len() && ops[i + 1].opname == "live",
+                "op2 -live- must follow the merge at {}",
+                op.pc
+            );
+            let gi_len = code_bytes[op.pc + 2];
+            let gr_off = op.pc + 3 + gi_len as usize;
+            let gr_len = code_bytes[gr_off];
+            assert_eq!(gr_len, 1, "greens_r must hold pycode");
+            let pycode = code_bytes[gr_off + 1] as u32;
+            let allowed = [frame, ec, pycode];
+            let op2 = ops[i + 1].pc;
+            let live_r = live_ref_colors_at(code_bytes, op2, &all_liveness);
+            let extra: Vec<u32> = live_r
+                .iter()
+                .copied()
+                .filter(|c| !allowed.contains(c))
+                .collect();
+            assert!(
+                extra.is_empty(),
+                "op2 live_r at {op2} has extra colors {extra:?}; live_r={live_r:?} allowed={allowed:?}"
+            );
+            n_op2 += 1;
+        }
+        assert!(
+            n_op2 > 1,
+            "portal must emit more than one merge, got {n_op2}"
+        );
+    }
+
+    #[test]
+    fn portal_with_many_instruction_pcs_still_assembles() {
+        // Per-instruction merge greens used to pool each PC as a
+        // `constants_i` slot. A body with more than 256 unique PCs then
+        // failed `try_finish` and latched ConstEncodingOverflow, so the
+        // frame never reached `jit_merge_point`. `next_instr` is now an
+        // `int_copy` of the PC (`/c>i` or `/d>i`), which is ConstInt at
+        // the merge without a pool slot.
+        let body: String = (0..80).map(|_| "    x = x + 1\n").collect();
+        let source = format!("def f(x):\n{body}    return x\n");
+        let code = first_nested_function_code(&source);
+        assert!(
+            code.instructions.len() > 256,
+            "fixture must have more instruction units than the int-pool ceiling"
         );
         let headers = pyre_interpreter::find_loop_header_pcs(&code);
         assert_eq!(
@@ -21579,6 +24368,164 @@ mod tests {
                 "first_loop_header_merge_point must not be the first instruction green"
             );
         }
+        body.push_str("        i = i + 1\n    return s\n");
+        let code = first_nested_function_code(&body);
+        let pyjit = assemble_portal(&code);
+        let code_len = pyjit.jitcode.code.len();
+        let merges = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .filter(|op| op.opname == "jit_merge_point")
+            .count();
+        let total_i = pyjit.jitcode.num_regs_i() as usize + pyjit.jitcode.constants_i.len();
+        let total_r = pyjit.jitcode.num_regs_r() as usize + pyjit.jitcode.constants_r.len();
+        assert!(
+            total_i <= 256 && total_r <= 256,
+            "try/except portal must assemble: units={} merges={} code_len={} total_i={} total_r={}",
+            code.instructions.len(),
+            merges,
+            code_len,
+            total_i,
+            total_r
+        );
+    }
+
+    #[test]
+    fn portal_switch_keys_cover_merge_green_pcs() {
+        // Shared-head switch keys are the merge-green next_instr copies.
+        // A key missing from the dict is `bhimpl_unreachable` at the
+        // switch default (`flatten.py` insert_switch_exits).
+        let code = first_nested_function_code(
+            "def f():\n    i = 0\n    while i < 5:\n        i += 1\n    return i\n",
+        );
+        let pyjit = assemble_portal(&code);
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let mut merge_pcs = Vec::new();
+        for (index, op) in ops.iter().enumerate() {
+            if op.key != "jit_merge_point" && !op.key.starts_with("jit_merge_point/") {
+                continue;
+            }
+            // `int_copy` sits before `promote_greens`; the sandwich after op3
+            // is only the vsd `setfield_vable`.
+            let int_copy = ops[..index]
+                .iter()
+                .rev()
+                .find(|op| op.opname == "int_copy")
+                .expect("next_instr green must be int_copy of the PC constant");
+            let code_bytes = pyjit.jitcode.code.as_slice();
+            let copy_imm = match int_copy.key {
+                "int_copy/c>i" => code_bytes[int_copy.pc + 1] as i8 as i64,
+                "int_copy/d>i" => {
+                    u16::from_le_bytes([code_bytes[int_copy.pc + 1], code_bytes[int_copy.pc + 2]])
+                        as i64
+                }
+                other => panic!(
+                    "merge-green int_copy used {other} at {}; expected int_copy/c>i or int_copy/d>i",
+                    int_copy.pc
+                ),
+            };
+            merge_pcs.push(copy_imm);
+        }
+        let switch = ops
+            .iter()
+            .find(|op| op.key == "switch/id")
+            .expect("shared hook switch");
+        let descr_idx = u16::from_le_bytes([
+            pyjit.jitcode.code[switch.pc + 2],
+            pyjit.jitcode.code[switch.pc + 3],
+        ]) as usize;
+        let keys: Vec<i64> = match pyjit.jitcode.descr_at(descr_idx) {
+            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
+                descr.switch_const_keys_in_order().to_vec()
+            }
+            other => panic!("switch descr {descr_idx} is not Switch: {other:?}"),
+        };
+        for pc in &merge_pcs {
+            assert!(
+                keys.contains(pc),
+                "merge-green next_instr {pc} missing from switch keys {keys:?}; merge_pcs={merge_pcs:?}"
+            );
+        }
+        assert!(
+            !keys.is_empty() && !merge_pcs.is_empty(),
+            "expected merge greens and switch keys, got merge_pcs={merge_pcs:?} keys={keys:?}"
+        );
+        let module = compile_exec("x = 1\n").expect("compile module");
+        let module_jit = assemble_portal(&module);
+        let module_ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&module_jit.jitcode.code).collect();
+        let module_switch = module_ops
+            .iter()
+            .find(|op| op.key == "switch/id")
+            .expect("module shared hook switch");
+        let module_descr_idx = u16::from_le_bytes([
+            module_jit.jitcode.code[module_switch.pc + 2],
+            module_jit.jitcode.code[module_switch.pc + 3],
+        ]) as usize;
+        let module_keys: Vec<i64> = match module_jit.jitcode.descr_at(module_descr_idx) {
+            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
+                descr.switch_const_keys_in_order().to_vec()
+            }
+            other => panic!("module switch descr {module_descr_idx} is not Switch: {other:?}"),
+        };
+        let mut module_merge_pcs = Vec::new();
+        for (index, op) in module_ops.iter().enumerate() {
+            if op.key != "jit_merge_point" && !op.key.starts_with("jit_merge_point/") {
+                continue;
+            }
+            let int_copy = module_ops[..index]
+                .iter()
+                .rev()
+                .find(|op| op.opname == "int_copy")
+                .expect("module next_instr green must be int_copy of the PC constant");
+            let code_bytes = module_jit.jitcode.code.as_slice();
+            let copy_imm = match int_copy.key {
+                "int_copy/c>i" => code_bytes[int_copy.pc + 1] as i8 as i64,
+                "int_copy/d>i" => {
+                    u16::from_le_bytes([code_bytes[int_copy.pc + 1], code_bytes[int_copy.pc + 2]])
+                        as i64
+                }
+                other => panic!(
+                    "module merge-green int_copy used {other} at {}; expected int_copy/c>i or int_copy/d>i",
+                    int_copy.pc
+                ),
+            };
+            module_merge_pcs.push(copy_imm);
+        }
+        for pc in &module_merge_pcs {
+            assert!(
+                module_keys.contains(pc),
+                "module merge-green next_instr {pc} missing from switch keys {module_keys:?}"
+            );
+        }
+        assert!(
+            !module_keys.is_empty() && !module_merge_pcs.is_empty(),
+            "expected module merge greens and switch keys, got merge_pcs={module_merge_pcs:?} keys={module_keys:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op.key.starts_with("loop_header")),
+            "JUMP_BACKWARD must lower can_enter_jit to loop_header/i so the header merge closes; keys={keys:?}"
+        );
+    }
+
+    #[test]
+    fn portal_exception_metadata_jitstress_run_still_assembles() {
+        // Per-instruction portal merge plus the dispatch_bytecode jitted
+        // arm must keep `run` inside the u16 `code_len` ceiling.
+        let _ = pyre_interpreter::builtins::new_builtin_module_dict();
+        let source = include_str!("../../../bench/synth/exception_metadata_jitstress.py");
+        let code = function_code_named(source, "run");
+        let pyjit = assemble_portal(&code);
+        let code_len = pyjit.jitcode.code.len();
+        let total_i = pyjit.jitcode.num_regs_i() as usize + pyjit.jitcode.constants_i.len();
+        let total_r = pyjit.jitcode.num_regs_r() as usize + pyjit.jitcode.constants_r.len();
+        assert!(
+            total_i <= 256 && total_r <= 256,
+            "exception_metadata_jitstress.run must assemble: units={} code_len={} total_i={} total_r={}",
+            code.instructions.len(),
+            code_len,
+            total_i,
+            total_r
+        );
     }
 
     #[test]
@@ -22351,6 +25298,80 @@ def f(g):
                 .any(|&pc| pyjit.merge_entry_for(pc).is_some()),
             "finally handler greens {handler_pcs:?} must keep a merge sandwich"
         );
+    }
+
+    #[test]
+    fn generator_try_finally_yield_lowers_exception_table_handler() {
+        // `flowcontext.py build_flow pendingblocks` drains a handler after
+        // `closeblock` / `StopFlowing`. `pyopcode.py handle_operation_error`
+        // reaches the table target. YieldValue is not can-raise, so the
+        // exception table must seed the same catch-landing entry a
+        // `guessexception` edge would.
+        let code = first_nested_function_code(
+            "def g():\n    try:\n        yield 1\n    finally:\n        x = 2\n",
+        );
+        let entries: Vec<_> =
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
+        assert!(
+            !entries.is_empty(),
+            "try/finally around yield must produce an exception table"
+        );
+        let handler_pcs: Vec<usize> = entries
+            .iter()
+            .map(|entry| entry.target as usize / 2)
+            .collect();
+
+        let pyjit = assemble_portal(&code);
+        assert!(
+            handler_pcs
+                .iter()
+                .any(|&pc| pyjit.merge_entry_for(pc).is_some()),
+            "exception-table handler greens {handler_pcs:?} must have a merge entry"
+        );
+        assert!(
+            handler_pcs
+                .iter()
+                .any(|&pc| pyjit.function_entry_for(pc).is_some()),
+            "exception-table handler greens {handler_pcs:?} must have a function-entry body"
+        );
+    }
+
+    #[test]
+    fn function_entry_for_declines_unlowered_non_trivia_pc() {
+        // Guard: an unlowered instruction start must not trivia-forward
+        // onto a later body's offset (`handle_operation_error` target).
+        let code = first_nested_function_code(
+            "def g():\n    try:\n        yield 1\n    finally:\n        x = 2\n",
+        );
+        let handler_pc = pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+            .map(|entry| entry.target as usize / 2)
+            .next()
+            .expect("try/finally has a handler pc");
+        assert!(
+            is_python_instruction_start(&code, handler_pc),
+            "handler pc {handler_pc} must be an instruction start"
+        );
+        let last_start = (0..code.instructions.len())
+            .rfind(|&pc| is_python_instruction_start(&code, pc))
+            .expect("code has an instruction start");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+        let mut pyjit = PyJitCode::skeleton(code_ptr);
+        pyjit.metadata.n_py_instrs = code.instructions.len() as u32;
+        pyjit.metadata.py_exact_by_jit_pc = vec![(10, last_start as u32)];
+        pyjit.metadata.merge_entry_by_green = Vec::new();
+        assert_eq!(pyjit.merge_entry_for(handler_pc), None);
+        assert_eq!(pyjit.function_entry_for(handler_pc), None);
+        assert_eq!(pyjit.function_entry_for(last_start), Some(10));
+        if let Some(cache_pc) = (0..last_start).find(|&pc| {
+            matches!(
+                pyre_interpreter::decode_instruction_at(&code, pc),
+                Some((Instruction::Cache, _))
+            )
+        }) {
+            assert_eq!(pyjit.function_entry_for(cache_pc), Some(10));
+        }
+        let _ = w_code;
     }
 
     #[test]

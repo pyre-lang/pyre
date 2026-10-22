@@ -69,14 +69,10 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::UnaryNegative
         | Instruction::UnaryNot
         | Instruction::UnaryInvert
-        // TO_BOOL is net 0 (liveness `(d, d)`) and emits no JitCode
-        // (codewriter `Instruction::ToBool => {}`), so it stamps no
-        // `write_ref_reg` box of its own.  It still belongs here: the
-        // unchanged value is exactly `vstack_last_ref`, and where that is
-        // NONE — the tested value came from an unboxed bank —
-        // `loadconst_operand_ref` fail-closes to NONE, leaving the
-        // intentional hole the capture overlay omits and resume
-        // rematerializes.  What it must NOT be is `Unmodeled`: that latched
+        // TO_BOOL is net 0 (liveness `(d, d)`): popvalue, `is_true`,
+        // push `w_bool_from(truth)`.  The bool result is the last Ref
+        // write (`write_ref_reg` / push chokepoint), same shape as
+        // UNARY_NOT.  What it must NOT be is `Unmodeled`: that latched
         // `vstack_valid = false` whenever the after-residual guard-capture
         // reconcile re-entered at the TO_BOOL pc (`prev_pypc == new_pypc`),
         // dropping the kept accumulator below a residual-call condition
@@ -91,7 +87,6 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::MatchSequence
         | Instruction::MatchMapping
         | Instruction::MatchKeys
-        | Instruction::LoadAttr { .. }
         | Instruction::ImportFrom { .. }
         | Instruction::BinaryOp { .. }
         | Instruction::CompareOp { .. }
@@ -219,6 +214,17 @@ pub(crate) fn classify_vstack_opcode(
         }
         Instruction::LoadGlobal { .. } => VstackOpClass::ResultToTos,
 
+        // LOAD_ATTR method form: pop the object and push `[attr, self_or_null]`
+        // (net +1), the same two-push shape as LOAD_SPECIAL / LOAD_GLOBAL
+        // method.  ResultToTos only writes TOS and leaves the popped object in
+        // the lower slot, so a later CALL-site snapshot can see
+        // `[Method, leftover, arg]` and prepend that leftover
+        // (`list.append() takes exactly one argument (2 given)`).
+        Instruction::LoadAttr { namei } if namei.get(op_arg).is_method() => {
+            VstackOpClass::LoadAttrMethod
+        }
+        Instruction::LoadAttr { .. } => VstackOpClass::ResultToTos,
+
         // LOAD_SUPER_ATTR pops `global_super`, `__class__`, and `self`
         // (`liveness.rs` `Instruction::LoadSuperAttr`). Non-method form pushes
         // one result (net -2); `ResultToTos` truncates to that depth and writes
@@ -292,17 +298,14 @@ pub(crate) fn classify_vstack_opcode(
         Instruction::BuildListFromArg => VstackOpClass::MultiResultFromShadow,
 
         // FOR_ITER (continue arm): peeks the iterator (kept on the stack) and
-        // pushes the yielded item on the new TOS (net +1) — the same shape as
-        // the value producers above, so the item is `vstack_last_ref`.  The
-        // item never reaches either mirror chokepoint on its own (the
-        // `for_iter_next` residual result is stamped via `set_opref_concrete`,
-        // not `write_ref_reg`, and the item lands on TOS through the
-        // codewriter's `pin!` slot binding, not a `setarrayitem_vable_r`
-        // push), so the residual-execution path seeds `vstack_last_ref` with
-        // the item OpRef explicitly (the `ForIterNext` capture site).  The
-        // exhaustion arm pushes no item, but it is a non-fallthrough guard
-        // exit, so the boundary's `sequential` gate suppresses this per-op
-        // effect there.
+        // pushes the yielded item on the new TOS (net +1).  The item is
+        // `vstack_last_ref` (seeded at the `ForIterNext` residual).  Apply
+        // that write only at the fallthrough boundary (`new_depth == d+1`):
+        // a same-pc residual-guard capture sits at the opcode-entry depth,
+        // which equals the exhaust successor (`d`), so `layout_only_boundary`
+        // is false there.  Writing `last_ref` at that depth replaces the
+        // iterator with the item (`'int' object is not an iterator`) or a
+        // NONE hole (force leaves the slot NULL → SIGSEGV in `next`).
         Instruction::ForIter { .. } => VstackOpClass::ResultToTos,
 
         // Everything else is not modeled — decline; the overlay then omits
@@ -362,7 +365,19 @@ fn loadconst_operand_ref<Sym: WalkSym>(
         // the per-frame red `pycode` owner.
         pyre_interpreter::pyframe::load_const_from_code(code, idx)
     } else {
-        unsafe { pyre_interpreter::pycode::w_code_const(w_code as pyre_object::PyObjectRef, idx) }
+        let resolved = unsafe {
+            pyre_interpreter::pycode::w_code_const(w_code as pyre_object::PyObjectRef, idx)
+        };
+        // `frontend_load_const_flow_value` falls through to
+        // `load_const_from_code` when `w_code_const` returns PY_NULL
+        // (unreadable nested code, OOB idx, unrealized table). A None
+        // constant must still surface as `space.w_None`, never as the
+        // `PUSH_NULL` sentinel — `eval_slice_index` refuses a null bound.
+        if resolved.is_null() {
+            pyre_interpreter::pyframe::load_const_from_code(code, idx)
+        } else {
+            resolved
+        }
     };
     if w_const.is_null() {
         return OpRef::NONE;
@@ -381,6 +396,64 @@ fn vstack_mirror_push_tos(boxes: &mut Vec<OpRef>, new_depth: usize, tos: OpRef) 
     if new_depth > 0 {
         boxes[new_depth - 1] = tos;
     }
+}
+
+/// True when live boxes already hold SWAP's exchanged opcode-entry image.
+///
+/// `stamp_vstack_from_array_store` writes each `settopvalue` into
+/// `vstack_boxes` while SWAP is still open. Replaying the exchange on
+/// the retiring boundary is not idempotent and restores the pre-SWAP
+/// order.
+fn vstack_swap_already_applied(
+    boxes: &[OpRef],
+    opcode_entry: &[OpRef],
+    top: usize,
+    other: usize,
+) -> bool {
+    let Some(&live_top) = boxes.get(top) else {
+        return false;
+    };
+    let Some(&live_other) = boxes.get(other) else {
+        return false;
+    };
+    let Some(&entry_top) = opcode_entry.get(top) else {
+        return false;
+    };
+    let Some(&entry_other) = opcode_entry.get(other) else {
+        return false;
+    };
+    live_top == entry_other
+        && live_other == entry_top
+        && (live_top != entry_top || live_other != entry_other)
+}
+
+/// Persist SWAP's TOS <-> TOS-(i-1) exchange in the live mirror.
+///
+/// A repeat boundary is still inside SWAP; SET stamps as they run.
+/// On the retiring boundary, skip the replay when SET already exchanged
+/// the boxes, and apply it when SET did not stamp (residual SWAP).
+/// Returns false on a malformed / out-of-range arg (latch invalid).
+fn persist_swap_exchange(
+    boxes: &mut Vec<OpRef>,
+    opcode_entry: &[OpRef],
+    depth: usize,
+    i: usize,
+    repeat_boundary: bool,
+) -> bool {
+    boxes.resize(depth, OpRef::NONE);
+    if repeat_boundary {
+        return true;
+    }
+    if depth < 1 || i < 1 || i > depth {
+        return false;
+    }
+    let top = depth - 1;
+    let other = depth - i;
+    if vstack_swap_already_applied(boxes, opcode_entry, top, other) {
+        return true;
+    }
+    boxes.swap(top, other);
+    true
 }
 
 /// The TOS box a [`VstackOpClass::ResultToTos`] opcode publishes.
@@ -496,6 +569,36 @@ fn vstack_slot_box_from_pcdep_registers<Sym: WalkSym>(
 /// the correct boxes for the guard's resume depth.
 ///
 /// `code` is the Python `CodeObject` of the outer (full-body) jitcode;
+/// Operand-stack slot of a two-push method-form opcode, taken from the SET
+/// store (`virtualizable_boxes` / callee `opref` shadow). `vstack_last_ref`
+/// is still the popped receiver at the opcode boundary, so it is not a
+/// source for either pushed slot. A pop-clear (`popvalue_maybe_none` stores
+/// NULL) is not a stored method / iterator.
+fn method_form_slot_from_vable_store<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &pyre_interpreter::CodeObject,
+    stack_slot: usize,
+) -> OpRef {
+    let stored = if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
+        let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+        shadow
+            .opref
+            .get(&((stack_base + stack_slot) as i64))
+            .copied()
+    } else if !ctx.fbw_mode.snapshot_sym.is_null() {
+        let nlocals = unsafe { (*ctx.fbw_mode.snapshot_sym).nlocals() };
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        let flat = nvs + nlocals + stack_slot;
+        ctx.trace_ctx.virtualizable_box_at(flat)
+    } else {
+        None
+    };
+    match stored {
+        Some(b) if b != OpRef::NONE && !opref_is_null_const_ptr(b) => b,
+        _ => OpRef::NONE,
+    }
+}
+
 /// `new_pypc` is the Python pc the walk is about to enter; `new_depth` is
 /// `depth_at_py_pc[new_pypc]` (stack-only).  The previous opcode is
 /// decoded from `code` at `ctx.vstack_cur_pypc`.  `jit_pc` is the JitCode
@@ -756,13 +859,6 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     } else {
         class
     };
-    // GET_ITER / LOAD_SPECIAL after-residual: the residual's result is the
-    // first pushed value (`make_result_of_lastop`), and neither push has
-    // run yet. Fill from `vstack_last_ref` after the hole-fill below, and
-    // only while the slot is still NONE, so a looked-inside GET_ITER that
-    // already wrote the iterator through `setarrayitem_vable_r` is not
-    // overwritten by a previous opcode's residual.
-    let mut fill_first_push_from_residual = false;
     match effective_class {
         // The saved boxes ARE the reconcile for this boundary; the previous
         // opcode's effect belongs to the excursion, not to the arm point.  The
@@ -783,51 +879,57 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 .resize(new_depth, OpRef::NONE);
         }
         VstackOpClass::ResultToTos => {
-            // `NONE` means the result was produced in an unboxed bank;
-            // leave an intentional hole so the capture overlay around
-            // stack_sync omits the slot and resume rematerializes it.
-            let last_ref = ctx.frame_state.borrow().vstack_last_ref;
-            // `pyopcode.py` `pushvalue` / `_opimpl_setarrayitem_vable`:
-            // the snapshot names the box the pushed slot holds now.
-            // Prefer the pcdep color at this py_pc over `vstack_last_ref`
-            // — a coalesced `LOAD_FAST` executes no op, so
-            // `write_ref_reg` never stamps the last-ref.
-            let from_reg = if new_depth > 0 {
-                vstack_slot_box_from_pcdep_registers(ctx, jit_pc, new_depth - 1)
-            } else {
-                OpRef::NONE
-            };
-            // `LOAD_CONST` / `LOAD_SMALL_INT` / a prebuilt
-            // `LOAD_COMMON_CONSTANT` push that constant. A `ref_copy`
-            // renaming does not stamp `vstack_last_ref`, so the previous
-            // opcode's ref (the `None` a generator send pushed, a FOR_ITER
-            // item `STORE_FAST` just popped) would otherwise become this
-            // TOS. When the const box is not known yet the slot is NONE,
-            // never that leftover.  Skip this mint when the pcdep register
-            // already holds the pushed box, so the snapshot names that
-            // identity.
-            let const_result = matches!(
-                instr,
-                pyre_interpreter::bytecode::Instruction::LoadSmallInt { .. }
-                    | pyre_interpreter::bytecode::Instruction::LoadConst { .. }
-                    | pyre_interpreter::bytecode::Instruction::LoadCommonConstant { .. }
-            );
-            let from_const = if from_reg == OpRef::NONE && (last_ref == OpRef::NONE || const_result)
-            {
-                loadconst_operand_ref(ctx, code, &instr, op_arg)
-            } else {
-                OpRef::NONE
-            };
-            let top = if from_reg != OpRef::NONE {
-                from_reg
-            } else {
-                vstack_result_to_tos_box(last_ref, const_result, from_const)
-            };
-            vstack_mirror_push_tos(
-                &mut ctx.frame_state.borrow_mut().vstack_boxes,
-                new_depth,
-                top,
-            );
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .resize(new_depth, OpRef::NONE);
+            // Same-pc is still the opcode-entry stack a mid-opcode guard's
+            // opcode-start resume re-pops (`pyframe.py` `pushvalue` has not
+            // retired). A non-fallthrough successor (FOR_ITER exhaust) is
+            // that same depth, so `layout_only_boundary` does not catch it:
+            // writing `last_ref` there would replace the iterator with the
+            // yielded item.
+            if !repeat_boundary && new_depth == fallthrough_depth && new_depth > 0 {
+                // `NONE` means the result was produced in an unboxed bank;
+                // leave an intentional hole so the capture overlay around
+                // stack_sync omits the slot and resume rematerializes it.
+                let last_ref = ctx.frame_state.borrow().vstack_last_ref;
+                // `pyopcode.py` `pushvalue` / `_opimpl_setarrayitem_vable`:
+                // the snapshot names the box the pushed slot holds now.
+                // Prefer the pcdep color at this py_pc over `vstack_last_ref`
+                // — a coalesced `LOAD_FAST` executes no op, so
+                // `write_ref_reg` never stamps the last-ref.
+                let from_reg = vstack_slot_box_from_pcdep_registers(ctx, jit_pc, new_depth - 1);
+                // `LOAD_CONST` / `LOAD_SMALL_INT` / a prebuilt
+                // `LOAD_COMMON_CONSTANT` push that constant. A `ref_copy`
+                // renaming does not stamp `vstack_last_ref`, so the previous
+                // opcode's ref (the `None` a generator send pushed) would
+                // otherwise become this TOS and the yield would finish with
+                // it.  Skip this mint when the pcdep register already holds
+                // the pushed box, so the snapshot names that identity.
+                let const_result = matches!(
+                    instr,
+                    pyre_interpreter::bytecode::Instruction::LoadSmallInt { .. }
+                        | pyre_interpreter::bytecode::Instruction::LoadConst { .. }
+                        | pyre_interpreter::bytecode::Instruction::LoadCommonConstant { .. }
+                );
+                let from_const =
+                    if from_reg == OpRef::NONE && (last_ref == OpRef::NONE || const_result) {
+                        loadconst_operand_ref(ctx, code, &instr, op_arg)
+                    } else {
+                        OpRef::NONE
+                    };
+                let top = if from_reg != OpRef::NONE {
+                    from_reg
+                } else {
+                    vstack_result_to_tos_box(last_ref, const_result, from_const)
+                };
+                vstack_mirror_push_tos(
+                    &mut ctx.frame_state.borrow_mut().vstack_boxes,
+                    new_depth,
+                    top,
+                );
+            }
         }
         VstackOpClass::LoadGlobalMethod => {
             // `opcode_load_global`: push the callable, then NULL.  The
@@ -855,28 +957,19 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // legacy-defer handles it); a malformed / out-of-range arg
             // declines (latch invalid).
             //
-            // The exchange belongs to the boundary that RETIRES the opcode.  A
-            // repeat boundary has not left it, and SWAP is the one class whose
-            // replay is not idempotent: exchanging the same pair twice restores
-            // the pre-SWAP order, so the mirror ends up disagreeing with the
-            // `setarrayitem_vable_r` stores the walk executed for that SWAP,
-            // and the capture overlay then publishes the stale order into a
-            // branch guard's virtualizable resume section.  A repeat is invisible
-            // to `layout_only_boundary` here precisely because the net-zero
-            // depth matches the fallthrough successor.  The depth normalization
-            // still runs: it is what keeps mirror slot `s` naming operand-stack
-            // slot `s` at the observed depth.
-            ctx.frame_state
-                .borrow_mut()
-                .vstack_boxes
-                .resize(new_depth, OpRef::NONE);
-            if repeat_boundary {
-                // The retiring boundary performs the exchange.
-            } else if new_depth >= 1 && i >= 1 && i <= new_depth {
-                let top = new_depth - 1;
-                let other = new_depth - i;
-                ctx.frame_state.borrow_mut().vstack_boxes.swap(top, other);
-            } else {
+            // `swap_values` stores through `settopvalue` →
+            // `setarrayitem_vable`. `stamp_vstack_from_array_store` writes
+            // each store into `vstack_boxes` while SWAP is still open. The
+            // retiring boundary used to replay the same exchange; SWAP is
+            // not idempotent, so that replay restored the pre-SWAP order
+            // and `vstack_opcode_entry` cloned that stale image. A repeat
+            // boundary has not left the opcode (SET stamps as they run).
+            // Skip the replay when live boxes already hold the exchanged
+            // entry image.
+            let mut st = ctx.frame_state.borrow_mut();
+            let entry = st.vstack_opcode_entry.clone();
+            if !persist_swap_exchange(&mut st.vstack_boxes, &entry, new_depth, i, repeat_boundary) {
+                drop(st);
                 ctx.vstack_valid = false;
             }
         }
@@ -956,13 +1049,58 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             for s in pop_point..new_depth {
                 ctx.frame_state.borrow_mut().vstack_boxes[s] = OpRef::NONE;
             }
-            if new_depth > 0 {
-                if let Some(null) = trailing_null {
-                    ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = null;
+        }
+        VstackOpClass::LoadAttrMethod => {
+            // Two-push method form. Clear the affected range so leftover
+            // receivers cannot occupy either pushed slot, then fill every
+            // slot from the SET store (`virtualizable_boxes` /
+            // `callee_shadow`). LOAD_ATTR's entry last_ref is still the
+            // receiver; stamping that published `[method, receiver, arg]`.
+            let pop_point = ctx.vstack_depth.saturating_sub(1);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .resize(new_depth, OpRef::NONE);
+            for s in pop_point..new_depth {
+                let stamp = method_form_slot_from_vable_store(ctx, code, s);
+                if stamp != OpRef::NONE {
+                    ctx.frame_state.borrow_mut().vstack_boxes[s] = stamp;
                 }
             }
-            fill_first_push_from_residual =
-                after_residual_call && trailing_null.is_some() && new_depth >= 2;
+        }
+        VstackOpClass::LoadSpecialMethod => {
+            // GET_ITER / method-form LOAD_SPECIAL: pop one, push two.
+            let pop_point = ctx.vstack_depth.saturating_sub(1);
+            ctx.frame_state
+                .borrow_mut()
+                .vstack_boxes
+                .resize(new_depth, OpRef::NONE);
+            for s in pop_point..new_depth {
+                ctx.frame_state.borrow_mut().vstack_boxes[s] = OpRef::NONE;
+            }
+            for s in pop_point..new_depth {
+                let stamp = method_form_slot_from_vable_store(ctx, code, s);
+                if stamp != OpRef::NONE {
+                    ctx.frame_state.borrow_mut().vstack_boxes[s] = stamp;
+                }
+            }
+            if new_depth > 0 {
+                let null = ctx.trace_ctx.const_null();
+                ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = null;
+            }
+            // The residual's result is the first pushed value
+            // (`make_result_of_lastop`); neither push has run; a
+            // looked-inside GET_ITER already stored a non-null iterator,
+            // which the stamp keeps.
+            if after_residual_call
+                && new_depth >= 2
+                && ctx.frame_state.borrow().vstack_boxes[new_depth - 2] == OpRef::NONE
+            {
+                let result = ctx.frame_state.borrow().vstack_last_ref;
+                if result != OpRef::NONE {
+                    ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 2] = result;
+                }
+            }
         }
         VstackOpClass::Unmodeled => {
             ctx.vstack_valid = false;
@@ -974,9 +1112,9 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     // below the new TOS — the per-op reconcile leaves a NONE hole there.
     // Recover those slots from the virtualizable shadow (kept current by the
     // portal `setarrayitem_vable_r` pushes for values that ARE written
-    // through).  `reseed_vstack_from_shadow` rejects a NULL-const shadow slot
-    // (a function-local temp the portal never wrote), so a genuinely
-    // unrecoverable kept slot fails the re-seed.
+    // through).  `reseed_vstack_from_shadow` accepts any non-NONE box below
+    // the depth, including a NULL-const (`PUSH_NULL` / method-form
+    // `self_or_null`); a genuinely unrecoverable kept slot stays NONE.
     //
     // A non-reseedable hole does NOT latch `vstack_valid = false`: an
     // Int/Float-bank operand-stack temp (e.g. the `while i < N` loop
@@ -1013,25 +1151,18 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             }
         }
     }
-    if fill_first_push_from_residual && ctx.vstack_valid && new_depth >= 2 {
-        let result = ctx.frame_state.borrow().vstack_last_ref;
-        let hole = ctx
-            .frame_state
-            .borrow()
-            .vstack_boxes
-            .get(new_depth - 2)
-            .copied()
-            == Some(OpRef::NONE);
-        // LoadSpecialMethod's last store is the trailing NULL sentinel, not
-        // the first push; a null-constant result would fill the hole wrongly.
-        if hole && result != OpRef::NONE && !opref_is_null_const_ptr(result) {
-            ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 2] = result;
-        }
-    }
     if ctx.vstack_valid {
         ctx.vstack_cur_pypc = new_pypc;
         ctx.vstack_depth = new_depth;
-        ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
+        // Same-pc has not retired the opcode: keep `vstack_last_ref` so the
+        // fallthrough ResultToTos can still place FOR_ITER's item after the
+        // continue-arm `setarrayitem_vable_r`.
+        if !repeat_boundary {
+            let mut st = ctx.frame_state.borrow_mut();
+            st.vstack_last_ref = OpRef::NONE;
+            // Capture reads this clone (`capture_resumedata` at `orgpc`).
+            st.vstack_opcode_entry = st.vstack_boxes.clone();
+        }
     }
 }
 
@@ -1079,7 +1210,11 @@ fn reseed_vstack_from_callee_shadow<Sym: WalkSym>(
         // a resolved mirror slot is the direction that turns a decline into a
         // wrong answer.
         match shadow.opref.get(&((stack_base + s) as i64)).copied() {
-            Some(value) if value != OpRef::NONE && !opref_is_null_const_ptr(value) => {
+            // A present key is the SET store (`setarrayitem_vable_r`).
+            // CONST_NULL is PUSH_NULL / LOAD_ATTR-method `null_or_self`;
+            // rejecting it left a NONE hole that leftover-fill replaced
+            // with a coalesced local (`list.append() 2 given`).
+            Some(value) if value != OpRef::NONE => {
                 *slot = value;
             }
             _ => all_present = false,
@@ -1110,24 +1245,10 @@ pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
     // SAFETY: pointer live for the full-body walk; read-only nlocals.
     let nlocals = unsafe { (*full_body_sym).nlocals() };
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-    // Only FILL the NONE holes the per-op reconcile could not source from
-    // the walk register file; keep the boxes the reconcile DID capture (the
-    // shadow may carry a stale value in a non-hole slot).  A hole the shadow
-    // also cannot source (NONE / NULL const-ptr — a function-local temp the
-    // portal never wrote through) fails the whole re-seed so the caller
-    // leaves the slot NONE; `stack_sync` then omits it (resume
-    // re-materializes).
-    //
-    // A NULL const-ptr is rejected because it cannot be told apart from a slot
-    // the portal never wrote — EXCEPT where the slot carries the live-NULL
-    // marker, which says the last executed store into it wrote a NULL on
-    // purpose.  That is PUSH_NULL's `self_or_null` sentinel: it stays live
-    // across the whole callable/args/kwargs build ahead of a CALL, and the
-    // reorder region reseeds the mirror from the shadow in the middle of that
-    // build.  Rejecting it left slot NONE, `capture_vstack_mirror_image`
-    // refuses an image with any unresolved slot, and an escape inside the call
-    // then had no blackhole image at all and fell back to the legacy entry
-    // replay — which re-runs the residuals the walk already executed.
+    // `pyframe.py` `pushvalue` writes `locals_cells_stack_w[depth]` then
+    // increments; `popvalue` clears the slot it pops, which is then at or
+    // above the new depth. Fill only NONE holes; a hole the shadow cannot
+    // source (`OpRef::NONE`) stays NONE.
     if ctx.frame_state.borrow().vstack_boxes.len() < new_depth {
         ctx.frame_state
             .borrow_mut()
@@ -1141,17 +1262,12 @@ pub(crate) fn reseed_vstack_from_shadow<Sym: WalkSym>(
         }
         let flat = nvs + nlocals + s;
         match ctx.trace_ctx.virtualizable_box_at(flat) {
-            Some(b)
-                if b != OpRef::NONE
-                    && (!opref_is_null_const_ptr(b)
-                        || ctx.trace_ctx.virtualizable_slot_stored_live_null(flat)) =>
-            {
+            // For `s < new_depth` a `ConstPtr(0)` box IS that slot's value
+            // (`PUSH_NULL` / LOAD_ATTR-method `null_or_self`); `pushvalue` /
+            // `popvalue` leave no unwritten case below the depth.
+            Some(b) if b != OpRef::NONE => {
                 ctx.frame_state.borrow_mut().vstack_boxes[s] = b;
             }
-            // Fill what we can; an unsourceable hole (NONE / NULL const-ptr —
-            // an Int/Float-bank temp or a function-local the portal never
-            // wrote) stays NONE.  `stack_sync` omits a NONE slot (resume
-            // re-materializes), so an unfilled slot is never a corrupt box.
             _ => all_present = false,
         }
     }
@@ -1293,7 +1409,9 @@ fn two_push_get_iter_or_load_special(code: &pyre_interpreter::CodeObject, pc: us
 /// while a populated pair is the later marker that should ShadowReseed a
 /// stale capture image. Outer operand slots are ignored so a nested
 /// GET_ITER is not treated as complete just because an enclosing iterator
-/// already occupies a lower slot.
+/// already occupies a lower slot. A pop-clear NULL does not count.
+/// GET_ITER's first push (the iterator) is never NULL, so it is the
+/// signal the pushes have landed.
 fn vstack_operand_shadow_occupied<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     code: &pyre_interpreter::CodeObject,
@@ -1348,6 +1466,24 @@ fn vstack_operand_shadow_occupied<Sym: WalkSym>(
 /// only the `vstack_*` side-fields; never the registers / snapshot.
 pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, jit_pc: usize) {
     if !ctx.vstack_valid {
+        return;
+    }
+    // Flatten's shared copies sit after the body (`emitline`), so a
+    // `goto pmg_shared` / `goto waj_shared` floors to the last opcode
+    // (RETURN) and would overlay NULL stack slots.  The hold is raised
+    // on those gotos before this step (`begin_hold_if_shared_hook`).
+    if ctx.session.borrow().hold_opcode_live_before {
+        return;
+    }
+    // Canonical helper (`run_sub_jitcode_walk`) sets `inline_subwalk` so
+    // capture skips the FBW py_pc map, but walks helper offsets. Mapping
+    // those through the Python frame `ActiveResumeFrame::current` returns
+    // (`mod.rs` `guarded_branch_core` helper cross-bank comment) rewrites
+    // `vstack_opcode_entry`. Helper guards resume at the containing
+    // opcode's `-live-` (`overlay_vstack_on_portal_vable_for_arm_capture`);
+    // freeze that mirror. `pyjitpl.py` keeps the parent `MIFrame` registers
+    // while the looked-inside helper runs.
+    if ctx.fbw_mode.transparent_helper_subwalk {
         return;
     }
     // On genuine callee sub-walk paths, `jit_pc` is a callee coordinate with
@@ -1457,13 +1593,6 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         return;
     }
     ctx.vstack_handler_landing_py = None;
-    // The Python-opcode boundary: sample the executed-effect odometer for any
-    // abort leg that resumes the interpreter AT this opcode, which re-executes
-    // it whole (`FBW_OPCODE_ENTRY_EFFECTS`).  Top-level only — a sub-walk's
-    // `py_pc` indexes the callee's code object.
-    if !ctx.fbw_mode.inline_subwalk {
-        fbw_note_opcode_entry_effects(new_pypc as usize);
-    }
     let code = unsafe { &*code_ptr };
     reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth, false, jit_pc);
 }
@@ -1511,9 +1640,6 @@ pub(crate) fn reconcile_vstack_to_resume_pc<Sym: WalkSym>(
         let depth = vstack_step_depth(&jc.payload, jit_pc, dest_py);
         (dest_py, jc.payload.code_ptr, depth)
     };
-    if !ctx.fbw_mode.inline_subwalk {
-        fbw_note_opcode_entry_effects(dest_py as usize);
-    }
     reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth, false, jit_pc);
 }
 
@@ -1524,10 +1650,14 @@ pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(
     let Some((first_pypc, _code_ptr, _depth)) = frame.vstack_coordinate_for_jitcode_pc(0) else {
         return;
     };
-    ctx.frame_state.borrow_mut().vstack_boxes.clear();
+    {
+        let mut st = ctx.frame_state.borrow_mut();
+        st.vstack_boxes.clear();
+        st.vstack_opcode_entry.clear();
+        st.vstack_last_ref = OpRef::NONE;
+    }
     ctx.vstack_depth = 0;
     ctx.vstack_cur_pypc = first_pypc;
-    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = None;
     ctx.vstack_valid = true;
 }
@@ -1643,10 +1773,14 @@ pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
             _ => return,
         }
     }
-    ctx.frame_state.borrow_mut().vstack_boxes = boxes;
+    {
+        let mut st = ctx.frame_state.borrow_mut();
+        st.vstack_boxes = boxes;
+        st.vstack_opcode_entry = st.vstack_boxes.clone();
+        st.vstack_last_ref = OpRef::NONE;
+    }
     ctx.vstack_depth = depth;
     ctx.vstack_cur_pypc = first_pypc;
-    ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = None;
     ctx.vstack_valid = true;
 }
@@ -1779,6 +1913,9 @@ fn land_vstack_at_handler<Sym: WalkSym>(
         // NONE (per-slot decline) rather than latching the whole mirror invalid.
         let _ = reseed_vstack_from_shadow(ctx, handler_depth);
     }
+    // The handler's opcode-entry stack is the landed mirror.
+    let boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+    ctx.frame_state.borrow_mut().vstack_opcode_entry = boxes;
 }
 
 /// #370: model the exception-unwind boundary on the operand-stack mirror.
@@ -1989,5 +2126,43 @@ mod tests {
             classify_vstack_opcode(&instr, pyre_interpreter::OpArg::NULL),
             VstackOpClass::PopOnlyOrSideStore,
         );
+    }
+
+    /// SWAP 2 after BUILD_LIST: SET already exchanged TOS with TOS1.
+    /// The retiring boundary must keep that order so the next opcode's
+    /// `vstack_opcode_entry` clone has the list at s=3.
+    #[test]
+    fn swap_retire_keeps_set_store_exchange_in_opcode_entry() {
+        let join = box_at(0x10);
+        let part = box_at(0x20);
+        let path_parts = box_at(0xA0);
+        let list = box_at(0x28);
+        // SWAP-entry image after BUILD_LIST 0: [NULL, join, part, path_parts, list].
+        let entry = vec![OpRef::NONE, join, part, path_parts, list];
+        // `stamp_vstack_from_array_store` already wrote the exchange.
+        let mut boxes = vec![OpRef::NONE, join, part, list, path_parts];
+        assert!(persist_swap_exchange(&mut boxes, &entry, 5, 2, false));
+        assert_eq!(boxes[3], list, "list stays at s=3 after SWAP retire");
+        assert_eq!(boxes[4], path_parts);
+        let opcode_entry = boxes.clone();
+        assert_eq!(
+            opcode_entry[3], list,
+            "next opcode's entry clone must see the swapped list at s=3",
+        );
+    }
+
+    /// Residual SWAP: SET did not stamp, so the retiring boundary applies
+    /// the exchange.
+    #[test]
+    fn swap_retire_applies_exchange_when_set_did_not_stamp() {
+        let join = box_at(0x10);
+        let part = box_at(0x20);
+        let path_parts = box_at(0xA0);
+        let list = box_at(0x28);
+        let entry = vec![OpRef::NONE, join, part, path_parts, list];
+        let mut boxes = entry.clone();
+        assert!(persist_swap_exchange(&mut boxes, &entry, 5, 2, false));
+        assert_eq!(boxes[3], list);
+        assert_eq!(boxes[4], path_parts);
     }
 }

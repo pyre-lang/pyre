@@ -2273,6 +2273,7 @@ fn a_borrowed_primitive_banks_by_its_container() {
                 &empty_sizes,
                 &empty_ranks,
                 &empty_set,
+                &HashMap::new(),
             );
             (
                 layout.fields[0].flag,

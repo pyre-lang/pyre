@@ -2276,6 +2276,111 @@ fn test_fbw_mode() -> FbwWalkMode<crate::state::PyreSym> {
     FbwWalkMode::default()
 }
 
+/// `generator.py` `_send_ex` records `frame.frame_finished_execution` after
+/// `_invoke_execute_frame`. The live walk is the generator portal, so the
+/// capture numbers the paused send_ex tail already in `parent_frames` and
+/// does not raise `transparent_helper_subwalk`. `capture_resumedata`
+/// (`pyjitpl.py`) has no extra helper `MIFrame` to append.
+#[test]
+fn send_ex_finished_frame_capture_has_no_live_helper_section() {
+    let mut tc = fresh_trace_ctx();
+    let frame_box = dummy_ptr_eq_box(&mut tc);
+    let iter_op = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let caller_parent = send_ex_continuation_parent_frame(iter_op).expect("tail installs");
+    let item = OpRef::input_arg_ref(0);
+    with_hint_walk_context(
+        &mut tc,
+        &mut [item],
+        &mut [ConcreteValue::Ref(pyre_object::PY_NULL)],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let frame_root = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+            record_send_ex_finished_frame_guard(
+                wc,
+                0,
+                frame_box,
+                frame_root,
+                iter_op,
+                item,
+                caller_parent,
+            )
+            .expect("paused-parent send_ex capture numbers parent_frames only");
+            assert!(
+                !wc.fbw_mode.transparent_helper_subwalk,
+                "the live walk is the generator portal, not a helper MIFrame"
+            );
+            assert!(
+                wc.fbw_mode.transparent_helper_jitcode_index.is_none(),
+                "send_ex tail numbering does not invent a helper jitcode index"
+            );
+            let sections = collect_live_helper_guard_sections(wc, 0, false)
+                .expect("a portal walk has no live helper section");
+            assert!(
+                sections.is_empty(),
+                "capture_resumedata numbers the paused send_ex parent, not a live helper section: {sections:?}"
+            );
+        },
+    );
+}
+
+/// A looked-inside helper is an `MIFrame` (`capture_resumedata` over
+/// `framestack`). Without `MIFrame.jitcode` the innermost section cannot be
+/// numbered, so capture aborts rather than dropping that frame.
+#[test]
+fn helper_walk_without_jitcode_index_aborts_innermost_section() {
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let lookup = { move |_idx: usize| None };
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: None,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(
+        collect_live_helper_guard_sections(&mut wc, 0, false),
+        Err(DispatchError::callee_inline_unsupported(0)),
+    );
+}
+
 /// Install the minimal `-live-`-anchored outer JitCode required by
 /// per-opcode guard tests. Production obtains this coordinate from the
 /// codewriter; these isolated dispatcher fixtures supply the same shape.
@@ -2331,6 +2436,269 @@ fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
         super::resume_snapshot::after_residual_guard_marker(&pyjit, 0, Some(0)),
         Some(4),
         "handler liveness must come from the trailing live before catch_exception",
+    );
+}
+
+#[test]
+fn gnf_after_residual_resolves_to_live_after_call_not_live_before_pops() {
+    // CALL body: LIVE before pops, a pop-shaped op, residual_call, LIVE
+    // after the residual, dest SET, a later LIVE. GuardNotForced must
+    // resume at the residual's trailing `-live-` (`pyjitpl.py`
+    // `do_residual_call` / `get_list_of_active_boxes(after_residual_call=True)`),
+    // not the before-pops LIVE and not the dest-SET LIVE.
+    let live = crate::state::op_live();
+    let int_copy = *insns_opname_to_byte()
+        .get("int_copy/i>i")
+        .expect("int_copy/i>i must be in the insns table");
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    // 0 LIVE, 3 int_copy (pop), 6 residual (6 bytes), 12 LIVE, 15 int_copy
+    // (dest SET), 18 LIVE.
+    let code = vec![
+        live, 0, 0, int_copy, 0, 0, residual, 0, 0, 0, 0, 0, live, 0, 0, int_copy, 0, 0, live, 0, 0,
+    ];
+    let live_before = 0usize;
+    let residual_pc = 6usize;
+    let live_after = 12usize;
+    let dest_set = 15usize;
+    let later_live = 18usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("gnf_call_body_trailing_live");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [
+                live_before,
+                3,
+                residual_pc,
+                live_after,
+                dest_set,
+                later_live,
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+
+    assert_eq!(
+        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, live_before),
+        Some(live_after),
+        "LIVE before pops must resolve to the residual's trailing LIVE",
+    );
+    assert_eq!(
+        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, live_before, usize::MAX),
+        Some(live_after),
+    );
+    assert_eq!(
+        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, residual_pc, usize::MAX),
+        Some(live_after),
+    );
+    assert_eq!(
+        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, dest_set, usize::MAX),
+        Some(live_after),
+        "a dest-SET capture must not skip dest SET by landing on the later LIVE",
+    );
+    assert_eq!(
+        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, later_live, usize::MAX),
+        Some(live_after),
+    );
+    assert!(
+        super::resume_snapshot::after_residual_should_fallthrough_py(&pyjit, live_before),
+        "residual_call_* is do_residual_call: fallthrough py",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_residual_resume_live_for_guard(
+            &pyjit,
+            dest_set,
+            usize::MAX,
+            Some(majit_ir::OpCode::GuardNotForced),
+            None,
+        ),
+        Some(live_after),
+        "GNF at dest SET rewinds to the residual trailing LIVE",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_residual_resume_live_for_guard(
+            &pyjit,
+            dest_set,
+            usize::MAX,
+            Some(majit_ir::OpCode::GuardNoException),
+            None,
+        ),
+        Some(later_live),
+        "GNE at dest SET must not rewind onto the residual trailing LIVE",
+    );
+}
+
+#[test]
+fn call_assembler_gnf_keeps_own_py_not_fallthrough() {
+    // `pyjitpl.py` `do_recursive_call` / `CALL_ASSEMBLER`: GNF still numbers
+    // the trailing `-live-`, but Python pc stays the residual's own
+    // (`pickle_bridge_call_assembler_resumes_caller` loop header).
+    let live = crate::state::op_live();
+    let assembler = *insns_opname_to_byte()
+        .get("call_assembler_void_ext/P")
+        .expect("call_assembler_void_ext/P must be in the insns table");
+    // 0 LIVE, 3 assembler (opcode + target u16 + nargs u16), 8 LIVE.
+    let code = vec![live, 0, 0, assembler, 0, 0, 0, 0, live, 0, 0];
+    let live_before = 0usize;
+    let assembler_pc = 3usize;
+    let live_after = 8usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("gnf_call_assembler_trailing_live");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [live_before, assembler_pc, live_after]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+
+    assert_eq!(
+        super::resume_snapshot::gnf_after_residual_live_marker(&pyjit, assembler_pc, usize::MAX),
+        Some(live_after),
+    );
+    assert!(
+        !super::resume_snapshot::after_residual_should_fallthrough_py(&pyjit, assembler_pc),
+        "call_assembler_* is do_recursive_call: keep own py",
+    );
+}
+
+#[test]
+fn preceding_live_marker_at_residual_is_adjacent_not_opcode_start() {
+    // `jtransform.py handle_regular_indirect_call`: CALL body after pops is
+    // `-live-` then `residual_call`. Fold GuardValue records at the residual
+    // pc; `plain_guard_resume_jitcode_pc` must accept that adjacent `-live-`
+    // (`get_live_vars_info` / `preceding_live_marker`) and must not fall
+    // back to the opcode-start twin (`resume_marker_for_jitcode_pc`).
+    let live = crate::state::op_live();
+    let int_copy = *insns_opname_to_byte()
+        .get("int_copy/i>i")
+        .expect("int_copy/i>i must be in the insns table");
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    // 0 LIVE (opcode start), 3 int_copy (pop), 6 LIVE (after pops),
+    // 9 residual (6 bytes), 15 LIVE after residual.
+    let code = vec![
+        live, 0, 0, int_copy, 0, 0, live, 0, 0, residual, 0, 0, 0, 0, 0, live, 0, 0,
+    ];
+    let live_before_pops = 0usize;
+    let live_before_residual = 6usize;
+    let residual_pc = 9usize;
+    let live_after = 15usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("call_body_live_before_residual");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(
+            [
+                live_before_pops,
+                3,
+                live_before_residual,
+                residual_pc,
+                live_after,
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.resume_marker_pred_by_jit_pc = vec![
+        (0, Some(0)),
+        (3, Some(0)),
+        (6, Some(0)),
+        (9, Some(0)),
+        (15, Some(0)),
+    ];
+
+    assert_eq!(
+        super::resume_snapshot::preceding_live_marker(&pyjit, residual_pc),
+        Some(live_before_residual),
+        "adjacency is OFFSET_SIZE+1, not a scan to opcode-start",
+    );
+    assert!(
+        pyjit.jitcode.can_decode_live_vars(residual_pc, live),
+        "get_live_vars_info accepts the residual when the previous insn is -live-",
+    );
+    let plain = super::resume_snapshot::plain_guard_resume_jitcode_pc(&pyjit, residual_pc);
+    assert_ne!(
+        plain, live_before_pops as i32,
+        "fold guards must not resume at the before-pops opcode-start -live-"
+    );
+    assert!(
+        plain == live_before_residual as i32 || plain == residual_pc as i32,
+        "plain_guard resume must be the adjacent -live- or the residual itself, got {plain}"
+    );
+    assert_eq!(
+        pyjit.resume_marker_for_jitcode_pc(residual_pc),
+        Some(live_before_pops),
+        "the opcode-start twin remains 0; plain_guard must not use it",
+    );
+    assert_eq!(
+        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, residual_pc),
+        Some(live_after),
+    );
+    assert_eq!(
+        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, live_before_pops),
+        Some(live_after),
+    );
+    assert_eq!(
+        super::resume_snapshot::after_residual_trailing_live_for_pc(&pyjit, live_before_residual),
+        Some(live_after),
+        "capture on the after-pops -live- still resolves to the residual trailing LIVE",
+    );
+}
+
+#[test]
+fn helper_parent_call_live_is_after_call_not_the_call_pc() {
+    // `[-live-, residual_call, -live-]`: a numbered CallResult helper's
+    // parent is the after-call `-live-` (`handle_residual_call` /
+    // `get_list_of_active_boxes(in_a_call=True)` /
+    // `_setup_return_value_*`). `helper_parent_call_live` must not return
+    // the CALL pc: an adjacent pre-call live makes `can_decode_live_vars`
+    // accept it, and `code[call_pc-1]` is then a liveness-offset byte.
+    let live = crate::state::op_live();
+    let residual = *insns_opname_to_byte()
+        .get("residual_call_r_i/iRd>i")
+        .expect("residual_call_r_i/iRd>i must be in the insns table");
+    let code = vec![live, 0, 0, residual, 0, 0, 0, 0, 0, live, 0, 0];
+    let live_before = 0usize;
+    let call_pc = 3usize;
+    let live_after = 9usize;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("helper_parent_after_call");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([live_before, call_pc, live_after].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+
+    assert_eq!(
+        super::resume_snapshot::inline_call_return_marker(&pyjit, call_pc),
+        Some(live_after),
+    );
+    assert_eq!(
+        super::resume_snapshot::helper_parent_call_live(&pyjit, call_pc),
+        Some(live_after),
+        "numbered CallResult parent is the after-call -live-",
+    );
+    assert_ne!(
+        super::resume_snapshot::helper_parent_call_live(&pyjit, call_pc),
+        Some(call_pc),
+        "helper_parent_call_live must not return the CALL pc",
+    );
+    assert!(
+        pyjit.jitcode.can_decode_live_vars(call_pc, live),
+        "an adjacent pre-call -live- makes can_decode_live_vars(CALL) true",
     );
 }
 
@@ -2433,6 +2801,200 @@ fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
         super::resume_snapshot::plain_guard_resume_jitcode_pc(&pyjit, 9),
         6,
         "a capture at the goto itself still walks back one `-live-`",
+    );
+}
+
+#[test]
+fn orgpc_liveness_banks_match_decoder_when_previous_insn_is_live() {
+    // Encoder (`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`) and
+    // decoder (`frame_liveness_reg_indices_by_bank_from_pc` /
+    // `JitCode.get_live_vars_info`) agree at a startpoint whose previous
+    // instruction is `-live-`.
+    let live = crate::state::op_live();
+    let offset =
+        crate::state::intern_liveness(&[7, 13], &[5], &[2]).expect("intern a distinct live set");
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in the insns table");
+    let mut code = vec![live];
+    majit_jitcode::liveness::encode_offset(offset as usize, &mut code);
+    let live_pc = 0usize;
+    let orgpc = majit_jitcode::liveness::OFFSET_SIZE + 1;
+    code.extend_from_slice(&[int_add, 0, 1, 2]);
+    assert_eq!(orgpc, 3);
+
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("orgpc_liveness_bank_test");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([live_pc, orgpc].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    let jitcode = crate::state::install_jitcode_for(std::ptr::null(), std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*jitcode).index };
+    assert!(
+        unsafe {
+            (&(*jitcode).payload)
+                .jitcode
+                .can_decode_live_vars(orgpc, live)
+        },
+        "orgpc whose previous insn is -live- must decode"
+    );
+
+    let encoder =
+        crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(index, orgpc as i32);
+    let decoder = crate::state::frame_liveness_reg_indices_by_bank_from_pc(index, orgpc as i32);
+    assert_eq!(encoder, decoder, "encoder-bank == decoder-bank at orgpc");
+    let at_live = crate::state::frame_liveness_reg_indices_by_bank_from_pc(index, live_pc as i32);
+    assert_eq!(
+        encoder, at_live,
+        "orgpc banks equal the preceding -live- banks"
+    );
+    assert_eq!(encoder.int, vec![7, 13]);
+    assert_eq!(encoder.ref_, vec![5]);
+    assert_eq!(encoder.float, vec![2]);
+}
+
+/// A helper bank whose colors 4/5 hold ConstPtrs must not number the
+/// portal section of a `newbool` fail. The paused portal banks hold
+/// InputArgRef(0)/(1) there (`portal_frame_reg` / `portal_ec_reg`).
+#[test]
+fn newbool_fail_portal_section_numbers_paused_portal_reds_not_helper_constptrs() {
+    use crate::state::PyreSym;
+
+    const FLOAT_FAKE: usize = 0x1022_bbeb0;
+    const TUPLE_FAKE: usize = 0x1022_bbef8;
+    let _restore = [
+        RestoreConstPtr::intern(FLOAT_FAKE),
+        RestoreConstPtr::intern(TUPLE_FAKE),
+    ];
+
+    let live = crate::state::op_live();
+    let offset =
+        crate::state::intern_liveness(&[], &[4, 5], &[]).expect("intern portal-red live set");
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in the insns table");
+    let mut code = vec![live];
+    majit_jitcode::liveness::encode_offset(offset as usize, &mut code);
+    let live_pc = 0usize;
+    let orgpc = majit_jitcode::liveness::OFFSET_SIZE + 1;
+    code.extend_from_slice(&[int_add, 0, 1, 2]);
+
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("newbool_portal_section_banks");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([live_pc, orgpc].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.portal_frame_reg = 4;
+    pyjit.metadata.portal_ec_reg = 5;
+    let jitcode = crate::state::install_jitcode_for(std::ptr::null(), std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*jitcode).index as u32 };
+
+    let helper_float = OpRef::const_ptr(majit_ir::GcRef(FLOAT_FAKE));
+    let helper_tuple = OpRef::const_ptr(majit_ir::GcRef(TUPLE_FAKE));
+    let portal_frame = OpRef::input_arg_ref(0);
+    let portal_ec = OpRef::input_arg_ref(1);
+
+    let mut helper_r = vec![OpRef::NONE; 9];
+    helper_r[4] = helper_float;
+    helper_r[5] = helper_tuple;
+    let mut portal_r = vec![OpRef::NONE; 16];
+    portal_r[4] = portal_frame;
+    portal_r[5] = portal_ec;
+
+    let helper_bank_r = RegisterBank::new(helper_r);
+    let helper_bank_i = RegisterBank::default();
+    let helper_bank_f = RegisterBank::default();
+    let portal_bank_r = RegisterBank::new(portal_r);
+    let portal_bank_i = RegisterBank::default();
+    let portal_bank_f = RegisterBank::default();
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let portal_state = WalkFrameState::new(WalkFrameStateData::default());
+    super::vable_ops::bind_paused_caller_regs(
+        &session,
+        &portal_bank_r,
+        &portal_bank_i,
+        &portal_bank_f,
+        &portal_state,
+    );
+    assert!(session.borrow().at_portal());
+
+    let mut tc = fresh_trace_ctx();
+    let mut snapshot_sym = PyreSym::new_uninit(portal_frame);
+    snapshot_sym.execution_context = portal_ec;
+    snapshot_sym.jitcode = jitcode;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_subwalk = true;
+    mode.transparent_helper_subwalk = true;
+
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &helper_bank_r,
+        registers_i: &helper_bank_i,
+        registers_f: &helper_bank_f,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(orgpc),
+        outer_jitcode_index: index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let helper_active = super::collect_outer_active_boxes(
+        &snapshot_sym,
+        wc.trace_ctx,
+        wc.registers_i,
+        wc.registers_r,
+        wc.registers_f,
+        index,
+        orgpc as i32,
+        orgpc as i32,
+        super::OuterActiveBoxesEntryTwin::Plain,
+        "newbool_completed_bool",
+        None,
+    )
+    .expect("helper-bank collect");
+    assert!(
+        helper_active.contains(&helper_float) && helper_active.contains(&helper_tuple),
+        "pre-fix collect from helper banks must invert ConstPtrs, got {helper_active:?}"
+    );
+
+    let active =
+        super::specialize::collect_newbool_portal_active_boxes(&mut wc, &snapshot_sym, orgpc)
+            .expect("newbool portal section");
+    assert!(
+        active.contains(&portal_frame) && active.contains(&portal_ec),
+        "newbool-fail portal section must number portal InputArgRef reds, got {active:?}"
+    );
+    assert!(
+        !active.contains(&helper_float) && !active.contains(&helper_tuple),
+        "newbool-fail portal section must not invert helper ConstPtrs, got {active:?}"
     );
 }
 
@@ -4747,6 +5309,7 @@ fn frame_debug_data_accessors_resolve_to_their_own_offsets() {
     }
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn builtin_wrapper_args_slice_names_the_object_gcarray_descr() {
     // `cpu.arraydescrof(ARRAY)` is one descr per ARRAY: the wrapper's length
@@ -4782,6 +5345,7 @@ fn gateway_positional_count_uses_rpython_signed() {
     );
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let wrapper =
@@ -4886,6 +5450,7 @@ fn inline_call_callee_name(
     }
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn random_core_residuals_use_registered_genrand32_address() {
     // `_random` is a `pyre-module` module, so its residual address reaches
@@ -5636,8 +6201,16 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     );
 }
 
+fn slot_is_const_null(tc: &TraceCtx, idx: usize, const_null: OpRef) -> bool {
+    tc.virtualizable_box_at(idx) == Some(const_null)
+        && matches!(
+            tc.virtualizable_entry_at(idx).map(|entry| entry.1),
+            Some(Value::Ref(r)) if r.is_null()
+        )
+}
+
 #[test]
-fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
+fn vable_store_tracks_null_box_without_changing_the_recorded_trace() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let array_len = 3;
@@ -5658,10 +6231,10 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     let fdescr = info.array_pointer_field_descr(0);
     let adescr = info.array_descrs[0].clone();
     let flat_base = info.num_static_extra_boxes;
-    assert!((0..=slot_count).all(|i| !tc.virtualizable_slot_stored_live_null(i)));
+    let const_null = tc.const_null();
+    assert!((0..slot_count).all(|i| slot_is_const_null(&tc, i, const_null)));
 
     let index0 = tc.const_int(0);
-    let const_null = tc.const_null();
     let ops_before = tc.num_ops();
     let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
         NonstandardVable::Decided(n) => n,
@@ -5680,25 +6253,51 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr.clone(),
             const_null,
             null,
-            true,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
     assert!(
-        (0..=slot_count)
+        (0..slot_count)
             .filter(|&i| i != flat_base)
-            .all(|i| !tc.virtualizable_slot_stored_live_null(i))
+            .all(|i| slot_is_const_null(&tc, i, const_null))
     );
     assert_eq!(
         tc.virtualizable_entry_at(flat_base).map(|entry| entry.0),
         Some(const_null)
     );
     assert!(const_null.is_constant());
+
+    tc.set_virtualizable_entry_at(flat_base, const_null, Value::Void);
+    let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
+        NonstandardVable::Decided(n) => n,
+        NonstandardVable::PendingEq { .. } => {
+            panic!("standard identity must take Step 3 Decided(false)")
+        }
+    };
+    assert!(matches!(
+        tc.vable_setarrayitem_checked(
+            nonstandard,
+            0,
+            vable,
+            index0,
+            0,
+            fdescr.clone(),
+            adescr.clone(),
+            const_null,
+            Value::Void,
+        ),
+        VableArrayStore::Stored(Some(_))
+    ));
+    assert_eq!(
+        tc.virtualizable_box_at(flat_base),
+        Some(const_null),
+        "ConstPtr(0) stack push with Void concrete is still this slot's own null"
+    );
     assert_eq!(
         tc.num_ops(),
         ops_before,
-        "the side-table marker records no op"
+        "storing ConstPtr(0) records no extra op"
     );
 
     let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
@@ -5718,11 +6317,10 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr.clone(),
             const_null,
             null,
-            false,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
 
     let index1 = tc.const_int(1);
     let non_null = tc.const_ref(2);
@@ -5743,11 +6341,15 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr.clone(),
             non_null,
             Value::Ref(majit_ir::GcRef(2)),
-            true,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(!tc.virtualizable_slot_stored_live_null(flat_base + 1));
+    assert_eq!(tc.virtualizable_box_at(flat_base + 1), Some(non_null));
+    assert_eq!(
+        tc.virtualizable_entry_at(flat_base + 1)
+            .map(|entry| entry.1),
+        Some(Value::Ref(majit_ir::GcRef(2)))
+    );
 
     let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
         NonstandardVable::Decided(n) => n,
@@ -5766,13 +6368,12 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr,
             const_null,
             null,
-            true,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
     tc.set_virtualizable_entry_at(flat_base, const_null, null);
-    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
 }
 
 /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the
@@ -7085,6 +7686,132 @@ fn null_live_vable_slot_reads_null_not_the_shadow() {
     );
     assert_eq!(out_of_range.shadow_opref, Some(stale));
     assert_eq!(out_of_range.shadow_value, Some(stale_value));
+}
+
+/// `_opimpl_setarrayitem_vable` takes `_nonstandard_virtualizable` first:
+/// dest of an inlined CALL_ASSEMBLER is that callee's TOS
+/// (`CalleeLocalsShadow`), not portal `virtualizable_boxes` at the same
+/// numeric index (`owns_virtualizable_shadow`).
+#[test]
+fn stamp_pushvalue_result_with_callee_shadow_does_not_write_portal_boxes() {
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    let (nlocals, _) = crate::state::callee_layout_for_call_assembler(&code);
+    assert_eq!(nlocals, 1, "slot 1 is TOS of a one-local frame");
+
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let tos_slot = nlocals as i64;
+    let vable_index = nvs + tos_slot as usize;
+    assert!(
+        vable_index < slot_count,
+        "portal array must hold the callee TOS index"
+    );
+
+    let standard = tc.const_ref(1);
+    let sentinel = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    tc.set_opref_concrete(sentinel, Value::Ref(majit_ir::GcRef(0x1111)));
+    let dest = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    tc.set_opref_concrete(dest, Value::Ref(majit_ir::GcRef(0x2222)));
+    let mut initial_boxes = vec![tc.const_null(); slot_count];
+    initial_boxes[vable_index] = sentinel;
+    let mut initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
+    initial_values[vable_index] = Value::Ref(majit_ir::GcRef(0x1111));
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let vsd_idx = info.static_field_index_by_name("valuestackdepth");
+    let vsd_before = vsd_idx.and_then(|idx| tc.virtualizable_box_at(idx));
+
+    let vable = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
+    let shadow = CalleeLocalsShadow {
+        fold_frame_reg: u16::MAX,
+        concrete_frame: 0,
+        frame_box: vable,
+        frame_materialized: true,
+        code_ptr: &code,
+        ..Default::default()
+    };
+    let regs_r = [vable, dest, OpRef::NONE];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: vec![crate::state::ConcreteValue::Null; 3],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::PerFn(&[]),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    stamp_pushvalue_result(&mut wc, dest, 'r', 1);
+    assert_eq!(
+        wc.trace_ctx.virtualizable_box_at(vable_index),
+        Some(sentinel),
+        "inlined dest must not replace the portal box at the same index"
+    );
+    if let Some(idx) = vsd_idx {
+        assert_eq!(
+            wc.trace_ctx.virtualizable_box_at(idx),
+            vsd_before,
+            "inlined pushvalue must not rewrite portal valuestackdepth"
+        );
+    }
+    let state = wc.frame_state.borrow();
+    let shadow = state
+        .callee_shadow
+        .as_ref()
+        .expect("shadow survives the stamp");
+    assert_eq!(
+        shadow.opref.get(&tos_slot).copied(),
+        Some(dest),
+        "dest lands on the inlined frame's TOS"
+    );
 }
 
 #[test]
@@ -11699,6 +12426,7 @@ fn float_cmp_leaves_are_the_pypy_leaf() {
     }
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn unary_neg_leaves_are_the_pypy_leaf() {
     for (path, arith) in [
@@ -19237,9 +19965,10 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
 
 // A may-force call that RAISES (publishes on BH_LAST_EXC_VALUE) is transcribed
 // onto WalkSession.last_exc_value (+ last_exc_value_concrete), while the
-// blackhole carrier is consumed exactly once. The result box is NOT stamped
-// (only the normal-return path stamps a result, mirroring `execute_varargs`'s
-// success-only `result_box.value`).
+// blackhole carrier is consumed exactly once. `executor.py _do_call` still
+// returns `0` / `NULL` / `ZEROF` after `execute_raised`; `History._make_op`
+// boxes that word so `execute_varargs` / `do_residual_call` can
+// `make_result_of_lastop` before `handle_possible_exception`.
 extern "C" fn raises_for_walker_test() -> i64 {
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xDEAD));
     0
@@ -19325,8 +20054,8 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     );
     assert_eq!(
         tc.box_value(born),
-        None,
-        "a raised call is recorded with no value; record_result_of_call_pure is skipped",
+        Some(majit_ir::Value::Int(0)),
+        "a raising int call still boxes the returned 0 word (`_do_call` / `History._make_op`)",
     );
     assert_eq!(
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
@@ -19350,15 +20079,24 @@ fn bind_fake_vable(tc: &mut TraceCtx, buf: &mut [u8]) {
         "fake vable buffer must cover token_offset",
     );
     let vable_ref = tc.const_ref(buf.as_ptr() as i64);
+    let vable_val = majit_ir::Value::Ref(majit_ir::GcRef(buf.as_ptr() as usize));
+    let mut oprefs = Vec::with_capacity(info.static_fields.len());
+    let mut values = Vec::with_capacity(info.static_fields.len());
+    for field in &info.static_fields {
+        match field.field_type {
+            Type::Int => {
+                oprefs.push(tc.const_int(0));
+                values.push(majit_ir::Value::Int(0));
+            }
+            Type::Ref => {
+                oprefs.push(tc.const_ref(0));
+                values.push(majit_ir::Value::Ref(majit_ir::GcRef(0)));
+            }
+            other => panic!("bind_fake_vable: unexpected static type {other:?}"),
+        }
+    }
     tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        vable_ref,
-        majit_ir::Value::Ref(majit_ir::GcRef(buf.as_ptr() as usize)),
-        &[],
-        &[],
-        &[0],
-    );
+    tc.init_virtualizable_boxes(&info, vable_ref, vable_val, &oprefs, &values, &[0]);
     tc.set_virtualizable_heap_ptr(buf.as_ptr());
 }
 
@@ -21079,6 +21817,114 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
     assert_eq!(
         regs_r[2], call_pos,
         "registers_r[dst] must equal CallR's OpRef when GuardNoException is recorded",
+    );
+}
+
+extern "C" fn raising_int_residual_writes_dst_for_walker_test() -> i64 {
+    use pyre_object::interp_exceptions::{ExcKind, w_exception_new};
+    let live = w_exception_new(ExcKind::ValueError, "boom");
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(live as i64));
+    0
+}
+
+#[test]
+fn residual_call_r_i_raising_writes_dst_before_guard_exception() {
+    // `pyjitpl.py execute_varargs` / `do_residual_call`: a raising
+    // residual still `make_result_of_lastop` (the 0 word `_do_call`
+    // returned) before `handle_possible_exception` records
+    // GUARD_EXCEPTION. The int dest is live at the trailing `-live-`,
+    // so capture must see the Call* OpRef rather than `OpRef::NONE`.
+    let code = residual_call_with_funcbox(1);
+    let mut tc = fresh_trace_ctx();
+    let func = tc.const_int(pyre_interpreter::residual_word_addr!(
+        0,
+        raising_int_residual_writes_dst_for_walker_test,
+    ) as i64);
+    let regs_i = [OpRef::NONE, func];
+    let regs_r: Vec<OpRef> = Vec::new();
+    let descr_pool = vec![make_call_descr(
+        7,
+        vec![],
+        Type::Int,
+        majit_ir::ExtraEffect::RandomEffects,
+    )];
+    let ops_before = tc.num_ops();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    wc.outer_jitcode_index = test_outer_resume_jitcode_index();
+    wc.outer_resume_marker_jit_pc = Some(0);
+    let (outcome, _next_pc) =
+        step(&code, 0, &mut wc).expect("raising residual_call_r_i/iRd>i must dispatch");
+    assert!(
+        matches!(outcome, DispatchOutcome::SubRaise { .. }),
+        "a raising residual returns SubRaise after GUARD_EXCEPTION (`finishframe_exception`)",
+    );
+    let dst = wc.registers_i.get(0).expect("int dest register in range");
+    drop(wc);
+    let opcodes: Vec<_> = tc.ops().iter().skip(ops_before).map(|o| o.opcode).collect();
+    assert!(
+        opcodes.contains(&OpCode::CallMayForceI),
+        "RandomEffects residual_call_r_i records CallMayForceI, got {opcodes:?}"
+    );
+    assert!(
+        opcodes.contains(&OpCode::GuardException),
+        "a raising residual records GUARD_EXCEPTION, got {opcodes:?}"
+    );
+    let call_pos = tc
+        .ops()
+        .iter()
+        .find(|o| o.opcode == OpCode::CallMayForceI)
+        .expect("CallMayForceI must be in the trace")
+        .pos()
+        .get();
+    assert_ne!(dst, OpRef::NONE, "raising int dest must not stay unboxed");
+    assert_eq!(
+        dst, call_pos,
+        "registers_i[dst] must equal CallMayForceI's OpRef when GUARD_EXCEPTION is recorded",
+    );
+    assert_eq!(
+        tc.box_value(call_pos),
+        Some(majit_ir::Value::Int(0)),
+        "raising int dest boxes the 0 word `_do_call` returned",
     );
 }
 
@@ -29272,6 +30118,7 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
                 &[],
                 None,
                 None,
+                None,
             );
             assert_eq!(
                 wc.trace_ctx.last_op_opcode(),
@@ -29286,17 +30133,20 @@ fn append_virtualizable_boxes_includes_every_declared_slot() {
     );
 }
 
-/// A pcdep Ref color fills a missing stack slot only when that color is
-/// live at the resume jitcode pc (`MIFrame.get_list_of_active_boxes`).
+/// A pcdep Ref color live at the resume jitcode pc
+/// (`MIFrame.get_list_of_active_boxes`) fills an unwritten (`OpRef::NONE`)
+/// stack slot.
 #[test]
-fn snapshot_stack_slot_ignores_dead_pcdep_ref_color() {
+fn snapshot_stack_slot_live_pcdep_ref_color_fills_hole() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let array_len = 1;
     let slot_count = info.num_static_extra_boxes + array_len;
     let null = Value::Ref(majit_ir::GcRef::NULL);
     let vable = tc.const_ref(1);
-    let initial_boxes = vec![tc.const_null(); slot_count];
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let mut initial_boxes = vec![tc.const_null(); slot_count];
+    initial_boxes[nvs] = OpRef::NONE;
     let initial_values = vec![null; slot_count];
     tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
@@ -29326,28 +30176,14 @@ fn snapshot_stack_slot_ignores_dead_pcdep_ref_color() {
         &descr_pool,
         |wc| {
             wc.vstack_valid = false;
-            let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
             let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
                 wc,
                 0,
                 1,
                 &pcdep_entries,
-                &[],
-                None,
-                None,
-            );
-            assert_ne!(
-                wc.trace_ctx.virtualizable_box_at(nvs),
-                Some(reg),
-                "dead pcdep Ref color must not fill a missing stack slot"
-            );
-            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
-                wc,
-                0,
-                1,
-                &pcdep_entries,
                 &[0],
+                None,
                 None,
                 None,
             );
@@ -29360,8 +30196,70 @@ fn snapshot_stack_slot_ignores_dead_pcdep_ref_color() {
     );
 }
 
-/// A stored live NULL is a real item (`capture_resumedata` encodes the
-/// existing box); a live pcdep Ref must not replace it.
+/// A dead pcdep Ref color does not fill an unwritten stack slot; the hole
+/// is a missing declared box, which `publish_frame_array_slots_for_snapshot`
+/// rejects.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic]
+fn snapshot_stack_slot_dead_pcdep_ref_color_leaves_hole() {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 1;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let null = Value::Ref(majit_ir::GcRef::NULL);
+    let vable = tc.const_ref(1);
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let mut initial_boxes = vec![tc.const_null(); slot_count];
+    initial_boxes[nvs] = OpRef::NONE;
+    let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &initial_values,
+        &[array_len],
+    );
+    let reg = tc.const_ref(0x10);
+    let mut regs_r = [reg];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0x10_usize as *mut pyre_object::pyobject::PyObject,
+    )];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            wc.vstack_valid = false;
+            let pcdep_entries: [(u8, u16, u16); 1] = [(1, 0, 0)];
+            let _saved = super::resume_snapshot::publish_frame_array_slots_for_snapshot(
+                wc,
+                0,
+                1,
+                &pcdep_entries,
+                &[],
+                None,
+                None,
+                None,
+            );
+        },
+    );
+}
+
+/// The slot is `const_null()` seeded with concrete `Ref(NULL)` by
+/// `init_virtualizable_boxes`, so `virtualizable_slot_stored_live_null`
+/// already reports a stored live NULL that `capture_resumedata` encodes
+/// and a live pcdep Ref must not replace.
 #[test]
 fn snapshot_stack_slot_keeps_stored_live_null() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
@@ -29383,7 +30281,6 @@ fn snapshot_stack_slot_keeps_stored_live_null() {
         &[array_len],
     );
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-    tc.mark_virtualizable_slot_live_null(nvs);
     let reg = tc.const_ref(0x10);
     let mut regs_r = [reg];
     let mut concrete_r = [ConcreteValue::Ref(
@@ -29410,6 +30307,7 @@ fn snapshot_stack_slot_keeps_stored_live_null() {
                 1,
                 &pcdep_entries,
                 &[0],
+                None,
                 None,
                 None,
             );
@@ -32848,7 +33746,9 @@ fn orthodox_helper_subwalk_keeps_setfield_vable_vsd_and_last_instr() {
         constants_f: &[],
         jitcode_index: None,
     };
-    let nested_entry = super::specialize::HelperEntry::for_test(false, HelperReturn::Converted);
+    // Dest is the helper return (`void_return` into residual dest).
+    // CallResult skips the Converted collapse last_instr stamp.
+    let nested_entry = super::specialize::HelperEntry::for_test(false, HelperReturn::CallResult);
     super::specialize::run_orthodox_helper_subwalk(
         &mut wc,
         CALL_JIT_PC,

@@ -647,10 +647,23 @@ pub(super) fn vable_value_concrete<Sym: WalkSym>(
         _ => None,
     };
     if bank == 'r' {
-        ctx.trace_ctx
-            .lookup_opref_concrete(value)
-            .or_else(|| ctx.trace_ctx.recover_ref_value(value, 8))
-            .or(from_register)
+        // `pyframe.py popvalue` stores `None`. The assembler patches that
+        // src to the constants suffix (`ConstPtr.NULL`). Pyre splits Box
+        // into OpRef + concrete, so a leftover live color can still be the
+        // encoded `value` while the register concrete is `Ref(0)`.
+        // `lookup_opref_concrete` of that leftover would win and stamp a
+        // live box against a NULL heap (`check_synchronized_virtualizable`).
+        // The store is ConstPtr.NULL; prefer the register / const-null half.
+        if value.as_const_ptr().is_some_and(|g| g.is_null())
+            || matches!(from_register, Some(Value::Ref(r)) if r.is_null())
+        {
+            Some(Value::Ref(majit_ir::GcRef::NULL))
+        } else {
+            ctx.trace_ctx
+                .lookup_opref_concrete(value)
+                .or_else(|| ctx.trace_ctx.recover_ref_value(value, 8))
+                .or(from_register)
+        }
     } else {
         from_register.or_else(|| ctx.trace_ctx.concrete_of_opref(value))
     }
@@ -838,24 +851,6 @@ fn durable_resume_frame<Sym: WalkSym>(
         return Some(frame);
     }
     None
-}
-
-/// A push writes at the current `valuestackdepth`; a pop/clear decrements its
-/// target index first and updates `valuestackdepth` afterward.  This ordering is
-/// emitted by `emit_pushvalue_ref_const!` / `emit_popvalue_ref!` and lets the
-/// generic vable-store handler distinguish a live NULL push from clearing a
-/// dead slot without weakening flush validation. pyjitpl.py
-/// `virtualizable_boxes[index] = valuebox` stores one Box carrying both identity
-/// and concrete value, so it needs no separate marker; pyre keeps the halves
-/// apart and marks the shadow slot beside the trace instead.
-fn vable_store_is_stack_push<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, index: i64) -> bool {
-    let depth_index = ctx
-        .trace_ctx
-        .virtualizable_info()
-        .and_then(|info| info.static_field_index_by_name("valuestackdepth"));
-    depth_index
-        .and_then(|idx| ctx.trace_ctx.virtualizable_entry_at(idx))
-        .is_some_and(|(_, value)| matches!(value, Value::Int(depth) if depth == index))
 }
 
 /// Heapcache forward of a scalar vable field read off the inlined callee's
@@ -1131,17 +1126,19 @@ pub(super) fn own_frame_array_store_target<Sym: WalkSym>(
     if let Some(frame) = current_inline_vable_target(ctx, vable) {
         return Some(frame);
     }
-    let frame = ctx
+    let shadow_frame = ctx
         .frame_state
         .borrow()
         .callee_shadow
         .as_ref()
         .map_or(0, |shadow| shadow.concrete_frame);
-    if frame != 0 {
-        match ctx.trace_ctx.lookup_opref_concrete(vable) {
-            Some(Value::Ref(value)) if value.as_usize() == frame => return Some(frame),
-            _ => {}
-        }
+    if shadow_frame != 0
+        && matches!(
+            ctx.trace_ctx.lookup_opref_concrete(vable),
+            Some(Value::Ref(value)) if value.as_usize() == shadow_frame
+        )
+    {
+        return Some(shadow_frame);
     }
     // Standard virtualizable: `_opimpl_setarrayitem_vable` +
     // `synchronize_virtualizable` write the real object. pyre's
@@ -1205,9 +1202,21 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         // folds SETFIELD_GC away. `_opimpl_setfield_vable` still assigns
         // `virtualizable_boxes[index] = valuebox` then
         // `synchronize_virtualizable_at`.
-        if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
+        if vable_is_standard_virtualizable(ctx, vable) {
             if vable.is_none() {
                 return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
+            }
+            // `_opimpl_setfield_vable` always writes
+            // `virtualizable_boxes[index] = valuebox` (`pyjitpl.py`).  The
+            // live-frame store is the heap half; without this box write a
+            // later `getfield_vable` (the shared `dispatch_bytecode`
+            // `last_instr` / `debugdata` block) reads a stale slot.
+            if let (Some(field_index), Some(concrete)) = (field_index, concrete)
+                && ctx.trace_ctx.virtualizable_box_at(field_index).is_some()
+            {
+                ctx.trace_ctx
+                    .set_virtualizable_entry_at(field_index, value, concrete);
+                ctx.trace_ctx.synchronize_virtualizable_at(field_index);
             }
             let captured =
                 vable_value_concrete(code, op, 1, ctx, value_bank, value).unwrap_or(Value::Void);
@@ -1286,6 +1295,56 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Flatten's shared `get_is_being_profiled` + `promote_greens` block:
+/// `-live-`, `getfield debugdata`, `goto_if_not_ptr_iszero`, then the
+/// profiled diamond and `{int,ref}_guard_value` before `switch next_instr`.
+pub(crate) fn is_shared_pmg_block(code: &[u8], target: usize) -> bool {
+    let Some(live) = crate::jitcode_runtime::decode_op_at(code, target) else {
+        return false;
+    };
+    if live.opname != "live" {
+        return false;
+    }
+    let Some(getfield) = crate::jitcode_runtime::decode_op_at(code, live.next_pc) else {
+        return false;
+    };
+    if getfield.opname != "getfield_vable_r" {
+        return false;
+    }
+    let mut pc = getfield.next_pc;
+    if let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+        if op.opname == "live" {
+            pc = op.next_pc;
+        }
+    }
+    crate::jitcode_runtime::decode_op_at(code, pc)
+        .is_some_and(|op| op.opname == "goto_if_not_ptr_iszero")
+}
+
+/// Freeze the entering opcode's banks when `pc` is flatten's shared
+/// portal merge-greens copy.
+///
+/// `pmg_shared` does not store `last_instr` (`interp_jit.py
+/// PyFrame.dispatch` greens only). Orgpc for a pmg-internal guard
+/// therefore stays on the entering opcode's `live_before` py, not the
+/// vable field.
+pub(crate) fn begin_hold_if_shared_hook<Sym: WalkSym>(
+    code: &[u8],
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) {
+    if !is_shared_pmg_block(code, pc) {
+        return;
+    }
+    ctx.session.borrow_mut().begin_hold_opcode_live_before(
+        ctx.registers_i,
+        ctx.registers_r,
+        ctx.registers_f,
+        false, // pmg_shared does not store last_instr
+        pc,
+    );
+}
+
 /// Whether `vable` is the standard virtualizable identity, by Box or by
 /// the concrete frame pointer `virtualizable_boxes[-1]` carries.
 ///
@@ -1300,12 +1359,29 @@ fn vable_is_standard_virtualizable<Sym: WalkSym>(
     if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
         return true;
     }
-    let Some(std_ptr) = ctx.trace_ctx.standard_virtualizable_ptr() else {
-        return false;
+    let vable_ptr = match ctx
+        .trace_ctx
+        .lookup_opref_concrete(vable)
+        .or_else(|| ctx.trace_ctx.recover_ref_value(vable, 8))
+    {
+        Some(Value::Ref(ptr)) => ptr.as_usize(),
+        _ => return false,
     };
+    if vable_ptr == 0 {
+        return false;
+    }
+    if ctx.trace_ctx.standard_virtualizable_ptr() == Some(vable_ptr) {
+        return true;
+    }
+    // Root portal seed points `virtualizable_heap_ptr` at the
+    // `snapshot_for_tracing` copy while `virtualizable_boxes[-1]` is the
+    // live frame (`standard_virtualizable_ptr`). A SETARRAYITEM whose
+    // vable box is that snapshot is still `write_box_at` on the standard
+    // virtualizable; treating it as nonstandard skips the box update and
+    // Option B `popvalue` then reads a NULL slot.
     matches!(
-        ctx.trace_ctx.lookup_opref_concrete(vable),
-        Some(Value::Ref(ptr)) if ptr.as_usize() == std_ptr
+        ctx.trace_ctx.virtualizable_heap_ptr(),
+        Some(heap) if heap as usize == vable_ptr
     )
 }
 
@@ -1387,11 +1463,17 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
                 .set_virtualizable_entry_at(field_index, imm_box, Value::Int(imm));
             ctx.trace_ctx.synchronize_virtualizable_at(field_index);
         }
-        if let (Some(frame), Some(field_index)) = (
-            current_inline_vable_target(ctx, obj)
-                .or_else(|| ctx.trace_ctx.standard_virtualizable_ptr()),
-            inline_field_index,
-        ) {
+        // Portal SETFIELD of `valuestackdepth` / `last_instr` updates
+        // `virtualizable_boxes` above; the heap write belongs on an inlined
+        // callee's own frame, matching `setfield_vable_via_metainterp`.
+        // `standard_virtualizable_ptr` is the live portal frame, and writing
+        // it here advances live `valuestackdepth` while `last_instr` stays at
+        // function entry. Function-entry CRN then re-enters `LOAD_GLOBAL`
+        // with a full stack (`object_array` OOB). Flush writes vsd together
+        // with `last_instr` onto the snapshot.
+        if let (Some(frame), Some(field_index)) =
+            (current_inline_vable_target(ctx, obj), inline_field_index)
+        {
             if let Some(frame) = durable_resume_frame(ctx, frame) {
                 fbw_arm_durable_frame_undo(frame);
             }
@@ -1824,6 +1906,35 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     } else {
         shadow_value
     };
+    // Fold-frame slots live in `callee_shadow`, including `ConstPtr(0)`
+    // from `PyFrame.__init__` / `PUSH_NULL`. Portal `virtualizable_boxes`
+    // at the same numeric index is a different frame.
+    let (result, shadow_value) = if dst_bank == 'r' && names_callee_frame && index_value >= 0 {
+        let slot_opref = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .and_then(|shadow| shadow.opref.get(&index_value).copied());
+        match slot_opref {
+            Some(shadow_op) if shadow_op != OpRef::NONE => {
+                let conc = ctx
+                    .trace_ctx
+                    .concrete_of_opref(shadow_op)
+                    .unwrap_or_else(|| {
+                        if opref_is_null_const_ptr(shadow_op) {
+                            Value::Ref(majit_ir::GcRef(0))
+                        } else {
+                            shadow_value
+                        }
+                    });
+                (shadow_op, conc)
+            }
+            _ => (result, shadow_value),
+        }
+    } else {
+        (result, shadow_value)
+    };
     // Mirror `getfield_vable_via_metainterp`: stamp the read result's
     // concrete so `concrete_of_opref(result)` honors the Box.value
     // contract for downstream consumers; `Value::Void` = no live concrete.
@@ -1847,7 +1958,9 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
-        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
+        'r' => {
+            write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
         'f' => {
             let len = ctx.registers_f.len();
             let _ = ctx
@@ -1930,6 +2043,140 @@ fn active_frame_nlocals<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<
     Some(unsafe { (*sym).nlocals() } as i64)
 }
 
+/// Stamp `vstack_last_ref` for a Ref store into `locals_cells_stack_w`
+/// at `index_value` (`pyframe.py pushvalue`).
+///
+/// The standard-vable strict-fold arm returns after
+/// `vable_setarrayitem_checked` without reaching the SETARRAYITEM_GC tail,
+/// so GET_ITER's iterator push never set `vstack_last_ref` and ResultToTos
+/// left a NONE hole that later FOR_ITER last_ref (the yielded int) filled.
+///
+/// After every stack-slot SET the live mirror names the same box as
+/// `virtualizable_boxes[NUM_VABLE_SCALARS + slot]` (`pyjitpl.py`
+/// `_opimpl_setarrayitem_vable`). Capture reads `vstack_opcode_entry`,
+/// cloned at the Python-opcode boundary, so a mid-opcode `popvalue` None
+/// does not become the opcode-start re-pop (`unary_negative`).
+///
+/// The operand-stack mirror (`vstack_boxes`) is gated on `vstack_valid` and
+/// `index >= nlocals`. `virtualizable_boxes` is written only by
+/// `vable_setarrayitem_checked` (`pyjitpl.py _opimpl_setarrayitem_vable`).
+/// A second `set_virtualizable_entry_at` here restamped a leftover live
+/// Const over a ConstPtr.NULL heap write (`check_synchronized_virtualizable`).
+fn stamp_vstack_from_array_store<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    index_value: i64,
+    value: OpRef,
+    value_bank: char,
+) {
+    if value_bank == 'r' && ctx.vstack_valid {
+        if let Some(nlocals) = active_frame_nlocals(ctx)
+            && index_value >= nlocals
+        {
+            let stack_slot = (index_value - nlocals) as usize;
+            let mut st = ctx.frame_state.borrow_mut();
+            if let Some((_, _, _, mask)) = st.vstack_reorder_saved.as_mut() {
+                if mask.len() <= stack_slot {
+                    mask.resize(stack_slot + 1, false);
+                }
+                mask[stack_slot] = true;
+            }
+            if st.vstack_boxes.len() <= stack_slot {
+                st.vstack_boxes.resize(stack_slot + 1, OpRef::NONE);
+            }
+            st.vstack_boxes[stack_slot] = value;
+            st.vstack_last_ref = value;
+            drop(st);
+        }
+    }
+}
+
+/// `pyframe.py pushvalue` after `make_result_of_lastop`.
+///
+/// A CALL_ASSEMBLER fold records GUARD_NOT_FORCED / GUARD_NO_EXCEPTION
+/// before the walk reaches the opcode's `setarrayitem_vable` of dest.
+/// BINARY GET reads `virtualizable_boxes` / `callee_shadow`
+/// (`_opimpl_getarrayitem_vable`), not only `vstack_boxes`. Stamp dest
+/// at TOS the way `_opimpl_setarrayitem_vable` does. GUARD_NOT_FORCED
+/// must already have captured: dest lives in FRAME until this push.
+///
+/// `_opimpl_setarrayitem_vable` takes `_nonstandard_virtualizable` first:
+/// an inlined callee is not the standard virtualizable, so dest goes in
+/// `CalleeLocalsShadow` only. Portal `virtualizable_boxes` at the same
+/// numeric index is a different frame (`owns_virtualizable_shadow`).
+pub(crate) fn stamp_pushvalue_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    dest: OpRef,
+    dest_bank: char,
+    resume_depth: usize,
+) {
+    if dest_bank != 'r' || dest == OpRef::NONE {
+        return;
+    }
+    let resume_depth = resume_depth.max(1);
+    let Some(stack_base) = active_frame_nlocals(ctx) else {
+        return;
+    };
+    let slot = stack_base + (resume_depth as i64 - 1);
+    if slot < 0 {
+        return;
+    }
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let vable_index = nvs.saturating_add(slot as usize);
+    let concrete = ctx
+        .trace_ctx
+        .concrete_of_opref(dest)
+        .or_else(|| ctx.trace_ctx.lookup_opref_concrete(dest))
+        .unwrap_or(Value::Void);
+    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
+    let has_callee_shadow = ctx.frame_state.borrow().callee_shadow.is_some();
+    if !has_callee_shadow && ctx.trace_ctx.virtualizable_box_at(vable_index).is_some() {
+        ctx.trace_ctx
+            .set_virtualizable_entry_at(vable_index, dest, concrete);
+        ctx.trace_ctx.synchronize_virtualizable_at(vable_index);
+        if matches!(concrete, Value::Ref(_)) {
+            ctx.trace_ctx
+                .write_virtualizable_heap_value_at(vable_index, concrete);
+        }
+    }
+    if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
+        shadow.set_opref(slot, dest);
+        if fold_frame_reg != u16::MAX && shadow.concrete_frame != 0 {
+            shadow.set_concrete(shadow.concrete_frame, slot, concrete);
+        }
+    }
+    stamp_vstack_from_array_store(ctx, slot, dest, dest_bank);
+    if !has_callee_shadow {
+        let vsd = stack_base + resume_depth as i64;
+        let vsd_op = ctx.trace_ctx.const_int(vsd);
+        crate::trace_opcode::mirror_vable_static_to_boxes(
+            ctx.trace_ctx,
+            "valuestackdepth",
+            vsd_op,
+            Value::Int(vsd),
+        );
+    }
+}
+
+/// `pyframe.py popvalue` stores `None`. The assembler patches that src to
+/// the constants suffix (`vable_setarrayitem_ref_const_value`). A leftover
+/// live color with `concrete = Ref(0)` is still that store: the Box is
+/// `ConstPtr(NULL)`, not the leftover producer (`try_set` is a no-op on
+/// Const). A pending CallMayForce dest is unstamped and is not this path.
+fn canonical_ref_array_store<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    value: OpRef,
+    concrete: Value,
+) -> (OpRef, Value) {
+    if matches!(concrete, Value::Ref(r) if r.is_null()) {
+        (
+            ctx.trace_ctx.const_null(),
+            Value::Ref(majit_ir::GcRef::NULL),
+        )
+    } else {
+        (value, concrete)
+    }
+}
+
 /// `setarrayitem_vable_<i|r|f>/riXdd` handler. Operand layout `riXdd`:
 /// 1B r-reg(vable) + 1B i-reg(index) + 1B X-reg(value) + 2B
 /// fdescr(VableArray) + 2B adescr(Array). No dst byte.
@@ -1984,10 +2231,15 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let mut store_root = VableStoreRoot::capture(encoded_captured);
     // Pin a TOS-recovered box's concrete now; recapturing the stamp after
     // `walker_promote_vable_array_index` is a from-space copy
-    // (`fwd=false free=true`).
+    // (`fwd=false free=true`). Only STORE_FAST (a pop into a local)
+    // recovers TOS. A stack-slot ConstPtr.NULL store must not recapture
+    // the previous TOS into the cleared cell.
     if encoded_value.is_none()
         && value_bank == 'r'
         && ctx.vstack_valid
+        && let Some(nlocals) = active_frame_nlocals(ctx)
+        && index_value >= 0
+        && index_value < nlocals
         && let Some(&tos) = ctx.frame_state.borrow().vstack_boxes.last()
         && !tos.is_none()
     {
@@ -2032,10 +2284,10 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // known before `walker_promote_vable_array_index`. `VableStoreRoot`
     // keeps a reconstructable Ref live across that promote so the store
     // word can move.
-    let mut concrete = if value_bank == 'r' {
-        store_root.live(captured)
+    let (mut value, mut concrete) = if value_bank == 'r' {
+        canonical_ref_array_store(ctx, value, store_root.live(captured))
     } else {
-        captured
+        (value, captured)
     };
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 3, 5, ctx)?;
     // `_opimpl_setarrayitem_vable` (`pyjitpl.py`) takes
@@ -2069,9 +2321,8 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         walker_promote_vable_array_index(ctx, op.pc, index, index_value)?
     };
     if value_bank == 'r' {
-        concrete = store_root.live(captured);
+        (value, concrete) = canonical_ref_array_store(ctx, value, store_root.live(captured));
     }
-    let is_stack_push = value_bank == 'r' && vable_store_is_stack_push(ctx, index_value);
     let _write = match ctx.trace_ctx.vable_setarrayitem_checked(
         nonstandard,
         op.pc,
@@ -2082,7 +2333,6 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         adescr,
         value,
         concrete,
-        is_stack_push,
     ) {
         VableArrayStore::Stored(write) => write,
         // The out-of-vable store recorded nothing, so there is no pre-store
@@ -2110,69 +2360,36 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         // operand register that held its address (`_opimpl_setarrayitem_vable`).
         let live = live_after_vable_store(&store_root, value_bank, concrete);
         publish_nonfold_slot(ctx, op.pc, frame, index_value, value, live)?;
+    } else if index_value >= 0 {
+        // The heap array was not this level's concrete frame (virtual, or
+        // the store targeted a copy of the frame box). `popvalue` still
+        // has to recover the push, so keep the per-slot OpRef shadow.
+        let own_box = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .is_some_and(|shadow| !shadow.frame_box.is_none() && shadow.frame_box == vable);
+        if own_box {
+            let frame = ctx
+                .frame_state
+                .borrow()
+                .callee_shadow
+                .as_ref()
+                .map(|shadow| shadow.concrete_frame)
+                .unwrap_or(0);
+            let live = live_after_vable_store(&store_root, value_bank, concrete);
+            publish_nonfold_slot(ctx, op.pc, frame, index_value, value, live)?;
+        }
     }
     let _ = _write;
     // A Ref stored to the operand-stack region of the vable array is an
     // operand-stack push (`pyframe.pushvalue` lowers to
-    // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`). Retain the
-    // last-write TOS candidate for ordinary single-result opcodes. Method-form
-    // LOAD_ATTR is the one two-result shape that also needs its exact lower
-    // slot mirrored: it writes `[method, self]`, and retaining only `self`
-    // made boundary reconciliation refill the method hole from the stale
-    // pre-LOAD_ATTR receiver. A later guard then resumed CALL with that
-    // receiver as its callee. Scope the positional write to that opcode; the
-    // general boundary model remains authoritative for other push/pop shapes.
-    // Local/cell stores remain excluded by the `index >= nlocals` gate.
-    if value_bank == 'r' && ctx.vstack_valid {
-        if let Some(nlocals) = active_frame_nlocals(ctx)
-            && index_value >= nlocals
-        {
-            // `vstack_cur_pypc` is a pc in the frame the op names, so it must
-            // be decoded against that frame's own bytecode.
-            let method_load = active_frame_code(ctx).is_some_and(|code| {
-                pyre_interpreter::decode_instruction_at(code, ctx.vstack_cur_pypc as usize)
-                    .is_some_and(|(instr, op_arg)| match instr {
-                        pyre_interpreter::Instruction::LoadAttr { namei } => {
-                            namei.get(op_arg).is_method()
-                        }
-                        _ => false,
-                    })
-            });
-            let stack_slot = (index_value - nlocals) as usize;
-            if method_load {
-                if ctx.frame_state.borrow().vstack_boxes.len() <= stack_slot {
-                    ctx.frame_state
-                        .borrow_mut()
-                        .vstack_boxes
-                        .resize(stack_slot + 1, OpRef::NONE);
-                }
-                ctx.frame_state.borrow_mut().vstack_boxes[stack_slot] = value;
-            }
-            // Mark the slot as execution-derived while an out-of-order region
-            // is armed, so the boundary restore does not put its pc-derived
-            // snapshot back over it.  Outside a region the mask does not exist
-            // and this costs one `Option` test.
-            //
-            // This is a property of the STORE, not of the opcode that issued
-            // it: the mask records which slot the walk demonstrably wrote, and
-            // that is the same fact whatever the surrounding opcode is.  Only
-            // the positional mirror write above is method-form specific, and
-            // for the reason its own comment gives.  Scoping the mask to that
-            // opcode too left every other push shape unprotected, so a window
-            // whose only executed store came from, say, `LOAD_NAME` or
-            // `BINARY_OP` reported an empty mask and the restore reinstated the
-            // pre-window mirror wholesale over it.
-            if let Some((_, _, _, mask)) =
-                ctx.frame_state.borrow_mut().vstack_reorder_saved.as_mut()
-            {
-                if mask.len() <= stack_slot {
-                    mask.resize(stack_slot + 1, false);
-                }
-                mask[stack_slot] = true;
-            }
-            ctx.frame_state.borrow_mut().vstack_last_ref = value;
-        }
-    }
+    // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_obj)`). The
+    // standard-vable fold returns earlier; this tail is the GC / nonstandard
+    // store. `stamp_vstack_from_array_store` writes the same box into the
+    // walk-level mirror so both stores agree.
+    stamp_vstack_from_array_store(ctx, index_value, value, value_bank);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
