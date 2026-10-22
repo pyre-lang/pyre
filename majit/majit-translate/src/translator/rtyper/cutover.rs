@@ -5238,6 +5238,31 @@ fn run_two_phase_prepass_inner(
         .collect();
     paths.sort_by_key(|p| p.canonical_key());
 
+    // Alias spellings of one GraphStore slot are one prepass subject:
+    // `description.py FunctionDesc.cachedgraph` returns the cached graph
+    // on a hit, and `GraphStore::alias_paths` lists every spelling bound
+    // to that GraphKey.
+    let mut access_direct_alias_rep: HashMap<
+        String,
+        (&crate::parse::CallPath, &crate::parse::CallPath),
+    > = HashMap::new();
+    for path in paths.iter().copied() {
+        if !crate::codewriter::call::is_access_directly_path(path) {
+            continue;
+        }
+        let aliases = function_graphs.alias_paths(path);
+        let Some(rep) = paths
+            .iter()
+            .copied()
+            .find(|candidate| aliases.contains(candidate))
+        else {
+            continue;
+        };
+        if path != rep {
+            access_direct_alias_rep.insert(path.canonical_key(), (path, rep));
+        }
+    }
+
     // Seed every AccessDirect key with that subject's own lift before
     // any Phase A caller can `cachedgraph` the None-key template
     // (`description.py FunctionDesc.cachedgraph`: first asker builds,
@@ -5246,6 +5271,9 @@ fn run_two_phase_prepass_inner(
     let mut phase_a_reasons: Vec<String> = Vec::new();
     let mut seeded_access_direct: HashMap<String, FlowspaceAdapterOutput> = HashMap::new();
     for path in paths.iter() {
+        if access_direct_alias_rep.contains_key(&path.canonical_key()) {
+            continue;
+        }
         if !crate::codewriter::call::is_access_directly_path(path) {
             continue;
         }
@@ -5269,6 +5297,9 @@ fn run_two_phase_prepass_inner(
 
     // ── Phase A — annotate-all over the portal closure ───────────────
     for (index, path) in paths.iter().enumerate() {
+        if access_direct_alias_rep.contains_key(&path.canonical_key()) {
+            continue;
+        }
         let Some(legacy) = function_graphs.get(path) else {
             continue;
         };
@@ -5341,6 +5372,29 @@ fn run_two_phase_prepass_inner(
                     );
                 }));
             }
+        }
+    }
+
+    let mut alias_keys: Vec<String> = access_direct_alias_rep.keys().cloned().collect();
+    alias_keys.sort();
+    for alias_key in alias_keys {
+        let (alias_path, rep) = access_direct_alias_rep[&alias_key];
+        let rep_key = rep.canonical_key();
+        let subject = call_registry.two_phase().subjects.get(&rep_key).cloned();
+        if let Some(subject) = subject {
+            call_registry
+                .two_phase()
+                .subjects
+                .insert(alias_key, subject);
+            continue;
+        }
+        let reason = call_registry
+            .two_phase()
+            .annotate_skipped
+            .get(&rep_key)
+            .cloned();
+        if let Some(reason) = reason {
+            record_phase_a_skip(call_registry, alias_path, reason, &mut phase_a_reasons);
         }
     }
 
@@ -7289,6 +7343,65 @@ mod tests {
             msg.contains(&ad_path.to_string()),
             "error must name the path, got {msg}"
         );
+    }
+
+    /// Alias spellings of one AccessDirect GraphStore slot are one
+    /// prepass subject (`description.py FunctionDesc.cachedgraph` hit).
+    #[test]
+    fn access_direct_alias_spellings_are_one_prepass_subject() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let origin_path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "pop".into()],
+        };
+        let ad_path = crate::codewriter::call::access_directly_path(&origin_path);
+        let alias_origin = crate::parse::CallPath {
+            segments: vec!["crate".into(), "owner".into(), "pop".into()],
+        };
+        let alias_ad = crate::codewriter::call::access_directly_path(&alias_origin);
+        let mut origin = empty_return_graph("pop");
+        origin.source_identity = Some("owner::pop".into());
+        let mut ad = empty_return_graph("pop__AccessDirect_None");
+        ad.source_identity = Some("owner::pop".into());
+        ad.access_directly = true;
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(origin_path.clone(), origin);
+        graphs.insert(ad_path.clone(), ad);
+        graphs.share_path(alias_ad.clone(), &ad_path);
+        let aliases = graphs.alias_paths(&ad_path);
+        assert_eq!(aliases, graphs.alias_paths(&alias_ad));
+        assert!(aliases.contains(&ad_path) && aliases.contains(&alias_ad));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            .expect("origin FunctionDesc");
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::from([origin_path, ad_path.clone(), alias_ad.clone()]),
+            &graphs,
+        );
+        let tp = registry.two_phase();
+        let ad_key = ad_path.canonical_key();
+        let alias_key = alias_ad.canonical_key();
+        let both_subjects =
+            tp.subjects.contains_key(&ad_key) && tp.subjects.contains_key(&alias_key);
+        let both_skipped = match (
+            tp.annotate_skipped.get(&ad_key),
+            tp.annotate_skipped.get(&alias_key),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        assert!(
+            both_subjects || both_skipped,
+            "alias AccessDirect keys must share a subject or the same skip; subjects={:?} skipped={:?}",
+            tp.subjects.keys().collect::<Vec<_>>(),
+            tp.annotate_skipped,
+        );
+        for reason in tp.annotate_skipped.values() {
+            assert!(
+                !reason.contains("did not provide"),
+                "alias spelling must not re-lift: {reason}"
+            );
+        }
     }
 
     /// `stack_base`-shaped getter: one Int formal returned. Live Signed

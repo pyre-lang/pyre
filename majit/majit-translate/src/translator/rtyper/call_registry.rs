@@ -312,6 +312,7 @@ impl FunctionEntry {
 /// The per-graph publish reads this back instead of re-running the real path,
 /// reproducing upstream's `translator.annotate()` → `rtyper.specialize()` →
 /// `codewriter.make_jitcodes()` phase ordering (`driver.py:306/345/361`).
+#[derive(Clone)]
 pub struct TwoPhaseSubject {
     /// The lifted subject graph itself. Phase B rtypes this graph in place;
     /// retaining the `GraphRef` lets post-rtype consumers inspect the exact
