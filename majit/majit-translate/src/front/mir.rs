@@ -563,6 +563,13 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             &mut seen_trait_names,
             &dedup_key,
         );
+        if let Some(acc) = &mut merged {
+            acc.raw_alloc_flavor_structs.extend(
+                crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                    std::slice::from_ref(*llbc),
+                ),
+            );
+        }
     }
     // The per-file builder hardened each program individually, but the
     // `or_insert` merges above can re-introduce a bare-leaf alias that
@@ -587,6 +594,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             known_trait_names: std::collections::HashSet::new(),
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
             immutable_fields: std::collections::HashMap::new(),
+            raw_alloc_flavor_structs: std::collections::HashSet::new(),
             enum_variant_by_discriminant: std::collections::HashMap::new(),
             struct_origins: std::collections::HashMap::new(),
             struct_field_attrs: std::collections::HashMap::new(),
@@ -2333,6 +2341,7 @@ impl CrateLoweringState {
             // (the `attributes` array carries DocComment / Outer but not our
             // proc-macro hints).
             immutable_fields: std::collections::HashMap::new(),
+            raw_alloc_flavor_structs: std::collections::HashSet::new(),
             enum_variant_by_discriminant,
             struct_origins,
             struct_field_attrs,

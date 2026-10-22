@@ -3092,6 +3092,11 @@ pub struct CallControl {
     /// `rank` on `StructFieldLayout`).  Rank encoding follows
     /// `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields_by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
+    /// Threaded onto the dual-gate bookkeeper so interned classdescs
+    /// receive `class_set("_alloc_flavor_", "raw")` (`rclass.py
+    /// getgcflavor`).
+    pub raw_alloc_flavor_structs: HashSet<String>,
     /// `descr.py:364 is_pure = ARRAY_INSIDE._immutable_field(None)` parity.
     /// Pre-computed at `set_struct_fields` time by walking
     /// `immutable_fields_by_struct` for fields with `ImmutableRank::is_array()
@@ -3721,6 +3726,7 @@ impl CallControl {
             array_header_size: crate::layout::target_word_size(),
             struct_layouts: Default::default(),
             immutable_fields_by_struct: HashMap::new(),
+            raw_alloc_flavor_structs: HashSet::new(),
             immutable_array_types: HashSet::new(),
             unsafe_fn_stubs: Vec::new(),
             foreign_opaque_method_externals: Vec::new(),

@@ -423,6 +423,10 @@ pub struct Bookkeeper {
     /// already projected (dedups the pending drain and the bare-name
     /// arm's first-sight detection).
     pub(crate) projected_struct_rows: RefCell<std::collections::HashSet<String>>,
+    /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
+    /// `rclass.py getgcflavor` reads `_alloc_flavor_` off the classdesc;
+    /// intern stamps that param onto matching hosts.
+    raw_alloc_flavor_structs: RefCell<HashSet<String>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -1269,6 +1273,7 @@ impl Bookkeeper {
             trait_family_bases: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
+            raw_alloc_flavor_structs: RefCell::new(HashSet::new()),
         }
     }
 
@@ -1285,6 +1290,33 @@ impl Bookkeeper {
     /// overwrites the previous registry.
     pub fn set_struct_fields(&self, registry: Rc<crate::front::StructFieldRegistry>) {
         *self.struct_fields.borrow_mut() = Some(registry);
+    }
+
+    /// Thread harvested `_alloc_flavor_ = raw` structs and stamp already
+    /// interned hosts (`rclass.py getgcflavor` / `classdesc.get_param`).
+    /// Order-independent with intern: a host minted before this call is
+    /// restamped on the next set.
+    pub fn set_raw_alloc_flavor_structs(&self, names: HashSet<String>) {
+        *self.raw_alloc_flavor_structs.borrow_mut() = names;
+        let hosts: Vec<(String, HostObject)> = self
+            .struct_root_classes
+            .borrow()
+            .iter()
+            .map(|(k, h)| (k.clone(), h.clone()))
+            .collect();
+        for (key, host) in hosts {
+            self.stamp_raw_alloc_flavor(&host, &key);
+        }
+    }
+
+    /// `classdesc.get_param('_alloc_flavor_')` carrier on the interned class.
+    fn stamp_raw_alloc_flavor(&self, host: &HostObject, key: &str) {
+        if crate::front::llbc_hints::alloc_flavor_raw_contains(
+            &self.raw_alloc_flavor_structs.borrow(),
+            key,
+        ) {
+            host.class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        }
     }
 
     /// Name the interpreter's error carrier object (see the
@@ -3921,6 +3953,7 @@ impl Bookkeeper {
             };
             let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
             crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
+            self.stamp_raw_alloc_flavor(&host, &key);
             self.struct_root_classes
                 .borrow_mut()
                 .insert(key, host.clone());
@@ -3964,6 +3997,7 @@ impl Bookkeeper {
         };
         let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
         crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
+        self.stamp_raw_alloc_flavor(&host, &key);
         self.struct_root_classes
             .borrow_mut()
             .insert(key, host.clone());

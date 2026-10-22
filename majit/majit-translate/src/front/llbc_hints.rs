@@ -322,6 +322,69 @@ pub fn harvest_immutable_fields_from_llbcs(
     out
 }
 
+/// Marker-const prefix for `_alloc_flavor_ = 'raw'` (`rclass.py
+/// getgcflavor` / `classdesc.get_param('_alloc_flavor_')`).
+const ALLOC_FLAVOR_PREFIX: &str = "_alloc_flavor_";
+
+/// Build the set of structs whose `_alloc_flavor_<Struct>` marker is
+/// `"raw"`.
+///
+/// Both the bare struct leaf and the crate-stripped qualified path are
+/// inserted, mirroring [`harvest_immutable_fields_from_llbcs`].
+pub fn harvest_alloc_flavor_raw_from_llbcs(llbcs: &[Llbc]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for llbc in llbcs {
+        for gd in llbc.iter_global_decls() {
+            let path = gd.item_meta.name_path();
+            let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+            let Some(struct_name) = leaf.strip_prefix(ALLOC_FLAVOR_PREFIX) else {
+                continue;
+            };
+            let flavor = global_marker_str(llbc, gd).unwrap_or_else(|| {
+                panic!(
+                    "_alloc_flavor_ marker `{path}` has an undecodable string \
+                     initializer; this signals a marker encoding/decoder drift"
+                )
+            });
+            if flavor != "raw" {
+                continue;
+            }
+            let qualified = {
+                let stripped = strip_crate_prefix(&path);
+                match stripped.rsplit_once("::") {
+                    Some((module, _)) => format!("{module}::{struct_name}"),
+                    None => struct_name.to_string(),
+                }
+            };
+            out.insert(struct_name.to_string());
+            out.insert(qualified);
+        }
+    }
+    out
+}
+
+/// Whether `path` names a struct harvested as `_alloc_flavor_ = raw`.
+/// Matches the intern key's leaf against harvested `CodeObject` /
+/// `pycode::CodeObject` spellings (`canonical_struct_name` may be
+/// `bytecode::CodeObject`).
+pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    if raw.contains(leaf) || raw.contains(path) {
+        return true;
+    }
+    let stripped = strip_crate_prefix(path);
+    if raw.contains(&stripped) {
+        return true;
+    }
+    let stripped_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_str());
+    let stripped_leaf = stripped_leaf.split('<').next().unwrap_or(stripped_leaf);
+    raw.contains(stripped_leaf)
+}
+
 /// Split the marker's comma-joined payload into `(field_name, rank)`
 /// pairs — `rclass.py _parse_field_list` over the declared
 /// `_immutable_fields_` list.  The suffix grammar lives entirely in

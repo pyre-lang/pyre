@@ -940,6 +940,11 @@ pub struct SemanticProgram {
     /// the same lookup logic works across module-prefix variants.  Rank
     /// encoding follows `rpython/rtyper/rclass.py _parse_field_list`.
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
+    /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`.
+    /// `rclass.py getgcflavor` / `getinstancerepr` build a raw
+    /// `InstanceRepr` for those classdefs. Keys are the bare leaf and
+    /// the crate-stripped qualified path, matching `immutable_fields`.
+    pub raw_alloc_flavor_structs: std::collections::HashSet<String>,
     /// Enum discriminant → variant name, keyed by enum type (both the
     /// qualified path and the bare leaf, mirroring `struct_fields`).
     /// The opcode-dispatch MIR extractor reads

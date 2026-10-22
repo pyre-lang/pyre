@@ -538,6 +538,13 @@ pub static CODE_TYPE: PyType =
 pub const _immutable_fields_CodeObject: &str =
     "varnames[*],cellvars[*],freevars[*],localspluskinds[*]";
 
+/// Host `bytecode::CodeObject` is `Box::into_raw`'d host memory, never a
+/// GC object. `rclass.py getgcflavor` reads `_alloc_flavor_` off the
+/// classdesc so `getinstancerepr` builds a raw `InstanceRepr`.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_CodeObject: &str = "raw";
+
 /// Python code object wrapper.
 ///
 /// Stores a raw pointer to the bytecode `CodeObject`. A top-level body is
@@ -4176,7 +4183,7 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
 /// [`_offset2lineno`], the residual call.
 pub unsafe fn w_code_addr2line(w_code: PyObjectRef, addrq: i64) -> i32 {
     unsafe {
-        if w_code_get_ptr(w_code).is_null() {
+        if (*(w_code as *const PyCode)).code_ptr.is_null() {
             return -1;
         }
         if addrq < 0 {

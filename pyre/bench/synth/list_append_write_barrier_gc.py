@@ -17,7 +17,7 @@
 # — there the block is std::alloc with no GC header, the barrier on the
 # W_ListObject is load-bearing, and the walker must keep emitting it.
 # Output verified against CPython/PyPy.
-N = 8000
+N = 40000
 CHURN = 300
 
 

@@ -253,6 +253,7 @@ fn build_semantic_program_via_active_frontend(
             let mut hints: std::collections::HashMap<String, Vec<String>> =
                 std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
+            let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
@@ -331,6 +332,11 @@ fn build_semantic_program_via_active_frontend(
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
+                raw_alloc_flavor_structs.extend(
+                    front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                        &llbc,
+                    )),
+                );
                 for path in front::mir::discover_eval_hook_graphs(&llbc) {
                     if !eval_hook_graphs.contains(&path) {
                         eval_hook_graphs.push(path);
@@ -415,6 +421,7 @@ fn build_semantic_program_via_active_frontend(
                 known_trait_names: std::collections::HashSet::new(),
                 struct_fields: front::semantic::StructFieldRegistry::default(),
                 immutable_fields: std::collections::HashMap::new(),
+                raw_alloc_flavor_structs: std::collections::HashSet::new(),
                 enum_variant_by_discriminant: std::collections::HashMap::new(),
                 struct_origins: std::collections::HashMap::new(),
                 struct_field_attrs: std::collections::HashMap::new(),
@@ -432,6 +439,7 @@ fn build_semantic_program_via_active_frontend(
             );
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
+            program.raw_alloc_flavor_structs = raw_alloc_flavor_structs;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             return (program, gc_struct_ids);
@@ -1838,6 +1846,7 @@ fn analyze_pipeline_from_module_paths(
     // `all_interiorfielddescrs` (the layout-provider path already carries
     // `is_immutable` on `StructFieldLayout`).
     call_control.immutable_fields_by_struct = immutable_fields;
+    call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.
     // Summarise `field[*]` annotations into the array-type-keyed set so
     // `arraydescrof_concrete` can fold field-level immutability into the

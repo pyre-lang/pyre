@@ -526,7 +526,7 @@ fn layout_is_fieldless_enum_discriminant(
 /// one-word `Vec` header. Layout keeps `ValueType::Int` (the header
 /// address); the annotator projects `SomeRustVec` from the `*mut Vec<…>`
 /// spelling. Seeding Integer made `len` of that field `'int' has no length`.
-pub(crate) fn register_struct_fields_with_layout(
+pub fn register_struct_fields_with_layout(
     qualname: &str,
     fields: &[(String, crate::model::ValueType)],
     layout: Option<&[(String, String)]>,

@@ -3936,12 +3936,12 @@ pub fn make_builtin_type_with_metatype(
 ///
 /// The body is this leaf so `BuiltinCode.func` joins the wrapper family, as
 /// [`__majit_wrap_bool_descr_new`] does.  `_new_baseint`'s first arm returns
-/// an exact `int` argument itself; an exact `float` whose truncation fits a
-/// machine Signed takes `float.__int__` (`floatobject.py descr_trunc`,
-/// `newint_from_float`).  No argument, a base, a subclass `cls`, and every
-/// other argument stay on [`int_descr_new`], which is `dont_look_inside` so
-/// the `__int__` / `__index__` / literal-parse arms are not graphs inside
-/// this one.
+/// an exact `int` argument itself; its second arm takes `space.int` of a
+/// value whose type has `__int__` (an exact `float` reaches
+/// `floatobject.py descr_trunc` through it).  No argument, a base, a
+/// subclass `cls`, and the `__index__` / literal-parse arms stay on
+/// [`int_descr_new`], which is `dont_look_inside`, so they are not graphs
+/// inside this one.
 pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[1].is_null() {
         let int_type = gettypeobject(&pyre_object::INT_TYPE);
@@ -3953,16 +3953,11 @@ pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             if w_type.is_some() && w_type == gettypefor(&pyre_object::INT_TYPE) {
                 return Ok(w_value);
             }
-            if unsafe { pyre_object::is_exact_builtin_instance_nonnull(w_value) }
-                && unsafe { pyre_object::is_float(w_value) }
-            {
-                // `ovfcheck_float_to_int`'s range: `2**63` is exact in a
-                // double while `i64::MAX` is not, so the upper bound is
-                // strict.  NaN fails both tests.
-                let x = unsafe { pyre_object::w_float_get_value(w_value) };
-                if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
-                    return crate::objspace::descroperation::_int_from_trunc(x);
-                }
+            // intobject.py `_new_baseint`: `space.lookup(w_value, '__int__')`,
+            // then `_ensure_baseint(space, space.int(w_value))`.
+            if unsafe { crate::baseobjspace::lookup(w_value, "__int__") }.is_some() {
+                let w_intvalue = crate::baseobjspace::space_int(w_value)?;
+                return crate::builtins::ensure_baseint_result(w_intvalue, w_value);
             }
         }
     }

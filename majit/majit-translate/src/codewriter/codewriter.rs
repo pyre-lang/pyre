@@ -194,6 +194,9 @@ impl CodeWriter {
         // can project a struct's fields onto its classdef when the
         // real-rtyper seed path resolves a `Ref(type_root)` to a class.
         registry.set_struct_fields(std::rc::Rc::new(callcontrol.struct_fields().clone()));
+        registry
+            .bookkeeper()
+            .set_raw_alloc_flavor_structs(callcontrol.raw_alloc_flavor_structs.clone());
         // The carrier class is the program's `OperationError`: it subclasses
         // `Exception` (see `Bookkeeper::set_exception_carrier`). Mint it
         // before the struct-root prologue so first mint wins the base.
@@ -379,6 +382,29 @@ impl CodeWriter {
     /// `value_to_var` map. A graph-native typed IR would remove that bridge and
     /// let the codewriter consume the rtyper's `Variable` graph directly.
     ///
+    /// Dual-gate skip reason for one graph, the same annotation
+    /// [`Self::dual_gate_publish_concretetypes`] / the two-phase prepass run.
+    /// `Ok(None)` is Match; `Ok(Some(reason))` is Skip. Does not fall back
+    /// to the legacy walker, so a test can see `"Cannot find attribute"`.
+    pub fn dual_gate_skip_reason(
+        &self,
+        graph: &FunctionGraph,
+        callcontrol: &CallControl,
+    ) -> Result<Option<String>, String> {
+        let registry = self.dual_gate_registry(callcontrol);
+        match crate::translator::rtyper::cutover::dual_gate_check_with_registry(
+            graph,
+            &registry,
+            callcontrol.function_graphs(),
+        ) {
+            Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match { .. }) => Ok(None),
+            Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {
+                Ok(Some(reason))
+            }
+            Err(diff) => Err(diff),
+        }
+    }
+
     /// Run the dual-gate type resolver against the program-wide
     /// `CallRegistry` and commit every resolved kind to the graph's backing
     /// `Variable.concretetype` cells. A Match returns the `LegacyToTyped` map so
