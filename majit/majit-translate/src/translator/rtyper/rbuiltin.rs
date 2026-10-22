@@ -2277,7 +2277,8 @@ pub fn rtype_builtin_utf8iter(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize
 
 /// `unichr_as_utf8(code)` — the front's `__majit_unichr_as_utf8` spelling
 /// of `rutf8.unichr_as_utf8(code, allow_surrogates=True)`.  The helper
-/// graph encodes 1–4 UTF-8 bytes; `code > 0x10FFFF` raises ValueError.
+/// graph encodes 1–4 UTF-8 bytes; `code > 0x10FFFF` raises
+/// `rutf8.OutOfRange`.
 pub fn rtype_builtin_unichr_as_utf8(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
@@ -2292,7 +2293,9 @@ pub fn rtype_builtin_unichr_as_utf8(
         "ll_unichr_as_utf8".to_string(),
         vec![LowLevelType::Signed],
         STRPTR.clone(),
-        move |_rtyper, _args, _result| build_ll_unichr_as_utf8_helper_graph("ll_unichr_as_utf8"),
+        move |rtyper, _args, _result| {
+            build_ll_unichr_as_utf8_helper_graph(rtyper, "ll_unichr_as_utf8")
+        },
     )?;
     hop.gendirectcall(&helper, vlist)
 }

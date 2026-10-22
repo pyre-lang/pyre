@@ -910,8 +910,16 @@ pub fn builtin_utf8iter(
 /// Translator-synthesised `rutf8.unichr_as_utf8(code, allow_surrogates=True)`:
 /// a nonneg integer code point becomes a UTF-8 `SomeString`.  The front
 /// spells `String::push(c)`'s piece as `__majit_unichr_as_utf8(c)`.
+///
+/// Upstream annotating `rutf8.unichr_as_utf8`'s body creates
+/// `rutf8.OutOfRange`'s classdef (`bookkeeper.getuniqueclassdef` via
+/// the `simple_call` of the class) and generalizes instance attribute
+/// `code` as unsigned (`OutOfRange.__init__` `self.code = code` after
+/// `code = r_uint(code)`). Intern that here so
+/// `perform_normalizations` / `assign_inheritance_ids` numbers it
+/// before rtyping.
 pub fn builtin_unichr_as_utf8(
-    _bk: &Rc<Bookkeeper>,
+    bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
@@ -921,6 +929,7 @@ pub fn builtin_unichr_as_utf8(
         ));
     }
     let _s_int = arg_at(args_s, 0, "builtin_unichr_as_utf8");
+    crate::rlib::rutf8::out_of_range_classdef(bk)?;
     Ok(SomeValue::String(SomeString::new(false, false)))
 }
 
@@ -5022,6 +5031,27 @@ mod tests {
             matches!(result, SomeValue::String(_)),
             "unichr_as_utf8 annotates a UTF-8 string, got {result:?}"
         );
+    }
+
+    #[test]
+    fn builtin_unichr_as_utf8_interns_out_of_range_classdef() {
+        let bk = bk();
+        let s_int = bk.immutablevalue(&ConstValue::Int(0x20ac)).unwrap();
+        let _ = builtin_unichr_as_utf8(&bk, &[Some(s_int)], &no_kwds()).unwrap();
+        let classdefs = bk.classdefs.borrow();
+        let oor = classdefs
+            .iter()
+            .find(|cd| cd.borrow().name == "rutf8.OutOfRange")
+            .expect("annotating unichr_as_utf8 intern rutf8.OutOfRange");
+        let cd = oor.borrow();
+        let attr = cd.attrs.get("code").expect("code attribute");
+        match &attr.s_value {
+            SomeValue::Integer(i) => {
+                assert!(i.unsigned);
+                assert!(i.nonneg);
+            }
+            other => panic!("code must be unsigned SomeInteger, got {other:?}"),
+        }
     }
 
     #[test]

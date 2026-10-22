@@ -1286,12 +1286,21 @@ pub(crate) fn build_ll_utf8next_helper_graph(
 ///     raise OutOfRange(code)
 /// ```
 ///
-/// `allow_surrogates=True` omits the D800–DFFF check. `assert code >= 0`
-/// is `int_ge` + `debug_assert` (`removeassert.kill_assertion_link`; same
-/// form as `ll_newlist_hint` in `rlist.build_ll_newlist_helper_graph_inner`).
+/// The only rtyper call site is `unichr_as_utf8(code, allow_surrogates=True)`
+/// (`rtype_builtin_unichr_as_utf8` / front `__majit_unichr_as_utf8`), so
+/// the `0xD800 <= code <= 0xDfff` `OutOfRange` branch is folded as that
+/// constant-True specialization. `assert code >= 0` is `int_ge` +
+/// `debug_assert` (`removeassert.kill_assertion_link`; same form as
+/// `ll_newlist_hint` in `rlist.build_ll_newlist_helper_graph_inner`).
 /// `code = r_uint(code)` is `cast_int_to_uint`; every range test is `uint_le`
 /// (`rint.rtype_compare_template` with `unsigned_repr` prefix `uint_`).
-pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
+/// `raise OutOfRange(code)` is `InstanceRepr.new_instance` then
+/// `InstanceRepr.setfield` of `code` (`OutOfRange.__init__` /
+/// `rclass.py`).
+pub(crate) fn build_ll_unichr_as_utf8_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+) -> Result<PyGraph, TyperError> {
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
 
     let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
@@ -1398,14 +1407,9 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
         Hlvalue::Variable(return_var),
     );
     // `unichr_as_utf8` raises `OutOfRange(code)` (`rutf8.OutOfRange`).
-    // Synthesized helpers only have `exception_args` (`rtyper.rs`), which
-    // looks up `HOST_ENV.lookup_exception_class` — builtin classes; that
-    // method has no rlib class registry. `ExceptionData.get_standard_ll_exc_instance_by_class`
-    // rejects anything outside `standardexceptions`. Minting `OutOfRange`
-    // would need `Bookkeeper::getuniqueclassdef` on an interned class plus
-    // instance `setfield` of `code`; neither exists for synthesized helpers.
-    // The raise edge is kept; the class is ValueError until that lands.
-    let exc_args = exception_args("ValueError")?;
+    // The raising block is `InstanceRepr.new_instance` plus `setfield`
+    // of `code`; the except link is `(OutOfRange vtable, instance)`
+    // (`ClassRepr.convert_desc` / `rutf8.py`).
 
     // `assert code >= 0` (`unichr_as_utf8`). Python `assert` becomes
     // `debug_assert` in `removeassert.kill_assertion_link`; same `int_ge`
@@ -1519,14 +1523,20 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
     );
     let alloc4_code = variable_with_lltype("code", LowLevelType::Unsigned);
     let alloc4 = Block::shared(vec![Hlvalue::Variable(alloc4_code.clone())]);
+    let raise_code = variable_with_lltype("code", LowLevelType::Unsigned);
+    let raise_block = Block::shared(vec![Hlvalue::Variable(raise_code.clone())]);
     switch_bool(
         &four,
         is_four,
         vec![Hlvalue::Variable(four_code.clone())],
         alloc4.clone(),
-        exc_args,
-        graph.exceptblock.clone(),
+        vec![Hlvalue::Variable(four_code)],
+        raise_block.clone(),
     );
+    let exc_args = crate::rlib::rutf8::raise_out_of_range_args(rtyper, &raise_block, &raise_code)?;
+    raise_block.closeblock(vec![
+        Link::new(exc_args, Some(graph.exceptblock.clone()), None).into_ref(),
+    ]);
 
     let malloc_str = |block: &BlockRef, n: i64| -> (Variable, Variable) {
         let result = variable_with_lltype("s", STRPTR.clone());
@@ -15219,9 +15229,42 @@ mod tests {
         );
     }
 
+    /// Annotation intern → one `assign_inheritance_ids` → exceptiondata,
+    /// matching `RPythonAnnotator.simplify` / `perform_normalizations`
+    /// then `RPythonTyper.specialize` / `exceptiondata.finish`.
+    fn rtyper_after_unichr_annotation() -> (std::rc::Rc<RPythonAnnotator>, std::rc::Rc<RPythonTyper>)
+    {
+        use crate::translator::rtyper::normalizecalls::assign_inheritance_ids;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        crate::rlib::rutf8::out_of_range_classdef(&ann.bookkeeper)
+            .expect("annotation intern OutOfRange");
+        crate::annotator::exception::standard_exception_classdefs(&ann.bookkeeper)
+            .expect("annotation intern standard exceptions");
+        assign_inheritance_ids(&ann);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper.finish_exceptiondata().expect("finish_exceptiondata");
+        (ann, rtyper)
+    }
+
+    fn classdef_vtable(
+        rtyper: &std::rc::Rc<RPythonTyper>,
+        classdef: &std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+    ) -> _ptr {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, getclassrepr_arc};
+        let rclass = getclassrepr_arc(rtyper, Some(classdef)).expect("getclassrepr_arc");
+        Repr::setup(&*rclass.as_repr()).expect("ClassRepr.setup");
+        rclass.getruntime(&CLASSTYPE).expect("getruntime")
+    }
+
     #[test]
     fn build_ll_unichr_as_utf8_helper_encodes_and_range_checks() {
-        let helper = build_ll_unichr_as_utf8_helper_graph("ll_unichr_as_utf8")
+        use crate::translator::rtyper::rclass::{CLASSTYPE, ll_issubclass};
+
+        let (ann, rtyper) = rtyper_after_unichr_annotation();
+        let helper = build_ll_unichr_as_utf8_helper_graph(&rtyper, "ll_unichr_as_utf8")
             .expect("build_ll_unichr_as_utf8_helper_graph");
         crate::flowspace::model::checkgraph(&helper.graph.borrow());
         let inner = helper.graph.borrow();
@@ -15253,7 +15296,8 @@ mod tests {
                 "startblock holds assert + r_uint; the last uint_le raises"
             );
         }
-        let too_large_raises = inner.iterblocks().iter().any(|block| {
+        let mut too_large_false: Option<crate::flowspace::model::BlockRef> = None;
+        for block in inner.iterblocks() {
             let b = block.borrow();
             let le_max = b.operations.iter().any(|op| {
                 op.opname == "uint_le"
@@ -15262,18 +15306,140 @@ mod tests {
                         Some(Hlvalue::Constant(c)) if c.value == ConstValue::UInt(0x10FFFF)
                     )
             });
-            let raises = b.exits.iter().any(|lnk| {
-                lnk.borrow()
-                    .target
+            if !le_max {
+                continue;
+            }
+            for lnk in &b.exits {
+                let link = lnk.borrow();
+                let is_false = matches!(
+                    &link.exitcase,
+                    Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false)
+                );
+                if is_false {
+                    too_large_false = link.target.clone();
+                }
+            }
+        }
+        let raise_block = too_large_false.expect("false arm of code <= r_uint(0x10FFFF)");
+        assert_ne!(
+            crate::flowspace::model::BlockKey::of(&raise_block),
+            except_key,
+            "code > 0x10FFFF must malloc OutOfRange before the exceptblock link"
+        );
+        let oor = crate::rlib::rutf8::out_of_range_class();
+        let exception = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let value_error = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("ValueError")
+            .expect("ValueError");
+        assert!(oor.is_subclass_of(&exception));
+        assert!(!oor.is_subclass_of(&value_error));
+        let oor_cd = crate::rlib::rutf8::out_of_range_classdef(&ann.bookkeeper)
+            .expect("OutOfRange classdef");
+        let exception_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&exception)
+            .expect("Exception classdef");
+        let value_error_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&value_error)
+            .expect("ValueError classdef");
+        let oor_vt = classdef_vtable(&rtyper, &oor_cd);
+        let exc_vt = classdef_vtable(&rtyper, &exception_cd);
+        let ve_vt = classdef_vtable(&rtyper, &value_error_cd);
+        assert!(oor_vt.nonzero());
+        assert!(ll_issubclass(&oor_vt, &exc_vt).expect("ll_issubclass Exception"));
+        assert!(!ll_issubclass(&oor_vt, &ve_vt).expect("ll_issubclass ValueError"));
+        {
+            let raise = raise_block.borrow();
+            assert!(
+                raise.operations.iter().any(|op| op.opname == "malloc"),
+                "raise block must malloc OutOfRange"
+            );
+            let input = match raise.inputargs.first() {
+                Some(Hlvalue::Variable(v)) => v.clone(),
+                other => panic!("raise block inputarg must be the code Variable, got {other:?}"),
+            };
+            let typeptr_set = raise.operations.iter().find(|op| {
+                op.opname == "setfield"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c))
+                            if matches!(&c.value, ConstValue::ByteStr(s) if s == b"typeptr")
+                    )
+            });
+            let typeptr_set = typeptr_set.expect("raise block setfield typeptr");
+            match typeptr_set.args.get(2) {
+                Some(Hlvalue::Constant(c)) => match &c.value {
+                    ConstValue::LLPtr(p) => {
+                        assert!(p.nonzero());
+                        assert_eq!(p.as_ref(), &oor_vt);
+                        assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                    }
+                    other => panic!("typeptr must be OutOfRange vtable, got {other:?}"),
+                },
+                other => panic!("typeptr value must be a Constant, got {other:?}"),
+            }
+            let set_code = raise.operations.iter().find(|op| {
+                op.opname == "setfield"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c))
+                            if matches!(&c.value, ConstValue::ByteStr(s) if s == b"inst_code")
+                    )
+            });
+            let set_code = set_code.expect("raise block setfield inst_code");
+            match set_code.args.get(2) {
+                Some(Hlvalue::Variable(v)) => assert_eq!(
+                    v, &input,
+                    "inst_code must be set from the raise-block input"
+                ),
+                other => panic!("setfield inst_code value must be the input code, got {other:?}"),
+            }
+            assert_eq!(raise.exits.len(), 1);
+            let link = raise.exits[0].borrow();
+            assert!(
+                link.target
                     .as_ref()
                     .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
-            });
-            le_max && raises
-        });
-        assert!(
-            too_large_raises,
-            "false arm of code <= r_uint(0x10FFFF) must raise"
-        );
+            );
+            assert_eq!(link.args.len(), 2);
+            match &link.args[0] {
+                Some(Hlvalue::Constant(c)) => match &c.value {
+                    ConstValue::LLPtr(p) => {
+                        assert!(p.nonzero());
+                        assert_eq!(p.as_ref(), &oor_vt);
+                        assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                    }
+                    other => panic!("etype must be OutOfRange vtable, got {other:?}"),
+                },
+                other => panic!("etype must be a Constant, got {other:?}"),
+            }
+            match &link.args[1] {
+                Some(Hlvalue::Variable(_)) => {}
+                other => panic!("evalue must be the malloc'd instance Variable, got {other:?}"),
+            }
+        }
+        for block in inner.iterblocks() {
+            for op in &block.borrow().operations {
+                for arg in &op.args {
+                    if let Hlvalue::Constant(c) = arg {
+                        let n = match c.value {
+                            ConstValue::UInt(n) => Some(n),
+                            ConstValue::Int(n) if n >= 0 => Some(n as u64),
+                            _ => None,
+                        };
+                        if let Some(n) = n {
+                            assert!(
+                                n != 0xD800 && n != 0xDFFF,
+                                "allow_surrogates=True folds the D800–DFFF branch"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let mut opnames = Vec::new();
         for block in inner.iterblocks() {
             for op in &block.borrow().operations {
@@ -15282,8 +15448,10 @@ mod tests {
         }
         for expected in [
             "malloc_varsize",
+            "malloc",
             "getsubstruct",
             "setarrayitem",
+            "setfield",
             "uint_le",
             "uint_rshift",
             "uint_and",
@@ -15295,6 +15463,125 @@ mod tests {
                 opnames.iter().any(|n| n == expected),
                 "ll_unichr_as_utf8 graph missing op {expected}; saw {opnames:?}"
             );
+        }
+    }
+
+    #[test]
+    fn build_ll_unichr_as_utf8_helper_after_exception_vtable_keeps_out_of_range_numbered() {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, ll_issubclass};
+
+        let (ann, rtyper) = rtyper_after_unichr_annotation();
+        let exception = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let exception_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&exception)
+            .expect("Exception classdef");
+        let exc_vt = classdef_vtable(&rtyper, &exception_cd);
+        assert!(
+            exception_cd
+                .borrow()
+                .repr
+                .as_ref()
+                .expect("Exception ClassRepr")
+                .is_vtable_materialized(),
+            "Exception vtable must be materialized before the helper graph"
+        );
+
+        let helper = build_ll_unichr_as_utf8_helper_graph(&rtyper, "ll_unichr_as_utf8")
+            .expect("build_ll_unichr_as_utf8_helper_graph");
+        crate::flowspace::model::checkgraph(&helper.graph.borrow());
+
+        let oor_cd = crate::rlib::rutf8::out_of_range_classdef(&ann.bookkeeper)
+            .expect("OutOfRange classdef");
+        {
+            let cd = oor_cd.borrow();
+            assert!(
+                cd.minid.is_some() && cd.maxid.is_some(),
+                "OutOfRange must stay numbered after Exception's vtable is baked"
+            );
+        }
+        let oor_vt = classdef_vtable(&rtyper, &oor_cd);
+        assert!(oor_vt.nonzero());
+        assert!(ll_issubclass(&oor_vt, &exc_vt).expect("ll_issubclass Exception"));
+        let value_error = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("ValueError")
+            .expect("ValueError");
+        let value_error_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&value_error)
+            .expect("ValueError classdef");
+        let ve_vt = classdef_vtable(&rtyper, &value_error_cd);
+        assert!(!ll_issubclass(&oor_vt, &ve_vt).expect("ll_issubclass ValueError"));
+
+        let inner = helper.graph.borrow();
+        let except_key = crate::flowspace::model::BlockKey::of(&inner.exceptblock);
+        let mut too_large_false: Option<crate::flowspace::model::BlockRef> = None;
+        for block in inner.iterblocks() {
+            let b = block.borrow();
+            let le_max = b.operations.iter().any(|op| {
+                op.opname == "uint_le"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c)) if c.value == ConstValue::UInt(0x10FFFF)
+                    )
+            });
+            if !le_max {
+                continue;
+            }
+            for lnk in &b.exits {
+                let link = lnk.borrow();
+                let is_false = matches!(
+                    &link.exitcase,
+                    Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false)
+                );
+                if is_false {
+                    too_large_false = link.target.clone();
+                }
+            }
+        }
+        let raise_block = too_large_false.expect("false arm of code <= r_uint(0x10FFFF)");
+        let raise = raise_block.borrow();
+        let typeptr_set = raise
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "setfield"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c))
+                            if matches!(&c.value, ConstValue::ByteStr(s) if s == b"typeptr")
+                    )
+            })
+            .expect("raise block setfield typeptr");
+        match typeptr_set.args.get(2) {
+            Some(Hlvalue::Constant(c)) => match &c.value {
+                ConstValue::LLPtr(p) => {
+                    assert!(p.nonzero());
+                    assert_eq!(p.as_ref(), &oor_vt);
+                    assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                }
+                other => panic!("typeptr must be OutOfRange vtable, got {other:?}"),
+            },
+            other => panic!("typeptr value must be a Constant, got {other:?}"),
+        }
+        let link = raise.exits[0].borrow();
+        assert!(
+            link.target
+                .as_ref()
+                .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
+        );
+        match &link.args[0] {
+            Some(Hlvalue::Constant(c)) => match &c.value {
+                ConstValue::LLPtr(p) => {
+                    assert!(p.nonzero());
+                    assert_eq!(p.as_ref(), &oor_vt);
+                    assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                }
+                other => panic!("etype must be OutOfRange vtable, got {other:?}"),
+            },
+            other => panic!("etype must be a Constant, got {other:?}"),
         }
     }
 }
