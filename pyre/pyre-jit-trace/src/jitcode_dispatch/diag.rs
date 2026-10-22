@@ -97,12 +97,6 @@ pub(crate) fn fbw_mf_diag_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_MF_DIAG").is_some())
 }
 
-/// `PYRE_P2_DIAG`: self-recursive CALL_ASSEMBLER fold diagnostics.
-pub(crate) fn p2_diag_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_P2_DIAG").is_some())
-}
-
 /// `PYRE_BRIDGE_LATCH_AUDIT`: report what the bridge sub-walk's abort latch
 /// would have been refused for at the walk-level latch site.
 ///
@@ -364,10 +358,8 @@ spec_folds! {
     NewtupleObject       => ("newtuple_object",          "residual_call", "-"),
     Newlist              => ("newlist",                  "residual_call", "-"),
     BuiltinLenDescent    => ("builtin_len_descent",      "inline_call",   "-"),
-    BuiltinIsinstance    => ("builtin_isinstance",       "residual_call", "-"),
     BuiltinTypeGetattr   => ("builtin_type_getattr",     "residual_call", "-"),
     BuiltinGetattr       => ("builtin_getattr",          "residual_call", "-"),
-    BuiltinRange         => ("builtin_range",            "residual_call", "-"),
     BuiltinLocals        => ("builtin_locals",           "residual_call", "-"),
     SysGetframe          => ("sys_getframe",             "residual_call", "-"),
     SysExcInfo           => ("sys_exc_info",             "residual_call", "-"),

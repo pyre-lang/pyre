@@ -51,7 +51,6 @@ cover the condition they diagnose.
 | `MAJIT_TRACE_CALL_DIAG` | OFF | Reports calls emitted by the native backend; remove when call lowering has sufficient trace-level coverage. |
 | `MAJIT_TRACE_OPS_DIAG` | OFF | Reports operations executed by the native backend; remove when operation lowering has sufficient trace-level coverage. |
 | `MAJIT_VABLE_IDX_PROBE` | OFF | Reports whether virtualizable array indices are constant; remove when supported index shapes are covered by ordinary tests. |
-| `MAJIT_VABLE_READ_PROBE` | OFF | Prints every exit of the virtualizable ref read, with the vable identity and the reading register, because a `getarrayitem_vable_r` that answers `(opref, None)` panics later in `read_ref_reg` naming none of the four exits that produce it; also names which cause made a vable descriptor lookup decline, since "no vinfo bound" and "index past the declared list" abort the walk identically and call for opposite fixes; remove when the concrete-less exits are separated by focused tests. |
 
 ### `MAJIT_BH_DEBUG`
 

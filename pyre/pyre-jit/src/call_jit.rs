@@ -2519,6 +2519,21 @@ fn leave_resumed_blackhole_frame(
     frame: &majit_metainterp::blackhole::BlackholeInterpreter,
     got_exception: bool,
 ) {
+    // Helper / degenerate continuation jitcodes never entered a Python
+    // frame (`portal_frame_reg == u16::MAX`, `pyjitcode.rs` `degenerate`).
+    // Their BlackholeInterpreter may still carry a copied parent
+    // `virtualizable_ptr` (`clone_context_from`; the inner-section
+    // "Codeless continuation" arm used to leave that copy in place).
+    // `ExecutionContext.leave` on it would finish the still-running
+    // portal. `blackhole.py` `_resume_mainloop` returning from a helper
+    // does not call `ExecutionContext.leave` — helpers are not MIFrames
+    // with a PyFrame.
+    if let Some(jitcode_index) = frame.jitcode.try_index() {
+        let (frame_reg, _) = pyre_jit_trace::state::portal_red_regs_at(jitcode_index as i32);
+        if frame_reg == u16::MAX {
+            return;
+        }
+    }
     let recovered = frame.virtualizable_ptr as *mut PyFrame;
     if recovered.is_null() {
         return;
@@ -2809,6 +2824,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 return None;
             }
         };
+        // Helper jitcodes share this index space (`ensure_build_time_jitcode_at`).
+        // A section whose `-live-` decodes is accepted; a pc without one is
+        // refused (`frame_value_count_at` would panic). `has_abort_opcode`
+        // helpers are refused: reachability from the guard pc to return is a
+        // CFG walk over `goto` / `goto_if_not` and is not cheap. The walker
+        // does not record a guard in those bodies (`helper_guard_resume_pjc`).
         if pyjitcode.has_abort_opcode() {
             if majit_gc::diag_p92_trace_io() {
                 eprintln!(
@@ -3081,6 +3102,11 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 if has_caller {
                     if frame_reg == u16::MAX {
                         // Codeless continuation: no Python frame red.
+                        // Do not keep a copied parent portal pointer
+                        // (`clone_context_from`); `leave_resumed_blackhole_frame`
+                        // and traceback recording must not treat this helper
+                        // as the still-running Python frame.
+                        frame.virtualizable_ptr = 0;
                     } else if own == 0 {
                         panic!(
                             "blackhole inner section jitcode={jitcode_index} \
@@ -3101,6 +3127,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     }
 
     leave_frames_handed_to_portal_call(&bh, guard_exc != 0);
+
+    // Opcode-entry / `jit_merge_point` resume re-pops
+    // `locals_cells_stack_w`. Mid-opcode parents (a nested helper's
+    // CALL `-live-`) keep the register section and the vable image
+    // `write_from_resume_data_partial` already wrote.
+    pyre_jit_trace::state::restore_inner_blackhole_opcode_entry_stack(&mut bh, guard_exc != 0);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
@@ -6559,6 +6591,16 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     let root_base = _roots.publish(&[callable, null_or_self]);
     _roots.publish(args);
     _roots.normalize(root_base, 2 + args.len());
+    // Bound METHOD_TYPE already holds self. CALL's `null_or_self` is
+    // PUSH_NULL (`compute_load_method_bound`); a leftover in that slot
+    // is not a receiver (`list.append() 2 given`). Zero it so
+    // `reload_args` and the `is_method` unwrap see the sentinel.
+    // Method-form `[Function, receiver]` is `is_function`, not this.
+    if unsafe { pyre_object::is_method(_roots.get(root_base)) }
+        && !_roots.get(root_base + 1).is_null()
+    {
+        _roots.set(root_base + 1, pyre_object::PY_NULL);
+    }
     // `eval.rs`'s `PyFrame::call` — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
     // as `callable(null_or_self, *args)`.
@@ -8280,14 +8322,13 @@ pub extern "C" fn bh_get_iter_fn(obj: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// Residual callee for `dispatch_bytecode`'s `we_are_jitted()` arm:
-/// `ec.bytecode_only_trace(frame)`.
+/// Residual fallback of `run_trace_func` (`@jit.unroll_safe`) for the
+/// portal `dispatch_bytecode` hook.  `bytecode_only_trace` itself is
+/// `@always_inline`; its early-outs are graph ops in the portal jitcode.
 ///
 /// Void result matching `bh_bytecode_trace_jitted_slow`: always returns 0;
 /// an exception is published through `BH_LAST_EXC_VALUE` for the trailing
-/// `GuardNoException`.  The portal jitcode emits this on the true arm of
-/// `if self.debugdata` so a blackhole from that guard fires the event
-/// instead of CRNing at the merge with no call.
+/// `GuardNoException`.
 pub extern "C" fn bh_bytecode_only_trace(
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame_ptr: *mut PyFrame,
@@ -8295,8 +8336,8 @@ pub extern "C" fn bh_bytecode_only_trace(
     if ec.is_null() {
         return 0;
     }
-    match unsafe { (*ec).bytecode_only_trace(frame_ptr) } {
-        Ok(_) => 0,
+    match unsafe { (*ec).run_trace_func(frame_ptr) } {
+        Ok(()) => 0,
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
             0
@@ -8467,6 +8508,21 @@ pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> PyObjectRef {
 pub extern "C" fn bh_unary_not_fn(value: PyObjectRef) -> PyObjectRef {
     match pyre_interpreter::opcode_ops::truth_value(value) {
         Ok(truth) => pyre_object::w_bool_from(!truth),
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object());
+            PY_NULL
+        }
+    }
+}
+
+/// TO_BOOL residual (`eval.rs` `to_bool` / `flowcontext.rs` ToBool).
+/// Returns `bool(value)` as a bool object via `opcode_ops::truth_value`.
+/// A user `__bool__` / `__len__` may run Python (`MayForce`); a raising
+/// `__bool__` publishes through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_to_bool_fn(value: PyObjectRef) -> PyObjectRef {
+    match pyre_interpreter::opcode_ops::truth_value(value) {
+        Ok(truth) => pyre_object::w_bool_from(truth),
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
             PY_NULL
@@ -8841,6 +8897,9 @@ pub fn cranelift_resumedata_deopt(
             return None;
         }
         let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+        // Same policy as `blackhole_resume_via_rd_numb`: helper sections with
+        // a decodable `-live-` are accepted; `has_abort_opcode` is refused
+        // because abort reachability is not a cheap CFG query.
         if pyjitcode.has_abort_opcode() {
             return None;
         }

@@ -2493,40 +2493,8 @@ where
             .and_then(|info| info.static_field_descrs().get(field_idx).cloned());
         match descr {
             Some(descr) => Some((vable_opref, descr)),
-            None => {
-                let declared = ctx
-                    .virtualizable_info()
-                    .map(|info| info.static_field_descrs().len());
-                self.report_absent_vable_descr("static field", field_idx, declared);
-                None
-            }
+            None => None,
         }
-    }
-
-    /// Name the reason a vable descriptor lookup declined, under
-    /// `MAJIT_VABLE_READ_PROBE`.
-    ///
-    /// Both causes — no `VirtualizableInfo` bound to the trace at all, and an
-    /// index past the declared list — return `None` here and abort the walk
-    /// identically, and the abort is reported by jitcode and cursor alone.
-    /// Without this the two are indistinguishable from outside, and they call
-    /// for opposite fixes: the first is a trace that was started without
-    /// `initialize_virtualizable`, the second a codewriter index that does not
-    /// match the runtime declaration.
-    fn report_absent_vable_descr(&mut self, kind: &str, index: usize, declared: Option<usize>) {
-        if !crate::vable_read_probe_enabled() {
-            return;
-        }
-        let depth = self.frames.len();
-        let frame = self.frames.current_mut();
-        let cause = match declared {
-            None => "no vinfo bound to the trace".to_owned(),
-            Some(n) => format!("declared {n}"),
-        };
-        eprintln!(
-            "[vable-read-probe] no {kind} descr jitcode={} depth={} cursor={} index={index} {cause}",
-            frame.jitcode.name, depth, frame.code_cursor,
-        );
     }
 
     /// Print one control-flow edge under `MAJIT_PCSEQ`
@@ -2571,13 +2539,7 @@ where
         });
         match pair {
             Some((fdescr, adescr)) => Some((vable_opref, fdescr, adescr)),
-            None => {
-                let declared = ctx
-                    .virtualizable_info()
-                    .map(|info| info.array_field_descrs().len());
-                self.report_absent_vable_descr("array", array_idx, declared);
-                None
-            }
+            None => None,
         }
     }
 

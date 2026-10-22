@@ -441,6 +441,9 @@ pub fn root_stack_depth() -> usize {
 /// living across the bracketed allocation call. Dropping the scope
 /// executes the equivalent of `pop_roots(hop, livevars)` by rewinding
 /// the shadow stack to the length captured at construction time.
+///
+/// The residual ABI returns it as its one word (`push_roots` fnaddr).
+#[repr(transparent)]
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \
               to `_` would pop immediately and defeat the bracket"]
@@ -662,7 +665,7 @@ pub fn root_scope_close(scope: &RootScope) {
 /// Residualised: `RootScope` is one word (`save_point`), which the residual
 /// ABI can carry.  `rlib/jit.py` `@dont_look_inside`.
 #[inline]
-#[majit_macros::dont_look_inside]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn push_roots() -> RootScope {
     RootScope::new()
 }

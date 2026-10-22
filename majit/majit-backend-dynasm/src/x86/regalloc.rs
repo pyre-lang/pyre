@@ -1768,7 +1768,10 @@ impl<'a> RegAlloc<'a> {
         let ofs_loc = self.make_sure_var_in_reg(offset, Type::Int, &args, None, false);
         let nsize = self.gc_load_nsize(op, size);
         let tp = op.opcode.result_type();
-        let res_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
+        // aarch64/regalloc.py `_prepare_op_gc_load`: `possibly_free_vars_for_op`
+        // then `force_allocate_reg(op)`.
+        self.possibly_free_vars_for_op(op);
+        let res_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &args, None, false));
         self.perform_gc_load(i, base_loc, ofs_loc, res_loc, nsize, asm);
     }
 

@@ -469,6 +469,9 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
         return gettypefor(&pyre_object::INT_TYPE);
     }
     unsafe {
+        // `StdObjSpace.type`: `jit.promote(w_obj.__class__); w_obj.getclass(space)`.
+        // The RPython class is the layout vtable `ob_type` that `guard_class` checks.
+        let _ = majit_metainterp::jit::promote((*obj).ob_type);
         // Trust a specialised `w_class` for every object, exception or not.
         // The generic `EXCEPTION_TYPE` stub is not the real class — only
         // then walk the `ExcKind` registry (`lookup_exc_class_for_kind`).
@@ -6264,9 +6267,118 @@ fn reversed_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     crate::builtins::builtin_reversed(args.get(1..).unwrap_or(&[]), cls)
 }
 
-/// `range.__new__(cls, stop)` / `range.__new__(cls, start, stop[, step])` —
-/// `functional.py W_Range.descr_new`. Range is not an acceptable base type.
-fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+/// `functional.py W_Range.descr_new`, exposed through `interp2app`.
+/// The body lives in this `__majit_wrap_` leaf so `BuiltinCode.func`'s PBC
+/// family has a real fnaddr for the constructor — a trampoline onto a
+/// private `range_descr_new` compiled as a second graph whose fnaddr is
+/// symbolic, and the wrapper walk aborted at that call.
+///
+/// Type-call `range(n)` walks this with `[cls, stop]` (length 2);
+/// `range(start, stop)` length 3; `range(start, stop, step)` length 4.
+/// Exact `range` and exact machine-int bounds stay here (`space.index` is
+/// identity). Bool (rewrapped), long, `__index__`, a subclass `cls`, and
+/// the wrong arity are the residual.
+pub fn __majit_wrap_range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let n = args.len();
+    if n < 2 || n > 4 {
+        return range_new_slow(args);
+    }
+    let cls = args[0];
+    let range_type = gettypeobject(&pyre_object::functional::RANGE_TYPE);
+    if cls.is_null() || !std::ptr::eq(cls, range_type) {
+        return range_new_slow(args);
+    }
+    unsafe {
+        // Exact `INT_TYPE` (`space.index` is identity). Bool, long, and
+        // a user int subclass take `range_new_slow`. Field loads and
+        // `wrapping_*` stay in this leaf (`int_sub` / `int_neg` /
+        // `int_floordiv` / `int_add`); `overflowing_*` / `checked_*` are
+        // residual `core::num` Calls. A helper or closure is a second
+        // graph and residualises the CALL.
+        let int_type = &pyre_object::INT_TYPE as *const pyre_object::PyType;
+        if args[1].is_null() || !std::ptr::eq((*args[1]).ob_type, int_type) {
+            return range_new_slow(args);
+        }
+        if n >= 3 && (args[2].is_null() || !std::ptr::eq((*args[2]).ob_type, int_type)) {
+            return range_new_slow(args);
+        }
+        if n >= 4 && (args[3].is_null() || !std::ptr::eq((*args[3]).ob_type, int_type)) {
+            return range_new_slow(args);
+        }
+        let start_i;
+        let stop_i;
+        let step_i;
+        let promote;
+        if n == 2 {
+            start_i = 0;
+            stop_i = (*(args[1] as *const pyre_object::W_IntObject)).intval;
+            step_i = 1;
+            promote = 1;
+        } else if n == 3 {
+            start_i = (*(args[1] as *const pyre_object::W_IntObject)).intval;
+            stop_i = (*(args[2] as *const pyre_object::W_IntObject)).intval;
+            step_i = 1;
+            promote = 1;
+        } else if n == 4 {
+            start_i = (*(args[1] as *const pyre_object::W_IntObject)).intval;
+            stop_i = (*(args[2] as *const pyre_object::W_IntObject)).intval;
+            step_i = (*(args[3] as *const pyre_object::W_IntObject)).intval;
+            promote = 0;
+        } else {
+            return range_new_slow(args);
+        }
+        if step_i == 0 {
+            return range_new_slow(args);
+        }
+        let span_hi;
+        let span_lo;
+        let span_step;
+        if step_i > 0 {
+            if start_i >= stop_i {
+                return Ok(pyre_object::functional::w_range_alloc_i64(
+                    start_i, stop_i, step_i, 0, promote,
+                ));
+            }
+            span_hi = stop_i;
+            span_lo = start_i;
+            span_step = step_i;
+        } else if start_i > stop_i {
+            // `overflowing_neg` is a residual `core::num` Call. `i64::MIN`
+            // is the only overflow; `wrapping_neg` is `int_neg`.
+            if step_i == i64::MIN {
+                return range_new_slow(args);
+            }
+            span_hi = start_i;
+            span_lo = stop_i;
+            span_step = step_i.wrapping_neg();
+        } else {
+            return Ok(pyre_object::functional::w_range_alloc_i64(
+                start_i, stop_i, step_i, 0, promote,
+            ));
+        }
+        // `overflowing_sub` is a residual `core::num` Call (`subwalk-
+        // unsupported`). `wrapping_sub` is `int_sub`; signed overflow of
+        // `hi - lo` is the XOR sign test, then the bigint tail.
+        let d = span_hi.wrapping_sub(span_lo);
+        if ((span_hi ^ span_lo) & (span_hi ^ d)) < 0 {
+            return range_new_slow(args);
+        }
+        // `hi > lo` and no overflow ⇒ `d > 0`, so `d - 1` and
+        // `(d - 1) / span_step + 1` stay in-range (`get_len_of_range`).
+        let e = d.wrapping_sub(1);
+        let q = e.wrapping_div(span_step);
+        let len_i = q.wrapping_add(1);
+        Ok(pyre_object::functional::w_range_alloc_i64(
+            start_i, stop_i, step_i, len_i, promote,
+        ))
+    }
+}
+
+/// Keywords, the wrong arity, a subclass `cls`, or a bound that is not an
+/// exact machine int.  Kept out of [`__majit_wrap_range_descr_new`]'s
+/// length-2/3/4 graph: `builtin_range` calls `space.index`.
+#[majit_macros::dont_look_inside]
+fn range_new_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut cls = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let value = pyre_object::with_roots!(cls => crate::builtins::builtin_range(args.get(1..).unwrap_or(&[])))?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::functional::RANGE_TYPE)? {
@@ -6274,6 +6386,11 @@ fn range_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
     Ok(value)
 }
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_range_descr_new,
+    __majit_wrap_range_descr_new
+);
 
 /// `descriptor.py W_Super.__new__` — allocate an uninitialised field-resident
 /// proxy; `__init__` fills it from zero, one, or two user arguments.
@@ -6566,7 +6683,7 @@ fn init_range_type(ns: PyObjectRef) {
             ),
         )
     };
-    let new_descr = make_new_descr(range_descr_new);
+    let new_descr = make_new_descr(__majit_wrap_range_descr_new);
     unsafe {
         crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
     };
@@ -15232,6 +15349,34 @@ fn type_dictoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(w_int_new(dict))
 }
 
+/// typeobject.py `type_isinstance` — `interp2app` body for `type.__instancecheck__`.
+pub fn type_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::type_methods::arity_exact(args, "__instancecheck__", 1)?;
+    let matched = unsafe { crate::baseobjspace::p_recursive_isinstance_type_w(args[1], args[0])? };
+    Ok(pyre_object::w_bool_from(matched))
+}
+
+/// Manual interp2app gateway for `type.__instancecheck__`.
+///
+/// Same shape as `__majit_wrap_builtin_isinstance`: the wrapper reads each
+/// positional slot out of the slice before entering the typed body so the
+/// gateway descent walker can key heap-cache entries off that element read.
+pub fn __majit_wrap_type_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return type_isinstance(args);
+    }
+    let w_type = args[0];
+    let w_inst = args[1];
+    Ok(pyre_object::w_bool_from(unsafe {
+        crate::baseobjspace::p_recursive_isinstance_type_w(w_inst, w_type)?
+    }))
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_wrap_type_isinstance_target,
+    __majit_wrap_type_isinstance
+);
+
 fn type_weakrefoffset_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let Some((_, weakref)) = cpython_type_offsets(args[1]) else {
         return Err(crate::PyError::attribute_error("__weakrefoffset__"));
@@ -15604,15 +15749,8 @@ fn init_type_type(ns: PyObjectRef) {
     // typeobject.py / W_TypeObject.typedef:1317-1318.
     // Keep these as the public type slots which delegate to abstractinst's
     // recursive implementations, just as PyPy does.
-    let instancecheck = make_builtin_function_with_arity(
-        "__instancecheck__",
-        |args| {
-            Ok(pyre_object::w_bool_from(unsafe {
-                crate::baseobjspace::p_recursive_isinstance_type_w(args[1], args[0])?
-            }))
-        },
-        2,
-    );
+    let instancecheck =
+        make_builtin_function_with_arity("__instancecheck__", __majit_wrap_type_isinstance, 2);
     let instancecheck_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(instancecheck);
     unsafe {
@@ -16159,12 +16297,7 @@ fn init_type_type(ns: PyObjectRef) {
     // looping, and what `super().__instancecheck__(x)` in a metaclass reaches.
     let instancecheck_method = crate::gateway::make_builtin_function_with_arity_and_text_signature(
         "__instancecheck__",
-        |args| {
-            crate::type_methods::arity_exact(args, "__instancecheck__", 1)?;
-            let matched =
-                unsafe { crate::baseobjspace::p_recursive_isinstance_type_w(args[1], args[0])? };
-            Ok(pyre_object::w_bool_from(matched))
-        },
+        __majit_wrap_type_isinstance,
         2,
         "($self, inst, /)",
     );

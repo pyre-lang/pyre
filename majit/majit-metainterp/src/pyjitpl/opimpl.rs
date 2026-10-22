@@ -2413,25 +2413,6 @@ where
             let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
             (opcode_pc, vable_reg, array_idx, index_reg, dest)
         };
-        if crate::vable_read_probe_enabled() {
-            let depth = self.frames.len();
-            let frame = self.frames.current_mut();
-            eprintln!(
-                "[vable-read-probe] reg jitcode={} depth={} vable_reg={} \
-                 reg_opref={:?} reg_value={:?}",
-                frame.jitcode.name,
-                depth,
-                vable_reg,
-                frame.ref_regs[vable_reg],
-                frame
-                    .ref_regs
-                    .get(vable_reg)
-                    .copied()
-                    .flatten()
-                    .and_then(|op| ctx.box_bits(op))
-                    .map(|v| format!("0x{v:x}")),
-            );
-        }
         let Some((vable_opref, fdescr, adescr)) =
             self.vable_array_descrs(ctx, vable_reg, array_idx)
         else {
@@ -2589,7 +2570,6 @@ where
             adescr,
             value,
             Value::Int(concrete),
-            false,
         ) {
             // Promoted index falls outside the standard virtualizable
             // array (e.g. a transient out-of-bounds state-field index);
@@ -2656,7 +2636,6 @@ where
             adescr,
             value,
             Value::Ref(majit_ir::GcRef(concrete as usize)),
-            false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
             VableArrayStore::Stored(_) => {}
@@ -2720,7 +2699,6 @@ where
             adescr,
             value,
             Value::Float(f64::from_bits(concrete as u64)),
-            false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
             VableArrayStore::Stored(_) => {}

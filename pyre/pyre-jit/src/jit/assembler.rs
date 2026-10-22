@@ -331,7 +331,10 @@ impl Assembler {
 
         self.fix_labels(&mut state);
 
-        let jitcode = state.builder.try_finish()?;
+        let jitcode = match state.builder.try_finish() {
+            Some(jitcode) => jitcode,
+            None => return None,
+        };
         dump_assembled_ssarepr(ssarepr, &jitcode);
         // `assembler.py` checks the completed register/constant namespace
         // before making the JitCode. Runtime-generated graphs use the checked
@@ -1221,6 +1224,13 @@ fn dispatch_op(
             let field = expect_field_bh_descr(&args[1], "getfield_gc_i");
             state.builder.getfield_gc_i_bh(dst, struct_reg, field);
         }
+        "getfield_gc_r" => {
+            let dst = expect_result_reg(result, Kind::Ref, "getfield_gc_r needs result");
+            assert_eq!(args.len(), 2, "getfield_gc_r expects [struct, fielddescr]");
+            let struct_reg = expect_reg(&args[0], Kind::Ref);
+            let field = expect_field_bh_descr(&args[1], "getfield_gc_r");
+            state.builder.getfield_gc_r_bh(dst, struct_reg, field);
+        }
         "setfield_gc_i" => {
             assert_eq!(
                 args.len(),
@@ -1653,11 +1663,13 @@ fn dispatch_op(
                 ),
             }
         }
-        "int_neg" | "int_invert" => {
+        "int_neg" | "int_invert" | "int_is_zero" | "int_is_true" => {
             let dst = expect_result_reg(result, Kind::Int, "int unary needs result");
             let opcode = match opname {
                 "int_neg" => majit_ir::OpCode::IntNeg,
                 "int_invert" => majit_ir::OpCode::IntInvert,
+                "int_is_zero" => majit_ir::OpCode::IntIsZero,
+                "int_is_true" => majit_ir::OpCode::IntIsTrue,
                 _ => unreachable!(),
             };
             state

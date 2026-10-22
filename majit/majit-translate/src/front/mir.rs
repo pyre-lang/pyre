@@ -24176,6 +24176,11 @@ impl<'a> Lowering<'a> {
     /// Charon leaves the declaration generic (`monomorphize:false`), so
     /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
     /// operand's place type is the type the call actually passes.
+    ///
+    /// `RootScope` is the exception: it *is* the save-point word
+    /// (`framework.py push_roots` / `pop_roots` livevars length,
+    /// `shadowstack.py gc_push_roots`). `Rvalue::Ref` aliases that word, and
+    /// the residual ABI takes it by value (`WordAbi` / `ResidualRet`).
     fn refuse_borrowed_transparent_scalar_residual(
         &self,
         mir_bb: usize,
@@ -24191,22 +24196,35 @@ impl<'a> Lowering<'a> {
         if !fun_decl_is_residual(fd, self.dont_look_inside) {
             return Ok(());
         }
+        // Charon names inherent methods `gc_roots::<Impl>::pin_roots`.
+        // After `repr(transparent)` the declared receiver is already
+        // `&usize`, so `tyref_is_root_scope` misses it. The residual ABI
+        // takes the save-point word by value (`framework.py push_roots`
+        // livevars length / `WordAbi`). Skip the whole call: later args
+        // (`&[PyObjectRef]`) must not trip the same refusal.
+        if gc_root_scope_residual_method_path(&fd.item_meta.name_path()) {
+            return Ok(());
+        }
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             let passed = arg_tys.get(index).and_then(Option::as_ref);
-            if std::iter::once(declared).chain(passed).any(|ty| {
+            let Some(ty) = std::iter::once(declared).chain(passed).find(|ty| {
                 tyref_is_borrowed_transparent_scalar(
                     ty,
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
                 )
-            }) {
-                return Err(LowerError::Unsupported(format!(
-                    "bb{mir_bb}: residual `{}` argument {index} borrows a \
-                     repr(transparent) scalar; the word is not an address",
-                    fd.item_meta.name_path()
-                )));
+            }) else {
+                continue;
+            };
+            if tyref_is_root_scope(ty, self.llbc) {
+                continue;
             }
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: residual `{}` argument {index} borrows a \
+                 repr(transparent) scalar; the word is not an address",
+                fd.item_meta.name_path()
+            )));
         }
         Ok(())
     }
@@ -48077,6 +48095,37 @@ fn gc_root_scope_type_path(name: &str) -> bool {
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
 }
 
+/// Charon names an inherent method `gc_roots::<Impl>::leaf` or
+/// `gc_roots::RootScope::leaf`. The residual ABI takes the save-point
+/// word by value (`WordAbi` / `ResidualRet`), so
+/// `refuse_borrowed_transparent_scalar_residual` must not reject these
+/// callees after `repr(transparent)` peels the receiver to `&usize`.
+/// Looking inside emits `getfield_raw_i` of that word as a struct
+/// pointer (`root_scope_close` of save-point 4 SIGSEGVs at address 4).
+/// Every `dont_look_inside_cannot_raise` RootScope helper is a residual,
+/// including `set` / `normalize_moved` / Drop and the free
+/// `root_scope_close`.
+fn gc_root_scope_residual_method_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    if !segments.contains(&ROOT_SCOPE_MODULE) {
+        return false;
+    }
+    if segments.contains(&ROOT_SCOPE_TYPE) || segments.iter().any(|s| s.starts_with('<')) {
+        return true;
+    }
+    matches!(segments.last().copied(), Some(ROOT_SCOPE_CLOSE))
+}
+
+/// `RootScope` or `&RootScope`: `strip_ty_wrappers` peels the borrow, and
+/// the transparent wrapper is the save-point word.
+fn tyref_is_root_scope(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+}
+
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
 fn gc_root_scope_drop_glue_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
@@ -62646,6 +62695,8 @@ fn declared_raw_adt_node<'a>(
 
 /// The ADT's fields are raw words: scalars, nested raw structs, or one
 /// address pointing at those. A `Vec` / `String` / other GC field is not.
+/// Compiler ADTs (`Tuple` / `Box` / `str`) are GC storage (`rtuple.py`
+/// `GcStruct`): their items may be scalars, but the allocation is `new`.
 fn adt_def_is_raw_storage(
     def_id: u64,
     llbc: &Llbc,
@@ -62661,6 +62712,14 @@ fn adt_def_is_raw_storage(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
+    // Tuple / Box / str are compiler ADTs with no `GcType` impl, but
+    // `rtuple.py` lays each tuple out as a `GcStruct` and `new` allocates
+    // them as GC. Walking their scalar items would stamp the tuple — and
+    // every Option/enum that boxes one — Raw, which `rewrite_op_setfield`
+    // then replaces with Abort.
+    if type_decl_is_builtin_adt(td) {
+        return false;
+    }
     if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
         return false;
     }

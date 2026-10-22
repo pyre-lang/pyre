@@ -1682,6 +1682,7 @@ typed_items_block_grow!(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
     if block.is_null()
+        || (block as usize) < 4096
         || block == ll_prebuilt_empty_int_items_block()
         || block == ll_prebuilt_empty_float_items_block()
     {

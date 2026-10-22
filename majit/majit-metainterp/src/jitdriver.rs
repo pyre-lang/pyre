@@ -8517,6 +8517,11 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return;
         }
+        // Same close as `force_start_tracing`: `gctypelayout.py
+        // encode_type_shapes_now` publishes `type_info_group` at
+        // translation. A back-edge FBW records `check_is_object` during
+        // the walk, before `compile_loop` would close the registry.
+        majit_gc::ensure_type_registry_closed();
         self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
@@ -9036,14 +9041,13 @@ impl<S: JitState> JitDriver<S> {
         let info_clone = self.meta.virtualizable_info().cloned();
         if let Some(ref info) = info_clone {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
+                // The compiled entry's own vable (`compile.py`
+                // `execute_assembler` / `vinfo.reset_vable_token`).  The
+                // recording context's virtualizable is the trace's own vable
+                // box (`virtualizable.py` `tracing_before_residual_call` /
+                // `tracing_after_residual_call`); entering compiled code for
+                // another frame must not retarget `TraceCtx.virtualizable_heap_ptr`.
                 self.meta.set_vable_ptr(ptr.cast_const());
-                // The entry names the frame this run executes.  The exits
-                // put the caller's frame back through
-                // `restore_trace_vable_ptr`: `sync_after` for the ones that
-                // take it, the decline and finish exits directly.
-                if let Some(ctx) = self.meta.tracing.as_mut() {
-                    ctx.set_virtualizable_heap_ptr(ptr.cast_const());
-                }
             }
             // Fallback cache for layouts that cannot expose array length on
             // the heap object alone (header-less embedded arrays). Unused in
@@ -9754,10 +9758,11 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // Return raw guard failure data; state restoration is the caller's
-        // handle_fail().  The vable pointer `sync_before` moved to this
-        // entry's frame is deliberately left naming it: `should_bridge` is
-        // false while a recording is live, so the one outcome handle_fail has
-        // then is the blackhole, and that resumes on this entry's frame.
+        // handle_fail().  A nested compiled entry does not retarget the
+        // tracer's virtualizable (`virtualizable.py`
+        // `tracing_before_residual_call`); the blackhole resumes from this
+        // entry's deadframe.  `should_bridge` is false while a recording is
+        // live.
         DetailedDriverRunOutcome::GuardFailure {
             fail_index,
             trace_id,

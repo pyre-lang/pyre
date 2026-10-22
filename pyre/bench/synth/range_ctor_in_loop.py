@@ -1,6 +1,5 @@
-# pyre-check: spec-folds=builtin_range
 # pyre-check: trace-shape=entry-bridge:main:absent=CallMayForceR
-# Pins virtual range construction for one-, two-, and three-bound calls while
+# Pins range construction for one-, two-, and three-bound calls while
 # retaining correct residual behavior for exceptional, subclass, index, and
 # escaping-object shapes.
 #
@@ -9,8 +8,7 @@
 # the gap between them picks up that comprehension's call-bearing `FOR_ITER`
 # -- an opcode this loop never reaches -- and `main` then runs interpreted end
 # to end. With the region built from the exception table instead, the while
-# loop and the three `for` loops compile.  The fold census verifies the range
-# construction itself without sizing the arithmetic loop to a timer floor.
+# loop and the three `for` loops compile.
 try:
     import pypyjit
 
