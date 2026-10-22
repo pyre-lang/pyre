@@ -82,6 +82,7 @@ pyre-module = { workspace = true, optional = true }
 pyre-jit = { workspace = true, features = ["prepass"] }
 majit-metainterp = { workspace = true }
 majit-gc = { workspace = true }
+majit-rlib = { workspace = true }
 lexopt = { workspace = true }
 rustpython-compiler = { workspace = true }
 rustpython-wtf8 = { workspace = true }

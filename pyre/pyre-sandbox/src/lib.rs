@@ -5,9 +5,9 @@
 //! controller (`pyre interact`). It ports, from the RPython/PyPy source tree:
 //!
 //!   - `rpython/rlib/rmarshal.py` + `rpython/translator/sandbox/_marshal.py`
-//!     -> [`rmarshal`] (the byte-exact wire codec),
+//!     -> `majit_rlib::rmarshal` (the byte-exact wire codec),
 //!   - `rpython/translator/sandbox/rsandbox.py` (runtime half)
-//!     -> `client` (the trampoline body; added in a later phase),
+//!     -> `majit_rlib::rsandbox` (the trampoline body),
 //!   - `rpython/translator/sandbox/vfs.py` -> [`vfs`],
 //!   - `rpython/translator/sandbox/sandlib.py` -> [`sandlib`],
 //!   - `pypy/sandbox/pypy_interact.py` -> [`controller`].
@@ -66,21 +66,19 @@
 //! must be weighed against the fence and seccomp allowlist — never assumed away
 //! by "it's translated".
 
-// The trampoline client, the controller, and the policy/dispatch in sandlib
+// The controller, the policy/dispatch in sandlib, and the virtual filesystem
 // drive a fork/fd-based sandbox via unix-only syscalls (kill/SIGKILL, arg0,
 // O_ACCMODE, pointer-sized read/write); they are unix-only. The wire codec
-// (rmarshal), the protocol enums, and the virtual filesystem are
-// host-neutral and compile everywhere so `cargo test --all` builds the crate
-// on non-unix targets.
-#[cfg(unix)]
-pub mod client;
+// and trampoline client live in `majit_rlib::{rmarshal,rsandbox}` under the
+// same unix gate.
+#[cfg(all(unix, test))]
+mod client;
 #[cfg(unix)]
 pub mod controller;
-pub mod protocol;
-pub mod rmarshal;
 #[cfg(unix)]
 pub mod sandlib;
 // OS-level seccomp backstop for the sandboxed child (Linux only).
 #[cfg(target_os = "linux")]
 pub mod seccomp;
+#[cfg(unix)]
 pub mod vfs;

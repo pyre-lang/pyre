@@ -513,14 +513,13 @@ fn stdin_is_interactive(interactive: bool) -> bool {
     if interactive {
         return true;
     }
-    #[cfg(feature = "sandbox")]
+    #[cfg(unix)]
     {
-        // Under sandbox the query goes through the seam, so a sandboxed child
-        // observes its virtual console rather than the trusted parent's
-        // terminal.
-        pyre_interpreter::host_seam::ops::isatty(0).unwrap_or(false)
+        // `rposix.isatty`; under sandbox the trampoline reports the virtual
+        // console rather than the trusted parent's terminal.
+        majit_rlib::rposix::isatty(0)
     }
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(not(unix))]
     {
         std::io::IsTerminal::is_terminal(&std::io::stdin())
     }
@@ -842,6 +841,19 @@ fn real_main(binary_name: &str) {
     // blackhole fallback), so its message is a false crash signal. A genuinely
     // uncaught one still aborts with a nonzero exit, so suppressing only the
     // message does not hide a real failure.
+    // `rsandbox.reraise_error` raises an ordinary exception; the trampoline
+    // unwinds with `SandboxError`, and `catch_sandbox_stub` turns it into
+    // the Python error, so its panic message is not a crash either.
+    #[cfg(unix)]
+    fn is_sandbox_error(payload: &(dyn std::any::Any + Send)) -> bool {
+        payload
+            .downcast_ref::<majit_rlib::rsandbox::SandboxError>()
+            .is_some()
+    }
+    #[cfg(not(unix))]
+    fn is_sandbox_error(_payload: &(dyn std::any::Any + Send)) -> bool {
+        false
+    }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let payload = info.payload();
@@ -853,7 +865,8 @@ fn real_main(binary_name: &str) {
                 .is_some()
             || payload
                 .downcast_ref::<pyre_interpreter::runtime_ops::SandboxStub>()
-                .is_some();
+                .is_some()
+            || is_sandbox_error(payload);
         if !is_silent_control_flow {
             // The suite runner keeps a signal death's last stderr line, and
             // the default hook's trailer is that line. Put the location on

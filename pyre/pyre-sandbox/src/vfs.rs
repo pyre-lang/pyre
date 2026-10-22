@@ -1,4 +1,5 @@
 use indexmap::IndexMap;
+use majit_rlib::rmarshal::StatResult;
 use std::cell::Cell;
 use std::fs;
 use std::io::{self, Cursor, Read, Seek};
@@ -66,20 +67,6 @@ bitflags::bitflags! {
         const IFREG = 0o100000;
         const IFMT = 0o170000;
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatResult {
-    pub st_mode: Mode,
-    pub st_ino: u64,
-    pub st_dev: u64,
-    pub st_nlink: u64,
-    pub st_uid: u32,
-    pub st_gid: u32,
-    pub st_size: u64,
-    pub st_atime: i64,
-    pub st_mtime: i64,
-    pub st_ctime: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

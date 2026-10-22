@@ -2376,6 +2376,55 @@ impl RPythonTyper {
                     GenopResult::LLType(result_lltype),
                 ))
             }
+            // `llop.threadlocalref_get` (`rthread.py ThreadLocalField.getraw`).
+            // Front emits BinOp (offset, loop_invariant); only the offset
+            // is an llop operand. The flag selects ExtraEffect in
+            // `rewrite_op_threadlocalref_get`.
+            "threadlocalref_get" => {
+                let v_offset = hop.inputarg_llop_intkind_or_signed(0)?;
+                let v_flag = hop.inputarg_llop_intkind_or_signed(1)?;
+                hop.exception_cannot_occur()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "threadlocalref_get: r_result not populated before genop",
+                        )
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop(
+                    "threadlocalref_get",
+                    vec![v_offset, v_flag],
+                    GenopResult::LLType(result_lltype),
+                ))
+            }
+            // `llop.threadlocalref_store` (`rthread.py ThreadLocalField.setraw`).
+            // Upstream has no `rewrite_op_threadlocalref_store`; jtransform
+            // residualizes this as a plain call.
+            "threadlocalref_store" => {
+                let v_offset = hop.inputarg_llop_intkind_or_signed(0)?;
+                let v_value = hop.inputarg_llop_intkind_or_signed(1)?;
+                hop.exception_cannot_occur()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "threadlocalref_store: r_result not populated before genop",
+                        )
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop(
+                    "threadlocalref_store",
+                    vec![v_offset, v_value],
+                    GenopResult::LLType(result_lltype),
+                ))
+            }
             // rtyper.py — `translate_op_newtuple` calls the
             // free function `rtuple.rtype_newtuple(hop)` which routes
             // to `TupleRepr._rtype_newtuple`. No per-Repr dispatch.

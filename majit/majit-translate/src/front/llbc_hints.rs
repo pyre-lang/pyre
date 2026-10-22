@@ -869,6 +869,40 @@ mod tests {
     }
 
     #[test]
+    fn random_effects_marker_keys_the_graphless_leaf() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/majit-rlib.ullbc"
+        );
+        let llbc = majit_charon_reader::Llbc::load(path).expect("load majit-rlib.ullbc");
+        let harvested = super::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        let keys: Vec<&str> = harvested
+            .iter()
+            .filter(|(_, hints)| hints.iter().any(|h| h == "gc_effects"))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        // `clibffi.c_ffi_call` releases the GIL; its local leaf is keyed
+        // without the crate, as a call to it is analysed.
+        assert!(
+            keys.contains(&"clibffi::__rffi_fp_c_ffi_call"),
+            "gc_effects keys: {keys:?}"
+        );
+        // `rposix_stat.c_stat` is `macro = libc::stat`; the foreign leaf
+        // keeps its crate. `rposix_stat` is `#[cfg(unix)]`.
+        if cfg!(unix) {
+            assert!(
+                keys.iter()
+                    .any(|k| k.starts_with("libc::") && k.ends_with("::stat")),
+                "gc_effects keys: {keys:?}"
+            );
+        }
+        assert!(
+            !keys.iter().any(|k| k.starts_with("majit_rlib::")),
+            "gc_effects keys: {keys:?}"
+        );
+    }
+
+    #[test]
     fn immutable_entry_list_parses_every_rank_suffix() {
         // The payload shape `#[jit_immutable_fields]` writes into
         // `_immutable_fields_<Struct>`: the declared entries joined by

@@ -3570,12 +3570,15 @@ impl UserDelAction {
                 }
                 let repr = unsafe { crate::display::py_repr_wtf8(current()) }
                     .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
-                let where_desc = crate::display::wtf8_format!(
-                    "Exception ignored while closing generator ",
-                    repr
-                );
+                let where_desc = crate::display::wtf8_format!("while closing generator ", repr);
                 error.reload(&_roots, err_slot);
-                report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
+                error.clone().write_unraisable_with_traceback(
+                    self.base.space,
+                    &where_desc,
+                    pyre_object::w_none(),
+                    true,
+                    rustpython_wtf8::Wtf8::new(""),
+                );
                 crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
             }
             return;
@@ -3617,12 +3620,15 @@ impl UserDelAction {
             // when its observable result differs from PyPy's.
             let del_repr = unsafe { crate::display::py_repr_wtf8(del()) }
                 .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_string()));
-            let where_desc = crate::display::wtf8_format!(
-                "Exception ignored while calling deallocator ",
-                del_repr
-            );
+            let where_desc = crate::display::wtf8_format!("while calling deallocator ", del_repr);
             error.reload(&_roots, err_slot);
-            report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
+            error.clone().write_unraisable_with_traceback(
+                self.base.space,
+                &where_desc,
+                pyre_object::w_none(),
+                true,
+                rustpython_wtf8::Wtf8::new(""),
+            );
         }
     }
 }

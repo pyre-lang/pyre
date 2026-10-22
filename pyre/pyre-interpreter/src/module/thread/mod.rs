@@ -2406,13 +2406,12 @@ fn spawn_thread(
                         })
                     };
                     error.reload(&_roots, error_slot);
-                    error.write_unraisable(
+                    error.write_unraisable_with_traceback(
                         w_none(),
-                        &crate::display::wtf8_format!(
-                            "Exception ignored in thread started by ",
-                            callable_repr
-                        ),
+                        &crate::display::wtf8_format!("in thread started by ", callable_repr),
                         w_none(),
+                        true,
+                        rustpython_wtf8::Wtf8::new(""),
                     );
                 }
             }

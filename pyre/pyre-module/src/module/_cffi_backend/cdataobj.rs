@@ -628,10 +628,12 @@ pub fn ec_finalizer_kind(obj: PyObjectRef) -> Option<bool> {
 /// Run [`finalize`] and write an unraisable if it raises.
 pub fn run_ec_finalize(mut obj: PyObjectRef) {
     if let Err(mut error) = pyre_object::with_roots!(obj => finalize(obj)) {
-        error.write_unraisable(
+        error.write_unraisable_with_traceback(
             pyre_object::w_none(),
-            rustpython_wtf8::Wtf8::new("Exception ignored in cffi destructor"),
+            rustpython_wtf8::Wtf8::new("in cffi destructor"),
             obj,
+            true,
+            rustpython_wtf8::Wtf8::new(""),
         );
     }
 }

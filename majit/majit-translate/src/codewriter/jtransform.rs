@@ -390,6 +390,17 @@ impl CallEffectOverride {
     }
 }
 
+/// `call.py CallControl.getcalldescr` for the threadlocalref helpers:
+/// `CollectAnalyzer` finds nothing in `support.py _ll_1_threadlocalref_get`,
+/// whose body is the `threadlocalref_get` llop (`lloperation.py`, not
+/// `canmallocgc`); the store helper is the `threadlocalref_store` llop.
+fn threadlocalref_effect_info(extra: ExtraEffect, oopspecindex: OopSpecIndex) -> EffectInfo {
+    EffectInfo {
+        can_collect: false,
+        ..EffectInfo::new(extra, oopspecindex)
+    }
+}
+
 fn effect_info_for_kind(effect: CallEffectKind) -> EffectInfo {
     match effect {
         CallEffectKind::Elidable => {
@@ -4027,6 +4038,28 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Keep
             }
+            // `jtransform.py rewrite_op_threadlocalref_get`: residual
+            // call of `support.py _ll_1_threadlocalref_get` with
+            // `OS_THREADLOCALREF_GET`. The loop-invariant flag is the
+            // second operand (`CDefinedIntSymbolic.loop_invariant`).
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "threadlocalref_get" => {
+                self.rewrite_op_threadlocalref_get(op, lhs, rhs, graph)
+            }
+            // Upstream has no `rewrite_op_threadlocalref_store`; residualize
+            // as a plain call of the registered helper.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "threadlocalref_store" => {
+                self.residual_call_threadlocalref_store(op, lhs, rhs, graph)
+            }
             // `jtransform.py` `rewrite_op_int_add_ovf` (aliased to
             // `rewrite_op_int_mul_ovf`) and `rewrite_op_int_sub_ovf` both
             // return `[SpaceOperation('-live-', [], None), op]`.  `flatten`
@@ -5406,6 +5439,89 @@ impl<'a> Transformer<'a> {
             }
             _ => RewriteResult::Keep,
         }
+    }
+
+    /// `jtransform.py rewrite_op_threadlocalref_get`.
+    ///
+    /// Residual-call `support.py _ll_1_threadlocalref_get` with
+    /// `oopspecindex=OS_THREADLOCALREF_GET`. `EF_LOOPINVARIANT` when the
+    /// flag constant is true, else `EF_CANNOT_RAISE`.
+    fn rewrite_op_threadlocalref_get(
+        &mut self,
+        op: &SpaceOperation,
+        offset: &crate::flowspace::model::Variable,
+        loop_invariant: &crate::flowspace::model::Variable,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let extra = if threadlocalref_loop_invariant_flag(graph, loop_invariant) {
+            ExtraEffect::LoopInvariant
+        } else {
+            ExtraEffect::CannotRaise
+        };
+        let target = CallTarget::function_path(["threadlocalref_get"]);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        self.stamp_value_kind(
+            graph,
+            op.result.clone(),
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        RewriteResult::Replace(vec![
+            funcptr_op,
+            SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &[majit_ir::value::Type::Int],
+                        majit_ir::value::Type::Int,
+                        threadlocalref_effect_info(extra, OopSpecIndex::ThreadlocalrefGet),
+                    ),
+                    args_i: vec![offset.clone()],
+                    args_r: vec![],
+                    args_f: vec![],
+                    result_kind: 'i',
+                    indirect_targets: None,
+                },
+            },
+        ])
+    }
+
+    /// Residual-call the `threadlocalref_store` helper. Upstream has
+    /// no `rewrite_op_threadlocalref_store`; the store stays a plain
+    /// residual call (`OopSpecIndex::None`).
+    fn residual_call_threadlocalref_store(
+        &mut self,
+        op: &SpaceOperation,
+        offset: &crate::flowspace::model::Variable,
+        value: &crate::flowspace::model::Variable,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let target = CallTarget::function_path(["threadlocalref_store"]);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+        self.stamp_value_kind(
+            graph,
+            op.result.clone(),
+            crate::codewriter::type_state::ConcreteType::Void,
+        );
+        RewriteResult::Replace(vec![
+            funcptr_op,
+            SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::CallResidual {
+                    funcptr: CallFuncPtr::Value(funcptr),
+                    descriptor: CallDescriptor::from_signature(
+                        &[majit_ir::value::Type::Int, majit_ir::value::Type::Int],
+                        majit_ir::value::Type::Void,
+                        threadlocalref_effect_info(ExtraEffect::CannotRaise, OopSpecIndex::None),
+                    ),
+                    args_i: vec![offset.clone(), value.clone()],
+                    args_r: vec![],
+                    args_f: vec![],
+                    result_kind: 'v',
+                    indirect_targets: None,
+                },
+            },
+        ])
     }
 
     /// `jtransform.py _rewrite_raw_malloc`: flavor raw of a fixed-size
@@ -15389,6 +15505,24 @@ fn is_closure_ctor_name(name: &str) -> bool {
     }
 }
 
+/// `CDefinedIntSymbolic.loop_invariant` on the offset of
+/// `llop.threadlocalref_get`. The front carries that flag as the
+/// second operand of the projected binop.
+fn threadlocalref_loop_invariant_flag(
+    graph: &FunctionGraph,
+    flag: &crate::flowspace::model::Variable,
+) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(flag)
+                && matches!(
+                    op.kind,
+                    OpKind::ConstBool(true) | OpKind::ConstInt(1) | OpKind::ConstUInt(1)
+                )
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -21880,6 +22014,83 @@ mod tests {
                 .operations
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::ConstFnAddr { value: 0x1234, .. }))
+        );
+    }
+
+    #[test]
+    fn threadlocalref_get_projects_to_loop_invariant_residual() {
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "majit_rlib::rthread::threadlocalref_get_int"
+            ),
+            Some(crate::front::mir::ThreadLocalRefLlop::Get)
+        );
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "majit_rlib::rthread::tlfield_getraw_int"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "other::rthread::threadlocalref_get_int"
+            ),
+            None
+        );
+        assert_eq!(
+            crate::front::mir::host_rthread_threadlocalref_llop(
+                "majit_rlib::rthread::threadlocalref_store_int"
+            ),
+            Some(crate::front::mir::ThreadLocalRefLlop::Store)
+        );
+
+        let mut cc = crate::call::CallControl::new();
+        cc.register_macro_helper_trace_fnaddr("majit_metainterp::threadlocalref_get", 0xBEEF);
+        let mut graph = FunctionGraph::new("threadlocalref_get_test");
+        let offset = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(240), true)
+            .unwrap();
+        let flag = graph
+            .push_op_var(graph.startblock, OpKind::ConstBool(true), true)
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "threadlocalref_get".into(),
+                    lhs: offset.clone(),
+                    rhs: flag,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let descriptor = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    descriptor,
+                    args_i,
+                    result_kind,
+                    ..
+                } if *result_kind == 'i' && args_i == &vec![offset.clone()] => Some(descriptor),
+                _ => None,
+            })
+            .expect("threadlocalref_get must become CallResidual");
+        assert_eq!(
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::ThreadlocalrefGet
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::LoopInvariant
         );
     }
 

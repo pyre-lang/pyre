@@ -33,6 +33,8 @@ pub mod rffi;
 #[allow(non_snake_case)]
 pub mod rlocale;
 #[cfg(unix)]
+pub mod rmarshal;
+#[cfg(unix)]
 pub mod rmmap;
 #[cfg(unix)]
 pub mod rpoll;
@@ -41,6 +43,8 @@ pub mod rposix;
 pub mod rposix_environ;
 #[cfg(unix)]
 pub mod rposix_stat;
+#[cfg(unix)]
+pub mod rsandbox;
 #[cfg(unix)]
 pub mod rsignal;
 #[cfg(any(unix, windows))]

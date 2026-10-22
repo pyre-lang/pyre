@@ -53,13 +53,17 @@ rustpython-wtf8 = { workspace = true }
 # `_ctypes`'s Windows-only helpers still come from host_env.
 rustpython-host_env = { workspace = true, optional = true, features = ["ctypes"] }
 # `faulthandler`'s vectored exception handler returns
-# `EXCEPTION_CONTINUE_SEARCH`. Same 0.61 line as pyre-interpreter so
+# `EXCEPTION_CONTINUE_SEARCH`; `_cffi_backend.errorbox` shows its dialog
+# from a `CreateThread` thread with `MessageBoxW`. Same 0.61 line as pyre-interpreter so
 # HANDLE types stay one package instance.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
     "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # `_overlapped.CreateEvent` builds the `WideCString` name
 # `rustpython_host_env::winapi::create_event_w` takes.

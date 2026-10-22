@@ -7,6 +7,7 @@ repository.workspace = true
 description = "RPython-style sandbox protocol, virtual filesystem and controller for pyre"
 
 [dependencies]
+majit-rlib = { workspace = true }
 parking_lot = { workspace = true }
 libc = { workspace = true }
 indexmap = { workspace = true }

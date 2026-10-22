@@ -622,22 +622,23 @@ fn filename_of(w_filename: PyObjectRef) -> Result<std::ffi::OsString, PyError> {
 }
 
 /// `rffi.cast(DLLHANDLE, handle)` — the raw address is the handle.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn adopt_raw_handle(handle: *mut u8) -> Result<usize, PyError> {
     Ok(handle as usize)
 }
 
 /// A build without a loader has no handle to hand back, and answering `0`
 /// would name a library whose every symbol is missing.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn adopt_raw_handle(_handle: *mut u8) -> Result<usize, PyError> {
     Err(PyError::os_error(
         "dlopen() cannot adopt a raw 'void *' handle in this build",
     ))
 }
 
-/// `rdynload.dlopen`, whose mode defaults to resolving everything now.
-#[cfg(unix)]
+/// `rdynload.dlopen` and `wrap_dlopenerror`. On Windows a str name reaches
+/// the loader as `space.utf8_w`; every other name is `space.fsencode_w`.
+#[cfg(any(unix, windows))]
 fn open_library(
     w_filename: PyObjectRef,
     is_none: bool,
@@ -646,13 +647,17 @@ fn open_library(
 ) -> Result<usize, PyError> {
     let name = if is_none {
         None
+    } else if cfg!(windows) && unsafe { pyre_interpreter::isinstance_str_w(w_filename) } {
+        // `space.utf8_w`: the internal (WTF-8) bytes, lone surrogates kept.
+        Some(
+            pyre_interpreter::baseobjspace::text_wtf8_w(w_filename)?
+                .as_bytes()
+                .to_vec(),
+        )
     } else {
-        Some(filename_of(w_filename)?)
+        Some(pyre_interpreter::gateway::fsencode_bytes_w(w_filename)?)
     };
-    let bytes = name
-        .as_ref()
-        .map(|n| std::os::unix::ffi::OsStrExt::as_bytes(n.as_os_str()));
-    majit_rlib::rdynload::dlopen(bytes, flags as majit_rlib::rdynload::INT)
+    majit_rlib::rdynload::dlopen(name.as_deref(), flags as majit_rlib::rdynload::INT)
         .map(|handle| handle as usize)
         .map_err(|e| match e {
             majit_rlib::rdynload::DLOpenError::Message(msg) => PyError::os_error(format!(
@@ -668,25 +673,6 @@ fn open_library(
                 )
             }
         })
-}
-
-#[cfg(windows)]
-fn open_library(
-    w_filename: PyObjectRef,
-    is_none: bool,
-    _flags: i64,
-    fname: &str,
-) -> Result<usize, PyError> {
-    if is_none {
-        return Err(PyError::os_error("cannot use None"));
-    }
-    let name = filename_of(w_filename)?;
-    rustpython_host_env::ctypes::open_library(&name).map_err(|e| {
-        PyError::os_error(format!(
-            "cannot load library {fname}: {}",
-            pyre_interpreter::with_causes(&e)
-        ))
-    })
 }
 
 #[cfg(not(any(unix, windows)))]

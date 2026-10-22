@@ -11106,10 +11106,12 @@ impl SimpleBufferBytes {
         if let Err(mut error) =
             pyre_object::with_roots!(view => crate::builtins::memoryview_release(&[view]))
         {
-            error.write_unraisable(
+            error.write_unraisable_with_traceback(
                 pyre_object::w_none(),
-                Wtf8::new("Exception ignored in __release_buffer__"),
+                Wtf8::new("in __release_buffer__"),
                 view,
+                true,
+                Wtf8::new(""),
             );
         }
     }
@@ -25381,14 +25383,11 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
         }
         .unwrap_or_else(|_| Wtf8Buf::from_string("<async_generator object>".to_owned()));
         err.reload(&_roots, err_slot);
-        let where_desc = crate::display::wtf8_format!(
-            "Exception ignored while finalizing async generator ",
-            repr
-        );
+        let where_desc = crate::display::wtf8_format!("while finalizing async generator ", repr);
         if let Some(slot) = exc_slot {
             err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(slot));
         }
-        err.write_unraisable(w_none(), &where_desc, w_none());
+        err.write_unraisable_with_traceback(w_none(), &where_desc, w_none(), true, Wtf8::new(""));
     }
 }
 
@@ -25405,8 +25404,7 @@ fn warn_unawaited_coroutine(mut gen_obj: PyObjectRef) {
     let repr =
         unsafe { pyre_object::with_roots!(gen_obj => crate::display::py_repr_wtf8(gen_obj)) }
             .unwrap_or_else(|_| Wtf8Buf::from_string("<coroutine object>".to_string()));
-    let where_desc =
-        crate::display::wtf8_format!("Exception ignored while finalizing coroutine ", repr);
+    let where_desc = crate::display::wtf8_format!("while finalizing coroutine ", repr);
 
     let w_warnings =
         pyre_object::with_roots!(gen_obj => crate::importing::get_sys_module("warnings"));
@@ -25423,7 +25421,13 @@ fn warn_unawaited_coroutine(mut gen_obj: PyObjectRef) {
             let exc = pyre_object::with_roots!(gen_obj => err.to_exc_object());
             let is_runtime_warning = crate::builtins::lookup_exc_class("RuntimeWarning")
                 .is_some_and(|cls| unsafe { isinstance_w(exc, cls) });
-            pyre_object::with_roots!(gen_obj => err.write_unraisable(w_none(), &where_desc, gen_obj));
+            pyre_object::with_roots!(gen_obj => err.write_unraisable_with_traceback(
+                w_none(),
+                &where_desc,
+                gen_obj,
+                true,
+                Wtf8::new(""),
+            ));
             is_runtime_warning
         }
         None => false,
@@ -25440,7 +25444,13 @@ fn warn_unawaited_coroutine(mut gen_obj: PyObjectRef) {
         let w_message = pyre_object::w_str_from_wtf8_managed(message);
         if let Err(mut err) = pyre_object::with_roots!(gen_obj => crate::warn::warn_category_w(w_message, "RuntimeWarning", 1))
         {
-            err.write_unraisable(w_none(), &where_desc, gen_obj);
+            err.write_unraisable_with_traceback(
+                w_none(),
+                &where_desc,
+                gen_obj,
+                true,
+                Wtf8::new(""),
+            );
         }
     }
 }

@@ -98,42 +98,26 @@ pub unsafe fn w_library_dealloc(obj: PyObjectRef) {
     close_lib(unsafe { &mut *(obj as *mut W_Library) });
 }
 
-#[cfg(unix)]
+/// `rdynload.dlclose`.
+#[cfg(any(unix, windows))]
 pub(crate) fn drop_library(handle: usize) {
     let _ = unsafe { majit_rlib::rdynload::dlclose(handle as majit_rlib::rdynload::DLLHANDLE) };
-}
-
-#[cfg(windows)]
-pub(crate) fn drop_library(handle: usize) {
-    rustpython_host_env::ctypes::drop_library(handle);
 }
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn drop_library(_handle: usize) {}
 
-/// `rdynload.dlsym`, split the way the host loader splits it: a function
-/// address and a data address are looked up differently on Windows.
-pub(crate) fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usize> {
-    #[cfg(unix)]
+/// `rdynload.dlsym`.
+pub(crate) fn dlsym(handle: usize, name: &str) -> Option<usize> {
+    #[cfg(any(unix, windows))]
     {
-        let _ = is_function;
         majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, name.as_bytes())
             .ok()
             .map(|address| address as usize)
     }
-    #[cfg(windows)]
-    {
-        let symbol = name.as_bytes();
-        let address = if is_function {
-            rustpython_host_env::ctypes::lookup_function_symbol_addr(handle, symbol)
-        } else {
-            rustpython_host_env::ctypes::lookup_data_symbol_addr(handle, symbol)
-        };
-        address.ok().filter(|&a| a != 0)
-    }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (handle, name, is_function);
+        let _ = (handle, name);
         None
     }
 }
@@ -157,7 +141,7 @@ fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // borrow a GC string across that call, and reload `w_ctype` from its root.
     let handle = lib.handle as usize;
     let lib_name = lib.name().to_owned();
-    let Some(address) = pyre_object::with_roots!(w_ctype => dlsym(handle, &name, true)) else {
+    let Some(address) = pyre_object::with_roots!(w_ctype => dlsym(handle, &name)) else {
         return Err(PyError::attribute_error(format!(
             "function/symbol '{name}' not found in library '{lib_name}'"
         )));
@@ -207,7 +191,7 @@ fn variable_address(lib: &W_Library, name: &str) -> Result<*const u8, PyError> {
     let name = name.to_owned();
     let handle = lib.handle as usize;
     let lib_name = lib.name().to_owned();
-    dlsym(handle, &name, false)
+    dlsym(handle, &name)
         .map(|address| address as *const u8)
         .ok_or_else(|| {
             PyError::key_error(format!(

@@ -14,32 +14,34 @@ use crate::{_rsocket_rffi, rwin32};
 
 /// `rposix._get_errno`.
 pub fn _get_errno() -> i32 {
-    unsafe { *rthread::tlfield_p_errno() }
+    unsafe { *(rthread::threadlocalref_get_int(rthread::TLFIELD_P_ERRNO_OFS, true) as *mut i32) }
 }
 
 /// `rposix._set_errno`.
 pub fn _set_errno(errno: i32) {
-    unsafe { *rthread::tlfield_p_errno() = errno };
+    unsafe {
+        *(rthread::threadlocalref_get_int(rthread::TLFIELD_P_ERRNO_OFS, true) as *mut i32) = errno
+    };
 }
 
 /// `rposix.get_saved_errno`.
 pub fn get_saved_errno() -> i32 {
-    rthread::tlfield_getraw_int(rthread::TLFIELD_RPY_ERRNO_OFS)
+    rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32
 }
 
 /// `rposix.set_saved_errno`.
 pub fn set_saved_errno(errno: i32) {
-    rthread::tlfield_setraw_int(rthread::TLFIELD_RPY_ERRNO_OFS, errno);
+    rthread::threadlocalref_store_int(rthread::TLFIELD_RPY_ERRNO_OFS, errno as i64);
 }
 
 /// `rposix.get_saved_alterrno`.
 pub fn get_saved_alterrno() -> i32 {
-    rthread::tlfield_getraw_int(rthread::TLFIELD_ALT_ERRNO_OFS)
+    rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32
 }
 
 /// `rposix.set_saved_alterrno`.
 pub fn set_saved_alterrno(errno: i32) {
-    rthread::tlfield_setraw_int(rthread::TLFIELD_ALT_ERRNO_OFS, errno);
+    rthread::threadlocalref_store_int(rthread::TLFIELD_ALT_ERRNO_OFS, errno as i64);
 }
 
 /// Stdio fds that were EBADF before rustc `sanitize_standard_fds` reopened
@@ -113,9 +115,13 @@ pub fn restore_closed_standard_fds() {}
 pub fn _errno_before(save_err: i64) {
     if save_err & RFFI_READSAVED_ERRNO != 0 {
         if save_err & RFFI_ALT_ERRNO != 0 {
-            _set_errno(rthread::tlfield_getraw_int(rthread::TLFIELD_ALT_ERRNO_OFS));
+            _set_errno(
+                rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_ERRNO_OFS, false) as i32,
+            );
         } else {
-            _set_errno(rthread::tlfield_getraw_int(rthread::TLFIELD_RPY_ERRNO_OFS));
+            _set_errno(
+                rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_ERRNO_OFS, false) as i32,
+            );
         }
     } else if save_err & RFFI_ZERO_ERRNO_BEFORE != 0 {
         _set_errno(0);
@@ -123,9 +129,9 @@ pub fn _errno_before(save_err: i64) {
     #[cfg(target_os = "windows")]
     if save_err & RFFI_READSAVED_LASTERROR != 0 {
         let err = if save_err & RFFI_ALT_ERRNO != 0 {
-            rthread::tlfield_getraw_int(rthread::TLFIELD_ALT_LASTERROR_OFS)
+            rthread::threadlocalref_get_int(rthread::TLFIELD_ALT_LASTERROR_OFS, false) as i32
         } else {
-            rthread::tlfield_getraw_int(rthread::TLFIELD_RPY_LASTERROR_OFS)
+            rthread::threadlocalref_get_int(rthread::TLFIELD_RPY_LASTERROR_OFS, false) as i32
         };
         // careful, getraw() overwrites GetLastError.
         // We must assign it with _SetLastError() as the last
@@ -150,23 +156,22 @@ pub fn _errno_after(save_err: i64) {
             None
         };
         if let Some(err) = err {
-            let ofs = if save_err & RFFI_ALT_ERRNO != 0 {
-                rthread::TLFIELD_ALT_LASTERROR_OFS
+            if save_err & RFFI_ALT_ERRNO != 0 {
+                rthread::threadlocalref_store_int(rthread::TLFIELD_ALT_LASTERROR_OFS, err as i64);
             } else {
-                rthread::TLFIELD_RPY_LASTERROR_OFS
-            };
-            rthread::tlfield_setraw_int(ofs, err);
+                rthread::threadlocalref_store_int(rthread::TLFIELD_RPY_LASTERROR_OFS, err as i64);
+            }
         }
     }
     #[cfg(not(target_os = "windows"))]
     let _ = (RFFI_SAVE_LASTERROR, RFFI_SAVE_WSALASTERROR);
     if save_err & RFFI_SAVE_ERRNO != 0 {
-        let ofs = if save_err & RFFI_ALT_ERRNO != 0 {
-            rthread::TLFIELD_ALT_ERRNO_OFS
+        let value = _get_errno() as i64;
+        if save_err & RFFI_ALT_ERRNO != 0 {
+            rthread::threadlocalref_store_int(rthread::TLFIELD_ALT_ERRNO_OFS, value);
         } else {
-            rthread::TLFIELD_RPY_ERRNO_OFS
-        };
-        rthread::tlfield_setraw_int(ofs, _get_errno());
+            rthread::threadlocalref_store_int(rthread::TLFIELD_RPY_ERRNO_OFS, value);
+        }
     }
 }
 
@@ -391,6 +396,41 @@ crate::rffi::llexternal!(
     macro = libc::lseek
 );
 
+/// `rposix.handle_posix_error` — `widen` then `result < 0` reads
+/// `get_saved_errno`. The RPython `name` is the OSError message; callers
+/// here receive the errno.
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn handle_posix_error(result: i64) -> Result<i64, i32> {
+    if result < 0 {
+        Err(get_saved_errno())
+    } else {
+        Ok(result)
+    }
+}
+
+/// `rposix.close` (`replace_os_function('close')`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("close")]
+pub fn close(fd: i32) -> Result<(), i32> {
+    let _iph = SuppressIPH::new();
+    handle_posix_error(unsafe { c_close(fd) } as i64).map(|_| ())
+}
+
+/// `rposix.lseek` (`replace_os_function('lseek')`). `how` 0/1/2 is remapped
+/// through `SEEK_SET`/`SEEK_CUR`/`SEEK_END` when those constants exist.
+#[cfg(unix)]
+#[majit_macros::replace_os_function("lseek")]
+pub fn lseek(fd: i32, pos: i64, how: i32) -> Result<i64, i32> {
+    let _iph = SuppressIPH::new();
+    let how = match how {
+        0 => libc::SEEK_SET,
+        1 => libc::SEEK_CUR,
+        2 => libc::SEEK_END,
+        other => other,
+    };
+    handle_posix_error(unsafe { c_lseek(fd, pos, how) } as i64)
+}
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_dup = "dup",
@@ -425,6 +465,34 @@ crate::rffi::llexternal!(
     compilation_info = POSIX_ECI
 );
 
+/// `rposix.isatty` (`replace_os_function('isatty')`) — `c_isatty(fd) != 0`.
+#[cfg(unix)]
+#[majit_macros::replace_os_function("isatty")]
+pub fn isatty(fd: i32) -> bool {
+    let _iph = SuppressIPH::new();
+    unsafe { c_isatty(fd) != 0 }
+}
+
+/// `rposix.open` (`replace_os_function('open')`). The path has no NUL;
+/// callers reject an embedded one (`bytesbuf0_w` / `fsencode_path_*`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("open")]
+pub fn open(path: &[u8], flags: i32, mode: i32) -> Result<i32, i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    let fd = unsafe { c_open(c_path.as_ptr(), flags, mode as _) };
+    handle_posix_error(fd as i64).map(|fd| fd as i32)
+}
+
+/// `rposix.access` (`replace_os_function('access')`) — `c_access(...) == 0`.
+#[cfg(unix)]
+#[majit_macros::replace_os_function("access")]
+pub fn access(path: &[u8], mode: i32) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    unsafe { c_access(c_path.as_ptr(), mode) == 0 }
+}
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_unlink = "unlink",
@@ -443,10 +511,26 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+/// `rposix.unlink` (`replace_os_function('unlink')`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("unlink")]
+pub fn unlink(path: &[u8]) -> Result<(), i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    handle_posix_error(unsafe { c_unlink(c_path.as_ptr()) } as i64).map(|_| ())
+}
+
+/// `rposix.mkdir` (`replace_os_function('mkdir')`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("mkdir")]
+pub fn mkdir(path: &[u8], mode: i32) -> Result<(), i32> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
+    handle_posix_error(unsafe { c_mkdir(c_path.as_ptr(), mode as libc::mode_t) } as i64).map(|_| ())
+}
+
 // `rposix_stat.c_fstat` is `macro=True` and saves errno. The call is
 // `libc::fstat`, which already carries the inode64 symbol. Includes are
 // `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; this
-// call does not use it). `c_stat` / `c_lstat` live in `rposix_stat`.
+// call does not use it). `c_stat` / `c_lstat` / `c_fstat` live in `rposix_stat`.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const STAT_ECI = {
@@ -454,19 +538,9 @@ crate::rffi::external_compilation_info! {
     };
 }
 
+// Tests below still name `rposix::c_stat` / `c_lstat` / `c_fstat`.
 #[cfg(unix)]
-crate::rffi::llexternal!(
-    pub c_fstat = "fstat",
-    [crate::rffi::INT, *mut libc::stat],
-    crate::rffi::INT,
-    compilation_info = STAT_ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::fstat
-);
-
-// `host_seam` and the tests below still name `rposix::c_stat` / `c_lstat`.
-#[cfg(unix)]
-pub use crate::rposix_stat::{c_lstat, c_stat};
+pub use crate::rposix_stat::{c_fstat, c_lstat, c_stat};
 
 // `rposix_stat.c_fstatvfs` / `c_statvfs` save errno and are not `macro=True`.
 #[cfg(all(unix, not(target_os = "redox")))]
@@ -569,6 +643,42 @@ crate::rffi::llexternal!(
     libc::gid_t,
     compilation_info = POSIX_ECI
 );
+
+/// `rposix.py` `widen_uid` — `rffi.cast(lltype.Unsigned, x)`.
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn widen_uid(x: libc::uid_t) -> u64 {
+    x as u64
+}
+
+/// `rposix.py` `widen_gid` — alias of `widen_uid`.
+#[cfg(all(unix, not(feature = "sandbox")))]
+fn widen_gid(x: libc::gid_t) -> u64 {
+    x as u64
+}
+
+#[cfg(unix)]
+#[majit_macros::replace_os_function("getuid")]
+pub fn getuid() -> u64 {
+    widen_uid(unsafe { c_getuid() })
+}
+
+#[cfg(unix)]
+#[majit_macros::replace_os_function("geteuid")]
+pub fn geteuid() -> u64 {
+    widen_uid(unsafe { c_geteuid() })
+}
+
+#[cfg(unix)]
+#[majit_macros::replace_os_function("getgid")]
+pub fn getgid() -> u64 {
+    widen_gid(unsafe { c_getgid() })
+}
+
+#[cfg(unix)]
+#[majit_macros::replace_os_function("getegid")]
+pub fn getegid() -> u64 {
+    widen_gid(unsafe { c_getegid() })
+}
 
 #[cfg(unix)]
 crate::rffi::llexternal!(
@@ -3346,6 +3456,45 @@ mod tests {
         assert_eq!(unsafe { c_geteuid() }, unsafe { libc::geteuid() });
         assert_eq!(unsafe { c_getgid() }, unsafe { libc::getgid() });
         assert_eq!(unsafe { c_getegid() }, unsafe { libc::getegid() });
+        assert_eq!(getuid(), unsafe { c_getuid() } as u64);
+        assert_eq!(geteuid(), unsafe { c_geteuid() } as u64);
+        assert_eq!(getgid(), unsafe { c_getgid() } as u64);
+        assert_eq!(getegid(), unsafe { c_getegid() } as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_wrappers_match_c_externals() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("pyre-rffi-wrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        mkdir(dir.as_os_str().as_bytes(), 0o700).unwrap();
+        assert!(access(dir.as_os_str().as_bytes(), libc::F_OK));
+        let st = crate::rposix_stat::stat(dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(st.st_mode as libc::mode_t & libc::S_IFMT, libc::S_IFDIR);
+        let path = dir.join("f");
+        let fd = open(
+            path.as_os_str().as_bytes(),
+            libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+            0o600,
+        )
+        .unwrap();
+        assert!(fd >= 0);
+        assert!(!isatty(fd));
+        assert_eq!(
+            unsafe { c_write(fd, b"xy".as_ptr() as *mut libc::c_void, 2) },
+            2
+        );
+        assert_eq!(lseek(fd, 0, 0).unwrap(), 0);
+        assert_eq!(lseek(fd, 0, libc::SEEK_END).unwrap(), 2);
+        let fst = crate::rposix_stat::fstat(fd).unwrap();
+        assert_eq!(fst.st_size, 2);
+        close(fd).unwrap();
+        assert!(close(fd).is_err());
+        assert!(access(path.as_os_str().as_bytes(), libc::R_OK));
+        unlink(path.as_os_str().as_bytes()).unwrap();
+        assert!(!access(path.as_os_str().as_bytes(), libc::F_OK));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

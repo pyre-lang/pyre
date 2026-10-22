@@ -28,6 +28,7 @@ use syn::{
 mod jit_interp;
 mod jit_struct;
 mod rffi_expand;
+mod sandbox_replace;
 mod virtualizable;
 
 /// `llexternal` (`rffi.py`): funcptr, `ccall_<name>`, and the forwarding wrapper.
@@ -2620,6 +2621,23 @@ pub fn dont_look_inside_cannot_raise(attr: TokenStream, item: TokenStream) -> To
         Err(err) => return err,
     };
     expand_dont_look_inside_attribute(item, "dont_look_inside_cannot_raise", &word_enums)
+}
+
+/// `rposix.py` `replace_os_function` — `register_replacement_for` with
+/// `sandboxed_name='ll_os.ll_os_%s'`. Under `feature = "sandbox"` the
+/// body is `rsandbox.py` `make_sandbox_trampoline`; otherwise the original
+/// body is kept.
+#[proc_macro_attribute]
+pub fn replace_os_function(attr: TokenStream, item: TokenStream) -> TokenStream {
+    sandbox_replace::expand_replace_os_function(attr, item)
+}
+
+/// `rtime.py` `replace_time_function` — `register_replacement_for` with
+/// `sandboxed_name='ll_time.ll_time_%s'`. Same trampoline selection as
+/// [`replace_os_function`].
+#[proc_macro_attribute]
+pub fn replace_time_function(attr: TokenStream, item: TokenStream) -> TokenStream {
+    sandbox_replace::expand_replace_time_function(attr, item)
 }
 
 /// `word_enums(CompareOp, CallMode)` lists fieldless enums a residual call

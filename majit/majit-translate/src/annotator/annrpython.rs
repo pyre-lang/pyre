@@ -2799,6 +2799,19 @@ impl RPythonAnnotator {
                         "signext" if sp.args.len() == 2 => Some(SomeValue::Integer(
                             super::model::SomeInteger::new(false, false),
                         )),
+                        // `llop.threadlocalref_get` (`ThreadLocalField.getraw`).
+                        // Flowspace has no operator of that name; bind the
+                        // FIELDTYPE word so rtype sees Signed rather than
+                        // Impossible/Void.
+                        "threadlocalref_get" if sp.args.len() == 2 => Some(SomeValue::Integer(
+                            super::model::SomeInteger::new(false, false),
+                        )),
+                        // `llop.threadlocalref_store` (`ThreadLocalField.setraw`).
+                        "threadlocalref_store" if sp.args.len() == 2 => Some(
+                            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                            ),
+                        ),
                         _ => None,
                     }
                 };

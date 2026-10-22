@@ -7406,6 +7406,20 @@ pub extern "C" fn _ll_1_cast_uint_to_float(x: i64) -> f64 {
     cast_uint_to_float(x)
 }
 
+/// `support.py _ll_1_threadlocalref_get(TP, offset)`.
+/// `jtransform.py rewrite_op_threadlocalref_get` residual-calls this
+/// helper with `OS_THREADLOCALREF_GET`.
+pub fn threadlocalref_get(offset: i64) -> i64 {
+    majit_rlib::rthread::threadlocalref_get(offset as usize)
+}
+
+/// Residual helper for `llop.threadlocalref_store`
+/// (`rthread.py ThreadLocalField.setraw`). Upstream has no
+/// `rewrite_op_threadlocalref_store`; the store is a plain residual call.
+pub fn threadlocalref_store(offset: i64, value: i64) {
+    majit_rlib::rthread::threadlocalref_store_int(offset as usize, value);
+}
+
 /// Residual-call ABI for [`cast_float_to_uint`]. `jtransform.py`
 /// `rewrite_op_cast_float_to_uint = _do_builtin_call`.
 pub extern "C" fn _ll_1_cast_float_to_uint(f: f64) -> i64 {

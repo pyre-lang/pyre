@@ -497,13 +497,12 @@ impl W_Profiler {
                 let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_callable) };
                 err.reload(&_roots, slot);
                 let repr = repr.unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
-                err.write_unraisable(
+                err.write_unraisable_with_traceback(
                     w_none(),
-                    &pyre_interpreter::wtf8_format!(
-                        "Exception ignored while calling _lsprof timer ",
-                        repr
-                    ),
+                    &pyre_interpreter::wtf8_format!("while calling _lsprof timer ", repr),
                     w_none(),
+                    true,
+                    rustpython_wtf8::Wtf8::new(""),
                 );
                 0
             }

@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::protocol::{SandboxError, SandboxResult, code_for_error};
-use crate::rmarshal::{
-    IntFlavor, Loader, MarshalValue, ReadNeedMore, dump_int, dump_longlong_result, dump_statresult,
-    dump_value, load_string, load_value,
+use crate::vfs::{self, FsNode, GID, ReadSeek, UID};
+use majit_rlib::rmarshal::{
+    IntFlavor, Loader, MarshalValue, ReadNeedMore, StatResult, dump_int, dump_longlong_result,
+    dump_statresult, dump_value, load_string, load_value,
 };
-use crate::vfs::{self, FsNode, GID, ReadSeek, StatResult, UID};
+use majit_rlib::rsandbox::{SandboxError, SandboxResult, code_for_error};
 
 // sandlib.py `virtual_fd_range = range(3, 50)`.
 const FD_RANGE_START: i32 = 3;
@@ -1083,8 +1083,8 @@ mod tests {
         // through the loop, and decode the reply.
         let mut p = SandboxPolicy::new(files_root(), "/tmp", vec![], false);
         let mut request = Vec::new();
-        crate::rmarshal::dump_string(&mut request, b"ll_os.ll_os_getcwd");
-        crate::rmarshal::dump_tuple(&mut request, &[], IntFlavor::Rmarshal);
+        majit_rlib::rmarshal::dump_string(&mut request, b"ll_os.ll_os_getcwd");
+        majit_rlib::rmarshal::dump_tuple(&mut request, &[], IntFlavor::Rmarshal);
 
         let mut replies: Vec<u8> = Vec::new();
         let (i, mut o, mut e) = no_console();
@@ -1100,8 +1100,8 @@ mod tests {
         }
         // reply = success int 0, then the cwd string.
         let mut ld = Loader::from_bytes(replies);
-        assert_eq!(crate::rmarshal::load_int(&mut ld).unwrap(), 0);
-        assert_eq!(crate::rmarshal::load_string(&mut ld).unwrap(), b"/tmp");
+        assert_eq!(majit_rlib::rmarshal::load_int(&mut ld).unwrap(), 0);
+        assert_eq!(majit_rlib::rmarshal::load_string(&mut ld).unwrap(), b"/tmp");
         ld.check_finished().unwrap();
     }
 

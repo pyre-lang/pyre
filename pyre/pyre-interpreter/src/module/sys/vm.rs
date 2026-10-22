@@ -1517,34 +1517,32 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     let mut w_value = pyre_object::with_roots!(w_hookargs, w_type => crate::baseobjspace::getattr_str(w_hookargs, "exc_value"))?;
     let mut w_tb = pyre_object::with_roots!(w_hookargs, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "exc_traceback"))?;
     let mut w_err_msg = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "err_msg"))?;
+    // `vm.py unraisablehook` uses `space.text_w` on `err_msg`. A `None`
+    // message stays `None` (`test_sys.py` `assertIsNone(hook_args.err_msg)`),
+    // and `write_unraisable_exc_file` writes a non-str through
+    // `PyFile_WriteObject(..., Py_PRINT_RAW)`.
     let err_msg = if unsafe { pyre_object::is_none(w_err_msg) } {
-        rustpython_wtf8::Wtf8Buf::new()
+        None
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
-        unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf()
+        Some(unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf())
     } else {
-        pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?
+        Some(pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?)
     };
-    let mut w_object = pyre_object::with_roots!(w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
-    // `vm.py unraisablehook` reads `extra_line` off the hook args. A 5-tuple
-    // `sys.UnraisableHookArgs` construction leaves the hidden field unset.
-    let extra_line = pyre_object::with_roots!(w_hookargs, w_object, w_tb, w_type, w_value => {
-        match crate::baseobjspace::getattr_str(w_hookargs, "extra_line") {
-            Ok(w) if !w.is_null() && unsafe { pyre_object::is_str(w) } => {
-                crate::baseobjspace::str_utf8_w(w)
-                    .map(str::to_string)
-                    .unwrap_or_default()
-            }
-            _ => String::new(),
-        }
-    });
+    let mut w_object = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
+    // `vm.py unraisablehook`: `space.text_w(space.getattr(w_hookargs,
+    // space.newtext("extra_line")))`. `app_hookargs` `UnraisableHookArgs`
+    // `extra_line` is a hidden field whose `_structseq.py` default is
+    // `make_none`; `text_w` rejects that `None`.
+    let w_extra_line = pyre_object::with_roots!(w_object, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "extra_line"))?;
+    let extra_line = crate::baseobjspace::text_wtf8_w(w_extra_line)?.to_wtf8_buf();
     crate::PyError::write_unraisable_default(
         w_none(),
         w_type,
         w_value,
         w_tb,
-        &err_msg,
+        err_msg.as_deref(),
         w_object,
-        extra_line.as_str(),
+        &extra_line,
     );
     Ok(w_none())
 }

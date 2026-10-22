@@ -24,6 +24,7 @@ pub mod ctypeobj;
 pub mod ctypeprim;
 pub mod ctypeptr;
 pub mod ctypestruct;
+pub mod errorbox;
 pub mod ffi_obj;
 pub mod func;
 pub mod handle;

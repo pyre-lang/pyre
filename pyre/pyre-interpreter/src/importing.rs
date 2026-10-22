@@ -41,26 +41,16 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 pub mod host {
     #[cfg(all(unix, not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pub mod fs {
-        use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
         use std::path::Path;
 
-        fn path_c(path: &Path) -> std::io::Result<CString> {
-            CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
-        }
-
         pub fn read(path: &Path) -> std::io::Result<Vec<u8>> {
-            let c_path = path_c(path)?;
             let flags = libc::O_RDONLY | libc::O_CLOEXEC;
             let fd = loop {
-                let fd = unsafe { majit_rlib::rposix::c_open(c_path.as_ptr(), flags, 0 as _) };
-                if fd >= 0 {
-                    break fd;
-                }
-                let err = majit_rlib::rposix::get_saved_errno();
-                if err != libc::EINTR {
-                    return Err(std::io::Error::from_raw_os_error(err));
+                match majit_rlib::rposix::open(path.as_os_str().as_bytes(), flags, 0) {
+                    Ok(fd) => break fd,
+                    Err(err) if err == libc::EINTR => continue,
+                    Err(err) => return Err(std::io::Error::from_raw_os_error(err)),
                 }
             };
             let mut out = Vec::new();
@@ -474,9 +464,9 @@ struct SeamSourceProvider;
 impl SeamSourceProvider {
     fn stat_mode(path: &Path) -> Option<u32> {
         use std::os::unix::ffi::OsStrExt;
-        crate::host_seam::ops::stat(path.as_os_str().as_bytes())
+        majit_rlib::rposix_stat::stat(path.as_os_str().as_bytes())
             .ok()
-            .map(|s| s.mode)
+            .map(|s| s.st_mode as u32)
     }
 }
 
@@ -497,19 +487,25 @@ impl SourceProvider for SeamSourceProvider {
             }
         }
         let bytes = path.as_os_str().as_bytes();
-        let fd = crate::host_seam::ops::open(bytes, libc::O_RDONLY, 0).map_err(to_io)?;
+        let fd = loop {
+            match majit_rlib::rposix::open(bytes, libc::O_RDONLY | libc::O_CLOEXEC, 0) {
+                Ok(fd) => break fd,
+                Err(err) if err == libc::EINTR => continue,
+                Err(err) => return Err(std::io::Error::from_raw_os_error(err)),
+            }
+        };
         let mut data = Vec::new();
         loop {
             match crate::host_seam::ops::read(fd, 65536) {
                 Ok(chunk) if chunk.is_empty() => break,
                 Ok(chunk) => data.extend_from_slice(&chunk),
                 Err(e) => {
-                    let _ = crate::host_seam::ops::close(fd);
+                    let _ = majit_rlib::rposix::close(fd);
                     return Err(to_io(e));
                 }
             }
         }
-        let _ = crate::host_seam::ops::close(fd);
+        let _ = majit_rlib::rposix::close(fd);
         Ok(data)
     }
 }

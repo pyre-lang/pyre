@@ -13,8 +13,7 @@
 //! Both *decoders* accept either int tag, which is why the wire interoperates.
 //! [`IntFlavor`] selects the encoder convention; the loaders accept both.
 
-use crate::protocol::{SandboxError, SandboxResult};
-use crate::vfs::StatResult;
+use crate::rsandbox::{SandboxError, SandboxResult};
 
 // rmarshal.py:71-80
 pub const TYPE_NONE: u8 = b'N';
@@ -53,6 +52,70 @@ pub enum MarshalValue {
     Tuple(Vec<MarshalValue>),
     List(Vec<MarshalValue>),
     Dict(Vec<(MarshalValue, MarshalValue)>),
+}
+
+/// 10-field wire `os.stat_result` (`vfs.py` `StatResult`, format
+/// `"iIIiiiIfff"` in `sandlib.py` `RESULTTYPE_STATRESULT`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatResult {
+    pub st_mode: u32,
+    pub st_ino: u64,
+    pub st_dev: u64,
+    pub st_nlink: u64,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_size: u64,
+    pub st_atime: i64,
+    pub st_mtime: i64,
+    pub st_ctime: i64,
+}
+
+/// Argument side of `rmarshal.get_marshaller` — the trampoline dumps each
+/// argument with the client int convention ([`IntFlavor::Rmarshal`]).
+pub trait SandboxArg {
+    fn to_marshal(&self) -> MarshalValue;
+}
+
+macro_rules! sandbox_arg_int {
+    ($($t:ty),+ $(,)?) => {$(
+        impl SandboxArg for $t {
+            fn to_marshal(&self) -> MarshalValue {
+                MarshalValue::Int(*self as i64)
+            }
+        }
+    )+};
+}
+
+sandbox_arg_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+impl SandboxArg for bool {
+    fn to_marshal(&self) -> MarshalValue {
+        MarshalValue::Bool(*self)
+    }
+}
+
+impl SandboxArg for f64 {
+    fn to_marshal(&self) -> MarshalValue {
+        MarshalValue::Float(*self)
+    }
+}
+
+impl SandboxArg for [u8] {
+    fn to_marshal(&self) -> MarshalValue {
+        MarshalValue::Str(self.to_vec())
+    }
+}
+
+impl SandboxArg for Vec<u8> {
+    fn to_marshal(&self) -> MarshalValue {
+        MarshalValue::Str(self.clone())
+    }
+}
+
+impl<'a> SandboxArg for &'a [u8] {
+    fn to_marshal(&self) -> MarshalValue {
+        MarshalValue::Str((*self).to_vec())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -378,6 +441,15 @@ pub fn load_int<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
         TYPE_INT => Ok(ld.readlong()? as i64),
         _ => Err(SandboxError::Protocol("expected an int".into())),
     }
+}
+
+/// rmarshal.py `load_int_nonneg`.
+pub fn load_int_nonneg<N: NeedMore>(ld: &mut Loader<N>) -> SandboxResult<i64> {
+    let x = load_int(ld)?;
+    if x < 0 {
+        return Err(SandboxError::Protocol("expected a non-negative int".into()));
+    }
+    Ok(x)
 }
 
 /// rmarshal.py `load_longlong` — requires `TYPE_INT64`.

@@ -110,9 +110,28 @@ pub fn threadlocalref_addr() -> *mut i64 {
     })
 }
 
+/// `llop.threadlocalref_get` (`rthread.py ThreadLocalField.getraw`).
+///
+/// `ofs` and `loop_invariant` must be call-site constants, matching
+/// `CDefinedIntSymbolic.loop_invariant`. The flag is not read at
+/// runtime; the translator projects it onto `ExtraEffect`.
+#[inline(never)]
+pub fn threadlocalref_get_int(ofs: usize, loop_invariant: bool) -> i64 {
+    let _ = loop_invariant;
+    threadlocalref_get(ofs)
+}
+
+/// `llop.threadlocalref_store` (`rthread.py ThreadLocalField.setraw`).
+#[inline(never)]
+pub fn threadlocalref_store_int(ofs: usize, value: i64) {
+    assert!(ofs < THREADLOCAL_WORDS * WORD && ofs.is_multiple_of(WORD));
+    unsafe { *threadlocalref_addr().byte_add(ofs) = value };
+}
+
 /// `rthread.get_ident` — `tlfield_thread_ident.getraw()`.
+#[inline(always)]
 pub fn get_ident() -> i64 {
-    unsafe { *threadlocalref_addr().byte_add(TLFIELD_THREAD_IDENT_OFS) }
+    threadlocalref_get_int(TLFIELD_THREAD_IDENT_OFS, true)
 }
 
 /// `RPyThread_kill` (`thread_pthread.c`).
@@ -134,18 +153,22 @@ crate::rffi::llexternal!(
 );
 
 /// `ThreadLocalField.getraw()` for an `rffi.INT` field.
+/// Errno save fields are not loop-invariant (`tlfield_rpy_errno`).
+#[inline(always)]
 pub fn tlfield_getraw_int(ofs: usize) -> i32 {
-    unsafe { *threadlocalref_addr().byte_add(ofs).cast::<i32>() }
+    threadlocalref_get_int(ofs, false) as i32
 }
 
 /// `ThreadLocalField.setraw()` for an `rffi.INT` field.
+#[inline(always)]
 pub fn tlfield_setraw_int(ofs: usize, value: i32) {
-    unsafe { *threadlocalref_addr().byte_add(ofs).cast::<i32>() = value };
+    threadlocalref_store_int(ofs, value as i64);
 }
 
 /// `tlfield_p_errno.getraw()`.
+#[inline(always)]
 pub fn tlfield_p_errno() -> *mut i32 {
-    unsafe { *threadlocalref_addr().byte_add(TLFIELD_P_ERRNO_OFS) as *mut i32 }
+    threadlocalref_get_int(TLFIELD_P_ERRNO_OFS, true) as *mut i32
 }
 
 /// The word at byte offset `ofs`, as `llop.threadlocalref_get` reads it.

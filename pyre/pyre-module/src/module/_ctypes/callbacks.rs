@@ -307,13 +307,12 @@ mod imp {
             Err(error) => Err(error),
         };
         if let Err(mut error) = written {
-            error.write_unraisable(
+            error.write_unraisable_with_traceback(
                 pyre_object::w_none(),
-                &rustpython_wtf8::Wtf8Buf::from_string(
-                    "Exception ignored while converting result of ctypes callback function"
-                        .to_string(),
-                ),
+                rustpython_wtf8::Wtf8::new("while converting result of ctypes callback function"),
                 pyre_object::PY_NULL,
+                true,
+                rustpython_wtf8::Wtf8::new(""),
             );
         }
     }

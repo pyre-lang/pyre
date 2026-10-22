@@ -5892,6 +5892,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "majit_metainterp::cast_float_to_uint",
         majit_metainterp::blackhole::cast_float_to_uint,
     );
+    // `support.py _ll_1_threadlocalref_get` residual-call target
+    // emitted by `rewrite_op_threadlocalref_get`.
+    pa1!(
+        &mut entries,
+        "majit_metainterp::blackhole::threadlocalref_get",
+        "majit_metainterp::threadlocalref_get",
+        majit_metainterp::blackhole::threadlocalref_get,
+    );
+    pa2!(
+        &mut entries,
+        "majit_metainterp::blackhole::threadlocalref_store",
+        "majit_metainterp::threadlocalref_store",
+        majit_metainterp::blackhole::threadlocalref_store,
+    );
 
     merge_macro_helper_fnaddrs(&mut entries, &abi_unsound_arguments);
 

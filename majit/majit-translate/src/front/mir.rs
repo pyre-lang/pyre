@@ -27974,6 +27974,46 @@ impl<'a> Lowering<'a> {
                         );
                     }
                 }
+                // `llop.threadlocalref_get` / `threadlocalref_store`
+                // (`rthread.py ThreadLocalField.getraw` / `setraw`).
+                // The intrinsic body reads `THREADLOCALS`; project the
+                // call so that body is never walked. Offset must be a
+                // call-site constant (`CDefinedIntSymbolic`); otherwise
+                // leave the call.
+                if args.len() == 2
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                {
+                    let path = fd.item_meta.name_path();
+                    match host_rthread_threadlocalref_llop(&path) {
+                        Some(ThreadLocalRefLlop::Get) if self.var_is_const_int(&args[0]) => {
+                            let result_ty = tyref_to_value_type_with(
+                                &call.dest.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                            );
+                            return self.emit_threadlocalref_get(
+                                mir_bb,
+                                dest_local,
+                                target,
+                                args[0].clone(),
+                                args[1].clone(),
+                                result_ty,
+                            );
+                        }
+                        Some(ThreadLocalRefLlop::Store) if self.var_is_const_int(&args[0]) => {
+                            return self.emit_threadlocalref_store(
+                                mir_bb,
+                                dest_local,
+                                target,
+                                args[0].clone(),
+                                args[1].clone(),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 // `f64::to_int_unchecked::<i64>(x)` is `cast_float_to_int`.
                 // Truncation toward zero, undefined outside the signed
                 // range — the same contract as the llop.  A saturating
@@ -38399,6 +38439,94 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(())
+    }
+
+    /// `llop.threadlocalref_get(c_offset, c_loop_invariant)`
+    /// (`rthread.py ThreadLocalField.getraw`). Result type is the
+    /// projection's `ValueType` (`FIELDTYPE`).
+    fn emit_threadlocalref_get(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        offset: crate::flowspace::model::Variable,
+        loop_invariant: crate::flowspace::model::Variable,
+        result_ty: ValueType,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        if let Some(shell) = crate::codewriter::annotation_state::valuetype_to_someshell(&result_ty)
+        {
+            *res.annotation.borrow_mut() = Some(std::rc::Rc::new(shell));
+        }
+        FunctionGraph::set_concretetype_of_inline(&offset, crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: "threadlocalref_get".to_string(),
+                lhs: offset,
+                rhs: loop_invariant,
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// `llop.threadlocalref_store(c_offset, value)`
+    /// (`rthread.py ThreadLocalField.setraw`). Upstream has no
+    /// `rewrite_op_threadlocalref_store`; jtransform residualizes this
+    /// as a plain call.
+    fn emit_threadlocalref_store(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        offset: crate::flowspace::model::Variable,
+        value: crate::flowspace::model::Variable,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+        *res.annotation.borrow_mut() = Some(std::rc::Rc::new(
+            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+            ),
+        ));
+        FunctionGraph::set_concretetype_of_inline(&offset, crate::model::ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&value, crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: "threadlocalref_store".to_string(),
+                lhs: offset,
+                rhs: value,
+                result_ty: ValueType::Void,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// True when `var` is a `ConstInt` / `ConstUInt` already emitted in
+    /// this graph. Used to refuse `threadlocalref_get` projection when
+    /// the offset is not a call-site constant.
+    fn var_is_const_int(&self, var: &crate::flowspace::model::Variable) -> bool {
+        self.graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                op.result.as_ref() == Some(var)
+                    && matches!(op.kind, OpKind::ConstInt(_) | OpKind::ConstUInt(_))
+            })
+        })
     }
 
     /// Rewrite a 64-bit float/int bitcast to the `longlong2float` pair.
@@ -70246,6 +70374,26 @@ fn host_lltype_cast_llop(
             .then_some(("cast_int_to_ptr", dst.clone()));
     }
     None
+}
+
+/// `majit_rlib::rthread::threadlocalref_get_int` /
+/// `threadlocalref_store_int` — the llop intrinsics
+/// `ThreadLocalField.getraw` / `setraw` lower to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadLocalRefLlop {
+    Get,
+    Store,
+}
+
+/// The full path, crate included, is `majit_rlib::rthread::threadlocalref_get_int`
+/// or `majit_rlib::rthread::threadlocalref_store_int`; a look-alike in another
+/// crate or module stays a call.
+pub(crate) fn host_rthread_threadlocalref_llop(path: &str) -> Option<ThreadLocalRefLlop> {
+    match path {
+        "majit_rlib::rthread::threadlocalref_get_int" => Some(ThreadLocalRefLlop::Get),
+        "majit_rlib::rthread::threadlocalref_store_int" => Some(ThreadLocalRefLlop::Store),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

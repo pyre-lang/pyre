@@ -746,10 +746,12 @@ pub(super) unsafe extern "C" fn interp_bf_releasebuffer(
 /// so it is reported the way an unraisable is.
 fn release_acquired(w_view: PyObjectRef) {
     if let Err(mut error) = crate::builtins::memoryview_release(&[w_view]) {
-        error.write_unraisable(
+        error.write_unraisable_with_traceback(
             pyre_object::w_none(),
-            rustpython_wtf8::Wtf8::new("Exception ignored in __release_buffer__"),
+            rustpython_wtf8::Wtf8::new("in __release_buffer__"),
             w_view,
+            true,
+            rustpython_wtf8::Wtf8::new(""),
         );
     }
 }

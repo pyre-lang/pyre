@@ -276,7 +276,7 @@ fn typeids_sidecar_exists(path: &std::path::Path) -> bool {
     #[cfg(feature = "sandbox")]
     {
         use std::os::unix::ffi::OsStrExt;
-        pyre_interpreter::host_seam::ops::stat(path.as_os_str().as_bytes()).is_ok()
+        majit_rlib::rposix_stat::stat(path.as_os_str().as_bytes()).is_ok()
     }
     #[cfg(not(feature = "sandbox"))]
     {

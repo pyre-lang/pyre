@@ -25,7 +25,21 @@ where
         Ok(result) => result,
         Err(payload) => match payload.downcast::<majit_rlib::rffi::SandboxStub>() {
             Ok(payload) => Err(stub(payload.fnname)),
-            Err(payload) => std::panic::resume_unwind(payload),
+            Err(payload) => {
+                #[cfg(all(unix, feature = "sandbox"))]
+                {
+                    match payload.downcast::<majit_rlib::rsandbox::SandboxError>() {
+                        Ok(err) => {
+                            return Err(crate::host_seam::seam_os_err((*err).into(), ""));
+                        }
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }
+                }
+                #[cfg(not(all(unix, feature = "sandbox")))]
+                {
+                    std::panic::resume_unwind(payload)
+                }
+            }
         },
     }
 }

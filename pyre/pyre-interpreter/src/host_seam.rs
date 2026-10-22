@@ -6,7 +6,7 @@
 //! (`rpython/translator/sandbox/rsandbox.py: make_sandbox_trampoline`): there,
 //! the translator replaces each external C call with a trampoline; here,
 //! `#[cfg(feature = "sandbox")]` selects [`TrampolineHost`] (which marshals to
-//! the controller via `pyre_sandbox::client`) instead of [`RealHost`] (the real
+//! the controller via `majit_rlib::rsandbox`) instead of [`RealHost`] (the real
 //! libc/std bodies). Because pyre's builtins are non-capturing `fn` pointers
 //! (`gateway.rs` `BuiltinCodeFn = fn(...)`), the seam cannot be a runtime-held
 //! object; it is reached purely by module path through the free functions in
@@ -25,11 +25,9 @@
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 #[cfg(feature = "sandbox")]
-use pyre_sandbox::client::{self, SyscallResult};
+use majit_rlib::rmarshal::MarshalValue;
 #[cfg(feature = "sandbox")]
-use pyre_sandbox::protocol::SandboxError;
-#[cfg(feature = "sandbox")]
-use pyre_sandbox::rmarshal::MarshalValue;
+use majit_rlib::rsandbox::{self as client, SandboxError, SyscallResult};
 
 /// `host_seam::sys` — the libc surface a sandbox-compiled module is allowed to
 /// name. Off sandbox it is `libc` verbatim; under sandbox it re-exports only
@@ -270,36 +268,11 @@ pub use crate::host_seam_stub::catch_sandbox_stub;
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 pub use crate::host_seam_stub::stub;
 
-/// The raw stat fields `make_stat_result` consumes. `RealHost` fills every field
-/// from a `libc::stat`; under sandbox the wire `os.stat_result` carries only the
-/// 10 protocol fields (mode/ino/dev/nlink/uid/gid/size + integer atime/mtime/
-/// ctime) and the remaining fields are zeroed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StatBuf {
-    pub mode: u32,
-    pub ino: u64,
-    pub dev: u64,
-    pub nlink: u64,
-    pub uid: u32,
-    pub gid: u32,
-    pub size: u64,
-    pub atime: i64,
-    pub mtime: i64,
-    pub ctime: i64,
-    pub atime_nsec: i64,
-    pub mtime_nsec: i64,
-    pub ctime_nsec: i64,
-    pub blksize: u64,
-    pub blocks: u64,
-    pub rdev: u64,
-    pub st_flags: u32,
-}
-
 /// The real-syscall host (selected when the `sandbox` feature is off).
 pub struct RealHost;
 
 /// The marshalling-trampoline host (selected when the `sandbox` feature is on);
-/// every method round-trips through `pyre_sandbox::client::syscall`.
+/// every method round-trips through `majit_rlib::rsandbox::syscall`.
 #[cfg(feature = "sandbox")]
 pub struct TrampolineHost;
 
@@ -333,7 +306,6 @@ macro_rules! seam_ret_ty {
     (optbytes) => { Option<Vec<u8>> };
     (liststr) => { Vec<Vec<u8>> };
     (envitems) => { Vec<(Vec<u8>, Vec<u8>)> };
-    (stat) => { StatBuf };
     (f64) => { f64 };
 }
 
@@ -342,37 +314,34 @@ macro_rules! seam_ret_ty {
 #[cfg(feature = "sandbox")]
 macro_rules! seam_result_kind {
     (unit) => {
-        pyre_sandbox::protocol::ResultKind::None
+        majit_rlib::rsandbox::ResultKind::None
     };
     (i32) => {
-        pyre_sandbox::protocol::ResultKind::Int
+        majit_rlib::rsandbox::ResultKind::Int
     };
     (i64) => {
-        pyre_sandbox::protocol::ResultKind::Int
+        majit_rlib::rsandbox::ResultKind::Int
     };
     (longlong) => {
-        pyre_sandbox::protocol::ResultKind::LongLong
+        majit_rlib::rsandbox::ResultKind::LongLong
     };
     (bytes) => {
-        pyre_sandbox::protocol::ResultKind::Str
+        majit_rlib::rsandbox::ResultKind::Str
     };
     (bool) => {
-        pyre_sandbox::protocol::ResultKind::Bool
+        majit_rlib::rsandbox::ResultKind::Bool
     };
     (optbytes) => {
-        pyre_sandbox::protocol::ResultKind::OptStr
+        majit_rlib::rsandbox::ResultKind::OptStr
     };
     (liststr) => {
-        pyre_sandbox::protocol::ResultKind::ListStr
+        majit_rlib::rsandbox::ResultKind::ListStr
     };
     (envitems) => {
-        pyre_sandbox::protocol::ResultKind::EnvItems
-    };
-    (stat) => {
-        pyre_sandbox::protocol::ResultKind::StatResult
+        majit_rlib::rsandbox::ResultKind::EnvItems
     };
     (f64) => {
-        pyre_sandbox::protocol::ResultKind::Float
+        majit_rlib::rsandbox::ResultKind::Float
     };
 }
 
@@ -453,12 +422,6 @@ macro_rules! seam_unwrap {
             _ => Err(SeamError::Runtime),
         }
     };
-    (stat, $r:expr) => {
-        match $r {
-            SyscallResult::Stat(s) => Ok(StatBuf::from_wire(&s)),
-            _ => Err(SeamError::Runtime),
-        }
-    };
     (f64, $r:expr) => {
         match $r {
             SyscallResult::Float(v) => Ok(v),
@@ -519,27 +482,13 @@ macro_rules! declare_seam {
 }
 
 declare_seam! {
-    open(path: bytes, flags: i32, mode: u32) -> i32 = "ll_os.ll_os_open";
-    close(fd: i32) -> unit = "ll_os.ll_os_close";
     read(fd: i32, size: i64) -> bytes = "ll_os.ll_os_read";
     write(fd: i32, data: bytes) -> i64 = "ll_os.ll_os_write";
-    lseek(fd: i32, pos: i64, how: i32) -> longlong = "ll_os.ll_os_lseek";
-    stat(path: bytes) -> stat = "ll_os.ll_os_stat";
-    lstat(path: bytes) -> stat = "ll_os.ll_os_lstat";
-    fstat(fd: i32) -> stat = "ll_os.ll_os_fstat";
-    access(path: bytes, mode: i32) -> bool = "ll_os.ll_os_access";
-    isatty(fd: i32) -> bool = "ll_os.ll_os_isatty";
     getcwd() -> bytes = "ll_os.ll_os_getcwd";
     listdir(path: bytes) -> liststr = "ll_os.ll_os_listdir";
     getenv(name: bytes) -> optbytes = "ll_os.ll_os_getenv";
     envitems() -> envitems = "ll_os.ll_os_envitems";
     strerror(code: i32) -> bytes = "ll_os.ll_os_strerror";
-    getuid() -> i64 = "ll_os.ll_os_getuid";
-    geteuid() -> i64 = "ll_os.ll_os_geteuid";
-    getgid() -> i64 = "ll_os.ll_os_getgid";
-    getegid() -> i64 = "ll_os.ll_os_getegid";
-    unlink(path: bytes) -> unit = "ll_os.ll_os_unlink";
-    mkdir(path: bytes, mode: u32) -> unit = "ll_os.ll_os_mkdir";
     urandom(size: i64) -> bytes = "ll_os.ll_os_urandom";
     time() -> f64 = "ll_time.ll_time_time";
     clock() -> f64 = "ll_time.ll_time_clock";
@@ -565,7 +514,7 @@ pub fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
     let result = client::syscall(
         "ll_os.ll_os_write",
         &args,
-        pyre_sandbox::protocol::ResultKind::Int,
+        majit_rlib::rsandbox::ResultKind::Int,
     )?;
     match result {
         SyscallResult::Int(written) => Ok(written),
@@ -665,58 +614,6 @@ pub fn flush_stdout() {
     }
 }
 
-// ── StatBuf constructors ─────────────────────────────────────────────────────
-
-impl StatBuf {
-    /// Build from a `libc::stat` (the real-host path). `st_flags` exists only on
-    /// the BSD-derived platforms; elsewhere it is 0.
-    #[cfg(not(feature = "sandbox"))]
-    fn from_libc(st: &libc::stat) -> Self {
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-        let st_flags = st.st_flags;
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
-        let st_flags = 0u32;
-        StatBuf {
-            mode: st.st_mode as u32,
-            ino: st.st_ino,
-            dev: st.st_dev as u64,
-            nlink: st.st_nlink as u64,
-            uid: st.st_uid,
-            gid: st.st_gid,
-            size: st.st_size as u64,
-            atime: st.st_atime,
-            mtime: st.st_mtime,
-            ctime: st.st_ctime,
-            atime_nsec: st.st_atime_nsec,
-            mtime_nsec: st.st_mtime_nsec,
-            ctime_nsec: st.st_ctime_nsec,
-            blksize: st.st_blksize as u64,
-            blocks: st.st_blocks as u64,
-            rdev: st.st_rdev as u64,
-            st_flags,
-        }
-    }
-
-    /// Build from the 10-field wire `os.stat_result` (the trampoline path); the
-    /// non-protocol fields (nsec, blksize, blocks, rdev, st_flags) are zero.
-    #[cfg(feature = "sandbox")]
-    fn from_wire(st: &pyre_sandbox::vfs::StatResult) -> Self {
-        StatBuf {
-            mode: st.st_mode,
-            ino: st.st_ino,
-            dev: st.st_dev,
-            nlink: st.st_nlink,
-            uid: st.st_uid,
-            gid: st.st_gid,
-            size: st.st_size,
-            atime: st.st_atime,
-            mtime: st.st_mtime,
-            ctime: st.st_ctime,
-            ..StatBuf::default()
-        }
-    }
-}
-
 // ── RealHost: the real-syscall bodies (non-sandbox build) ─────────────────────
 
 #[cfg(not(feature = "sandbox"))]
@@ -753,56 +650,7 @@ mod real {
         f()
     }
 
-    fn real_stat(path: &[u8], symlink: bool) -> SeamResult<StatBuf> {
-        let c = cstr(path)?;
-        // `rposix_stat.c_stat` / `c_lstat` are `macro=libc::stat` /
-        // `libc::lstat` and save errno.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            if symlink {
-                majit_rlib::rposix::c_lstat(c.as_ptr(), &mut st)
-            } else {
-                majit_rlib::rposix::c_stat(c.as_ptr(), &mut st)
-            }
-        };
-        if r < 0 {
-            Err(saved_os_error())
-        } else {
-            Ok(StatBuf::from_libc(&st))
-        }
-    }
-
     impl SandboxableHost for RealHost {
-        fn open(path: &[u8], flags: i32, mode: u32) -> SeamResult<i32> {
-            let c = cstr(path)?;
-            // `rposix.c_open` releases the GIL and saves errno. Darwin's
-            // `open` is variadic (`natural_arity=2`).
-            let fd = unsafe {
-                #[cfg(target_os = "macos")]
-                {
-                    majit_rlib::rposix::c_open(c.as_ptr(), flags, mode as libc::c_int)
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    majit_rlib::rposix::c_open(c.as_ptr(), flags, mode as libc::mode_t)
-                }
-            };
-            if fd < 0 {
-                Err(saved_os_error())
-            } else {
-                Ok(fd)
-            }
-        }
-
-        fn close(fd: i32) -> SeamResult<()> {
-            // `rposix.c_close` is `releasegil=False` and still saves errno.
-            if unsafe { majit_rlib::rposix::c_close(fd) } < 0 {
-                Err(saved_os_error())
-            } else {
-                Ok(())
-            }
-        }
-
         fn read(fd: i32, size: i64) -> SeamResult<Vec<u8>> {
             let n = size.max(0) as usize;
             // The count carries a Python-supplied `read(size)` through, so an
@@ -848,44 +696,6 @@ mod real {
             } else {
                 Ok(n as i64)
             }
-        }
-
-        fn lseek(fd: i32, pos: i64, how: i32) -> SeamResult<i64> {
-            // `rposix.c_lseek` is `macro=libc::lseek` and saves errno.
-            let r = unsafe { majit_rlib::rposix::c_lseek(fd, pos, how) };
-            if r < 0 { Err(saved_os_error()) } else { Ok(r) }
-        }
-
-        fn stat(path: &[u8]) -> SeamResult<StatBuf> {
-            real_stat(path, false)
-        }
-
-        fn lstat(path: &[u8]) -> SeamResult<StatBuf> {
-            real_stat(path, true)
-        }
-
-        fn fstat(fd: i32) -> SeamResult<StatBuf> {
-            // `rposix_stat.c_fstat` is `macro=libc::fstat` and saves errno.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let r = unsafe { majit_rlib::rposix::c_fstat(fd, &mut st) };
-            if r < 0 {
-                Err(saved_os_error())
-            } else {
-                Ok(StatBuf::from_libc(&st))
-            }
-        }
-
-        fn access(path: &[u8], mode: i32) -> SeamResult<bool> {
-            let c = cstr(path)?;
-            // `rposix.c_access` releases the GIL and does not save errno.
-            // `rposix.access` returns `c_access(...) == 0`.
-            Ok(unsafe { majit_rlib::rposix::c_access(c.as_ptr(), mode) } == 0)
-        }
-
-        fn isatty(fd: i32) -> SeamResult<bool> {
-            // `rposix.c_isatty` releases the GIL and does not save errno.
-            // `rposix.isatty` returns `c_isatty(fd) != 0`.
-            Ok(unsafe { majit_rlib::rposix::c_isatty(fd) } != 0)
         }
 
         fn getcwd() -> SeamResult<Vec<u8>> {
@@ -956,45 +766,6 @@ mod real {
                 return Ok(format!("Unknown error {code}").into_bytes());
             }
             Ok(unsafe { CStr::from_ptr(p) }.to_bytes().to_vec())
-        }
-
-        // `rposix.c_getuid` / `c_geteuid` / `c_getgid` / `c_getegid` return
-        // `uid_t` / `gid_t` and release the GIL. They do not save errno.
-        fn getuid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_getuid() } as i64)
-        }
-
-        fn geteuid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_geteuid() } as i64)
-        }
-
-        fn getgid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_getgid() } as i64)
-        }
-
-        fn getegid() -> SeamResult<i64> {
-            Ok(unsafe { majit_rlib::rposix::c_getegid() } as i64)
-        }
-
-        fn unlink(path: &[u8]) -> SeamResult<()> {
-            let c = cstr(path)?;
-            // `rposix.c_unlink` releases the GIL and saves errno.
-            if unsafe { majit_rlib::rposix::c_unlink(c.as_ptr()) } < 0 {
-                Err(saved_os_error())
-            } else {
-                Ok(())
-            }
-        }
-
-        fn mkdir(path: &[u8], mode: u32) -> SeamResult<()> {
-            let c = cstr(path)?;
-            // `rposix.c_mkdir` releases the GIL and saves errno. Mode is
-            // `rffi.MODE_T`.
-            if unsafe { majit_rlib::rposix::c_mkdir(c.as_ptr(), mode as libc::mode_t) } < 0 {
-                Err(saved_os_error())
-            } else {
-                Ok(())
-            }
         }
 
         fn time() -> SeamResult<f64> {

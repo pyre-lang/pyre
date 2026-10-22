@@ -1,6 +1,7 @@
 //! `rpython/rlib/rposix_stat.py` — `os.stat` / `os.lstat` and the
 //! `STAT_FIELDS` result they return.
 
+#[cfg(not(feature = "sandbox"))]
 use crate::rposix::get_saved_errno;
 
 // `rposix_stat.compilation_info`.
@@ -26,6 +27,15 @@ crate::rffi::llexternal!(
     compilation_info = STAT_ECI,
     save_err = crate::rffi::RFFI_SAVE_ERRNO,
     macro = libc::lstat
+);
+
+crate::rffi::llexternal!(
+    pub c_fstat = "fstat",
+    [crate::rffi::INT, *mut libc::stat],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = crate::rffi::RFFI_SAVE_ERRNO,
+    macro = libc::fstat
 );
 
 /// `rposix_stat.STAT_FIELDS` on unix: the portable 10, then `st_blksize` /
@@ -91,6 +101,7 @@ pub fn build_stat_result(st: &libc::stat) -> StatResult {
     }
 }
 
+#[cfg(not(feature = "sandbox"))]
 fn finish_stat(
     ret: crate::rffi::INT,
     st: std::mem::MaybeUninit<libc::stat>,
@@ -102,7 +113,8 @@ fn finish_stat(
     }
 }
 
-/// `rposix_stat.stat`.
+/// `rposix_stat.stat` (`replace_os_function('stat')`).
+#[majit_macros::replace_os_function("stat")]
 pub fn stat(path: &[u8]) -> Result<StatResult, i32> {
     let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -110,11 +122,20 @@ pub fn stat(path: &[u8]) -> Result<StatResult, i32> {
     finish_stat(ret, st)
 }
 
-/// `rposix_stat.lstat`.
+/// `rposix_stat.lstat` (`replace_os_function('lstat')`).
+#[majit_macros::replace_os_function("lstat")]
 pub fn lstat(path: &[u8]) -> Result<StatResult, i32> {
     let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     let ret = unsafe { c_lstat(c_path.as_ptr(), st.as_mut_ptr()) };
+    finish_stat(ret, st)
+}
+
+/// `rposix_stat.fstat` (`replace_os_function('fstat')`).
+#[majit_macros::replace_os_function("fstat")]
+pub fn fstat(fd: i32) -> Result<StatResult, i32> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let ret = unsafe { c_fstat(fd, st.as_mut_ptr()) };
     finish_stat(ret, st)
 }
 

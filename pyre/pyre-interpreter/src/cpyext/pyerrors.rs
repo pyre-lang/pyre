@@ -1026,11 +1026,13 @@ fn write_unraisable(context: Option<String>, object: *mut CPyObject) {
     } else {
         object
     };
-    let context = context.unwrap_or_default();
-    error.write_unraisable(
+    // `format_unraisable_v` reports the formatted message as `err_msg`
+    // verbatim, an empty one included; `PyErr_WriteUnraisable` passes none.
+    error.write_unraisable_first_line(
         pyre_object::w_none(),
-        rustpython_wtf8::Wtf8::new(context.as_str()),
+        context.map(rustpython_wtf8::Wtf8Buf::from_string),
         object,
+        rustpython_wtf8::Wtf8::new(""),
     );
 }
 
@@ -1113,10 +1115,12 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
         Ok(w_hook) => w_hook,
         Err(error) if error.kind == crate::PyErrorKind::AttributeError => pyre_object::PY_NULL,
         Err(mut failure) => {
-            failure.write_unraisable(
+            failure.write_unraisable_with_traceback(
                 space,
-                rustpython_wtf8::Wtf8::new("Exception ignored when trying to fetch sys.excepthook"),
+                rustpython_wtf8::Wtf8::new("when trying to fetch sys.excepthook"),
                 pyre_object::PY_NULL,
+                true,
+                rustpython_wtf8::Wtf8::new(""),
             );
             pyre_object::PY_NULL
         }
@@ -1136,10 +1140,12 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
         // The hook is what failed, and this entry point has no way to say so
         // to its caller: reporting it as unraisable both names it and leaves
         // the indicator clear, which is what the next C call needs.
-        failure.write_unraisable(
+        failure.write_unraisable_with_traceback(
             space,
-            rustpython_wtf8::Wtf8::new("Exception ignored in sys.excepthook"),
+            rustpython_wtf8::Wtf8::new("in sys.excepthook"),
             pyre_object::gc_roots::shadow_stack_get(hook_slot),
+            true,
+            rustpython_wtf8::Wtf8::new(""),
         );
     }
 }

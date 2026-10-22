@@ -322,26 +322,63 @@ fn print_error(
     let repr_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_repr);
     let repr = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(roots.get(repr_slot)) };
+    // `ccallback.py W_ExternPython.print_error`: `s = "from cffi callback %s:"`
+    // then `operr.write_unraisable(space, s, None, with_traceback=True)`.
     let where_desc = if extra_line.is_empty() {
-        pyre_interpreter::display::wtf8_format!("Exception ignored from cffi callback ", repr)
+        pyre_interpreter::display::wtf8_format!("from cffi callback ", repr, ":")
     } else {
-        pyre_interpreter::display::wtf8_format!(
-            "Exception ignored from cffi callback ",
-            repr,
-            extra_line
-        )
+        pyre_interpreter::display::wtf8_format!("from cffi callback ", repr, extra_line, ":")
     };
     error.reload(&roots, error_slot);
-    error.write_unraisable(pyre_object::w_none(), &where_desc, pyre_object::PY_NULL);
+    error.write_unraisable_with_traceback(
+        pyre_object::w_none(),
+        &where_desc,
+        pyre_object::PY_NULL,
+        true,
+        rustpython_wtf8::Wtf8::new(""),
+    );
     Ok(())
 }
 
+/// `ccallback.py W_ExternPython.handle_applevel_exception`
+/// `except OperationError as e2`: normalizing the exception, calling
+/// `onerror` or converting its result raised `e2`. The original exception
+/// is printed first, then `e2` with the extra line that names `onerror`.
+/// `error` is pinned at `error_slot` in `roots`, the callback at
+/// `callback_slot`.
+fn print_double_exception(
+    roots: &pyre_object::gc_roots::RootScope,
+    callback_slot: usize,
+    error: &mut PyError,
+    error_slot: usize,
+    e2: PyError,
+    extra_line: &str,
+) -> Result<(), PyError> {
+    let mut e2 = e2;
+    let e2_slot = e2.pin(roots);
+    // An `OperationError` from `print_error` skips the rest; upstream has no
+    // `try`/`finally` around it either.
+    let ecap_slot = roots.pin_roots(&[super::errorbox::start_error_capture()?]);
+    error.reload(roots, error_slot);
+    print_error(roots.get(callback_slot), error, extra_line)?;
+    e2.reload(roots, e2_slot);
+    e2.write_unraisable_with_traceback(
+        pyre_object::w_none(),
+        rustpython_wtf8::Wtf8::new(""),
+        pyre_object::PY_NULL,
+        true,
+        rustpython_wtf8::Wtf8::new(ONERROR_SECONDARY_EXTRA_LINE),
+    );
+    super::errorbox::stop_error_capture(roots.get(ecap_slot))
+}
+
+#[majit_macros::dont_look_inside]
 fn handle_applevel_exception(
     w_callback: PyObjectRef,
     error: PyError,
     ll_res: *mut u8,
     extra_line: &str,
-) {
+) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let mut error = error;
     let error_slot = error.pin(&roots);
@@ -358,21 +395,26 @@ fn handle_applevel_exception(
         .expect("root remains a callback")
         .w_destructor;
     if w_onerror.is_null() {
-        let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
-        return;
+        let ecap_slot = roots.pin_roots(&[super::errorbox::start_error_capture()?]);
+        error.reload(&roots, error_slot);
+        print_error(roots.get(callback_slot), &mut error, extra_line)?;
+        return super::errorbox::stop_error_capture(roots.get(ecap_slot));
     }
     let onerror_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_onerror);
     error.reload(&roots, error_slot);
     let w_value = match error.normalize_exception(pyre_object::w_none()) {
         Ok(value) => value,
-        Err(mut normalization_error) => {
-            let _ = print_error(
-                roots.get(callback_slot),
-                &mut normalization_error,
+        Err(normalization_error) => {
+            print_double_exception(
+                &roots,
+                callback_slot,
+                &mut error,
+                error_slot,
+                normalization_error,
                 extra_line,
-            );
-            return;
+            )?;
+            return Ok(());
         }
     };
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -381,26 +423,8 @@ fn handle_applevel_exception(
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_type);
     error.reload(&roots, error_slot);
-    let mut w_tb = error.get_traceback();
-    if w_tb.is_null() {
-        // A raise that never entered `handle_operation_error` still
-        // owes `onerror` a traceback. Stamp the live callback frame.
-        let frame = pyre_interpreter::eval::current_frame();
-        if !frame.is_null() && !error.exc_object.is_null() {
-            unsafe {
-                pyre_interpreter::pytraceback::record_application_traceback(
-                    error.exc_object,
-                    frame,
-                    (*frame).last_instr as i64,
-                );
-            }
-            error.reload(&roots, error_slot);
-            w_tb = error.get_traceback();
-        }
-        if w_tb.is_null() {
-            w_tb = pyre_object::w_none();
-        }
-    }
+    // `ccallback.py handle_applevel_exception`: `w_tb = e.get_w_traceback(space)`.
+    let w_tb = error.get_w_traceback(pyre_object::w_none());
     let tb_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_tb);
     match pyre_interpreter::call::call_function_impl_result(
@@ -417,47 +441,45 @@ fn handle_applevel_exception(
             if let Err(conversion_error) =
                 unsafe { convert_result(roots.get(callback_slot), ll_res, roots.get(res_slot)) }
             {
-                let mut conversion_error = conversion_error;
-                let conversion_error_slot = conversion_error.pin(&roots);
                 error.reload(&roots, error_slot);
-                let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
-                conversion_error.reload(&roots, conversion_error_slot);
-                conversion_error.write_unraisable_with_traceback(
-                    pyre_object::w_none(),
-                    rustpython_wtf8::Wtf8::new(""),
-                    pyre_object::PY_NULL,
-                    true,
-                    ONERROR_SECONDARY_EXTRA_LINE,
-                );
+                print_double_exception(
+                    &roots,
+                    callback_slot,
+                    &mut error,
+                    error_slot,
+                    conversion_error,
+                    extra_line,
+                )?;
             }
         }
         Ok(_) => {}
         Err(onerror_error) => {
-            let mut onerror_error = onerror_error;
-            let onerror_error_slot = onerror_error.pin(&roots);
             error.reload(&roots, error_slot);
-            let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
-            onerror_error.reload(&roots, onerror_error_slot);
-            onerror_error.write_unraisable_with_traceback(
-                pyre_object::w_none(),
-                rustpython_wtf8::Wtf8::new(""),
-                pyre_object::PY_NULL,
-                true,
-                ONERROR_SECONDARY_EXTRA_LINE,
-            );
+            print_double_exception(
+                &roots,
+                callback_slot,
+                &mut error,
+                error_slot,
+                onerror_error,
+                extra_line,
+            )?;
         }
     }
+    Ok(())
 }
 
-unsafe fn do_invoke(w_callback: PyObjectRef, ll_res: *mut u8, ll_args: *mut *mut libc::c_void) {
+unsafe fn do_invoke(
+    w_callback: PyObjectRef,
+    ll_res: *mut u8,
+    ll_args: *mut *mut libc::c_void,
+) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.base();
     let _ = roots.pin_root(w_callback);
     let w_args = match unsafe { prepare_args_tuple(roots.get(base), ll_args) } {
         Ok(args) => args,
         Err(error) => {
-            handle_applevel_exception(roots.get(base), error, ll_res, "");
-            return;
+            return handle_applevel_exception(roots.get(base), error, ll_res, "");
         }
     };
     let _ = roots.pin_root(w_args);
@@ -470,15 +492,13 @@ unsafe fn do_invoke(w_callback: PyObjectRef, ll_res: *mut u8, ll_args: *mut *mut
         match pyre_interpreter::argument::Arguments::frompacked(Some(roots.get(base + 1)), None) {
             Ok(arguments) => arguments,
             Err(error) => {
-                handle_applevel_exception(roots.get(base), error, ll_res, "");
-                return;
+                return handle_applevel_exception(roots.get(base), error, ll_res, "");
             }
         };
     let w_res = match pyre_interpreter::baseobjspace::call_args(roots.get(base + 2), &arguments) {
         Ok(result) => result,
         Err(error) => {
-            handle_applevel_exception(roots.get(base), error, ll_res, "");
-            return;
+            return handle_applevel_exception(roots.get(base), error, ll_res, "");
         }
     };
     let _ = roots.pin_root(w_res);
@@ -488,8 +508,9 @@ unsafe fn do_invoke(w_callback: PyObjectRef, ll_res: *mut u8, ll_args: *mut *mut
             error,
             ll_res,
             ", trying to convert the result back to C",
-        );
+        )?;
     }
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]
@@ -512,7 +533,17 @@ unsafe extern "C" fn invoke_callback(
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
             let _ = roots.pin_root(w_callback);
-            unsafe { do_invoke(roots.get(base), ll_res.cast::<u8>(), ll_args) };
+            // `ccallback.py W_ExternPython.invoke` `except Exception as e`:
+            // the last-level attempt to recover.
+            if let Err(e) = unsafe { do_invoke(roots.get(base), ll_res.cast::<u8>(), ll_args) } {
+                pyre_interpreter::host_seam::emit_stderr(b"SystemError: callback raised ");
+                pyre_interpreter::host_seam::emit_stderr(e.to_string().as_bytes());
+                pyre_interpreter::host_seam::emit_stderr(b"\n");
+                write_error_return_value(
+                    callback_arg(roots.get(base)).expect("root remains a callback"),
+                    ll_res.cast::<u8>(),
+                );
+            }
         } else {
             pyre_interpreter::host_seam::emit_stderr(
                 b"SystemError: invoking a callback that was already freed\n",

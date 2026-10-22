@@ -1371,13 +1371,15 @@ pub(super) fn callback_result(
                         .unwrap_or_else(|_| unknown())
                 };
                 error.reload(&roots, error_slot);
-                error.write_unraisable(
+                error.write_unraisable_with_traceback(
                     pyre_object::w_none(),
                     &pyre_interpreter::display::wtf8_format!(
-                        "Exception ignored while calling ctypes callback function ",
+                        "while calling ctypes callback function ",
                         rendered
                     ),
                     pyre_object::PY_NULL,
+                    true,
+                    rustpython_wtf8::Wtf8::new(""),
                 );
             });
             pyre_object::w_int_new(0)
