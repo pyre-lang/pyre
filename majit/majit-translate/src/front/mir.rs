@@ -13230,29 +13230,53 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    fn classify_gc_mut_ref_arg(&self, arg_local: Option<usize>) -> Result<GcMutRefArg, LowerError> {
-        let Some(local) = arg_local else {
-            return Err(gc_mut_ref_not_whole_local());
-        };
-        if self.gc_mut_ref_params.contains(&local) {
-            return Ok(GcMutRefArg::CellParam(local));
-        }
-        let Some(recorded) = self.atomic_ref_place.get(&local).cloned() else {
-            return Err(gc_mut_ref_not_whole_local());
-        };
-        let followed = self.concrete_borrow_place(recorded);
-        if let PlaceKind::Local(slot) = &followed.kind {
-            let slot = *slot as usize;
-            if self.gc_mut_ref_params.contains(&slot) {
-                return Ok(GcMutRefArg::CellParam(slot));
+    fn classify_gc_mut_ref_arg(
+        &self,
+        arg_local: Option<usize>,
+        operand: Option<&Operand>,
+    ) -> Result<GcMutRefArg, LowerError> {
+        if let Some(local) = arg_local {
+            if self.gc_mut_ref_params.contains(&local) {
+                return Ok(GcMutRefArg::CellParam(local));
             }
-            return Ok(GcMutRefArg::WholeLocal(slot));
+            let Some(recorded) = self.atomic_ref_place.get(&local).cloned() else {
+                return Err(gc_mut_ref_not_whole_local());
+            };
+            let followed = self.concrete_borrow_place(recorded);
+            if let PlaceKind::Local(slot) = &followed.kind {
+                let slot = *slot as usize;
+                if self.gc_mut_ref_params.contains(&slot) {
+                    return Ok(GcMutRefArg::CellParam(slot));
+                }
+                return Ok(GcMutRefArg::WholeLocal(slot));
+            }
+            if let Some(cell) = self.deref_cell_param_local(&followed) {
+                return Ok(GcMutRefArg::CellParam(cell));
+            }
+            if self.mut_ref_cell_root(&followed.ty).is_some() {
+                return Ok(GcMutRefArg::Place(followed));
+            }
+            return Err(gc_mut_ref_not_whole_local());
         }
-        if let Some(cell) = self.deref_cell_param_local(&followed) {
-            return Ok(GcMutRefArg::CellParam(cell));
-        }
-        if self.mut_ref_cell_root(&followed.ty).is_some() {
-            return Ok(GcMutRefArg::Place(followed));
+        // A tuple-field projection of `&mut T` has no bare local. Ordinary
+        // call lowering of `f(args.0)` still wraps that place as a cell.
+        if let Some(Operand::Copy(place) | Operand::Move(place)) = operand {
+            let followed = self.concrete_borrow_place(clone_place(place));
+            if let Some(cell) = self.deref_cell_param_local(&followed) {
+                return Ok(GcMutRefArg::CellParam(cell));
+            }
+            if tyref_gc_mut_ref_cell_root(
+                &followed.ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+            .is_some()
+                || self.mut_ref_cell_root(&followed.ty).is_some()
+            {
+                return Ok(GcMutRefArg::Place(followed));
+            }
         }
         Err(gc_mut_ref_not_whole_local())
     }
@@ -13263,6 +13287,7 @@ impl<'a> Lowering<'a> {
         op_kind: &mut OpKind,
         sig: &Option<(Option<u64>, Vec<(usize, String)>)>,
         arg_locals: &[Option<usize>],
+        arg_operands: &[Operand],
         resolved_args: &[Variable],
     ) -> Result<Vec<GcMutRefCopy>, LowerError> {
         let plan = {
@@ -13292,7 +13317,7 @@ impl<'a> Lowering<'a> {
                 plan.push((
                     *index,
                     root.clone(),
-                    self.classify_gc_mut_ref_arg(arg_local)?,
+                    self.classify_gc_mut_ref_arg(arg_local, arg_operands.get(*index))?,
                 ));
             }
             plan
@@ -13367,7 +13392,8 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let arg_local = arg_locals.get(index).copied().flatten();
-            if let Ok(GcMutRefArg::CellParam(local)) = self.classify_gc_mut_ref_arg(arg_local) {
+            if let Ok(GcMutRefArg::CellParam(local)) = self.classify_gc_mut_ref_arg(arg_local, None)
+            {
                 let Some(root) = self.gc_mut_ref_param_root(local) else {
                     continue;
                 };
@@ -25754,6 +25780,9 @@ impl<'a> Lowering<'a> {
         target: usize,
         on_unwind: usize,
     ) -> Result<(), LowerError> {
+        if let Some(direct) = self.fn_item_call_once_direct_call(&call) {
+            return self.lower_call(mir_bb, direct, target, on_unwind);
+        }
         let bb_id = self.emit_bb(mir_bb);
         let callee_pin_gcref_arg = match &call.func {
             CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
@@ -26077,7 +26106,7 @@ impl<'a> Lowering<'a> {
         // First argument's MIR-declared type, captured before the
         // operands are consumed — `reflexive_into_alias` compares it
         // against the destination type.
-        let mut first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
+        let first_arg_ty: Option<TyRef> = call.args.first().and_then(|op| match op {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
@@ -26117,17 +26146,6 @@ impl<'a> Lowering<'a> {
             .args
             .get(1)
             .and_then(|op| const_operand_tyref(op, self.llbc));
-        // Function-item identity of arg #0, captured before `call.args` is
-        // consumed. A `FnOnce::call_once` on a `FnDef` constant (or a
-        // Copy/Move of a `FnDef`-typed local) has no ADT receiver, so
-        // `first_arg_ty` is `None` for the Const form; the FunDecl is the
-        // direct call the generated shim would tail-call.
-        let first_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.first());
-        let first_arg_fn_decl_id = first_arg_fn_decl.map(|fd| fd.def_id);
-        let first_arg_fn_n_inputs = first_arg_fn_decl.map(|fd| fd.signature.inputs.len());
-        // Instantiation generics live on the FnDef, not on the FunDecl.
-        // Unreadable generics decline the unpack below.
-        let first_arg_fn_item = operand_fn_item_call(self.llbc, call.args.first());
         // Function-item identity of arg #1, captured before `call.args` is
         // consumed.  `Option::map(opt, named_fn)` passes a `FnDef` constant
         // (or a Copy/Move of a `FnDef`-typed local); that shape has no
@@ -26521,7 +26539,6 @@ impl<'a> Lowering<'a> {
             }
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
-                let mut reg = reg;
                 let mut args = self.coerce_ccharp_byte_list_call_args(mir_bb, &reg, args);
                 // A boundary the consumer declared as one scalar field
                 // store ([`crate::ScalarFieldStore`]).  Emit the
@@ -27467,43 +27484,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // rustc's `FnOnce`/`Fn`/`FnMut` shim for a function item
-                // unpacks `Args` and tail-calls the `FnDef`. The shim is
-                // Opaque; continue as a Fun Regular call of that FunDecl
-                // so the same std-method lowerings a direct `f(x)` uses
-                // (`<str>::is_empty` → `__len` + `eq 0`) apply. A closure
-                // ADT has no `FnDef` identity and keeps the trait-method
-                // route. An arity mismatch, or a FnDef whose instantiation
-                // generics cannot be read, declines.
-                if self.is_fn_family_call_once(&reg)
-                    && let Some(fn_id) = first_arg_fn_decl_id
-                    && let Some(fn_item) = first_arg_fn_item
-                    && matches!(
-                        &fn_item.kind,
-                        CallKind::Fun(FunId::Regular { id }) if *id == fn_id
-                    )
-                    && fn_item.generics.as_object().is_some()
-                    && args.len() == 2
-                    && let Some(n_inputs) = first_arg_fn_n_inputs
-                    && let Some(payloads) = self.emit_fn_item_call_once_payloads(
-                        bb_id,
-                        &args[1],
-                        second_arg_ty.as_ref().or(second_const_arg_ty.as_ref()),
-                        n_inputs,
-                    )
-                {
-                    let tuple_ty = second_arg_ty.as_ref().or(second_const_arg_ty.as_ref());
-                    first_arg_ty = if n_inputs == 0 {
-                        None
-                    } else {
-                        tuple_ty.and_then(|ty| tyref_tuple_element(ty, 0, self.llbc))
-                    };
-                    args = payloads;
-                    // The FnDef's own RegularCall: Fun id plus the
-                    // instantiation generics `fn_def_of_const` reads.
-                    reg = fn_item;
-                }
-
                 if args.len() == 1 && self.is_const_ptr_as_ref(&reg) {
                     self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                     let target_bb = self.block_id[target];
@@ -34267,6 +34247,7 @@ impl<'a> Lowering<'a> {
             &mut op_kind,
             &gc_mut_ref_sig,
             &arg_locals,
+            &arg_operands,
             &resolved_call_args,
         )?;
         let raw_scalar_reloads = self.install_raw_scalar_address_call(
@@ -39697,74 +39678,77 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Unpack `FnOnce::Args` into the arguments of the named `FnDef`.
-    /// `n_inputs` is `FunDecl.signature.inputs.len()`. `n_inputs == 0`
-    /// is a niladic item (`Args = ()`); otherwise each `__pos_i` of the
-    /// tuple is one parameter. A tuple whose arity differs from
-    /// `n_inputs` declines.
-    fn emit_fn_item_call_once_payloads(
-        &mut self,
-        bb_id: BlockId,
-        args_tuple: &Variable,
-        args_tuple_ty: Option<&TyRef>,
-        n_inputs: usize,
-    ) -> Option<Vec<Variable>> {
-        let tuple_arity = args_tuple_ty.map(|ty| tyref_tuple_arity(ty, self.llbc));
-        if n_inputs == 0 {
-            if tuple_arity.is_some_and(|n| n != 0) {
+    /// rustc's `FnOnce`/`Fn`/`FnMut` shim for a function item unpacks
+    /// `Args` and tail-calls the `FnDef`. Rewrite that trait call into
+    /// the ordinary `Fun` call so argument conversion runs on the named
+    /// function's own inputs. A closure ADT, an arity mismatch, a const
+    /// non-unit tuple, or unreadable generics declines and the trait
+    /// call stays as it is.
+    fn fn_item_call_once_direct_call(&self, call: &CallPayload) -> Option<CallPayload> {
+        let CallFunc::Regular(reg) = &call.func else {
+            return None;
+        };
+        if !self.is_fn_family_call_once(reg) {
+            return None;
+        }
+        if call.args.len() != 2 {
+            return None;
+        }
+        let fn_item = operand_fn_item_call(self.llbc, call.args.first())?;
+        let CallKind::Fun(FunId::Regular { id }) = &fn_item.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if fn_item.generics.as_object().is_none() {
+            return None;
+        }
+        let n = fd.signature.inputs.len();
+        let args = if n == 0 {
+            let unit = match &call.args[1] {
+                Operand::Copy(p) | Operand::Move(p) => is_unit_type(&p.ty, self.llbc),
+                Operand::Const(_) => const_operand_tyref(&call.args[1], self.llbc)
+                    .is_some_and(|ty| is_unit_type(&ty, self.llbc)),
+            };
+            if !unit {
                 return None;
             }
-            return Some(Vec::new());
-        }
-        let tuple_ty = args_tuple_ty?;
-        if tuple_arity != Some(n_inputs) {
-            return None;
-        }
-        let mut payloads = Vec::with_capacity(n_inputs);
-        for idx in 0..n_inputs {
-            payloads.push(self.emit_tuple_nth_field(bb_id, args_tuple, tuple_ty, idx)?);
-        }
-        Some(payloads)
-    }
-
-    /// `tuple.__pos_{idx}` as a typed `FieldRead`, matching the
-    /// `resolve_place` tuple-projection owner (`Tuple{suffix}`).
-    fn emit_tuple_nth_field(
-        &mut self,
-        bb_id: BlockId,
-        tuple: &Variable,
-        tuple_ty: &TyRef,
-        idx: usize,
-    ) -> Option<Variable> {
-        let suffix = tyref_tuple_suffix(tuple_ty, self.llbc);
-        if suffix.is_empty() {
-            return None;
-        }
-        let owner = format!("Tuple{suffix}");
-        let element_ty = tyref_tuple_element(tuple_ty, idx, self.llbc)?;
-        let inline_vec = field_ty_is_inline_vec(&element_ty, self.llbc);
-        let ty = tuple_element_field_value_type(
-            &element_ty,
-            Some(element_ty.clone()),
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
-        let res = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(res.clone()),
-            kind: OpKind::FieldRead {
-                base: tuple.clone(),
-                field: FieldDescriptor::new(format!("__pos_{idx}"), Some(owner))
-                    .with_inline_vec(inline_vec),
-                ty,
-                pure: false,
-            },
-        });
-        Some(res)
+            Vec::new()
+        } else {
+            let (is_move, place) = match &call.args[1] {
+                Operand::Copy(p) => (false, p),
+                Operand::Move(p) => (true, p),
+                Operand::Const(_) => return None,
+            };
+            if tyref_tuple_arity(&place.ty, self.llbc) != n {
+                return None;
+            }
+            let mut args = Vec::with_capacity(n);
+            for i in 0..n {
+                let ty = tyref_tuple_element(&place.ty, i, self.llbc)?;
+                // Extracted LLBC spells a variant-less tuple field as
+                // `"Field":[null, idx]` (`build/llbc/majit-rlib.ullbc`).
+                let field = Place {
+                    kind: PlaceKind::Projection(
+                        Box::new(place.clone()),
+                        ProjectionElem::Tagged(serde_json::json!({
+                            "Field": [serde_json::Value::Null, i]
+                        })),
+                    ),
+                    ty,
+                };
+                args.push(if is_move {
+                    Operand::Move(field)
+                } else {
+                    Operand::Copy(field)
+                });
+            }
+            args
+        };
+        Some(CallPayload {
+            func: CallFunc::Regular(fn_item),
+            args,
+            dest: call.dest.clone(),
+        })
     }
 
     /// True when [`Self::emit_default_of_ty`] can build `ty` without a
@@ -105062,6 +105046,259 @@ mod tests {
         );
     }
 
+    fn fn_item_call_once_gc_mut_ref_fixture() -> Llbc {
+        let span = serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        });
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let mut_ref = serde_json::json!({
+            "Ref": ["Erased", {"RawPtr": [{"Adt": {"id": 7}}, "Mut"]}, "Mut"]
+        });
+        let dest_ty = serde_json::json!({"Adt": {
+            "builtin": "Tuple",
+            "generics": generics.clone()
+        }});
+        let tuple_ty = serde_json::json!({"Adt": {
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [mut_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }});
+        let fn_ty = serde_json::json!({
+            "FnDef": {
+                "kind": {"Fun": 1},
+                "generics": generics.clone()
+            }
+        });
+        let fn_const = serde_json::json!({"Const": [{
+            "FnDef": {
+                "kind": {"Fun": 1},
+                "generics": generics.clone()
+            }
+        }, fn_ty]});
+        let locals = serde_json::json!([
+            {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+            {"index": 1, "name": "args", "span": span, "ty": tuple_ty.clone()}
+        ]);
+        let unwind_and_return = serde_json::json!([
+            {
+                "statements": [],
+                "terminator": {"span": span, "kind": "UnwindResume"}
+            },
+            {
+                "statements": [],
+                "terminator": {"span": span, "kind": "Return"}
+            }
+        ]);
+        let once_caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "call_once_fndef"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [tuple_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span,
+                    "locals": {"arg_count": 1, "locals": locals.clone()},
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span,
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Trait": [
+                                                        {
+                                                            "kind": "Unknown",
+                                                            "trait_decl_ref": {
+                                                                "skip_binder": {"id": 0}
+                                                            }
+                                                        },
+                                                        0
+                                                    ]},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [
+                                                fn_const,
+                                                {"Copy": {"kind": {"Local": 1}, "ty": tuple_ty.clone()}}
+                                            ],
+                                            "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        unwind_and_return[0].clone(),
+                        unwind_and_return[1].clone()
+                    ]
+                }
+            }
+        });
+        let field0 = serde_json::json!({
+            "kind": {"Projection": [
+                {"kind": {"Local": 1}, "ty": tuple_ty.clone()},
+                {"Field": [null, 0]}
+            ]},
+            "ty": mut_ref.clone()
+        });
+        let direct_caller = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["fixture", "direct_mut_ref"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [tuple_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span,
+                    "locals": {"arg_count": 1, "locals": locals},
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span,
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 1},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [{"Copy": field0}],
+                                            "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        unwind_and_return[0].clone(),
+                        unwind_and_return[1].clone()
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(&["fixture", "takes_mut_ref"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [mut_ref.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span,
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                            {"index": 1, "name": "slot", "span": span, "ty": mut_ref}
+                        ]
+                    },
+                    "body": [{
+                        "statements": [],
+                        "terminator": {"span": span, "kind": "Return"}
+                    }]
+                }
+            }
+        });
+        let trait_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["core", "ops", "function", "FnOnce"], false),
+            "methods": []
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [once_caller, callee, direct_caller],
+                "global_decls": [],
+                "trait_decls": [trait_decl],
+                "trait_impls": [],
+                "assoc_item_names": [{
+                    "types": [],
+                    "methods": ["call_once"],
+                    "consts": []
+                }]
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes())
+            .expect("FnDef call_once &mut T fixture Llbc parses")
+    }
+
+    #[test]
+    fn fn_item_call_once_gc_mut_ref_matches_direct_call() {
+        let llbc = fn_item_call_once_gc_mut_ref_fixture();
+        let once = super::lower_function(&llbc, "call_once_fndef")
+            .expect("lower FnOnce::call_once of takes_mut_ref");
+        let direct = super::lower_function(&llbc, "direct_mut_ref")
+            .expect("lower direct takes_mut_ref(args.0)");
+        let once_kinds = startblock_op_kind_names(&once);
+        let direct_kinds = startblock_op_kind_names(&direct);
+        assert_eq!(
+            once_kinds, direct_kinds,
+            "rewritten FnOnce call must use the same call-block op kinds as a direct f(&mut x); once={once_kinds:?} direct={direct_kinds:?}"
+        );
+        let once_ops = graph_ops(&once);
+        assert!(
+            !call_leafs(&once_ops)
+                .iter()
+                .any(|leaf| *leaf == "call_once"),
+            "FnDef call_once of takes_mut_ref must unpack; ops={once_ops:?}"
+        );
+        assert!(
+            once_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "value"
+            )),
+            "the rewritten &mut T argument must wrap a MutRef cell; ops={once_ops:?}"
+        );
+    }
+
     #[test]
     fn ptr_add_of_bytes_is_unscaled_direct_ptradd() {
         let ptr_ty = serde_json::json!({
@@ -107171,6 +107408,22 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|block| block.operations.iter())
+            .collect()
+    }
+
+    fn startblock_op_kind_names(graph: &crate::model::FunctionGraph) -> Vec<String> {
+        graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|op| {
+                let dbg = format!("{:?}", op.kind);
+                dbg.split(['(', '{'])
+                    .next()
+                    .unwrap_or(&dbg)
+                    .trim()
+                    .to_string()
+            })
             .collect()
     }
 
@@ -114013,39 +114266,6 @@ mod tests {
         );
     }
 
-    fn control_flow_enum(def_id: u64) -> serde_json::Value {
-        let span = serde_json::json!({"data": {
-            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
-        }});
-        serde_json::json!({
-            "def_id": def_id,
-            "item_meta": {
-                "name": [
-                    {"Ident": ["core", 0]},
-                    {"Ident": ["ops", 0]},
-                    {"Ident": ["control_flow", 0]},
-                    {"Ident": ["ControlFlow", 0]}
-                ],
-                "span": span,
-                "source_text": null,
-                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
-                "is_local": false
-            },
-            "kind": {"Enum": [
-                {
-                    "name": "Continue",
-                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
-                    "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
-                },
-                {
-                    "name": "Break",
-                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
-                    "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
-                }
-            ]}
-        })
-    }
-
     #[test]
     fn control_flow_value_and_param_share_instantiation_class() {
         // A split core ControlFlow value and parameter take the same instantiation class root.
@@ -120501,6 +120721,7 @@ mod tests {
             &tombstoned,
             &gc_struct_ids_llbc,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
             false,
