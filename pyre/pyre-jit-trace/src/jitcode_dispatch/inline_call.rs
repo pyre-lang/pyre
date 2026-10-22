@@ -15038,16 +15038,13 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
 /// `CallMayForce` — one interpreter frame, plus the virtualref bracket that
 /// forces the caller's frame — for every `for x in obj` over a user iterator.
 ///
-/// The check is reproduced rather than dropped: this route admits only the
-/// shape where the inlined body hands back the receiver's own box, so the
-/// class the receiver is already guarded to, under the `_version_tag?` pin the
-/// same guard takes, is the class the check would have looked `__next__` up
-/// on.  The lookup is then a record-time question, and any other returned box
-/// falls back to the residual, which runs the check itself. GET_ITER's caller
-/// image carries its consumed iterable as the one proof operand, so a seeded
-/// callee guard resumes after GET_ITER with the result slot pending just like
-/// LOAD_ATTR; that is what also admits a body whose effects are protected by
-/// the per-frame resume path.
+/// Returning the receiver is the shortcut shape whose `__next__` lookup is
+/// decided on the receiver class the guard pins.  A different dest is still
+/// `get_and_call_function`'s return (`descroperation.py iter`); residualizing
+/// would re-run `__iter__` once the body has executed an effect, so dest
+/// stays and the walk continues.  GET_ITER's caller image carries its
+/// consumed iterable as the one proof operand, so a seeded callee guard
+/// resumes after GET_ITER with the result slot pending just like LOAD_ATTR.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -15186,14 +15183,20 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         return Ok(Some((DispatchOutcome::Continue, inline_resume_pc)));
     }
 
-    // The identity the `iter_check_is_iterator` decision above rests on, as a
-    // property of the trace rather than of this recording: the body handed
-    // back the very box the receiver guard pins, so the class the check reads
-    // is that guard's class on every entry.  Any other result reaches the
-    // residual, which runs the check itself.
+    // dest is `get_and_call_function`'s return (`descroperation.py iter`).
+    // Residualizing after an effect would re-run `__iter__`.  Keep dest and
+    // continue.  A non-concrete dest cannot be published, so convert.
     if ctx.registers_r.get(dst).expect("ref register in range") != obj_op {
         if fbw_executed_effect_count() != executed_effects_before {
-            return Err(DispatchError::callee_inline_unsupported(op.pc));
+            let result_op = ctx.registers_r.get(dst).expect("ref register in range");
+            let Some(result_obj) = walker_concrete_ref_object(ctx, result_op) else {
+                return Err(DispatchError::callee_inline_abort(op.pc, true));
+            };
+            if result_obj.is_null() {
+                return Err(DispatchError::callee_inline_abort(op.pc, true));
+            }
+            ctx.frame_state.borrow_mut().vstack_last_ref = result_op;
+            return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
         }
         ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
         ctx.trace_ctx.heap_cache_mut().reset();

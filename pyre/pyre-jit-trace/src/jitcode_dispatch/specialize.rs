@@ -850,10 +850,10 @@ fn walker_emit_specialised_pair_item<Sym: WalkSym>(
 /// One hop of a `while tb is not None: names.append(tb.tb_frame.f_code.co_name);
 /// tb = tb.tb_next` traceback walk.
 ///
-/// Each of these is a `GetSetProperty` whose getter body is a slot read on a
-/// receiver [`walker_specialize_traceback_walk_field`] pins by class:
-/// `pytraceback.py descr_get_next` / `descr_get_tb_frame` /
-/// `descr_get_tb_lasti` and `pyframe.py fget_code`.
+/// Each of these is a slot read on a receiver
+/// [`walker_specialize_traceback_walk_field`] pins by class:
+/// `typedef.py interp_attrproperty_w('frame')`, `pytraceback.py descr_get_next`,
+/// and `pyframe.py fget_code`.
 /// None of them dispatches anywhere or can raise.  `tb_lineno` is not a
 /// slot fold: [`try_walker_orthodox_traceback_lineno`] descends
 /// `descr_get_tb_lineno` so a sentinel node records getfield + residual
@@ -863,8 +863,7 @@ enum TracebackWalkField {
     /// `tb.tb_next` — the chain link; a null slot is the terminator and
     /// surfaces as `None`.
     TbNext,
-    /// `tb.tb_frame` — the node's frame.  Unlike its two siblings the getter
-    /// ALSO runs `mark_as_escaped()`; see the escape emit.
+    /// `tb.tb_frame` — `interp_attrproperty_w('frame')`, the node's frame slot.
     TbFrame,
     /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
     /// `tb_lasti` / `tb_lineno` are absent: `tb_lasti` is unused on the walk,
@@ -977,8 +976,6 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    use pyre_interpreter::pyframe::PyFrame;
-
     let receiver_type = match field {
         TracebackWalkField::FCode => &pyre_interpreter::pyframe::FRAME_TYPE,
         TracebackWalkField::CoName | TracebackWalkField::CoFirstlineno => {
@@ -1055,7 +1052,10 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         TracebackWalkField::CoName => unsafe {
             (*(concrete_obj as *const pyre_interpreter::pycode::PyCode)).w_name
         },
-        _ => (unsafe { (*(concrete_obj as *const PyFrame)).pycode }) as pyre_object::PyObjectRef,
+        _ => {
+            (unsafe { (*(concrete_obj as *const pyre_interpreter::pyframe::PyFrame)).pycode })
+                as pyre_object::PyObjectRef
+        }
     };
     // Only `tb_next` has a null with a defined meaning.  A null frame is a
     // torn-down traceback and a null `pycode` a half-built frame; both are
@@ -1096,37 +1096,6 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         walker_guard_stamped_nonnull(ctx, op_pc, raw_value, stored)?;
         raw_value
     };
-
-    if field == TracebackWalkField::TbFrame {
-        // `descr_get_tb_frame` also runs `frame.mark_as_escaped()`
-        // (`pyframe.py mark_as_escaped`): the reference it hands out has to
-        // keep the frame materialised.  `set_escaped` ORs `FLAG_ESCAPED` into
-        // the `flags` byte, so the trace reads that byte, sets the bit, and
-        // stores it back.
-        //
-        // The bit has to be set BY THE TRACE, not only stamped now: the trace
-        // is reused, and each replay walks a different traceback naming a
-        // different frame, so a trace-time-only mark would leave every later
-        // frame unmarked.  The concrete write below is the one the
-        // authoritative walk's residual executor would have performed, applied
-        // here for the same reason `try_walker_lower_exc_info_residual` applies
-        // its own.
-        let flags_descr = crate::descr::pyframe_flags_descr();
-        let live_flags =
-            crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, raw_value, flags_descr.clone());
-        let escaped_bit = ctx.trace_ctx.const_int(i64::from(PyFrame::FLAG_ESCAPED));
-        let new_flags = ctx
-            .trace_ctx
-            .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetfieldGc,
-            &[raw_value, new_flags],
-            flags_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setfield_cached(raw_value, flags_descr.index(), new_flags);
-        unsafe { (*(stored as *mut PyFrame)).mark_as_escaped() };
-    }
 
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
@@ -2190,8 +2159,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     //
     // There are two identities the walker can prove here: the current inline
     // callee's shadow frame, whose locals region the walk flushes itself at the
-    // escape, or the portal frame.  `descr_get_tb_frame` hands the portal
-    // back as a getfield result, a red box other than
+    // escape, or the portal frame.  `tb_frame` (`interp_attrproperty_w`)
+    // hands the portal back as a getfield result, a red box other than
     // `standard_virtualizable_box`; the check below proves that alias is the
     // standard virtualizable.  `fast2locals` is `@jit.unroll_safe` and reads
     // `locals_cells_stack_w` from the virtualizable boxes, so the proxy read
