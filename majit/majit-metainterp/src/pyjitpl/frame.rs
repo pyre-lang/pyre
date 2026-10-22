@@ -794,6 +794,27 @@ impl MIFrame {
         self.pushed_box = None;
     }
 
+    /// `pyjitpl.py perform_call` is `newframe` then `setup_call`. A portal
+    /// frame that only went through `newframe` stays at pc 0 with empty
+    /// working banks — the FBW walker's `note_inline_subwalk_start` does
+    /// that so `portal_trace_positions` has a `find_biggest_function` row.
+    /// `_copy_data_from_miframe` would `setposition` it at 0, and a later
+    /// `_setup_return_value_*` would read `code[position-1]`.
+    ///
+    /// Working slots only (`0..num_regs_*`). `copy_constants` writes the
+    /// constants area past that; a live `setup_call` box may be an InputArg
+    /// rather than a `ConstPtr`.
+    pub fn never_received_setup_call(&self) -> bool {
+        if self.pc != 0 || self.jitcode.jitdriver_sd().is_none() {
+            return false;
+        }
+        let empty =
+            |regs: &[Option<OpRef>], n: usize| !regs.iter().take(n).any(|slot| slot.is_some());
+        empty(&self.int_regs, self.jitcode.num_regs_i())
+            && empty(&self.ref_regs, self.jitcode.num_regs_r())
+            && empty(&self.float_regs, self.jitcode.num_regs_f())
+    }
+
     /// pyjitpl.py `MIFrame.setup_resume_at_op(pc)`.
     ///
     /// `last_opcode_position` follows `pc`, the way `setup` seats both and
@@ -1523,6 +1544,16 @@ impl MIFrameStack {
         self.free_frames = frames;
     }
 
+    /// Drop portal frames that `newframe` created without `setup_call`.
+    ///
+    /// `convert_and_run_from_pyjitpl` copies every remaining frame;
+    /// `_setup_return_value_*` requires each caller to sit at the `-live-`
+    /// after `xxx_call_yyy`.
+    pub fn drop_frames_never_setup_call(&mut self) {
+        self.frames
+            .retain(|frame| !frame.never_received_setup_call());
+    }
+
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
@@ -1620,6 +1651,49 @@ mod tests {
         assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(20)));
         assert_eq!(frame.ref_regs[1], Some(OpRef::ref_op(21)));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(30)));
+    }
+
+    #[test]
+    fn never_received_setup_call_is_newframe_without_setup_call() {
+        let portal = make_jitcode_with_regs(0, 2, 0);
+        portal.set_jitdriver_sd(0);
+
+        let log_only = MIFrame::new(portal.clone(), 0);
+        assert!(log_only.never_received_setup_call());
+
+        let mut setup = MIFrame::new(portal.clone(), 0);
+        setup.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xBEEF)));
+        assert!(!setup.never_received_setup_call());
+
+        let mut setup_box = MIFrame::new(portal.clone(), 0);
+        setup_box.ref_regs[0] = Some(OpRef::ref_op(3));
+        assert!(!setup_box.never_received_setup_call());
+
+        let portal_i = make_jitcode_with_regs(2, 0, 0);
+        portal_i.set_jitdriver_sd(0);
+        let mut setup_green = MIFrame::new(portal_i, 0);
+        setup_green.int_regs[0] = Some(OpRef::int_op(1));
+        assert!(!setup_green.never_received_setup_call());
+
+        let advanced = MIFrame::new(portal, 250);
+        assert!(!advanced.never_received_setup_call());
+
+        let non_portal = MIFrame::new(make_jitcode_with_regs(0, 2, 0), 0);
+        assert!(!non_portal.never_received_setup_call());
+    }
+
+    #[test]
+    fn drop_frames_never_setup_call_keeps_setup_and_advanced() {
+        let portal = make_jitcode_with_regs(0, 2, 0);
+        portal.set_jitdriver_sd(0);
+        let mut stack = MIFrameStack::empty();
+        stack.push(MIFrame::new(portal.clone(), 0));
+        let mut live = MIFrame::new(portal.clone(), 250);
+        live.ref_regs[0] = Some(OpRef::const_ptr(majit_ir::GcRef(0xBEEF)));
+        stack.push(live);
+        stack.drop_frames_never_setup_call();
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.frames[0].pc, 250);
     }
 
     #[test]

@@ -460,8 +460,8 @@ pub const MIN_FRAME_BYTES: usize = CALL_SRET_OFS as usize + MAX_SRET_BYTES;
 
 /// Per-token layout of a wasm execution frame. Every frozen geometry retains
 /// the historical host-trampoline call area even though emitted code uses the
-/// module-static scratch area. CA callee frames allocate only the prefix ending
-/// after the Ref homes.
+/// module-static scratch area. Host entry and CALL_ASSEMBLER allocate the
+/// full `frame_bytes` (`jfi_frame_depth`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGeometry {
     /// Number of value slots before the dispatch key (including frame[0]).
@@ -488,11 +488,12 @@ pub struct FrameGeometry {
     /// i64 slot per value slot and is disjoint from exits, dispatch, homes and
     /// the residual-call area.
     pub force_slot_base: u64,
-    /// Bytes through the end of Ref homes. CA callee frames allocate exactly
-    /// this many item bytes; the unused tail call area is intentionally omitted.
+    /// Bytes through the end of Ref homes. The residual-call area and any
+    /// extend tail sit past this prefix; `jfi_frame_depth` covers them.
     pub ca_frame_bytes: u32,
-    /// Full bytes in the frame layout, including the tail call area. Host entry
-    /// frames and every chained bridge use this geometry and allocation size.
+    /// Full bytes in the frame layout, including the tail call area. Host
+    /// entry, CALL_ASSEMBLER, and chained bridges allocate this many item
+    /// bytes (`ca_frame_depth` / `jfi_frame_depth`).
     /// An extended geometry keeps the source bytes through [`Self::tail_base`]
     /// and stores the grown total here.
     pub frame_bytes: u32,
@@ -608,18 +609,13 @@ impl FrameGeometry {
     }
 
     /// Frame depth, in Signed items, that `compile_loop` installs on the
-    /// token's `frame_info`. A CALL_ASSEMBLER caller allocates the callee frame
-    /// from it and stores the arguments at `_ll_initial_locs` before the
-    /// callee's `_check_frame_depth` runs, so a tailed geometry covers the
-    /// whole tail; otherwise the callee frame is the homes prefix
-    /// (`ca_frame_bytes`).
+    /// token's `frame_info`. `assembler.py` `update_frame_depth` publishes
+    /// the assembled depth; `rewrite.py` `gen_malloc_frame` / CALL_ASSEMBLER
+    /// and `llmodel.py` `malloc_jitframe` allocate from that same
+    /// `jfi_frame_depth`. The running `jf_frame` must cover every offset
+    /// this geometry stores, including the tail and the residual-call area.
     pub const fn ca_frame_depth(self) -> usize {
-        let bytes = if self.has_tail() {
-            self.frame_bytes
-        } else {
-            self.ca_frame_bytes
-        };
-        bytes as usize / std::mem::size_of::<isize>()
+        self.signed_item_count()
     }
 
     /// Signed item count `JitFrame::init` stores as `jf_frame.length`.
@@ -14089,12 +14085,10 @@ mod tests {
     #[test]
     fn ca_frame_depth_covers_tail_initial_locs() {
         let source = FrameGeometry::compact(8, 4, 1);
-        assert_eq!(
-            source.ca_frame_depth(),
-            source.ca_frame_bytes as usize / std::mem::size_of::<isize>()
-        );
+        assert_eq!(source.ca_frame_depth(), source.signed_item_count());
         let tailed = source.extend(11, source.ordinary_home_slots());
         assert!(tailed.has_tail());
+        assert_eq!(tailed.ca_frame_depth(), tailed.signed_item_count());
         let items_bytes = (tailed.ca_frame_depth() * std::mem::size_of::<isize>()) as u64;
         for k in 0..tailed.value_slots as u64 {
             assert!(
@@ -14102,6 +14096,41 @@ mod tests {
                 "initial loc {k} past the CALL_ASSEMBLER frame"
             );
         }
+        let map = build_home_gcmap(tailed, tailed.addressable_ordinary_homes(), 1);
+        let bits = usize::BITS as usize;
+        let mut max_bit = 0usize;
+        for (i, &w) in map[1..].iter().enumerate() {
+            if w != 0 {
+                max_bit = max_bit.max(i * bits + (bits - 1 - w.leading_zeros() as usize));
+            }
+        }
+        assert!(
+            max_bit < tailed.ca_frame_depth(),
+            "home gcmap bit {max_bit} past ca_frame_depth {}",
+            tailed.ca_frame_depth()
+        );
+    }
+
+    #[test]
+    fn ca_frame_depth_covers_compact_home_gcmap() {
+        let frame = FrameGeometry::compact(32, 18, 2);
+        assert_eq!(frame.ca_frame_depth(), frame.signed_item_count());
+        assert!(
+            frame.ca_frame_depth() > frame.ca_frame_bytes as usize / std::mem::size_of::<isize>()
+        );
+        let map = build_home_gcmap(frame, frame.ordinary_home_slots(), 2);
+        let bits = usize::BITS as usize;
+        let mut max_bit = 0usize;
+        for (i, &w) in map[1..].iter().enumerate() {
+            if w != 0 {
+                max_bit = max_bit.max(i * bits + (bits - 1 - w.leading_zeros() as usize));
+            }
+        }
+        assert!(
+            max_bit < frame.ca_frame_depth(),
+            "home gcmap bit {max_bit} past ca_frame_depth {}",
+            frame.ca_frame_depth()
+        );
     }
 
     #[test]

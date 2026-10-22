@@ -3707,8 +3707,12 @@ pub fn convert_and_run_from_pyjitpl(
             cur_bh.virtualizable_stack_base = config.virtualizable_stack_base;
             if let Some(per_frame) = config.per_frame {
                 let (frame_ptr, frame_stack_base) = per_frame[frame_index];
-                cur_bh.virtualizable_ptr = frame_ptr;
-                cur_bh.virtualizable_stack_base = frame_stack_base;
+                // A helper jitcode with no portal red leaves `(0, 0)`.
+                // Keep the portal pointer rather than nulling the vable.
+                if frame_ptr != 0 {
+                    cur_bh.virtualizable_ptr = frame_ptr;
+                    cur_bh.virtualizable_stack_base = frame_stack_base;
+                }
             }
         }
         // Keep every completed interpreter bank rooted while later frames are

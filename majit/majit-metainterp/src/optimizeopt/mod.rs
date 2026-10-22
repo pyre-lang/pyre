@@ -312,7 +312,8 @@ impl Drop for LiveOpPublication {
     }
 }
 
-fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
+/// Forward ConstPtr slots and `QuasiImmutDescr.struct` on one live op.
+pub(crate) fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     op.walk_const_ptr_refs_mut(visitor);
     // A folded const can sit on `_forwarded` before emit copies it into an arg.
     // `ForwardedSlot::borrow` copies the packed word; `walk_const_ptr_refs`

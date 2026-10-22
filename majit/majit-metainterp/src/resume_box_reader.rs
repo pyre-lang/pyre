@@ -68,8 +68,9 @@ pub struct BridgeVirtualCache<'a> {
     /// box the write just produced instead of a fresh load.
     pending_ref_array_writes: Vec<PendingRefArrayWrite>,
     /// The guard's fail values, which `resume.py decode_ref` reads a TAGBOX
-    /// operand out of (`cpu.get_ref_value(self.deadframe, num)`). Empty for
-    /// the recording-only reader, which never needs a concrete.
+    /// operand out of (`cpu.get_ref_value(self.deadframe, num)`).
+    /// `ResumeDataBoxReader.__init__` always keeps `self.deadframe`, recording
+    /// reader included — `decode_box` TAGBOX is `load_box_from_cpu`.
     ///
     /// Int and float failargs only — a ref failarg is read out of
     /// [`Self::fail_ref_roots`] instead.
@@ -115,6 +116,19 @@ impl Drop for BridgeVirtualCache<'_> {
     }
 }
 
+/// `cpu.get_ref_value(deadframe, num)` half of the failarg vector: only
+/// Ref-typed slots carry a pointer the collector must rewrite.
+fn fail_ref_roots_from(fail_values: &[i64], fail_types: &[majit_ir::Type]) -> Vec<i64> {
+    fail_values
+        .iter()
+        .enumerate()
+        .map(|(i, &bits)| match fail_types.get(i) {
+            Some(majit_ir::Type::Ref) => bits,
+            _ => 0,
+        })
+        .collect()
+}
+
 /// One `SETARRAYITEM_GC` of a ref item that `_prepare_pendingfields`
 /// applied, kept on the reader (see `BridgeVirtualCache`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,7 +151,7 @@ impl<'a> BridgeVirtualCache<'a> {
             bool,
         ) -> majit_ir::DescrRef,
     ) -> Self {
-        Self::recording(size, mint_raw_array_descr, &[])
+        Self::recording(size, mint_raw_array_descr, &[], &[], &[])
     }
 
     /// The recording-only reader seeded with the objects the direct reader
@@ -147,6 +161,10 @@ impl<'a> BridgeVirtualCache<'a> {
     /// because this reader records what that one applied. A
     /// `getvirtual_ptr` hit then returns that object's box rather than
     /// allocating a second one.
+    ///
+    /// `fail_values` / `fail_types` are `ResumeDataBoxReader.deadframe`:
+    /// `decode_box` TAGBOX still `load_box_from_cpu` (`cpu.get_ref_value`)
+    /// when a virtual field is a live box the assembler saved.
     pub fn recording(
         size: usize,
         mint_raw_array_descr: fn(
@@ -157,6 +175,8 @@ impl<'a> BridgeVirtualCache<'a> {
             bool,
         ) -> majit_ir::DescrRef,
         all_virtuals: &[Option<majit_ir::GcRef>],
+        fail_values: &[i64],
+        fail_types: &[majit_ir::Type],
     ) -> Self {
         // Recording-only still allocates concrete shadows
         // (`materialize_concrete_virtual_ptr`). resume.py keeps each virtual
@@ -173,14 +193,19 @@ impl<'a> BridgeVirtualCache<'a> {
             mint_raw_array_descr,
             executing: None,
             pending_ref_array_writes: Vec::new(),
-            fail_values: Vec::new(),
-            fail_ref_roots: Vec::new(),
+            fail_values: fail_values.to_vec(),
+            fail_ref_roots: fail_ref_roots_from(fail_values, fail_types),
             concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         };
         if size > 0 {
             unsafe {
                 majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
+        }
+        if !cache.fail_ref_roots.is_empty() {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.fail_ref_roots);
             }
         }
         for (vidx, slot) in all_virtuals.iter().enumerate() {
@@ -218,14 +243,7 @@ impl<'a> BridgeVirtualCache<'a> {
             executing: Some(allocator),
             pending_ref_array_writes: Vec::new(),
             fail_values: fail_values.to_vec(),
-            fail_ref_roots: fail_values
-                .iter()
-                .enumerate()
-                .map(|(i, &bits)| match fail_types.get(i) {
-                    Some(majit_ir::Type::Ref) => bits,
-                    _ => 0,
-                })
-                .collect(),
+            fail_ref_roots: fail_ref_roots_from(fail_values, fail_types),
             concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         };
@@ -2126,6 +2144,8 @@ mod tests {
             1,
             default_bridge_array_descr,
             &[Some(majit_ir::GcRef(0x1000))],
+            &[],
+            &[],
         );
         assert_eq!(cache.get_concrete_ptr(0), Some(majit_ir::GcRef(0x1000)));
         majit_gc::shadow_stack::walk_resume_ref_roots(|root| {
@@ -2167,6 +2187,42 @@ mod tests {
         let second = decode_fieldnum(&mut ctx, tagged, None, &resume_data, &mut cache);
         assert_eq!(second, first);
         assert_eq!(ctx.box_value(second), Some(majit_ir::Value::Int(42)));
+    }
+
+    /// `call_jit.rs` `start_bridge_tracing(..., execute_replay=false)` builds
+    /// the recording reader after a DirectReader already applied. That reader
+    /// is still `ResumeDataBoxReader` and must carry `self.deadframe`: a
+    /// virtual field TAGBOX is `load_box_from_cpu`, including a failarg the
+    /// assembler left as a hole (`rd_locs == 0xFFFF`, `liveboxes[num] is None`).
+    #[test]
+    fn tagbox_decode_loads_from_recording_deadframe() {
+        let fail_types = [Type::Ref, Type::Ref];
+        let fail_values = [0x1110i64, 0x2220];
+        let mut ctx = crate::TraceCtx::for_test_input_layout(&fail_types, &[true, false]);
+        let hole = OpRef::input_arg_ref(1);
+        assert_eq!(ctx.box_value(hole), None);
+
+        let resume_data = empty_resume_data(fail_types.to_vec());
+        let mut cache = BridgeVirtualCache::recording(
+            1,
+            default_bridge_array_descr,
+            &[],
+            &fail_values,
+            &fail_types,
+        );
+        let tagged = tag_box(1);
+        let first = decode_fieldnum(&mut ctx, tagged, None, &resume_data, &mut cache);
+        assert_eq!(first, hole);
+        assert_eq!(
+            ctx.box_value(first),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0x2220)))
+        );
+        let second = decode_fieldnum(&mut ctx, tagged, None, &resume_data, &mut cache);
+        assert_eq!(second, first);
+        assert_eq!(
+            ctx.box_value(second),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(0x2220)))
+        );
     }
 
     /// The funnel folds through the executor row, so the concrete this helper
@@ -2468,7 +2524,8 @@ mod tests {
             fieldnums: vec![tag0, tag1],
         })];
         let seed = GcRef(0xFEED);
-        let mut cache = BridgeVirtualCache::recording(1, default_bridge_array_descr, &[Some(seed)]);
+        let mut cache =
+            BridgeVirtualCache::recording(1, default_bridge_array_descr, &[Some(seed)], &[], &[]);
         CALLS.store(0, Ordering::SeqCst);
         let result =
             materialize_bridge_virtual(&mut ctx, 0, Some(&virtuals), &resume_data, &mut cache);
