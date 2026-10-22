@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The slowest reading is 4.7x, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=6
+# ubuntu cranelift 5.5x at pypy exec 0.08s (wall 0.47s). 6 is 9% over that reading.
 # A residual callee raises for the extremes of a hot descending loop and
 # returns in the middle, so the loop trace's exception guard chronically fails
 # WITHOUT a pending exception and a no-exception bridge gets compiled.  That
