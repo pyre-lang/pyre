@@ -2030,11 +2030,18 @@ fn analyze_pipeline_from_module_paths(
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }
-            layout.gckind = if declared_gc.contains(&sid) {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-            } else {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-            };
+            // `DeclaredGcFacts` seeds `GcType` / field-0. A layout that
+            // already holds a GC pointer — including one nested inside an
+            // inlined by-value struct, recorded by `from_type_strings`
+            // before interior-field clearing — is a `GcStruct` even
+            // without that impl (`declared_raw_adt_node`). A nested raw
+            // Struct of only scalars stays Raw. Do not downgrade that
+            // answer to Raw: `new` defaults the Size descr to GC, and
+            // `rewrite_op_{get,set}field` would otherwise Abort a Ref
+            // store into the object it just allocated.
+            if declared_gc.contains(&sid) || layout.holds_gc_pointer() {
+                layout.gckind = crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc;
+            }
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {

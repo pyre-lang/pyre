@@ -985,10 +985,12 @@ pub(crate) fn mro_contains(mro: &[PyObjectRef], needle: PyObjectRef) -> bool {
 }
 
 /// pypy/interpreter/baseobjspace.py `issubtype_w` — `cls` is in
-/// `w_type.mro_w`. Iterates the installed MRO (`typeobject.py:1640-1644
+/// `w_type.mro_w`. Iterates the installed MRO (`typeobject.py
 /// _issubtype`: `w_type in w_sub.mro_w`); a type whose MRO is not yet
 /// installed (`mro_ptr` null / `not hasmro`) takes the
 /// [`issubtype_slow_and_wrong`] base-chain walk.
+///
+/// The MRO test itself is [`typeobject_issubtype`] (`W_TypeObject.issubtype`).
 pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     if w_type.is_null() {
         return false;
@@ -999,10 +1001,28 @@ pub(crate) unsafe fn issubtype_w(w_type: PyObjectRef, cls: PyObjectRef) -> bool 
     if !is_type_like_w(w_type) {
         return false;
     }
-    // One owner for `_issubtype`: under the JIT this registered
-    // `dont_look_inside` helper is the residual scan inside PyPy's
-    // `_pure_issubtype`; it also owns the partially-initialized slow path.
-    pyre_object::w_type_issubtype(w_type, cls)
+    typeobject_issubtype(w_type, cls)
+}
+
+/// typeobject.py `W_TypeObject.issubtype`.
+///
+/// `promote(self); promote(w_type)`; under the JIT with two nonzero
+/// version tags, `_pure_issubtype`; otherwise `_issubtype`.
+/// Shared by [`issubtype_w`] (`_type_issubtype`) and [`isinstance_w`]
+/// (`_type_isinstance` → `self.type(w_inst).issubtype(w_type)`).
+/// `issubtype_w`'s `is_type_like_w` check reads `isinstance_w`, so this
+/// body must not go back through [`issubtype_w`].
+unsafe fn typeobject_issubtype(w_sub: PyObjectRef, w_type: PyObjectRef) -> bool {
+    let _ = majit_metainterp::jit::promote(w_sub);
+    let _ = majit_metainterp::jit::promote(w_type);
+    if majit_metainterp::jit::we_are_jitted() {
+        let version_tag1 = w_type_version_tag(w_sub);
+        let version_tag2 = w_type_version_tag(w_type);
+        if version_tag1 != 0 && version_tag2 != 0 {
+            return _pure_issubtype(w_sub, w_type, version_tag1, version_tag2);
+        }
+    }
+    pyre_object::w_type_issubtype(w_sub, w_type)
 }
 
 /// JIT walker accessor for `issubtype_w` without exposing the internal helper
@@ -1486,12 +1506,9 @@ pub(crate) unsafe fn p_recursive_issubclass_w(
 /// leaving the call an opaque residual.
 #[majit_macros::unroll_safe]
 pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
-    // Nested tuple / union classinfo recurses in native Rust with no
-    // Python frame push, so guard the C stack here or a deep classinfo
-    // blows it before any frame-level check fires.
-    crate::stack_check::stack_check()?;
     unsafe {
-        // abstractinst.py:104-106 — quick exact-type test.
+        // abstractinst.py `abstract_isinstance_w` — no stack_check on the
+        // exact-type arm or the `__instancecheck__` arm.
         if let Some(t) = crate::typedef::r#type(obj)
             && std::ptr::eq(t.as_ptr(), classinfo)
         {
@@ -1499,6 +1516,10 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         }
         // abstractinst.py:108-114 — tuple recursion.
         if is_tuple(classinfo) {
+            // Nested tuple / union classinfo recurses in native Rust with no
+            // Python frame push, so guard the C stack here or a deep classinfo
+            // blows it before any frame-level check fires.
+            crate::stack_check::stack_check()?;
             // The recursive `isinstance` re-enters Python (`__instancecheck__`)
             // and may collect; `obj` and the classinfo tuple are raw locals, so
             // pin them on the shadow stack across the walk.
@@ -1518,6 +1539,7 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         }
         // PEP 604 `X | Y` union recursion — lib_pypy/_pypy_generic_alias.py.
         if pyre_object::is_union(classinfo) {
+            crate::stack_check::stack_check()?;
             let union_args = pyre_object::w_union_get_args(classinfo);
             let _roots = pyre_object::gc_roots::push_roots();
             let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, union_args]);
@@ -2698,13 +2720,29 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     } else {
         return Err(index_type_error("list", index));
     };
+    // `rlist.py` `ll_getitem` (`func is dum_checkidx`): `r_uint(index) >=
+    // r_uint(length)`, then `index = r_uint(index) + r_uint(length)` and the
+    // same test again. Raise here so a walked `getitem_list` records the
+    // IndexError on the failing bounds guard (`descr_getitem` except). The
+    // inner body still range-checks; on the in-range path that test folds.
+    {
+        let length = w_list_len(obj) as i64;
+        let mut index_u = idx as u64;
+        let length_u = length as u64;
+        if index_u >= length_u {
+            index_u = index_u.wrapping_add(length_u);
+            if index_u >= length_u {
+                return Err(PyError::index_error("list index out of range"));
+            }
+        }
+    }
     // `listobject.py` `W_ListObject.descr_getitem` calls `self.getitem(index)`
     // with no list lock. `w_list_getitem` is opaque (`dont_look_inside` pairs
     // acquire/release), so the `gil_ready == 0` arm's look-inside call is
     // what `grab_initial_jitcodes` uses to reach `w_list_getitem_inner`.
     // Publication fails the guard and the retrace takes the locked wrapper.
-    // The BINARY_SUBSCR walker descends that inner body by name
-    // (`list_getitem_jitcode`).
+    // The BINARY_SUBSCR walker descends this PyResult body
+    // (`list_getitem_jitcode`), whose bounds guard is the IndexError.
     let ready = pyre_object::gil_ready::gil_ready_word();
     let item = if ready != 0 {
         w_list_getitem(obj, idx)
@@ -12127,6 +12165,23 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
     unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) }
 }
 
+/// typeobject.py `_pure_issubtype` — `@elidable_promote()` over `_issubtype`.
+/// The two version tags are the elidable key; the body is the MRO scan.
+#[majit_macros::elidable_promote]
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn _pure_issubtype(
+    w_sub: PyObjectRef,
+    w_type: PyObjectRef,
+    version_tag1: u64,
+    version_tag2: u64,
+) -> bool {
+    let _ = (version_tag1, version_tag2);
+    unsafe { pyre_object::w_type_issubtype(w_sub, w_type) }
+}
+
 /// typeobject.py `version_tag()` — the cache-version reader.
 /// In the interpreter, and for a heap type whose tag can still change,
 /// it reads the live `_version_tag` field; under the JIT for a prebuilt
@@ -14383,11 +14438,10 @@ pub unsafe fn isinstance_w(w_obj: PyObjectRef, w_cls: PyObjectRef) -> bool {
     if w_obj_type.is_null() {
         return false;
     }
-    // `type(w_inst).issubtype(w_type)` (objspace.py:808 _type_isinstance).
-    // The MRO membership scan is the single home `w_type_issubtype`
-    // (self-identity is mro[0], so the `w_obj_type is w_cls` fast path is
-    // subsumed); the null-mro case walks find_best_base there.
-    w_type_issubtype(w_obj_type, w_cls)
+    // `type(w_inst).issubtype(w_type)` (`StdObjSpace._type_isinstance`).
+    // `W_TypeObject.issubtype` — not `space.issubtype_w`, whose
+    // `is_type_like_w` check reads this function.
+    typeobject_issubtype(w_obj_type, w_cls)
 }
 
 /// pypy/interpreter/baseobjspace.py DescrMismatch.

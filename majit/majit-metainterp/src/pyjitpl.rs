@@ -5921,18 +5921,6 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:3330: virtualizable_boxes.append(virtualizable_box)
         // is folded inside init_virtualizable_boxes (it pushes vable_ref
         // at the end of the list).
-        if crate::vable_read_probe_enabled() {
-            eprintln!(
-                "[vable-read-probe] init virtualizable_box={virtualizable_box:?} \
-                 virtualizable_value={virtualizable_value:?} num_greens={num_green_args} \
-                 num_reds={num_reds} index_of_virtualizable={index_of_virtualizable} \
-                 identity_ref_bank_index={:?} identity_index={identity_index:?} \
-                 box_ref_index={box_ref_index} num_static={num_static} \
-                 array_lengths={array_lengths:?} has_expanded_tail={has_expanded_tail} \
-                 live_values={:?}",
-                info.identity_ref_bank_index, live_values,
-            );
-        }
         ctx.install_virtualizable_info(std::sync::Arc::clone(&info));
         ctx.init_virtualizable_boxes(
             &info,
@@ -8021,7 +8009,6 @@ impl<M: Clone> MetaInterp<M> {
                 adescr,
                 value,
                 concrete,
-                false,
             )
         });
         assert!(
@@ -8059,7 +8046,6 @@ impl<M: Clone> MetaInterp<M> {
                 adescr,
                 value,
                 concrete,
-                false,
             )
         });
         assert!(
@@ -8097,7 +8083,6 @@ impl<M: Clone> MetaInterp<M> {
                 adescr,
                 value,
                 concrete,
-                false,
             )
         });
         assert!(
@@ -31370,6 +31355,8 @@ mod tests {
                     Value::Ref(GcRef::NULL),
                     Value::Int(4),
                 ],
+                color_r: Vec::new(),
+                color_concrete_r: Vec::new(),
                 frame: OpRef::NONE,
                 nargs: 0,
                 return_substitute: None,
@@ -31875,6 +31862,8 @@ mod tests {
                 registers_r: vec![b],
                 registers_f: Vec::new(),
                 concrete_r: vec![Value::Ref(GcRef(0x5c100))],
+                color_r: Vec::new(),
+                color_concrete_r: Vec::new(),
                 frame: OpRef::NONE,
                 nargs: 0,
                 return_substitute: None,

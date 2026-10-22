@@ -162,7 +162,7 @@ impl majit_backend_wasm_host::HostState for Host {
 /// permanently empty: every `std::env::var_os` reached from inside the guest
 /// returns `None` regardless of this process's environment. That covers every
 /// JIT knob and probe that lives in the guest crates — `PYRE_GC_INTERP`,
-/// `MAJIT_STRICT`, `MAJIT_LOG`, the `PYRE_FBW_*` / `PYRE_P2_DIAG` /
+/// `MAJIT_STRICT`, `MAJIT_LOG`, the `PYRE_FBW_*` /
 /// `PYRE_JD1_DEBUG` / `PYRE_JD1_DUMP` diagnostics — so setting one here
 /// changes nothing at all. Silently ignoring them is the trap: an A/B run
 /// through such a knob measures the same build twice and reads as a result.

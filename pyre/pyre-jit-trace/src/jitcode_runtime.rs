@@ -146,6 +146,7 @@ pub(crate) fn get_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitC
 
 /// Already-published body at `index`, or `None` if that cell was never
 /// decoded. Does not run [`load_jitcode`].
+#[cfg(test)]
 pub(crate) fn peek_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitCode>> {
     JITCODE_CELLS.get(index)?.get().map(|frozen| &frozen.0)
 }
@@ -592,8 +593,8 @@ static UNWRAP_CELL_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_list_setitem_inner`, resolved by name for
 /// the same reason.
 static LIST_SETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `w_list_getitem_inner`, resolved by name for
-/// the same reason.
+/// Cached `ALL_JITCODES` index of `baseobjspace::getitem_list`, resolved by
+/// graph key the way [`str_getitem_jitcode`] resolves `getitem_str`.
 static LIST_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_tuple_getitem`, resolved by graph key
 /// rather than by name -- see [`compute_pathed_jitcode_index`].
@@ -761,10 +762,14 @@ pub fn list_setitem_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
-/// The lock-guard-free charon `w_list_getitem_inner` body in `ALL_JITCODES`.
+/// `baseobjspace::getitem_list` — `descr_getitem` after `getindex_w`.
+/// The IndexError lives in this PyResult graph (`ll_getitem` dum_checkidx);
+/// `w_list_getitem_inner` remains the unique lock-free leaf the in-range
+/// path nested-walks.
 pub fn list_getitem_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*LIST_GETITEM_JITCODE_INDEX
-        .get_or_init(|| compute_named_jitcode_index("w_list_getitem_inner")))?;
+    let idx = (*LIST_GETITEM_JITCODE_INDEX.get_or_init(|| {
+        compute_pathed_jitcode_index("pyre_interpreter::baseobjspace::getitem_list")
+    }))?;
     get_jitcode_by_index(idx)
 }
 
@@ -4581,11 +4586,7 @@ mod tests {
                 list_setitem_jitcode(),
                 "w_list_setitem_inner",
             ),
-            (
-                "list_getitem",
-                list_getitem_jitcode(),
-                "w_list_getitem_inner",
-            ),
+            ("list_getitem", list_getitem_jitcode(), "getitem_list"),
             (
                 "list_pop_end",
                 list_pop_end_jitcode(),

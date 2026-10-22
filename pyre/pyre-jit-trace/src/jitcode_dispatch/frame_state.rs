@@ -49,6 +49,13 @@ pub struct WalkFrameStateData {
     /// than read from the flat map.  `PYRE_VSTACK_DIAG` logs the per-op
     /// reconcile trace.
     pub vstack_boxes: Vec<OpRef>,
+    /// Operand stack at the current Python-opcode boundary.
+    ///
+    /// `vstack_boxes` is the live SET store (`_opimpl_setarrayitem_vable`
+    /// `virtualizable_boxes[index] = valuebox`). A mid-opcode opcode-start
+    /// capture re-pops the entering stack (`capture_resumedata` at `orgpc`),
+    /// so that clone is taken at the boundary and left untouched by SET.
+    pub vstack_opcode_entry: Vec<OpRef>,
     /// #73: the last Ref box written via [`super::write_ref_reg`] during the
     /// CURRENT Python opcode — the box a value-producing opcode lands on
     /// the operand-stack TOS.  Reset to `OpRef::NONE` at every opcode
@@ -128,12 +135,29 @@ pub struct WalkFrameStateData {
     pub list_iter_class_guard_resume: Option<(usize, Vec<OpRef>)>,
 }
 
+impl WalkFrameStateData {
+    /// Snapshot capture reads the opcode-entry stack, including CONST_NULL.
+    ///
+    /// `resume.py` `ResumeDataLoopMemo` copies the live registers at the
+    /// marker; a mid-opcode SET has not retired that marker. Empty entry
+    /// (tests / first instruction before the first boundary) falls back to
+    /// the live SET store.
+    pub fn capture_vstack(&self) -> Vec<OpRef> {
+        if self.vstack_opcode_entry.is_empty() {
+            self.vstack_boxes.clone()
+        } else {
+            self.vstack_opcode_entry.clone()
+        }
+    }
+}
+
 impl Default for WalkFrameStateData {
     fn default() -> Self {
         Self {
             callee_shadow: None,
             outer_active_boxes: Vec::new(),
             vstack_boxes: Vec::new(),
+            vstack_opcode_entry: Vec::new(),
             vstack_last_ref: OpRef::NONE,
             vstack_reorder_saved: None,
             current_exception_seed: None,
@@ -219,6 +243,9 @@ impl WalkFrameState {
         for slot in &mut data.vstack_boxes {
             replace(slot);
         }
+        for slot in &mut data.vstack_opcode_entry {
+            replace(slot);
+        }
         replace(&mut data.vstack_last_ref);
         if let Some((_, _, boxes, _)) = &mut data.vstack_reorder_saved {
             for slot in boxes {
@@ -286,6 +313,9 @@ unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut G
         }
     }
     for value in &mut data.vstack_boxes {
+        walk_frame_box(value, visitor);
+    }
+    for value in &mut data.vstack_opcode_entry {
         walk_frame_box(value, visitor);
     }
     walk_frame_box(&mut data.vstack_last_ref, visitor);

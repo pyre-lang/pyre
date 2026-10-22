@@ -1230,6 +1230,60 @@ fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
 }
 
 #[test]
+fn orgpc_liveness_banks_match_decoder_when_previous_insn_is_live() {
+    // Encoder (`frame_liveness_reg_indices_by_bank_at_with_jitcode_pc`) and
+    // decoder (`frame_liveness_reg_indices_by_bank_from_pc` /
+    // `JitCode.get_live_vars_info`) agree at a startpoint whose previous
+    // instruction is `-live-`.
+    let live = crate::state::op_live();
+    let offset =
+        crate::state::intern_liveness(&[7, 13], &[5], &[2]).expect("intern a distinct live set");
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("int_add/ii>i must be in the insns table");
+    let mut code = vec![live];
+    majit_jitcode::liveness::encode_offset(offset as usize, &mut code);
+    let live_pc = 0usize;
+    let orgpc = majit_jitcode::liveness::OFFSET_SIZE + 1;
+    code.extend_from_slice(&[int_add, 0, 1, 2]);
+    assert_eq!(orgpc, 3);
+
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("orgpc_liveness_bank_test");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([live_pc, orgpc].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    let jitcode = crate::state::install_jitcode_for(std::ptr::null(), std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*jitcode).index };
+    assert!(
+        unsafe {
+            (&(*jitcode).payload)
+                .jitcode
+                .can_decode_live_vars(orgpc, live)
+        },
+        "orgpc whose previous insn is -live- must decode"
+    );
+
+    let encoder =
+        crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(index, orgpc as i32);
+    let decoder = crate::state::frame_liveness_reg_indices_by_bank_from_pc(index, orgpc as i32);
+    assert_eq!(encoder, decoder, "encoder-bank == decoder-bank at orgpc");
+    let at_live = crate::state::frame_liveness_reg_indices_by_bank_from_pc(index, live_pc as i32);
+    assert_eq!(
+        encoder, at_live,
+        "orgpc banks equal the preceding -live- banks"
+    );
+    assert_eq!(encoder.int, vec![7, 13]);
+    assert_eq!(encoder.ref_, vec![5]);
+    assert_eq!(encoder.float, vec![2]);
+}
+
+#[test]
 fn vstack_permuted_for_iter_entry_uses_block_head_target() {
     let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
     pyjit.metadata.n_py_instrs = 19;
@@ -1709,6 +1763,7 @@ fn frame_debug_data_accessors_resolve_to_their_own_offsets() {
     }
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn builtin_wrapper_args_slice_names_the_object_gcarray_descr() {
     // `cpu.arraydescrof(ARRAY)` is one descr per ARRAY: the wrapper's length
@@ -1744,6 +1799,7 @@ fn gateway_positional_count_uses_rpython_signed() {
     );
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     let wrapper =
@@ -1848,6 +1904,7 @@ fn inline_call_callee_name(
     }
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn random_core_residuals_use_registered_genrand32_address() {
     // `_random` is a `pyre-module` module, so its residual address reaches
@@ -2304,8 +2361,16 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
     );
 }
 
+fn slot_is_const_null(tc: &TraceCtx, idx: usize, const_null: OpRef) -> bool {
+    tc.virtualizable_box_at(idx) == Some(const_null)
+        && matches!(
+            tc.virtualizable_entry_at(idx).map(|entry| entry.1),
+            Some(Value::Ref(r)) if r.is_null()
+        )
+}
+
 #[test]
-fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
+fn vable_store_tracks_null_box_without_changing_the_recorded_trace() {
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let array_len = 3;
@@ -2326,10 +2391,10 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     let fdescr = info.array_pointer_field_descr(0);
     let adescr = info.array_descrs[0].clone();
     let flat_base = info.num_static_extra_boxes;
-    assert!((0..=slot_count).all(|i| !tc.virtualizable_slot_stored_live_null(i)));
+    let const_null = tc.const_null();
+    assert!((0..slot_count).all(|i| slot_is_const_null(&tc, i, const_null)));
 
     let index0 = tc.const_int(0);
-    let const_null = tc.const_null();
     let ops_before = tc.num_ops();
     let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
         NonstandardVable::Decided(n) => n,
@@ -2348,25 +2413,51 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr.clone(),
             const_null,
             null,
-            true,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
     assert!(
-        (0..=slot_count)
+        (0..slot_count)
             .filter(|&i| i != flat_base)
-            .all(|i| !tc.virtualizable_slot_stored_live_null(i))
+            .all(|i| slot_is_const_null(&tc, i, const_null))
     );
     assert_eq!(
         tc.virtualizable_entry_at(flat_base).map(|entry| entry.0),
         Some(const_null)
     );
     assert!(const_null.is_constant());
+
+    tc.set_virtualizable_entry_at(flat_base, const_null, Value::Void);
+    let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
+        NonstandardVable::Decided(n) => n,
+        NonstandardVable::PendingEq { .. } => {
+            panic!("standard identity must take Step 3 Decided(false)")
+        }
+    };
+    assert!(matches!(
+        tc.vable_setarrayitem_checked(
+            nonstandard,
+            0,
+            vable,
+            index0,
+            0,
+            fdescr.clone(),
+            adescr.clone(),
+            const_null,
+            Value::Void,
+        ),
+        VableArrayStore::Stored(Some(_))
+    ));
+    assert_eq!(
+        tc.virtualizable_box_at(flat_base),
+        Some(const_null),
+        "ConstPtr(0) stack push with Void concrete is still this slot's own null"
+    );
     assert_eq!(
         tc.num_ops(),
         ops_before,
-        "the side-table marker records no op"
+        "storing ConstPtr(0) records no extra op"
     );
 
     let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
@@ -2386,11 +2477,10 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr.clone(),
             const_null,
             null,
-            false,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
 
     let index1 = tc.const_int(1);
     let non_null = tc.const_ref(2);
@@ -2411,11 +2501,15 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr.clone(),
             non_null,
             Value::Ref(majit_ir::GcRef(2)),
-            true,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(!tc.virtualizable_slot_stored_live_null(flat_base + 1));
+    assert_eq!(tc.virtualizable_box_at(flat_base + 1), Some(non_null));
+    assert_eq!(
+        tc.virtualizable_entry_at(flat_base + 1)
+            .map(|entry| entry.1),
+        Some(Value::Ref(majit_ir::GcRef(2)))
+    );
 
     let nonstandard = match tc.begin_nonstandard_virtualizable(0, vable, &fdescr) {
         NonstandardVable::Decided(n) => n,
@@ -2434,13 +2528,12 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
             adescr,
             const_null,
             null,
-            true,
         ),
         VableArrayStore::Stored(Some(_))
     ));
-    assert!(tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
     tc.set_virtualizable_entry_at(flat_base, const_null, null);
-    assert!(!tc.virtualizable_slot_stored_live_null(flat_base));
+    assert!(slot_is_const_null(&tc, flat_base, const_null));
 }
 
 /// `getfield_vable_*` must abort to `VableBoxNotSeeded` when the
@@ -5616,6 +5709,7 @@ fn float_cmp_leaves_are_the_pypy_leaf() {
     }
 }
 
+#[cfg(feature = "pyre-module")]
 #[test]
 fn unary_neg_leaves_are_the_pypy_leaf() {
     for (path, arith) in [
@@ -12848,15 +12942,24 @@ fn bind_fake_vable(tc: &mut TraceCtx, buf: &mut [u8]) {
         "fake vable buffer must cover token_offset",
     );
     let vable_ref = tc.const_ref(buf.as_ptr() as i64);
+    let vable_val = majit_ir::Value::Ref(majit_ir::GcRef(buf.as_ptr() as usize));
+    let mut oprefs = Vec::with_capacity(info.static_fields.len());
+    let mut values = Vec::with_capacity(info.static_fields.len());
+    for field in &info.static_fields {
+        match field.field_type {
+            Type::Int => {
+                oprefs.push(tc.const_int(0));
+                values.push(majit_ir::Value::Int(0));
+            }
+            Type::Ref => {
+                oprefs.push(tc.const_ref(0));
+                values.push(majit_ir::Value::Ref(majit_ir::GcRef(0)));
+            }
+            other => panic!("bind_fake_vable: unexpected static type {other:?}"),
+        }
+    }
     tc.install_virtualizable_info(info.clone());
-    tc.init_virtualizable_boxes(
-        &info,
-        vable_ref,
-        majit_ir::Value::Ref(majit_ir::GcRef(buf.as_ptr() as usize)),
-        &[],
-        &[],
-        &[0],
-    );
+    tc.init_virtualizable_boxes(&info, vable_ref, vable_val, &oprefs, &values, &[0]);
     tc.set_virtualizable_heap_ptr(buf.as_ptr());
 }
 

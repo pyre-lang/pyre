@@ -3695,11 +3695,11 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 /// strategy and bounds guards of [`w_list_getitem_inner`], then the release;
 /// a guard failing between the two resumes at the opcode boundary, which runs
 /// the whole subscript again and leaves the traced acquire unreleased.
-/// `getitem_list` calls the inner while `gil_ready` is still 0, and the
-/// getitem fold descends that lock-free body by name
-/// (`list_getitem_jitcode`). The locked iterator arm
-/// (`list_iter_getitem_locked`) is a separate opaque residual for the same
-/// reason.
+/// `getitem_list` calls the inner while `gil_ready` is still 0. The getitem
+/// fold descends `getitem_list` (`list_getitem_jitcode`) so the IndexError
+/// is in the walked PyResult graph; the inner remains the lock-free leaf.
+/// The locked iterator arm (`list_iter_getitem_locked`) is a separate
+/// opaque residual for the same reason.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
@@ -3735,7 +3735,7 @@ fn ll_getitem_index(index: i64, length: i64) -> Option<usize> {
 }
 
 /// `#[inline(never)]` keeps a unique Charon leaf so
-/// `list_getitem_jitcode()` resolves `w_list_getitem_inner` the way
+/// `array_descr_identity` can name `w_list_getitem_inner` the way
 /// `list_setitem_jitcode()` resolves `w_list_setitem_inner`.
 #[inline(never)]
 pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {

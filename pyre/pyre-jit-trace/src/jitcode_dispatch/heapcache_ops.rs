@@ -1395,7 +1395,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         };
         let struct_ptr = concrete_obj_ptr;
         match (load_type, struct_ptr) {
-            (Some(ty), Some(p)) => {
+            (Some(ty), Some(p)) if p != 0 => {
                 ctx.trace_ctx
                     .field_sanity_load(p, &descr, ty)
                     .map(|v| match v {
@@ -1540,6 +1540,7 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
         let concrete_obj_ptr =
             concrete_obj_ptr.map(|p| obj_pin.as_ref().map_or(p, |pin| pin.get().0 as i64));
         if let (Some(ty), Some(struct_ptr)) = (load_type, concrete_obj_ptr)
+            && struct_ptr != 0
             && let Some(live_value) = ctx.trace_ctx.field_sanity_load(struct_ptr, &descr, ty)
         {
             if let majit_ir::Value::Ref(reference) = live_value {
@@ -1632,7 +1633,7 @@ pub(crate) fn guard_class_record<Sym: WalkSym>(
         .profiler()
         .count_ops(OpCode::GuardClass, majit_metainterp::counters::OPS);
     if !obj.is_constant() {
-        walker_guard_class(ctx, op.pc, obj, cls)?;
+        walker_guard_class(ctx, op.pc, obj, cls, true)?;
     }
     match dst_bank {
         'i' => {

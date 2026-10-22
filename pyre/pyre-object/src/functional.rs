@@ -986,11 +986,84 @@ pub const RANGE_PROMOTE_STEP_OFFSET: usize = std::mem::offset_of!(W_Range, promo
 /// already be non-zero (the caller raises `ValueError` for a zero step
 /// before reaching here).  The element count is computed once here and
 /// stored, mirroring `descr_new`'s `compute_range_length`.
+///
+/// `promote_step` is 0/1 so the constructor can join `jit_trace_fnaddrs`
+/// as a four-word residual (`pa4`); `w_range_new` is the bool-facing
+/// wrapper the interpreter already calls.
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
 )]
-pub fn w_range_new(
+pub fn w_range_finish(
+    start: PyObjectRef,
+    stop: PyObjectRef,
+    step: PyObjectRef,
+    promote_step: i64,
+) -> PyObjectRef {
+    let promote_step = promote_step != 0;
+    let _roots = crate::gc_roots::push_roots();
+    let _ = crate::gc_roots::pin_root(start);
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(stop);
+    let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(step);
+    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
+    // `functional.py compute_range_length`: `space.int_w` of every bound,
+    // then `get_len_of_range` (`ovfcheck`).  Machine-int bounds stay on
+    // this arm; overflow and a bound that is not a machine int take the
+    // bigint path below.
+    let start = crate::gc_roots::shadow_stack_get(start_slot);
+    let stop = crate::gc_roots::shadow_stack_get(stop_slot);
+    let step = crate::gc_roots::shadow_stack_get(step_slot);
+    // Exact machine ints (`functional.py` `space.int_w` then
+    // `get_len_of_range`).  Long / bool / overflow stay in the opaque
+    // bigint helper so this graph is the wrap's walked body.
+    if unsafe {
+        is_int(start)
+            && !is_bool(start)
+            && is_int(stop)
+            && !is_bool(stop)
+            && is_int(step)
+            && !is_bool(step)
+    } {
+        let (start_i, stop_i, step_i) = unsafe {
+            (
+                crate::intobject::w_int_get_value(start),
+                crate::intobject::w_int_get_value(stop),
+                crate::intobject::w_int_get_value(step),
+            )
+        };
+        if let Some(len_i) = range_length_checked(start_i, stop_i, step_i) {
+            let length = crate::gc_roots::pin_root(crate::intobject::jit_w_int_new(len_i));
+            let start = crate::gc_roots::shadow_stack_get(start_slot);
+            let stop = crate::gc_roots::shadow_stack_get(stop_slot);
+            let step = crate::gc_roots::shadow_stack_get(step_slot);
+            return W_Range::allocate_stable(W_Range {
+                ob: PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                start,
+                stop,
+                step,
+                length,
+                promote_step,
+            });
+        }
+    }
+    w_range_finish_big(
+        crate::gc_roots::shadow_stack_get(start_slot),
+        crate::gc_roots::shadow_stack_get(stop_slot),
+        crate::gc_roots::shadow_stack_get(step_slot),
+        promote_step,
+    )
+}
+
+/// Overflow / long / bool bounds.  Kept out of [`w_range_finish`]'s
+/// walked graph (`functional.py` `compute_range_length` on wrapped
+/// objects that are not machine ints).
+#[majit_macros::dont_look_inside]
+fn w_range_finish_big(
     start: PyObjectRef,
     stop: PyObjectRef,
     step: PyObjectRef,
@@ -1005,8 +1078,6 @@ pub fn w_range_new(
     let step_slot = crate::gc_roots::shadow_stack_len() - 1;
     // `RBigInt::fromint` / `RBigInt::new` allocate a nursery `Digits`
     // payload (`rbigint.py fromint`), so each conversion can collect.
-    // Reload every bound from its shadow-stack slot before the next
-    // `range_obj_to_bigint` — the Rust locals above are not rewritten.
     let length = unsafe {
         let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
             start_slot,
@@ -1020,10 +1091,6 @@ pub fn w_range_new(
         let len_big = range_length_big(&start_b, &stop_b, &step_b);
         range_bigint_to_obj(len_big)
     };
-    // `range_bigint_to_obj` is `w_int_new` / `w_long_new` and may collect.
-    // The three bounds live on the shadow stack (`expand_pop_roots` /
-    // `gc_restore_root`); the Rust locals do not, so an old-gen store of
-    // those copies would remember a nursery interior.
     let length = crate::gc_roots::pin_root(length);
     let start = crate::gc_roots::shadow_stack_get(start_slot);
     let stop = crate::gc_roots::shadow_stack_get(stop_slot);
@@ -1039,6 +1106,48 @@ pub fn w_range_new(
         length,
         promote_step,
     })
+}
+
+/// Box four machine ints and [`W_Range::allocate_stable`].  Residual so
+/// `descr_new`'s wrap records `get_len_of_range` (`range_length_checked`)
+/// then this one helper, matching `w_list_allocate_instance`.
+#[majit_macros::dont_look_inside]
+pub fn w_range_alloc_i64(
+    start: i64,
+    stop: i64,
+    step: i64,
+    length: i64,
+    promote_step: i64,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let _ = crate::gc_roots::pin_root(crate::intobject::jit_w_int_new(start));
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(crate::intobject::jit_w_int_new(stop));
+    let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(crate::intobject::jit_w_int_new(step));
+    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let length = crate::gc_roots::pin_root(crate::intobject::jit_w_int_new(length));
+    W_Range::allocate_stable(W_Range {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        start: crate::gc_roots::shadow_stack_get(start_slot),
+        stop: crate::gc_roots::shadow_stack_get(stop_slot),
+        step: crate::gc_roots::shadow_stack_get(step_slot),
+        length,
+        promote_step: promote_step != 0,
+    })
+}
+
+/// Bool-facing constructor.  The walkable four-word entry is [`w_range_finish`].
+pub fn w_range_new(
+    start: PyObjectRef,
+    stop: PyObjectRef,
+    step: PyObjectRef,
+    promote_step: bool,
+) -> PyObjectRef {
+    w_range_finish(start, stop, step, i64::from(promote_step))
 }
 
 /// Convenience constructor wrapping three machine-int bounds.  The explicit
@@ -1127,6 +1236,7 @@ pub fn range_bigint_to_obj(value: BigInt) -> PyObjectRef {
 ///
 /// # Safety
 /// `obj` must be a valid int/long/bool object.
+#[inline(always)]
 pub unsafe fn range_obj_as_i64(obj: PyObjectRef) -> Option<i64> {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
@@ -1454,16 +1564,46 @@ pub unsafe fn w_range_eq(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// Number of elements in a `(start, stop, step)` range —
 /// `functional.py compute_range_length`.
 pub fn range_length(start: i64, stop: i64, step: i64) -> i64 {
-    if step > 0 {
-        if start < stop {
-            (stop - start - 1) / step + 1
+    range_length_checked(start, stop, step).unwrap_or_else(|| {
+        if step > 0 {
+            if start < stop {
+                (stop - start - 1) / step + 1
+            } else {
+                0
+            }
+        } else if start > stop {
+            (start - stop - 1) / (-step) + 1
         } else {
             0
         }
-    } else if start > stop {
-        (start - stop - 1) / (-step) + 1
+    })
+}
+
+/// `get_len_of_range` with `ovfcheck` — `None` on overflow or a zero step.
+#[inline(always)]
+pub fn range_length_checked(start: i64, stop: i64, step: i64) -> Option<i64> {
+    if step > 0 {
+        if start < stop {
+            stop.checked_sub(start)?
+                .checked_sub(1)?
+                .checked_div(step)?
+                .checked_add(1)
+        } else {
+            Some(0)
+        }
+    } else if step < 0 {
+        if start > stop {
+            let neg_step = step.checked_neg()?;
+            start
+                .checked_sub(stop)?
+                .checked_sub(1)?
+                .checked_div(neg_step)?
+                .checked_add(1)
+        } else {
+            Some(0)
+        }
     } else {
-        0
+        None
     }
 }
 

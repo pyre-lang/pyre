@@ -1137,6 +1137,48 @@ impl Operand {
 /// `opname` field of `Insn::Op`, matching the tuple-shape exactly.
 pub const OPNAME_LIVE: &str = "-live-";
 
+/// Graph op the portal codewriter records for `dispatch_bytecode`'s
+/// `if self.debugdata is not None and self.debugdata.w_f_trace is not None:
+/// ec.bytecode_only_trace(self)`.  Flatten lowers each copy to
+/// `goto L_shared` and emits one out-of-line residual block per jitcode,
+/// matching the single copy in the dispatch loop. The shared block tests
+/// both conjuncts before the residual.
+/// A per-instruction inlined skip overflowed the u16 `code_len`
+/// ceiling on `exception_metadata_jitstress.run` (76364 vs 62584).
+pub const OPNAME_COND_RESIDUAL_CALL_R_V: &str = "cond_residual_call_r_v";
+
+/// Graph op the portal codewriter records for the
+/// `get_is_being_profiled` + `promote_greens` prefix of every
+/// instruction-start `jit_merge_point`.
+///
+/// `interp_jit.py PyFrame.dispatch` holds one loop head:
+/// `jit_merge_point(..., next_instr, pycode, is_being_profiled)` then
+/// `handle_bytecode`, then
+/// `is_being_profiled = self.get_is_being_profiled()`.
+/// `pyframe.py PyFrame.get_is_being_profiled` reads `debugdata` (a
+/// virtualizable field) and, when non-null,
+/// `FrameDebugData.is_being_profiled`. `jtransform.py promote_greens`
+/// then `{kind}_guard_value`s every Variable green.
+///
+/// Pyre unrolls that loop per instruction, so flatten lowers each copy
+/// to `goto pmg_shared` and emits one out-of-line block per jitcode,
+/// matching the single copy in the dispatch loop.
+pub const OPNAME_PORTAL_MERGE_GREENS: &str = "portal_merge_greens";
+
+pub(super) const SHARED_WAJ_LABEL_PREFIX: &str = "waj";
+const SHARED_WAJ_LABEL: &str = "waj_shared";
+const SHARED_WAJ_DISPATCH_LABEL: &str = "waj_dispatch";
+/// `interp_jit.py PyFrame._virtualizable_`: last_instr, pycode,
+/// valuestackdepth, debugdata.  The shared block reads debugdata,
+/// `debugdata.w_f_trace`, and last_instr; the switch key is
+/// `next_instr = r_uint(self.last_instr)`.
+const SHARED_WAJ_LAST_INSTR_FIELD_IDX: u16 = 0;
+const SHARED_WAJ_DEBUGDATA_FIELD_IDX: u16 = 3;
+
+const SHARED_PMG_LABEL: &str = "pmg_shared";
+const SHARED_PMG_NONNULL_LABEL: &str = "pmg_nonnull";
+const SHARED_PMG_JOIN_LABEL: &str = "pmg_join";
+
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
 /// The three RPython tuple shapes enumerated above: `Label`, `---`
@@ -1284,6 +1326,22 @@ pub struct GraphFlattener<'a> {
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
     next_label_id: usize,
+    /// Residual `bytecode_only_trace` args for the one out-of-line block
+    /// (`dispatch_bytecode` holds a single copy).
+    cond_residual_shared: Option<SpaceOperation>,
+    /// Portal frame the shared block reads `debugdata` / `last_instr` from.
+    cond_residual_frame: Option<FlowValue>,
+    /// `(last_instr, body_label)` so the shared block can switch back to
+    /// the opcode after `bytecode_only_trace`.
+    cond_residual_bodies: Vec<(i64, String)>,
+    /// `(frame, next_instr, pycode, profiled)` registers of the one
+    /// out-of-line `get_is_being_profiled` + `promote_greens` block.
+    /// Recorded from the first `portal_merge_greens` copy; later copies
+    /// must resolve to the same four.
+    portal_merge_regs: Option<(Register, Register, Register, Register)>,
+    /// `(next_instr, body_label)` so the shared block can switch back
+    /// after promoting the greens.
+    portal_merge_bodies: Vec<(i64, String)>,
     /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
     /// opnames from the four retired families (BINARY_OP / COMPARE_OP
     /// / BOOL / SETITEM) through
@@ -1326,6 +1384,11 @@ impl<'a> GraphFlattener<'a> {
             block_names: Vec::new(),
             link_names: Vec::new(),
             next_label_id: 0,
+            cond_residual_shared: None,
+            cond_residual_frame: None,
+            cond_residual_bodies: Vec::new(),
+            portal_merge_regs: None,
+            portal_merge_bodies: Vec::new(),
             lowering_ctx: None,
         }
     }
@@ -1422,6 +1485,14 @@ impl<'a> GraphFlattener<'a> {
                 self.ssarepr.pc_run_insn_pos.push((pos, py_pc));
             }
         }
+        if op.opname == OPNAME_COND_RESIDUAL_CALL_R_V {
+            self.serialize_cond_residual_call(op);
+            return;
+        }
+        if op.opname == OPNAME_PORTAL_MERGE_GREENS {
+            self.serialize_portal_merge_greens(op);
+            return;
+        }
         let insn = self.flatten_space_operation(op);
         // `jtransform.py:467-482` appends a `-live-` AFTER a call op so the
         // metainterp can snapshot the post-call resume state for
@@ -1445,6 +1516,288 @@ impl<'a> GraphFlattener<'a> {
 
     fn emitline(&mut self, insn: Insn) {
         self.ssarepr.insns.push(insn);
+    }
+
+    /// Fresh color past every graph-allocated one.  The assembler freezes
+    /// `num_regs_*` from `num_colors`, so the bump has to happen before
+    /// `try_assemble` (`assembler.py` `Assembler.emit_reg`).
+    fn alloc_scratch_reg(&mut self, kind: Kind) -> Register {
+        let alloc = &mut self.regallocs[kind.index()];
+        let color = alloc.num_colors;
+        alloc.num_colors += 1;
+        Register::new(kind, color)
+    }
+
+    /// `pyopcode.py dispatch_bytecode` holds one
+    /// `if self.debugdata is not None and self.debugdata.w_f_trace is not None`
+    /// in the loop.  Each unrolled instruction jumps to that copy, then
+    /// the shared block switches on `last_instr` back to the opcode.
+    fn serialize_cond_residual_call(&mut self, op: &SpaceOperation) {
+        if self.cond_residual_shared.is_none() {
+            let residual =
+                SpaceOperation::new("residual_call_r_v", op.args.clone(), None, op.offset);
+            let frame = match op.args.get(1) {
+                Some(SpaceOperationArg::ListOfKind(list)) => list.content.get(1).cloned(),
+                other => panic!(
+                    "{OPNAME_COND_RESIDUAL_CALL_R_V} missing frame ListOfKind, got {other:?}"
+                ),
+            };
+            self.cond_residual_shared = Some(residual);
+            self.cond_residual_frame = Some(frame.unwrap_or_else(|| {
+                panic!("{OPNAME_COND_RESIDUAL_CALL_R_V} ListOfKind missing frame")
+            }));
+        }
+        let body_name = format!("waj{}", self.next_label_id);
+        self.next_label_id += 1;
+        self.cond_residual_bodies
+            .push((op.offset, body_name.clone()));
+        self.emitline(Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(SHARED_WAJ_LABEL))],
+        ));
+        self.emitline(Insn::Label(Label::new(body_name)));
+    }
+
+    fn emit_shared_cond_residual(&mut self) {
+        let Some(residual) = self.cond_residual_shared.take() else {
+            return;
+        };
+        let Some(frame) = self.cond_residual_frame.take() else {
+            return;
+        };
+        let bodies = std::mem::take(&mut self.cond_residual_bodies);
+        if bodies.is_empty() {
+            return;
+        }
+        let frame_op = self.getcolor(&frame);
+        // These dests are not graph Variables, so regalloc never colored
+        // them.  `assembler.py emit_reg` requires `reg < count_regs[kind]`
+        // once `num_regs` is frozen from `num_colors`; bump here so the
+        // extra color is part of that window.  Armed and last_instr share
+        // the Int scratch: `goto_if_not` kills armed before dispatch.
+        let debugdata_dst = self.alloc_scratch_reg(Kind::Ref);
+        let int_scratch = self.alloc_scratch_reg(Kind::Int);
+        self.emitline(Insn::Label(Label::new(SHARED_WAJ_LABEL)));
+        self.emitline(Insn::op_with_result(
+            "getfield_vable_r",
+            vec![
+                frame_op.clone(),
+                Operand::descr_vable_static_field(SHARED_WAJ_DEBUGDATA_FIELD_IDX),
+            ],
+            debugdata_dst,
+        ));
+        self.emitline(Insn::op_with_result(
+            "ptr_nonzero",
+            vec![Operand::Register(debugdata_dst)],
+            int_scratch,
+        ));
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "goto_if_not",
+            vec![
+                Operand::Register(int_scratch),
+                Operand::TLabel(TLabel::new(SHARED_WAJ_DISPATCH_LABEL)),
+            ],
+        ));
+        // pyopcode.py dispatch_bytecode we_are_jitted arm:
+        // `_d is not None and _d.w_f_trace is not None`.  The debugdata
+        // read above is the first conjunct.  FrameDebugData is allocated
+        // on essentially every frame here, so that conjunct is almost
+        // always true; without the w_f_trace test the shared residual
+        // records CallMayForceN(bytecode_only_trace) at every opcode.
+        let f_trace_dst = self.alloc_scratch_reg(Kind::Ref);
+        let f_trace_descr = flatten_descr_by_ptr(&super::flow::DescrByPtr(
+            pyre_jit_trace::descr::frame_debug_data_w_f_trace_descr(),
+        ));
+        self.emitline(Insn::op_with_result(
+            "getfield_gc_r",
+            vec![Operand::Register(debugdata_dst), f_trace_descr],
+            f_trace_dst,
+        ));
+        self.emitline(Insn::op_with_result(
+            "ptr_nonzero",
+            vec![Operand::Register(f_trace_dst)],
+            int_scratch,
+        ));
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "goto_if_not",
+            vec![
+                Operand::Register(int_scratch),
+                Operand::TLabel(TLabel::new(SHARED_WAJ_DISPATCH_LABEL)),
+            ],
+        ));
+        let insn = self.flatten_space_operation(&residual);
+        let trailing_live = insn_needs_trailing_live(&insn);
+        self.emitline(insn);
+        if trailing_live {
+            self.emitline(Insn::live(Vec::new()));
+        }
+        self.emitline(Insn::Label(Label::new(SHARED_WAJ_DISPATCH_LABEL)));
+        self.emitline(Insn::op_with_result(
+            "getfield_vable_i",
+            vec![
+                frame_op,
+                Operand::descr_vable_static_field(SHARED_WAJ_LAST_INSTR_FIELD_IDX),
+            ],
+            int_scratch,
+        ));
+        let mut switchdict = SwitchDictDescr::new();
+        for (pc, body) in &bodies {
+            switchdict.labels.push((*pc, TLabel::new(body.clone())));
+        }
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "switch",
+            vec![
+                Operand::Register(int_scratch),
+                Operand::descr(DescrOperand::SwitchDict(switchdict)),
+            ],
+        ));
+        self.emitline(Insn::op("unreachable", Vec::new()));
+        self.emitline(Insn::Unreachable);
+    }
+
+    /// Each unrolled instruction jumps to the one
+    /// `get_is_being_profiled` + `promote_greens` copy, then the shared
+    /// block switches on `next_instr` back to op3.  The walker follows
+    /// that `goto` through the generic opimpls (`pyjitpl.py`
+    /// `opimpl_goto`, `opimpl_goto_if_not_ptr_iszero`,
+    /// `implement_guard_value`, `opimpl_switch`); after the three
+    /// promote guards `next_instr` is ConstInt and the switch jumps to
+    /// the body.  Blackhole runs the same switch.
+    fn serialize_portal_merge_greens(&mut self, op: &SpaceOperation) {
+        let frame = match op.args.first() {
+            Some(arg) => self.expect_portal_merge_reg(arg, "frame"),
+            None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing frame"),
+        };
+        let next_instr = match op.args.get(1) {
+            Some(arg) => self.expect_portal_merge_reg(arg, "next_instr"),
+            None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing next_instr"),
+        };
+        let pycode = match op.args.get(2) {
+            Some(arg) => self.expect_portal_merge_reg(arg, "pycode"),
+            None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing pycode"),
+        };
+        let profiled = match &op.result {
+            Some(FlowValue::Variable(variable)) => self.getcolor_var(*variable),
+            other => panic!(
+                "{OPNAME_PORTAL_MERGE_GREENS} result must be the profiled Variable, got {other:?}"
+            ),
+        };
+        let regs = (frame, next_instr, pycode, profiled);
+        match self.portal_merge_regs {
+            None => self.portal_merge_regs = Some(regs),
+            Some(first) => {
+                assert!(
+                    first == regs,
+                    "{OPNAME_PORTAL_MERGE_GREENS} copies must share \
+                     frame/next_instr/pycode/profiled registers, first={first:?} this={regs:?}"
+                );
+            }
+        }
+        let body_name = format!("pmg{}", self.next_label_id);
+        self.next_label_id += 1;
+        self.portal_merge_bodies
+            .push((op.offset, body_name.clone()));
+        // Stay a regular op through `compute_liveness`.  `goto pmg_shared`
+        // plus `switch` would `follow_label` every body (`liveness.py`)
+        // and union those lives into every instruction-start `-live-`;
+        // the extra Int colors are unbound at trace start
+        // (`GuardResumeCoordinateUnavailable`).  `attach_portal_merge_greens_gotos`
+        // rewrites this op to `goto` + body label after liveness.
+        self.emitline(Insn::op_with_result(
+            OPNAME_PORTAL_MERGE_GREENS,
+            vec![
+                Operand::Register(frame),
+                Operand::Register(next_instr),
+                Operand::Register(pycode),
+                Operand::TLabel(TLabel::new(body_name)),
+            ],
+            profiled,
+        ));
+    }
+
+    fn expect_portal_merge_reg(&mut self, arg: &SpaceOperationArg, what: &str) -> Register {
+        match self.flatten_arg(arg) {
+            Operand::Register(reg) => reg,
+            other => {
+                panic!("{OPNAME_PORTAL_MERGE_GREENS} {what} must be a register, got {other:?}")
+            }
+        }
+    }
+
+    fn emit_shared_portal_merge_greens(&mut self) {
+        let Some((frame, next_instr, pycode, profiled)) = self.portal_merge_regs.take() else {
+            return;
+        };
+        let bodies = std::mem::take(&mut self.portal_merge_bodies);
+        if bodies.is_empty() {
+            return;
+        }
+        let debugdata_dst = self.alloc_scratch_reg(Kind::Ref);
+        self.emitline(Insn::Label(Label::new(SHARED_PMG_LABEL)));
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op_with_result(
+            "getfield_vable_r",
+            vec![
+                Operand::Register(frame),
+                Operand::descr_vable_static_field(SHARED_WAJ_DEBUGDATA_FIELD_IDX),
+            ],
+            debugdata_dst,
+        ));
+        // `jtransform.py optimize_goto_if_not`: the graph diamond carried
+        // `-live-before` on the `ptr_iszero` exitswitch, which flatten
+        // emits as a `-live-` immediately before the fused branch.
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "goto_if_not_ptr_iszero",
+            vec![
+                Operand::Register(debugdata_dst),
+                Operand::TLabel(TLabel::new(SHARED_PMG_NONNULL_LABEL)),
+            ],
+        ));
+        self.emitline(Insn::op_with_result(
+            "int_copy",
+            vec![Operand::ConstInt(0)],
+            profiled,
+        ));
+        self.emitline(Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(SHARED_PMG_JOIN_LABEL))],
+        ));
+        self.emitline(Insn::Label(Label::new(SHARED_PMG_NONNULL_LABEL)));
+        let profiled_descr = flatten_descr_by_ptr(&super::flow::DescrByPtr(
+            pyre_jit_trace::descr::frame_debug_data_is_being_profiled_descr(),
+        ));
+        self.emitline(Insn::op_with_result(
+            "getfield_gc_i",
+            vec![Operand::Register(debugdata_dst), profiled_descr],
+            profiled,
+        ));
+        self.emitline(Insn::Label(Label::new(SHARED_PMG_JOIN_LABEL)));
+        for (opname, green) in [
+            ("int_guard_value", Operand::Register(next_instr)),
+            ("int_guard_value", Operand::Register(profiled)),
+            ("ref_guard_value", Operand::Register(pycode)),
+        ] {
+            self.emitline(Insn::live(Vec::new()));
+            self.emitline(Insn::op(opname, vec![green]));
+        }
+        let mut switchdict = SwitchDictDescr::new();
+        for (pc, body) in &bodies {
+            switchdict.labels.push((*pc, TLabel::new(body.clone())));
+        }
+        self.emitline(Insn::live(Vec::new()));
+        self.emitline(Insn::op(
+            "switch",
+            vec![
+                Operand::Register(next_instr),
+                Operand::descr(DescrOperand::SwitchDict(switchdict)),
+            ],
+        ));
+        self.emitline(Insn::op("unreachable", Vec::new()));
+        self.emitline(Insn::Unreachable);
     }
 
     /// `flatten.py popline`: pop the most recently emitted
@@ -1594,7 +1947,7 @@ impl<'a> GraphFlattener<'a> {
             return;
         }
         self.insert_renamings(link);
-        self.make_bytecode_block(target, handling_ovf);
+        self.make_bytecode_block(target, handling_ovf, Some(link));
     }
 
     fn make_exception_link(&mut self, link: &LinkRef, handling_ovf: bool) {
@@ -1817,10 +2170,13 @@ impl<'a> GraphFlattener<'a> {
             // stack slot).  Emit the byte-adjacent `catch_exception <L>`
             // dispatch and lower the handler entry through
             // `make_exception_link` — `L` is the handler entry placed
-            // right before `make_exception_link`'s `last_exception` /
-            // `last_exc_value` emission, mirroring the canraise arm's
+            // before `make_exception_link`.  `last_exception` /
+            // `last_exc_value` emit *inside* the landing (after
+            // `Label(target)` in `make_bytecode_block`), matching
+            // `pyopcode.py handle_operation_error` → `pushvalue(w_exc)`.
+            // Stream layout still mirrors the canraise arm's
             // `catch_exception TLabel(normal) … Label(normal) …
-            // make_exception_link` layout (flatten.py).
+            // make_exception_link` (flatten.py).
             if block.borrow().canraise() {
                 let catch_label = self.tlabel_for_link(link);
                 self.emitline(Insn::op("catch_exception", vec![catch_label]));
@@ -2196,8 +2552,12 @@ impl<'a> GraphFlattener<'a> {
                 }
             }
         }
-        let link_borrow = link.borrow();
-        self.generate_last_exc(&link_borrow, &target_inputargs);
+        // `flatten.py insert_renamings` calls `generate_last_exc` here,
+        // before `Label(target)`.  That makes `last_exc_value` dest live-in
+        // of the landing.  `pyopcode.py handle_operation_error` reads the
+        // exception *inside* the handler and `pushvalue(w_exc)` onto
+        // `locals_cells_stack_w`.  Emit the load after `Label` in
+        // `make_bytecode_block` so dest is defined in the landing (INV).
     }
 
     fn generate_last_exc(&mut self, link: &super::flow::Link, inputargs: &[FlowValue]) {
@@ -2250,10 +2610,17 @@ impl<'a> GraphFlattener<'a> {
     /// reset `seen_blocks` and recurse from `self.graph.startblock`.
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
-        self.make_bytecode_block(self.graph.startblock.clone(), false);
+        self.make_bytecode_block(self.graph.startblock.clone(), false, None);
+        self.emit_shared_portal_merge_greens();
+        self.emit_shared_cond_residual();
     }
 
-    fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {
+    fn make_bytecode_block(
+        &mut self,
+        block: BlockRef,
+        handling_ovf: bool,
+        incoming: Option<&LinkRef>,
+    ) {
         if block.borrow().exits.is_empty() {
             // `rpython/jit/codewriter/flatten.py:107-109`: empty-exits
             // blocks are `returnblock` (1 arg) or `exceptblock` (2 args)
@@ -2262,6 +2629,10 @@ impl<'a> GraphFlattener<'a> {
             // inside `make_return` (upstream raises `Exception("?")` at
             // `flatten.py`).  Pyre keeps the upstream behavior:
             // delegate to `make_return` directly.
+            if let Some(link) = incoming {
+                let inputargs = block.borrow().inputargs.clone();
+                self.generate_last_exc(&link.borrow(), &inputargs);
+            }
             let args = block.borrow().inputargs.clone();
             self.make_return(&args);
             return;
@@ -2275,6 +2646,14 @@ impl<'a> GraphFlattener<'a> {
         self.seen_blocks.push(block.clone());
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
+        if let Some(link) = incoming {
+            // `pyopcode.py handle_operation_error` → `pushvalue(w_exc)`:
+            // the exception is loaded inside the handler block, then
+            // stored on `locals_cells_stack_w`.  A later opcode re-reads
+            // it with `getarrayitem_vable_r` (`peekvalue`/`popvalue`).
+            let inputargs = block.borrow().inputargs.clone();
+            self.generate_last_exc(&link.borrow(), &inputargs);
+        }
         // `flatten.py` make_bytecode_block emits Label(block)
         // at entry, then ops via `serialize_op`, then `insert_exits`.
         // No per-PC anchors, no `-live-` interleaving — those come
@@ -2517,6 +2896,56 @@ impl<'a> GraphFlattener<'a> {
     }
 }
 
+/// Rewrite each `portal_merge_greens` op to `goto pmg_shared` plus its
+/// body label, after `compute_liveness` has already run.
+///
+/// Flatten keeps the graph op through liveness so `follow_label` on the
+/// shared `switch` cannot union every body's live-in into the
+/// instruction-start `-live-`.  Assembler and the walker still see the
+/// factored `goto`; the walker follows it into `pmg_shared`
+/// (`opimpl_goto`) and the shared `switch` (`opimpl_switch`) jumps
+/// back to the body.
+///
+/// Returns `old_insn_index -> new_insn_index` for side tables built
+/// before the rewrite.
+pub(crate) fn attach_portal_merge_greens_gotos(ssarepr: &mut SSARepr) -> Vec<usize> {
+    let old_len = ssarepr.insns.len();
+    let mut remap = vec![0usize; old_len];
+    let mut new_insns = Vec::with_capacity(old_len);
+    for (i, insn) in ssarepr.insns.iter().cloned().enumerate() {
+        remap[i] = new_insns.len();
+        match &insn {
+            Insn::Op { opname, args, .. } if opname == OPNAME_PORTAL_MERGE_GREENS => {
+                let body_name = args.iter().find_map(|arg| match arg {
+                    Operand::TLabel(label) => Some(label.name.clone()),
+                    _ => None,
+                });
+                let Some(body_name) = body_name else {
+                    panic!("{OPNAME_PORTAL_MERGE_GREENS} missing body TLabel, args={args:?}");
+                };
+                new_insns.push(Insn::op(
+                    "goto",
+                    vec![Operand::TLabel(TLabel::new(SHARED_PMG_LABEL))],
+                ));
+                new_insns.push(Insn::Label(Label::new(body_name)));
+            }
+            _ => new_insns.push(insn),
+        }
+    }
+    ssarepr.insns = new_insns;
+    let map_pos = |pos: usize| remap.get(pos).copied().unwrap_or(pos);
+    for (_, pos) in ssarepr.pc_first_insn_pos.iter_mut() {
+        *pos = map_pos(*pos);
+    }
+    for (pos, _) in ssarepr.abort_permanent_insn_pos.iter_mut() {
+        *pos = map_pos(*pos);
+    }
+    for (pos, _) in ssarepr.pc_run_insn_pos.iter_mut() {
+        *pos = map_pos(*pos);
+    }
+    remap
+}
+
 /// Look up the regalloc color for `v` in the per-Kind `regallocs` table
 /// and build the matching `Register`.  Panics if `v` has no entry — a
 /// missing color signals a regalloc invariant violation upstream of the
@@ -2674,6 +3103,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "delete_subscr"
             | "delete_attr"
             | "list_extend"
+            | "run_trace_func"
             | "set_add"
             | "set_update"
             | "dict_update"
@@ -3275,7 +3705,10 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
                     size: size.size(),
                     type_id: size.cache_key(),
                     vtable: size.vtable() as u64,
-                    owner: String::new(),
+                    // STRUCT._name.  Empty feeds the already-qualified
+                    // display string back as FIELDNAME and mints a
+                    // parallel descriptor (`descr.py cache[STRUCT]`).
+                    owner: owner.to_string(),
                     is_gc_managed: size.is_gc_managed(),
                     headerless: size.headerless(),
                     all_fielddescrs: majit_jitcode::jitcode::bh_field_specs_from_size_descr(size),
@@ -3774,6 +4207,11 @@ pub struct LoweringContext {
     /// `jit_newlist_from_iter_hint` runs `length_hint` then
     /// `w_list_new_with_sizehint` (user `__length_hint__` → `MayForce`).
     pub newlist_from_iter_hint_fn_idx: u16,
+    /// Residual fallback of `run_trace_func` (`@jit.unroll_safe`).  The
+    /// portal graph records the `run_trace_func(ec, frame)` HLOp; flatten
+    /// emits `inline_call_r_v` when that body is fully bound, else
+    /// `residual_call_r_v` through this index (`bh_bytecode_only_trace`).
+    pub bytecode_only_trace_fn_idx: u16,
 }
 
 /// Map a BINARY_OP HLOp opname (`add`/.../`xor`/`getitem` plus the
@@ -5731,6 +6169,9 @@ where
     {
         return Some(insn);
     }
+    if let Some(insn) = lower_run_trace_func_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_accumulator_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -6552,6 +6993,8 @@ pub(crate) mod inline_call_targets {
     pub const DICT_DISPLAY_NEW: &str = "pyre_object::dictmultiobject::w_dict_new";
     /// BUILD_MAP insert — `lower_tuple_build_hlop_to_insn`.
     pub const DICT_DISPLAY_SETITEM: &str = "pyre_interpreter::baseobjspace::dict_display_setitem";
+    /// `executioncontext.py run_trace_func` (`@jit.unroll_safe`).
+    pub const RUN_TRACE_FUNC: &str = "pyre_interpreter::executioncontext::<Impl>::run_trace_func";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -7597,6 +8040,47 @@ where
     ))
 }
 
+/// Lower the portal `run_trace_func(ec, frame)` HLOp to `inline_call_r_v`
+/// of `executioncontext::run_trace_func` when this build binds that
+/// `@jit.unroll_safe` body fully, else `residual_call_r_v` through
+/// `bytecode_only_trace_fn_idx`.  Same two-Ref void shape as
+/// [`lower_list_extend_hlop_to_insn`].
+pub fn lower_run_trace_func_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "run_trace_func" {
+        return None;
+    }
+    if op.args.len() != 2 {
+        return None;
+    }
+    if op.result.is_some() {
+        return None;
+    }
+    let ec_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let frame_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    if let Some(insn) = build_orthodox_inline_call_r_v(
+        inline_call_targets::RUN_TRACE_FUNC,
+        vec![ec_operand.clone(), frame_operand.clone()],
+    ) {
+        return Some(insn);
+    }
+    Some(build_residual_call_r_v_insn_from_operands(
+        ctx.bytecode_only_trace_fn_idx,
+        vec![ec_operand, frame_operand],
+        CallFlavor::MayForce,
+        true,
+        majit_ir::RuntimeHelperKind::None,
+    ))
+}
+
 /// Lower the comprehension/display accumulator HLOps to `inline_call_r_v`
 /// of the matching `opcode_ops::*` body when this build binds that body
 /// fully, else `residual_call_r_v` (void, N Ref operands, `MayForce`).
@@ -8246,6 +8730,33 @@ mod tests {
                 DescrOperand::Bh(BhDescr::Field { name, owner, .. }) => {
                     assert_eq!(name, "PyFrame.PyFrame.flags");
                     assert_eq!(owner, "PyFrame");
+                }
+                other => panic!("expected BhDescr::Field, got {other:?}"),
+            },
+            other => panic!("expected Operand::Descr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_w_f_trace_descr_keeps_frame_debug_data_owner() {
+        let field = pyre_jit_trace::descr::frame_debug_data_w_f_trace_descr();
+        let by_ptr = super::super::flow::DescrByPtr(field);
+        match flatten_descr_by_ptr(&by_ptr) {
+            Operand::Descr(rc) => match &*rc {
+                DescrOperand::Bh(BhDescr::Field {
+                    name,
+                    owner,
+                    parent,
+                    ..
+                }) => {
+                    assert_eq!(owner, "FrameDebugData");
+                    assert!(
+                        name.ends_with("w_f_trace"),
+                        "display name should end with the field key, got {name}"
+                    );
+                    let parent = parent.as_ref().expect("w_f_trace carries its SizeDescr");
+                    assert_eq!(parent.owner, "FrameDebugData");
+                    assert_ne!(parent.type_id, 0, "headerless STRUCT still has a cache key");
                 }
                 other => panic!("expected BhDescr::Field, got {other:?}"),
             },

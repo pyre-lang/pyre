@@ -3342,6 +3342,27 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
             // virtualizable to measure: there are no array items encoded.
             return;
         }
+        // `pyframe.py popvalue_maybe_none` stores None at every slot
+        // `>= valuestackdepth`. A popped pointer can remain in the trace
+        // vable boxes; `resume.py handling_async_forcing` writes those
+        // leftovers while the residual is still running. Null them here
+        // so the type-9 array walker and a later CRN at the next opcode's
+        // POST-push depth cannot observe a dead TOS.
+        let async_force_vsd = if reader.resume_after_guard_not_forced == 1 {
+            self.static_fields
+                .iter()
+                .position(|f| f.name == "valuestackdepth")
+                .and_then(|idx| {
+                    let ptr = reader.virtualizable_ptr as *mut u8;
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { self.read_field(ptr, idx) as usize })
+                    }
+                })
+        } else {
+            None
+        };
         // virtualizable.py:134-137: array items
         for array in &self.array_fields {
             let vable_ptr = reader.virtualizable_ptr as *mut u8;
@@ -3361,8 +3382,16 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
             // and a `Ref` array resolves per item.
             let base = (array.item_type != Type::Ref)
                 .then(|| unsafe { vable_array_write_base(vable_ptr, array) });
+            let trim_dead_tail = array.item_type == Type::Ref
+                && array.name == "locals_cells_stack_w"
+                && async_force_vsd.is_some();
             for j in 0..arr_len {
                 let value = reader.next_value_of_type(array.item_type);
+                let value = if trim_dead_tail && async_force_vsd.is_some_and(|vsd| j >= vsd) {
+                    0
+                } else {
+                    value
+                };
                 // `next_ref` / `getvirtual_ptr` can malloc; the GC transform
                 // roots the decoded GCREF local across the store. Re-read
                 // `virtualizable_ptr` after that malloc — it is the live

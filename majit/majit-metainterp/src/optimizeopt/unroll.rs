@@ -1107,6 +1107,16 @@ impl UnrollOptimizer {
             opt_p1.explicit_input_ops_seed = Some(p1_ops_in.clone());
             let p1_ops =
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
+            // unroll.py `UnrollOptimizer.optimize_preamble` after `export_state`:
+            // `self._clean_optimization_info(self._newoperations)`. Leftover
+            // PtrInfo on preamble result boxes (a GETFIELD of a residual that
+            // later leaves JUMP `end_args`) is otherwise visible to Phase 2
+            // after bind-at-alloc, and a leftover `FieldEntry::Value` folds
+            // the body GETFIELD without `force_op_from_preamble` / `use_box`.
+            crate::optimizeopt::optimizer::Optimizer::clean_optimization_info(&p1_ops);
+            crate::optimizeopt::optimizer::Optimizer::clean_optimization_info(
+                &opt_p1.phase1_emit_ops,
+            );
             merge_quasi_immutable_deps(
                 &mut self.quasi_immutable_deps,
                 &opt_p1.quasi_immutable_deps,

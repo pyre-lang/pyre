@@ -497,13 +497,20 @@ pub(crate) fn mirror_vable_static_to_boxes(
     opref: OpRef,
     concrete: Value,
 ) {
-    if !ctx.has_virtualizable_shadow() {
+    if !ctx.has_virtualizable_boxes() {
         return;
     }
     let idx = ctx
         .virtualizable_info()
         .and_then(|info| info.static_field_index_by_name(static_field_name));
     if let Some(idx) = idx {
+        // Identity lives at `boxes[-1]`. A greenfield / empty-opref seed is
+        // only that slot; writing a static through it would rename the
+        // virtualizable. Skip until the declared statics exist.
+        match ctx.virtualizable_boxes_len() {
+            Some(len) if idx + 1 < len => {}
+            _ => return,
+        }
         ctx.set_virtualizable_entry_at(idx, opref, concrete);
         // `_opimpl_setfield_vable` writes only the slot it stored
         // (`synchronize_virtualizable_at`). A full `synchronize_virtualizable`
@@ -523,13 +530,17 @@ pub(crate) fn mirror_vable_static_to_boxes_nosync(
     opref: OpRef,
     concrete: Value,
 ) {
-    if !ctx.has_virtualizable_shadow() {
+    if !ctx.has_virtualizable_boxes() {
         return;
     }
     let idx = ctx
         .virtualizable_info()
         .and_then(|info| info.static_field_index_by_name(static_field_name));
     if let Some(idx) = idx {
+        match ctx.virtualizable_boxes_len() {
+            Some(len) if idx + 1 < len => {}
+            _ => return,
+        }
         ctx.set_virtualizable_entry_at(idx, opref, concrete);
     }
 }
@@ -1298,12 +1309,15 @@ impl MIFrame {
                     s.registers_r.resize(color_idx + 1, OpRef::NONE);
                 }
             }
-            // pyjitpl.py:218-234 parity for the snapshot/fallback:
-            // produce the color-indexed Ref bank, but source active
-            // virtualizable frame slots from the semantic shadow. A
-            // stack color may be coalesced with a dead local color;
-            // reading `registers_r[color]` for the fallback would pick
-            // up the stale local mirror for a live stack slot.
+            // pyjitpl.py get_list_of_active_boxes: `self.registers_r[index]`
+            // is the color-indexed bank. Portal-owner frames source the
+            // standard virtualizable from `virtualizable_boxes` at the
+            // semantic slot (`_opimpl_setarrayitem_vable`). Non-owner
+            // frames (from_test_state) read the color first: F4 removed
+            // `register_color = nlocals + depth`, so several live stack
+            // slots may share one color, and rewriting that color from
+            // the smallest semantic slot drops the box the test (and
+            // PyPy) placed in the register.
             let live_max = nlocals + valid_stack_only;
             let read_live = |this: &MIFrame, ctx: &TraceCtx| -> OpRef {
                 let s = this.sym();
@@ -1312,6 +1326,10 @@ impl MIFrame {
                     return ctx
                         .virtualizable_box_at(nvs + semantic_idx)
                         .expect("get_list_of_active_boxes: missing vable frame box");
+                }
+                let color_val = s.registers_r.get(color_idx).unwrap_or(OpRef::NONE);
+                if color_val != OpRef::NONE {
+                    return color_val;
                 }
                 let val = s.registers_r.get(semantic_idx).unwrap_or(OpRef::NONE);
                 if val != OpRef::NONE {
@@ -1619,12 +1637,6 @@ impl MIFrame {
                         sym_ec
                     }
                 } else {
-                    if is_portal_red && crate::jitcode_dispatch::p2_diag_enabled() {
-                        eprintln!(
-                            "[p2-trait-scratch] jitcode_pc={} color={} owned by frame slot; keeping bank box",
-                            jit_pc, reg_idx
-                        );
-                    }
                     // `registers_r_bank` is slot-indexed (`sym.registers_r`).
                     // `pyjitpl.py` `MIFrame.get_list_of_active_boxes` records
                     // `registers_r[index]`, the color-indexed register. An
@@ -3206,9 +3218,14 @@ impl MIFrame {
         // matches `flush_to_frame_for_guard` so the snapshot stays
         // self-consistent.
         //
-        // The slot-2 inline override re-derives the pre-opcode
-        // valuestackdepth from the same source `flush_to_frame_for_guard`
-        // uses to set `s.vable_valuestackdepth`.
+        // The slot-2 inline override re-derives valuestackdepth from
+        // `pre_opcode_semantic_depth` when the opcode-start snapshot
+        // captured it, otherwise from the traced `virtualizable_boxes`
+        // vsd (`virtualizable.py read_boxes` getattr of the field
+        // `_opimpl_setfield_vable` wrote).  The heap
+        // `PyFrame.valuestackdepth` lags that box:
+        // `outer_executor_owns_state` skips `write_box_at`
+        // (`trace_ctx.rs` `write_virtualizable_heap_bits_at`).
         //
         // Test-fixture fallback: `TraceCtx::for_test_types` callers
         // construct a ctx without registering `VirtualizableInfo` and
@@ -3230,12 +3247,18 @@ impl MIFrame {
             ),
             None => (Vec::new(), None, None, 0),
         };
-        let pre_opcode_vsd: Option<i64> = if vsd_field_index.is_some() {
-            let resume_pc = self.orgpc;
-            Some(self.pre_opcode_concrete_depth() as i64)
-        } else {
-            None
-        };
+        let pre_opcode_vsd: Option<i64> = vsd_field_index.and_then(|idx| {
+            self.pre_opcode_semantic_depth
+                .map(|d| d as i64)
+                .or_else(|| {
+                    ctx.virtualizable_box_at(idx)
+                        .and_then(|opref| ctx.box_value(opref))
+                        .and_then(|value| match value {
+                            majit_ir::Value::Int(n) if n >= 0 => Some(n),
+                            _ => None,
+                        })
+                })
+        });
         let pre_opcode_last_instr: Option<i64> = ni_field_index.map(|_| self.orgpc as i64 - 1);
         if num_static > 0 && ctx.has_virtualizable_boxes() {
             for idx in 0..num_static {
@@ -3245,9 +3268,10 @@ impl MIFrame {
                         .expect("pre_opcode_last_instr seeded when ni_field_index is Some");
                     ctx.const_int(li)
                 } else if Some(idx) == vsd_field_index {
-                    let vsd =
-                        pre_opcode_vsd.expect("pre_opcode_vsd seeded when vsd_field_index is Some");
-                    ctx.const_int(vsd)
+                    match pre_opcode_vsd {
+                        Some(vsd) => ctx.const_int(vsd),
+                        None => ctx.virtualizable_box_at(idx).unwrap_or(OpRef::NONE),
+                    }
                 } else {
                     ctx.virtualizable_box_at(idx).unwrap_or(OpRef::NONE)
                 };
@@ -3345,7 +3369,9 @@ impl MIFrame {
         // in compiled code and missing from the COND_CALL gcmap, and
         // `write_from_resume_data_partial` would copy the stale word into
         // the type-9 array. `close_loop_args_at` already force-nulls the
-        // same JUMP tail.
+        // same JUMP tail. A leftover non-NONE past vsd is the popped TOS
+        // (`True` after POP_JUMP_IF_FALSE); keeping it republishes the
+        // cond as a live array item.
         let live_array_depth = pre_opcode_vsd.map(|v| v as usize);
         for i in 0..full_array_len {
             // virtualizable_boxes layout:
@@ -3353,6 +3379,9 @@ impl MIFrame {
             // so array slot `i` lives at `num_static + i`. The trailing
             // `vable_ref` is at `virtualizable_boxes[-1]` and NEVER covers
             // an array slot — skip it via `.get()`.
+            let opref = ctx
+                .virtualizable_box_at(num_static + i)
+                .unwrap_or(OpRef::NONE);
             if live_array_depth.is_some_and(|vsd| i >= vsd) {
                 boxes.push(Self::opref_to_snapshot_tagged_for_slot(
                     OpRef::NONE,
@@ -3361,9 +3390,6 @@ impl MIFrame {
                 ));
                 continue;
             }
-            let opref = ctx
-                .virtualizable_box_at(num_static + i)
-                .unwrap_or(OpRef::NONE);
             if !opref.is_none() {
                 boxes.push(Self::opref_to_snapshot_tagged_for_slot(
                     opref,
