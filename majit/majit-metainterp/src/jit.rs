@@ -20,7 +20,6 @@
 //!
 //! - `promote(x)` → `int_guard_value` / `ref_guard_value` / `float_guard_value`
 //! - `record_exact_class(v, cls)` → RECORD_EXACT_CLASS IR op
-//! - `record_exact_value(v, c)` → RECORD_EXACT_VALUE IR op
 
 // ── DEBUG_ELIDABLE_FUNCTIONS ──
 // rlib/jit.py
@@ -946,21 +945,6 @@ pub fn _jit_record_known_result<T>(_known_result: T, _func_result: T) {
 // Rust doesn't have *args; use the `record_known_result!` macro in lib.rs
 // which accepts any arity via variadic macro pattern.
 
-// ── record_exact_value ──
-// rlib/jit.py
-
-/// Assure the JIT that value is the same as const_value.
-///
-/// rlib/jit.py record_exact_value — `assert value == const_value; return const_value`
-#[inline(always)]
-pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const_value: T) -> T {
-    debug_assert_eq!(
-        value, const_value,
-        "record_exact_value called with two different arguments"
-    );
-    const_value
-}
-
 // ── conditional_call ──
 // rlib/jit.py
 //
@@ -1285,11 +1269,6 @@ mod tests {
         let none_val: Option<i64> = None;
         let result = conditional_call_elidable(none_val, || Some(99_i64));
         assert_eq!(result, Some(99));
-    }
-
-    #[test]
-    fn test_record_exact_value_passthrough() {
-        assert_eq!(record_exact_value(42, 42), 42);
     }
 
     #[test]

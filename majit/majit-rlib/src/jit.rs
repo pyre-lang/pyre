@@ -4,6 +4,9 @@
 //! rewrites calls marked `oopspec("jit.isvirtual")` / `jit.isconstant` into
 //! the `ref_isvirtual` / `*_isconstant` ops; the bodies here are the
 //! untranslated residual (`rlib/jit.py isconstant` / `isvirtual`).
+//! `record_exact_value` is `rlib/jit.py record_exact_value`; jtransform
+//! rewrites that helper to `record_exact_value_{i,r}` (`jtransform.py
+//! rewrite_op_jit_record_exact_value`).
 //!
 //! `we_are_jitted` is `_we_are_jitted = CDefinedIntSymbolic('0 /* we are not
 //! jitted here */', default=0)`: the translated interpreter reads a literal
@@ -45,6 +48,18 @@ pub fn isconstant<T: ?Sized>(_value: &T) -> bool {
 #[majit_macros::oopspec("jit.isvirtual(value)")]
 pub fn isvirtual<T: ?Sized>(_value: &T) -> bool {
     crate::nonconst::non_constant(false)
+}
+
+/// Assure the JIT that value is the same as const_value.
+///
+/// rlib/jit.py record_exact_value — `assert value == const_value; return const_value`
+#[inline(always)]
+pub fn record_exact_value<T: Copy + PartialEq + std::fmt::Debug>(value: T, const_value: T) -> T {
+    debug_assert_eq!(
+        value, const_value,
+        "record_exact_value called with two different arguments"
+    );
+    const_value
 }
 
 /// `rlib/jit.py conditional_call` residual body (`if condition: function(*args)`).
@@ -141,6 +156,11 @@ pub fn loop_unrolling_heuristic<T: ?Sized>(lst: &T, size: usize, cutoff: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_record_exact_value_passthrough() {
+        assert_eq!(record_exact_value(42, 42), 42);
+    }
 
     #[test]
     fn loop_unrolling_heuristic_empty_unrolls() {

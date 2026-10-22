@@ -8,25 +8,31 @@
 //! `int_contains/rr>i`.
 //!
 //! This module gives that spine the helper `rtype_contains` would have
-//! minted: [`ll_find_path`] registers [`build_ll_find_helper_graph`] as a
+//! minted: [`ll_find_path`] registers [`build_ll_find_helper_graph_on`] as a
 //! Spine-B candidate (`CallControl::register_opname_helper_graph`), matching
 //! `codewriter::minmax` / `codewriter::getslice`.
 //!
-//! [`ll_find_char_path`] and [`search_elidable_path`] are the elidable
-//! residual siblings (`LLHelpers.ll_find_char`, `rstring._search_elidable`).
-//! Shape matches [`super::alloc_and_set::register`]: bind fnaddr →
-//! `register_function_graph` → `add_candidate_graph_if_look_inside`.
+//! Callee funcptrs (`ll_find_char`, `ll_search`, `_search_elidable`,
+//! `_search_normal`) carry their graphs (`HighLevelOp.gendirectcall` /
+//! `getcallable`). [`ll_find_path`] walks those funcptrs depth-first
+//! (`call.py CallControl.find_all_graphs`) and registers each graph
+//! once. `policy.look_inside_graph` decides candidacy. A residual
+//! callee published on `HELPER_FNADDRS` aliases that native fnaddr.
 
 use std::rc::Rc;
 
+use crate::annotator::annrpython::RPythonAnnotator;
 use crate::codewriter::call::CallControl;
-use crate::model::{ConcreteType, FunctionGraph, OpKind, ValueType};
+use crate::codewriter::jtransform_opname::lower_graph;
 use crate::parse::CallPath;
+use crate::policy::{DefaultJitPolicy, JitPolicy};
+use crate::rlib::rstring::effect_graph_from_search_helper;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::lltypesystem::rstr::{
-    STRPTR, build_ll_find_char_helper_graph, build_ll_find_helper_graph,
-    build_ll_search_helper_graph,
+    STRPTR, UNICODEPTR, build_ll_find_char_helper_graph, build_ll_find_helper_graph_on,
+    build_ll_search_helper_graph_on, direct_call_funcobjs, graph_ref_for_funcptr_id,
 };
+use crate::translator::rtyper::rtyper::RPythonTyper;
 
 /// `LLHelpers.ll_find` (`rstr.py`).
 pub const LL_FIND: &str = "ll_find";
@@ -36,15 +42,8 @@ pub const LL_FIND_CHAR: &str = "ll_find_char";
 pub const LL_SEARCH: &str = "ll_search";
 /// `rstring._search_elidable` (`rlib/rstring.py`).
 pub const SEARCH_ELIDABLE: &str = "_search_elidable";
-
-/// Native `HELPER_FNADDRS` leaf after crate-strip.
-fn native_fnaddr_key() -> CallPath {
-    CallPath::from_segments(["lltypesystem", "rstr", LL_FIND_CHAR])
-}
-
-fn search_elidable_native_fnaddr_key() -> CallPath {
-    CallPath::from_segments(["rstring", SEARCH_ELIDABLE])
-}
+/// `rstring._search_normal` (`rlib/rstring.py`).
+pub const SEARCH_NORMAL: &str = "_search_normal";
 
 #[cfg(test)]
 fn helper_fnaddr_path() -> String {
@@ -56,41 +55,53 @@ fn search_elidable_fnaddr_path() -> String {
     format!("majit_rlib::rstring::{SEARCH_ELIDABLE}")
 }
 
+#[cfg(test)]
+fn search_normal_fnaddr_path() -> String {
+    format!("majit_rlib::rstring::{SEARCH_NORMAL}")
+}
+
 /// The helper path for `ll_find`, minting and registering the graph on first use.
 ///
-/// Also registers the callees `ll_find_char`, `ll_search`, and
-/// `_search_elidable` so neither spine meets an unknown callee.
+/// Callees `ll_find_char`, `ll_search`, and `_search_elidable` come off
+/// the funcptrs `HighLevelOp.gendirectcall` attached, so this path
+/// stays self-contained without a second registration site.
 pub fn ll_find_path(cc: &mut CallControl) -> CallPath {
     let path = CallPath::from_segments([LL_FIND]);
     if cc.jitcode_handle(&path).is_none() {
-        let py = build_ll_find_helper_graph(LL_FIND, STRPTR.clone()).expect("ll_find helper graph");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let py = build_ll_find_helper_graph_on(&rtyper, LL_FIND, STRPTR.clone())
+            .expect("ll_find helper graph");
+        register_direct_call_callees(cc, &rtyper, &py.graph.borrow());
         let crate::flowspace::pygraph::PyGraph { graph, .. } = py;
         let flow = Rc::try_unwrap(graph)
             .expect("fresh ll_find helper is uniquely owned")
             .into_inner();
         cc.register_opname_helper_graph(path.clone(), flow);
     }
-    let _ = ll_find_char_path(cc, &*STRPTR);
-    let _ = ll_search_path(cc);
     path
 }
 
 /// The helper path for `ll_search`, minting a look-inside graph.
 ///
 /// Upstream `LLHelpers.ll_search` has no JIT hint. The STR body is
-/// `direct_call _search_elidable`.
+/// `direct_call _search_elidable`. Skips when [`ll_find_path`] already
+/// consumed the graph from the find helper's funcptr.
 pub fn ll_search_path(cc: &mut CallControl) -> CallPath {
     let path = CallPath::from_segments([LL_SEARCH]);
-    if cc.jitcode_handle(&path).is_none() {
-        let py = build_ll_search_helper_graph(LL_SEARCH, STRPTR.clone())
-            .expect("ll_search helper graph");
-        let crate::flowspace::pygraph::PyGraph { graph, .. } = py;
-        let flow = Rc::try_unwrap(graph)
-            .expect("fresh ll_search helper is uniquely owned")
-            .into_inner();
-        cc.register_opname_helper_graph(path.clone(), flow);
+    if callee_already_registered(cc, &path) {
+        return path;
     }
-    let _ = search_elidable_path(cc);
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let rtyper = RPythonTyper::new(&ann);
+    let py = build_ll_search_helper_graph_on(&rtyper, LL_SEARCH, STRPTR.clone())
+        .expect("ll_search helper graph");
+    register_direct_call_callees(cc, &rtyper, &py.graph.borrow());
+    let crate::flowspace::pygraph::PyGraph { graph, .. } = py;
+    let flow = Rc::try_unwrap(graph)
+        .expect("fresh ll_search helper is uniquely owned")
+        .into_inner();
+    cc.register_opname_helper_graph(path.clone(), flow);
     path
 }
 
@@ -104,27 +115,11 @@ pub fn ll_find_char_path(cc: &mut CallControl, ptr_lltype: &LowLevelType) -> Cal
     if cc.has_function_graph(&path) {
         return path;
     }
-    let _ = build_ll_find_char_helper_graph(LL_FIND_CHAR, ptr_lltype.clone())
+    let py = build_ll_find_char_helper_graph(LL_FIND_CHAR, ptr_lltype.clone())
         .expect("ll_find_char helper graph");
-    if ptr_lltype == &*STRPTR {
-        bind_ll_find_char_fnaddr(cc);
-    }
-    let mut graph = residual_ll_find_char_graph();
-    graph.push_hint("elidable");
-    cc.register_function_graph(path.clone(), graph);
-    cc.add_candidate_graph_if_look_inside(path.clone());
+    debug_assert!(py.func._elidable_function_);
+    register_callee_graph(cc, path.clone(), &py.graph.borrow(), true);
     path
-}
-
-fn bind_ll_find_char_fnaddr(cc: &mut CallControl) {
-    let dest = CallPath::from_segments([LL_FIND_CHAR]);
-    if cc.lookup_function_fnaddr(&dest).is_some() {
-        return;
-    }
-    let src = native_fnaddr_key();
-    if cc.lookup_function_fnaddr(&src).is_some() {
-        cc.alias_function_fnaddr(dest, &src);
-    }
 }
 
 /// The helper path for `_search_elidable`, minting the elidable residual.
@@ -137,144 +132,108 @@ pub fn search_elidable_path(cc: &mut CallControl) -> CallPath {
     if cc.has_function_graph(&path) {
         return path;
     }
-    bind_search_elidable_fnaddr(cc);
-    let mut graph = residual_search_elidable_graph();
-    graph.push_hint("elidable");
-    cc.register_function_graph(path.clone(), graph);
-    cc.add_candidate_graph_if_look_inside(path.clone());
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let rtyper = RPythonTyper::new(&ann);
+    let py = crate::rlib::rstring::build_search_elidable_helper_graph(
+        &rtyper,
+        SEARCH_ELIDABLE,
+        STRPTR.clone(),
+    )
+    .expect("_search_elidable helper graph");
+    register_direct_call_callees(cc, &rtyper, &py.graph.borrow());
+    register_callee_graph(cc, path.clone(), &py.graph.borrow(), true);
     path
 }
 
-fn bind_search_elidable_fnaddr(cc: &mut CallControl) {
-    let dest = CallPath::from_segments([SEARCH_ELIDABLE]);
-    if cc.lookup_function_fnaddr(&dest).is_some() {
+fn callee_already_registered(cc: &CallControl, path: &CallPath) -> bool {
+    cc.has_function_graph(path) || cc.jitcode_handle(path).is_some() || cc.has_opname_graph(path)
+}
+
+/// Walk `direct_call` callee graphs depth-first, once per path
+/// (`call.py CallControl.find_all_graphs`). Each callee is
+/// `register_function_graph` then `add_candidate_graph_if_look_inside`;
+/// `policy.look_inside_graph` decides candidacy. Nested callees of a
+/// residual are registered for `getcalldescr` only.
+fn register_direct_call_callees(
+    cc: &mut CallControl,
+    rtyper: &RPythonTyper,
+    graph: &crate::flowspace::model::FunctionGraph,
+) {
+    visit_direct_call_callees(cc, rtyper, graph, true);
+}
+
+fn visit_direct_call_callees(
+    cc: &mut CallControl,
+    rtyper: &RPythonTyper,
+    graph: &crate::flowspace::model::FunctionGraph,
+    offer_candidate: bool,
+) {
+    for func in direct_call_funcobjs(graph) {
+        let graph_id = func
+            .graph
+            .expect("HighLevelOp.gendirectcall funcptr carries graph");
+        let callee = graph_ref_for_funcptr_id(rtyper, graph_id)
+            .expect("funcobj.graph lives on translator.graphs");
+        let path = CallPath::from_segments([func._name.as_str()]);
+        if callee_already_registered(cc, &path) {
+            continue;
+        }
+        register_callee_graph(cc, path.clone(), &callee.borrow(), offer_candidate);
+        let nested_offer = offer_candidate && cc.is_candidate(&path);
+        visit_direct_call_callees(cc, rtyper, &callee.borrow(), nested_offer);
+    }
+}
+
+/// Register one callee. A look-inside graph is `lower_graph`; a refused
+/// graph is effect-only so `getcalldescr` walks the real body. Residual
+/// native fnaddr is the `HELPER_FNADDRS` row whose leaf is the callee
+/// name (`ll_find_char`, `_search_elidable`, `_search_normal`).
+fn register_callee_graph(
+    cc: &mut CallControl,
+    path: CallPath,
+    callee: &crate::flowspace::model::FunctionGraph,
+    offer_candidate: bool,
+) {
+    if callee_already_registered(cc, &path) {
         return;
     }
-    let src = search_elidable_native_fnaddr_key();
-    if cc.lookup_function_fnaddr(&src).is_some() {
-        cc.alias_function_fnaddr(dest, &src);
+    if !offer_candidate {
+        let graph = effect_graph_from_search_helper(callee);
+        cc.register_function_graph(path, graph);
+        return;
+    }
+    let effect = effect_graph_from_search_helper(callee);
+    let mut probe = DefaultJitPolicy::new();
+    let look_inside = probe.look_inside_graph(&effect);
+    if look_inside {
+        cc.register_function_graph(path.clone(), lower_graph(callee));
+    } else {
+        cc.register_function_graph(path.clone(), effect);
+    }
+    cc.add_candidate_graph_if_look_inside(path.clone());
+    if cc.is_candidate(&path) {
+        let _ = cc.get_jitcode(&path);
+    } else {
+        bind_residual_native_fnaddr(cc, &path);
     }
 }
 
-/// Body is never traced (`look_inside_graph` refuses elidable). Four
-/// arguments matching `ll_find_char(s, ch, start, end)`.
-fn residual_ll_find_char_graph() -> FunctionGraph {
-    let mut graph = FunctionGraph::new(LL_FIND_CHAR);
-    let start = graph.startblock;
-    let s = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-    let ch = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    let start_i = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    let end = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    graph.push_inputarg_var(start, s.clone());
-    graph.push_inputarg_var(start, ch.clone());
-    graph.push_inputarg_var(start, start_i.clone());
-    graph.push_inputarg_var(start, end.clone());
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "s".to_string(),
-            ty: ValueType::Str,
-            class_root: None,
-        },
-        s,
-    );
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "ch".to_string(),
-            ty: ValueType::Int,
-            class_root: None,
-        },
-        ch,
-    );
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "start".to_string(),
-            ty: ValueType::Int,
-            class_root: None,
-        },
-        start_i,
-    );
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "end".to_string(),
-            ty: ValueType::Int,
-            class_root: None,
-        },
-        end,
-    );
-    let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    graph.push_op_with_result_var(start, OpKind::ConstInt(-1), result.clone());
-    graph.set_return(start, Some(result));
-    graph.with_return_type("i64")
-}
-
-/// Body is never traced (`look_inside_graph` refuses elidable). Five
-/// arguments matching `_search_elidable(s1, s2, start, end, mode)`.
-fn residual_search_elidable_graph() -> FunctionGraph {
-    let mut graph = FunctionGraph::new(SEARCH_ELIDABLE);
-    let start = graph.startblock;
-    let s1 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-    let s2 = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-    let start_i = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    let end = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    let mode = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    graph.push_inputarg_var(start, s1.clone());
-    graph.push_inputarg_var(start, s2.clone());
-    graph.push_inputarg_var(start, start_i.clone());
-    graph.push_inputarg_var(start, end.clone());
-    graph.push_inputarg_var(start, mode.clone());
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "s1".to_string(),
-            ty: ValueType::Str,
-            class_root: None,
-        },
-        s1,
-    );
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "s2".to_string(),
-            ty: ValueType::Str,
-            class_root: None,
-        },
-        s2,
-    );
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "start".to_string(),
-            ty: ValueType::Int,
-            class_root: None,
-        },
-        start_i,
-    );
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "end".to_string(),
-            ty: ValueType::Int,
-            class_root: None,
-        },
-        end,
-    );
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "mode".to_string(),
-            ty: ValueType::Int,
-            class_root: None,
-        },
-        mode,
-    );
-    let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    graph.push_op_with_result_var(start, OpKind::ConstInt(-1), result.clone());
-    graph.set_return(start, Some(result));
-    graph.with_return_type("i64")
+fn bind_residual_native_fnaddr(cc: &mut CallControl, dest: &CallPath) {
+    if cc.lookup_function_fnaddr(dest).is_some() {
+        return;
+    }
+    let Some(name) = dest.last_segment() else {
+        return;
+    };
+    for src in [
+        CallPath::from_segments(["lltypesystem", "rstr", name]),
+        CallPath::from_segments(["rstring", name]),
+    ] {
+        if cc.lookup_function_fnaddr(&src).is_some() {
+            cc.alias_function_fnaddr(dest.clone(), &src);
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -283,13 +242,15 @@ mod tests {
     use crate::codewriter::call::{CallKind, is_symbolic_fnaddr};
     use crate::codewriter::codewriter::CodeWriter;
     use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
-    use crate::codewriter::jtransform_opname::lower_graph;
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, Hlvalue,
         Link, SpaceOperation,
     };
-    use crate::model::{CallTarget, OpKind};
+    use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
     use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        build_ll_find_helper_graph, build_ll_search_helper_graph,
+    };
     use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
     use majit_ir::descr::ExtraEffect;
 
@@ -536,11 +497,11 @@ mod tests {
         (effects, addrs)
     }
 
-    /// `contains` through `ll_find` residuals `ll_find_char` (m == 1) and
-    /// `_search_elidable` (m > 1 via `ll_search`), both
-    /// `ElidableCannotRaise` with real fnaddrs. `jit_record_exact_value`
-    /// lives on the `ll_find` CFG; Spine B lowers it to
-    /// `record_exact_value_i` when that rewrite is present.
+    /// `contains` through `ll_find` residuals `ll_find_char` (m == 1,
+    /// `ElidableCannotRaise`) and `_search_elidable` (m > 1 via
+    /// `ll_search`, `ElidableOrMemoryError` from `_twoway_preprocess`).
+    /// `jit_record_exact_value` lives on the `ll_find` CFG; Spine B
+    /// lowers it to `record_exact_value_i` when that rewrite is present.
     #[test]
     fn ll_find_contains_residuals_ll_find_char_and_search_elidable() {
         let contains = contains_graph();
@@ -644,7 +605,7 @@ mod tests {
             .with_callcontrol(&mut cc)
             .transform(&search_lowered);
         let (search_effects, search_addrs) = residual_effect_and_fnaddrs(&search_xf.graph);
-        assert_eq!(search_effects, vec![ExtraEffect::ElidableCannotRaise]);
+        assert_eq!(search_effects, vec![ExtraEffect::ElidableOrMemoryError]);
         assert!(
             search_addrs.iter().any(|(addr, symbolic)| *addr == 0x2000
                 && !*symbolic
@@ -686,8 +647,8 @@ mod tests {
     }
 
     /// `contains` through `ll_find` drains with no raw `direct_call` in any
-    /// emitted jitcode. `ll_find_char` and `_search_elidable` are
-    /// `residual_call_*` with `ElidableCannotRaise`; `ll_search` is an
+    /// emitted jitcode. `ll_find_char` is `ElidableCannotRaise`;
+    /// `_search_elidable` is `ElidableOrMemoryError`; `ll_search` is an
     /// `inline_call_*` (`jtransform.py rewrite_op_direct_call`).
     #[test]
     fn contains_through_ll_find_emits_no_direct_call() {
@@ -758,11 +719,11 @@ mod tests {
             "ll_search leftover Call after rewrite_op_direct_call: {leftover:?}"
         );
         let (search_effects, _) = residual_effect_and_fnaddrs(&search_xf.graph);
-        assert_eq!(search_effects, vec![ExtraEffect::ElidableCannotRaise]);
+        assert_eq!(search_effects, vec![ExtraEffect::ElidableOrMemoryError]);
     }
 
     /// `direct_call _search_elidable(...)` becomes `residual_call_*`
-    /// with `EF_ELIDABLE_CANNOT_RAISE` and a real fnaddr.
+    /// with `EF_ELIDABLE_OR_MEMORYERROR` and a real fnaddr.
     #[test]
     fn search_elidable_direct_call_lowers_to_elidable_residual() {
         let s1 = variable_with_lltype("s1", STRPTR.clone());
@@ -844,7 +805,7 @@ mod tests {
                 _ => None,
             })
             .expect("direct_call _search_elidable must rewrite to residual_call");
-        assert_eq!(residual.0, ExtraEffect::ElidableCannotRaise);
+        assert_eq!(residual.0, ExtraEffect::ElidableOrMemoryError);
         let fnaddr = ops.iter().find_map(|op| match &op.kind {
             OpKind::ConstFnAddr {
                 value, symbolic, ..
@@ -855,5 +816,339 @@ mod tests {
         assert!(!symbolic, "_search_elidable fnaddr must be executable");
         assert!(!is_symbolic_fnaddr(addr));
         assert_eq!(addr, 0x2000);
+    }
+
+    /// rtyper path alone: callee funcptrs carry graphs, and lowering
+    /// without [`ll_find_path`] residuals `ll_find_char`
+    /// (`ElidableCannotRaise`) / `_search_elidable`
+    /// (`ElidableOrMemoryError`) with executable fnaddrs and inlines
+    /// `ll_search`.
+    #[test]
+    fn rtyper_ll_find_funcptrs_carry_graphs_and_lower_without_ll_find_path() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let py = build_ll_find_helper_graph_on(&rtyper, LL_FIND, STRPTR.clone())
+            .expect("ll_find helper graph");
+
+        let callees = direct_call_funcobjs(&py.graph.borrow());
+        assert!(
+            callees.iter().any(|func| func._name == LL_FIND_CHAR),
+            "ll_find calls ll_find_char"
+        );
+        assert!(
+            callees.iter().any(|func| func._name == LL_SEARCH),
+            "ll_find calls ll_search"
+        );
+        for func in &callees {
+            let graph_id = func
+                .graph
+                .expect("HighLevelOp.gendirectcall funcptr carries graph");
+            assert!(
+                graph_ref_for_funcptr_id(&rtyper, graph_id).is_some(),
+                "{} graph lives on translator.graphs",
+                func._name
+            );
+        }
+
+        let search = callees
+            .iter()
+            .find(|func| func._name == LL_SEARCH)
+            .expect("ll_search callee");
+        let search_graph =
+            graph_ref_for_funcptr_id(&rtyper, search.graph.expect("ll_search graph id"))
+                .expect("ll_search graph lives on translator.graphs");
+        let nested = direct_call_funcobjs(&search_graph.borrow());
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0]._name, SEARCH_ELIDABLE);
+        let nested_id = nested[0]
+            .graph
+            .expect("_search_elidable funcptr carries graph");
+        assert!(graph_ref_for_funcptr_id(&rtyper, nested_id).is_some());
+
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr(&helper_fnaddr_path(), 0x1000);
+        cc.register_macro_helper_trace_fnaddr(&search_elidable_fnaddr_path(), 0x2000);
+        register_direct_call_callees(&mut cc, &rtyper, &py.graph.borrow());
+
+        let find_char = CallPath::from_segments([LL_FIND_CHAR]);
+        let search_path = CallPath::from_segments([LL_SEARCH]);
+        let elidable = CallPath::from_segments([SEARCH_ELIDABLE]);
+        assert!(cc.has_function_graph(&find_char));
+        assert!(!cc.is_candidate(&find_char));
+        assert!(cc.has_function_graph(&search_path));
+        assert!(cc.is_candidate(&search_path));
+        assert!(cc.has_function_graph(&elidable));
+        assert!(!cc.is_candidate(&elidable));
+        assert!(
+            cc.jitcode_handle(&CallPath::from_segments([LL_FIND]))
+                .is_none()
+        );
+
+        let find_xf = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&lower_graph(&py.graph.borrow()));
+        assert!(
+            find_xf
+                .graph
+                .iter_blocks()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::InlineCall { .. })),
+            "ll_search is look-inside: inline_call"
+        );
+        let (find_effects, find_addrs) = residual_effect_and_fnaddrs(&find_xf.graph);
+        assert!(
+            find_effects
+                .iter()
+                .any(|effect| *effect == ExtraEffect::ElidableCannotRaise),
+            "ll_find_char residual is ElidableCannotRaise: {find_effects:?}"
+        );
+        assert!(
+            find_addrs.iter().any(|(addr, symbolic)| *addr == 0x1000
+                && !*symbolic
+                && !is_symbolic_fnaddr(*addr)),
+            "ll_find_char fnaddr is executable: {find_addrs:?}"
+        );
+
+        let search_xf = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&lower_graph(&search_graph.borrow()));
+        let (search_effects, search_addrs) = residual_effect_and_fnaddrs(&search_xf.graph);
+        assert_eq!(search_effects, vec![ExtraEffect::ElidableOrMemoryError]);
+        assert!(
+            search_addrs.iter().any(|(addr, symbolic)| *addr == 0x2000
+                && !*symbolic
+                && !is_symbolic_fnaddr(*addr)),
+            "_search_elidable fnaddr is executable: {search_addrs:?}"
+        );
+    }
+
+    fn calldescr(
+        cc: &CallControl,
+        name: &str,
+        args: Vec<majit_ir::value::Type>,
+    ) -> crate::codewriter::call::CallDescriptor {
+        use crate::codewriter::call::AnalysisCache;
+        use crate::model::CallTarget;
+        use majit_ir::descr::OopSpecIndex;
+        use majit_ir::value::Type;
+        let n = args.len();
+        let call = crate::model::SpaceOperation {
+            result: Some(crate::flowspace::model::Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path([name]),
+                args: crate::model::call_args(
+                    (0..n)
+                        .map(|_| crate::flowspace::model::Variable::new())
+                        .collect::<Vec<_>>(),
+                ),
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut cache = AnalysisCache::default();
+        cc.getcalldescr(
+            &call,
+            args,
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        )
+    }
+
+    /// `getcalldescr` (`call.py`) on `ll_find_char`: elidable loop of
+    /// `getarrayitem` / `char_eq`, no malloc → `EF_ELIDABLE_CANNOT_RAISE`.
+    #[test]
+    fn ll_find_char_calldescr_is_elidable_cannot_raise() {
+        use majit_ir::value::Type;
+        let cc = mint();
+        let descr = calldescr(
+            &cc,
+            LL_FIND_CHAR,
+            vec![Type::Ref, Type::Int, Type::Int, Type::Int],
+        );
+        assert_eq!(
+            descr.extra_info.extraeffect,
+            ExtraEffect::ElidableCannotRaise
+        );
+        assert!(!descr.extra_info.can_collect);
+        let graph = cc
+            .function_graphs()
+            .get(&CallPath::from_segments([LL_FIND_CHAR]))
+            .expect("ll_find_char graph");
+        assert!(
+            graph
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "ll_find_char reads s.chars"
+        );
+    }
+
+    /// `getcalldescr` (`call.py`) on `_search_elidable`: `_canraise`
+    /// `"mem"` from `_twoway_preprocess` → `EF_ELIDABLE_OR_MEMORYERROR`.
+    #[test]
+    fn search_elidable_calldescr_is_elidable_or_memoryerror() {
+        use majit_ir::value::Type;
+        let cc = mint();
+        let descr = calldescr(
+            &cc,
+            SEARCH_ELIDABLE,
+            vec![Type::Ref, Type::Ref, Type::Int, Type::Int, Type::Int],
+        );
+        assert_eq!(
+            descr.extra_info.extraeffect,
+            ExtraEffect::ElidableOrMemoryError
+        );
+        let elidable = CallPath::from_segments([SEARCH_ELIDABLE]);
+        assert!(
+            nested_has_newarray(&cc, &elidable),
+            "_twoway_preprocess table is a GC list malloc"
+        );
+    }
+
+    fn nested_has_newarray(cc: &CallControl, path: &CallPath) -> bool {
+        use std::collections::HashSet;
+        fn walk(cc: &CallControl, path: &CallPath, seen: &mut HashSet<CallPath>) -> bool {
+            if !seen.insert(path.clone()) {
+                return false;
+            }
+            let Some(graph) = cc.function_graphs().get(path) else {
+                return false;
+            };
+            for (_, op) in graph.iter_block_ops() {
+                if matches!(op.kind, OpKind::NewArray { .. }) {
+                    return true;
+                }
+                if let OpKind::Call { target, .. } = &op.kind {
+                    if let Some(segs) = target.path_segments() {
+                        let nested = CallPath::from_segments(segs);
+                        if walk(cc, &nested, seen) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        walk(cc, path, &mut HashSet::new())
+    }
+
+    /// UNICODE `ll_find` look-inside: `inline_call` `ll_search`;
+    /// `_search_normal` is a loopy residual (`policy.look_inside_graph`
+    /// / `unsafe_loopy_graphs`). Fresh `CallControl` so STR/UNICODE
+    /// helper names do not collide.
+    #[test]
+    fn unicode_ll_find_inlines_ll_search_and_calls_search_normal_residual() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let py = build_ll_find_helper_graph_on(&rtyper, "ll_unicode_find", UNICODEPTR.clone())
+            .expect("UNICODE ll_find");
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr(&search_normal_fnaddr_path(), 0x3000);
+        register_direct_call_callees(&mut cc, &rtyper, &py.graph.borrow());
+        let search = CallPath::from_segments([LL_SEARCH]);
+        let normal = CallPath::from_segments([SEARCH_NORMAL]);
+        assert!(cc.is_candidate(&search), "ll_search is look-inside");
+        assert!(
+            !cc.is_candidate(&normal),
+            "_search_normal is residual (contains a loop)"
+        );
+        assert!(cc.has_function_graph(&normal));
+        let mut policy = DefaultJitPolicy::new();
+        let normal_graph = cc
+            .function_graphs()
+            .get(&normal)
+            .expect("_search_normal graph");
+        assert!(
+            !policy.look_inside_graph(&normal_graph),
+            "look_inside_graph refuses a loopy _search_normal"
+        );
+        assert!(
+            policy.state().unsafe_loopy_graphs.contains(SEARCH_NORMAL),
+            "_search_normal is in unsafe_loopy_graphs: {:?}",
+            policy.state().unsafe_loopy_graphs
+        );
+        assert_eq!(cc.lookup_function_fnaddr(&normal), Some(0x3000));
+        assert!(!cc.is_elidable(&CallTarget::function_path([SEARCH_NORMAL])));
+
+        let find_xf = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&lower_graph(&py.graph.borrow()));
+        assert!(
+            find_xf
+                .graph
+                .iter_blocks()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::InlineCall { .. })),
+            "UNICODE ll_find inlines ll_search: {:?}",
+            leftover_call_targets(&find_xf.graph)
+        );
+
+        let callees = direct_call_funcobjs(&py.graph.borrow());
+        let search_func = callees
+            .iter()
+            .find(|func| func._name == LL_SEARCH)
+            .expect("ll_search callee");
+        let search_graph =
+            graph_ref_for_funcptr_id(&rtyper, search_func.graph.expect("ll_search graph id"))
+                .expect("ll_search graph");
+        let nested = direct_call_funcobjs(&search_graph.borrow());
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0]._name, SEARCH_NORMAL);
+
+        let search_xf = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&lower_graph(&search_graph.borrow()));
+        let leftover = leftover_call_targets(&search_xf.graph);
+        assert!(
+            leftover.is_empty(),
+            "UNICODE ll_search leftover Call: {leftover:?}"
+        );
+        assert!(
+            !search_xf
+                .graph
+                .iter_blocks()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::InlineCall { .. })),
+            "UNICODE ll_search must not inline _search_normal"
+        );
+        let (search_effects, search_addrs) = residual_effect_and_fnaddrs(&search_xf.graph);
+        assert!(
+            search_effects.iter().any(|effect| !matches!(
+                *effect,
+                ExtraEffect::ElidableCannotRaise
+                    | ExtraEffect::ElidableOrMemoryError
+                    | ExtraEffect::ElidableCanRaise
+            )),
+            "_search_normal residual is not elidable: {search_effects:?}"
+        );
+        assert!(
+            search_addrs.iter().any(|(addr, symbolic)| *addr == 0x3000
+                && !*symbolic
+                && !is_symbolic_fnaddr(*addr)),
+            "_search_normal fnaddr is executable: {search_addrs:?}"
+        );
+
+        let mut codewriter = CodeWriter::new();
+        codewriter.drain_pending_graphs(&mut cc, &GraphTransformConfig::default());
+        let direct_call_insns: Vec<&String> = codewriter
+            .assembler
+            .insns()
+            .keys()
+            .filter(|key| key.starts_with("direct_call"))
+            .collect();
+        assert!(
+            direct_call_insns.is_empty(),
+            "raw direct_call in assembled insns: {direct_call_insns:?}"
+        );
+        for (path, jitcode) in cc.jitcodes() {
+            let dump = jitcode.dump();
+            assert!(
+                !dump
+                    .split_whitespace()
+                    .any(|tok| tok == "call" || tok.starts_with("direct_call")),
+                "raw direct_call in {path}: {dump}"
+            );
+        }
     }
 }

@@ -24433,6 +24433,20 @@ impl<'a> Lowering<'a> {
                                 .is_some()
                                 .then(|| root.clone())
                         })
+                } else if crate::front::result_exc::tyref_is_result_of_carrier(
+                    &call.dest.ty,
+                    self.llbc,
+                    self.static_addrs.error_carrier,
+                ) || crate::front::result_exc::tyref_is_result_of_carrier(
+                    dest_class_ty,
+                    self.llbc,
+                    self.static_addrs.error_carrier,
+                ) {
+                    // `result_exc` erases Result-of-carrier to `T` plus
+                    // exception links. A recast here would be the last op,
+                    // and checkgraph refuses that result on the exception
+                    // link (`simplify.py`).
+                    None
                 } else {
                     Some(root.clone())
                 }
@@ -40501,12 +40515,14 @@ impl<'a> Lowering<'a> {
         }
         // `Result<T, E>::branch` returns
         // `ControlFlow<Result<Infallible, E>, T>`. `Break`'s payload is
-        // that `Result`, not `E`. Binary core enums stay classdef-less, so
-        // `tyref_to_value_type_with` banks `Result<Infallible, E>` as
-        // `Ref(None)`. That kind is not `E`. The match builds `Err(e)`
-        // when the two kinds differ. rustc lays this `Result` out as `E`
-        // with no discriminant, because `Ok(Infallible)` is uninhabited;
-        // the translator does not collapse the kind to `E`.
+        // that `Result`, not `E`. Split-eligible Result instantiations
+        // annotate as that class (`bookkeeper.py` `getuniqueclassdef`),
+        // so `tyref_to_value_type_with` banks `Result<Infallible, E>` as
+        // `Ref(Some("Result<Infallible,E>"))`. That kind is not `E`. The
+        // match builds `Err(e)` when the two kinds differ. rustc lays
+        // this `Result` out as `E` with no discriminant, because
+        // `Ok(Infallible)` is uninhabited; the translator does not
+        // collapse the kind to `E`.
         let payloads = crate::model::ResultBranchPayloads {
             ok: adt_variant_payload_type(
                 recv_ty,
@@ -66100,21 +66116,28 @@ fn adt_node_class_root_leaf(
         // (lists, wrappers), never to a classdef.  Same crate-root
         // convention as the trait-bound resolver above.
         //
-        // Split-eligible unary core enums (`Option<i64>`) take the
-        // instantiation suffix below so a returned value annotates as
-        // that class (`bookkeeper.py` `getuniqueclassdef(cls)`). A
+        // Split-eligible core enums (`Option<i64>`, `Result<i32, E>`) take
+        // the instantiation suffix below so a returned or parameter value
+        // annotates as that class (`bookkeeper.py` `getuniqueclassdef(cls)`).
+        // `InstanceRepr.rtype_getattr` then reads `__discriminant` off the
+        // interned tagged struct (rclass.py); `ok` / `unwrap_or_default` are
+        // a match on that tag returning Option or the Ok payload. A
         // pointer-niche Option is the null word, not an enum class, and
-        // stays excluded. Binary core enums (`Result`, `ControlFlow`)
-        // stay classdef-less: their `?` diamond is the ControlFlow
-        // residual, and painting them recasts the `branch` result off
-        // the tracked value. The `?` rewrite peels the Option recast
-        // that this paint inserts on a call-returned Option.
+        // stays excluded. Result keeps its tag even when a type argument is
+        // pointer-like, so the niche exclusion does not apply to it.
+        // ControlFlow stays classdef-less: the `?` diamond residual recasts
+        // `branch`. Result-of-carrier call results skip the classdef recast
+        // (`result_narrow_root`); `result_exc` collapses any trailing recast
+        // so the raising call stays last (checkgraph, `simplify.py`). The
+        // `?` rewrite peels the Option recast that this paint inserts on a
+        // call-returned Option.
         let crate_root = name.split("::").next().unwrap_or(&name);
         if matches!(crate_root, "core" | "std" | "alloc") {
             let types = type_decl_ref_generics(adt, llbc)
                 .and_then(|g| g.get("types"))
                 .and_then(|t| t.as_array());
             let unary = types.is_some_and(|t| t.len() == 1);
+            let tagged_result = name.ends_with("::result::Result");
             let split = adt_head_instantiation_suffix(adt, llbc).is_some();
             let pointer_niche = types
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
@@ -66125,7 +66148,8 @@ fn adt_node_class_root_leaf(
             // are not `Struct` and do not match.
             let foreign_struct =
                 foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
-            if !foreign_struct && (!unary || !split || pointer_niche) {
+            let paint_core_enum = (unary && split && !pointer_niche) || (tagged_result && split);
+            if !foreign_struct && !paint_core_enum {
                 return None;
             }
         }
@@ -81937,7 +81961,10 @@ mod tests {
         let (reads, writes) = payload_field_tys(&graph);
         assert_eq!(reads, vec![ValueType::Int, ValueType::Int]);
         assert!(
-            writes.iter().any(|ty| *ty == ValueType::Ref(None)),
+            writes.iter().any(|ty| matches!(
+                ty,
+                ValueType::Ref(Some(name)) if name.starts_with("Result<")
+            )),
             "Break stores the Result value, got {writes:?}"
         );
     }
@@ -101589,6 +101616,85 @@ mod tests {
             crate::model::ValueType::Ref(Some("Option<i64>".into()))
         );
         assert_ne!(usize_ty, i64_ty);
+    }
+
+    fn result_enum(def_id: u64) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["result", 0]},
+                    {"Ident": ["Result", 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Enum": [
+                {
+                    "name": "Ok",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                },
+                {
+                    "name": "Err",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                }
+            ]}
+        })
+    }
+
+    fn result_adt_node(
+        def_id: u64,
+        ok: serde_json::Value,
+        err: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": def_id,
+                "generics": {
+                    "regions": [],
+                    "types": [ok, err],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn result_integer_instantiations_paint_distinct_class_roots() {
+        // `Result::ok` / `unwrap_or_default` match on the interned tagged
+        // struct (`InstanceRepr.rtype_getattr` `__discriminant`, rclass.py).
+        // Each instantiation is its own class (`bookkeeper.py`
+        // `getuniqueclassdef(cls)`), so `__pos_0` does not union i32 with
+        // Layout / String.
+        let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![]);
+        let dest = |ok: serde_json::Value, err: serde_json::Value| {
+            TyRef::Other(serde_json::json!({
+                "Value": [7, result_adt_node(0, ok, err)]
+            }))
+        };
+        let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let i32_u8 = super::tyref_to_value_type(&dest(i32_ty, u8_ty.clone()), &llbc);
+        let usize_u8 = super::tyref_to_value_type(&dest(usize_ty, u8_ty), &llbc);
+        assert_eq!(
+            i32_u8,
+            crate::model::ValueType::Ref(Some("Result<i32,u8>".into()))
+        );
+        assert_eq!(
+            usize_u8,
+            crate::model::ValueType::Ref(Some("Result<usize,u8>".into()))
+        );
+        assert_ne!(i32_u8, usize_u8);
     }
 
     fn option_i64_ty() -> serde_json::Value {

@@ -3,9 +3,11 @@
 //!
 //! `SEARCH_COUNT`, `SEARCH_FIND`, `SEARCH_RFIND` live here, matching
 //! the upstream module. The residual `_search_elidable` reads `Ptr(STR)`
-//! through the shared layout in [`crate::lltypesystem::rstr`].
+//! through the shared layout in [`crate::lltypesystem::rstr`]. UNICODE
+//! `_search_normal` reads `Ptr(UNICODE)` through the same header with
+//! UCS-4 `UniChar` cells.
 
-use crate::lltypesystem::rstr::str_as_bytes;
+use crate::lltypesystem::rstr::{str_as_bytes, unicode_as_unichars};
 
 /// `rstring.py` `SEARCH_COUNT`.
 pub const SEARCH_COUNT: i64 = 0;
@@ -21,16 +23,36 @@ const TWOWAY_MAX_SHIFT: usize = 255;
 const TWOWAY_TABLE_SIZE: usize = 64;
 const TWOWAY_TABLE_MASK: usize = TWOWAY_TABLE_SIZE - 1;
 
+/// `STR` `Char` (`u8`) or `UNICODE` `UniChar` (`u32`, UCS-4).
+pub trait SearchChar: Copy + Eq + Ord {
+    fn as_ord(self) -> u32;
+    const NUL: Self;
+}
+
+impl SearchChar for u8 {
+    fn as_ord(self) -> u32 {
+        u32::from(self)
+    }
+    const NUL: Self = 0;
+}
+
+impl SearchChar for u32 {
+    fn as_ord(self) -> u32 {
+        self
+    }
+    const NUL: Self = 0;
+}
+
 /// `rstring.py` `bloom_add`.
 #[inline]
-fn bloom_add(mask: u64, c: u8) -> u64 {
-    mask | (1u64 << (u32::from(c) & (BLOOM_WIDTH - 1)))
+fn bloom_add<C: SearchChar>(mask: u64, c: C) -> u64 {
+    mask | (1u64 << (c.as_ord() & (BLOOM_WIDTH - 1)))
 }
 
 /// `rstring.py` `bloom`.
 #[inline]
-fn bloom(mask: u64, c: u8) -> bool {
-    (mask & (1u64 << (u32::from(c) & (BLOOM_WIDTH - 1)))) != 0
+fn bloom<C: SearchChar>(mask: u64, c: C) -> bool {
+    (mask & (1u64 << (c.as_ord() & (BLOOM_WIDTH - 1)))) != 0
 }
 
 /// `rstring.py` `_search_elidable`. `@jit.elidable` wrapper around
@@ -44,8 +66,53 @@ pub fn _search_elidable(s1: *const u8, s2: *const u8, start: i64, end: i64, mode
     _search_normal(value, other, start, end, mode)
 }
 
+/// UNICODE `@specialize.argtype(0, 1)` of `_search_normal` (`rstring.py`).
+/// `_search` sends STR through `_search_elidable` and UNICODE through
+/// `_search_normal`; this residual takes two `Ptr(UNICODE)` and is
+/// published on `HELPER_FNADDRS` as `_search_normal`, the way the STR
+/// residual is published as `_search_elidable`.
+pub extern "C" fn _search_normal_unicode(
+    s1: *const u8,
+    s2: *const u8,
+    start: i64,
+    end: i64,
+    mode: i64,
+) -> i64 {
+    // SAFETY: residual `Ptr(UNICODE)` callee; the caller supplies live UNICODEs.
+    let value = unsafe { unicode_as_unichars(s1) };
+    let other = unsafe { unicode_as_unichars(s2) };
+    _search_normal(value, other, start, end, mode)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static __MAJIT_HELPER_FNADDR__search_normal: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        ::core::concat!(::core::module_path!(), "::", stringify!(_search_normal)),
+        _search_normal_unicode as *const (),
+        5,
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn __majit_register_helper_fnaddr__search_normal() {
+    majit_ir::helper_fnaddr::register(
+        ::core::concat!(::core::module_path!(), "::", stringify!(_search_normal)),
+        _search_normal_unicode as *const (),
+        5,
+    );
+}
+
 /// `rstring.py` `_search_normal`.
-pub fn _search_normal(value: &[u8], other: &[u8], mut start: i64, mut end: i64, mode: i64) -> i64 {
+pub fn _search_normal<C: SearchChar>(
+    value: &[C],
+    other: &[C],
+    mut start: i64,
+    mut end: i64,
+    mode: i64,
+) -> i64 {
     if start < 0 {
         start = 0;
     }
@@ -165,7 +232,11 @@ pub fn _search_normal(value: &[u8], other: &[u8], mut start: i64, mut end: i64, 
 }
 
 /// `rstring.py` `_lex_search`.
-fn lex_search(needle: &[u8], len_needle: usize, invert_alphabet: bool) -> (usize, usize) {
+fn lex_search<C: SearchChar>(
+    needle: &[C],
+    len_needle: usize,
+    invert_alphabet: bool,
+) -> (usize, usize) {
     let mut max_suffix = 0usize;
     let mut candidate = 1usize;
     let mut k = 0usize;
@@ -195,7 +266,7 @@ fn lex_search(needle: &[u8], len_needle: usize, invert_alphabet: bool) -> (usize
 }
 
 /// `rstring.py` `_factorize`.
-fn factorize(needle: &[u8], len_needle: usize) -> (usize, usize) {
+fn factorize<C: SearchChar>(needle: &[C], len_needle: usize) -> (usize, usize) {
     let (cut1, period1) = lex_search(needle, len_needle, false);
     let (cut2, period2) = lex_search(needle, len_needle, true);
     if cut1 > cut2 {
@@ -206,10 +277,10 @@ fn factorize(needle: &[u8], len_needle: usize) -> (usize, usize) {
 }
 
 /// `rstring.py` `_twoway_preprocess`.
-fn twoway_preprocess(
-    needle: &[u8],
+fn twoway_preprocess<C: SearchChar>(
+    needle: &[C],
     len_needle: usize,
-) -> (usize, usize, usize, bool, [u8; TWOWAY_TABLE_SIZE]) {
+) -> (usize, usize, usize, bool, Vec<isize>) {
     let (cut, mut period) = factorize(needle, len_needle);
     let mut is_periodic = true;
     let mut i = 0usize;
@@ -225,39 +296,51 @@ fn twoway_preprocess(
     } else {
         period = cut.max(len_needle - cut) + 1;
         let mut gap = len_needle;
-        let last = (needle[len_needle - 1] as usize) & TWOWAY_TABLE_MASK;
+        let last = (needle[len_needle - 1].as_ord() as usize) & TWOWAY_TABLE_MASK;
         let mut i = len_needle - 1;
         while i > 0 {
             i -= 1;
-            if ((needle[i] as usize) & TWOWAY_TABLE_MASK) == last {
+            if ((needle[i].as_ord() as usize) & TWOWAY_TABLE_MASK) == last {
                 gap = len_needle - 1 - i;
                 break;
             }
         }
         gap
     };
-    let not_found_shift = len_needle.min(TWOWAY_MAX_SHIFT) as u8;
-    let mut table = [not_found_shift; TWOWAY_TABLE_SIZE];
+    // compressed Boyer-Moore "bad character" table. Build it with an
+    // explicit append loop rather than repeating `not_found_shift`
+    // TWOWAY_TABLE_SIZE times: `_twoway_preprocess` is reached as a
+    // low-level helper (`rstr.py` `ll_search` via hlstr), and the
+    // post-annotation `transform_allocate` pass rewrites list-multiply
+    // into an `alloc_and_set` SpaceOperation that low-level re-annotation
+    // cannot reflow.
+    let not_found_shift = len_needle.min(TWOWAY_MAX_SHIFT) as isize;
+    let mut table = Vec::new();
+    let mut _i = 0;
+    while _i < TWOWAY_TABLE_SIZE {
+        table.push(not_found_shift);
+        _i += 1;
+    }
     let mut i = len_needle - not_found_shift as usize;
     while i < len_needle {
-        table[(needle[i] as usize) & TWOWAY_TABLE_MASK] = (len_needle - 1 - i) as u8;
+        table[(needle[i].as_ord() as usize) & TWOWAY_TABLE_MASK] = (len_needle - 1 - i) as isize;
         i += 1;
     }
     (cut, period, gap, is_periodic, table)
 }
 
 /// `rstring.py` `_two_way`.
-fn two_way(
-    value: &[u8],
+fn two_way<C: SearchChar>(
+    value: &[C],
     base: usize,
     n: usize,
-    needle: &[u8],
+    needle: &[C],
     m: usize,
     cut: usize,
     mut period: usize,
     gap: usize,
     is_periodic: bool,
-    table: &[u8; TWOWAY_TABLE_SIZE],
+    table: &[isize],
 ) -> i64 {
     let haystack_end = base + n;
     let mut window_last = base + m - 1;
@@ -267,7 +350,8 @@ fn two_way(
         while window_last < haystack_end {
             if !skip_horspool {
                 loop {
-                    let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                    let shift =
+                        table[(value[window_last].as_ord() as usize) & TWOWAY_TABLE_MASK] as usize;
                     window_last += shift;
                     if shift == 0 {
                         break;
@@ -301,7 +385,8 @@ fn two_way(
                     if window_last >= haystack_end {
                         return -1;
                     }
-                    let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                    let shift =
+                        table[(value[window_last].as_ord() as usize) & TWOWAY_TABLE_MASK] as usize;
                     if shift != 0 {
                         let mem_jump = cut.max(memory) - cut + 1;
                         memory = 0;
@@ -327,7 +412,8 @@ fn two_way(
         let gap_jump_end = (cut + gap).min(m);
         while window_last < haystack_end {
             loop {
-                let shift = table[(value[window_last] as usize) & TWOWAY_TABLE_MASK] as usize;
+                let shift =
+                    table[(value[window_last].as_ord() as usize) & TWOWAY_TABLE_MASK] as usize;
                 window_last += shift;
                 if shift == 0 {
                     break;
@@ -381,17 +467,17 @@ fn two_way(
 }
 
 /// `rstring.py` `_two_way_count`.
-fn two_way_count(
-    value: &[u8],
+fn two_way_count<C: SearchChar>(
+    value: &[C],
     base: usize,
     n: usize,
-    needle: &[u8],
+    needle: &[C],
     m: usize,
     cut: usize,
     period: usize,
     gap: usize,
     is_periodic: bool,
-    table: &[u8; TWOWAY_TABLE_SIZE],
+    table: &[isize],
 ) -> i64 {
     let mut index = 0usize;
     let mut count = 0i64;
@@ -417,7 +503,14 @@ fn two_way_count(
 }
 
 /// `rstring.py` `_default_find`.
-fn default_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, mode: i64) -> i64 {
+fn default_find<C: SearchChar>(
+    value: &[C],
+    base: usize,
+    n: usize,
+    needle: &[C],
+    m: usize,
+    mode: i64,
+) -> i64 {
     let w = n - m;
     let mlast = m - 1;
     let mut count = 0i64;
@@ -451,7 +544,7 @@ fn default_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, mo
                 i += mlast;
             } else {
                 let la = base + mlast + i + 1;
-                let c = if la < value.len() { value[la] } else { 0 };
+                let c = if la < value.len() { value[la] } else { C::NUL };
                 if !bloom(mask, c) {
                     i += m;
                 } else {
@@ -460,7 +553,7 @@ fn default_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, mo
             }
         } else {
             let la = base + mlast + i + 1;
-            let c = if la < value.len() { value[la] } else { 0 };
+            let c = if la < value.len() { value[la] } else { C::NUL };
             if !bloom(mask, c) {
                 i += m;
             }
@@ -471,7 +564,14 @@ fn default_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, mo
 }
 
 /// `rstring.py` `_adaptive_find`.
-fn adaptive_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, mode: i64) -> i64 {
+fn adaptive_find<C: SearchChar>(
+    value: &[C],
+    base: usize,
+    n: usize,
+    needle: &[C],
+    m: usize,
+    mode: i64,
+) -> i64 {
     let w = n - m;
     let mlast = m - 1;
     let mut count = 0i64;
@@ -538,7 +638,7 @@ fn adaptive_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, m
                     return res + count;
                 }
                 let la = base + mlast + i + 1;
-                let c = if la < value.len() { value[la] } else { 0 };
+                let c = if la < value.len() { value[la] } else { C::NUL };
                 if !bloom(mask, c) {
                     i += m;
                 } else {
@@ -547,7 +647,7 @@ fn adaptive_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, m
             }
         } else {
             let la = base + mlast + i + 1;
-            let c = if la < value.len() { value[la] } else { 0 };
+            let c = if la < value.len() { value[la] } else { C::NUL };
             if !bloom(mask, c) {
                 i += m;
             }
@@ -560,9 +660,12 @@ fn adaptive_find(value: &[u8], base: usize, n: usize, needle: &[u8], m: usize, m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lltypesystem::rstr::{STR_CHARS_OFFSET, STR_HASH_OFFSET, STR_LEN_OFFSET};
+    use crate::lltypesystem::rstr::{
+        STR_CHARS_OFFSET, STR_HASH_OFFSET, STR_LEN_OFFSET, UNICODE_CHARS_OFFSET,
+        UNICODE_HASH_OFFSET, UNICODE_LEN_OFFSET,
+    };
 
-    fn naive(hay: &[u8], needle: &[u8], lo: i64, hi: i64, mode: i64) -> i64 {
+    fn naive<C: SearchChar>(hay: &[C], needle: &[C], lo: i64, hi: i64, mode: i64) -> i64 {
         let mut start = lo;
         let mut end = hi;
         if start < 0 {
@@ -620,7 +723,7 @@ mod tests {
         }
     }
 
-    fn assert_agree(hay: &[u8], needle: &[u8], lo: i64, hi: i64) {
+    fn assert_agree<C: SearchChar>(hay: &[C], needle: &[C], lo: i64, hi: i64) {
         for mode in [SEARCH_FIND, SEARCH_RFIND, SEARCH_COUNT] {
             let got = _search_normal(hay, needle, lo, hi, mode);
             let expect = naive(hay, needle, lo, hi, mode);
@@ -708,6 +811,120 @@ mod tests {
             _search_elidable(hay.as_ptr(), needle.as_ptr(), 0, 11, SEARCH_FIND),
             4
         );
+    }
+
+    fn unicode_buf(chars: &[u32]) -> Vec<u8> {
+        let mut buf = vec![0u8; UNICODE_CHARS_OFFSET + chars.len() * 4];
+        unsafe {
+            buf.as_mut_ptr()
+                .add(UNICODE_HASH_OFFSET)
+                .cast::<isize>()
+                .write_unaligned(0);
+            buf.as_mut_ptr()
+                .add(UNICODE_LEN_OFFSET)
+                .cast::<usize>()
+                .write_unaligned(chars.len());
+            std::ptr::copy_nonoverlapping(
+                chars.as_ptr(),
+                buf.as_mut_ptr().add(UNICODE_CHARS_OFFSET).cast::<u32>(),
+                chars.len(),
+            );
+        }
+        buf
+    }
+
+    fn latin1(bytes: &[u8]) -> Vec<u32> {
+        bytes.iter().map(|&b| u32::from(b)).collect()
+    }
+
+    #[test]
+    fn search_normal_unicode_find_rfind_count() {
+        let hay = latin1(b"abracadabra");
+        let bra = latin1(b"bra");
+        let a = latin1(b"a");
+        let cad = latin1(b"cad");
+        assert_agree(&hay, &bra, 0, hay.len() as i64);
+        assert_agree(&hay, &a, 0, hay.len() as i64);
+        assert_agree(&hay, &cad, 1, 6);
+        let grin = 0x1F600u32;
+        let hay_u = [b'a' as u32, grin, b'b' as u32, grin, b'c' as u32];
+        let needle_u = [grin];
+        assert_agree(&hay_u, &needle_u, 0, hay_u.len() as i64);
+        assert_eq!(
+            _search_normal(&hay_u, &needle_u, 0, hay_u.len() as i64, SEARCH_FIND),
+            1
+        );
+        assert_eq!(
+            _search_normal(&hay_u, &needle_u, 0, hay_u.len() as i64, SEARCH_RFIND),
+            3
+        );
+        assert_eq!(
+            _search_normal(&hay_u, &needle_u, 0, hay_u.len() as i64, SEARCH_COUNT),
+            2
+        );
+        let two = [grin, b'b' as u32];
+        assert_eq!(
+            _search_normal(&hay_u, &two, 0, hay_u.len() as i64, SEARCH_FIND),
+            1
+        );
+    }
+
+    #[test]
+    fn search_normal_unicode_repeated_prefix() {
+        let hay = latin1(b"aaaabaaa");
+        let aaa = latin1(b"aaa");
+        assert_agree(&hay, &aaa, 0, hay.len() as i64);
+        assert_eq!(
+            _search_normal(&hay, &aaa, 0, hay.len() as i64, SEARCH_FIND),
+            0
+        );
+        assert_eq!(
+            _search_normal(&hay, &aaa, 0, hay.len() as i64, SEARCH_RFIND),
+            5
+        );
+        assert_eq!(
+            _search_normal(&hay, &aaa, 0, hay.len() as i64, SEARCH_COUNT),
+            2
+        );
+        let grin = 0x1F600u32;
+        let hay_u = [grin, grin, grin, b'x' as u32, grin, grin, grin];
+        let needle_u = [grin, grin, grin];
+        assert_agree(&hay_u, &needle_u, 0, hay_u.len() as i64);
+        assert_eq!(
+            _search_normal(&hay_u, &needle_u, 0, hay_u.len() as i64, SEARCH_RFIND),
+            4
+        );
+    }
+
+    #[test]
+    fn search_normal_unicode_reads_unicode_layout() {
+        let hay = unicode_buf(&[b'a' as u32, 0x1F600, b'b' as u32, 0x1F600]);
+        let needle = unicode_buf(&[0x1F600]);
+        assert_eq!(
+            _search_normal_unicode(hay.as_ptr(), needle.as_ptr(), 0, 4, SEARCH_FIND),
+            1
+        );
+        assert_eq!(
+            _search_normal_unicode(hay.as_ptr(), needle.as_ptr(), 0, 4, SEARCH_RFIND),
+            3
+        );
+        assert_eq!(
+            _search_normal_unicode(hay.as_ptr(), needle.as_ptr(), 0, 4, SEARCH_COUNT),
+            2
+        );
+    }
+
+    #[test]
+    fn search_normal_unicode_is_published_on_helper_fnaddrs() {
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path.ends_with("rstring::_search_normal") {
+                found = true;
+                assert_ne!(row.get(), 0);
+                assert_eq!(row.arity, 5);
+            }
+        });
+        assert!(found, "HELPER_FNADDRS must publish _search_normal");
     }
 
     #[test]

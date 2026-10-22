@@ -5638,6 +5638,14 @@ fn rewire_one_call_site(
     if matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException)) {
         return Ok(SiteOutcome::TailForward);
     }
+    // `tyref_to_value_type` paints split-eligible Result as
+    // `Ref(Some(root))`, so `lower_call` recasts the call result
+    // (`result_narrow_root`). The recast is identity (`cast_pointer`);
+    // this rewrite needs the residual call last (`call_ends_block`,
+    // checkgraph: raising op result cannot flow into the exception
+    // link — `simplify.py`). Same collapse the checked-arith Option
+    // path uses.
+    collapse_trailing_recasts_onto(graph, a, r);
     // Tail forward: the callee's Result flows straight to returnblock, or
     // through blocks that only close brackets.  Those closes also run when
     // the callee raises, so the call gains an exception edge that re-emits
@@ -12985,6 +12993,67 @@ mod tail_forward_close_tests {
         assert_eq!(exc.target, graph.exceptblock);
         assert!(exc.last_exception.is_some());
         assert!(exc.last_exc_value.is_some());
+    }
+
+    /// `tyref_to_value_type` paints split-eligible Result as
+    /// `Ref(Some(root))`, so `lower_call` recasts the call result
+    /// (`result_narrow_root`). The recast is identity (`cast_pointer`);
+    /// the rewrite still tail-forwards, and the raising call stays last
+    /// so its result does not ride the exception link (`simplify.py`
+    /// checkgraph).
+    #[test]
+    fn a_trailing_result_classdef_recast_still_tail_forwards() {
+        let mut graph = FunctionGraph::new("wrap_tail");
+        let start = graph.startblock;
+        let r = graph
+            .push_op_var(
+                start,
+                OpKind::Call {
+                    target: CallTarget::function_path(["m", "f"]),
+                    args: crate::model::call_args(Vec::new()),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call result");
+        let recast = graph
+            .push_op_var(
+                start,
+                crate::model::cast_instance_call("Result<i64,PyError>", r.clone()),
+                true,
+            )
+            .expect("recast");
+        graph.set_goto(start, graph.returnblock, vec![recast]);
+
+        let outcome = rewire_one_call_site(
+            &mut graph,
+            &r,
+            "",
+            &ValueType::Int,
+            true,
+            true,
+            &[(r.clone(), None, ValueType::Int)],
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("recast tail-forward rewires");
+        assert!(matches!(outcome, SiteOutcome::TailForward));
+        let a = &graph.blocks[start.0];
+        assert!(
+            !a.operations.iter().any(|op| is_recast_narrow(&op.kind)),
+            "the Result classdef recast is collapsed"
+        );
+        assert!(matches!(a.exitswitch, Some(ExitSwitch::LastException)));
+        let last = a.operations.last().expect("raising call remains");
+        let last_res = last.result.as_ref().expect("call result");
+        let [_, exc] = a.exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        assert!(
+            !exc.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == last_res)),
+            "raising operation result cannot flow into exception link"
+        );
     }
 }
 

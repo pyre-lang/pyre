@@ -8776,9 +8776,25 @@ where
                     .map(|f| f.jitcode.name().to_string())
                     .unwrap_or_default()
             };
-            // `jd_sd.warmstate.get_location_str(greenkey)` is not on this
-            // jitcode machine; empty merge points share that string.
-            let loc = "unknown language location";
+            // pyjitpl.py `_record_exact_value`: empty `current_merge_points`
+            // prints "unknown language location"; otherwise
+            // `jd_sd.warmstate.get_location_str(greenkey)` of
+            // `current_merge_points[0][:num_green_args]`.
+            let loc = match ctx.current_merge_points_first_greenkey() {
+                None => "unknown language location".to_string(),
+                Some(green_key) => {
+                    let jd_sd = ctx
+                        .driver_descriptor()
+                        .and_then(|jd_sd| jd_sd.index)
+                        .and_then(|idx| ctx.metainterp_sd().jitdrivers_sd.get(idx))
+                        .or_else(|| ctx.driver_descriptor())
+                        .or_else(|| ctx.metainterp_sd().jitdrivers_sd.first());
+                    match jd_sd.and_then(|jd_sd| jd_sd.warmstate.as_ref()) {
+                        Some(ws) => ws.borrow().get_location(green_key),
+                        None => format!("<jit key 0x{green_key:x}>"),
+                    }
+                }
+            };
             crate::debug::debug_print(&format!("{error} {name} {loc}"));
         }
         if invalid {

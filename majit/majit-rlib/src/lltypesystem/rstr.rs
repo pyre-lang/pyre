@@ -3,8 +3,7 @@
 //!
 //! Layout matches `LowlevelStringHeader` / `BUILTIN_STRING_*`: `hash` at
 //! word 0, `length` at one word, `chars` immediately after the header.
-//! UNICODE is not implemented here; this crate has no native UNICODE
-//! layout reader.
+//! UNICODE uses the same header; `chars` are UCS-4 `UniChar` (`u32`).
 
 /// `rstr.STR` header in front of the character bytes.
 #[repr(C)]
@@ -20,10 +19,20 @@ pub(crate) const STR_LEN_OFFSET: usize = std::mem::offset_of!(StrHeader, length)
 /// `LOWLEVEL_STRING_CHARS_OFFSET` / `BUILTIN_STRING_CHARS_OFFSET`.
 pub(crate) const STR_CHARS_OFFSET: usize = std::mem::size_of::<StrHeader>();
 
+/// `rstr.UNICODE` header; same `hash` / `length` words as [`STR_HASH_OFFSET`].
+pub(crate) const UNICODE_HASH_OFFSET: usize = STR_HASH_OFFSET;
+/// `rstr.UNICODE` length word; same slot as [`STR_LEN_OFFSET`].
+pub(crate) const UNICODE_LEN_OFFSET: usize = STR_LEN_OFFSET;
+/// Offset of the UCS-4 `chars` payload (`Array(UniChar)` item width 4).
+pub(crate) const UNICODE_CHARS_OFFSET: usize = STR_CHARS_OFFSET;
+
 const _: () = {
     assert!(STR_HASH_OFFSET == 0);
     assert!(STR_LEN_OFFSET == std::mem::size_of::<usize>());
     assert!(STR_CHARS_OFFSET == 2 * std::mem::size_of::<usize>());
+    assert!(UNICODE_HASH_OFFSET == STR_HASH_OFFSET);
+    assert!(UNICODE_LEN_OFFSET == STR_LEN_OFFSET);
+    assert!(UNICODE_CHARS_OFFSET == STR_CHARS_OFFSET);
 };
 
 /// The `chars` payload of a live `Ptr(STR)`.
@@ -33,6 +42,15 @@ const _: () = {
 pub(crate) unsafe fn str_as_bytes<'a>(s: *const u8) -> &'a [u8] {
     let len = unsafe { s.add(STR_LEN_OFFSET).cast::<usize>().read_unaligned() };
     unsafe { std::slice::from_raw_parts(s.add(STR_CHARS_OFFSET), len) }
+}
+
+/// The `chars` payload of a live `Ptr(UNICODE)`.
+///
+/// SAFETY: `s` is a residual `Ptr(UNICODE)` whose header and `length`
+/// UCS-4 codepoints are valid for this layout.
+pub(crate) unsafe fn unicode_as_unichars<'a>(s: *const u8) -> &'a [u32] {
+    let len = unsafe { s.add(UNICODE_LEN_OFFSET).cast::<usize>().read_unaligned() };
+    unsafe { std::slice::from_raw_parts(s.add(UNICODE_CHARS_OFFSET).cast::<u32>(), len) }
 }
 
 /// `LLHelpers.ll_find_char` (`rstr.py`). `#[elidable]` publishes the

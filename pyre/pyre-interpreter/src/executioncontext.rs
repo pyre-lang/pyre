@@ -467,6 +467,16 @@ impl WRootFinalizerQueue {
         finalizer_queue_trigger();
     }
 
+    /// framework.py `get_finalizer_queue_index`, cached like the
+    /// translation-time constant. This queue's `finalizer_queue_trigger` is
+    /// the identity key.
+    fn fq_index() -> usize {
+        static INDEX: OnceLock<usize> = OnceLock::new();
+        *INDEX.get_or_init(|| {
+            pyre_object::gc_hook::try_gc_get_finalizer_queue_index(finalizer_queue_trigger)
+        })
+    }
+
     /// `pypy/interpreter/executioncontext.py:640` —
     /// `self.space.finalizer_queue.next_dead()`.
     ///
@@ -474,7 +484,7 @@ impl WRootFinalizerQueue {
     /// when the death queue is empty.
     ///
     pub fn next_dead(&mut self) -> Option<PyObjectRef> {
-        let obj = pyre_object::gc_hook::try_gc_finalizer_next_dead(0);
+        let obj = pyre_object::gc_hook::try_gc_finalizer_next_dead(Self::fq_index());
         (!obj.is_null()).then_some(obj)
     }
 }
@@ -563,7 +573,11 @@ pub(crate) fn walk_space_user_del_action_roots(visitor: &mut dyn FnMut(&mut maji
 // residual call, as for [`may_ignore_finalizer`].
 #[majit_macros::dont_look_inside]
 pub fn register_finalizer(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
+    pyre_object::gc_hook::try_gc_register_finalizer(
+        WRootFinalizerQueue::fq_index(),
+        obj,
+        finalizer_queue_trigger,
+    );
 }
 
 /// objspace.py:486-487 `allocate_instance`:

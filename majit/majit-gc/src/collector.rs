@@ -2644,6 +2644,26 @@ impl MiniMarkGC {
         }
     }
 
+    /// framework.py `get_finalizer_queue_index`. Each FinalizerQueue is
+    /// identified by its `ll_finalizer_trigger` fn pointer
+    /// (`finalizer_queue_indexes[fq]`); a first visit takes
+    /// `len(finalizer_handlers)` and pushes that queue's deque and trigger.
+    pub fn get_finalizer_queue_index(&mut self, trigger: FinalizerTriggerFn) -> usize {
+        if let Some(index) = self
+            .finalizer_handlers
+            .iter()
+            .position(|handler| std::ptr::fn_addr_eq(handler.trigger, trigger))
+        {
+            return index;
+        }
+        let index = self.finalizer_handlers.len();
+        self.finalizer_handlers.push(FinalizerHandler {
+            deque: VecDeque::new(),
+            trigger,
+        });
+        index
+    }
+
     /// Initialize a nursery object's header.
     fn init_nursery_object(header_ptr: *mut u8, type_id: u32) {
         let hdr = unsafe { &mut *(header_ptr as *mut GcHeader) };
@@ -11095,17 +11115,21 @@ impl GcAllocator for MiniMarkGC {
         self.isenabled()
     }
 
+    fn get_finalizer_queue_index(&mut self, trigger: FinalizerTriggerFn) -> usize {
+        MiniMarkGC::get_finalizer_queue_index(self, trigger)
+    }
+
     fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
         if obj.is_null() || !self.is_managed_heap_object(obj.0) {
             return;
         }
-        assert!(fq_index <= self.finalizer_handlers.len());
-        if fq_index == self.finalizer_handlers.len() {
-            self.finalizer_handlers.push(FinalizerHandler {
-                deque: VecDeque::new(),
-                trigger,
-            });
-        }
+        // framework.py `gct_gc_fq_register` calls `get_finalizer_queue_index`
+        // first; the handler already exists.
+        assert!(
+            fq_index < self.finalizer_handlers.len()
+                && std::ptr::fn_addr_eq(self.finalizer_handlers[fq_index].trigger, trigger),
+            "finalizer queue index must come from get_finalizer_queue_index"
+        );
         let fq_index = isize::try_from(fq_index).expect("finalizer queue index exceeds Signed");
         self.register_finalizer_index(fq_index, obj);
     }
@@ -11490,6 +11514,13 @@ impl Drop for MiniMarkGC {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// framework.py `get_finalizer_queue_index` then `register_finalizer`.
+    fn register_on_fq(gc: &mut MiniMarkGC, obj: GcRef, trigger: FinalizerTriggerFn) -> usize {
+        let fq_index = GcAllocator::get_finalizer_queue_index(gc, trigger);
+        GcAllocator::register_finalizer(gc, fq_index, obj, trigger);
+        fq_index
+    }
 
     static SHADOW_STACK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     static SUPPLIED_ENV_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -11916,7 +11947,7 @@ mod tests {
             "the collecting entry births an oversized allocation young"
         );
         let registered_bytes = gc.oldgen.rawmalloced_bytes();
-        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        register_on_fq(&mut gc, obj, trigger);
 
         // Deliberately unrooted: the registration is the only thing that can
         // keep this block alive, which is the property being tested.
@@ -13136,7 +13167,7 @@ mod tests {
         let mut gc = test_gc(4096);
         let object_tid = gc.register_type(TypeInfo::object(ptr_size));
         let object = gc.alloc_with_type(object_tid, ptr_size);
-        gc.register_finalizer(0, object, trigger);
+        register_on_fq(&mut gc, object, trigger);
 
         let mut objects = Vec::new();
         gc.do_get_objects(-1, &mut |gcref| objects.push(gcref));
@@ -17676,7 +17707,7 @@ cache size\t: 8192 kB\n";
         // encoded as RPython `customdata`, so the header bit supplies the same
         // rejection once registration has occurred.
         let finalizable = gc.alloc_with_type(plain_tid, 16);
-        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+        register_on_fq(&mut gc, finalizable, trigger);
         assert!(!gc.pin(finalizable));
     }
 
@@ -18439,7 +18470,7 @@ cache size\t: 8192 kB\n";
         let f = gc.alloc_with_type(tid, ptr_size);
         assert!(gc.is_in_nursery(f.0));
         unsafe { *(f.0 as *mut GcRef) = q };
-        GcAllocator::register_finalizer(&mut gc, 0, f, trigger);
+        register_on_fq(&mut gc, f, trigger);
         assert_eq!(gc.oldgen.object_count(), 1);
 
         gc.do_collect_oldgen_nonmoving();
@@ -18634,11 +18665,11 @@ cache size\t: 8192 kB\n";
         let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         let mut root = obj;
         unsafe { gc.roots.add(&mut root) };
-        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        let fq_index = register_on_fq(&mut gc, obj, trigger);
 
         // A live registered object stays on the registration deque.
         gc.do_collect_oldgen_nonmoving();
-        assert!(GcAllocator::finalizer_next_dead(&mut gc, 0).is_none());
+        assert!(GcAllocator::finalizer_next_dead(&mut gc, fq_index).is_none());
         assert!(gc.oldgen.contains(obj.0));
 
         // Once unreachable it moves to the death queue and is kept alive for
@@ -18647,7 +18678,10 @@ cache size\t: 8192 kB\n";
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
         assert!(gc.oldgen.contains(obj.0));
-        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), Some(obj));
+        assert_eq!(
+            GcAllocator::finalizer_next_dead(&mut gc, fq_index),
+            Some(obj)
+        );
 
         // Popping removes the queue root; the following major reclaims it.
         gc.do_collect_oldgen_nonmoving();
@@ -18655,6 +18689,53 @@ cache size\t: 8192 kB\n";
         // can stay true for a freed block while the current arena is retained.
         // The allocator's exact live count verifies reclamation here.
         assert_eq!(gc.oldgen.object_count(), 0);
+    }
+
+    /// framework.py `get_finalizer_queue_index`: each FinalizerQueue owns a
+    /// distinct handler; an object registered on B is delivered only by B.
+    #[test]
+    fn get_finalizer_queue_index_keeps_queues_distinct() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static TRIGGERS_A: AtomicUsize = AtomicUsize::new(0);
+        static TRIGGERS_B: AtomicUsize = AtomicUsize::new(0);
+        fn trigger_a() {
+            TRIGGERS_A.fetch_add(1, Ordering::Relaxed);
+        }
+        fn trigger_b() {
+            TRIGGERS_B.fetch_add(1, Ordering::Relaxed);
+        }
+
+        TRIGGERS_A.store(0, Ordering::Relaxed);
+        TRIGGERS_B.store(0, Ordering::Relaxed);
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let index_a = GcAllocator::get_finalizer_queue_index(&mut gc, trigger_a);
+        let index_b = GcAllocator::get_finalizer_queue_index(&mut gc, trigger_b);
+        assert_ne!(index_a, index_b);
+        assert_eq!(
+            GcAllocator::get_finalizer_queue_index(&mut gc, trigger_a),
+            index_a
+        );
+        assert_eq!(
+            GcAllocator::get_finalizer_queue_index(&mut gc, trigger_b),
+            index_b
+        );
+
+        let obj_b = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
+        GcAllocator::register_finalizer(&mut gc, index_b, obj_b, trigger_b);
+
+        gc.do_collect_oldgen_nonmoving();
+        assert_eq!(TRIGGERS_A.load(Ordering::Relaxed), 0);
+        assert_eq!(TRIGGERS_B.load(Ordering::Relaxed), 1);
+        assert!(GcAllocator::finalizer_next_dead(&mut gc, index_a).is_none());
+        assert_eq!(
+            GcAllocator::finalizer_next_dead(&mut gc, index_b),
+            Some(obj_b)
+        );
+        assert!(GcAllocator::finalizer_next_dead(&mut gc, index_a).is_none());
+        assert!(GcAllocator::finalizer_next_dead(&mut gc, index_b).is_none());
     }
 
     /// After `do_collect_oldgen_nonmoving` with a young finalizer object, no
@@ -18671,23 +18752,24 @@ cache size\t: 8192 kB\n";
 
         let obj = gc.alloc_with_type(tid, 16);
         assert!(gc.is_in_nursery(obj.0));
-        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        let fq_index = register_on_fq(&mut gc, obj, trigger);
 
         // A young leftover already on the old deque, as a pinned identity copy
         // from `deal_with_young_objects_with_finalizers` would leave.
         let leftover = gc.alloc_with_type(tid, 16);
         assert!(gc.is_in_nursery(leftover.0));
-        GcAllocator::register_finalizer(&mut gc, 0, leftover, trigger);
+        register_on_fq(&mut gc, leftover, trigger);
         gc.probably_young_objects_with_finalizers
             .retain(|&(addr, _)| addr != leftover.0);
         gc.old_objects_with_finalizers
             .retain(|&(addr, _)| addr != leftover.0);
-        gc.old_objects_with_finalizers.push_back((leftover.0, 0));
+        gc.old_objects_with_finalizers
+            .push_back((leftover.0, fq_index as isize));
 
         gc.do_collect_oldgen_nonmoving();
 
         assert!(
-            gc.finalizer_handlers[0]
+            gc.finalizer_handlers[fq_index]
                 .deque
                 .iter()
                 .all(|&addr| !gc.is_in_nursery(addr)),
@@ -18771,7 +18853,7 @@ cache size\t: 8192 kB\n";
         let holder =
             gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + std::mem::size_of::<GcRef>());
         unsafe { *(holder.0 as *mut GcRef) = finalizable };
-        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+        register_on_fq(&mut gc, finalizable, trigger);
 
         assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated]));
         assert!(gc.do_subgraph_has_pending_finalizer(&[holder]));
@@ -18821,7 +18903,7 @@ cache size\t: 8192 kB\n";
         }
         let mut live_root = live;
         unsafe { gc.roots.add(&mut live_root) };
-        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+        let fq_index = register_on_fq(&mut gc, finalizable, trigger);
 
         gc.do_collect_oldgen_nonmoving();
 
@@ -18830,7 +18912,7 @@ cache size\t: 8192 kB\n";
         let expected = allocation_size as f64 * gc.major_collection_threshold;
         assert_eq!(gc.next_major_collection_threshold, expected);
         assert_eq!(
-            GcAllocator::finalizer_next_dead(&mut gc, 0),
+            GcAllocator::finalizer_next_dead(&mut gc, fq_index),
             Some(finalizable)
         );
     }
@@ -18864,7 +18946,7 @@ cache size\t: 8192 kB\n";
         gc.do_write_barrier(finalizable);
         let mut live_root = live;
         unsafe { gc.roots.add(&mut live_root) };
-        GcAllocator::register_finalizer(&mut gc, 0, finalizable, trigger);
+        register_on_fq(&mut gc, finalizable, trigger);
 
         gc.do_collect_oldgen_nonmoving();
 
@@ -18898,21 +18980,24 @@ cache size\t: 8192 kB\n";
 
         // The construction site registers, then a later out-of-band caller
         // asks again without knowing that.
-        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
-        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        let fq_index = register_on_fq(&mut gc, obj, trigger);
+        register_on_fq(&mut gc, obj, trigger);
         assert_eq!(gc.old_objects_with_finalizers.len(), 1);
 
         gc.roots.remove(&mut root);
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
-        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), Some(obj));
-        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+        assert_eq!(
+            GcAllocator::finalizer_next_dead(&mut gc, fq_index),
+            Some(obj)
+        );
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, fq_index), None);
 
         // No survivor was carried into the next cycle, so the object is not
         // delivered a second time.
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS.load(Ordering::Relaxed), 1);
-        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, fq_index), None);
     }
 
     /// incminimark.py `ignore_finalizer`: the object stays on the queue, and
@@ -18932,7 +19017,7 @@ cache size\t: 8192 kB\n";
         let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         let mut root = obj;
         unsafe { gc.roots.add(&mut root) };
-        GcAllocator::register_finalizer(&mut gc, 0, obj, trigger);
+        let fq_index = register_on_fq(&mut gc, obj, trigger);
         assert_eq!(gc.old_objects_with_finalizers.len(), 1);
 
         GcAllocator::ignore_finalizer(&mut gc, obj);
@@ -18941,7 +19026,7 @@ cache size\t: 8192 kB\n";
         gc.roots.remove(&mut root);
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS.load(Ordering::Relaxed), 0);
-        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, 0), None);
+        assert_eq!(GcAllocator::finalizer_next_dead(&mut gc, fq_index), None);
     }
 
     /// A non-moving major releases an unreachable young raw-malloced object
@@ -18962,8 +19047,8 @@ cache size\t: 8192 kB\n";
         unsafe { gc.roots.add(&mut kept) };
         assert!(gc.is_young_rawmalloced(dead.0));
         assert!(gc.is_young_rawmalloced(kept.0));
-        GcAllocator::register_finalizer(&mut gc, 0, dead, trigger);
-        GcAllocator::register_finalizer(&mut gc, 0, kept, trigger);
+        register_on_fq(&mut gc, dead, trigger);
+        register_on_fq(&mut gc, kept, trigger);
         assert_eq!(gc.probably_young_objects_with_finalizers.len(), 2);
         GcAllocator::ignore_finalizer(&mut gc, dead);
 

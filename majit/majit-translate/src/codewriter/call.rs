@@ -12938,6 +12938,429 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<EffectInfo> {
         .map(|entry| entry.get_extra_info())
 }
 
+/// Convert an rtyped helper graph into a rich-`OpKind` graph for
+/// [`CallControl::getcalldescr`] (`call.py`). `dont_look_inside` /
+/// `_elidable_function_` refuse `look_inside_graph`; the collect / write /
+/// raise analyzers still walk the real body. Spine B `lower_graph` fuses
+/// `getsubstruct` only inside one block and panics on `gc_can_move` /
+/// `gc_move_out_of_nursery`, so a residual registers this conversion
+/// instead of a constant-return stub.
+pub(crate) fn effect_graph_from_rtyped_helper(
+    graph: &crate::flowspace::model::FunctionGraph,
+) -> FunctionGraph {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::flowspace::model::{Block as FlowBlock, ConstValue, Hlvalue, Variable as FVar};
+    use crate::model::{BlockId, ConcreteType, ExitCase, ExitSwitch, Link};
+
+    type FlowBlockKey = *const RefCell<FlowBlock>;
+
+    let mut out = FunctionGraph::new(graph.name.clone());
+    let mut block_map: HashMap<FlowBlockKey, BlockId> = HashMap::new();
+    block_map.insert(Rc::as_ptr(&graph.startblock), out.startblock);
+    block_map.insert(Rc::as_ptr(&graph.returnblock), out.returnblock);
+    block_map.insert(Rc::as_ptr(&graph.exceptblock), out.exceptblock);
+
+    let flow_blocks = graph.iterblocks();
+    for fb in &flow_blocks {
+        let key = Rc::as_ptr(fb);
+        let id = *block_map.entry(key).or_insert_with(|| out.create_block());
+        let inputargs: Vec<FVar> = fb
+            .borrow()
+            .inputargs
+            .iter()
+            .filter_map(|hlv| match hlv {
+                Hlvalue::Variable(v) => Some(v.clone()),
+                Hlvalue::Constant(_) => None,
+            })
+            .collect();
+        out.block_mut(id).inputargs = inputargs;
+    }
+    let return_inputargs: Vec<FVar> = graph
+        .returnblock
+        .borrow()
+        .inputargs
+        .iter()
+        .filter_map(|hlv| match hlv {
+            Hlvalue::Variable(v) => Some(v.clone()),
+            Hlvalue::Constant(_) => None,
+        })
+        .collect();
+    let return_id = out.returnblock;
+    out.block_mut(return_id).inputargs = return_inputargs;
+
+    let start_id = out.startblock;
+    let start_inputs = out.block(start_id).inputargs.clone();
+    for var in start_inputs {
+        let ty = effect_value_type_of(&var);
+        let name = if var.renamed() {
+            var.name_prefix()
+        } else {
+            "arg".to_string()
+        };
+        out.push_op_with_result_var(
+            start_id,
+            OpKind::Input {
+                name,
+                ty,
+                class_root: None,
+            },
+            var,
+        );
+    }
+
+    for fb in &flow_blocks {
+        let id = block_map[&Rc::as_ptr(fb)];
+        let fb_ref = fb.borrow();
+        for op in &fb_ref.operations {
+            effect_transduce_op(&mut out, id, op);
+        }
+        let exitswitch = if fb_ref.canraise() {
+            Some(ExitSwitch::LastException)
+        } else {
+            match &fb_ref.exitswitch {
+                Some(Hlvalue::Variable(v)) => Some(ExitSwitch::Value(v.clone())),
+                _ => None,
+            }
+        };
+        let exits: Vec<Link> = fb_ref
+            .exits
+            .iter()
+            .map(|link_ref| {
+                let link = link_ref.borrow();
+                let target = link
+                    .target
+                    .as_ref()
+                    .expect("rtyped helper link has no target block");
+                let target_id = block_map[&Rc::as_ptr(target)];
+                let args: Vec<LinkArg> = link
+                    .args
+                    .iter()
+                    .map(|arg| {
+                        effect_linkarg(arg.as_ref().expect("rtyped helper link arg is undefined"))
+                    })
+                    .collect();
+                let exitcase = match &link.exitcase {
+                    Some(Hlvalue::Constant(c)) => match &c.value {
+                        ConstValue::Bool(b) => Some(ExitCase::Bool(*b)),
+                        other => Some(ExitCase::Const(other.clone())),
+                    },
+                    _ => None,
+                };
+                let mut model_link = Link::new_mixed(args, target_id, exitcase);
+                model_link.last_exception = link.last_exception.as_ref().map(effect_linkarg);
+                model_link.last_exc_value = link.last_exc_value.as_ref().map(effect_linkarg);
+                model_link
+            })
+            .collect();
+        drop(fb_ref);
+        if exitswitch.is_some() || !exits.is_empty() {
+            out.set_control_flow_metadata(id, exitswitch, exits);
+        }
+    }
+
+    if let Some(func) = &graph.func {
+        if func._elidable_function_ {
+            out.push_hint("elidable");
+        }
+        if func._jit_look_inside_ == Some(false) {
+            out.push_hint("dont_look_inside");
+        } else if let Some(look) = func._jit_look_inside_ {
+            out.func.jit_look_inside = Some(look);
+        }
+        if func._jit_unroll_safe_ {
+            out.func.unroll_safe = true;
+        }
+    }
+    if out
+        .block(out.returnblock)
+        .inputargs
+        .first()
+        .is_some_and(|ret| FunctionGraph::concretetype_of(ret) == ConcreteType::Signed)
+    {
+        out.return_type = Some("i64".into());
+    }
+    out
+}
+
+fn effect_value_type_of(var: &crate::flowspace::model::Variable) -> crate::model::ValueType {
+    use crate::model::{ConcreteType, ValueType};
+    match FunctionGraph::concretetype_of(var) {
+        ConcreteType::Signed => ValueType::Int,
+        ConcreteType::GcRef => ValueType::Ref(None),
+        ConcreteType::Float => ValueType::Float,
+        ConcreteType::Void => ValueType::Void,
+        ConcreteType::Unknown => ValueType::Int,
+    }
+}
+
+/// ARRAY identity for `arraydescrof_concrete`. A named `array_type_id`
+/// publishes `DescrSetMember::Array`; `None` mints a descr with no key
+/// and S4c degrades to `EF_RANDOM_EFFECTS`. STR.chars is
+/// `CHAR_ARRAY = GcArray(Char)` (`ll_str.py`).
+fn effect_array_type_id(base: &crate::flowspace::model::Variable) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let of = match base.concretetype() {
+        Some(LowLevelType::Ptr(ptr)) => match ptr.TO {
+            PtrTarget::Array(arr) => arr.OF,
+            _ => return Some("GcArray(Char)".to_string()),
+        },
+        Some(LowLevelType::Array(arr)) => arr.OF,
+        _ => return Some("GcArray(Char)".to_string()),
+    };
+    let elem = match of {
+        LowLevelType::Char => "Char",
+        LowLevelType::UniChar => "UniChar",
+        LowLevelType::Signed => "Signed",
+        LowLevelType::Unsigned => "Unsigned",
+        LowLevelType::Bool => "Bool",
+        LowLevelType::Float => "Float",
+        _ => return Some("GcArray(Char)".to_string()),
+    };
+    Some(format!("GcArray({elem})"))
+}
+
+fn effect_linkarg(hlv: &crate::flowspace::model::Hlvalue) -> LinkArg {
+    match hlv {
+        crate::flowspace::model::Hlvalue::Variable(v) => LinkArg::Value(v.clone()),
+        crate::flowspace::model::Hlvalue::Constant(c) => LinkArg::Const(c.clone()),
+    }
+}
+
+fn effect_expect_var(hlv: &crate::flowspace::model::Hlvalue) -> crate::flowspace::model::Variable {
+    match hlv {
+        crate::flowspace::model::Hlvalue::Variable(v) => v.clone(),
+        crate::flowspace::model::Hlvalue::Constant(c) => {
+            panic!("effect_graph_from_rtyped_helper: expected a Variable, found constant {c:?}")
+        }
+    }
+}
+
+fn effect_materialize(
+    out: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    hlv: &crate::flowspace::model::Hlvalue,
+) -> crate::flowspace::model::Variable {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match hlv {
+        Hlvalue::Variable(v) => v.clone(),
+        Hlvalue::Constant(c) => {
+            let (kind, lltype) = match &c.value {
+                ConstValue::Int(n) => (OpKind::ConstInt(*n), LowLevelType::Signed),
+                ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
+                ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
+                ConstValue::AddressOffset(_) => (OpKind::ConstInt(0), LowLevelType::Signed),
+                ConstValue::ByteStr(bytes) => {
+                    let n = i64::from(bytes.first().copied().unwrap_or(0));
+                    (OpKind::ConstInt(n), LowLevelType::Signed)
+                }
+                other => {
+                    panic!("effect_graph_from_rtyped_helper: cannot materialise constant {other:?}")
+                }
+            };
+            let result = out
+                .push_op_var(block, kind, true)
+                .expect("constant op produces a result var");
+            result.set_concretetype(Some(lltype));
+            result
+        }
+    }
+}
+
+fn effect_callee_name_from_funcptr(hlv: &crate::flowspace::model::Hlvalue) -> String {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    let Hlvalue::Constant(c) = hlv else {
+        panic!("effect_graph_from_rtyped_helper: direct_call callee is not a constant");
+    };
+    let ConstValue::LLPtr(ptr) = &c.value else {
+        panic!(
+            "effect_graph_from_rtyped_helper: direct_call callee is not an LLPtr: {:?}",
+            c.value
+        );
+    };
+    match ptr._obj0_value() {
+        Ok(Some(_ptr_obj::Func(func))) => func._name.clone(),
+        other => {
+            panic!("effect_graph_from_rtyped_helper: direct_call callee is not a Func: {other:?}")
+        }
+    }
+}
+
+fn effect_transduce_op(
+    out: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+) {
+    use crate::model::ValueType;
+    match op.opname.as_str() {
+        "getsubstruct" => {
+            let string_var = effect_expect_var(&op.args[0]);
+            let chars_var = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand: string_var,
+                    result_ty: effect_value_type_of(&chars_var),
+                },
+                chars_var,
+            );
+        }
+        "getarraysize" => {
+            let base = effect_expect_var(&op.args[0]);
+            let array_type_id = effect_array_type_id(&base);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::ArrayLen {
+                    base,
+                    array_type_id,
+                    nolength: false,
+                },
+                result,
+            );
+        }
+        "getarrayitem" => {
+            let base = effect_expect_var(&op.args[0]);
+            let array_type_id = effect_array_type_id(&base);
+            let index = effect_materialize(out, block, &op.args[1]);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: effect_value_type_of(&result),
+                    array_type_id,
+                    nolength: false,
+                    pure: false,
+                },
+                result,
+            );
+        }
+        "setarrayitem" => {
+            let base = effect_expect_var(&op.args[0]);
+            let array_type_id = effect_array_type_id(&base);
+            let index = effect_materialize(out, block, &op.args[1]);
+            let value = effect_linkarg(&op.args[2]);
+            let item_ty = match &op.args[2] {
+                crate::flowspace::model::Hlvalue::Variable(v) => effect_value_type_of(v),
+                crate::flowspace::model::Hlvalue::Constant(_) => ValueType::Int,
+            };
+            out.push_op_var(
+                block,
+                OpKind::ArrayWrite {
+                    base,
+                    index,
+                    value,
+                    item_ty,
+                    array_type_id,
+                    nolength: false,
+                },
+                false,
+            );
+        }
+        "gc_can_move" => {
+            let operand = effect_expect_var(&op.args[0]);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "gc_can_move".to_string(),
+                    operand,
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        "gc_move_out_of_nursery" => {
+            let arg = effect_expect_var(&op.args[0]);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path(["majit_gc", "gc_move_out_of_nursery"]),
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        "direct_call" => {
+            let callee = effect_callee_name_from_funcptr(&op.args[0]);
+            let target = CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()));
+            let args: Vec<_> = op.args[1..]
+                .iter()
+                .map(|a| effect_materialize(out, block, a))
+                .collect();
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::Call {
+                    target,
+                    args: crate::model::call_args(args),
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        name @ ("cast_ptr_to_adr" | "cast_adr_to_ptr" | "cast_primitive" | "cast_bool_to_int"
+        | "cast_char_to_int" | "cast_int_to_char") => {
+            let operand = effect_materialize(out, block, &op.args[0]);
+            let result = effect_expect_var(&op.result);
+            let _ = name;
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand,
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "bool_not") => {
+            let operand = effect_materialize(out, block, &op.args[0]);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        name @ ("int_add" | "int_sub" | "int_mul" | "int_and" | "int_or" | "int_xor"
+        | "int_rshift" | "int_lshift" | "int_lt" | "int_le" | "int_eq" | "int_ne"
+        | "int_gt" | "int_ge" | "adr_add" | "char_eq" | "char_ne" | "unichar_eq"
+        | "unichar_ne") => {
+            let lhs = effect_materialize(out, block, &op.args[0]);
+            let rhs = effect_materialize(out, block, &op.args[1]);
+            let result = effect_expect_var(&op.result);
+            let bare = match name {
+                "adr_add" => "add",
+                _ => name.split_once('_').map(|(_, rest)| rest).unwrap_or(name),
+            };
+            out.push_op_with_result_var(
+                block,
+                OpKind::BinOp {
+                    op: bare.to_string(),
+                    lhs,
+                    rhs,
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        other => panic!("effect_graph_from_rtyped_helper: unsupported opname {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

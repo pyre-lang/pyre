@@ -7,17 +7,24 @@
 //! Shape matches [`super::alloc_and_set::register`]: bind fnaddr →
 //! `register_function_graph` → `add_candidate_graph_if_look_inside`.
 //!
-//! `_get_raw_address_buf_from_string` is the same residual: its body
-//! (`objectmodel.compute_unique_id`, `str2charp`, `raw_copies`) is not
-//! expressed as ops. The translator graph `direct_call`s a
-//! `functionptr_with_external_name` (`llexternal` sibling); this module
-//! binds the native fnaddr.
+//! `_get_raw_address_buf_from_string` (`rffi.py`) has no hint. Register
+//! its graph for effect analysis only: `CallControl.find_all_graphs`
+//! never makes it a candidate, because the only caller is the refused
+//! `get_raw_address_of_string` graph.
+//!
+//! Effect analysis walks the translator helper graph
+//! (`build_ll_get_raw_address_of_string_helper_graph`): `gc_can_move`,
+//! `gc_move_out_of_nursery`, NUL `setarrayitem` on `STR.chars`, and a
+//! `direct_call` to `_get_raw_address_buf_from_string`. Native LLBC of
+//! the majit-rlib body would hide those as `RawStore` / `HashMap` and
+//! miss `CollectAnalyzer`.
 
-use crate::codewriter::call::CallControl;
+use crate::codewriter::call::{CallControl, effect_graph_from_rtyped_helper};
 use crate::flowspace::model::Variable;
 use crate::model::{CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 use crate::runtime_names::shims;
+use crate::translator::rtyper::lltypesystem::rffi::build_ll_get_raw_address_of_string_helper_graph;
 
 /// Rtyper helper name (`lowlevel_helper_function_with_builder`).
 pub const LL_GET_RAW_ADDRESS_OF_STRING: &str = "ll_get_raw_address_of_string";
@@ -64,10 +71,19 @@ fn register(cc: &mut CallControl) {
     bind_fnaddr(cc, LL_GET_RAW_ADDRESS_OF_STRING, NATIVE_LEAF);
     bind_fnaddr(cc, shims::GET_RAW_ADDRESS_OF_STRING, NATIVE_LEAF);
     bind_fnaddr(cc, BUF_LEAF, BUF_LEAF);
+    // MiniMark `move_out_of_nursery` / `_find_shadow` after
+    // `gct_gc_move_out_of_nursery`. The LLOp itself is not
+    // `canmallocgc`; the transformed `direct_call` allocates the
+    // shadow. `mark_canmallocgc` is the graph-less stand-in
+    // (`collectanalyze.py analyze_simple_operation`).
+    cc.mark_canmallocgc(CallPath::from_segments([
+        "majit_gc",
+        "gc_move_out_of_nursery",
+    ]));
+    register_buf_effect_graph(cc);
     register_residual_graph(cc, NATIVE_LEAF);
     register_residual_graph(cc, LL_GET_RAW_ADDRESS_OF_STRING);
     register_residual_graph(cc, shims::GET_RAW_ADDRESS_OF_STRING);
-    register_residual_graph(cc, BUF_LEAF);
 }
 
 fn bind_fnaddr(cc: &mut CallControl, dest_leaf: &str, src_leaf: &str) {
@@ -79,6 +95,20 @@ fn bind_fnaddr(cc: &mut CallControl, dest_leaf: &str, src_leaf: &str) {
     if cc.lookup_function_fnaddr(&src).is_some() {
         cc.alias_function_fnaddr(dest, &src);
     }
+}
+
+/// `_get_raw_address_buf_from_string` (`rffi.py`) has no
+/// `@jit.dont_look_inside`. `CallControl.find_all_graphs` never makes it
+/// a candidate: the only caller is the refused `get_raw_address_of_string`
+/// graph. Register the graph for `getcalldescr` analyzers without a
+/// tracing prohibition and without `add_candidate_graph_if_look_inside`.
+fn register_buf_effect_graph(cc: &mut CallControl) {
+    let path = CallPath::from_segments([BUF_LEAF]);
+    if cc.has_function_graph(&path) {
+        return;
+    }
+    let graph = residual_buf_from_string_graph();
+    cc.register_function_graph(path, graph);
 }
 
 fn register_residual_graph(cc: &mut CallControl, name: &str) {
@@ -95,7 +125,17 @@ fn register_residual_graph(cc: &mut CallControl, name: &str) {
 /// Body is never traced (`dont_look_inside`). One STR argument, CCHARP
 /// residual ABI (integer bank).
 fn residual_helper_graph(name: &str) -> FunctionGraph {
-    let mut graph = FunctionGraph::new(name);
+    let py = build_ll_get_raw_address_of_string_helper_graph(name)
+        .expect("ll_get_raw_address_of_string helper graph");
+    effect_graph_from_rtyped_helper(&py.graph.borrow())
+}
+
+/// `_get_raw_address_buf_from_string` (`rffi.py`): dict insert into
+/// `_fq_addr_from_string.raw_copies` plus `str2charp`. The translator
+/// graph is a `functionptr_with_external_name`; the dict resize is a
+/// GC malloc (`CollectAnalyzer` / `RaiseAnalyzer` MemoryError).
+fn residual_buf_from_string_graph() -> FunctionGraph {
+    let mut graph = FunctionGraph::new(BUF_LEAF);
     let start = graph.startblock;
     let s = graph.alloc_value_var_with_type(ConcreteType::GcRef);
     graph.push_inputarg_var(start, s.clone());
@@ -108,10 +148,18 @@ fn residual_helper_graph(name: &str) -> FunctionGraph {
         },
         s,
     );
+    let dict = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+    graph.push_op_with_result_var(
+        start,
+        OpKind::New {
+            owner: "raw_copies".to_string(),
+        },
+        dict,
+    );
     let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
     graph.push_op_with_result_var(start, OpKind::ConstInt(0), result.clone());
     graph.set_return(start, Some(result));
-    graph
+    graph.with_return_type("i64")
 }
 
 #[cfg(test)]
@@ -177,12 +225,121 @@ mod tests {
     }
 
     #[test]
-    fn get_raw_address_buf_from_string_is_residual_with_real_fnaddr() {
+    fn get_raw_address_buf_from_string_is_effect_graph_not_a_candidate() {
         let cc = mint();
-        assert_residual(&cc, BUF_LEAF, 0x2000);
+        let path = CallPath::from_segments([BUF_LEAF]);
+        assert!(cc.has_function_graph(&path), "missing graph {BUF_LEAF}");
+        assert!(
+            !cc.is_candidate(&path),
+            "find_all_graphs never candidates {BUF_LEAF}"
+        );
+        let graph = cc
+            .function_graphs()
+            .get(&path)
+            .unwrap_or_else(|| panic!("missing helper {BUF_LEAF}"));
+        assert!(
+            !graph.hints.iter().any(|h| h == "dont_look_inside"),
+            "{BUF_LEAF} has no dont_look_inside hint"
+        );
+        assert_eq!(graph.func.jit_look_inside, None);
         assert_eq!(
             cc.lookup_function_fnaddr(&native_fnaddr_key(BUF_LEAF)),
             Some(0x2000)
+        );
+    }
+
+    fn calldescr(cc: &CallControl, name: &str) -> crate::codewriter::call::CallDescriptor {
+        use crate::codewriter::call::AnalysisCache;
+        use majit_ir::descr::OopSpecIndex;
+        use majit_ir::value::Type;
+        let mut cache = AnalysisCache::default();
+        cc.getcalldescr(
+            &call_op(name),
+            vec![Type::Ref],
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        )
+    }
+
+    /// `getcalldescr` (`call.py`) on a `dont_look_inside` helper that
+    /// `gc_move_out_of_nursery`s, writes the NUL, and may take the
+    /// buffer-cache path: `EF_CAN_RAISE` and `can_collect`.
+    #[test]
+    fn get_raw_address_of_string_calldescr_collects_and_can_raise() {
+        use majit_ir::descr::ExtraEffect;
+        let cc = mint();
+        for name in [
+            LL_GET_RAW_ADDRESS_OF_STRING,
+            shims::GET_RAW_ADDRESS_OF_STRING,
+            NATIVE_LEAF,
+        ] {
+            let descr = calldescr(&cc, name);
+            assert_eq!(
+                descr.extra_info.extraeffect,
+                ExtraEffect::CanRaise,
+                "{name}"
+            );
+            assert!(descr.extra_info.can_collect, "{name}");
+            let graph = cc
+                .function_graphs()
+                .get(&CallPath::from_segments([name]))
+                .unwrap_or_else(|| panic!("missing helper {name}"));
+            assert!(
+                graph
+                    .iter_block_ops()
+                    .any(|(_, op)| matches!(op.kind, OpKind::ArrayWrite { .. })),
+                "{name} NUL is setarrayitem: {:?}",
+                graph
+                    .iter_block_ops()
+                    .map(|(_, op)| format!("{:?}", op.kind))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                graph.iter_block_ops().any(|(_, op)| matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. }
+                        if matches!(
+                            target,
+                            CallTarget::FunctionPath { segments, .. }
+                                if segments == &["majit_gc".to_string(), "gc_move_out_of_nursery".to_string()]
+                        )
+                )),
+                "{name} calls gc_move_out_of_nursery"
+            );
+            assert!(
+                graph.iter_block_ops().any(|(_, op)| matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. }
+                        if matches!(
+                            target,
+                            CallTarget::FunctionPath { segments, .. }
+                                if segments == &[BUF_LEAF.to_string()]
+                        )
+                )),
+                "{name} calls {BUF_LEAF}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_raw_address_buf_from_string_calldescr_collects_and_can_raise() {
+        use majit_ir::descr::ExtraEffect;
+        let cc = mint();
+        let descr = calldescr(&cc, BUF_LEAF);
+        assert_eq!(descr.extra_info.extraeffect, ExtraEffect::CanRaise);
+        assert!(descr.extra_info.can_collect);
+        let graph = cc
+            .function_graphs()
+            .get(&CallPath::from_segments([BUF_LEAF]))
+            .expect("buf helper graph");
+        assert!(
+            graph
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::New { .. })),
+            "raw_copies insert is a GC malloc"
         );
     }
 }

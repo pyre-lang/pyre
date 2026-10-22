@@ -42,6 +42,13 @@ fn rewire_one(graph: &mut FunctionGraph, site: &ResultAsRefSite) -> Result<(), S
                 .any(|op| op.result.as_ref() == Some(&site.result_var))
         })
         .ok_or("Result::as_ref producer missing")?;
+    // `tyref_to_value_type` paints split-eligible Result as
+    // `Ref(Some(root))` (`bookkeeper.py` `getuniqueclassdef`), so
+    // `lower_call` recasts the as_ref result (`result_narrow_root`).
+    // The recast is identity (`cast_pointer`); this rewrite needs the
+    // residual call last. Same collapse the checked-arith Option path
+    // uses (`collapse_trailing_recasts_onto`).
+    crate::front::result_exc::collapse_trailing_recasts_onto(graph, a, &site.result_var);
     let Some(op) = graph.blocks[a].operations.last() else {
         return Err("empty block".into());
     };
@@ -192,6 +199,79 @@ mod tests {
                     && *ty == site.payload_types[tag])));
             assert_eq!(block.exits[0].target, continuation);
             assert_eq!(block.exits[0].args.len(), 2);
+        }
+    }
+
+    #[test]
+    fn borrowed_result_rewrites_through_instantiation_recast() {
+        // `tyref_to_value_type` paints split-eligible Result as
+        // `Ref(Some(root))`, so `lower_call` recasts the as_ref dest
+        // (`result_narrow_root`). The Option sibling is
+        // `rewrite_finds_checked_add_behind_instantiation_recast`.
+        let mut graph = FunctionGraph::new("borrow_result_recast");
+        let receiver = graph.alloc_value_var();
+        let live = graph.alloc_value_var();
+        graph.block_mut(graph.startblock).inputargs = vec![receiver.clone(), live.clone()];
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::method("as_ref", Some("Result".into())),
+                    args: crate::model::call_args(vec![receiver]),
+                    result_ty: ValueType::Ref(Some("Result<i64,String>".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let recast = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::cast_instance_call("Result<i64,String>", result.clone()),
+                true,
+            )
+            .unwrap();
+        let (continuation, inputs) = graph.create_block_with_arg_vars(2);
+        let start = graph.startblock;
+        graph.set_goto(start, continuation, vec![recast, live]);
+        graph.set_return(continuation, Some(inputs[0].clone()));
+        let site = ResultAsRefSite {
+            result_var: result,
+            receiver_owner: "Result<i64,String>".into(),
+            receiver_variants: [
+                "Result<i64,String>::Ok".into(),
+                "Result<i64,String>::Err".into(),
+            ],
+            result_owner: "Result<&i64,&String>".into(),
+            result_variants: [
+                "Result<&i64,&String>::Ok".into(),
+                "Result<&i64,&String>::Err".into(),
+            ],
+            payload_types: [ValueType::Int, ValueType::Str],
+        };
+        assert_eq!(rewire_result_as_ref_sites(&mut graph, &[site.clone()]), 1);
+        let start_block = graph.block(start);
+        assert!(
+            start_block
+                .operations
+                .iter()
+                .all(|op| crate::model::cast_instance_root(&op.kind).is_none()),
+            "the Result classdef recast is collapsed"
+        );
+        assert!(start_block.operations.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+        )));
+        for edge in &start_block.exits {
+            let tag = match edge.exitcase {
+                Some(crate::model::ExitCase::Bool(value)) => usize::from(value),
+                _ => panic!("as_ref must have boolean branch edges"),
+            };
+            let block = graph.block(edge.target);
+            assert!(block.operations.iter().any(|op| matches!(&op.kind,
+                OpKind::FieldRead { field, ty, .. }
+                if field.owner_root.as_deref() == Some(site.receiver_variants[tag].as_str())
+                    && *ty == site.payload_types[tag])));
+            assert_eq!(block.exits[0].target, continuation);
         }
     }
 }

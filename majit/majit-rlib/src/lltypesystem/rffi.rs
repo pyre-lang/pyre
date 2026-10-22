@@ -14,10 +14,11 @@
 use parking_lot::Mutex;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, OnceLock};
 
 use super::rstr::{STR_CHARS_OFFSET, StrHeader, str_as_bytes};
-use crate::rffi::str2charp;
+use crate::rffi::{free_charp, str2charp};
 
 /// Alignment of every block [`raw_malloc_varsize_char`] returns, and the
 /// header word [`raw_free`] reads the size back from.
@@ -94,12 +95,52 @@ pub fn raw_write_f64(data: usize, value: f64) {
     unsafe { (data as *mut f64).write(value) }
 }
 
-/// `_StrFinalizerQueue` (`rffi.py`). `raw_copies` is the process-global
-/// `{unique_id: CCHARP}` dict. Addresses are stored as `usize` so the
-/// dict is `Send` (`CCHARP` is a raw pointer).
+/// `_StrFinalizerQueue` (`rffi.py`). `Class = None` so the queue holds
+/// GCREFs. `raw_copies` is `{compute_unique_id: CCHARP}`; addresses are
+/// `usize` so the dict is `Send`.
 #[allow(non_snake_case)]
 struct _StrFinalizerQueue {
     raw_copies: HashMap<usize, usize>,
+}
+
+impl _StrFinalizerQueue {
+    /// framework.py `get_finalizer_queue_index`, cached like the
+    /// translation-time constant. This queue's `finalizer_trigger` is the
+    /// identity key.
+    fn fq_index() -> usize {
+        static INDEX: OnceLock<usize> = OnceLock::new();
+        *INDEX.get_or_init(|| majit_gc::gc_get_finalizer_queue_index(finalizer_trigger))
+    }
+
+    fn next_dead() -> Option<majit_ir::GcRef> {
+        majit_gc::gc_fq_next_dead(Self::fq_index())
+    }
+
+    fn register_finalizer(gcptr: majit_ir::GcRef) {
+        if !majit_gc::current_thread_gc_available() || !majit_gc::rgil::am_i_holding_the_gil() {
+            return;
+        }
+        majit_gc::gc_register_finalizer(Self::fq_index(), gcptr, finalizer_trigger);
+    }
+
+    fn drain() {
+        loop {
+            let Some(gcptr) = Self::next_dead() else {
+                break;
+            };
+            if gcptr.is_null() {
+                break;
+            }
+            let key = majit_gc::gc_id_or_identityhash(gcptr.0);
+            let ptr = {
+                let mut fq = _fq_addr_from_string.lock();
+                fq.raw_copies.remove(&key).unwrap_or(0)
+            };
+            if ptr != 0 {
+                unsafe { free_charp(ptr as *mut u8, false) };
+            }
+        }
+    }
 }
 
 /// `_fq_addr_from_string = _StrFinalizerQueue()` (`rffi.py`).
@@ -110,18 +151,34 @@ static _fq_addr_from_string: LazyLock<Mutex<_StrFinalizerQueue>> = LazyLock::new
     })
 });
 
+/// `execute_finalizer_triggers` runs inside `gc_op`; `gc_fq_next_dead` is
+/// another `gc_op` (`ReentryGuard`). Set here, drained once `gc_op` returns.
+static STR_FQ_DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// `_StrFinalizerQueue.finalizer_trigger` (`rffi.py`).
+fn finalizer_trigger() {
+    if majit_gc::gc_sync::in_gc_op() {
+        STR_FQ_DRAIN_PENDING.store(true, Ordering::Release);
+        return;
+    }
+    STR_FQ_DRAIN_PENDING.store(false, Ordering::Release);
+    _StrFinalizerQueue::drain();
+}
+
+fn drain_str_fq_if_pending() {
+    if STR_FQ_DRAIN_PENDING.load(Ordering::Acquire) {
+        finalizer_trigger();
+    }
+}
+
 /// `_get_raw_address_buf_from_string` (`rffi.py`). Cache key is
 /// `objectmodel.compute_unique_id` via `majit_gc::gc_id_or_identityhash`.
 /// Returns `CCHARP` (`*mut u8`).
 ///
-/// `_StrFinalizerQueue.register_finalizer` is not called:
-/// `gc_register_finalizer` assigns `fq_index` sequentially from 0
-/// (`register_finalizer` asserts `fq_index <= handlers.len()`), so a raw
-/// queue cannot pick an independent index. `_StrFinalizerQueue.finalizer_trigger`
-/// is therefore not installed; `raw_copies` live until process exit.
+/// Upstream has no JIT hint; the only caller is `get_raw_address_of_string`.
 #[allow(non_snake_case)]
-#[majit_macros::dont_look_inside]
 pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
+    drain_str_fq_if_pending();
     let key = majit_gc::gc_id_or_identityhash(string as usize);
     let mut fq = _fq_addr_from_string.lock();
     if let Some(&ptr) = fq.raw_copies.get(&key) {
@@ -129,7 +186,40 @@ pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
     }
     let ptr = unsafe { str2charp(str_as_bytes(string as *const u8), false) };
     fq.raw_copies.insert(key, ptr as usize);
+    drop(fq);
+    _StrFinalizerQueue::register_finalizer(majit_ir::GcRef(string as usize));
     ptr
+}
+
+/// Residual `HELPER_FNADDRS` row (`rffi_expand` `helper_fnaddr_registration`).
+/// The leaf has no `@jit.dont_look_inside`; this publishes the address only.
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static __MAJIT_HELPER_FNADDR__get_raw_address_buf_from_string:
+    majit_ir::helper_fnaddr::HelperFnAddr = majit_ir::helper_fnaddr::HelperFnAddr::new(
+    ::core::concat!(
+        ::core::module_path!(),
+        "::",
+        stringify!(_get_raw_address_buf_from_string)
+    ),
+    _get_raw_address_buf_from_string as *const (),
+    1,
+);
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn __majit_register_helper_fnaddr__get_raw_address_buf_from_string() {
+    majit_ir::helper_fnaddr::register(
+        ::core::concat!(
+            ::core::module_path!(),
+            "::",
+            stringify!(_get_raw_address_buf_from_string)
+        ),
+        _get_raw_address_buf_from_string as *const (),
+        1,
+    );
 }
 
 /// `rffi.get_raw_address_of_string` (`rffi.py`), the translated branch.
@@ -224,6 +314,70 @@ mod tests {
             assert_eq!(std::slice::from_raw_parts(first, text.len()), text);
             assert_eq!(*first.add(text.len()), 0);
         }
+    }
+
+    fn with_host_gc_mutator<R>(f: impl FnOnce() -> R) -> R {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            majit_gc::gc_sync::store_singleton(Box::new(majit_gc::collector::MiniMarkGC::new()));
+        });
+        majit_gc::shadow_stack::register_mutator();
+        majit_gc::gc_sync::register_thread();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        majit_gc::gc_sync::gc_thread_die();
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn write_str_payload(payload: *mut u8, text: &[u8]) {
+        unsafe {
+            let strp = payload.cast::<StrHeader>();
+            (*strp).hash = 0;
+            (*strp).length = text.len();
+            std::ptr::copy_nonoverlapping(text.as_ptr(), payload.add(STR_CHARS_OFFSET), text.len());
+            *payload.add(STR_CHARS_OFFSET + text.len()) = 0;
+        }
+    }
+
+    /// Host MiniMark: copy, drop the last root, collect, drain
+    /// `_StrFinalizerQueue.finalizer_trigger`, the raw copy is gone.
+    #[test]
+    fn get_raw_address_buf_from_string_finalizer_frees_raw_copy() {
+        with_host_gc_mutator(|| {
+            let text = b"fq-free-me";
+            let payload = STR_CHARS_OFFSET + text.len() + 1;
+            let mut root = majit_gc::gc_sync::gc_op(|gc| {
+                let tid = gc.register_type(majit_gc::TypeInfo::simple(payload));
+                gc.alloc_with_type(tid, payload)
+            });
+            majit_gc::gc_sync::gc_op(|gc| unsafe { gc.roots.add(&mut root) });
+            majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
+            write_str_payload(root.0 as *mut u8, text);
+
+            let copy = _get_raw_address_buf_from_string(root.0 as *mut u8);
+            let key = majit_gc::gc_id_or_identityhash(root.0);
+            unsafe {
+                assert_ne!(copy, (root.0 as *mut u8).add(STR_CHARS_OFFSET));
+                assert_eq!(std::slice::from_raw_parts(copy, text.len()), text);
+                assert_eq!(*copy.add(text.len()), 0);
+            }
+            {
+                let fq = _fq_addr_from_string.lock();
+                assert_eq!(fq.raw_copies.get(&key).copied(), Some(copy as usize));
+            }
+
+            majit_gc::gc_sync::gc_op(|gc| gc.roots.remove(&mut root));
+            majit_gc::gc_sync::gc_op(|gc| gc.do_collect_oldgen_nonmoving());
+            finalizer_trigger();
+
+            {
+                let fq = _fq_addr_from_string.lock();
+                assert!(!fq.raw_copies.contains_key(&key));
+            }
+            assert!(majit_gc::gc_fq_next_dead(_StrFinalizerQueue::fq_index()).is_none());
+        });
     }
 
     #[cfg(not(target_arch = "wasm32"))]

@@ -44,22 +44,23 @@
 
 use std::sync::LazyLock;
 
+use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
-    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
-    SpaceOperation, Variable,
+    Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, GraphKey,
+    GraphRef, Hlvalue, Link, SpaceOperation, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, _ptr_obj, Array, ForwardReference, FuncType, GcKind, LowLevelType, LowLevelValue,
-    MallocFlavor, Ptr, PtrTarget, Struct, functionptr, malloc,
+    _func, _ptr, _ptr_obj, Array, ForwardReference, GcKind, LowLevelType, LowLevelValue,
+    MallocFlavor, Ptr, PtrTarget, Struct, malloc,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, HighLevelOp, constant_with_lltype, exception_args, helper_pygraph_from_graph,
-    variable_with_lltype, void_field_const,
+    ConvertedTo, HighLevelOp, RPythonTyper, constant_with_lltype, exception_args,
+    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
 
 /// RPython `STR = GcForwardReference()` resolved via
@@ -1285,12 +1286,21 @@ pub(crate) fn build_ll_utf8next_helper_graph(
 ///     raise OutOfRange(code)
 /// ```
 ///
-/// `allow_surrogates=True` omits the D800–DFFF check. `assert code >= 0`
-/// is `int_ge` + `debug_assert` (`removeassert.kill_assertion_link`; same
-/// form as `ll_newlist_hint` in `rlist.build_ll_newlist_helper_graph_inner`).
+/// The only rtyper call site is `unichr_as_utf8(code, allow_surrogates=True)`
+/// (`rtype_builtin_unichr_as_utf8` / front `__majit_unichr_as_utf8`), so
+/// the `0xD800 <= code <= 0xDfff` `OutOfRange` branch is folded as that
+/// constant-True specialization. `assert code >= 0` is `int_ge` +
+/// `debug_assert` (`removeassert.kill_assertion_link`; same form as
+/// `ll_newlist_hint` in `rlist.build_ll_newlist_helper_graph_inner`).
 /// `code = r_uint(code)` is `cast_int_to_uint`; every range test is `uint_le`
 /// (`rint.rtype_compare_template` with `unsigned_repr` prefix `uint_`).
-pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
+/// `raise OutOfRange(code)` is `InstanceRepr.new_instance` then
+/// `InstanceRepr.setfield` of `code` (`OutOfRange.__init__` /
+/// `rclass.py`).
+pub(crate) fn build_ll_unichr_as_utf8_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+) -> Result<PyGraph, TyperError> {
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
 
     let chars_array_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
@@ -1397,14 +1407,9 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
         Hlvalue::Variable(return_var),
     );
     // `unichr_as_utf8` raises `OutOfRange(code)` (`rutf8.OutOfRange`).
-    // Synthesized helpers only have `exception_args` (`rtyper.rs`), which
-    // looks up `HOST_ENV.lookup_exception_class` — builtin classes; that
-    // method has no rlib class registry. `ExceptionData.get_standard_ll_exc_instance_by_class`
-    // rejects anything outside `standardexceptions`. Minting `OutOfRange`
-    // would need `Bookkeeper::getuniqueclassdef` on an interned class plus
-    // instance `setfield` of `code`; neither exists for synthesized helpers.
-    // The raise edge is kept; the class is ValueError until that lands.
-    let exc_args = exception_args("ValueError")?;
+    // The raising block is `InstanceRepr.new_instance` plus `setfield`
+    // of `code`; the except link is `(OutOfRange vtable, instance)`
+    // (`ClassRepr.convert_desc` / `rutf8.py`).
 
     // `assert code >= 0` (`unichr_as_utf8`). Python `assert` becomes
     // `debug_assert` in `removeassert.kill_assertion_link`; same `int_ge`
@@ -1518,14 +1523,20 @@ pub(crate) fn build_ll_unichr_as_utf8_helper_graph(name: &str) -> Result<PyGraph
     );
     let alloc4_code = variable_with_lltype("code", LowLevelType::Unsigned);
     let alloc4 = Block::shared(vec![Hlvalue::Variable(alloc4_code.clone())]);
+    let raise_code = variable_with_lltype("code", LowLevelType::Unsigned);
+    let raise_block = Block::shared(vec![Hlvalue::Variable(raise_code.clone())]);
     switch_bool(
         &four,
         is_four,
         vec![Hlvalue::Variable(four_code.clone())],
         alloc4.clone(),
-        exc_args,
-        graph.exceptblock.clone(),
+        vec![Hlvalue::Variable(four_code)],
+        raise_block.clone(),
     );
+    let exc_args = crate::rlib::rutf8::raise_out_of_range_args(rtyper, &raise_block, &raise_code)?;
+    raise_block.closeblock(vec![
+        Link::new(exc_args, Some(graph.exceptblock.clone()), None).into_ref(),
+    ]);
 
     let malloc_str = |block: &BlockRef, n: i64| -> (Variable, Variable) {
         let result = variable_with_lltype("s", STRPTR.clone());
@@ -8351,19 +8362,70 @@ fn build_ll_findlike_char_helper_graph(
     ))
 }
 
-fn named_helper_funcptr_constant(
+/// `HighLevelOp.gendirectcall` / `RPythonTyper.getcallable`: annotate the
+/// callee graph (`lowlevel_helper_function_with_builder` is the
+/// `MixLevelHelperAnnotator` / `cachedgraph` stand-in) and build the
+/// funcptr from that graph so `funcobj.graph` is set.
+fn cached_helper_funcptr(
+    rtyper: &RPythonTyper,
     name: &str,
     args: Vec<LowLevelType>,
     result: LowLevelType,
-) -> Hlvalue {
-    let ft = FuncType { args, result };
-    let funcptr = functionptr(ft.clone(), name, None, Some(name.to_string()));
-    constant_with_lltype(
-        ConstValue::LLPtr(Box::new(funcptr)),
-        LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Func(ft),
-        })),
-    )
+    builder: impl FnOnce(&RPythonTyper) -> Result<PyGraph, TyperError>,
+) -> Result<Hlvalue, TyperError> {
+    let name_owned = name.to_string();
+    let helper = rtyper.lowlevel_helper_function_with_builder(
+        name_owned,
+        args,
+        result,
+        move |rtyper, _args, _result| builder(rtyper),
+    )?;
+    Ok(Hlvalue::Constant(sub_helper_funcptr_constant(
+        rtyper, &helper,
+    )?))
+}
+
+/// The `_func` object of a `direct_call` callee constant.
+pub(crate) fn funcobj_from_funcptr_constant(hlv: &Hlvalue) -> Option<_func> {
+    let Hlvalue::Constant(c) = hlv else {
+        return None;
+    };
+    let ConstValue::LLPtr(ptr) = &c.value else {
+        return None;
+    };
+    match ptr._obj0_value() {
+        Ok(Some(_ptr_obj::Func(func))) => Some(func),
+        _ => None,
+    }
+}
+
+/// Every `direct_call` callee funcobj in `graph`.
+pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
+    graph
+        .iterblocks()
+        .into_iter()
+        .flat_map(|block| {
+            block
+                .borrow()
+                .operations
+                .iter()
+                .filter(|op| op.opname == "direct_call")
+                .filter_map(|op| op.args.first().and_then(funcobj_from_funcptr_constant))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// `record_extra_call_by_graph_id`: the live graph `funcobj.graph` names
+/// lives on `translator.graphs`.
+pub(crate) fn graph_ref_for_funcptr_id(rtyper: &RPythonTyper, graph_id: usize) -> Option<GraphRef> {
+    let ann = rtyper.annotator.upgrade()?;
+    ann.translator
+        .graphs
+        .borrow()
+        .iter()
+        .find(|graph| GraphKey::of(graph).as_usize() == graph_id)
+        .cloned()
 }
 
 fn require_str_ptr(ptr_lltype: &LowLevelType, helper: &str) -> Result<(), TyperError> {
@@ -8379,12 +8441,12 @@ fn require_str_ptr(ptr_lltype: &LowLevelType, helper: &str) -> Result<(), TyperE
             chars_ptr.TO
         )));
     };
-    if arr.OF != LowLevelType::Char {
-        return Err(TyperError::message(format!(
-            "{helper}: Ptr(UNICODE) requires rstring._search_normal, which is unported as a graph"
-        )));
+    match arr.OF {
+        LowLevelType::Char | LowLevelType::UniChar => Ok(()),
+        ref other => Err(TyperError::message(format!(
+            "{helper} expects Ptr(Array(Char|UniChar)), got {other:?}"
+        ))),
     }
-    Ok(())
 }
 
 fn emit_record_exact_value_and_return(
@@ -8440,9 +8502,26 @@ fn emit_record_exact_value_and_return(
 ///     return res
 /// ```
 ///
-/// STR only. UNICODE would take `_search`'s `_search_normal` arm, which
-/// is unported as a graph.
+/// `Ptr(STR)` and `Ptr(UNICODE)`. UNICODE `ll_search` takes
+/// `_search_normal` (look-inside); STR takes `_search_elidable`.
+///
+/// Callee funcptrs are `getcallable` of the helper graphs
+/// (`HighLevelOp.gendirectcall`), so `funcobj.graph` is set. Callers
+/// that keep `rtyper` alive (`build_ll_find_helper_graph_on`) can look
+/// those graphs up on `translator.graphs`.
 pub(crate) fn build_ll_find_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let rtyper = RPythonTyper::new(&ann);
+    build_ll_find_helper_graph_on(&rtyper, name, ptr_lltype)
+}
+
+/// [`build_ll_find_helper_graph`] against a live rtyper so callee graphs
+/// stay on `translator.graphs` for `funcobj.graph` lookup.
+pub(crate) fn build_ll_find_helper_graph_on(
+    rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -8736,7 +8815,7 @@ pub(crate) fn build_ll_find_helper_graph(
         .into_ref(),
     ]);
 
-    let chars2_char = variable_with_lltype("chars2", chars_array_ptr_lltype);
+    let chars2_char = variable_with_lltype("chars2", chars_array_ptr_lltype.clone());
     block_find_char
         .borrow_mut()
         .operations
@@ -8745,7 +8824,22 @@ pub(crate) fn build_ll_find_helper_graph(
             vec![Hlvalue::Variable(s2_for_char.clone()), chars_field_const()],
             Hlvalue::Variable(chars2_char.clone()),
         ));
-    let ch = variable_with_lltype("ch", LowLevelType::Char);
+    let elem_lltype = match &chars_array_ptr_lltype {
+        LowLevelType::Ptr(chars_ptr) => match &chars_ptr.TO {
+            PtrTarget::Array(arr) => arr.OF.clone(),
+            other => {
+                return Err(TyperError::message(format!(
+                    "ll_find chars Ptr.TO must be Array, got {other:?}"
+                )));
+            }
+        },
+        other => {
+            return Err(TyperError::message(format!(
+                "ll_find chars must be Ptr(Array), got {other:?}"
+            )));
+        }
+    };
+    let ch = variable_with_lltype("ch", elem_lltype.clone());
     block_find_char
         .borrow_mut()
         .operations
@@ -8754,16 +8848,21 @@ pub(crate) fn build_ll_find_helper_graph(
             vec![Hlvalue::Variable(chars2_char), signed_const(0)],
             Hlvalue::Variable(ch.clone()),
         ));
-    let find_char_ptr = named_helper_funcptr_constant(
+    let find_char_ptr = cached_helper_funcptr(
+        rtyper,
         "ll_find_char",
         vec![
             ptr_lltype.clone(),
-            LowLevelType::Char,
+            elem_lltype,
             LowLevelType::Signed,
             LowLevelType::Signed,
         ],
         LowLevelType::Signed,
-    );
+        {
+            let ptr = ptr_lltype.clone();
+            move |_rtyper| build_ll_find_char_helper_graph("ll_find_char", ptr)
+        },
+    )?;
     let res_char = variable_with_lltype("res", LowLevelType::Signed);
     block_find_char
         .borrow_mut()
@@ -8788,17 +8887,22 @@ pub(crate) fn build_ll_find_helper_graph(
 
     // `rlib/rstring.py` `SEARCH_FIND`. Named constant: `majit_rlib::rstring::SEARCH_FIND`.
     let search_find = signed_const(1);
-    let search_ptr = named_helper_funcptr_constant(
+    let search_ptr = cached_helper_funcptr(
+        rtyper,
         "ll_search",
         vec![
             ptr_lltype.clone(),
-            ptr_lltype,
+            ptr_lltype.clone(),
             LowLevelType::Signed,
             LowLevelType::Signed,
             LowLevelType::Signed,
         ],
         LowLevelType::Signed,
-    );
+        {
+            let ptr = ptr_lltype;
+            move |rtyper| build_ll_search_helper_graph_on(rtyper, "ll_search", ptr)
+        },
+    )?;
     let res_search = variable_with_lltype("res", LowLevelType::Signed);
     block_search
         .borrow_mut()
@@ -8839,17 +8943,29 @@ pub(crate) fn build_ll_find_helper_graph(
     ))
 }
 
-/// Synthesise `LLHelpers.ll_search` (`rstr.py`) for STR.
+/// Synthesise `LLHelpers.ll_search` (`rstr.py`).
 ///
-/// `hlstr` is the identity on a low-level STR pointer. `_search` dispatches
-/// on `isinstance(value, str)`, a translation-time constant for STR, so the
-/// body is `direct_call _search_elidable(s1, s2, start, end, mode)`.
-/// UNICODE would take `_search_normal`, which is unported as a graph.
+/// `hlstr` / `hlunicode` are identity on the low-level pointer. `_search`
+/// dispatches on `isinstance(value, str)` at translation time: STR is
+/// `direct_call _search_elidable`; UNICODE is `direct_call _search_normal`.
 pub(crate) fn build_ll_search_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let rtyper = RPythonTyper::new(&ann);
+    build_ll_search_helper_graph_on(&rtyper, name, ptr_lltype)
+}
+
+/// [`build_ll_search_helper_graph`] against a live rtyper so the
+/// callee graph stays on `translator.graphs`.
+pub(crate) fn build_ll_search_helper_graph_on(
+    rtyper: &RPythonTyper,
+    name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
     require_str_ptr(&ptr_lltype, "ll_search")?;
+    let kind = crate::rlib::rstring::StringKind::from_ptr(ptr_lltype.clone())?;
 
     let s1 = variable_with_lltype("s1", ptr_lltype.clone());
     let s2 = variable_with_lltype("s2", ptr_lltype.clone());
@@ -8870,22 +8986,65 @@ pub(crate) fn build_ll_search_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    let elidable_ptr = named_helper_funcptr_constant(
-        "_search_elidable",
-        vec![
-            ptr_lltype.clone(),
-            ptr_lltype,
-            LowLevelType::Signed,
-            LowLevelType::Signed,
-            LowLevelType::Signed,
-        ],
-        LowLevelType::Signed,
-    );
+    let (callee_name, callee_ptr) = if kind.is_unicode() {
+        (
+            "_search_normal",
+            cached_helper_funcptr(
+                rtyper,
+                "_search_normal",
+                vec![
+                    ptr_lltype.clone(),
+                    ptr_lltype.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Signed,
+                {
+                    let ptr = ptr_lltype;
+                    move |rtyper| {
+                        crate::rlib::rstring::build_search_normal_helper_graph(
+                            rtyper,
+                            "_search_normal",
+                            ptr,
+                        )
+                    }
+                },
+            )?,
+        )
+    } else {
+        (
+            "_search_elidable",
+            cached_helper_funcptr(
+                rtyper,
+                "_search_elidable",
+                vec![
+                    ptr_lltype.clone(),
+                    ptr_lltype.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Signed,
+                {
+                    let ptr = ptr_lltype;
+                    move |rtyper| {
+                        crate::rlib::rstring::build_search_elidable_helper_graph(
+                            rtyper,
+                            "_search_elidable",
+                            ptr,
+                        )
+                    }
+                },
+            )?,
+        )
+    };
+    let _ = callee_name;
     let res = variable_with_lltype("res", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
         vec![
-            elidable_ptr,
+            callee_ptr,
             Hlvalue::Variable(s1),
             Hlvalue::Variable(s2),
             Hlvalue::Variable(start_arg),
@@ -14351,20 +14510,6 @@ mod tests {
         link.borrow().target.as_ref().unwrap().clone()
     }
 
-    fn funcptr_name(hlv: &Hlvalue) -> String {
-        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
-        let Hlvalue::Constant(c) = hlv else {
-            panic!("expected Constant funcptr, got {hlv:?}");
-        };
-        let ConstValue::LLPtr(ptr) = &c.value else {
-            panic!("expected LLPtr funcptr, got {:?}", c.value);
-        };
-        match ptr._obj0_value() {
-            Ok(Some(_ptr_obj::Func(func))) => func._name,
-            other => panic!("expected Func, got {other:?}"),
-        }
-    }
-
     /// `LLHelpers.ll_find` (`rstr.py`): clamp start/end, then `m == 0`
     /// return start, `m == 1` `ll_find_char` + `jit.record_exact_value`,
     /// `m > 1` `ll_search(..., SEARCH_FIND)` + the same record.
@@ -14449,7 +14594,12 @@ mod tests {
                 .iter()
                 .find(|op| op.opname == "direct_call")
                 .expect("ll_find_char call");
-            assert_eq!(funcptr_name(&call.args[0]), "ll_find_char");
+            let func = funcobj_from_funcptr_constant(&call.args[0]).expect("ll_find_char funcptr");
+            assert_eq!(func._name, "ll_find_char");
+            assert!(
+                func.graph.is_some(),
+                "HighLevelOp.gendirectcall funcptr carries graph"
+            );
         }
 
         let block_search = pick_bool_exit(&block_m, false);
@@ -14464,7 +14614,12 @@ mod tests {
                 .iter()
                 .find(|op| op.opname == "direct_call")
                 .expect("ll_search call");
-            assert_eq!(funcptr_name(&call.args[0]), "ll_search");
+            let func = funcobj_from_funcptr_constant(&call.args[0]).expect("ll_search funcptr");
+            assert_eq!(func._name, "ll_search");
+            assert!(
+                func.graph.is_some(),
+                "HighLevelOp.gendirectcall funcptr carries graph"
+            );
             assert!(
                 matches!(
                     call.args.get(5),
@@ -14476,11 +14631,19 @@ mod tests {
         }
 
         drop(inner);
-        let err = build_ll_find_helper_graph("ll_unicode_find", UNICODEPTR.clone())
-            .expect_err("UNICODE ll_find needs _search_normal");
+        let uni = build_ll_find_helper_graph("ll_unicode_find", UNICODEPTR.clone())
+            .expect("UNICODE ll_find");
+        let names: Vec<String> = direct_call_funcobjs(&uni.graph.borrow())
+            .into_iter()
+            .map(|func| func._name)
+            .collect();
         assert!(
-            err.to_string().contains("_search_normal"),
-            "UNICODE refusal names _search_normal: {err}"
+            names.iter().any(|n| n == "ll_search"),
+            "UNICODE ll_find calls ll_search: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ll_find_char"),
+            "UNICODE ll_find calls ll_find_char: {names:?}"
         );
     }
 
@@ -14493,17 +14656,26 @@ mod tests {
         let inner = helper.graph.borrow();
         assert_eq!(opnames(&inner.startblock), vec!["direct_call"]);
         let startblock = inner.startblock.borrow();
-        assert_eq!(
-            funcptr_name(&startblock.operations[0].args[0]),
-            "_search_elidable"
+        let func = funcobj_from_funcptr_constant(&startblock.operations[0].args[0])
+            .expect("_search_elidable funcptr");
+        assert_eq!(func._name, "_search_elidable");
+        assert!(
+            func.graph.is_some(),
+            "HighLevelOp.gendirectcall funcptr carries graph"
         );
         drop(startblock);
         drop(inner);
-        let err = build_ll_search_helper_graph("ll_unicode_search", UNICODEPTR.clone())
-            .expect_err("UNICODE ll_search needs _search_normal");
+        let helper = build_ll_search_helper_graph("ll_unicode_search", UNICODEPTR.clone())
+            .expect("build_ll_search_helper_graph for UNICODE");
+        let inner = helper.graph.borrow();
+        assert_eq!(opnames(&inner.startblock), vec!["direct_call"]);
+        let startblock = inner.startblock.borrow();
+        let func = funcobj_from_funcptr_constant(&startblock.operations[0].args[0])
+            .expect("_search_normal funcptr");
+        assert_eq!(func._name, "_search_normal");
         assert!(
-            err.to_string().contains("_search_normal"),
-            "UNICODE refusal names _search_normal: {err}"
+            func.graph.is_some(),
+            "HighLevelOp.gendirectcall funcptr carries graph"
         );
     }
 
@@ -15057,9 +15229,42 @@ mod tests {
         );
     }
 
+    /// Annotation intern → one `assign_inheritance_ids` → exceptiondata,
+    /// matching `RPythonAnnotator.simplify` / `perform_normalizations`
+    /// then `RPythonTyper.specialize` / `exceptiondata.finish`.
+    fn rtyper_after_unichr_annotation() -> (std::rc::Rc<RPythonAnnotator>, std::rc::Rc<RPythonTyper>)
+    {
+        use crate::translator::rtyper::normalizecalls::assign_inheritance_ids;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        crate::rlib::rutf8::out_of_range_classdef(&ann.bookkeeper)
+            .expect("annotation intern OutOfRange");
+        crate::annotator::exception::standard_exception_classdefs(&ann.bookkeeper)
+            .expect("annotation intern standard exceptions");
+        assign_inheritance_ids(&ann);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper.finish_exceptiondata().expect("finish_exceptiondata");
+        (ann, rtyper)
+    }
+
+    fn classdef_vtable(
+        rtyper: &std::rc::Rc<RPythonTyper>,
+        classdef: &std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+    ) -> _ptr {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, getclassrepr_arc};
+        let rclass = getclassrepr_arc(rtyper, Some(classdef)).expect("getclassrepr_arc");
+        Repr::setup(&*rclass.as_repr()).expect("ClassRepr.setup");
+        rclass.getruntime(&CLASSTYPE).expect("getruntime")
+    }
+
     #[test]
     fn build_ll_unichr_as_utf8_helper_encodes_and_range_checks() {
-        let helper = build_ll_unichr_as_utf8_helper_graph("ll_unichr_as_utf8")
+        use crate::translator::rtyper::rclass::{CLASSTYPE, ll_issubclass};
+
+        let (ann, rtyper) = rtyper_after_unichr_annotation();
+        let helper = build_ll_unichr_as_utf8_helper_graph(&rtyper, "ll_unichr_as_utf8")
             .expect("build_ll_unichr_as_utf8_helper_graph");
         crate::flowspace::model::checkgraph(&helper.graph.borrow());
         let inner = helper.graph.borrow();
@@ -15091,7 +15296,8 @@ mod tests {
                 "startblock holds assert + r_uint; the last uint_le raises"
             );
         }
-        let too_large_raises = inner.iterblocks().iter().any(|block| {
+        let mut too_large_false: Option<crate::flowspace::model::BlockRef> = None;
+        for block in inner.iterblocks() {
             let b = block.borrow();
             let le_max = b.operations.iter().any(|op| {
                 op.opname == "uint_le"
@@ -15100,18 +15306,140 @@ mod tests {
                         Some(Hlvalue::Constant(c)) if c.value == ConstValue::UInt(0x10FFFF)
                     )
             });
-            let raises = b.exits.iter().any(|lnk| {
-                lnk.borrow()
-                    .target
+            if !le_max {
+                continue;
+            }
+            for lnk in &b.exits {
+                let link = lnk.borrow();
+                let is_false = matches!(
+                    &link.exitcase,
+                    Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false)
+                );
+                if is_false {
+                    too_large_false = link.target.clone();
+                }
+            }
+        }
+        let raise_block = too_large_false.expect("false arm of code <= r_uint(0x10FFFF)");
+        assert_ne!(
+            crate::flowspace::model::BlockKey::of(&raise_block),
+            except_key,
+            "code > 0x10FFFF must malloc OutOfRange before the exceptblock link"
+        );
+        let oor = crate::rlib::rutf8::out_of_range_class();
+        let exception = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let value_error = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("ValueError")
+            .expect("ValueError");
+        assert!(oor.is_subclass_of(&exception));
+        assert!(!oor.is_subclass_of(&value_error));
+        let oor_cd = crate::rlib::rutf8::out_of_range_classdef(&ann.bookkeeper)
+            .expect("OutOfRange classdef");
+        let exception_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&exception)
+            .expect("Exception classdef");
+        let value_error_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&value_error)
+            .expect("ValueError classdef");
+        let oor_vt = classdef_vtable(&rtyper, &oor_cd);
+        let exc_vt = classdef_vtable(&rtyper, &exception_cd);
+        let ve_vt = classdef_vtable(&rtyper, &value_error_cd);
+        assert!(oor_vt.nonzero());
+        assert!(ll_issubclass(&oor_vt, &exc_vt).expect("ll_issubclass Exception"));
+        assert!(!ll_issubclass(&oor_vt, &ve_vt).expect("ll_issubclass ValueError"));
+        {
+            let raise = raise_block.borrow();
+            assert!(
+                raise.operations.iter().any(|op| op.opname == "malloc"),
+                "raise block must malloc OutOfRange"
+            );
+            let input = match raise.inputargs.first() {
+                Some(Hlvalue::Variable(v)) => v.clone(),
+                other => panic!("raise block inputarg must be the code Variable, got {other:?}"),
+            };
+            let typeptr_set = raise.operations.iter().find(|op| {
+                op.opname == "setfield"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c))
+                            if matches!(&c.value, ConstValue::ByteStr(s) if s == b"typeptr")
+                    )
+            });
+            let typeptr_set = typeptr_set.expect("raise block setfield typeptr");
+            match typeptr_set.args.get(2) {
+                Some(Hlvalue::Constant(c)) => match &c.value {
+                    ConstValue::LLPtr(p) => {
+                        assert!(p.nonzero());
+                        assert_eq!(p.as_ref(), &oor_vt);
+                        assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                    }
+                    other => panic!("typeptr must be OutOfRange vtable, got {other:?}"),
+                },
+                other => panic!("typeptr value must be a Constant, got {other:?}"),
+            }
+            let set_code = raise.operations.iter().find(|op| {
+                op.opname == "setfield"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c))
+                            if matches!(&c.value, ConstValue::ByteStr(s) if s == b"inst_code")
+                    )
+            });
+            let set_code = set_code.expect("raise block setfield inst_code");
+            match set_code.args.get(2) {
+                Some(Hlvalue::Variable(v)) => assert_eq!(
+                    v, &input,
+                    "inst_code must be set from the raise-block input"
+                ),
+                other => panic!("setfield inst_code value must be the input code, got {other:?}"),
+            }
+            assert_eq!(raise.exits.len(), 1);
+            let link = raise.exits[0].borrow();
+            assert!(
+                link.target
                     .as_ref()
                     .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
-            });
-            le_max && raises
-        });
-        assert!(
-            too_large_raises,
-            "false arm of code <= r_uint(0x10FFFF) must raise"
-        );
+            );
+            assert_eq!(link.args.len(), 2);
+            match &link.args[0] {
+                Some(Hlvalue::Constant(c)) => match &c.value {
+                    ConstValue::LLPtr(p) => {
+                        assert!(p.nonzero());
+                        assert_eq!(p.as_ref(), &oor_vt);
+                        assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                    }
+                    other => panic!("etype must be OutOfRange vtable, got {other:?}"),
+                },
+                other => panic!("etype must be a Constant, got {other:?}"),
+            }
+            match &link.args[1] {
+                Some(Hlvalue::Variable(_)) => {}
+                other => panic!("evalue must be the malloc'd instance Variable, got {other:?}"),
+            }
+        }
+        for block in inner.iterblocks() {
+            for op in &block.borrow().operations {
+                for arg in &op.args {
+                    if let Hlvalue::Constant(c) = arg {
+                        let n = match c.value {
+                            ConstValue::UInt(n) => Some(n),
+                            ConstValue::Int(n) if n >= 0 => Some(n as u64),
+                            _ => None,
+                        };
+                        if let Some(n) = n {
+                            assert!(
+                                n != 0xD800 && n != 0xDFFF,
+                                "allow_surrogates=True folds the D800–DFFF branch"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let mut opnames = Vec::new();
         for block in inner.iterblocks() {
             for op in &block.borrow().operations {
@@ -15120,8 +15448,10 @@ mod tests {
         }
         for expected in [
             "malloc_varsize",
+            "malloc",
             "getsubstruct",
             "setarrayitem",
+            "setfield",
             "uint_le",
             "uint_rshift",
             "uint_and",
@@ -15133,6 +15463,125 @@ mod tests {
                 opnames.iter().any(|n| n == expected),
                 "ll_unichr_as_utf8 graph missing op {expected}; saw {opnames:?}"
             );
+        }
+    }
+
+    #[test]
+    fn build_ll_unichr_as_utf8_helper_after_exception_vtable_keeps_out_of_range_numbered() {
+        use crate::translator::rtyper::rclass::{CLASSTYPE, ll_issubclass};
+
+        let (ann, rtyper) = rtyper_after_unichr_annotation();
+        let exception = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let exception_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&exception)
+            .expect("Exception classdef");
+        let exc_vt = classdef_vtable(&rtyper, &exception_cd);
+        assert!(
+            exception_cd
+                .borrow()
+                .repr
+                .as_ref()
+                .expect("Exception ClassRepr")
+                .is_vtable_materialized(),
+            "Exception vtable must be materialized before the helper graph"
+        );
+
+        let helper = build_ll_unichr_as_utf8_helper_graph(&rtyper, "ll_unichr_as_utf8")
+            .expect("build_ll_unichr_as_utf8_helper_graph");
+        crate::flowspace::model::checkgraph(&helper.graph.borrow());
+
+        let oor_cd = crate::rlib::rutf8::out_of_range_classdef(&ann.bookkeeper)
+            .expect("OutOfRange classdef");
+        {
+            let cd = oor_cd.borrow();
+            assert!(
+                cd.minid.is_some() && cd.maxid.is_some(),
+                "OutOfRange must stay numbered after Exception's vtable is baked"
+            );
+        }
+        let oor_vt = classdef_vtable(&rtyper, &oor_cd);
+        assert!(oor_vt.nonzero());
+        assert!(ll_issubclass(&oor_vt, &exc_vt).expect("ll_issubclass Exception"));
+        let value_error = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("ValueError")
+            .expect("ValueError");
+        let value_error_cd = ann
+            .bookkeeper
+            .getuniqueclassdef(&value_error)
+            .expect("ValueError classdef");
+        let ve_vt = classdef_vtable(&rtyper, &value_error_cd);
+        assert!(!ll_issubclass(&oor_vt, &ve_vt).expect("ll_issubclass ValueError"));
+
+        let inner = helper.graph.borrow();
+        let except_key = crate::flowspace::model::BlockKey::of(&inner.exceptblock);
+        let mut too_large_false: Option<crate::flowspace::model::BlockRef> = None;
+        for block in inner.iterblocks() {
+            let b = block.borrow();
+            let le_max = b.operations.iter().any(|op| {
+                op.opname == "uint_le"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c)) if c.value == ConstValue::UInt(0x10FFFF)
+                    )
+            });
+            if !le_max {
+                continue;
+            }
+            for lnk in &b.exits {
+                let link = lnk.borrow();
+                let is_false = matches!(
+                    &link.exitcase,
+                    Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false)
+                );
+                if is_false {
+                    too_large_false = link.target.clone();
+                }
+            }
+        }
+        let raise_block = too_large_false.expect("false arm of code <= r_uint(0x10FFFF)");
+        let raise = raise_block.borrow();
+        let typeptr_set = raise
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "setfield"
+                    && matches!(
+                        op.args.get(1),
+                        Some(Hlvalue::Constant(c))
+                            if matches!(&c.value, ConstValue::ByteStr(s) if s == b"typeptr")
+                    )
+            })
+            .expect("raise block setfield typeptr");
+        match typeptr_set.args.get(2) {
+            Some(Hlvalue::Constant(c)) => match &c.value {
+                ConstValue::LLPtr(p) => {
+                    assert!(p.nonzero());
+                    assert_eq!(p.as_ref(), &oor_vt);
+                    assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                }
+                other => panic!("typeptr must be OutOfRange vtable, got {other:?}"),
+            },
+            other => panic!("typeptr value must be a Constant, got {other:?}"),
+        }
+        let link = raise.exits[0].borrow();
+        assert!(
+            link.target
+                .as_ref()
+                .is_some_and(|t| crate::flowspace::model::BlockKey::of(t) == except_key)
+        );
+        match &link.args[0] {
+            Some(Hlvalue::Constant(c)) => match &c.value {
+                ConstValue::LLPtr(p) => {
+                    assert!(p.nonzero());
+                    assert_eq!(p.as_ref(), &oor_vt);
+                    assert_eq!(c.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+                }
+                other => panic!("etype must be OutOfRange vtable, got {other:?}"),
+            },
+            other => panic!("etype must be a Constant, got {other:?}"),
         }
     }
 }
