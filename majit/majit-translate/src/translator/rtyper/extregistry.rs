@@ -196,15 +196,15 @@ pub enum ExtRegistryEntry {
     /// its translation is registered here and specializes to that same
     /// LLOp instead of recursively lifting `executioncontext::force_frame`.
     JitForceVirtualizable,
-    /// Pyre's source spelling of the llop that `rclass.py
+    /// The interpreter's source spelling of the llop that `rclass.py
     /// InstanceRepr.hook_setfield` emits.
     ///
     /// Upstream genops `jit_force_quasi_immutable(vinst, Constant(Void,
     /// 'mutate_' + name))` while rtyping and never annotates an
-    /// invalidation body.  Rust needs a callable marker in the source, so
-    /// the call is registered here and specializes to that same llop
-    /// instead of lifting `Function::jit_force_quasi_immutable` →
-    /// `QuasiImmutField::invalidate` → `sync::Arc::deref`.
+    /// invalidation body.  The declared llop spelling (`#[jit_llop]`) is
+    /// the callable marker in the source; the call is registered here and
+    /// specializes to that same llop instead of lifting the native
+    /// invalidation body.
     JitForceQuasiImmutable,
     /// `BigInt::from(i64) -> BigInt` — the `From<i64>` impl that boxes a
     /// machine int into the foreign opaque `BigInt` (Python `long`) on the

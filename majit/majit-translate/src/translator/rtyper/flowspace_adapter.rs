@@ -2030,6 +2030,55 @@ fn enum_payload_getattr_ops(
     ]))
 }
 
+/// The `#[jit_llop]` opname declared on the callee of `target`, read off
+/// the CallRegistry funcobj (`GraphFunc._jit_llop_`).
+///
+/// FunctionPath keys are the spelled segments, the same lookup
+/// `translate_op` uses for ordinary registry calls. Method keys are the
+/// inherent-method registration path (`resolved_path`, else
+/// `CallPath::for_impl_method(receiver_root, name)`).
+///
+/// The registry probe is `CallRegistry::lookup_existing`: a pure
+/// identity test (`extregistry.is_registered`), never a materializing
+/// lookup.
+fn declared_llop(
+    target: &crate::model::CallTarget,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Option<String> {
+    use crate::model::CallTarget;
+    use crate::translator::rtyper::call_registry::FunctionPathKey;
+    let key = match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            FunctionPathKey::from_segments(segments.iter().cloned())
+        }
+        CallTarget::Method {
+            name,
+            receiver_root,
+            resolved_path,
+            ..
+        } => {
+            if let Some(path) = resolved_path {
+                FunctionPathKey::from_segments(path.segments.iter().cloned())
+            } else if let Some(receiver) = receiver_root.as_deref() {
+                let path = crate::parse::CallPath::for_impl_method(receiver, name);
+                FunctionPathKey::from_segments(path.segments)
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let entry = call_registry.lookup_existing(&key)?;
+    entry
+        .function_desc
+        .borrow()
+        .base
+        .pyobj
+        .as_ref()
+        .and_then(HostObject::user_function)
+        .and_then(|func| func._jit_llop_.clone())
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -2957,15 +3006,16 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
-                    // `rclass.py InstanceRepr.hook_setfield` genops
-                    // `jit_force_quasi_immutable` during rtyping;
-                    // `lloperation.py LLOp` ExtRegistry `specialize_call`
-                    // genops the opname.  The annotator must not lift the
-                    // native invalidation body (`warmspot.py
-                    // rewrite_force_quasi_immutable` is the native half).
-                    if segments
-                        .last()
-                        .is_some_and(|name| name == "jit_force_quasi_immutable")
+                    // The interpreter's source spelling of the llop
+                    // `rclass.py InstanceRepr.hook_setfield` genops during
+                    // rtyping; `lloperation.py LLOp` ExtRegistry
+                    // `specialize_call` genops the opname.  The annotator
+                    // must not lift the native invalidation body
+                    // (`warmspot.py rewrite_force_quasi_immutable` is the
+                    // native half). Identity is the declared `#[jit_llop]`
+                    // on the CallRegistry funcobj.
+                    if declared_llop(target, call_registry).as_deref()
+                        == Some("jit_force_quasi_immutable")
                     {
                         let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                             HostObject::new_builtin_callable(
@@ -4142,16 +4192,17 @@ pub fn translate_op(
                     ));
                     Ok(vec![FlowspaceOp::new("same_as", vec![constant], result)])
                 }
-                // `rclass.py InstanceRepr.hook_setfield` genops
-                // `jit_force_quasi_immutable` during rtyping;
-                // `lloperation.py LLOp` ExtRegistry `specialize_call`
-                // genops the opname.  The annotator must not lift the
-                // native invalidation body (`warmspot.py
-                // rewrite_force_quasi_immutable` is the native half).
-                target @ CallTarget::Method { .. }
-                    if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                        &target,
-                    ) =>
+                // The interpreter's source spelling of the llop
+                // `rclass.py InstanceRepr.hook_setfield` genops during
+                // rtyping; `lloperation.py LLOp` ExtRegistry
+                // `specialize_call` genops the opname.  The annotator
+                // must not lift the native invalidation body
+                // (`warmspot.py rewrite_force_quasi_immutable` is the
+                // native half). Identity is the declared `#[jit_llop]`
+                // on the CallRegistry funcobj.
+                CallTarget::Method { .. }
+                    if declared_llop(target, call_registry).as_deref()
+                        == Some("jit_force_quasi_immutable") =>
                 {
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                         HostObject::new_builtin_callable(
@@ -8792,19 +8843,35 @@ mod tests {
 
     #[test]
     fn translate_op_jit_force_quasi_immutable_method_bypasses_invalidation_body() {
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::GraphFunc;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_force_quasi_immutable_fixture");
         let vars = mint_vars(&mut graph, 4);
         value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
         value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let path = crate::parse::CallPath::for_impl_method("Function", "jit_force_quasi_immutable");
+        let mut func = GraphFunc::new(
+            "jit_force_quasi_immutable",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func._jit_llop_ = Some("jit_force_quasi_immutable".into());
+        let registry = empty_call_registry();
+        registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(path.segments.iter().cloned()),
+            Signature::new(vec!["self".into(), "mutatefieldname".into()], None, None),
+            func,
+        );
         let op = SpaceOperation {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::Method {
                     name: "jit_force_quasi_immutable".to_string(),
                     receiver_root: Some("Function".to_string()),
-                    resolved_path: None,
+                    resolved_path: Some(path),
                     fun_decl_id: None,
                     branch_payloads: None,
                 },
@@ -8813,9 +8880,7 @@ mod tests {
             },
         };
 
-        // No CallRegistry entry is intentional: upstream rtyping emits this
-        // force as an LLOp and does not annotate its native invalidation body.
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &registry)
             .expect("jit_force_quasi_immutable must lower through ExtRegistry");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -8833,6 +8898,62 @@ mod tests {
         assert!(crate::translator::rtyper::extregistry::is_registered(
             &callable.value
         ));
+    }
+
+    #[test]
+    fn translate_op_same_named_method_without_jit_llop_is_ordinary_getattr() {
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::GraphFunc;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_force_quasi_immutable_unmarked_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let path = crate::parse::CallPath::for_impl_method("Function", "jit_force_quasi_immutable");
+        let func = GraphFunc::new(
+            "jit_force_quasi_immutable",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let registry = empty_call_registry();
+        registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(path.segments.iter().cloned()),
+            Signature::new(vec!["self".into(), "mutatefieldname".into()], None, None),
+            func,
+        );
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("Function".to_string()),
+                    resolved_path: Some(path),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
+                result_ty: ValueType::Void,
+            },
+        };
+
+        let translated = translate_op(&op, &value_map, &registry)
+            .expect("unmarked same-named method lowers as getattr + simple_call");
+        assert_eq!(translated.len(), 2);
+        assert_eq!(translated[0].opname, "getattr");
+        assert_eq!(translated[1].opname, "simple_call");
+        let Hlvalue::Constant(name_const) = &translated[0].args[1] else {
+            panic!("getattr name must be constant");
+        };
+        assert_eq!(
+            name_const.value,
+            ConstValue::byte_str("jit_force_quasi_immutable")
+        );
+        assert!(
+            matches!(translated[1].args[0], Hlvalue::Variable(_)),
+            "ordinary method call args[0] is the bound method, not the ExtRegistry llop"
+        );
     }
 
     #[test]

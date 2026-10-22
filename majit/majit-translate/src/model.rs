@@ -7625,6 +7625,11 @@ pub struct FuncEffects {
     /// `parse_oopspec` to resolve identifier slots in the spec's `(...)`
     /// pattern. Empty when no `(...)`-bearing spec was registered.
     pub oopspec_argnames: Vec<String>,
+    /// Declared llop opname (`#[jit_llop("...")]`), harvested as
+    /// `llop:<opname>`. Stands for the upstream callee identity
+    /// (`ExtRegistryEntry._about_`); the opname names the llop its
+    /// calls specialize to.
+    pub llop: Option<String>,
     /// `func._gctransformer_hint_cannot_collect_` (collectanalyze.py:15)
     /// — `analyze_can_collect` returns False immediately.
     pub cannot_collect: bool,
@@ -7704,6 +7709,7 @@ impl Default for FuncEffects {
         Self {
             oopspec: None,
             oopspec_argnames: Vec::new(),
+            llop: None,
             cannot_collect: false,
             random_effects_on_gcobjs: false,
             // `canraise.py analyze_external_call` defaults missing to True.
@@ -7735,6 +7741,12 @@ impl FuncEffects {
         if let Some(spec) = hint.strip_prefix("oopspec:") {
             if !spec.is_empty() {
                 self.oopspec = Some(spec.to_string());
+            }
+            return;
+        }
+        if let Some(opname) = hint.strip_prefix("llop:") {
+            if !opname.is_empty() {
+                self.llop = Some(opname.to_string());
             }
             return;
         }
@@ -7773,6 +7785,9 @@ impl FuncEffects {
         }
         if !other.oopspec_argnames.is_empty() {
             self.oopspec_argnames = other.oopspec_argnames.clone();
+        }
+        if other.llop.is_some() {
+            self.llop = other.llop.clone();
         }
         self.cannot_collect |= other.cannot_collect;
         self.random_effects_on_gcobjs |= other.random_effects_on_gcobjs;
@@ -10047,6 +10062,7 @@ mod tests {
     #[test]
     fn merge_from_folds_every_effect_flag_in_both_directions() {
         let set = FuncEffects {
+            llop: Some("jit_force_quasi_immutable".to_string()),
             cannot_collect: true,
             random_effects_on_gcobjs: true,
             canraise: false,

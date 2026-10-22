@@ -1510,6 +1510,9 @@ pub(crate) enum DecoratorAttr {
     /// paired with `#[oopspec(...)]` by
     /// `front::llbc_hints::harvest_hints_from_llbcs`.
     OopspecArgnames(Vec<String>),
+    /// Declared llop opname (`#[jit_llop("...")]`), harvested as
+    /// `llop:<opname>`. Stands for `ExtRegistryEntry._about_`.
+    Llop(String),
     AroundstateTarget(String, i64),
     Elidable,
     CannotRaise,
@@ -1527,6 +1530,9 @@ impl DecoratorAttr {
     pub(crate) fn from_hint(hint: &str) -> Option<Self> {
         if let Some(spec) = hint.strip_prefix("oopspec:") {
             return Some(Self::Oopspec(spec.to_string()));
+        }
+        if let Some(opname) = hint.strip_prefix("llop:") {
+            return Some(Self::Llop(opname.to_string()));
         }
         if let Some(rest) = hint.strip_prefix("aroundstate_target:") {
             let Some((save, identity)) = rest.split_once(':') else {
@@ -1578,6 +1584,10 @@ impl FuncObjAttrs {
                 }
                 DecoratorAttr::OopspecArgnames(argnames) => {
                     func.oopspec_argnames = argnames;
+                    None
+                }
+                DecoratorAttr::Llop(opname) => {
+                    func.llop = Some(opname);
                     None
                 }
                 DecoratorAttr::AroundstateTarget(identity, save_err) => {
@@ -2287,6 +2297,20 @@ impl FuncRef<'_> {
         graph.hints.iter().find_map(|hint| {
             let spec = hint.strip_prefix("oopspec:")?;
             (!spec.is_empty()).then_some(spec)
+        })
+    }
+
+    /// Declared llop opname, or the `llop:` token still sitting on `graph.hints`.
+    fn recorded_llop(&self) -> Option<&str> {
+        if let Some(opname) = self.llop.as_deref() {
+            return Some(opname);
+        }
+        let FuncRef::Graph(graph) = self else {
+            return None;
+        };
+        graph.hints.iter().find_map(|hint| {
+            let opname = hint.strip_prefix("llop:")?;
+            (!opname.is_empty()).then_some(opname)
         })
     }
 }
@@ -5248,15 +5272,17 @@ impl CallControl {
     /// `cannot_raise`).
     fn func_effects_with_crate_alias(&self, path: &CallPath) -> Option<FuncRef<'_>> {
         let direct = self.func_effects(path);
-        if direct
-            .as_ref()
-            .is_some_and(|effects| effects.recorded_oopspec().is_some())
-        {
+        if direct.as_ref().is_some_and(|effects| {
+            effects.recorded_oopspec().is_some() || effects.recorded_llop().is_some()
+        }) {
             return direct;
         }
         if let Some(user) = user_path_behind_majit_call_target(path)
             && let Some(alt) = self.func_effects_with_crate_alias(&user)
-            && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
+            && (alt.recorded_oopspec().is_some()
+                || alt.recorded_llop().is_some()
+                || alt.elidable
+                || direct.is_none())
         {
             return Some(alt);
         }
@@ -5272,13 +5298,19 @@ impl CallControl {
         if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
             let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
             if let Some(alt) = self.func_effects(&stripped)
-                && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
+                && (alt.recorded_oopspec().is_some()
+                    || alt.recorded_llop().is_some()
+                    || alt.elidable
+                    || direct.is_none())
             {
                 return Some(alt);
             }
             if let Some(user) = user_path_behind_majit_call_target(&stripped)
                 && let Some(alt) = self.func_effects_with_crate_alias(&user)
-                && (alt.recorded_oopspec().is_some() || alt.elidable || direct.is_none())
+                && (alt.recorded_oopspec().is_some()
+                    || alt.recorded_llop().is_some()
+                    || alt.elidable
+                    || direct.is_none())
             {
                 return Some(alt);
             }
@@ -9005,6 +9037,7 @@ impl CallControl {
                 DecoratorAttr::OopspecArgnames(argnames) => {
                     self.mark_oopspec_argnames(path, argnames)
                 }
+                DecoratorAttr::Llop(opname) => self.mark_llop(path, opname),
                 DecoratorAttr::AroundstateTarget(identity, save_err) => {
                     self.mark_call_aroundstate_target(path, identity, save_err)
                 }
@@ -9157,6 +9190,18 @@ impl CallControl {
     pub fn get_oopspec(&self, target: &CallTarget) -> Option<String> {
         self.target_func_effects(target)
             .and_then(|f| f.recorded_oopspec().map(str::to_string))
+    }
+
+    /// Store the declared llop opname (`#[jit_llop("...")]`) on the funcobj
+    /// `path` names. Stands for `ExtRegistryEntry._about_`.
+    pub fn mark_llop(&mut self, path: CallPath, opname: String) {
+        self.func_effects_mut(&path).llop = Some(opname);
+    }
+
+    /// The llop opname declared on the callee of this `CallTarget`.
+    pub fn callee_llop(&self, target: &CallTarget) -> Option<String> {
+        self.target_func_effects(target)
+            .and_then(|f| f.recorded_llop().map(str::to_string))
     }
 
     /// `support.py argnames = ll_func.__code__.co_varnames[:nb_args]` —
@@ -9412,7 +9457,7 @@ impl CallControl {
                         // llop's producer.
                         OpKind::Call { target, .. }
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                                target,
+                                self, target,
                             ) =>
                         {
                             false
@@ -9440,7 +9485,7 @@ impl CallControl {
                                 )
                             }),
                         },
-                        other => raise_class_can_raise(op_can_raise(other), ignore_memoryerror),
+                        other => raise_class_can_raise(op_can_raise(other, self), ignore_memoryerror),
                     };
                     if op_result {
                         break 'walk true;
@@ -9510,7 +9555,7 @@ impl CallControl {
                         // `jit_force_virtual`.
                         OpKind::Call { target, .. }
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                                target,
+                                self, target,
                             ) => {}
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
@@ -9595,7 +9640,7 @@ impl CallControl {
                         // always returns False (`effectinfo.py`).
                         OpKind::Call { target, .. }
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                                target,
+                                self, target,
                             ) => {}
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
@@ -9694,7 +9739,7 @@ impl CallControl {
                     // recurse into.
                     OpKind::Call { target, .. }
                         if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                            target,
+                            self, target,
                         ) =>
                     {
                         None
@@ -9793,7 +9838,7 @@ impl CallControl {
                         // into the rtyped graph.
                         OpKind::Call { target, .. }
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                                target,
+                                self, target,
                             ) =>
                         {
                             break 'walk true;
@@ -9909,7 +9954,7 @@ impl CallControl {
                         // `jit_force_quasi_immutable` has neither.
                         OpKind::Call { target, .. }
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                                target,
+                                self, target,
                             ) => {}
                         OpKind::Call { target, .. } => {
                             // graphanalyze.py: analyze_direct_call — recurse
@@ -10694,7 +10739,7 @@ impl CallControl {
                     // is the llop's producer.
                     OpKind::Call { target, .. }
                         if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
-                            target,
+                            self, target,
                         ) =>
                     {
                         ReadWriteEffects::bottom_result()
@@ -12365,7 +12410,7 @@ pub(crate) fn type_align(type_str: &str) -> usize {
 /// Returns true if the operation itself (not counting transitive calls)
 /// can raise an exception. When `ignore_memoryerror` is true, operations
 /// that can only raise MemoryError are treated as non-raising.
-fn op_can_raise(op: &OpKind) -> RaiseClass {
+fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
     // RPython canraise.py analyze_simple_operation:
     //   canraise = LL_OPERATIONS[op.opname].canraise
     //   return bool(canraise) and canraise != (self.ignore_exact_class,)
@@ -12481,7 +12526,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // (`canraise.py`) therefore answers False. `rclass.py
         // InstanceRepr.hook_setfield` is the llop's producer.
         OpKind::Call { target, .. }
-            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(target) =>
+            if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(cc, target) =>
         {
             RaiseClass::No
         }
@@ -17326,10 +17371,9 @@ mod tests {
             .operations
             .push(indirect_call_op(None));
         callee.set_return(callee_start, None);
-        cc.register_function_graph(
-            CallPath::from_segments(["m", "S", "jit_force_quasi_immutable"]),
-            callee,
-        );
+        let callee_path = CallPath::from_segments(["m", "S", "jit_force_quasi_immutable"]);
+        cc.register_function_graph(callee_path.clone(), callee);
+        cc.mark_decorator_hints(&callee_path, &["llop:jit_force_quasi_immutable".into()]);
 
         let mut setter = FunctionGraph::new("setter");
         let force_call = OpKind::Call {
@@ -17351,7 +17395,7 @@ mod tests {
             "QuasiImmutAnalyzer.analyze_simple_operation: the Call is the llop"
         );
 
-        assert_eq!(op_can_raise(&force_call), RaiseClass::No);
+        assert_eq!(op_can_raise(&force_call, &cc), RaiseClass::No);
         assert!(
             !cc.analyze_can_raise_impl(
                 &setter_path,
@@ -17406,6 +17450,44 @@ mod tests {
             ),
             "CollectAnalyzer.analyze_simple_operation does not match \
              jit_force_quasi_immutable"
+        );
+    }
+
+    #[test]
+    fn analyzers_treat_unmarked_same_named_call_as_ordinary() {
+        let mut cc = CallControl::new();
+
+        let mut callee = FunctionGraph::new("m::S::jit_force_quasi_immutable");
+        let callee_start = callee.startblock;
+        callee.blocks[callee_start.0]
+            .operations
+            .push(indirect_call_op(None));
+        callee.set_return(callee_start, None);
+        cc.register_function_graph(
+            CallPath::from_segments(["m", "S", "jit_force_quasi_immutable"]),
+            callee,
+        );
+
+        let mut setter = FunctionGraph::new("setter");
+        let force_call = OpKind::Call {
+            target: CallTarget::function_path(["m", "S", "jit_force_quasi_immutable"]),
+            args: Vec::new(),
+            result_ty: ValueType::Void,
+        };
+        setter.push_op_var(setter.startblock, force_call.clone(), false);
+        setter.set_return(setter.startblock, None);
+        let setter_path = CallPath::from_segments(["setter"]);
+        cc.register_function_graph(setter_path.clone(), setter);
+
+        assert_eq!(op_can_raise(&force_call, &cc), RaiseClass::Yes);
+        assert!(
+            cc.analyze_can_raise_impl(
+                &setter_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "a same-named call without #[jit_llop] recurses into the callee body"
         );
     }
 

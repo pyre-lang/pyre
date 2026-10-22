@@ -3797,7 +3797,12 @@ impl<'a> Transformer<'a> {
             OpKind::Call { target, args, .. } if is_jit_force_virtualizable_target(target) => {
                 self.rewrite_op_jit_force_virtualizable(args, graph_name)
             }
-            OpKind::Call { target, args, .. } if is_jit_force_quasi_immutable_target(target) => {
+            OpKind::Call { target, args, .. }
+                if self
+                    .callcontrol
+                    .as_deref()
+                    .is_some_and(|cc| is_jit_force_quasi_immutable_target(cc, target)) =>
+            {
                 self.rewrite_op_jit_force_quasi_immutable(target, args, graph, graph_name)
             }
             // `jtransform.py rewrite_op_jit_record_exact_value`: the rtyper
@@ -14606,15 +14611,13 @@ fn is_jit_force_virtualizable_target(target: &CallTarget) -> bool {
 
 /// The llop `jit_force_quasi_immutable` (`lloperation.py`).
 ///
-/// A `CallTarget::FunctionPath` last segment or a `CallTarget::Method` name.
-pub(crate) fn is_jit_force_quasi_immutable_target(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::FunctionPath { segments, .. } => segments
-            .last()
-            .is_some_and(|name| name == "jit_force_quasi_immutable"),
-        CallTarget::Method { name, .. } => name == "jit_force_quasi_immutable",
-        _ => false,
-    }
+/// Identity is the declared llop spelling (`#[jit_llop]`) on the callee
+/// funcobj (`ExtRegistryEntry._about_`), never the callee name.
+pub(crate) fn is_jit_force_quasi_immutable_target(
+    callcontrol: &crate::call::CallControl,
+    target: &CallTarget,
+) -> bool {
+    callcontrol.callee_llop(target).as_deref() == Some("jit_force_quasi_immutable")
 }
 
 /// STRUCT for `fielddescrof(STRUCT, c_fieldname.value)`: the method's impl type.
@@ -22177,28 +22180,74 @@ mod tests {
         ));
     }
 
+    fn mark_qi_llop(cc: &mut crate::call::CallControl, path: &crate::parse::CallPath) {
+        cc.mark_decorator_hints(path, &["llop:jit_force_quasi_immutable".into()]);
+    }
+
+    fn transform_with_qi_llop(
+        graph: &FunctionGraph,
+        callee: crate::parse::CallPath,
+    ) -> GraphTransformResult {
+        let mut cc = crate::call::CallControl::new();
+        mark_qi_llop(&mut cc, &callee);
+        Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(graph)
+    }
+
     #[test]
     fn is_jit_force_quasi_immutable_target_matches_method_and_function_path() {
-        assert!(is_jit_force_quasi_immutable_target(&CallTarget::Method {
-            name: "jit_force_quasi_immutable".to_string(),
-            receiver_root: Some("Function".to_string()),
-            resolved_path: None,
-            fun_decl_id: None,
-            branch_payloads: None,
-        }));
+        let mut cc = crate::call::CallControl::new();
+        let path = crate::parse::CallPath::from_segments([
+            "function",
+            "Function",
+            "jit_force_quasi_immutable",
+        ]);
+        mark_qi_llop(&mut cc, &path);
         assert!(is_jit_force_quasi_immutable_target(
+            &cc,
+            &CallTarget::Method {
+                name: "jit_force_quasi_immutable".to_string(),
+                receiver_root: Some("Function".to_string()),
+                resolved_path: Some(path.clone()),
+                fun_decl_id: None,
+                branch_payloads: None,
+            }
+        ));
+        assert!(is_jit_force_quasi_immutable_target(
+            &cc,
             &CallTarget::function_path(["function", "Function", "jit_force_quasi_immutable"])
         ));
         assert!(!is_jit_force_quasi_immutable_target(
+            &cc,
             &CallTarget::function_path(["function", "function_notify_quasi_immut"])
         ));
-        assert!(!is_jit_force_quasi_immutable_target(&CallTarget::Method {
-            name: "jit_force_virtualizable".to_string(),
-            receiver_root: Some("Function".to_string()),
-            resolved_path: None,
-            fun_decl_id: None,
-            branch_payloads: None,
-        }));
+        assert!(!is_jit_force_quasi_immutable_target(
+            &cc,
+            &CallTarget::Method {
+                name: "jit_force_virtualizable".to_string(),
+                receiver_root: Some("Function".to_string()),
+                resolved_path: None,
+                fun_decl_id: None,
+                branch_payloads: None,
+            }
+        ));
+        let unmarked =
+            crate::parse::CallPath::from_segments(["other", "Type", "jit_force_quasi_immutable"]);
+        assert!(!is_jit_force_quasi_immutable_target(
+            &cc,
+            &CallTarget::function_path(["other", "Type", "jit_force_quasi_immutable"])
+        ));
+        assert!(!is_jit_force_quasi_immutable_target(
+            &cc,
+            &CallTarget::Method {
+                name: "jit_force_quasi_immutable".to_string(),
+                receiver_root: Some("Type".to_string()),
+                resolved_path: Some(unmarked),
+                fun_decl_id: None,
+                branch_payloads: None,
+            }
+        ));
     }
 
     #[test]
@@ -22218,7 +22267,7 @@ mod tests {
                 target: CallTarget::Method {
                     name: "jit_force_quasi_immutable".to_string(),
                     receiver_root: Some("Function".to_string()),
-                    resolved_path: Some(path),
+                    resolved_path: Some(path.clone()),
                     fun_decl_id: None,
                     branch_payloads: None,
                 },
@@ -22232,7 +22281,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let result = transform_with_qi_llop(&graph, path);
         let ops: Vec<&OpKind> = result
             .graph
             .block(graph.startblock)
@@ -22260,6 +22309,62 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_op_jit_force_quasi_immutable_leaves_unmarked_same_named_call() {
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let mut graph = FunctionGraph::new("set_code");
+        let inst = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, inst.clone());
+        let path = crate::parse::CallPath::for_impl_method(
+            "function::Function",
+            "jit_force_quasi_immutable",
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("Function".to_string()),
+                    resolved_path: Some(path.clone()),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: vec![
+                    LinkArg::from(inst.clone()),
+                    LinkArg::Const(Constant::new(ConstValue::byte_str("mutate_code"))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let mut cc = crate::call::CallControl::new();
+        let result = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, OpKind::JitForceQuasiImmutable { .. })),
+            "unmarked same-named call must not rewrite, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|o| matches!(
+                o,
+                OpKind::Call { .. } | OpKind::CallResidual { .. } | OpKind::CallMayForce { .. }
+            )),
+            "unmarked same-named call stays an ordinary call, got {ops:?}"
+        );
+    }
+
+    #[test]
     fn rewrite_op_jit_force_quasi_immutable_accepts_const_receiver() {
         use crate::flowspace::model::{ConstValue, Constant};
 
@@ -22275,7 +22380,7 @@ mod tests {
                 target: CallTarget::Method {
                     name: "jit_force_quasi_immutable".to_string(),
                     receiver_root: Some("Function".to_string()),
-                    resolved_path: Some(path),
+                    resolved_path: Some(path.clone()),
                     fun_decl_id: None,
                     branch_payloads: None,
                 },
@@ -22289,7 +22394,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
 
-        let result = transform_graph(&graph, &GraphTransformConfig::default());
+        let result = transform_with_qi_llop(&graph, path);
         let ops: Vec<&OpKind> = result
             .graph
             .block(graph.startblock)

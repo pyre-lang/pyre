@@ -810,18 +810,15 @@ impl CallRegistry {
         &self.bookkeeper
     }
 
-    /// Look up an existing entry without creating one.  Returns
-    /// `None` when the path has not yet been registered.
+    /// Pure probe for identity questions.  Mirrors
+    /// `extregistry.is_registered`, which never creates a desc.
     ///
-    /// First checks the canonical `entries` map; if that misses,
-    /// resolves through `aliases` to the canonical key and re-reads.
-    /// Mirrors RPython `Bookkeeper.getdesc(pyobj)`'s "obj_key direct
-    /// lookup" plus alias indirection (`bookkeeper.py`).
-    ///
-    /// A path with no entry yet is handed to the [`Self::set_getdesc`]
-    /// callback, which makes the entry of a function object seen after
-    /// the registry was populated.
-    pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+    /// Does only what [`Self::lookup`] does without materializing:
+    /// `lookup_registered(key)`, then the `strip_alias_crate_prefix`
+    /// → `lookup_registered(stripped)` step.  Does not
+    /// `materialize_residual_inst`, does not invoke `getdesc`, and
+    /// does not fall back to leaf-match.
+    pub fn lookup_existing(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         if let Some(entry) = self.lookup_registered(key) {
             return Some(entry);
         }
@@ -835,6 +832,28 @@ impl CallRegistry {
             if let Some(entry) = self.lookup_registered(&stripped_key) {
                 return Some(entry);
             }
+        }
+        None
+    }
+
+    /// Look up an existing entry without creating one.  Returns
+    /// `None` when the path has not yet been registered.
+    ///
+    /// First checks the canonical `entries` map; if that misses,
+    /// resolves through `aliases` to the canonical key and re-reads.
+    /// Mirrors RPython `Bookkeeper.getdesc(pyobj)`'s "obj_key direct
+    /// lookup" plus alias indirection (`bookkeeper.py`).
+    ///
+    /// A path with no entry yet is handed to the [`Self::set_getdesc`]
+    /// callback, which makes the entry of a function object seen after
+    /// the registry was populated.  Identity questions that must not
+    /// create a desc use [`Self::lookup_existing`].
+    pub fn lookup(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+        if let Some(entry) = self.lookup_existing(key) {
+            return Some(entry);
+        }
+        if let Some(stripped) = crate::local_crates::strip_alias_crate_prefix(key.segments()) {
+            let stripped_key = FunctionPathKey::from_segments(stripped);
             if let Some(entry) = self.materialize_residual_inst(&stripped_key) {
                 return Some(entry);
             }
@@ -1421,6 +1440,24 @@ mod tests {
                 .lookup(&FunctionPathKey::from_segments(["foo"]))
                 .is_none(),
             "unregistered path must return None"
+        );
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn lookup_existing_on_unregistered_key_returns_none_without_materializing() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = CallRegistry::new(bk);
+        let key = FunctionPathKey::from_segments(["foo"]);
+        let before = registry.len();
+        assert!(
+            registry.lookup_existing(&key).is_none(),
+            "unregistered path must return None"
+        );
+        assert_eq!(
+            registry.len(),
+            before,
+            "lookup_existing must not create a registry entry"
         );
         assert!(registry.is_empty());
     }
