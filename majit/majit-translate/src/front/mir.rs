@@ -116014,7 +116014,7 @@ mod tests {
         );
     }
 
-    /// `PyError::new` initializes four `PyObjectRef` fields with
+    /// `PyError::new` initializes three `PyObjectRef` fields with
     /// `null_mut()`. These are typed nullable W_Root slots, not erased root
     /// references; each aggregate write must consume a PyObject-narrowed
     /// value so `InstanceRepr._setup_repr` and later reads agree.
@@ -116029,7 +116029,7 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "pyre_interpreter::error::<Impl>::new")
             .expect("lower PyError::new");
-        for field_name in ["exc_object", "w_name_context", "w_obj_context", "w_fmt_x0"] {
+        for field_name in ["exc_object", "w_name_context", "w_obj_context"] {
             let value = graph
                 .blocks
                 .iter()

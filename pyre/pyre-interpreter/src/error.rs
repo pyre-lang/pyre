@@ -444,7 +444,7 @@ pub struct PyErrorObject {
     pub w_type: pyre_object::PyObjectRef,
     /// Nullable rstr `STR`. Null means the display text comes from
     /// `exc_object` ([`DisplayMessage::FromExcObject`]) or from a deferred
-    /// `OpErrFmt` payload (`w_fmt_x0` + `fmt_valuefmt_*`) that
+    /// `OpErrFmt` payload (`fmt_x0` + `fmt_valuefmt_*`) that
     /// [`PyError::ensure_deferred_computed`] has not yet filled. Otherwise
     /// the pointer holds the WTF-8 bytes. The object does not own a `Wtf8Buf`.
     pub message: pyre_object::gc_hook::GCREF,
@@ -509,11 +509,10 @@ pub struct PyErrorObject {
     /// (Python 3.10+): the object whose attribute lookup failed.
     /// Carried and applied alongside `w_name_context`; `PY_NULL` = unset.
     pub w_obj_context: pyre_object::PyObjectRef,
-    /// `error.py get_operrcls2.OpErrFmt.x0` for a deferred single-`%T`
-    /// format. Null when this carrier is not an `OpErrFmt` `%T` payload.
-    /// A GC edge: the object lives until `_compute_value` (and after, as
-    /// upstream keeps `x0` on the instance).
-    pub w_fmt_x0: pyre_object::PyObjectRef,
+    /// `OpErrFmt.x0`, the single deferred operand: a W_Root for `%T`,
+    /// an rstr `STR` for `%s` (`error.py get_operrcls2.OpErrFmt.__init__`
+    /// stores it unconverted).
+    pub fmt_x0: pyre_object::gc_hook::GCREF,
     /// Call-site `valuefmt` bytes for that deferred `%T` (`oefmt` is
     /// `@specialize.arg(1)`: a constant per call site). Not a GC edge.
     /// `fmt_valuefmt_len == 0` means no deferred format is pending.
@@ -544,7 +543,7 @@ pub const PYERROR_EXC_OBJECT_OFFSET: usize = std::mem::offset_of!(PyErrorObject,
 pub const PYERROR_W_NAME_CONTEXT_OFFSET: usize =
     std::mem::offset_of!(PyErrorObject, w_name_context);
 pub const PYERROR_W_OBJ_CONTEXT_OFFSET: usize = std::mem::offset_of!(PyErrorObject, w_obj_context);
-pub const PYERROR_W_FMT_X0_OFFSET: usize = std::mem::offset_of!(PyErrorObject, w_fmt_x0);
+pub const PYERROR_FMT_X0_OFFSET: usize = std::mem::offset_of!(PyErrorObject, fmt_x0);
 
 /// GC type id of [`HOST_EXCEPTION_TYPE`]: one past the module classes.
 pub fn host_exception_gc_type_id() -> u32 {
@@ -691,7 +690,7 @@ fn make_pyerror(
         reraise_lasti,
         w_name_context,
         w_obj_context,
-        w_fmt_x0: std::ptr::null_mut(),
+        fmt_x0: std::ptr::null_mut(),
         fmt_valuefmt_ptr: std::ptr::null(),
         fmt_valuefmt_len: 0,
     });
@@ -723,7 +722,7 @@ fn make_pyerror(
 fn make_pyerror_deferred_t(
     kind: PyErrorKind,
     w_type: pyre_object::PyObjectRef,
-    w_fmt_x0: pyre_object::PyObjectRef,
+    fmt_x0: pyre_object::gc_hook::GCREF,
     fmt_valuefmt_ptr: *const u8,
     fmt_valuefmt_len: usize,
 ) -> PyError {
@@ -741,7 +740,7 @@ fn make_pyerror_deferred_t(
         reraise_lasti: -1,
         w_name_context: std::ptr::null_mut(),
         w_obj_context: std::ptr::null_mut(),
-        w_fmt_x0,
+        fmt_x0,
         fmt_valuefmt_ptr,
         fmt_valuefmt_len,
     });
@@ -860,8 +859,8 @@ impl PyError {
         self.write_barrier();
     }
 
-    pub fn set_w_fmt_x0(&mut self, w_fmt_x0: pyre_object::PyObjectRef) {
-        unsafe { (*self.raw()).w_fmt_x0 = w_fmt_x0 };
+    pub fn set_fmt_x0(&mut self, fmt_x0: pyre_object::gc_hook::GCREF) {
+        unsafe { (*self.raw()).fmt_x0 = fmt_x0 };
         self.write_barrier();
     }
 
@@ -1054,7 +1053,7 @@ pub unsafe fn pyerror_index_error_to_exc_object(
 impl PyError {
     /// Visit this handle by address so a moved [`PyErrorObject`] is relocated
     /// in place. The collector traces `w_type`, `message`, `exc_object`,
-    /// `w_name_context`, `w_obj_context` and `w_fmt_x0` through the registered
+    /// `w_name_context`, `w_obj_context` and `fmt_x0` through the registered
     /// offsets.
     /// `walk_raw_exception_roots` stays: those offsets do not cover the
     /// off-GC `malloc_typed` children of the W exception.
@@ -1277,25 +1276,27 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let handle_slot = err.pin(&_roots);
         let x0_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !err.w_fmt_x0.is_null() {
-            let _ = pyre_object::gc_roots::pin_root(err.w_fmt_x0);
+        if !err.fmt_x0.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(err.fmt_x0 as pyre_object::PyObjectRef);
         }
         let fmt = err.deferred_valuefmt();
         let (strings, formats) = decompose_valuefmt(fmt);
-        let x0 = if err.w_fmt_x0.is_null() {
-            err.w_fmt_x0
+        let x0 = if err.fmt_x0.is_null() {
+            err.fmt_x0
         } else {
-            pyre_object::gc_roots::shadow_stack_get(x0_slot)
+            pyre_object::gc_roots::shadow_stack_get(x0_slot) as pyre_object::gc_hook::GCREF
         };
         let mut message = Wtf8Buf::new();
         for (i, part) in strings[..formats.len()].iter().enumerate() {
             message.push_str(part);
             match formats[i].as_str() {
-                "T" => message.push_str(&type_name_of(x0)),
+                "T" => message.push_str(&type_name_of(x0 as PyObjectRef)),
                 "s" => {
-                    if let Ok(text) = crate::baseobjspace::text_wtf8_w(x0) {
-                        message.push_wtf8(text);
-                    }
+                    message.push_wtf8(unsafe {
+                        pyre_object::unicodeobject::utf8_payload_wtf8(
+                            x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
+                        )
+                    });
                 }
                 _ => {}
             }
@@ -5738,19 +5739,11 @@ fn valuefmt_is_single_s(valuefmt: &str) -> bool {
     valuefmt_is_single_code(valuefmt, b's')
 }
 
-/// `OpErrFmt.__init__` for one `%s` text operand: intern the text as `x0`,
-/// then the same look-inside ctor as `%T`. `_compute_value` joins the
-/// stored pieces on first read (`error.py get_operrcls2.OpErrFmt`).
-///
-/// `objspace.py newtext` is `rstr.mallocstr` then `rutf8.codepoints_in_utf8`.
-/// `w_str_from_storage` is the ASCII wrap (`len(_utf8)` as the code-point
-/// count) and would mis-count a non-ASCII `%s`.
+/// `OpErrFmt.__init__` keeps the RPython str as `x0`; `_compute_value`
+/// converts it on first read.
 fn oefmt_single_s(w_type: PyObjectRef, valuefmt: &'static str, text: &str) -> OperationError {
     let payload = pyre_object::unicodeobject::alloc_utf8_payload(text.as_bytes(), true);
-    let wtf8 = unsafe { pyre_object::unicodeobject::utf8_payload_wtf8(payload) };
-    let length = pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, wtf8.len());
-    let w_fmt_x0 = pyre_object::unicodeobject::w_str_from_storage_and_length(payload, length);
-    oefmt_single_t(w_type, valuefmt, w_fmt_x0)
+    oefmt_single_t(w_type, valuefmt, payload as pyre_object::gc_hook::GCREF)
 }
 
 /// `error.py oefmt` at a `@specialize.arg(1)` site with one interned operand.
@@ -5764,10 +5757,10 @@ fn oefmt_single_s(w_type: PyObjectRef, valuefmt: &'static str, text: &str) -> Op
 pub fn oefmt_one(
     kind: PyErrorKind,
     w_type: PyObjectRef,
-    w_fmt_x0: PyObjectRef,
+    fmt_x0: pyre_object::gc_hook::GCREF,
     valuefmt: &'static str,
 ) -> OperationError {
-    make_pyerror_deferred_t(kind, w_type, w_fmt_x0, valuefmt.as_ptr(), valuefmt.len())
+    make_pyerror_deferred_t(kind, w_type, fmt_x0, valuefmt.as_ptr(), valuefmt.len())
 }
 
 /// `OpErrFmt.__init__` for one operand (`%T` or `%s`): pin `w_type` and `x0`,
@@ -5780,7 +5773,7 @@ pub fn oefmt_one(
 fn oefmt_single_t(
     w_type: PyObjectRef,
     valuefmt: &'static str,
-    w_fmt_x0: PyObjectRef,
+    fmt_x0: pyre_object::gc_hook::GCREF,
 ) -> OperationError {
     let _roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5788,8 +5781,8 @@ fn oefmt_single_t(
         let _ = _roots.pin_root(w_type);
     }
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    if !w_fmt_x0.is_null() {
-        let _ = _roots.pin_root(w_fmt_x0);
+    if !fmt_x0.is_null() {
+        let _ = _roots.pin_root(fmt_x0 as PyObjectRef);
     }
     let w_type_now = if w_type.is_null() {
         w_type
@@ -5808,12 +5801,12 @@ fn oefmt_single_t(
     } else {
         _roots.get(type_slot)
     };
-    let w_fmt_x0 = if w_fmt_x0.is_null() {
-        w_fmt_x0
+    let fmt_x0 = if fmt_x0.is_null() {
+        fmt_x0
     } else {
-        _roots.get(obj_slot)
+        _roots.get(obj_slot) as pyre_object::gc_hook::GCREF
     };
-    make_pyerror_deferred_t(kind, w_type, w_fmt_x0, valuefmt.as_ptr(), valuefmt.len())
+    make_pyerror_deferred_t(kind, w_type, fmt_x0, valuefmt.as_ptr(), valuefmt.len())
 }
 
 /// `OperationError(w_type, space.newtext(message))`. The instance is built
@@ -5862,7 +5855,7 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
 /// The two `OpErrFmt` classes exist so RPython can defer `%`-interleaving until
 /// something reads the message. `get_operrcls2` cannot mint a class here; a
 /// single `%T` or `%s` text stores the same payload on `PyErrorObject`
-/// (`w_fmt_x0` plus the format-string constant) and formats on first read.
+/// (`fmt_x0` plus the format-string constant) and formats on first read.
 /// The other conversions still run up front. Both arms then build the error
 /// **from `w_type`**.
 ///
@@ -6001,7 +5994,7 @@ pub fn oefmt_noargs(kind: PyErrorKind, valuefmt: &'static str) -> OperationError
 /// reads `space.type(value).name` or the stored text only from
 /// `OperationError.get_w_value`. pyre cannot mint that class (`get_operrcls2`
 /// already admits this), so the same payload sits on `PyErrorObject`
-/// (`w_fmt_x0`, the format-string constant) next to `w_name_context` /
+/// (`fmt_x0`, the format-string constant) next to `w_name_context` /
 /// `w_obj_context`. That carrier holds one object operand; `_properror`'s
 /// `"property %R of '%s' object has no %s"` has no extra slots and stays on
 /// the eager walk. The look-inside ctor is [`make_pyerror_deferred_t`], split
@@ -6068,7 +6061,7 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -
                 args[0].kind_name()
             );
         };
-        return oefmt_single_t(w_type, valuefmt, obj);
+        return oefmt_single_t(w_type, valuefmt, obj as pyre_object::gc_hook::GCREF);
     }
     if valuefmt_is_single_s(valuefmt) {
         assert_eq!(
@@ -6600,11 +6593,10 @@ mod tests {
         // `error.py get_operrcls2.OpErrFmt.__init__`: store w_type, x0, and
         // the format constant. `_compute_value` runs on first read.
         let payload = pyre_object::unicodeobject::alloc_utf8_payload(b"-1.1", true);
-        let w_fmt_x0 = pyre_object::unicodeobject::w_str_from_storage(payload);
         let err = super::oefmt_one(
             super::PyErrorKind::ValueError,
             std::ptr::null_mut(),
-            w_fmt_x0,
+            payload as pyre_object::gc_hook::GCREF,
             "expected a nonnegative input, got %s",
         );
         assert!(
@@ -6635,13 +6627,13 @@ mod tests {
             "first read clears the pending format latch"
         );
 
-        // Non-ASCII `%s` still uses `codepoints_in_utf8` for `x0._length`.
+        // Stored operand is the rstr STR itself (`OpErrFmt.__init__` x0).
         let text = "abc \u{e0}\u{e8}\u{ec}\u{f2}\u{f9}";
         let err = super::oefmt(std::ptr::null_mut(), "got %s", &[super::FmtArg::Text(text)]);
         assert!(err.has_deferred_fmt());
         assert_eq!(
-            unsafe { pyre_object::w_str_len(err.w_fmt_x0) },
-            text.chars().count()
+            unsafe { pyre_object::unicodeobject::utf8_payload_wtf8(err.fmt_x0 as _) }.as_bytes(),
+            text.as_bytes()
         );
         assert_eq!(err.message_text(), format!("got {text}"));
     }
@@ -6835,7 +6827,7 @@ mod tests {
         err.set_exc_object(dummy(0x1000));
         err.set_w_name_context(dummy(0x2000));
         err.set_w_obj_context(dummy(0x3000));
-        err.set_w_fmt_x0(dummy(0x4000));
+        err.set_fmt_x0(dummy(0x4000) as pyre_object::gc_hook::GCREF);
         let roots = pyre_object::gc_roots::push_roots();
         let base = err.pin(&roots);
         let handle = err.as_raw();
@@ -6855,7 +6847,7 @@ mod tests {
         assert_eq!(err.exc_object as usize, 0x1000);
         assert_eq!(err.w_name_context as usize, 0x2000);
         assert_eq!(err.w_obj_context as usize, 0x3000);
-        assert_eq!(err.w_fmt_x0 as usize, 0x4000);
+        assert_eq!(err.fmt_x0 as usize, 0x4000);
     }
 
     #[test]
@@ -6887,7 +6879,7 @@ mod tests {
             err.message.is_null(),
             "OpErrFmt.__init__ must not call _compute_value"
         );
-        assert!(!err.w_fmt_x0.is_null());
+        assert!(!err.fmt_x0.is_null());
         assert_eq!(
             err.fmt_valuefmt_len,
             "object of type '%T' has no len()".len()
@@ -6898,7 +6890,7 @@ mod tests {
 
     #[test]
     fn oefmt_property_r_and_s_format_is_eager() {
-        // `PyErrorObject.w_fmt_x0` is `OpErrFmt.x0` for a single `%T`.
+        // `PyErrorObject.fmt_x0` is `OpErrFmt.x0` for a single `%T`.
         // `_properror`'s `"property %R of '%s' object has no %s"` needs a
         // carrier extension to defer; until then `_compute_value` runs here.
         crate::typedef::init_typeobjects();

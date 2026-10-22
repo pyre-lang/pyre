@@ -286,12 +286,11 @@ fn sqrt_from_double(x: f64) -> PyResult {
 /// the format is an interned `&str` literal (`__str_const`).
 fn sqrt_translate_ll_error(x: f64) -> PyResult {
     let payload = pyre_interpreter::display::jit_format_float_repr_rstr(x);
-    let w_fmt_x0 = pyre_object::unicodeobject::w_str_from_storage(payload);
     let w_type = pyre_object::interp_exceptions::lookup_exc_class_for_kind(ExcKind::ValueError);
     Err(pyre_interpreter::error::oefmt_one(
         pyre_interpreter::PyErrorKind::ValueError,
         w_type,
-        w_fmt_x0,
+        payload as pyre_object::gc_hook::GCREF,
         "expected a nonnegative input, got %s",
     ))
 }
