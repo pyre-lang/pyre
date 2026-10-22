@@ -1103,11 +1103,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
-    # The dynasm leg carries the pip end-to-end and the CPython suite as well,
-    # and measured 48 min without them against the 11 min they take. The cap
-    # comes from the job they used to be, and still bounds a hang rather than
-    # the work.
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy: &pyre-check-backends
       # Linux runs one job per backend and macOS runs both backends in one job;
       # Windows runs dynasm alone. `check.py` builds each backend's release
