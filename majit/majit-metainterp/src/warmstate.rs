@@ -9,7 +9,8 @@ use indexmap::IndexMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_backend::JitCellToken;
-use majit_ir::{GreenKey, GreenType, RetainedGreens, Type};
+use majit_ir::{GREEN_INLINE, GreenKey, GreenType, RetainedGreens, Type};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 use crate::counter::{DEFAULT_SIZE, JitCounter};
@@ -184,6 +185,17 @@ impl BaseJitCell {
         }
     }
 
+    /// Live `JitCell.gN` values (`warmstate.py` `make_jitcell_subclass`).
+    ///
+    /// `greens` holds the addresses copied at install. Each `gN` is a
+    /// GC-managed field upstream, so a retained Ref is read through
+    /// `retained_greens.current_value`.
+    pub fn current_greens(&self) -> SmallVec<[i64; GREEN_INLINE]> {
+        (0..self.greens.len())
+            .map(|i| self.retained_greens.current_value(i, self.greens[i]))
+            .collect()
+    }
+
     /// warmstate.py `JitCell.comparekey(*greenargs2)`:
     ///
     /// ```python
@@ -201,24 +213,16 @@ impl BaseJitCell {
     /// (`jitdriver_sd._green_args_spec`), used only to pick
     /// `equal_whatever`'s TYPE. There is no types comparison: every
     /// caller has already checked `cell.jitdriver_sd`
-    /// (`isinstance(cell, JitCell)`).
+    /// (`isinstance(cell, JitCell)`). Each `gN` is the same per-index
+    /// read as [`Self::current_greens`].
     #[inline(always)]
     pub fn comparekey(&self, greenargs: &[i64], types: &[GreenType]) -> bool {
         debug_assert_eq!(types.len(), greenargs.len());
-        let greens = &self.greens[..];
-        if greens.len() != types.len() {
+        if self.greens.len() != types.len() {
             return false;
         }
-        if self.retained_greens.is_empty() {
-            for i in 0..types.len() {
-                if !majit_ir::equal_whatever(types[i], greens[i], greenargs[i]) {
-                    return false;
-                }
-            }
-            return true;
-        }
         for i in 0..types.len() {
-            let item1 = self.retained_greens.current_value(i, greens[i]);
+            let item1 = self.retained_greens.current_value(i, self.greens[i]);
             if !majit_ir::equal_whatever(types[i], item1, greenargs[i]) {
                 return false;
             }
@@ -997,7 +1001,8 @@ impl WarmEnterState {
                     "the hash form names an installed cell; a tracing start without one needs greens, \
                      warmstate.py bound_reached JitCell(*greenargs) — use the `_for_key` twin",
                 );
-                if !self.confirm_enter_jit_if_available(Some(&cell.greens[..])) {
+                let greens = cell.current_greens();
+                if !self.confirm_enter_jit_if_available(Some(&greens[..])) {
                     return HotResult::NotHot;
                 }
             }
@@ -1086,12 +1091,13 @@ impl WarmEnterState {
         let cell = self.cell_by_key(cell_key);
         let is_runnable = cell.as_ref().is_some_and(|c| c.is_compiled());
         let hash = self.bucket_of(cell_key);
+        let greens = cell.as_ref().map(|c| c.current_greens());
         matches!(
             self.maybe_compile_and_run_decision(
                 cell.as_deref(),
                 hash,
                 self.increment_threshold,
-                cell.as_ref().map(|c| &c.greens[..]),
+                greens.as_deref(),
                 is_runnable,
                 WarmEntryDoor::BackEdge,
             ),
@@ -1138,11 +1144,12 @@ impl WarmEnterState {
             .as_ref()
             .is_some_and(|c| c.is_compiled() && has_compiled_meta(cell_key));
         let hash = self.bucket_of(cell_key);
+        let greens = cell.as_ref().map(|c| c.current_greens());
         self.maybe_compile_and_run_decision(
             cell.as_deref(),
             hash,
             self.increment_threshold,
-            cell.as_ref().map(|c| &c.greens[..]),
+            greens.as_deref(),
             is_runnable,
             WarmEntryDoor::BackEdge,
         )
@@ -1286,13 +1293,14 @@ impl WarmEnterState {
     /// driver, so the stored greens always match that spec.
     pub fn installed_greenkey(&self, cell_key: u64, types: &[GreenType]) -> Option<GreenKey> {
         self.cell_by_key(cell_key).map(|c| {
+            let greens = c.current_greens();
             assert_eq!(
-                c.greens.len(),
+                greens.len(),
                 types.len(),
                 "cell greens match the driver's _green_args_spec \
                  (warmstate.py make_jitcell_subclass)"
             );
-            GreenKey::with_types(c.greens.to_vec(), types.to_vec())
+            GreenKey::with_types(greens, types.to_vec())
         })
     }
 
@@ -1315,7 +1323,8 @@ impl WarmEnterState {
     pub fn force_start_tracing(&mut self, cell_key: u64) -> HotResult {
         if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() {
-                if !self.confirm_enter_jit_if_available(Some(&cell.greens[..])) {
+                let greens = cell.current_greens();
+                if !self.confirm_enter_jit_if_available(Some(&greens[..])) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -2334,7 +2343,8 @@ impl WarmEnterState {
             return true;
         }
         let cell = self.cell_by_key(cell_key);
-        self.confirm_enter_jit_if_available(cell.as_ref().map(|c| &c.greens[..]))
+        let greens = cell.as_ref().map(|c| c.current_greens());
+        self.confirm_enter_jit_if_available(greens.as_deref())
     }
 
     /// `warmspot.py` `make_driverhook_graphs` —
@@ -5354,6 +5364,25 @@ mod tests {
             assert!(
                 cell.comparekey_matches(&moved_key),
                 "comparekey must read the collector-forwarded owner-root value"
+            );
+            assert_eq!(
+                cell.current_greens()[2],
+                MOVED_REF_GREEN,
+                "current_greens reads the same forwarded gN as comparekey"
+            );
+            let cell_key = cell.cell_key.get().expect("installed cell has a key");
+            let types = [
+                GreenType::Int,
+                GreenType::Int,
+                GreenType::Ref,
+                GreenType::Ref,
+            ];
+            let installed = ws
+                .installed_greenkey(cell_key, &types)
+                .expect("the retained cell is named by its cell key");
+            assert_eq!(
+                installed.values[2], MOVED_REF_GREEN,
+                "installed_greenkey reconstructs from forwarded gN values"
             );
         }
 

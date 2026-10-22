@@ -5800,10 +5800,11 @@ impl TraceCtx {
 
     /// pyjitpl.py `same_greenkey(original_boxes, live_arg_boxes, num_green_args)`.
     ///
-    /// Typed greens compare with `GreenKey::eq` (`comparekey` /
-    /// `equal_whatever`). Hash equality is only the fallback when the live
-    /// side has no typed key (`MetaInterp::cross_loop_cut_info` names the
-    /// cut by `cut_inner_green_key`, a cell key).
+    /// Typed greens compare with `GreenKey::same_constant` (`pyjitpl.py`
+    /// `same_greenkey` / `Const.same_constant`). Hash equality is only the
+    /// fallback when the live side has no typed key
+    /// (`MetaInterp::cross_loop_cut_info` names the cut by
+    /// `cut_inner_green_key`, a cell key).
     pub fn has_merge_point_same_greenkey(
         &self,
         key: u64,
@@ -5826,7 +5827,7 @@ impl TraceCtx {
                 "same_greenkey: merge points in one trace share the jitdriver shape"
             );
             let greens_match = match live_typed {
-                Some(live) => mp.green_key_typed == *live,
+                Some(live) => mp.green_key_typed.same_constant(live),
                 None => mp.green_key == key,
             };
             if greens_match {
@@ -5940,9 +5941,9 @@ impl TraceCtx {
     /// point's own pc (and the other way round). `header_pc` on
     /// [`MergePoint`] stays the guest pc of that visit, for the cut.
     ///
-    /// Typed greens use `GreenKey::eq` (`comparekey`). Hash equality is the
-    /// fallback when the live side has no typed key
-    /// (`MetaInterp::cross_loop_cut_info`).
+    /// Typed greens use `GreenKey::same_constant` (`pyjitpl.py`
+    /// `same_greenkey`). Hash equality is the fallback when the live side
+    /// has no typed key (`MetaInterp::cross_loop_cut_info`).
     pub fn find_merge_point_same_greenkey(
         &self,
         key: u64,
@@ -5952,7 +5953,7 @@ impl TraceCtx {
             .iter()
             .rev()
             .find(|mp| match live_typed {
-                Some(live) => mp.green_key_typed == *live,
+                Some(live) => mp.green_key_typed.same_constant(live),
                 None => mp.green_key == key,
             })
     }

@@ -5663,36 +5663,43 @@ impl<S: JitState> JitDriver<S> {
                 ctx.green_key_values().cloned(),
             )
         };
-        let named = close
-            .as_ref()
-            .filter(|key| key.get_uhash() == target_key)
-            .cloned()
-            .or_else(|| {
-                start
+        // The target is the installed cell named by `target_key`
+        // (`pyjitpl.py` `reached_loop_header` compares live green
+        // constants). A typed key whose raw hash equals a minted cell
+        // id is not that cell.
+        let jd_no = self.index().unwrap_or(0);
+        let types = self
+            .meta
+            .staticdata
+            .jitdrivers_sd
+            .get(jd_no)
+            .map(|jd| jd.green_args_spec())
+            .expect("the driver this trace runs on");
+        let key_typed = {
+            let warm = self.meta.warm_state_for_driver(jd_no);
+            if let Some(installed) = warm.installed_greenkey(target_key, &types) {
+                installed
+            } else {
+                // A minted id exists only for an installed cell, so a miss
+                // here is an uninstalled target. Prefer close/start when
+                // they resolve to `target_key`; otherwise they are still
+                // the live boxes `reached_loop_header` appends.
+                let matches_target = |key: &majit_ir::GreenKey| {
+                    warm.resolve_cell_key(key.get_uhash(), || key.clone()) == target_key
+                };
+                close
                     .as_ref()
-                    .filter(|key| key.get_uhash() == target_key)
+                    .filter(|key| matches_target(key))
                     .cloned()
-            });
-        let key_typed = named
-            .or_else(|| {
-                let jd_no = self.index().unwrap_or(0);
-                let types = self
-                    .meta
-                    .staticdata
-                    .jitdrivers_sd
-                    .get(jd_no)
-                    .map(|jd| jd.green_args_spec())
-                    .expect("the driver this trace runs on");
-                self.meta
-                    .warm_state_for_driver(jd_no)
-                    .installed_greenkey(target_key, &types)
-            })
-            .or(close)
-            .or(start)
-            .expect(
-                "keep_tracing_after_declined_jump: a merge point keeps its greens: \
-                 pyjitpl.py reached_loop_header live_arg_boxes",
-            );
+                    .or_else(|| start.as_ref().filter(|key| matches_target(key)).cloned())
+                    .or(close)
+                    .or(start)
+                    .expect(
+                        "keep_tracing_after_declined_jump: a merge point keeps its greens: \
+                         pyjitpl.py reached_loop_header live_arg_boxes",
+                    )
+            }
+        };
         let already = {
             let Some(ctx) = self.meta.trace_ctx() else {
                 return false;
@@ -16812,6 +16819,55 @@ mod cross_loop_cut_close_tests {
         assert!(
             !driver.meta.is_cross_loop_cut_key(inner_key.get_uhash()),
             "the cut mark must not outlive the loop it describes",
+        );
+    }
+
+    /// A declined jump's target is the installed cell, not a typed key
+    /// whose `get_uhash` equals that cell's minted id.
+    #[test]
+    fn declined_jump_names_the_installed_cell_not_a_hash_match() {
+        let mut driver = cut_close_driver();
+        let parked = majit_ir::GreenKey::new(vec![7100, 7200]);
+        let parked_bucket = parked.get_uhash();
+        let squatter = gk_with_uhash(parked_bucket, 7300);
+        assert_ne!(squatter, parked);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .ensure_cell_for_key(&squatter);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .ensure_cell_for_key(&parked);
+        let minted = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_key_for(&parked)
+            .expect("colliding squatter forces a minted key");
+        assert_ne!(minted, parked_bucket);
+        let start_a = gk_with_uhash(minted, 8100);
+        assert_eq!(start_a.get_uhash(), minted);
+        assert_ne!(start_a, parked);
+
+        start_outer_trace(&mut driver, 8110);
+        {
+            let ctx = driver.meta.trace_ctx().expect("tracing");
+            ctx.set_green_key_values(start_a);
+        }
+        assert!(
+            driver.keep_tracing_after_declined_jump(minted, &[OpRef::input_arg_int(0)]),
+            "first visit of the target appends and keeps tracing"
+        );
+        let mp = driver
+            .meta
+            .trace_ctx()
+            .expect("tracing")
+            .current_merge_points
+            .last()
+            .expect("declined jump registered a merge point");
+        assert!(
+            mp.green_key_typed.same_constant(&parked),
+            "the merge point stores B's greens, not A's hash-equal start key"
         );
     }
 }

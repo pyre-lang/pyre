@@ -3704,15 +3704,9 @@ where
         // pc-aligned portal runtimes (dispatch.rs test fixtures) wire
         // `portal_jitcode`; enter their portal at `green_pc` as before.
         if let Some(portal) = runtime.portal_jitcode(jd_index) {
-            let mut portal_frame = self.frames.take_frame(portal, green_pc, None, Some(ctx));
-            portal_frame.code_cursor = green_pc;
-            ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
-            // pyjitpl.py `MetaInterp.newframe`: `portal_call_depth += 1`, then
-            // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
-            // and `enter_portal_frame(jd_no, unique_id)`.
-            ctx.adjust_portal_call_depth(1);
             // pyjitpl.py `_opimpl_recursive_call` `boxes3` concatenates I then
-            // R then F; `newframe` uses that one `greenkey` for unique_id and
+            // R then F; `newframe(jitcode, greenkey)` → `f.setup(jitcode,
+            // greenkey)` uses that one `greenkey` for unique_id and
             // `portal_trace_positions`.
             let mut types = Vec::with_capacity(greens_i.len() + greens_r.len() + greens_f.len());
             types.extend(std::iter::repeat(GreenType::Int).take(greens_i.len()));
@@ -3720,6 +3714,15 @@ where
             types.extend(std::iter::repeat(GreenType::Float).take(greens_f.len()));
             let typed = GreenKey::with_types(green_values.clone(), types);
             let greenkey: crate::pyjitpl::PortalGreenKey = (typed.get_uhash(), typed);
+            let mut portal_frame =
+                self.frames
+                    .take_frame(portal, green_pc, Some(greenkey.clone()), Some(ctx));
+            portal_frame.code_cursor = green_pc;
+            ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
+            // pyjitpl.py `MetaInterp.newframe`: `portal_call_depth += 1`, then
+            // `unique_id = jitcode.jitdriver_sd.warmstate.get_unique_id(greenkey)`
+            // and `enter_portal_frame(jd_no, unique_id)`.
+            ctx.adjust_portal_call_depth(1);
             let unique_id = ctx.unique_id_for_greenkey(jd_index, &greenkey);
             let jd_box = ctx.const_int(jd_index as i64);
             let uid_box = ctx.const_int(unique_id as i64);
