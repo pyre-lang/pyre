@@ -42914,15 +42914,18 @@ impl<'a> Lowering<'a> {
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
         );
-        // RPython has one string type. A rust-heap `String` payload still
-        // paints `Ref` so `ll_strconcat` does not consume `{cap, ptr, len}`,
-        // but the `None` sentinel of `Option<&String>` is `convert_const(None)`
-        // on `StringRepr` (`STRPTR` nullptr). Leave the null as a classdef-less
-        // `SomeInstance` and `is_` sees `StringRepr` vs `InstanceRepr(object)`.
-        if matches!(payload_ty, ValueType::Str)
-            || tyref_is_string_family(&TyRef::Other(payload.clone()), self.llbc)
+        // RPython has one string type. Every [`tyref_is_option_of_string_value`]
+        // payload paints `Str` here (`&str` / `Utf8Str` / `Wtf8` / `Wtf8Buf`).
+        // A rust-heap `String` payload still paints `Ref` so `ll_strconcat`
+        // does not consume `{cap, ptr, len}`. The `None` of `Option<String>`
+        // / `Option<&String>` is that same null Ref, not a `STR` pointer.
+        if tyref_is_option_of_string_value(option_ty, self.llbc)
+            || matches!(payload_ty, ValueType::Str)
         {
             return Some((rendered, ValueType::Str));
+        }
+        if tyref_is_string_family(&TyRef::Other(payload.clone()), self.llbc) {
+            return Some((rendered, payload_ty));
         }
         if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
             return Some((rendered.clone(), ValueType::Ref(Some(rendered))));
@@ -45101,34 +45104,6 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// `true` when Charon's resolved layout for `ty` is a two-variant
-    /// enum stored in one pointer word with no `Branch` tag.
-    ///
-    /// That is the physical encoding of a pointer niche: `None` is the
-    /// null word and `Some(p)` is `p`.  A `Branch` discriminator is a
-    /// tagged enum and stays an aggregate `__discriminant` read.  Generic
-    /// declarations (including `core::option::Option`) emit no layout;
-    /// those return `false` here and the payload-shape walk decides.
-    fn tyref_enum_layout_is_pointer_niche(&self, ty: &TyRef) -> bool {
-        let Some(def_id) = self.tyref_adt_def_id(ty) else {
-            return false;
-        };
-        let Some(td) = self.llbc.type_by_id(def_id) else {
-            return false;
-        };
-        let TypeDeclKind::Enum(variants) = &td.kind else {
-            return false;
-        };
-        if variants.len() != 2 {
-            return false;
-        }
-        let target = std::env::var("TARGET").unwrap_or_default();
-        let Some(layout) = td.layout_for_target(self.llbc, &target) else {
-            return false;
-        };
-        !layout.has_branch_discriminant() && matches!(layout.size, Some(4 | 8))
-    }
-
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
     /// one variant and every variant carrying zero payload fields.  Such
     /// an enum is represented by-value as its discriminant integer, so
@@ -45253,10 +45228,12 @@ impl<'a> Lowering<'a> {
     /// `&[T]` / `&dyn` carry no ADT def-id, and an unsized nominal newtype (a
     /// DST such as `Wtf8 { bytes: [u8] }`) DOES carry a def-id but has no
     /// concrete layout size — both are two-word references with no one-word
-    /// niche payload. Bare `&str` is the deliberate exception because the
-    /// front has already replaced that Rust `(data, len)` spelling with
-    /// RPython's single `SomeString` value. PyPy `BuiltinCode.docstring` is
-    /// exactly `SomeString(can_be_None=True)` (`gateway.py:getdocstring`), not
+    /// niche payload. String-family fat refs (`&str`, `&[u8]`, `&Wtf8`) and
+    /// by-value `Wtf8Buf` return from the early
+    /// [`tyref_is_option_of_string_value`] arm: the front has already
+    /// replaced that Rust `(data, len)` spelling with RPython's single
+    /// `SomeString` value. PyPy `BuiltinCode.docstring` is exactly
+    /// `SomeString(can_be_None=True)` (`gateway.py:getdocstring`), not
     /// a tag + payload aggregate.
     ///
     /// `front::iter_next` interaction (shared arm only). `Iterator::next()`
@@ -45281,214 +45258,7 @@ impl<'a> Lowering<'a> {
     /// iter_next the null-test shape (its matcher must accept the
     /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
     fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
-        if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
-            return false;
-        }
-        // `Option<&[u8]>` is a two-word nullable window, not a one-word
-        // STR niche. Pair locals carry it as `{data, len}` with a null
-        // data word for `None`.
-        if tyref_is_u8_window(ty, self.llbc) {
-            return false;
-        }
-        // A `Vec` of one-word items is the header address, never null
-        // (`RustVecRepr`). Charon's `Option<Vec<T>>` layout may still be
-        // a pointer niche (the source `Unique` word); the translated
-        // Option keeps its tag so the payload stays `Int` for
-        // `ll_vec_length` / `gcarray_from_pyobject_vec`.
-        if crate::front::result_exc::tyref_option_payload(ty, self.llbc)
-            .is_some_and(|payload| tyref_rust_vec_item_kind(&payload, self.llbc).is_some())
-        {
-            return false;
-        }
-        // Instantiated `Option<T>` whose Charon layout occupies one
-        // pointer word with no `Branch` tag is already a null niche.
-        // Generic `Option` declarations carry no layout; those fall
-        // through to the payload-shape walk below.
-        if self.tyref_enum_layout_is_pointer_niche(ty) {
-            return true;
-        }
-        let Some(node) = tyref_node(ty, self.llbc) else {
-            return false;
-        };
-        let Some(payload) = node
-            .as_object()
-            .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.as_object())
-            .and_then(|a| type_decl_ref_generics(a, self.llbc))
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-            .and_then(|t| t.first())
-        else {
-            return false;
-        };
-        // `opcode_for_iter`'s match is `Option<H::Value>`. The only
-        // `IterOpcodeHandler` impl binds `Value = *mut PyObject`, which
-        // Rust represents as a null niche. The generic body still spells
-        // the payload as a trait projection, so peel that unique binding
-        // before the raw-pointer test. A multi-impl projection stays
-        // unresolved and keeps the tagged aggregate.
-        let resolved_assoc = trait_payload_node(payload, self.llbc)
-            .and_then(|node| trait_assoc_projection_target(node, self.llbc));
-        let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
-        let payload = resolved_body.unwrap_or(payload);
-        let Some(payload) = type_node_peel_aliases(payload, self.llbc) else {
-            return false;
-        };
-        // `OwnerRootGuard` lowers as the one reference it roots, so
-        // `Option<OwnerRootGuard>` is the same nullable word as
-        // `Option<*mut T>`.
-        if owner_root_guard::type_node_is_guard(payload, self.llbc) {
-            return true;
-        }
-        if type_node_is_mut_ref(payload, self.llbc) {
-            return true;
-        }
-        // `Box<T>` is a non-null owning pointer, so `Option<Box<T>>` uses the
-        // same null niche as `Option<&T>`.  Keep the same concrete-layout gate
-        // as the reference/raw-pointer arms: `Box<dyn Trait>` and `Box<[T]>`
-        // are fat pointers, while a boxed nominal ADT such as the interpreter's
-        // error object is one word.  RPython's owning GC pointer has this same
-        // nullable `SomeInstance` shape; there is no separate Option object.
-        if type_node_is_thin_box(payload, self.llbc) {
-            return true;
-        }
-        // A function pointer is one word, and `Option<fn(..)>` represents
-        // `None` as the null pointer.  The payload therefore aliases the
-        // base pointer directly and carries no metadata word.
-        if type_node_is_fn_ptr(payload, self.llbc) {
-            return true;
-        }
-        // A shared reference `&T` is equally a one-word null-pointer niche
-        // (`Option<&T>` = nullable pointer, `Some(&T)` = the non-null pointer),
-        // but ONLY when the pointee is thin (Sized). A fat reference — `&str` /
-        // `&[T]` / `&dyn Trait`, and crucially an unsized nominal newtype like
-        // `rustpython_wtf8::Wtf8 { bytes: [u8] }` (`&Wtf8` = data + length word) —
-        // is two words, so aliasing the payload to the base pointer would read
-        // the metadata word. A def-id alone does NOT imply thin: a DST newtype
-        // is a nominal ADT with a def-id. Gate on the pointee's RESOLVED layout
-        // size being concrete (`Some`) — `None` is the DST/unsized signature.
-        // `getdebug_data() -> Option<&FrameDebugData>` is a live shared-ref
-        // producer reaching here; its `FrameDebugData` pointee is Sized
-        // (carries a concrete layout size).
-        if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc) {
-            let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc) else {
-                return false;
-            };
-            // Rust's `&str` is a fat pointer, but this source translator has
-            // already projected the bare builtin `str` to RPython's single GC
-            // string pointer (`SomeString`). Preserve that projection through
-            // `Option`: None is the null string pointer and Some is the string
-            // itself. Do not admit nominal unsized wrappers here;
-            // `Option<&Wtf8>` remains the aggregate pinned below.
-            if stripped.get("Adt").and_then(type_decl_ref_builtin) == Some("Str") {
-                return true;
-            }
-            // Shared `&[u8]` is a two-word window. `Option<&[u8]>` is
-            // handled above (`tyref_is_u8_window`); a bare `[u8]`
-            // referent is not a one-word STR niche.
-            if tyref_is_bare_u8_slice(&TyRef::Other(stripped.clone()), self.llbc) {
-                return false;
-            }
-            // `&*mut T` is a thin shared reference even though its pointee is
-            // itself a raw pointer rather than a nominal ADT.  This is the
-            // shape of `<[*mut PyObject]>::get`: `Option<&PyObjectRef>` is one
-            // nullable reference word, and its successful value is the list
-            // item pointer.  RPython has no Option aggregate here; it is the
-            // same `SomeInstance(T, can_be_None=True)` pointer lattice as the
-            // direct `&T` nominal-ADT arm below.
-            if type_node_raw_ptr_pointee(stripped, self.llbc).is_some() {
-                return true;
-            }
-            if let Some(def_id) = adt_node_def_id(stripped)
-                && self
-                    .llbc
-                    .type_by_id(def_id)
-                    .and_then(|td| {
-                        td.layout_for_target(
-                            self.llbc,
-                            &std::env::var("TARGET").unwrap_or_default(),
-                        )
-                    })
-                    .and_then(|l| l.size)
-                    .is_some()
-            {
-                return true;
-            }
-        }
-        // A direct raw pointer to a nominal ADT is the one-word address of
-        // that aggregate in these graphs. Keep the concrete-layout gate even
-        // though such raw-pointer DSTs are not expected: Charon represents an
-        // unsized nominal pointee as a fat pointer, whose metadata cannot
-        // alias the single base word. Primitive/scalar pointees have no ADT
-        // def-id and deliberately remain excluded because `Some(null)` may be
-        // observably distinct from `None` for such payloads.
-        //
-        // `Option<*mut PyObjectRef>` expands to `Option<*mut *mut PyObject>`:
-        // the pointee is itself a raw pointer, not an ADT, so the layout
-        // gate below misses. It is still one nullable word.
-        if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, self.llbc)
-            && let Some(stripped) = strip_ty_wrappers(raw_pointee, self.llbc)
-            && type_node_raw_ptr_pointee(stripped, self.llbc).is_some()
-        {
-            return true;
-        }
-        if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, self.llbc)
-            && let Some(stripped) = strip_ty_wrappers(raw_pointee, self.llbc)
-            && let Some(def_id) = adt_node_def_id(stripped)
-            && self.llbc.type_by_id(def_id).is_some_and(|td| {
-                // A recorded layout must name a concrete size (a DST is not
-                // one word). A cross-crate nominal pointee often has no
-                // layout in this ullbc at all; `RawPtr` is already the thin
-                // spelling, so a missing layout is still the nullable
-                // pointer, not a two-word shell. Reading `__discriminant`
-                // off that pointer loads the pointee header and the match
-                // falls into `unreachable`.
-                match td.layout_for_target(self.llbc, &std::env::var("TARGET").unwrap_or_default())
-                {
-                    Some(layout) => layout.size.is_some(),
-                    None => td.layout.is_none(),
-                }
-            })
-        {
-            return true;
-        }
-        let Some(payload) = strip_ty_wrappers(payload, self.llbc) else {
-            return false;
-        };
-        // The same projection as `Option<Vec<T>>` below applies to the
-        // string family: rstr `STR` wrappers and rust-heap
-        // `alloc::string::String` ([`tyref_is_string_family`], `SomeString`).
-        // `node_is_string_value` excludes the rust-heap header; the family
-        // predicate is what `option_niche_null_cast` already uses.
-        // `Option<String>` is the nullable form (`s is None` /
-        // `s is not None`; `pairtype(SomeObject, SomeObject).is_`,
-        // `rtype_is_` / `ptr_iszero`), and `Some` is the string itself —
-        // there is no `__discriminant` / `__pos_0` field.
-        if tyref_is_string_family(&TyRef::Other(payload.clone()), self.llbc) {
-            return true;
-        }
-        let Some(def_id) = adt_node_def_id(payload) else {
-            return false;
-        };
-        let payload_path = self
-            .llbc
-            .type_by_id(def_id)
-            .map(|td| td.item_meta.name_path());
-        // PyPy TextIOWrapper.pending_bytes is `None` or an ordinary RPython
-        // list (`interp_textio.py:_writeflush`). Rust's `Vec<T>` is a
-        // three-word source spelling, but the front translates it to the same
-        // one-pointer `SomeList`; retaining Rust's enum tag after that
-        // projection manufactures an attribute no RPython object has.
-        // A `Vec` of one-word items is instead the address of its raw
-        // `{ptr, len, cap}` header, which is never null, so its `Option`
-        // keeps the tagged aggregate.
-        match payload_path.as_deref() {
-            Some("core::ptr::non_null::NonNull") => true,
-            Some("alloc::vec::Vec") => {
-                tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_none()
-            }
-            _ => false,
-        }
+        tyref_is_niche_option(ty, self.llbc)
     }
 
     /// `true` when `option_ty` is a niche nullable `Option<P>` and `P`
@@ -45601,7 +45371,7 @@ impl<'a> Lowering<'a> {
     /// * Address identity (`*mut T` / `*const T`, `NonNull<T>`,
     ///   function pointer) — `rclass.py` `rtype_eq` / `rtype_ne`
     ///   → `ptr_eq` / `ptr_ne`; `rptr.py` `PtrRepr.rtype_eq`.
-    /// * String-family (`node_is_string_value`, including
+    /// * String-family (`tyref_is_option_of_string_value` and
     ///   `Option<&str>` / `Option<String>`) — `rstr.py`
     ///   `AbstractStringRepr.rtype_eq` / `rtype_ne` →
     ///   `ll_streq`, which already treats a null operand
@@ -67692,9 +67462,12 @@ fn tyref_to_value_type_with(
     }
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
-        || tyref_is_option_of_string_family(ty, llbc)
+        || tyref_is_option_of_string_value(ty, llbc)
     {
         return ValueType::Str;
+    }
+    if let Some(paint) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
+        return paint;
     }
     // A payload-carrying enum (any variant has a non-ZST field) is a
     // `SomeInstance` of its interned enum-base classdef.  Fieldless
@@ -69067,7 +68840,7 @@ fn dont_look_inside_return_is_str(
     let ty = payload.as_ref().unwrap_or(output);
     tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
-        || tyref_is_option_of_string_family(ty, llbc)
+        || tyref_is_option_of_string_value(ty, llbc)
 }
 
 /// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to the
@@ -69281,9 +69054,12 @@ fn tyref_to_attr_value_type_with(
     }
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
-        || tyref_is_option_of_string_family(ty, llbc)
+        || tyref_is_option_of_string_value(ty, llbc)
     {
         return ValueType::Str;
+    }
+    if let Some(paint) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
+        return paint;
     }
     // `history.getkind` puts `Ptr(FuncType)` in the int bank. A struct
     // field or enum payload (`Option<fn>`'s `Some` word, a stored `fn`)
@@ -69796,6 +69572,9 @@ fn tyref_input_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    if let Some(ValueType::Ref(root)) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
+        return root;
+    }
     let leaf = tyref_class_root_with(ty, llbc, tombstoned);
     if leaf
         .as_deref()
@@ -69823,9 +69602,9 @@ fn tyref_input_class_root(
 /// (`rclass.py` `getclsfield`). Without this seed the formal is
 /// `SomeInstance { classdef: None }` and `getattr __discriminant` walls.
 ///
-/// A pointer-niche Option (`Option<*mut T>`) is the null word on both
-/// the value and the parameter path. Vec/Box stay on their annotator
-/// models (`adt_head_instantiation_suffix` is enum-only).
+/// A pointer-niche Option ([`tyref_is_niche_option`]) is the null word
+/// on both the value and the parameter path. Vec/Box stay on their
+/// annotator models (`adt_head_instantiation_suffix` is enum-only).
 fn tyref_split_core_enum_param_root(
     ty: &TyRef,
     llbc: &Llbc,
@@ -69844,7 +69623,13 @@ fn tyref_split_core_enum_param_root(
     let types = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.get("types"))
         .and_then(|t| t.as_array())?;
-    if types.len() == 1 && types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)) {
+    // A modeled pointer-niche Option is the null word, not an enum class.
+    // `adt_type_arg_is_pointer_like` also covers payloads the niche
+    // recognizer leaves as aggregates (scalar `*mut u8`): those stay
+    // classdef-less on both the value and the parameter path.
+    if tyref_is_niche_option(ty, llbc)
+        || (types.len() == 1 && types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)))
+    {
         return None;
     }
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
@@ -71350,14 +71135,278 @@ fn tyref_is_option_of_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     })
 }
 
-/// `Option` of an rstr `STR` wrapper or a rust-heap `String`: a nullable
-/// `SomeString`. The `Some` word is the string itself
-/// (`tyref_is_niche_option_ptr`); painting the Option as the payload-enum
+/// `Option` of an rstr `STR` value: a nullable `SomeString`.
+///
+/// `P` is a value the classifier paints `ValueType::Str`
+/// ([`tyref_is_string_value`]): the builtin `str`, `Utf8Str` /
+/// `BytesBlock`, a shared `&str` / `&Wtf8` / `&Wtf8Buf`, or a
+/// by-value `Wtf8Buf` / `Utf8Str`. `&[u8]` is the
+/// [`tyref_is_u8_window`] window, painted `Int`. A rust-heap
+/// `String` (`{cap, ptr, len}`) is not this family, so
+/// `Option<String>` / `Option<&String>` / `Option<*mut String>`
+/// stay out. `Option<Vec<u8>>` is a list.
+/// The `Some` word of the admitted set is the string itself
+/// (`tyref_is_niche_option`); painting the Option as the payload-enum
 /// class makes a `Some` arm that aliases the base (`__pos_0`) join
 /// `Instance(Option) ∪ String`.
-fn tyref_is_option_of_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
+fn tyref_is_option_of_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
     crate::front::result_exc::tyref_option_payload(ty, llbc)
-        .is_some_and(|payload| tyref_is_string_family(&payload, llbc))
+        .is_some_and(|payload| tyref_is_string_value(&payload, llbc))
+}
+
+/// Paint of a niche `Option<P>` whose payload is a rust-heap `String`.
+///
+/// The niche is one pointer word: `Some` is the payload, `None` is null.
+/// `annotator/model.py` `SomeInstance(can_be_None=True)` / `SomePtr`
+/// nullable uses the payload's paint, so this Option intern's as that
+/// `Ref` made nullable rather than as the `Option<String>` enum class.
+fn tyref_niche_option_payload_paint(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<ValueType> {
+    if !tyref_is_niche_option(ty, llbc) {
+        return None;
+    }
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
+    if !tyref_is_rust_heap_string(&payload, llbc) {
+        return None;
+    }
+    Some(ValueType::Ref(tyref_class_root_with(
+        &payload, llbc, tombstoned,
+    )))
+}
+
+/// `true` when Charon's resolved layout for `ty` is a two-variant
+/// enum stored in one pointer word with no `Branch` tag.
+///
+/// That is the physical encoding of a pointer niche: `None` is the
+/// null word and `Some(p)` is `p`.  A `Branch` discriminator is a
+/// tagged enum and stays an aggregate `__discriminant` read.  Generic
+/// declarations (including `core::option::Option`) emit no layout;
+/// those return `false` here and the payload-shape walk decides.
+fn tyref_enum_layout_is_pointer_niche(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(def_id) = tyref_adt_def_id_of(ty, llbc) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return false;
+    };
+    if variants.len() != 2 {
+        return false;
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let Some(layout) = td.layout_for_target(llbc, &target) else {
+        return false;
+    };
+    !layout.has_branch_discriminant() && matches!(layout.size, Some(4 | 8))
+}
+
+/// See [`Lowering::tyref_is_niche_option_ptr`].
+fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> bool {
+    if !crate::front::result_exc::tyref_is_option(ty, llbc) {
+        return false;
+    }
+    // `Option<&[u8]>` is a two-word nullable window, not a one-word
+    // STR niche. Pair locals carry it as `{data, len}` with a null
+    // data word for `None`.
+    if tyref_is_u8_window(ty, llbc) {
+        return false;
+    }
+    // `Option` of an rstr `STR` value is the nullable string: `None` is
+    // the null `STR` pointer (`StringRepr.convert_const(None)`), `Some`
+    // is the string itself. `Option<&Wtf8>` and `Option<Wtf8Buf>` are the same
+    // set. A rust-heap `String` is not this set; it is niched by the
+    // [`tyref_is_string_family`] arm below.
+    if tyref_is_option_of_string_value(ty, llbc) {
+        return true;
+    }
+    // A `Vec` of one-word items is the header address, never null
+    // (`RustVecRepr`). Charon's `Option<Vec<T>>` layout may still be
+    // a pointer niche (the source `Unique` word); the translated
+    // Option keeps its tag so the payload stays `Int` for
+    // `ll_vec_length` / `gcarray_from_pyobject_vec`.
+    if crate::front::result_exc::tyref_option_payload(ty, llbc)
+        .is_some_and(|payload| tyref_rust_vec_item_kind(&payload, llbc).is_some())
+    {
+        return false;
+    }
+    // Instantiated `Option<T>` whose Charon layout occupies one
+    // pointer word with no `Branch` tag is already a null niche.
+    // Generic `Option` declarations carry no layout; those fall
+    // through to the payload-shape walk below.
+    if tyref_enum_layout_is_pointer_niche(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(payload) = node
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| type_decl_ref_generics(a, llbc))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+    else {
+        return false;
+    };
+    // `opcode_for_iter`'s match is `Option<H::Value>`. The only
+    // `IterOpcodeHandler` impl binds `Value = *mut PyObject`, which
+    // Rust represents as a null niche. The generic body still spells
+    // the payload as a trait projection, so peel that unique binding
+    // before the raw-pointer test. A multi-impl projection stays
+    // unresolved and keeps the tagged aggregate.
+    let resolved_assoc = trait_payload_node(payload, llbc)
+        .and_then(|node| trait_assoc_projection_target(node, llbc));
+    let resolved_body = resolved_assoc.as_ref().and_then(|ty| tyref_node(ty, llbc));
+    let payload = resolved_body.unwrap_or(payload);
+    let Some(payload) = type_node_peel_aliases(payload, llbc) else {
+        return false;
+    };
+    // `OwnerRootGuard` lowers as the one reference it roots, so
+    // `Option<OwnerRootGuard>` is the same nullable word as
+    // `Option<*mut T>`.
+    if owner_root_guard::type_node_is_guard(payload, llbc) {
+        return true;
+    }
+    if type_node_is_mut_ref(payload, llbc) {
+        return true;
+    }
+    // `Box<T>` is a non-null owning pointer, so `Option<Box<T>>` uses the
+    // same null niche as `Option<&T>`.  Keep the same concrete-layout gate
+    // as the reference/raw-pointer arms: `Box<dyn Trait>` and `Box<[T]>`
+    // are fat pointers, while a boxed nominal ADT such as the interpreter's
+    // error object is one word.  RPython's owning GC pointer has this same
+    // nullable `SomeInstance` shape; there is no separate Option object.
+    if type_node_is_thin_box(payload, llbc) {
+        return true;
+    }
+    // A function pointer is one word, and `Option<fn(..)>` represents
+    // `None` as the null pointer.  The payload therefore aliases the
+    // base pointer directly and carries no metadata word.
+    if type_node_is_fn_ptr(payload, llbc) {
+        return true;
+    }
+    // A shared reference `&T` is equally a one-word null-pointer niche
+    // (`Option<&T>` = nullable pointer, `Some(&T)` = the non-null pointer),
+    // but ONLY when the pointee is thin (Sized). A fat reference — `&str` /
+    // `&[T]` / `&dyn Trait`, and crucially an unsized nominal newtype like
+    // `rustpython_wtf8::Wtf8 { bytes: [u8] }` (`&Wtf8` = data + length word) —
+    // is two words, so aliasing the payload to the base pointer would read
+    // the metadata word. String-value fat refs (`&str`, `&Wtf8`)
+    // returned above; `&[u8]` is the window. A def-id alone does NOT imply thin: a DST newtype
+    // is a nominal ADT with a def-id. Gate on the pointee's RESOLVED layout
+    // size being concrete (`Some`) — `None` is the DST/unsized signature.
+    // `getdebug_data() -> Option<&FrameDebugData>` is a live shared-ref
+    // producer reaching here; its `FrameDebugData` pointee is Sized
+    // (carries a concrete layout size).
+    if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, llbc) {
+        let Some(stripped) = strip_ty_wrappers(shared_pointee, llbc) else {
+            return false;
+        };
+        // Shared `&[u8]` is a two-word window. `Option<&[u8]>` is
+        // handled above (`tyref_is_u8_window`); a bare `[u8]`
+        // referent is not a one-word STR niche.
+        if tyref_is_bare_u8_slice(&TyRef::Other(stripped.clone()), llbc) {
+            return false;
+        }
+        // `&*mut T` is a thin shared reference even though its pointee is
+        // itself a raw pointer rather than a nominal ADT.  This is the
+        // shape of `<[*mut PyObject]>::get`: `Option<&PyObjectRef>` is one
+        // nullable reference word, and its successful value is the list
+        // item pointer.  RPython has no Option aggregate here; it is the
+        // same `SomeInstance(T, can_be_None=True)` pointer lattice as the
+        // direct `&T` nominal-ADT arm below.
+        if type_node_raw_ptr_pointee(stripped, llbc).is_some() {
+            return true;
+        }
+        if let Some(def_id) = adt_node_def_id(stripped)
+            && llbc
+                .type_by_id(def_id)
+                .and_then(|td| {
+                    td.layout_for_target(llbc, &std::env::var("TARGET").unwrap_or_default())
+                })
+                .and_then(|l| l.size)
+                .is_some()
+        {
+            return true;
+        }
+    }
+    // A direct raw pointer to a nominal ADT is the one-word address of
+    // that aggregate in these graphs. Keep the concrete-layout gate even
+    // though such raw-pointer DSTs are not expected: Charon represents an
+    // unsized nominal pointee as a fat pointer, whose metadata cannot
+    // alias the single base word. Primitive/scalar pointees have no ADT
+    // def-id and deliberately remain excluded because `Some(null)` may be
+    // observably distinct from `None` for such payloads.
+    //
+    // `Option<*mut PyObjectRef>` expands to `Option<*mut *mut PyObject>`:
+    // the pointee is itself a raw pointer, not an ADT, so the layout
+    // gate below misses. It is still one nullable word.
+    if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, llbc)
+        && let Some(stripped) = strip_ty_wrappers(raw_pointee, llbc)
+        && type_node_raw_ptr_pointee(stripped, llbc).is_some()
+    {
+        return true;
+    }
+    if let Some(raw_pointee) = type_node_raw_ptr_pointee(payload, llbc)
+        && let Some(stripped) = strip_ty_wrappers(raw_pointee, llbc)
+        && let Some(def_id) = adt_node_def_id(stripped)
+        && llbc.type_by_id(def_id).is_some_and(|td| {
+            // A recorded layout must name a concrete size (a DST is not
+            // one word). A cross-crate nominal pointee often has no
+            // layout in this ullbc at all; `RawPtr` is already the thin
+            // spelling, so a missing layout is still the nullable
+            // pointer, not a two-word shell. Reading `__discriminant`
+            // off that pointer loads the pointee header and the match
+            // falls into `unreachable`.
+            match td.layout_for_target(llbc, &std::env::var("TARGET").unwrap_or_default()) {
+                Some(layout) => layout.size.is_some(),
+                None => td.layout.is_none(),
+            }
+        })
+    {
+        return true;
+    }
+    let Some(payload) = strip_ty_wrappers(payload, llbc) else {
+        return false;
+    };
+    // The same projection as `Option<Vec<T>>` below applies to the
+    // string family: rstr `STR` wrappers and rust-heap
+    // `alloc::string::String` ([`tyref_is_string_family`], `SomeString`).
+    // `node_is_string_value` excludes the rust-heap header; the family
+    // predicate is what `option_niche_null_cast` already uses.
+    // `Option<String>` is the nullable form (`s is None` /
+    // `s is not None`; `pairtype(SomeObject, SomeObject).is_`,
+    // `rtype_is_` / `ptr_iszero`), and `Some` is the string itself —
+    // there is no `__discriminant` / `__pos_0` field.
+    if tyref_is_string_family(&TyRef::Other(payload.clone()), llbc) {
+        return true;
+    }
+    let Some(def_id) = adt_node_def_id(payload) else {
+        return false;
+    };
+    let payload_path = llbc.type_by_id(def_id).map(|td| td.item_meta.name_path());
+    // PyPy TextIOWrapper.pending_bytes is `None` or an ordinary RPython
+    // list (`interp_textio.py:_writeflush`). Rust's `Vec<T>` is a
+    // three-word source spelling, but the front translates it to the same
+    // one-pointer `SomeList`; retaining Rust's enum tag after that
+    // projection manufactures an attribute no RPython object has.
+    // A `Vec` of one-word items is instead the address of its raw
+    // `{ptr, len, cap}` header, which is never null, so its `Option`
+    // keeps the tagged aggregate.
+    match payload_path.as_deref() {
+        Some("core::ptr::non_null::NonNull") => true,
+        Some("alloc::vec::Vec") => {
+            tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), llbc).is_none()
+        }
+        _ => false,
+    }
 }
 
 /// Shared `&[u8]` / `*const [u8]` / `Option<&[u8]>`: the W3 window.
@@ -119293,7 +119342,7 @@ mod tests {
                 .position(serde_json::Value::is_null)
                 .expect("corpus type_decls has a null hole");
             // `SomeRawStruct` is a sized nominal struct; rename the copy to
-            // `alloc::string::String` so [`node_is_string_value`] admits it.
+            // `alloc::string::String` so the payload is a rust-heap header.
             let mut copy = decls
                 .iter()
                 .find(|decl| decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(5))
@@ -120416,42 +120465,187 @@ mod tests {
         );
     }
 
-    #[test]
-    fn option_of_string_family_paints_as_str() {
-        use crate::model::ValueType;
-        let llbc = llbc_with_types(
+    fn option_of_string_value_llbc() -> Llbc {
+        llbc_with_types(
             "fixture",
             vec![
                 option_enum(0),
                 code_struct(1, &["rustpython_wtf8", "Wtf8"]),
                 code_struct(2, &["alloc", "string", "String"]),
+                code_struct(3, &["rustpython_wtf8", "Wtf8Buf"]),
             ],
             vec![],
+        )
+    }
+
+    fn with_fixture_lowering(llbc: &Llbc, f: impl FnOnce(&super::Lowering<'_>)) {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let accum = super::AccumulatorFacts::build(llbc, &body);
+        let tombstoned = std::collections::HashSet::new();
+        let gc_struct_ids_llbc = super::harvest_declared_gc_facts(llbc).gc_struct_ids();
+        let lowering = super::Lowering::new(
+            llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+            &tombstoned,
+            &gc_struct_ids_llbc,
+            super::no_immutable_fields(),
+            &accum,
+            &super::RootStackAnalyzer::new(llbc, &super::RootStackState::new(llbc)),
+            false,
+            false,
+        )
+        .unwrap();
+        f(&lowering);
+    }
+
+    fn option_shared_ref(def: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"Ref": ["Erased", def, "Shared"]})
+    }
+
+    #[test]
+    fn option_of_shared_str_paints_as_str_and_is_niche() {
+        use crate::model::ValueType;
+        let llbc = option_of_string_value_llbc();
+        let option_str = TyRef::Other(option_adt_node(
+            0,
+            option_shared_ref(serde_json::json!({"Adt": {"builtin": "Str"}})),
+        ));
+        assert!(
+            matches!(
+                super::tyref_to_value_type(&option_str, &llbc),
+                ValueType::Str
+            ),
+            "Option<&str> is a nullable SomeString"
         );
-        let option_wtf8 = TyRef::Other(option_adt_node(0, adt_node(1)));
-        let option_string = TyRef::Other(option_adt_node(0, adt_node(2)));
-        let string = TyRef::Other(adt_node(2));
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                lowering.tyref_is_niche_option_ptr(&option_str),
+                "Option<&str> is the nullable-string niche"
+            );
+        });
+    }
+
+    #[test]
+    fn option_of_shared_wtf8_paints_as_str_and_is_niche() {
+        use crate::model::ValueType;
+        let llbc = option_of_string_value_llbc();
+        let option_wtf8 = TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(1))));
         assert!(
             matches!(
                 super::tyref_to_value_type(&option_wtf8, &llbc),
                 ValueType::Str
             ),
-            "Option<Wtf8> is a nullable SomeString"
+            "Option<&Wtf8> is a nullable SomeString"
         );
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                lowering.tyref_is_niche_option_ptr(&option_wtf8),
+                "Option<&Wtf8> is the nullable-string niche"
+            );
+        });
+    }
+
+    #[test]
+    fn option_of_wtf8buf_paints_as_str_and_is_niche() {
+        use crate::model::ValueType;
+        let llbc = option_of_string_value_llbc();
+        let option_wtf8buf = TyRef::Other(option_adt_node(0, adt_node(3)));
         assert!(
             matches!(
-                super::tyref_to_value_type(&option_string, &llbc),
+                super::tyref_to_value_type(&option_wtf8buf, &llbc),
                 ValueType::Str
             ),
-            "Option<String> is a nullable SomeString"
+            "Option<Wtf8Buf> is a nullable SomeString"
+        );
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                lowering.tyref_is_niche_option_ptr(&option_wtf8buf),
+                "Option<Wtf8Buf> is the nullable-string niche"
+            );
+        });
+    }
+
+    #[test]
+    fn option_of_string_is_ref_paint_and_niche() {
+        use crate::model::ValueType;
+        let llbc = option_of_string_value_llbc();
+        let option_string = TyRef::Other(option_adt_node(0, adt_node(2)));
+        let string = TyRef::Other(adt_node(2));
+        let option_ref_string = TyRef::Other(option_adt_node(0, option_shared_ref(adt_node(2))));
+        let option_paint = super::tyref_to_value_type(&option_string, &llbc);
+        let string_paint = super::tyref_to_value_type(&string, &llbc);
+        assert!(
+            !matches!(option_paint, ValueType::Str),
+            "Option<String> is not a nullable SomeString"
         );
         assert!(
-            matches!(
-                super::tyref_to_value_type(&string, &llbc),
-                ValueType::Ref(_)
-            ),
+            matches!(string_paint, ValueType::Ref(_)),
             "a rust-heap String itself stays Ref"
         );
+        assert_eq!(
+            option_paint, string_paint,
+            "Option<String> value paint is the payload String's Ref"
+        );
+        assert_eq!(
+            super::tyref_to_attr_value_type(&option_string, &llbc),
+            super::tyref_to_attr_value_type(&string, &llbc),
+            "Option<String> attr paint is the payload String's Ref"
+        );
+        let tomb = super::no_tombstoned_leaves();
+        let option_param = super::tyref_ref_param_class_root(&option_string, &llbc, &tomb, None);
+        let string_param = super::tyref_ref_param_class_root(&string, &llbc, &tomb, None);
+        assert_eq!(
+            option_param, string_param,
+            "Option<String> param class root is the payload String's class root"
+        );
+        assert!(
+            option_param.is_some(),
+            "String class root must be named, got {option_param:?}"
+        );
+        assert_eq!(
+            super::tyref_input_class_root(&option_string, &llbc, &tomb),
+            super::tyref_input_class_root(&string, &llbc, &tomb),
+            "Option<String> input class root is the payload String's class root"
+        );
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                lowering.tyref_is_niche_option_ptr(&option_string),
+                "Option<String> is the rust-heap-string niche"
+            );
+            assert!(
+                matches!(
+                    lowering.option_niche_null_cast(&option_string),
+                    Some((_, ValueType::Ref(_)))
+                ),
+                "Option<String> None is a null Ref"
+            );
+            assert!(
+                lowering.tyref_is_niche_option_ptr(&option_ref_string),
+                "Option<&String> is the rust-heap-string niche"
+            );
+            assert_eq!(
+                super::tyref_to_value_type(&option_ref_string, &llbc),
+                string_paint,
+                "Option<&String> value paint is the payload String's Ref"
+            );
+            assert_eq!(
+                super::tyref_ref_param_class_root(&option_ref_string, &llbc, &tomb, None),
+                string_param,
+                "Option<&String> param class root is the payload String's class root"
+            );
+        });
     }
 
     /// `Option<&[u8]>` None is a null window data word, not
