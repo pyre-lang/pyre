@@ -96,6 +96,10 @@ pub fn jd1_root_base() -> (i64, i64, i64) {
 }
 
 /// Loop-carried reds in merge-point bank order (red I, then red R).
+///
+/// `unpackiterable_portal` does `push_roots` then `pin_roots` of the three
+/// objects with nothing in between, so the `RootScope` save point equals
+/// `root_base`. The extracted merge names that word as a third red Int.
 pub fn jd1_live_values_at(root_base: i64) -> Vec<Value> {
     let save_point = root_base;
     vec![

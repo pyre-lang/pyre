@@ -995,12 +995,15 @@ pub enum RuntimeHelperKind {
     /// broken baked-NULL-globals shape the walker's may-force NULL-ref
     /// gate rejects.
     CallFn,
-    /// `bh_truth_fn(value)` — the TO_BOOL / `POP_JUMP_IF_*` truth helper
-    /// (`opcode_ops::truth_value`).  Returns the operand's truthiness as a
-    /// raw Int.  The full-body walker recognises this tag to specialise a
-    /// provably-int operand to a pure `guard_class INT` + `getfield intval`
-    /// + `int_is_true`, eliding the `CALL_MAY_FORCE` (and its
-    ///   `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the generic residual emits.
+    /// `bh_truth_fn(value)` — the `POP_JUMP_IF_*` truth helper
+    /// (`opcode_ops::truth_value`), and the fused `bh_to_bool_fn` residual
+    /// `eval.rs` `to_bool` emits (`is_true` then `w_bool_from`).  The int
+    /// form returns truthiness as a raw Int; the Ref form returns the
+    /// bool singleton.  The full-body walker recognises this tag to walk
+    /// `truth_value` for an exact builtin (`guard_class` + `getfield intval`
+    /// + `int_is_true`), then `newbool` when the residual's result is a Ref,
+    /// eliding the `CALL_MAY_FORCE` (and its `GUARD_NOT_FORCED` /
+    /// `GUARD_NO_EXCEPTION`) the generic residual emits.
     Truth,
     /// `bh_unary_positive_fn(value)` — the CALL_INTRINSIC_1 UNARY_POSITIVE
     /// helper (`opcode_ops::unary_positive_value` → `space.pos`).  `int.__pos__`

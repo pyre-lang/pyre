@@ -20970,6 +20970,8 @@ fn sum_shell_instance_payload_is_one_gc_pointer() {
         &HashMap::new(),
         &HashMap::new(),
         &HashSet::new(),
+    
+        &std::collections::HashMap::new(),
     );
     let word = crate::layout::target_word_size();
     let pos0 = layout

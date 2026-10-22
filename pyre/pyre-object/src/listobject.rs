@@ -4589,7 +4589,7 @@ fn list_boxed_getitem(wrapped: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 /// `#[inline(never)]` keeps a unique Charon leaf so
-/// `list_getitem_jitcode()` resolves `w_list_getitem_inner` the way
+/// `array_descr_identity` can name `w_list_getitem_inner` the way
 /// `list_setitem_jitcode()` resolves `w_list_setitem_inner`.
 #[inline(never)]
 pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {

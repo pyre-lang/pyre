@@ -2451,7 +2451,9 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
 /// raw-word field test; a zero-variant enum (FFI opaque); a fieldless
 /// enum (discriminant integer); a `repr(transparent)` wrapper whose
 /// fields pass that same test. A Rust-repr data-carrying struct/enum is
-/// `rclass.py` `getinstancerepr` (default gc).
+/// `rclass.py` `getinstancerepr` (default gc). Compiler ADTs (`Tuple` /
+/// `Box` / `str`) are GC storage (`rtuple.py` `GcStruct`): their items
+/// may be scalars, but the allocation is `new`.
 pub(in crate::front::mir) fn adt_def_is_raw_storage(
     def_id: u64,
     llbc: &Llbc,
@@ -2495,6 +2497,14 @@ fn adt_def_is_raw_storage_at(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
+    // Tuple / Box / str are compiler ADTs with no `GcType` impl, but
+    // `rtuple.py` lays each tuple out as a `GcStruct` and `new` allocates
+    // them as GC. Walking their scalar items would stamp the tuple — and
+    // every Option/enum that boxes one — Raw, which `rewrite_op_setfield`
+    // then replaces with Abort.
+    if type_decl_is_builtin_adt(td) {
+        return false;
+    }
     // A marked exception-class enum is the minted class, not a raw word
     // bag. `&E` must stay `Ref` so the parameter carries the class root.
     if matches!(&td.kind, TypeDeclKind::Enum(_)) {

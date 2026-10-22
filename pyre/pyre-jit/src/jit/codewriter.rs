@@ -2512,6 +2512,25 @@ fn null_stack_sentinel() -> super::flow::FlowValue {
     super::flow::Constant::none().into()
 }
 
+/// Drop local SSA Variables that a later Python instruction must not read.
+///
+/// `pyopcode.py` STORE_FAST writes `locals_cells_stack_w`; LOAD_FAST reads
+/// it (`emit_load_fast_ref!` / `getarrayitem_vable_r`).  Clearing the
+/// FrameState local so the next opcode cannot inherit the producer's
+/// dest keeps that dest from staying SSA-live-through a later residual
+/// `-live-`.  Operand-stack slots stay: consumers already `peekvalue` /
+/// `popvalue` the virtualizable, and the PRE-dispatch pcdep snapshot
+/// still needs those Variables so a guard resume can name pre-pop
+/// depths.  Portal reds (`portal_extras`) and the exception-edge pair
+/// stay.
+fn forget_ssa_across_instruction(state: &mut FrameState) {
+    for slot in &mut state.locals_w {
+        if matches!(slot, Some(super::flow::FlowValue::Variable(_))) {
+            *slot = None;
+        }
+    }
+}
+
 fn pyobject_const_ref_value(w_obj: pyre_object::PyObjectRef) -> super::flow::FlowValue {
     super::flow::Constant::new(
         super::flow::ConstantValue::Signed(w_obj as i64),
@@ -11111,6 +11130,7 @@ impl CodeWriter {
                     // and an arm that aborts has usually already modelled the
                     // opcode's stack effect on `current_state`.
                     pre_opcode_stack.clear();
+                    forget_ssa_across_instruction(&mut current_state);
                     pre_opcode_stack.extend(current_state.stack.iter().cloned());
 
                     // RPython jtransform.py: rewrite_operation() dispatches per opname.
@@ -19697,7 +19717,7 @@ mod tests {
     }
 
     fn assemble_portal(code: &CodeObject) -> std::sync::Arc<PyJitCode> {
-        let w_code = pyre_interpreter::box_code_constant(code);
+        let w_code = pyre_interpreter::box_code_constant(code).unwrap();
         let code_ptr = unsafe {
             pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
         };
@@ -23624,6 +23644,80 @@ def f(x):
             !after.contains(&"catch_exception"),
             "arm with no exception table must not grow catch_exception, got {after:?}"
         );
+    }
+
+    #[test]
+    fn generator_try_finally_yield_lowers_exception_table_handler() {
+        // `flowcontext.py build_flow pendingblocks` drains a handler after
+        // `closeblock` / `StopFlowing`. `pyopcode.py handle_operation_error`
+        // reaches the table target. YieldValue is not can-raise, so the
+        // exception table must seed the same catch-landing entry a
+        // `guessexception` edge would.
+        let code = first_nested_function_code(
+            "def g():\n    try:\n        yield 1\n    finally:\n        x = 2\n",
+        );
+        let entries: Vec<_> =
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
+        assert!(
+            !entries.is_empty(),
+            "try/finally around yield must produce an exception table"
+        );
+        let handler_pcs: Vec<usize> = entries
+            .iter()
+            .map(|entry| entry.target as usize / 2)
+            .collect();
+
+        let pyjit = assemble_portal(&code);
+        assert!(
+            handler_pcs
+                .iter()
+                .any(|&pc| pyjit.merge_entry_for(pc).is_some()),
+            "exception-table handler greens {handler_pcs:?} must have a merge entry"
+        );
+        assert!(
+            handler_pcs
+                .iter()
+                .any(|&pc| pyjit.function_entry_for(pc).is_some()),
+            "exception-table handler greens {handler_pcs:?} must have a function-entry body"
+        );
+    }
+
+    #[test]
+    fn function_entry_for_declines_unlowered_non_trivia_pc() {
+        // Guard: an unlowered instruction start must not trivia-forward
+        // onto a later body's offset (`handle_operation_error` target).
+        let code = first_nested_function_code(
+            "def g():\n    try:\n        yield 1\n    finally:\n        x = 2\n",
+        );
+        let handler_pc = pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+            .map(|entry| entry.target as usize / 2)
+            .next()
+            .expect("try/finally has a handler pc");
+        assert!(
+            is_python_instruction_start(&code, handler_pc),
+            "handler pc {handler_pc} must be an instruction start"
+        );
+        let last_start = (0..code.instructions.len())
+            .rfind(|&pc| is_python_instruction_start(&code, pc))
+            .expect("code has an instruction start");
+        let w_code = pyre_interpreter::box_code_constant(&code).unwrap();
+        let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(w_code) };
+        let mut pyjit = PyJitCode::skeleton(code_ptr);
+        pyjit.metadata.n_py_instrs = code.instructions.len() as u32;
+        pyjit.metadata.py_exact_by_jit_pc = vec![(10, last_start as u32)];
+        pyjit.metadata.merge_entry_by_green = Vec::new();
+        assert_eq!(pyjit.merge_entry_for(handler_pc), None);
+        assert_eq!(pyjit.function_entry_for(handler_pc), None);
+        assert_eq!(pyjit.function_entry_for(last_start), Some(10));
+        if let Some(cache_pc) = (0..last_start).find(|&pc| {
+            matches!(
+                pyre_interpreter::decode_instruction_at(&code, pc),
+                Some((Instruction::Cache, _))
+            )
+        }) {
+            assert_eq!(pyjit.function_entry_for(cache_pc), Some(10));
+        }
+        let _ = w_code;
     }
 
     #[test]

@@ -8142,6 +8142,7 @@ pub(crate) fn host_header_layout() -> crate::call::StructLayout {
         &std::collections::HashMap::new(),
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),
+        &std::collections::HashMap::new(),
     )
 }
 
@@ -9549,6 +9550,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].name, "__pos_0");
