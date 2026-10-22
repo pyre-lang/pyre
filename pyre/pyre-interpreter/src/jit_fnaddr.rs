@@ -74,6 +74,11 @@ impl<T> ResidualSlot for *mut T {}
 impl<T> ResidualRet for *const T {}
 impl<T> ResidualRet for *mut T {}
 
+/// `#[repr(transparent)]` over one `usize`. Method residuals take the
+/// save-point word by value; `Rvalue::Ref` aliases that word.
+impl ResidualSlot for pyre_object::gc_roots::RootScope {}
+impl ResidualRet for pyre_object::gc_roots::RootScope {}
+
 /// One-word `repr(transparent)` dict keys. `ObjectKey` / `IdentitySetKey`
 /// are two words and stay off this trait.
 impl ResidualSlot for pyre_object::identitydict::IdentityKey {}
@@ -615,6 +620,18 @@ pub mod word_publish {
         }
         fn into_reg(self) -> i64 {
             self.0 as usize as i64
+        }
+    }
+    /// `#[repr(transparent)]` over one `usize`. Transmute so Drop does not
+    /// close the bracket when the shim lifts the save-point word.
+    impl WordAbi for pyre_object::gc_roots::RootScope {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            unsafe { std::mem::transmute(reg as usize) }
+        }
+        fn into_reg(self) -> i64 {
+            unsafe { std::mem::transmute::<Self, usize>(self) as i64 }
         }
     }
 
@@ -1311,6 +1328,11 @@ macro_rules! p5 {
         publish_p5($e, $p, |a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f);
     };
 }
+macro_rules! pa5 {
+    ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
+        publish_pa5($e, $m, $r, $f, $f);
+    };
+}
 macro_rules! cpa5 {
     ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
         publish_cpa5($e, $m, $r, |a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f);
@@ -1962,6 +1984,62 @@ fn jit_trace_fnaddr_tables() -> &'static (Vec<(&'static str, i64)>, Vec<i64>) {
     TABLES.get_or_init(build_jit_trace_fnaddrs)
 }
 
+/// Bind the residual save-point word as a `RootScope` without running Drop.
+/// Method residuals take that word (`WordAbi`); Drop would rewind the bracket.
+fn with_root_scope_word<R>(
+    scope: pyre_object::gc_roots::RootScope,
+    f: impl FnOnce(&pyre_object::gc_roots::RootScope) -> R,
+) -> R {
+    let scope = std::mem::ManuallyDrop::new(scope);
+    f(&scope)
+}
+
+fn root_scope_pin_root(
+    scope: pyre_object::gc_roots::RootScope,
+    root: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    with_root_scope_word(scope, |s| s.pin_root(root))
+}
+
+fn root_scope_get(
+    scope: pyre_object::gc_roots::RootScope,
+    index: usize,
+) -> pyre_object::PyObjectRef {
+    with_root_scope_word(scope, |s| s.get(index))
+}
+
+extern "C" fn root_scope_publish(
+    scope: pyre_object::gc_roots::RootScope,
+    array: *const pyre_object::object_array::GcTypedArray,
+) -> i64 {
+    with_root_scope_word(scope, |s| s.publish_jit_abi(array))
+}
+
+extern "C" fn root_scope_pin_roots(
+    scope: pyre_object::gc_roots::RootScope,
+    array: *const pyre_object::object_array::GcTypedArray,
+) -> i64 {
+    with_root_scope_word(scope, |s| s.pin_roots_jit_abi(array))
+}
+
+fn root_scope_normalize(scope: pyre_object::gc_roots::RootScope, base: usize, len: usize) {
+    with_root_scope_word(scope, |s| s.normalize(base, len))
+}
+
+fn root_scope_set(
+    scope: pyre_object::gc_roots::RootScope,
+    index: usize,
+    root: pyre_object::PyObjectRef,
+) {
+    with_root_scope_word(scope, |s| s.set(index, root))
+}
+
+/// Close by dropping the reconstructed word. `root_scope_close` takes `&self`
+/// for the native RAII path; the residual ABI is the save-point itself.
+fn root_scope_close_word(scope: pyre_object::gc_roots::RootScope) {
+    drop(scope);
+}
+
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
 /// which the publication sites fill in one pass.
 fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
@@ -2405,6 +2483,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::shadow_stack_set",
         pyre_object::gc_roots::shadow_stack_set,
     );
+    // The bracket's open; one word out (`RootScope` save point), read back
+    // by `root_scope_close` below.
+    pa0!(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots,
+    );
     pa0!(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_cell",
@@ -2435,7 +2521,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        root_scope_close_word,
     );
     cpa2!(
         &mut entries,
@@ -2451,8 +2537,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `w_type_issubtype` is the MRO membership scan (`_issubtype`,
     // typeobject.py), run under the JIT inside `_pure_issubtype`
-    // (`@elidable_promote`, typeobject.py:1657).  Its `#[dont_look_inside]`
-    // residualises the call. `CallDescr.create_call_stub` calls a boolean
+    // (`@elidable_promote`). `CallDescr.create_call_stub` calls a boolean
     // RESULT before widening to Signed: bind the word-ABI bridge, never the
     // raw Rust function whose upper result-register bits are undefined.
     cpa2!(
@@ -2576,13 +2661,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_root",
         "gc_roots::RootScope::pin_root",
-        pyre_object::gc_roots::RootScope::pin_root,
+        root_scope_pin_root,
     );
     pa2!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::get",
         "gc_roots::RootScope::get",
-        pyre_object::gc_roots::RootScope::get,
+        root_scope_get,
     );
     // The rest of the scope-local API a bracket body calls on its guard: the
     // slice-taking pair through the one-word array ABI `publish_roots` uses,
@@ -2591,25 +2676,25 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_object::gc_roots::RootScope::publish",
         "gc_roots::RootScope::publish",
-        pyre_object::gc_roots::RootScope::publish_jit_abi,
+        root_scope_publish,
     );
     cpa2!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_roots",
         "gc_roots::RootScope::pin_roots",
-        pyre_object::gc_roots::RootScope::pin_roots_jit_abi,
+        root_scope_pin_roots,
     );
     pa3!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::normalize",
         "gc_roots::RootScope::normalize",
-        pyre_object::gc_roots::RootScope::normalize,
+        root_scope_normalize,
     );
     pa3!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::set",
         "gc_roots::RootScope::set",
-        pyre_object::gc_roots::RootScope::set,
+        root_scope_set,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
@@ -2946,6 +3031,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::_pure_version_tag",
         "pyre_interpreter::_pure_version_tag",
         crate::baseobjspace::__majit_call_target__orig__pure_version_tag_unlikely_name,
+    );
+    cpa4!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::_pure_issubtype",
+        "pyre_interpreter::_pure_issubtype",
+        crate::baseobjspace::__majit_call_target__orig__pure_issubtype_unlikely_name,
     );
     cpa3!(
         &mut entries,
@@ -4772,6 +4863,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::functional::jit_range_iter_new",
         "pyre_object::jit_range_iter_new",
         pyre_object::jit_range_iter_new,
+    );
+    pa4!(
+        &mut entries,
+        "pyre_object::functional::w_range_finish",
+        "pyre_object::w_range_finish",
+        pyre_object::functional::w_range_finish,
+    );
+    pa5!(
+        &mut entries,
+        "pyre_object::functional::w_range_alloc_i64",
+        "pyre_object::w_range_alloc_i64",
+        pyre_object::functional::w_range_alloc_i64,
     );
     // The lowered raise path's exception materialisation, opaque so that its
     // body stays out of every JitCode that can raise.
@@ -7861,6 +7964,14 @@ mod tests {
         assert!(are_alias_spellings(
             "pyre_interpreter::_pure_version_tag",
             "pyre_interpreter::baseobjspace::_orig__pure_version_tag_unlikely_name",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_interpreter::baseobjspace::_pure_issubtype",
+            "pyre_interpreter::baseobjspace::_orig__pure_issubtype_unlikely_name",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_interpreter::_pure_issubtype",
+            "pyre_interpreter::baseobjspace::_orig__pure_issubtype_unlikely_name",
         ));
         assert!(!are_alias_spellings(
             "pyre_interpreter::baseobjspace::_orig_should_not_inline_unlikely_name",

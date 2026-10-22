@@ -4169,9 +4169,13 @@ pub struct StructLayout {
     pub align: usize,
     /// `Struct._gckind` / `GcStruct._gckind`. `Gc` when the type implements
     /// majit-gc `GcType`, is field 0 of a `Gc` type, or its own field 0 is
-    /// `Gc` (`Struct._note_inlined_into`). The three clauses are a fixpoint
-    /// on the field-0 chain. `Raw` otherwise. Set when the layout is
-    /// registered; readers must not treat a missing layout as either kind.
+    /// `Gc` (`Struct._note_inlined_into`), **or** any enumerated field is a
+    /// GC pointer (`FLAG_POINTER`), **or** an inlined by-value nested
+    /// struct transitively holds one: an ADT that holds a GC pointer is a
+    /// `GcStruct` (`declared_raw_adt_node`), matching the `new` Size descr
+    /// which defaults to GC. A nested raw `Struct` of only scalars stays
+    /// `Raw`. Set when the layout is registered; readers must not treat a
+    /// missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     /// Per-field layout: (field_name, offset, size, type).
     /// RPython: `symbolic.get_field_token(STRUCT, name, tsc) → (offset, size)`.
@@ -4279,6 +4283,222 @@ fn outer_type_leaf(type_name: &str) -> &str {
     base.rsplit("::").next().unwrap_or(base)
 }
 
+/// Spellings under which `nested_fields` may store `type_str`'s rows:
+/// the exact field type, the generic-stripped template, and the unique
+/// leaf (`Fmt`, `DictKeyError`).
+fn nested_struct_name_keys(type_str: &str) -> Vec<String> {
+    let mut keys = vec![type_str.to_string()];
+    let stripped = majit_ir::descr::strip_generic_args(type_str);
+    if stripped.as_ref() != type_str {
+        keys.push(stripped.into_owned());
+    }
+    let leaf = type_str.rsplit("::").next().unwrap_or(type_str);
+    let leaf = majit_ir::descr::strip_generic_args(leaf);
+    if leaf.as_ref() != type_str && keys.iter().all(|key| key != leaf.as_ref()) {
+        keys.push(leaf.into_owned());
+    }
+    keys
+}
+
+/// Field rows of a nested by-value type. Exact spelling first, then the
+/// generic-stripped template (`core::option::Option<*mut PyObject>` →
+/// `core::option::Option`) so an instantiated field still finds the
+/// template's registered rows.
+fn nested_struct_field_rows<'a>(
+    type_str: &str,
+    nested_fields: &'a std::collections::HashMap<String, Vec<(String, String)>>,
+) -> Option<&'a [(String, String)]> {
+    for key in nested_struct_name_keys(type_str) {
+        if let Some(fields) = nested_fields.get(&key) {
+            return Some(fields.as_slice());
+        }
+    }
+    None
+}
+
+/// True when `key` is a variant subclass of `type_str` (`LoopResult::Done`,
+/// `pyre_jit::eval::LoopResult::Done`). The enum base's own rows are only
+/// the tag; payload FLAG_POINTER fields live on the variant keys.
+fn nested_fields_key_is_variant_of(key: &str, type_str: &str) -> bool {
+    for prefix in nested_struct_name_keys(type_str) {
+        let rest = match key.strip_prefix(&prefix) {
+            Some(rest) => rest,
+            None => continue,
+        };
+        if let Some(variant) = rest.strip_prefix("::")
+            && !variant.is_empty()
+            && !variant.contains("::")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rows that are only the synthetic enum-base tag (`rclass.py` sum-type
+/// base). Payload fields are on the variant subclasses, not here.
+fn rows_are_enum_base_tag(rows: &[(String, String)]) -> bool {
+    let mut saw_tag = false;
+    for (name, _) in rows {
+        if name == "__discriminant" {
+            saw_tag = true;
+            continue;
+        }
+        if name == "typeptr" || name.starts_with("c__pad") {
+            continue;
+        }
+        return false;
+    }
+    saw_tag
+}
+
+/// Type arguments of a nested spelling (`Option<T>`, `Result<T, E>`,
+/// `Tuple<A,B>`, `[T; N]`). The nested field list is not always in hand
+/// at [`StructLayout::from_type_strings`]; the argument strings are on
+/// the field's own type and classify with the same [`field_metadata`]
+/// helper as a nested layout's rows.
+fn type_string_generic_args(type_str: &str) -> Vec<&str> {
+    let type_str = type_str.trim();
+    if let Some((elem, _)) = crate::front::mir::shaped_array_parts(type_str) {
+        return vec![elem];
+    }
+    let Some(open) = type_str.find('<') else {
+        return Vec::new();
+    };
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, b) in type_str.bytes().enumerate().skip(open) {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close) = close else {
+        return Vec::new();
+    };
+    crate::front::mir::split_top_level_type_args(&type_str[open + 1..close])
+        .into_iter()
+        .filter(|arg| {
+            let arg = arg.trim();
+            // A lifetime (`'a`) or const generic (`12`) is not a field type.
+            !arg.is_empty()
+                && !arg.starts_with('\'')
+                && arg.starts_with(|c: char| {
+                    c.is_alphabetic() || c == '_' || c == '*' || c == '&' || c == '[' || c == '('
+                })
+        })
+        .collect()
+}
+
+/// True when `type_str` is a GC pointer (`FLAG_POINTER`), or a by-value
+/// nested struct that (transitively, through inlined substructs) holds
+/// one. `lltype.Struct` inlining another raw `Struct` of only scalars
+/// stays `_gckind='raw'`; a GC pointer inside a raw container is
+/// refused (`jtransform.py` `setfield_raw_r`).
+fn type_str_holds_gc_pointer(
+    type_str: &str,
+    known_structs: &std::collections::HashSet<String>,
+    known_struct_sizes: &std::collections::HashMap<String, usize>,
+    raw_alloc_flavor_structs: &HashSet<String>,
+    nested_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
+    visiting: &mut std::collections::HashSet<String>,
+) -> bool {
+    let type_str = type_str.trim();
+    let (flag, _, _) = field_metadata(
+        type_str,
+        known_structs,
+        known_struct_sizes,
+        raw_alloc_flavor_structs,
+    );
+    if flag == majit_ir::descr::ArrayFlag::Pointer {
+        return true;
+    }
+    if flag != majit_ir::descr::ArrayFlag::Struct {
+        return false;
+    }
+    if !visiting.insert(type_str.to_string()) {
+        return false;
+    }
+    let args_hold = type_string_generic_args(type_str).iter().any(|arg| {
+        type_str_holds_gc_pointer(
+            arg,
+            known_structs,
+            known_struct_sizes,
+            raw_alloc_flavor_structs,
+            nested_fields,
+            visiting,
+        )
+    });
+    let rows = nested_struct_field_rows(type_str, nested_fields);
+    let rows_hold = rows.into_iter().flatten().any(|(name, nested_ty)| {
+        name != "typeptr"
+            && !name.starts_with("c__pad")
+            && type_str_holds_gc_pointer(
+                nested_ty,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+                nested_fields,
+                visiting,
+            )
+    });
+    let mut saw_variant = false;
+    let variants_hold = nested_fields.iter().any(|(key, variant_rows)| {
+        if !nested_fields_key_is_variant_of(key, type_str) {
+            return false;
+        }
+        saw_variant = true;
+        variant_rows.iter().any(|(name, nested_ty)| {
+            name != "typeptr"
+                && !name.starts_with("c__pad")
+                && type_str_holds_gc_pointer(
+                    nested_ty,
+                    known_structs,
+                    known_struct_sizes,
+                    raw_alloc_flavor_structs,
+                    nested_fields,
+                    visiting,
+                )
+        })
+    });
+    let holds = if is_known_by_value_struct(known_structs, type_str) {
+        match rows {
+            // Nested layout rows are not in hand: the field is still a
+            // by-value ADT (`FLAG_STRUCT`). Carry that up — Field descrs
+            // mint a GCREF word via `type_flag_from_str`'s unknown-name
+            // fallback (`Option<DictKeyError>`, `Result::Err` payload).
+            None => true,
+            Some(rows) if rows.is_empty() => {
+                args_hold
+                    || variants_hold
+                    || get_type_flag(type_str, raw_alloc_flavor_structs).0
+                        == majit_ir::descr::ArrayFlag::Pointer
+            }
+            Some(rows) if rows_are_enum_base_tag(rows) => {
+                // Payload FLAG_POINTER fields live on the variant
+                // subclasses. Missing variant rows is an incomplete
+                // nested layout, not a scalar-only Struct.
+                args_hold || if saw_variant { variants_hold } else { true }
+            }
+            Some(_) => rows_hold || args_hold || variants_hold,
+        }
+    } else {
+        // `Vec<T>` is `FLAG_STRUCT` (`get_type_flag`) but not a known
+        // by-value struct. Walk `T`: `Vec<*mut PyObject>` holds a pointer;
+        // `Vec<u8>` does not.
+        rows_hold || args_hold || variants_hold
+    };
+    visiting.remove(type_str);
+    holds
+}
+
 /// Layout-transparent `core::sync::atomic` wrappers. `AtomicI64` occupies
 /// the same bytes as `i64`; `AtomicPtr<T>` the same as a pointer word.
 /// OBJECT_VTABLE spells `instantiate` as a function pointer, not a nested
@@ -4316,6 +4536,28 @@ pub(crate) fn atomic_wrapper_leaf(
 }
 
 impl StructLayout {
+    /// True when any enumerated field is a GC pointer (`descr.py`
+    /// `FLAG_POINTER`). Nested by-value structs are `FLAG_STRUCT` and do
+    /// not count: they are not a `getfield` of a Ref.
+    pub fn holds_gc_pointer(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.flag == majit_ir::descr::ArrayFlag::Pointer)
+    }
+
+    /// `_gckind` as `rewrite_op_{get,set}field` and `new` agree on it.
+    /// A stored `Gc`, or a `Raw` layout that still holds a GC pointer
+    /// field: `jtransform.py` refuses `setfield_raw_r` / non-pure
+    /// `getfield_raw_r`, and the Size descr for that ADT is GC.
+    pub fn effective_gckind(&self) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        if self.gckind == GcKind::Gc || self.holds_gc_pointer() {
+            GcKind::Gc
+        } else {
+            self.gckind
+        }
+    }
+
     /// Build a StructLayout from type-string heuristic.
     /// Used at pipeline init to populate struct_layouts from struct_fields.
     /// The runtime can later override with actual layout via set_struct_layout().
@@ -4324,6 +4566,11 @@ impl StructLayout {
     /// every entry in the owning class's `_immutable_fields_` declaration.
     /// RPython `STRUCT._immutable_field(fieldname)` returns the matching
     /// `ImmutableRanking` for these; fields not in the map are mutable.
+    ///
+    /// `nested_fields`: field rows of by-value nested types, keyed by the
+    /// same spelling `field_metadata` uses. Empty when the nested layout
+    /// is not in hand; generic arguments of the nested type string still
+    /// classify with [`field_metadata`].
     pub fn from_type_strings(
         fields: &[(String, String)],
         known_structs: &std::collections::HashSet<String>,
@@ -4331,6 +4578,7 @@ impl StructLayout {
         known_struct_aligns: &std::collections::HashMap<String, usize>,
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
         raw_alloc_flavor_structs: &HashSet<String>,
+        nested_fields: &std::collections::HashMap<String, Vec<(String, String)>>,
     ) -> Self {
         // RPython: symbolic.get_array_token() computes itemsize for ANY struct,
         // even those with nested structs. UnsupportedFieldExc only affects
@@ -4340,6 +4588,39 @@ impl StructLayout {
         let has_nested_struct = fields
             .iter()
             .any(|(_, type_str)| is_known_by_value_struct(known_structs, type_str));
+        // `_gckind` is Gc only when a FLAG_POINTER field is present, on
+        // this layout or (recursively) inside an inlined nested Struct.
+        // Computed before the interior-field clear: that drop would hide
+        // a FLAG_POINTER sibling, and a nested FLAG_STRUCT is not itself
+        // a pointer. A nested raw Struct of only scalars stays Raw.
+        let mut visiting = std::collections::HashSet::new();
+        let nested_holds_gc_pointer = fields.iter().any(|(name, type_str)| {
+            if name == "typeptr" || name.starts_with("c__pad") {
+                return false;
+            }
+            let (flag, _, _) = field_metadata(
+                type_str,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+            );
+            // Explicit sum-shell / positional payload (`rclass.py`
+            // variant subclass, `rtuple.py` item): the nested ADT is a
+            // GCREF word (`explicit_sum_shell` 8-byte slot; Field descrs
+            // mint FLAG_POINTER). Recursing into a scalar pointee would
+            // miss the pointer on this layout.
+            if name.starts_with("__pos_") && flag == majit_ir::descr::ArrayFlag::Struct {
+                return true;
+            }
+            type_str_holds_gc_pointer(
+                type_str,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+                nested_fields,
+                &mut visiting,
+            )
+        });
         let mut offset: usize = 0;
         let mut layout_fields = Vec::new();
         for (name, type_str) in fields {
@@ -4386,6 +4667,21 @@ impl StructLayout {
             });
             offset += field_size;
         }
+        // Flat FLAG_POINTER rows, plus a nested by-value struct that
+        // itself holds a GC pointer (`Result<Option<*mut PyObject>, _>`).
+        // The clear below drops interior descriptors (`heaptracker.py all_interiorfielddescrs`)
+        // but must not flip a pointer-holding owner to Raw:
+        // `rewrite_op_setfield` would Abort the Ref store into the object
+        // `new` just allocated. A nested scalar-only Struct stays Raw.
+        let gckind = if nested_holds_gc_pointer
+            || layout_fields
+                .iter()
+                .any(|field| field.flag == majit_ir::descr::ArrayFlag::Pointer)
+        {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+        } else {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        };
         // RPython: heaptracker.py:89-90 — if nested struct exists,
         // all_interiorfielddescrs raises UnsupportedFieldExc, so
         // interior field descriptors are not enumerable. Clear fields
@@ -4427,7 +4723,7 @@ impl StructLayout {
         StructLayout {
             size,
             align,
-            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            gckind,
             fields: layout_fields,
             host: None,
             ll_struct: std::cell::RefCell::new(None),
@@ -4998,6 +5294,7 @@ impl CallControl {
             &HashMap::new(),
             &HashMap::new(),
             &self.raw_alloc_flavor_structs,
+            &HashMap::new(),
         ));
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
@@ -5005,11 +5302,16 @@ impl CallControl {
 
     /// `Struct._gckind` for a type whose layout was registered.
     /// `None` when `name` is not one analysed struct or enum.
+    ///
+    /// Uses [`StructLayout::effective_gckind`]: a layout stored as `Raw`
+    /// that still holds a `FLAG_POINTER` field is a GC owner, the same
+    /// fact `new`'s Size descr defaults to and `declared_raw_adt_node`
+    /// records.
     pub fn declared_gckind_for(
         &self,
         name: &str,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::GcKind> {
-        Some(self.struct_layout_for(name)?.gckind)
+        Some(self.struct_layout_for(name)?.effective_gckind())
     }
 
     /// Host layout of `owner`, when Charon recorded one.
@@ -21070,6 +21372,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields[0].size, 8);
 
@@ -21125,6 +21428,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         let value_offset = layout
             .fields
@@ -21216,6 +21520,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields[0].name, "stack");
         assert_eq!(layout.fields[0].offset, 0);
@@ -21234,6 +21539,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(vec_only.fields.len(), 1);
         assert_eq!(vec_only.fields[0].size, 3 * word);
@@ -21246,6 +21552,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(vec_then_flag.fields[1].offset, 3 * word);
         assert_eq!(vec_then_flag.size, 4 * word);
@@ -21261,6 +21568,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(triple.align, 4);
         assert_eq!(triple.size, 12);
@@ -21273,6 +21581,7 @@ mod tests {
             &std::collections::HashMap::from([("Triple".to_string(), 4)]),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(nested.align, 4, "three u32 align to 4, not a word");
         assert_eq!(nested.size, 12);
@@ -21303,6 +21612,279 @@ mod tests {
             Some(0),
             "the address of an inline Vec is the field, not a load of cap"
         );
+    }
+
+    /// `rtuple.py` `GcStruct`: a positional tuple that holds a GC pointer
+    /// is a GC owner. A scalar-only tuple stays Raw (`Tuple<i64>` spill).
+    #[test]
+    fn from_type_strings_gckind_follows_pointer_fields() {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let empty = std::collections::HashSet::new();
+        let sizes = std::collections::HashMap::new();
+        let aligns = std::collections::HashMap::new();
+        let ranks = std::collections::HashMap::new();
+        let none = std::collections::HashMap::new();
+        let gc = StructLayout::from_type_strings(
+            &[
+                ("__pos_0".into(), "*mut PyObject".into()),
+                ("__pos_1".into(), "i64".into()),
+            ],
+            &empty,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &none,
+        );
+        assert_eq!(gc.gckind, GcKind::Gc);
+        assert!(gc.holds_gc_pointer());
+        assert_eq!(gc.effective_gckind(), GcKind::Gc);
+
+        let raw = StructLayout::from_type_strings(
+            &[("__pos_0".into(), "i64".into())],
+            &empty,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &none,
+        );
+        assert_eq!(raw.gckind, GcKind::Raw);
+        assert!(!raw.holds_gc_pointer());
+        assert_eq!(raw.effective_gckind(), GcKind::Raw);
+
+        // Nested by-value ADT: the pointer is on the inner type, classified
+        // with the same field_metadata walk the nested layout uses.
+        let nested_known = std::collections::HashSet::from(["InnerPayload".to_string()]);
+        let nested_fields = std::collections::HashMap::from([(
+            "InnerPayload".to_string(),
+            vec![("cell".into(), "*mut PyObject".into())],
+        )]);
+        let nested = StructLayout::from_type_strings(
+            &[("payload".into(), "InnerPayload".into())],
+            &nested_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &nested_fields,
+        );
+        assert_eq!(nested.gckind, GcKind::Gc);
+        assert!(
+            nested.fields.is_empty(),
+            "heaptracker.py:89-90 clears interior rows of a nested struct"
+        );
+        assert_eq!(nested.effective_gckind(), GcKind::Gc);
+
+        let mut cc = CallControl::new();
+        let owner = "from_type_gckind::Slice";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "cell".to_string(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        assert_eq!(
+            cc.declared_gckind_for(owner),
+            Some(GcKind::Gc),
+            "a Raw-stored layout with a FLAG_POINTER field is a GC owner"
+        );
+    }
+
+    /// Inlined nested Struct: Gc only when a FLAG_POINTER field is
+    /// reachable through the nested layout's own `field_metadata` rows.
+    /// A nested raw Struct of only scalars stays Raw (`lltype.Struct`).
+    #[test]
+    fn from_type_strings_gckind_follows_nested_pointer_fields() {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let sizes = std::collections::HashMap::new();
+        let aligns = std::collections::HashMap::new();
+        let ranks = std::collections::HashMap::new();
+        let known = std::collections::HashSet::from([
+            "InnerPtr".to_string(),
+            "InnerScalars".to_string(),
+            "core::option::Option<*mut PyObject>".to_string(),
+        ]);
+        let nested_fields = std::collections::HashMap::from([
+            (
+                "InnerPtr".to_string(),
+                vec![("cell".into(), "*mut PyObject".into())],
+            ),
+            (
+                "InnerScalars".to_string(),
+                vec![("a".into(), "i64".into()), ("b".into(), "u32".into())],
+            ),
+        ]);
+
+        let with_ptr = StructLayout::from_type_strings(
+            &[("payload".into(), "InnerPtr".into())],
+            &known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &nested_fields,
+        );
+        assert_eq!(with_ptr.gckind, GcKind::Gc);
+        assert!(
+            with_ptr.fields.is_empty(),
+            "heaptracker.py:89-90 clears interior rows of a nested struct"
+        );
+        assert_eq!(with_ptr.effective_gckind(), GcKind::Gc);
+
+        let scalars = StructLayout::from_type_strings(
+            &[("payload".into(), "InnerScalars".into())],
+            &known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &nested_fields,
+        );
+        assert_eq!(scalars.gckind, GcKind::Raw);
+        assert!(
+            scalars.fields.is_empty(),
+            "heaptracker.py:89-90 clears interior rows of a nested struct"
+        );
+        assert_eq!(scalars.effective_gckind(), GcKind::Raw);
+
+        // Nested field list not in hand: the pointer is one type-argument
+        // down (`Result<Option<*mut PyObject>, _>` / similar).
+        let option_nested = StructLayout::from_type_strings(
+            &[(
+                "payload".into(),
+                "core::option::Option<*mut PyObject>".into(),
+            )],
+            &known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(option_nested.gckind, GcKind::Gc);
+        assert_eq!(option_nested.effective_gckind(), GcKind::Gc);
+
+        // Unit nested ADT (`Option<DictKeyError>`): Field descrs mint a
+        // GCREF word (`type_flag_from_str` unknown → FLAG_POINTER). Empty
+        // rows still count; so does a known struct whose rows are absent.
+        let unit_known = std::collections::HashSet::from(["DictKeyError".to_string()]);
+        let unit_empty = std::collections::HashMap::from([("DictKeyError".to_string(), vec![])]);
+        let unit = StructLayout::from_type_strings(
+            &[("payload".into(), "DictKeyError".into())],
+            &unit_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &unit_empty,
+        );
+        assert_eq!(unit.gckind, GcKind::Gc);
+        assert_eq!(unit.effective_gckind(), GcKind::Gc);
+
+        let unit_missing = StructLayout::from_type_strings(
+            &[("payload".into(), "DictKeyError".into())],
+            &unit_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(unit_missing.gckind, GcKind::Gc);
+        assert_eq!(unit_missing.effective_gckind(), GcKind::Gc);
+
+        // Enum base rows are the tag; FLAG_POINTER payloads live on the
+        // variant subclasses (`LoopResult::Done(PyResult)`).
+        let enum_known = std::collections::HashSet::from([
+            "LoopLike".to_string(),
+            "Enc".to_string(),
+            "InnerScalars".to_string(),
+        ]);
+        let enum_fields = std::collections::HashMap::from([
+            (
+                "LoopLike".to_string(),
+                vec![("__discriminant".into(), "u8".into())],
+            ),
+            (
+                "LoopLike::Done".to_string(),
+                vec![("__pos_0".into(), "*mut PyObject".into())],
+            ),
+            (
+                "Enc".to_string(),
+                vec![("__discriminant".into(), "u8".into())],
+            ),
+            ("Enc::A".to_string(), vec![]),
+            (
+                "Enc::B".to_string(),
+                vec![("__pos_0".into(), "InnerScalars".into())],
+            ),
+            (
+                "InnerScalars".to_string(),
+                vec![("a".into(), "i64".into()), ("b".into(), "u32".into())],
+            ),
+        ]);
+        let loop_like = StructLayout::from_type_strings(
+            &[("inner".into(), "LoopLike".into())],
+            &enum_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &enum_fields,
+        );
+        assert_eq!(loop_like.gckind, GcKind::Gc);
+        assert_eq!(loop_like.effective_gckind(), GcKind::Gc);
+
+        let enc = StructLayout::from_type_strings(
+            &[("inner".into(), "Enc".into())],
+            &enum_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &enum_fields,
+        );
+        assert_eq!(enc.gckind, GcKind::Raw);
+        assert_eq!(enc.effective_gckind(), GcKind::Raw);
+
+        // Sum-shell payload word: the nested scalar ADT is stored as a
+        // GCREF (`Option<Utf16Or32Form>::Some.__pos_0`).
+        let shell = StructLayout::from_type_strings(
+            &[
+                ("__discriminant".into(), "i64".into()),
+                ("__pos_0".into(), "InnerScalars".into()),
+            ],
+            &enum_known,
+            &sizes,
+            &aligns,
+            &ranks,
+            &HashSet::new(),
+            &enum_fields,
+        );
+        assert_eq!(shell.gckind, GcKind::Gc);
+        assert_eq!(shell.effective_gckind(), GcKind::Gc);
     }
 
     /// Synthetic `OpKind::Call` wrapper — mirrors RPython test_jtransform
@@ -24225,6 +24807,7 @@ mod tests {
                     &known_aligns,
                     &HashMap::new(),
                     &HashSet::new(),
+                    &HashMap::new(),
                 );
                 if known_sizes.get(*name) != Some(&layout.size)
                     || known_aligns.get(*name) != Some(&layout.align)
@@ -24367,6 +24950,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashSet::new(),
+            &HashMap::new(),
         );
         assert_eq!(layout.size, crate::layout::target_word_size());
         assert_eq!(layout.fields.len(), 1);
@@ -24479,6 +25063,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &HashSet::new(),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Unsigned);

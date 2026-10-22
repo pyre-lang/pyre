@@ -1432,10 +1432,18 @@ pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
         discard_staged_abort(ctx.session);
         let _ = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
     } else if ctx.vstack_valid && !ctx.trace_ctx.is_bridge_trace {
-        fbw_qmut_abort_stack_latch(
-            ctx.vstack_cur_pypc as usize,
-            ctx.frame_state.borrow().vstack_boxes.clone(),
-        );
+        // The root flush rewinds to this opcode (`last_instr = py_pc - 1`)
+        // and re-runs the write. `vstack_cur_pypc` can lag on a `Cache`
+        // unit of an earlier `LOAD_ATTR` while the walk has already
+        // entered a later `STORE_NAME`; `debug_merge_point` is the green
+        // `next_instr` of the last portal merge, which is that opcode.
+        let py_pc = ctx
+            .session
+            .borrow()
+            .current_debug_merge_point_py_pc()
+            .map(|pc| pc as usize)
+            .unwrap_or(ctx.vstack_cur_pypc as usize);
+        fbw_qmut_abort_stack_latch(py_pc, ctx.frame_state.borrow().vstack_boxes.clone());
     }
     // The session flag survives recovered sub-walks; always overwrite it at
     // the raise site so a later root-frame abort cannot inherit `true`.
@@ -4446,8 +4454,7 @@ pub(crate) fn mayforce_null_ref_arg_is_checked_sentinel(
 ///
 /// A plain `dont_look_inside*` body has no `RuntimeHelperKind`, so the table
 /// above cannot name it and the funcptr is the only coordinate the call
-/// carries; resolve it against the published registry the way
-/// `records_inside_transparent_helper` does.
+/// carries; resolve it against the published `jit_trace_fnaddrs` registry.
 fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: usize) -> bool {
     if target <= 0 {
         return false;
@@ -4718,44 +4725,6 @@ fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
             as *const pyre_interpreter::CodeObject;
         !raw.is_null() && pyre_interpreter::ncells(&*raw) != 0
     }
-}
-
-/// `dont_look_inside_cannot_raise` helpers whose descr stays
-/// `EF_RANDOM_EFFECTS`. Recording the call inside a transparent helper
-/// is sound: they do not call Python, so `GUARD_NOT_FORCED` does not fail.
-/// `module_spec_get_initializing` answers `-1` instead of running `__eq__`,
-/// `__get__`, or `__bool__`. `bootstrap_handle_fromlist` and
-/// `default_importlib_import_word` are the same kind of lookup: a miss is
-/// null, and neither calls `_handle_fromlist`.
-fn records_inside_transparent_helper(addr: i64) -> bool {
-    if addr <= 0 {
-        return false;
-    }
-    pyre_interpreter::jit_trace_fnaddrs()
-        .iter()
-        .any(|(path, registered)| *registered == addr && transparent_helper_recordable_leaf(path))
-}
-
-fn transparent_helper_recordable_leaf(path: &str) -> bool {
-    path.rsplit("::").next().is_some_and(|leaf| {
-        let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
-        matches!(
-            leaf,
-            "tuple_from_exact_list"
-                | "dict_get_plain"
-                | "dict_get_plain_applies"
-                | "exc_init_one_positional"
-                | "value_error_one_arg"
-                | "extend_from_frame_locals_proxy"
-                | "proxy_list_new"
-                | "proxy_list_append"
-                | "append_extra_locals"
-                | "append_extra_locals_items"
-                | "module_spec_get_initializing"
-                | "bootstrap_handle_fromlist"
-                | "default_importlib_import_word"
-        )
-    })
 }
 
 /// `jit_portal_call_3` is `space.call_method` (`baseobjspace.py`) as five
@@ -5173,15 +5142,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // with such a parameter, so the descent declines before running one and
     // the interpreter makes the call with the argument whole.
     //
-    // A may-force residual inside a transparent helper is declined for the
-    // resume it would need.  Its GUARD_NOT_FORCED and GUARD_NO_EXCEPTION fail
-    // after the Python code it called back into has run: a callback that
-    // raises forces the caller's frame vref on `leave`, and so does one that
-    // escapes its frame.  `capture_resumedata` resumes such a guard inside the
-    // helper's own frame, past the call.  A transparent helper has no frame of
-    // its own, so its guards resume at the Python CALL that entered it, and
-    // the CALL runs the callback a second time -- or, with the exception still
-    // pending at that coordinate, lets it past the CALL's handler.
+    // A may-force residual inside a helper is `do_residual_call`
+    // (`pyjitpl.py`): `execute_and_record` then `GUARD_NOT_FORCED`.
+    // `capture_resumedata` numbers the helper MIFrame at that pc
+    // (`walker_capture_transparent_helper_snapshot`); the fail path
+    // resumes past the call. Declining the whole descent aborted the
+    // IndexError bridge of `getitem_list` instead of recording the raise.
     let unsupported_funcbox = if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
@@ -5194,29 +5160,6 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // A real funcptr reached here, so there is no hash to carry, and
             // zero is what this variant spells for that.
             Some(("abi-unsound-arg", addr, 0))
-        } else if ctx.fbw_mode.transparent_helper_subwalk
-            && call_opcode.is_call_may_force()
-            && !records_inside_transparent_helper(addr)
-            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
-            && !call_descr.get_extra_info().is_call_release_gil()
-            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
-            // and records `call_release_gil`. The helper is
-            // `dont_look_inside` and does not re-enter Python; the forces
-            // guard belongs to the recorded release-gil op.
-            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
-        {
-            // These helpers are `dont_look_inside_cannot_raise`. Their
-            // call descr is still `EF_RANDOM_EFFECTS` because the graph
-            // is top, so the opcode is may-force. They do not call back
-            // into Python, so the guard the comment above is about does
-            // not fail and the call can be recorded.
-            // `do_residual_call` runs `executor.execute_varargs` on
-            // `call_external_function` (`ccall_*`), then
-            // `direct_call_release_gil` records `CALL_RELEASE_GIL_*`
-            // (`history.record_nospec`). The wrapper releases the GIL around
-            // the C call, so it does not re-enter Python and
-            // `GUARD_NOT_FORCED` cannot fail for a callback.
-            Some(("may-force-in-transparent-helper", addr, 0))
         } else {
             None
         }
@@ -7105,17 +7048,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     body,
                     for_iter_journaled,
                 );
-                // #73/#267: the item lands on the operand-stack TOS through the
-                // codewriter's `pin!` slot binding (FOR_ITER lowering), not a
-                // `setarrayitem_vable_r` push, and the residual result is
-                // stamped via `set_opref_concrete`, not `write_ref_reg` — so
-                // neither mirror chokepoint sees the item and `vstack_last_ref`
-                // still holds whatever inner box the ForIterNext produced.  Seed
-                // it with the item OpRef so the FOR_ITER boundary
-                // (`ResultToTos`) places the item, not a stale box, on the new
-                // TOS.  This runs for every `ForIterNext` residual once it
-                // returns, placing the item OpRef on the new TOS for the
-                // FOR_ITER `ResultToTos` boundary. An inline const has no slot.
+                // The continue-arm `setarrayitem_vable_r` writes the item
+                // above the iterator (`pyopcode.py` `pushvalue(w_nextitem)`).
+                // Seed `vstack_last_ref` so the FOR_ITER *fallthrough*
+                // ResultToTos places that item on the new TOS; same-pc
+                // reconcile must not, because that depth still names the
+                // iterator. An inline const has no slot.
                 if !recorded.is_none() && recorded.inline_const_to_value().is_none() {
                     ctx.frame_state.borrow_mut().vstack_last_ref = recorded;
                 }
@@ -7867,7 +7805,6 @@ fn emit_shadow_slot_stores<Sym: WalkSym>(
                     adescr.clone(),
                     value,
                     concrete,
-                    false,
                 )
             } else {
                 ctx.trace_ctx.vable_setarrayitem_checked(
@@ -7880,7 +7817,6 @@ fn emit_shadow_slot_stores<Sym: WalkSym>(
                     adescr.clone(),
                     value,
                     concrete,
-                    false,
                 )
             };
             Ok(stored)
@@ -9825,26 +9761,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // `isinstance(x, C)` for a class whose metaclass is exactly `type`: the
-    // answer is `issubtype`'s elidable MRO test on two promoted types
-    // (typeobject.py), so pin both and bake it instead of leaving the opaque
-    // `bh_call_fn(isinstance_builtin, NULL, x, C)` residual.  Read-only like
-    // the `len` fold, so no sub-walk restriction; a tuple or union classinfo, a
-    // custom `__instancecheck__`, and an unversioned type fall through to the
-    // generic residual (SAFE).
+    // `ABCMeta.__instancecheck__` is Python.  Enter it before the wrapper
+    // descent: an `Err` from that descent aborts the trace.  Ordinary
+    // `type.__instancecheck__` declines here and the wrapper descent records
+    // `W_TypeObject.issubtype` (`_pure_issubtype`).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
-        if spec_gate(SpecFold::BuiltinIsinstance, || {
-            try_walker_specialize_builtin_isinstance(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-        {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
-        // `ABCMeta.__instancecheck__` is Python.  Enter it before the wrapper
-        // descent: an `Err` from that descent aborts the trace.
         if let Some(inlined) =
             try_walker_inline_isinstance_dunder(ctx, op, code, &r_args, call_descr, dst, dst_bank)?
         {
@@ -10172,25 +10096,28 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
         return Ok((outcome, op.next_pc));
     }
 
-    if ctx.is_authoritative_executor && dst_bank == 'i' && r_args.len() == 1 {
+    if ctx.is_authoritative_executor
+        && r_args.len() == 1
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::Truth
+    {
         // A TO_BOOL / POP_JUMP truth residual walks
         // `opcode_ops::truth_value` (`is_true`). That elides the may-force
         // call whose force/exc guards mis-resume the kept short-circuit
         // stack (`(i % 7) and ...`, and the boxed bool a COMPARE_OP leaves
-        // for `if a == b:`).
-        if foldable_runtime_helper == majit_ir::RuntimeHelperKind::Truth {
-            if let Some(outcome) = try_walker_orthodox_truth(ctx, op.pc, r_args[0], dst, dst_bank)?
-            {
-                return Ok((outcome, op.next_pc));
-            }
-            // `is_true_lookup` is `dont_look_inside`. An overriding Python
-            // `__bool__` is inlined here, the way `len` inlines `__len__`,
-            // instead of recording the lookup as RandomEffects.
-            if let Some(routed) =
+        // for `if a == b:`). `dst_bank == 'r'` is fused `eval.rs` `to_bool`
+        // (`bh_to_bool_fn`); the descent still unboxes before `newbool`.
+        if let Some(outcome) = try_walker_orthodox_truth(ctx, op.pc, r_args[0], dst, dst_bank)? {
+            return Ok((outcome, op.next_pc));
+        }
+        // `is_true_lookup` is `dont_look_inside`. An overriding Python
+        // `__bool__` is inlined here, the way `len` inlines `__len__`,
+        // instead of recording the lookup as RandomEffects. The inline
+        // writes the raw truth int, so only the POP_JUMP (`'i'`) residual.
+        if dst_bank == 'i'
+            && let Some(routed) =
                 try_walker_inline_truth_bool(ctx, op, code, funcptr, &r_args, call_descr, dst)?
-            {
-                return Ok(routed);
-            }
+        {
+            return Ok(routed);
         }
     }
 
@@ -10443,11 +10370,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
     // parity suite folding function-entry helper appends on both backends.
     // Inside an inlined callee the same descent runs only when
     // `walker_inline_guard_resumes_in_callee` holds.  `w_list_append_inner`
-    // is a transparent helper: a complete parent chain numbers the paused
-    // Python CALL (`in_a_call`) plus the helper section at the guard
-    // (`capture_resumedata`). A shorter parent chain still collapses onto
-    // `entry_py_pc` / `outer_active_boxes` and stays on the residual, whose
-    // resume is past the call.
+    // is a transparent helper: `walker_capture_transparent_helper_snapshot`
+    // appends a helper section and the paused Python CALL sits at `next_pc`
+    // dest-cleared (`compute_inline_caller_frame`). A shorter parent chain
+    // still collapses onto `entry_py_pc` / `outer_active_boxes` and stays on
+    // the residual, whose resume is past the call.
     // #171 ORTHODOX descent: descend the real `w_list_append` body,
     // recording its array ops native.
     // A recognition or body-sub-walk decline falls through to the generic
@@ -10540,20 +10467,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
         .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // An exact `range(...)` constructor call becomes a virtual W_Range whose
-    // four wrapped-int fields can fold directly into GET_ITER virtualization.
-    // Non-canonical callables and arguments fall through to the residual.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
-            try_walker_specialize_builtin_range(ctx, code, op, funcptr, &r_args, call_descr, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal
@@ -12863,7 +12776,9 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
             let concrete = concrete_from_box_value(ctx.trace_ctx.box_value(first));
             match dst_bank {
                 'i' => write_int_reg(ctx, op.pc, dst, first, concrete)?,
-                'r' => write_ref_reg(ctx, op.pc, dst, first, concrete)?,
+                'r' => {
+                    write_ref_reg(ctx, op.pc, dst, first, concrete)?;
+                }
                 _ => unreachable!("cond_call_value dst bank is i or r"),
             }
             return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -12978,7 +12893,9 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
     };
     match dst_bank {
         'i' => write_int_reg(ctx, op.pc, dst, result, concrete)?,
-        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete)?,
+        'r' => {
+            write_ref_reg(ctx, op.pc, dst, result, concrete)?;
+        }
         _ => unreachable!("cond_call_value dst bank is i or r"),
     }
     if let Some(out) = cond_record_handle_exception(ctx, op, &ei)? {

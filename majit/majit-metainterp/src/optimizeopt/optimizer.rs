@@ -31,7 +31,7 @@ pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earl
 /// Chains multiple optimization passes and drives operations through them.
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type};
+use majit_ir::{Descr, DescrRef, FailDescr, Op, OpCode, OpRc, OpRef, Type};
 use std::sync::Arc;
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};

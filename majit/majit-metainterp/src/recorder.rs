@@ -763,7 +763,7 @@ impl Trace {
         // would keep the from-space word. Hold the index and resolve after
         // the previous encode, matching `record_bytes`.
         let mut const_i = 0;
-        for &tagged in boxes {
+        for &tagged in boxes.iter() {
             let b = match tagged {
                 SnapshotTagged::Const(v, Type::Ref) if v != 0 => {
                     let opref = const_refs[const_i];

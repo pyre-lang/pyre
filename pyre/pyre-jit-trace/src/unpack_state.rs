@@ -9,7 +9,7 @@
 //! `state.rs`:
 //!
 //! * [`UnpackSym`] — the extracted `reds='auto'` state of the Rust portal:
-//!   `root_base`, `items_slot`, and the live `RootScope` cell.
+//!   `root_base`, `items_slot`, and the live `RootScope` save point.
 //! * [`UnpackJitState`] — `Meta = PyreMeta`, `Sym = UnpackSym`, `Env = PyreEnv`.
 //!
 //! Dormant means gated, not unbuilt: the descriptor builder, its second
@@ -21,7 +21,7 @@
 //! portal — see `eval.rs jd1_experiment_enabled` for why that is not yet
 //! RPython's independent second driver.
 
-use majit_ir::{GcRef, OpRef, Type, Value};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use crate::state::{PyreEnv, PyreMeta};
@@ -33,7 +33,7 @@ use pyre_object::{PY_NULL, PyObjectRef};
 /// and `items`.  The extracted Rust portal cannot: there is no RPython GC
 /// transform to keep those objects as traced locals, so they live on the
 /// shadow stack and `reds='auto'` names `root_base`, `items_slot`, and the
-/// `RootScope` cell.  Binding the objects as merge-point reds rematerializes
+/// `RootScope` save point.  Binding the objects as merge-point reds rematerializes
 /// the slots after the marker and silently declines `try_fuse_drain_match`
 /// (`front/result_exc.rs`), leaving `StopIteration` / `PyErrorKind::eq`
 /// residuals.  JUMP / enter must match the extracted banks.
@@ -50,7 +50,8 @@ pub struct UnpackSym {
     pub root_base: OpRef,
     /// Shadow-stack slot of the pinned `items` list (`root_base + 1`).
     pub items_slot: OpRef,
-    /// `RootScope.stack_slot`, the one object red the extracted body keeps.
+    /// `RootScope.save_point`. `RootScope` is `#[repr(transparent)]` over
+    /// that `usize`, so rtyper classifies the live local as a red Int.
     pub roots_cell: OpRef,
 }
 
@@ -92,11 +93,15 @@ pub fn jd1_root_base() -> i64 {
 }
 
 /// Loop-carried reds in merge-point bank order (red I, then red R).
+///
+/// `unpackiterable_portal` does `push_roots` then `pin_roots` of the three
+/// objects with nothing in between, so the `RootScope` save point equals
+/// `root_base`. The extracted merge names that word as a third red Int.
 pub fn jd1_live_values_at(root_base: i64) -> Vec<Value> {
     vec![
         Value::Int(root_base),
         Value::Int(root_base + 1),
-        Value::Ref(GcRef(pyre_object::gc_roots::shadow_stack_cell() as usize)),
+        Value::Int(root_base),
     ]
 }
 
@@ -107,14 +112,14 @@ pub const UNPACKITERABLE_JD_INDEX: usize = 1;
 impl UnpackJitState {
     /// jd1 (`unpackiterable_driver`) portal descriptor.
     /// `baseobjspace.py` `greens=['greenkey'], reds='auto'`. The extracted
-    /// body names `root_base`, `items_slot`, and the `RootScope` cell.
+    /// body names `root_base`, `items_slot`, and the `RootScope` save point.
     pub fn unpackiterable_driver_descriptor() -> JitDriverStaticData {
         let mut sd = JitDriverStaticData::new(
             vec![("greenkey", Type::Ref)],
             vec![
                 ("root_base", Type::Int),
                 ("items_slot", Type::Int),
-                ("roots_cell", Type::Ref),
+                ("roots_cell", Type::Int),
             ],
         );
         // baseobjspace.py unpackiterable_driver = jit.JitDriver(name='unpackiterable', ...)
@@ -167,7 +172,7 @@ impl JitState for UnpackJitState {
             greenkey: PY_NULL,
             root_base: OpRef::input_arg_typed(0, Type::Int),
             items_slot: OpRef::input_arg_typed(1, Type::Int),
-            roots_cell: OpRef::input_arg_typed(2, Type::Ref),
+            roots_cell: OpRef::input_arg_typed(2, Type::Int),
         }
     }
 
@@ -226,13 +231,13 @@ mod tests {
         assert_eq!(banks.green_f.len(), 0);
         assert_eq!(
             banks.red_i.len(),
-            2,
-            "extracted portal carries root_base and items_slot as red Ints"
+            3,
+            "extracted portal carries root_base, items_slot, and the RootScope save point as red Ints"
         );
         assert_eq!(
             banks.red_r.len(),
-            1,
-            "extracted portal carries the RootScope cell as the one object red"
+            0,
+            "RootScope is a transparent Int save point, so the extracted portal has no object red"
         );
         assert_eq!(banks.red_f.len(), 0);
 

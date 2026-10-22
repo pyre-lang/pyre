@@ -1788,6 +1788,128 @@ pub fn emit_box_float_inline(
 ///    (`f_generator_wref`, `w_yielding_from`, `f_backref`) are written
 ///    explicitly to match the same constructor shape instead of relying on
 ///    an implicit backend zero-fill side effect.
+/// `execute_new_array_clear` (`pyjitpl.py`): allocate the live
+/// `locals_cells_stack_w` block, record `NEW_ARRAY_CLEAR`, stamp the
+/// pointer. `setup_call` then stores through `execute_setarrayitem_gc`.
+fn execute_inline_locals_array(
+    ctx: &mut TraceCtx,
+    array_size: usize,
+) -> (OpRef, majit_ir::DescrRef, u32) {
+    use crate::state::pyobject_gcarray_descr;
+    let len_ref = ctx.const_int(array_size as i64);
+    let array_descr = pyobject_gcarray_descr();
+    let allocated =
+        unsafe { pyre_object::object_array::alloc_cleared_ref_items_block_gc(array_size) };
+    if let Some(p) = allocated {
+        let _ = pyre_object::gc_roots::pin_root(p as pyre_object::PyObjectRef);
+    }
+    let value = allocated.map(|p| Value::Ref(GcRef(p as usize)));
+    let locals_array = ctx.execute_new_array_clear(array_descr.clone(), len_ref, value);
+    let heapcache_item_descr_index = ctx
+        .virtualizable_info()
+        .map(|info| info.array_item_descr(0).index())
+        .unwrap_or_else(|| array_descr.index());
+    (locals_array, array_descr, heapcache_item_descr_index)
+}
+
+/// `pyjitpl.py execute_new_with_vtable`: allocate the live `PyFrame` then
+/// record `NEW_WITH_VTABLE` with that pointer. A later `FrameBox::new` would
+/// be a second object whose `locals_cells_stack_w` disagrees with the
+/// heapcache (`_opimpl_getfield_gc_any_pureornot`). The block is young
+/// non-moving, the placement `FrameBox::new` / `materialize_resumed_pyframe_block`
+/// use for an executing frame: the tracer holds the address across
+/// allocations and has no shadow-stack rewrite for a nursery move.
+/// `None` before the collector hook is installed leaves the recorded op
+/// virtual, matching the previous record-only emit.
+fn alloc_live_inline_pyframe() -> Option<Value> {
+    let size = std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>();
+    let raw = pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
+        pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID,
+        size,
+    );
+    if raw.is_null() {
+        return None;
+    }
+    unsafe {
+        std::ptr::write_bytes(raw as *mut u8, 0, size);
+        let frame = raw as *mut pyre_interpreter::pyframe::PyFrame;
+        (*frame).ob_header.ob_type =
+            &pyre_interpreter::pyframe::FRAME_TYPE as *const pyre_object::PyType;
+        (*frame).ob_header.w_class =
+            pyre_object::get_instantiate(&pyre_interpreter::pyframe::FRAME_TYPE);
+    }
+    let _ = pyre_object::gc_roots::pin_root(raw as pyre_object::PyObjectRef);
+    Some(Value::Ref(GcRef(raw as usize)))
+}
+
+fn emit_inline_pyframe_new(ctx: &mut TraceCtx) -> OpRef {
+    ctx.execute_new_with_vtable(
+        crate::descr::pyframe_size_descr(),
+        alloc_live_inline_pyframe(),
+    )
+}
+
+/// Constructor-visible fields of `new_for_call_with_closure`.
+/// `execute_setfield_gc` writes the live object and heapcaches, matching
+/// `pyjitpl.py`. `flags` / `failed_attr_cleanup` stay record-only: the
+/// interpreter's `mark_as_escaped` mutates the live byte during tracing,
+/// so a constructor-time heapcache zero would fail GETFIELD sanity.
+fn emit_inline_pyframe_constructor_fields(
+    ctx: &mut TraceCtx,
+    new_frame: OpRef,
+    pycode: OpRef,
+    locals_array: OpRef,
+    valuestackdepth: usize,
+) {
+    use crate::descr::{
+        pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
+        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_stack_depth_descr,
+    };
+
+    ctx.execute_setfield_gc(new_frame, pycode, pyframe_code_descr());
+    ctx.execute_setfield_gc(new_frame, locals_array, pyframe_locals_cells_stack_descr());
+
+    let vsd = ctx.const_int(valuestackdepth as i64);
+    ctx.execute_setfield_gc(new_frame, vsd, pyframe_stack_depth_descr());
+
+    let neg_one = ctx.const_int(-1);
+    ctx.execute_setfield_gc(new_frame, neg_one, pyframe_next_instr_descr());
+
+    let zero = ctx.const_int(0);
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_frame, zero],
+        pyframe_flags_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_frame, zero],
+        pyframe_failed_attr_cleanup_descr(),
+    );
+}
+
+/// `setup_call` (`pyjitpl.py`): `execute_setarrayitem_gc` stores the arg
+/// on the live array then heapcaches. The recorded descr is the struct
+/// layout; the heapcache key for later `getarrayitem_vable` is the vinfo
+/// array item descr.
+fn setup_call_setarrayitem(
+    ctx: &mut TraceCtx,
+    locals_array: OpRef,
+    array_descr: &majit_ir::DescrRef,
+    heapcache_item_descr_index: u32,
+    index: usize,
+    value: OpRef,
+) {
+    if value.is_none() {
+        return;
+    }
+    let idx = ctx.const_int(index as i64);
+    ctx.execute_setarrayitem_gc(locals_array, idx, value, array_descr.clone());
+    if heapcache_item_descr_index != array_descr.index() {
+        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, value);
+    }
+}
+
 /// Build a VIRTUAL callee `PyFrame` for a multi-frame inline (#68) from
 /// already-boxed positional argument refs.  Same field-complete frame shape as
 /// [`emit_new_pyframe_inline_self_recursive`] but seeds `locals[0..nparams]`
@@ -1828,68 +1950,42 @@ pub fn emit_new_pyframe_inline_with_params(
     w_globals: OpRef,
 ) -> Option<OpRef> {
     let debugdata_kind = inline_frame_debugdata_kind(ctx, pycode, w_globals)?;
-    use crate::descr::{
-        pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
-        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr,
-    };
-    use crate::state::pyobject_gcarray_descr;
 
     // locals_cells_stack_w array, zero-filled so an unbound local reads PY_NULL.
-    let len_ref = ctx.const_int(array_size as i64);
-    let array_descr = pyobject_gcarray_descr();
-    let locals_array =
-        ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
-    // `heapcache.py new_array` stores the length in `_heapc_deps[0]`.
-    // `append_bound_entries` compares `slot < locals_w!(frame).len()`
-    // through `opimpl_arraylen_vable`. A hit answers with this const.
-    // `_escape_box` keeps deps[0]; a miss executes `ARRAYLEN_GC`.
-    ctx.heap_cache_mut().new_array(locals_array, len_ref, true);
+    // `execute_new_array_clear` allocates the live block so `setup_call`
+    // SETARRAYITEMs write the same object (`pyjitpl.py`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let (locals_array, array_descr, heapcache_item_descr_index) =
+        execute_inline_locals_array(ctx, array_size);
 
     // locals[i] = param_boxes[i] — the positional arguments (already boxed).
-    // Register each store in the heapcache so a later nonstandard
-    // `getarrayitem_vable` read of this VIRTUAL inline-callee frame forwards the
-    // stored param box (with its concrete shadow) instead of recording a fresh
-    // `GetarrayitemGc` whose result has no concrete — the gap that made an
-    // in-callee pure comparison branch surface `GotoIfNotValueNotConcrete`.
-    // Heapcache key for the locals-array elements must match the descr the
-    // codewriter's `getarrayitem_vable`/`setarrayitem_vable` ops carry — the
-    // virtualizable info's array descr (`info.array_descrs[0]`), NOT the
-    // struct-layout `pyobject_gcarray_descr` the recorded `SetarrayitemGc` uses
-    // for materialization.  The heapcache `heap_array_cache` is keyed by descr
-    // FIRST, so a struct-vs-vinfo descr mismatch silently misses every forward.
-    let heapcache_item_descr_index = ctx
-        .virtualizable_info()
-        .map(|info| info.array_item_descr(0).index())
-        .unwrap_or_else(|| array_descr.index());
+    // `setup_call` stores through `execute_setarrayitem_gc` so the live
+    // array and the heapcache name the same word
+    // (`_do_getarrayitem_gc_any`). A NONE slot keeps the NewArrayClear
+    // zero-fill (PY_NULL).
     for (i, &p) in param_boxes.iter().enumerate() {
-        // A NONE slot (an unbound local in a reconstructed bridge-carrier
-        // callee frame) keeps the NewArrayClear zero-fill (PY_NULL); only
-        // bound slots are stored.  Forward-inline callees pass dense param
-        // boxes, so this skips nothing on that path.
-        if p.is_none() {
-            continue;
-        }
-        let idx = ctx.const_int(i as i64);
-        ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[locals_array, idx, p],
-            array_descr.clone(),
+        setup_call_setarrayitem(
+            ctx,
+            locals_array,
+            &array_descr,
+            heapcache_item_descr_index,
+            i,
+            p,
         );
-        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, p);
     }
     // PyFrame.finish_for_call_with_globals_obj: the pure cellvars take a fresh
     // cell each and a closure then contributes its existing cell objects
     // themselves, in that order. LOAD_DEREF must read the live cell, not a
     // snapshot of its contents, so the slot holds the cell.
     for (i, &cell) in cell_slots.iter().enumerate() {
-        let idx = ctx.const_int((cell_start + i) as i64);
-        ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[locals_array, idx, cell],
-            array_descr.clone(),
+        setup_call_setarrayitem(
+            ctx,
+            locals_array,
+            &array_descr,
+            heapcache_item_descr_index,
+            cell_start + i,
+            cell,
         );
-        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, cell);
     }
     // A paused frame's operand stack occupies the slots above the cells
     // (`pyframe.py` `locals_cells_stack_w`). A reconstructed bridge-carrier
@@ -1899,81 +1995,19 @@ pub fn emit_new_pyframe_inline_with_params(
     // inline callee starts with an empty stack and passes nothing here.
     let stack_start = cell_start + cell_slots.len();
     for (i, &item) in stack_items.iter().enumerate() {
-        if item.is_none() {
-            continue;
-        }
-        let idx = ctx.const_int((stack_start + i) as i64);
-        ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[locals_array, idx, item],
-            array_descr.clone(),
+        setup_call_setarrayitem(
+            ctx,
+            locals_array,
+            &array_descr,
+            heapcache_item_descr_index,
+            stack_start + i,
+            item,
         );
-        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, item);
     }
 
-    let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
-    ctx.heap_cache_mut().new_object(new_frame);
-
-    let code_descr = pyframe_code_descr();
-    let code_idx = code_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
-    ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
-
-    let locals_descr = pyframe_locals_cells_stack_descr();
-    let locals_idx = locals_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, locals_array], locals_descr);
-    ctx.heapcache_setfield_cached(new_frame, locals_idx, locals_array);
-
-    let vsd = ctx.const_int(valuestackdepth as i64);
-    let vsd_descr = pyframe_stack_depth_descr();
-    let vsd_idx = vsd_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, vsd], vsd_descr);
-    ctx.heapcache_setfield_cached(new_frame, vsd_idx, vsd);
-
-    let neg_one = ctx.const_int(-1);
-    let last_instr_descr = pyframe_next_instr_descr();
-    let last_instr_idx = last_instr_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
-    ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
-
-    // `pyframe.py` leaves `debugdata` unset unless `frame_stores_global`
-    // installs the rare namespace override. Store PY_NULL or a New
-    // `FrameDebugData` so a `getfield_vable_r` of that slot on this virtual
-    // folds to the constructor value (`dispatch_bytecode`'s jitted arm).
+    let new_frame = emit_inline_pyframe_new(ctx);
+    emit_inline_pyframe_constructor_fields(ctx, new_frame, pycode, locals_array, valuestackdepth);
     store_inline_frame_debugdata(ctx, new_frame, pycode, w_globals, debugdata_kind);
-
-    let zero = ctx.const_int(0);
-    let flags_descr = pyframe_flags_descr();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], flags_descr);
-    // The concrete carrier may already be marked escaped by record-time
-    // traceback inspection before this allocation shape is emitted. Do not
-    // seed TraceCtx's concrete sanity cache with the constructor-time zero;
-    // a later mark_as_escaped read must observe the carrier's current byte.
-
-    // `failed_attr_cleanup` is the second byte beside `flags` and is not a GC
-    // reference, so `clear_gc_fields` does not reach it. incminimark's
-    // `malloc_zero_filled = False` leaves the `NewWithVtable` block holding
-    // recycled nursery bytes, and the byte's "run the deferred cleanup before
-    // the next opcode" value is `u8::MAX` — a recycled `0xff` makes every
-    // dispatch on this frame run a full non-moving old-gen collection.
-    let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
-
-    // The virtualizable token is a GCREF row of `gc_fielddescrs`
-    // (`VirtualizableInstanceRepr._setup_repr_llfields`), so
-    // `clear_gc_fields` zeroes it.
-
-    // pyframe.py `f_generator_wref`/`w_yielding_from`/`f_backref`
-    // are class-level defaults (dead_ref/None/vref_None), never assigned in the
-    // frame constructor. The trace of frame construction therefore emits no
-    // setfield for them; clear_gc_fields initializes these GC-reference slots,
-    // so the fields read back as PY_NULL. No explicit store here.
-    //
-    // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
-    // `self.builtin` only under `honor__builtins__`, which
-    // `baseobjspace::HONOR_BUILTINS` leaves off, so the constructor writes
-    // nothing and every reader goes through `get_builtin`, which answers
-    // `space.builtin` for an unset slot.
 
     Some(new_frame)
 }
@@ -1994,6 +2028,75 @@ fn store_inline_frame_debugdata(
     let debugdata_idx = debugdata_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, debugdata], debugdata_descr);
     ctx.heapcache_setfield_cached(new_frame, debugdata_idx, debugdata);
+}
+
+/// The live `PyFrame` `emit_new_pyframe_inline_*` allocated, if the
+/// `NEW_WITH_VTABLE` box already carries it. Callers that would otherwise
+/// `FrameBox::new` a second object reuse this pointer.
+pub fn emitted_pyframe_ptr(
+    ctx: &TraceCtx,
+    frame: OpRef,
+) -> Option<*mut pyre_interpreter::pyframe::PyFrame> {
+    let Some(Value::Ref(r)) = ctx.box_value(frame) else {
+        return None;
+    };
+    if r == GcRef::NO_CONCRETE || r.as_usize() == 0 {
+        return None;
+    }
+    let p = majit_gc::gc_current_object_address(r.as_usize())
+        as *mut pyre_interpreter::pyframe::PyFrame;
+    (!p.is_null()).then_some(p)
+}
+
+/// Point a live `PyFrame.locals_cells_stack_w` at the array `setup_call`
+/// wrote through `execute_setarrayitem_gc`.
+///
+/// `emit_new_pyframe_inline_*` now `execute_setfield_gc`s that field onto
+/// the live `NEW_WITH_VTABLE` object. A fallback `FrameBox::new` still
+/// allocates a second array; bind the live field to the SET-written array
+/// so GETFIELD locals and the constructor slots are one store.
+/// No-op until `frame` has a concrete pointer (or `concrete_frame` is
+/// passed). Does not record another SETFIELD: emit already did.
+pub fn bind_emitted_pyframe_locals_array(
+    ctx: &mut TraceCtx,
+    frame: OpRef,
+    concrete_frame: Option<*mut pyre_interpreter::pyframe::PyFrame>,
+) {
+    let locals_descr = crate::descr::pyframe_locals_cells_stack_descr();
+    let Some(arr_op) = ctx.heapcache_getfield_cached(frame, locals_descr.index()) else {
+        return;
+    };
+    let Some(Value::Ref(a)) = ctx.box_value(arr_op) else {
+        return;
+    };
+    if a == GcRef::NO_CONCRETE {
+        return;
+    }
+    let a_ptr = majit_gc::gc_current_object_address(a.as_usize());
+    if a_ptr == 0 {
+        return;
+    }
+    let live = concrete_frame.filter(|p| !p.is_null()).or_else(|| {
+        let Some(Value::Ref(r)) = ctx.box_value(frame) else {
+            return None;
+        };
+        if r == GcRef::NO_CONCRETE || r.as_usize() == 0 {
+            return None;
+        }
+        let p = majit_gc::gc_current_object_address(r.as_usize())
+            as *mut pyre_interpreter::pyframe::PyFrame;
+        (!p.is_null()).then_some(p)
+    });
+    let Some(live) = live else {
+        return;
+    };
+    unsafe {
+        (*live).locals_cells_stack_w = a_ptr as *mut pyre_object::FixedObjectArray;
+    }
+    crate::state::frame_array_write_barrier(
+        live as *mut u8,
+        a_ptr as *mut pyre_object::FixedObjectArray,
+    );
 }
 
 fn store_debugdata_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef, value: OpRef) {
@@ -2114,12 +2217,6 @@ pub fn emit_new_pyframe_inline_self_recursive(
     w_globals: OpRef,
 ) -> Option<OpRef> {
     let debugdata_kind = inline_frame_debugdata_kind(ctx, pycode, w_globals)?;
-    use crate::descr::{
-        pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
-        pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr,
-    };
-    use crate::state::pyobject_gcarray_descr;
 
     // Step 1 — `locals[0]` receives the caller's already-boxed positional
     // argument box.  The caller supplies the shape-correct box so the callee
@@ -2134,96 +2231,28 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // Step 2 — allocate the locals_cells_stack_w array. `NewArrayClear`
     // zeros every slot so any future LOAD_FAST on an unbound local
     // observes `PY_NULL` (UnboundLocalError parity).
-    let len_ref = ctx.const_int(array_size as i64);
-    let array_descr = pyobject_gcarray_descr();
-    let locals_array =
-        ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
-    // Same `new_array` length as `emit_new_pyframe_inline_with_params`.
-    ctx.heap_cache_mut().new_array(locals_array, len_ref, true);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let (locals_array, array_descr, heapcache_item_descr_index) =
+        execute_inline_locals_array(ctx, array_size);
 
     // Step 3 — locals[0] = boxed. The single positional argument of
-    // the self-recursive call.
-    let zero = ctx.const_int(0);
-    ctx.record_op_with_descr(
-        OpCode::SetarrayitemGc,
-        &[locals_array, zero, boxed],
-        array_descr,
+    // the self-recursive call. `setup_call` stores through
+    // `execute_setarrayitem_gc`.
+    setup_call_setarrayitem(
+        ctx,
+        locals_array,
+        &array_descr,
+        heapcache_item_descr_index,
+        0,
+        boxed,
     );
 
     // Step 4 — allocate the new PyFrame. The GC tags it with
     // `PYFRAME_GC_TYPE_ID` because the size descr's parent type id is
     // registered in `pyre-jit/src/eval.rs`.
-    let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
-    ctx.heap_cache_mut().new_object(new_frame);
-
-    // Step 5 — SetfieldGc for the constructor-visible fields, mirroring
-    // the explicit assignments inside `new_for_call_with_closure`.
-    // Order matches the field declaration so the optimizer's lazy-set
-    // replace logic groups them together.
-    // `pycode` arrives as a trace-time Ref Const (the bound `PyCode`).
-    let code_descr = pyframe_code_descr();
-    let code_idx = code_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
-    ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
-
-    // `locals_array` is a fresh `NewArrayClear` op result.  PyPy's
-    // executor-while-trace model would have `Box.value` carry the
-    // actual allocated array ref; pyre's `record_op` does not execute
-    // the alloc, so the runtime ref does not exist until codegen +
-    // execution.  Honest carrier: `Value::Void` (= "no Box.value
-    // known"), so the downstream cache-hit sanity check skips
-    // explicitly.  Fabricating a `Ref(0)` here would lie about the
-    // payload.
-    let locals_descr = pyframe_locals_cells_stack_descr();
-    let locals_idx = locals_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, locals_array], locals_descr);
-    ctx.heapcache_setfield_cached(new_frame, locals_idx, locals_array);
-
-    let vsd = ctx.const_int(valuestackdepth as i64);
-    let vsd_descr = pyframe_stack_depth_descr();
-    let vsd_idx = vsd_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, vsd], vsd_descr);
-    ctx.heapcache_setfield_cached(new_frame, vsd_idx, vsd);
-
-    let neg_one = ctx.const_int(-1);
-    let last_instr_descr = pyframe_next_instr_descr();
-    let last_instr_idx = last_instr_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
-    ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
-
+    let new_frame = emit_inline_pyframe_new(ctx);
+    emit_inline_pyframe_constructor_fields(ctx, new_frame, pycode, locals_array, valuestackdepth);
     store_inline_frame_debugdata(ctx, new_frame, pycode, w_globals, debugdata_kind);
-
-    let zero = ctx.const_int(0);
-    let flags_descr = pyframe_flags_descr();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], flags_descr);
-    // See emit_new_pyframe_inline_with_params: the trace store is required for
-    // materialization, but its constructor-time value is not the concrete
-    // carrier's necessarily later record-time state.
-
-    // `failed_attr_cleanup` is the second byte beside `flags` and is not a GC
-    // reference, so `clear_gc_fields` does not reach it. incminimark's
-    // `malloc_zero_filled = False` leaves the `NewWithVtable` block holding
-    // recycled nursery bytes, and the byte's "run the deferred cleanup before
-    // the next opcode" value is `u8::MAX` — a recycled `0xff` makes every
-    // dispatch on this frame run a full non-moving old-gen collection.
-    let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
-
-    // The virtualizable token is a GCREF row of `gc_fielddescrs`
-    // (`VirtualizableInstanceRepr._setup_repr_llfields`), so
-    // `clear_gc_fields` zeroes it.
-
-    // pyframe.py `f_generator_wref`/`w_yielding_from`/`f_backref`
-    // are class-level defaults (dead_ref/None/vref_None), never assigned in the
-    // frame constructor. The trace of frame construction therefore emits no
-    // setfield for them; clear_gc_fields initializes these GC-reference slots,
-    // so the fields read back as PY_NULL. No explicit store here.
-    //
-    // `w_builtin` joins them: the frame constructor (pyframe.py) assigns
-    // `self.builtin` only under `honor__builtins__`, which
-    // `baseobjspace::HONOR_BUILTINS` leaves off, so the constructor writes
-    // nothing and every reader goes through `get_builtin`, which answers
-    // `space.builtin` for an unset slot.
 
     Some(new_frame)
 }

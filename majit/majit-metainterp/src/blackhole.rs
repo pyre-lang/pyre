@@ -12996,19 +12996,28 @@ fn handler_debug_fatalerror(
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
 /// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// (the tagging arithmetic lives at the erase site, never here).
+/// `ll_assert((i & 1) == 1)` is `rtyper/debug.py` `ll_assert` → genop
+/// `debug_assert` → `RPyAssert`. `warmspot.py` `prejit_optimizations`
+/// translates the JIT with `remove_asserts=True` /
+/// `really_remove_asserts=True`, and `translator/c/src/support.h`
+/// compiles `RPyAssert` out unless `RPY_ASSERT`. `jtransform.py`
+/// `rewrite_op_cast_ptr_to_int` keeps the opcode for GC pointers;
+/// `rtagged.py` `ll_unboxed_getclass` does `cast_ptr_to_int(instance) & 1`
+/// on even boxed objects. Nested `interpret_unresolved_inline_call`
+/// stands in for `bhimpl_inline_call_*`'s `cpu.bh_call_*` (native
+/// `_genop_same_as`); `ll_stringslice_startstop` and the tag test both
+/// CAST even GC pointers. `debug_assert!` is the `ll_assert` port.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
+    debug_assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast.
+/// Same `ll_assert` → `debug_assert` / `RPyAssert` as
+/// `bhimpl_cast_ptr_to_int`; the product profile compiles it out.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
+    debug_assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 

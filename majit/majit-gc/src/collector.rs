@@ -11421,6 +11421,10 @@ impl GcAllocator for MiniMarkGC {
             return false;
         }
         // gc.py: typeid = self.get_actual_typeid(gcptr).
+        // `get_translated_info_for_typeinfo` reads `type_info_table` after
+        // `encode_type_shapes_now`. Tracing entries close the registry
+        // (`JitDriver::force_start_tracing` / `bound_reached`) before any
+        // walk records this query.
         let Some(typeid) = self.get_actual_typeid(gcref) else {
             return false;
         };

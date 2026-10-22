@@ -3194,20 +3194,18 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 };
                 if has_caller {
                     if frame_reg == u16::MAX {
-                        // Helper / continuation: no Python frame red. A helper
-                        // body is not a Python frame level: the jitdriver
-                        // virtualizable `consume_vable_info` handed the
-                        // innermost frame belongs to the outermost section,
-                        // and a helper keeping it would close that Python
-                        // frame's execution scope when the helper returns.
-                        if pyre_jit_trace::state::jitcode_is_transparent_helper(
-                            jitcode_index as i32,
-                        ) {
-                            if frame.virtualizable_ptr != 0 {
-                                jitdriver_vable = frame.virtualizable_ptr;
-                            }
-                            frame.virtualizable_ptr = 0;
+                        // A level with no Python frame red (helper or
+                        // codeless continuation) is not a Python frame
+                        // level; the jitdriver virtualizable
+                        // `consume_vable_info` handed it belongs to the
+                        // outermost section, and keeping it would close
+                        // that frame's execution scope when the level
+                        // returns (`blackhole.py` `_resume_mainloop`: only
+                        // MIFrame levels with a PyFrame leave it).
+                        if frame.virtualizable_ptr != 0 {
+                            jitdriver_vable = frame.virtualizable_ptr;
                         }
+                        frame.virtualizable_ptr = 0;
                     } else if own == 0 {
                         panic!(
                             "blackhole inner section jitcode={jitcode_index} \
@@ -3230,6 +3228,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     }
 
     leave_frames_handed_to_portal_call(&bh, guard_exc != 0);
+
+    // Opcode-entry / `jit_merge_point` resume re-pops
+    // `locals_cells_stack_w`. Mid-opcode parents (a nested helper's
+    // CALL `-live-`) keep the register section and the vable image
+    // `write_from_resume_data_partial` already wrote.
+    pyre_jit_trace::state::restore_inner_blackhole_opcode_entry_stack(&mut bh, guard_exc != 0);
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);
@@ -4210,7 +4214,7 @@ pub fn trace_and_compile_from_bridge(
     }
     // A helper innermost has no Python code object (`py_pc == usize::MAX`).
     // The carrier drain walks that jitcode from the guard
-    // (`drive_helper_innermost_subwalk`). Reconstruct failure still
+    // (`drive_innermost_helper_subwalk`). Reconstruct failure still
     // leaves an empty carrier (`P2Drain::NoRecipes`) and blackholes.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(bridge_frame_root.frame()) };
     let env = PyreEnv;
@@ -6956,6 +6960,16 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
     let root_base = _roots.publish(&[callable, null_or_self]);
     _roots.publish(args);
     _roots.normalize(root_base, 2 + args.len());
+    // Bound METHOD_TYPE already holds self. CALL's `null_or_self` is
+    // PUSH_NULL (`compute_load_method_bound`); a leftover in that slot
+    // is not a receiver (`list.append() 2 given`). Zero it so
+    // `reload_args` and the `is_method` unwrap see the sentinel.
+    // Method-form `[Function, receiver]` is `is_function`, not this.
+    if unsafe { pyre_object::is_method(_roots.get(root_base)) }
+        && !_roots.get(root_base + 1).is_null()
+    {
+        _roots.set(root_base + 1, pyre_object::PY_NULL);
+    }
     // `eval.rs`'s `PyFrame::call` — a non-null null_or_self is the method receiver
     // (load_method_fast_path pushes `[w_descr, w_obj]`); the call proceeds
     // as `callable(null_or_self, *args)`.
@@ -8852,6 +8866,21 @@ pub extern "C" fn bh_load_common_constant_fn(disc: i64) -> PyObjectRef {
 pub extern "C" fn bh_unary_not_fn(value: PyObjectRef) -> PyObjectRef {
     match pyre_interpreter::opcode_ops::truth_value(value) {
         Ok(truth) => pyre_object::w_bool_from(!truth),
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object());
+            PY_NULL
+        }
+    }
+}
+
+/// TO_BOOL residual (`eval.rs` `to_bool` / `flowcontext.rs` ToBool).
+/// Returns `bool(value)` as a bool object via `opcode_ops::truth_value`.
+/// A user `__bool__` / `__len__` may run Python (`MayForce`); a raising
+/// `__bool__` publishes through `BH_LAST_EXC_VALUE` for the trailing
+/// `GuardNoException` and the call returns 0.
+pub extern "C" fn bh_to_bool_fn(value: PyObjectRef) -> PyObjectRef {
+    match pyre_interpreter::opcode_ops::truth_value(value) {
+        Ok(truth) => pyre_object::w_bool_from(truth),
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
             PY_NULL

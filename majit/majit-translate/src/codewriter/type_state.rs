@@ -1898,6 +1898,50 @@ mod tests {
     }
 
     #[test]
+    fn field_owner_is_gc_pointer_field_layout_is_gc() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let owner = "type_state_gckind::Cell";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "item".to_string(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let field = FieldDescriptor::new("item", Some(owner.into()));
+        assert!(
+            field_owner_is_gc(&field, Some(&cc)),
+            "a FLAG_POINTER field makes the owner GC even when stored gckind is Raw"
+        );
+        let declared_raw = field.clone().with_owner_declared_gc(Some(false));
+        assert!(
+            !field_owner_is_gc(&declared_raw, Some(&cc)),
+            "owner_declared_gc Some(false) is a genuinely raw owner"
+        );
+    }
+
+    #[test]
     fn arraylen_result_is_signed_like_arraylen_vable() {
         let mut graph = FunctionGraph::new("arraylen_kind");
         let base = push_input(&mut graph, "arr", ValueType::Ref(None));
