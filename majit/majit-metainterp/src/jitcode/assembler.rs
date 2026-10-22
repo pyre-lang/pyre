@@ -1456,6 +1456,73 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "getfield_gc_r result");
     }
 
+    /// Offset and IR type of `field_name` in the layout registered under
+    /// `type_id`.  The emitters that intern two field descrs by name
+    /// (`record_quasiimmut_field`, `jit_force_quasi_immutable`) look the
+    /// field up here so they share `add_struct_field_descr`'s parent.
+    fn field_offset_and_type(
+        &self,
+        type_id: u64,
+        field_name: &str,
+    ) -> (usize, majit_ir::value::Type) {
+        let spec = self.struct_size_specs.get(&type_id).unwrap_or_else(|| {
+            panic!("no registered layout for type_id {type_id:#x} (needed for {field_name})")
+        });
+        spec.all_fielddescrs
+            .iter()
+            .find(|f| f.name == field_name)
+            .map(|f| (f.offset, f.field_type))
+            .unwrap_or_else(|| {
+                panic!("field {field_name:?} not in layout for type_id {type_id:#x}")
+            })
+    }
+
+    /// Emit `record_quasiimmut_field/rdd` (`pyjitpl.py
+    /// opimpl_record_quasiimmut_field`): the struct, the field descr, and
+    /// the hidden mutate-field descr.  The layout must already be
+    /// registered under `type_id` (`register_struct_layout`).
+    pub fn record_quasiimmut_field(
+        &mut self,
+        struct_reg: u16,
+        type_id: u64,
+        field_name: &str,
+        mutate_name: &str,
+    ) {
+        self.touch_ref_reg(struct_reg);
+        let (field_offset, field_type) = self.field_offset_and_type(type_id, field_name);
+        let (mutate_offset, _) = self.field_offset_and_type(type_id, mutate_name);
+        let field_descr =
+            self.add_struct_field_descr(field_offset, field_type, type_id, field_name);
+        let mutate_descr = self.add_struct_field_descr(
+            mutate_offset,
+            majit_ir::value::Type::Ref,
+            type_id,
+            mutate_name,
+        );
+        self.write_insn("record_quasiimmut_field/rdd");
+        self.push_reg_u8(struct_reg, "record_quasiimmut_field struct");
+        self.push_u16(field_descr);
+        self.push_u16(mutate_descr);
+    }
+
+    /// Emit `jit_force_quasi_immutable/rd` (`pyjitpl.py
+    /// opimpl_jit_force_quasi_immutable`): the struct and the hidden
+    /// mutate-field descr.  The layout must already be registered under
+    /// `type_id`.
+    pub fn jit_force_quasi_immutable(&mut self, struct_reg: u16, type_id: u64, mutate_name: &str) {
+        self.touch_ref_reg(struct_reg);
+        let (mutate_offset, _) = self.field_offset_and_type(type_id, mutate_name);
+        let mutate_descr = self.add_struct_field_descr(
+            mutate_offset,
+            majit_ir::value::Type::Ref,
+            type_id,
+            mutate_name,
+        );
+        self.write_insn("jit_force_quasi_immutable/rd");
+        self.push_reg_u8(struct_reg, "jit_force_quasi_immutable struct");
+        self.push_u16(mutate_descr);
+    }
+
     /// Emit `getfield_gc_f/rd>f` (`jtransform.py` `rewrite_op_getfield`:
     /// `getkind` of a `lltype.Float` field is `f`).
     ///

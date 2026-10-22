@@ -6,7 +6,7 @@
 use pyre_interpreter::{locals_w, locals_w_mut};
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 /// Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
 #[allow(dead_code)]
@@ -764,6 +764,52 @@ pub(crate) extern "C" fn force_quasi_immutable(field_addr: i64) {
             field_addr as *const pyre_object::quasiimmut::QuasiImmutField,
         )
     };
+}
+
+/// `quasiimmut.py QuasiImmut` published as a [`majit_ir::QuasiImmutHandle`].
+struct HostQuasiImmut(Arc<pyre_object::quasiimmut::QuasiImmut>);
+
+impl std::fmt::Debug for HostQuasiImmut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QuasiImmut({:p})", Arc::as_ptr(&self.0))
+    }
+}
+
+impl majit_ir::QuasiImmutHandle for HostQuasiImmut {
+    fn is_current(&self) -> bool {
+        self.0.is_current()
+    }
+
+    fn register_loop_token(&self, token: &Arc<dyn majit_ir::QuasiImmutLoopToken>) {
+        self.0.register_loop_token(token);
+    }
+
+    fn instance_identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+/// `quasiimmut.py get_current_qmut_instance` for the hidden mutate field
+/// at `field_addr`.
+///
+/// This is the host half of `majit_metainterp::quasiimmut`'s
+/// `get_current_qmut_instance`.  Upstream reads a `GCREF` out of the field
+/// (and installs a fresh instance when it is null); pyre embeds the state
+/// in the owner, so the field's own `get_current_qmut_instance` is the
+/// whole body.
+fn get_current_qmut_instance(field_addr: i64) -> Arc<dyn majit_ir::QuasiImmutHandle> {
+    if field_addr == 0 {
+        panic!(
+            "get_current_qmut_instance: field_addr is 0; \
+             call `publish_host_hooks` with a live mutate field"
+        );
+    }
+    // Safety: the only caller is `majit_metainterp::quasiimmut::get_current_qmut_instance`,
+    // which derives the address from a live struct pointer plus the mutate
+    // field descr's offset; that field is a `QuasiImmutField` embedded in
+    // the owner.
+    let field = unsafe { &*(field_addr as *const pyre_object::quasiimmut::QuasiImmutField) };
+    Arc::new(HostQuasiImmut(field.get_current_qmut_instance()))
 }
 
 pub(crate) extern "C" fn record_caught_blackhole_traceback(
@@ -1887,6 +1933,7 @@ pub fn publish_pyre_host_hooks() {
         record_discarded_level_traceback: Some(record_discarded_level_traceback),
         resolve_exception_context: Some(resolve_exception_context),
         force_quasi_immutable: Some(force_quasi_immutable),
+        get_current_qmut_instance: Some(get_current_qmut_instance),
         symbolic_fnaddr_path_resolver: Some(
             pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
         ),

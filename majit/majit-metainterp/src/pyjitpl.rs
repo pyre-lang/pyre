@@ -3308,6 +3308,7 @@ pub struct HostHooks {
     pub record_discarded_level_traceback: Option<RecordDiscardedLevelTraceback>,
     pub resolve_exception_context: Option<ResolveExceptionContext>,
     pub force_quasi_immutable: Option<crate::quasiimmut::ForceQuasiImmutable>,
+    pub get_current_qmut_instance: Option<crate::quasiimmut::GetCurrentQmutInstance>,
     pub symbolic_fnaddr_path_resolver: Option<SymbolicFnaddrPathResolver>,
     pub assertion_error_typeptr: Option<AssertionErrorTypeptr>,
 }
@@ -3321,6 +3322,7 @@ static HOST_HOOKS: parking_lot::Mutex<HostHooks> = parking_lot::const_mutex(Host
     record_discarded_level_traceback: None,
     resolve_exception_context: None,
     force_quasi_immutable: None,
+    get_current_qmut_instance: None,
     symbolic_fnaddr_path_resolver: None,
     assertion_error_typeptr: None,
 });
@@ -22855,6 +22857,17 @@ impl SwitchToBlackhole {
         Self {
             reason: counters::ABORT_ESCAPE,
             raising_exception: true,
+        }
+    }
+
+    /// Construct a `SwitchToBlackhole(Counters.ABORT_FORCE_QUASIIMMUT)` —
+    /// `pyjitpl.py opimpl_jit_force_quasi_immutable` when the mutate field
+    /// is already non-null, so tracing cannot turn the force into a
+    /// `GUARD_ISNULL`.
+    pub fn abort_force_quasiimmut() -> Self {
+        Self {
+            reason: counters::ABORT_FORCE_QUASIIMMUT,
+            raising_exception: false,
         }
     }
 

@@ -79,6 +79,10 @@ where
         table[jitcode::insns::BC_ARRAYBASE_VABLE as usize] = Self::opimpl_arraybase_vable;
         table[jitcode::insns::BC_HINT_FORCE_VIRTUALIZABLE as usize] =
             Self::opimpl_hint_force_virtualizable;
+        table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD as usize] =
+            Self::opimpl_record_quasiimmut_field;
+        table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE as usize] =
+            Self::opimpl_jit_force_quasi_immutable;
         table[jitcode::insns::BC_INT_ADD as usize] = Self::opimpl_int_add;
         table[jitcode::insns::BC_INT_SUB as usize] = Self::opimpl_int_sub;
         table[jitcode::insns::BC_INT_MUL as usize] = Self::opimpl_int_mul;
@@ -2822,6 +2826,172 @@ where
         let vable_reg = self.frames.current_mut().next_reg() as usize;
         let vable_opref = self.resolve_vable_box(vable_reg);
         ctx.gen_store_back_in_vable(vable_opref);
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_record_quasiimmut_field(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py opimpl_record_quasiimmut_field:
+        //   @arguments("box", "descr", "descr", "orgpc")
+        // last_opcode_position is orgpc: execute_one_instruction saved
+        // the cursor before consuming the opcode byte.
+        let opcode_pc = self.frames.current_mut().last_opcode_position;
+        let (struct_reg, field_idx, mutate_idx) = {
+            let frame = self.frames.current_mut();
+            let struct_reg = frame.next_reg() as usize;
+            let field_idx = frame.next_u16() as usize;
+            let mutate_idx = frame.next_u16() as usize;
+            (struct_reg, field_idx, mutate_idx)
+        };
+        let (fielddescr, mutate_bh) = {
+            let frame = self.frames.current_mut();
+            let field_bh = frame.runtime_bh_descr(field_idx).unwrap_or_else(|| {
+                panic!("BC_RECORD_QUASIIMMUT_FIELD: descrs[{field_idx}] is not a BhDescr entry")
+            });
+            let fielddescr = frame
+                .runtime_optimizer_descr(field_idx)
+                .unwrap_or_else(|| field_descr_ref_from_bh(field_bh).1);
+            let mutate_bh = frame
+                .runtime_bh_descr(mutate_idx)
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "BC_RECORD_QUASIIMMUT_FIELD: descrs[{mutate_idx}] is not a BhDescr entry"
+                    )
+                });
+            (fielddescr, mutate_bh)
+        };
+        let (struct_opref, struct_ptr) = self.read_ref_reg(ctx, struct_reg);
+        if ctx
+            .heap_cache()
+            .is_quasi_immut_known(fielddescr.index(), struct_opref)
+        {
+            ctx.profiler().count_ops(
+                OpCode::QuasiimmutField,
+                crate::pyjitpl::counters::HEAPCACHED_OPS,
+            );
+            return TraceAction::Continue;
+        }
+        let qmut = crate::quasiimmut::get_current_qmut_instance(struct_ptr, &mutate_bh);
+        let constantfieldbox = if let Some(fd) = fielddescr.as_field_descr() {
+            Some(if struct_ptr == 0 {
+                if fd.is_pointer_field() {
+                    Value::Ref(majit_ir::GcRef(0))
+                } else if fd.is_float_field() {
+                    Value::Float(0.0)
+                } else {
+                    Value::Int(0)
+                }
+            } else if fd.is_pointer_field() {
+                Value::Ref(self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd))
+            } else if fd.is_float_field() {
+                Value::Float(self.cpu.bh_getfield_gc_f(struct_ptr as usize, fd))
+            } else {
+                Value::Int(self.cpu.bh_getfield_gc_i(struct_ptr as usize, fd))
+            })
+        } else {
+            None
+        };
+        ctx.heap_cache_mut()
+            .quasi_immut_now_known(fielddescr.index(), struct_opref);
+        let descr = Arc::new(majit_ir::QuasiImmutDescr::new(
+            fielddescr,
+            struct_ptr as u64,
+            qmut,
+            constantfieldbox,
+        )) as majit_ir::DescrRef;
+        ctx.record_op_with_descr(OpCode::QuasiimmutField, &[struct_opref], descr);
+        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+            self.record_state_guard(ctx, sym, OpCode::GuardNotInvalidated, &[], opcode_pc, false);
+        }
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_jit_force_quasi_immutable(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        // pyjitpl.py opimpl_jit_force_quasi_immutable:
+        //   @arguments("box", "descr", "orgpc")
+        let opcode_pc = self.frames.current_mut().last_opcode_position;
+        let (struct_reg, mutate_idx) = {
+            let frame = self.frames.current_mut();
+            let struct_reg = frame.next_reg() as usize;
+            let mutate_idx = frame.next_u16() as usize;
+            (struct_reg, mutate_idx)
+        };
+        let (mutatefielddescr, mutate_bh) =
+            {
+                let frame = self.frames.current_mut();
+                let mutate_bh = frame.runtime_bh_descr(mutate_idx).cloned().unwrap_or_else(|| {
+                panic!(
+                    "BC_JIT_FORCE_QUASI_IMMUTABLE: descrs[{mutate_idx}] is not a BhDescr entry"
+                )
+            });
+                let mutatefielddescr = frame
+                    .runtime_optimizer_descr(mutate_idx)
+                    .unwrap_or_else(|| field_descr_ref_from_bh(&mutate_bh).1);
+                (mutatefielddescr, mutate_bh)
+            };
+        let struct_opref = {
+            let frame = self.frames.current_mut();
+            match frame.ref_regs[struct_reg] {
+                Some(opref) => opref,
+                None => return TraceAction::Abort,
+            }
+        };
+        let Some(struct_ptr) = ctx.box_bits(struct_opref) else {
+            return TraceAction::Abort;
+        };
+        // An unobservable or null struct cannot decide mutatebox.nonnull();
+        // treating it as null would emit GUARD_ISNULL against a value the
+        // load never produced.
+        if struct_ptr == 0 {
+            return TraceAction::Abort;
+        }
+        let loaded = match mutatefielddescr.as_field_descr() {
+            Some(fd) => self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd),
+            None => return TraceAction::Abort,
+        };
+        // `pyjitpl.py execute_with_descr(GETFIELD_GC_R, mutatefielddescr, box)`:
+        // records and executes the load without consulting or populating
+        // the heapcache (`_opimpl_getfield_gc_any_pureornot` is the path
+        // that does).  Upstream's kind split still uses GETFIELD_GC_R on
+        // the float arm; the mutate field is a GCREF.
+        let mutatebox = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::GetfieldGcR,
+            Some(mutatefielddescr),
+            &[struct_opref],
+            Some(Value::Ref(loaded)),
+            self.last_exception_value,
+        );
+        if loaded.as_usize() != 0 {
+            crate::quasiimmut::do_force_quasi_immutable(struct_ptr, &mutate_bh);
+            return TraceAction::SwitchToBlackhole(
+                crate::pyjitpl::SwitchToBlackhole::abort_force_quasiimmut(),
+            );
+        }
+        self.record_state_guard(
+            ctx,
+            sym,
+            OpCode::GuardIsnull,
+            &[mutatebox],
+            opcode_pc,
+            false,
+        );
         TraceAction::Continue
     }
 
