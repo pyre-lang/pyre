@@ -2957,6 +2957,26 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // `rclass.py InstanceRepr.hook_setfield` genops
+                    // `jit_force_quasi_immutable` during rtyping;
+                    // `lloperation.py LLOp` ExtRegistry `specialize_call`
+                    // genops the opname.  The annotator must not lift the
+                    // native invalidation body (`warmspot.py
+                    // rewrite_force_quasi_immutable` is the native half).
+                    if segments
+                        .last()
+                        .is_some_and(|name| name == "jit_force_quasi_immutable")
+                    {
+                        let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            HostObject::new_builtin_callable(
+                                "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable",
+                            ),
+                        )));
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                        call_args.push(callable);
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     // `core` method spellings of upstream operations:
                     // pyre source writes `a.min(b)` /
                     // `a != b`-via-`PartialEq::ne` / `v.len()` /
@@ -4121,6 +4141,27 @@ pub fn translate_op(
                         LowLevelType::Void,
                     ));
                     Ok(vec![FlowspaceOp::new("same_as", vec![constant], result)])
+                }
+                // `rclass.py InstanceRepr.hook_setfield` genops
+                // `jit_force_quasi_immutable` during rtyping;
+                // `lloperation.py LLOp` ExtRegistry `specialize_call`
+                // genops the opname.  The annotator must not lift the
+                // native invalidation body (`warmspot.py
+                // rewrite_force_quasi_immutable` is the native half).
+                target @ CallTarget::Method { .. }
+                    if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
+                        &target,
+                    ) =>
+                {
+                    let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                        HostObject::new_builtin_callable(
+                            "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable",
+                        ),
+                    )));
+                    let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                    call_args.push(callable);
+                    call_args.extend(arg_hls);
+                    Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
                 }
                 CallTarget::Method {
                     name,
@@ -8743,6 +8784,51 @@ mod tests {
         assert_eq!(
             host.qualname(),
             "pyre_interpreter.executioncontext.jit_force_virtualizable"
+        );
+        assert!(crate::translator::rtyper::extregistry::is_registered(
+            &callable.value
+        ));
+    }
+
+    #[test]
+    fn translate_op_jit_force_quasi_immutable_method_bypasses_invalidation_body() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_force_quasi_immutable_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("Function".to_string()),
+                    resolved_path: None,
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
+                result_ty: ValueType::Void,
+            },
+        };
+
+        // No CallRegistry entry is intentional: upstream rtyping emits this
+        // force as an LLOp and does not annotate its native invalidation body.
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("jit_force_quasi_immutable must lower through ExtRegistry");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "simple_call");
+        let Hlvalue::Constant(callable) = &lowered.args[0] else {
+            panic!("marker callable must be constant");
+        };
+        let ConstValue::HostObject(host) = &callable.value else {
+            panic!("marker callable must be a HostObject");
+        };
+        assert_eq!(
+            host.qualname(),
+            "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable"
         );
         assert!(crate::translator::rtyper::extregistry::is_registered(
             &callable.value

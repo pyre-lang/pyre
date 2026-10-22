@@ -196,6 +196,16 @@ pub enum ExtRegistryEntry {
     /// its translation is registered here and specializes to that same
     /// LLOp instead of recursively lifting `executioncontext::force_frame`.
     JitForceVirtualizable,
+    /// Pyre's source spelling of the llop that `rclass.py
+    /// InstanceRepr.hook_setfield` emits.
+    ///
+    /// Upstream genops `jit_force_quasi_immutable(vinst, Constant(Void,
+    /// 'mutate_' + name))` while rtyping and never annotates an
+    /// invalidation body.  Rust needs a callable marker in the source, so
+    /// the call is registered here and specializes to that same llop
+    /// instead of lifting `Function::jit_force_quasi_immutable` →
+    /// `QuasiImmutField::invalidate` → `sync::Arc::deref`.
+    JitForceQuasiImmutable,
     /// `BigInt::from(i64) -> BigInt` — the `From<i64>` impl that boxes a
     /// machine int into the foreign opaque `BigInt` (Python `long`) on the
     /// cold `int_add`/`int_sub`/… overflow→long arm.  Modeled as a
@@ -354,6 +364,7 @@ pub enum ExtRegistryEntryKey {
         is_value: bool,
     },
     JitForceVirtualizable,
+    JitForceQuasiImmutable,
     /// Singleton key for the `BigInt.from` residual-external entry. No
     /// per-instance identity — the variant tag alone supplies
     /// `self.__class__` and there is no `self.instance`.
@@ -408,6 +419,7 @@ impl ExtRegistryEntry {
                 }
             }
             ExtRegistryEntry::JitForceVirtualizable => ExtRegistryEntryKey::JitForceVirtualizable,
+            ExtRegistryEntry::JitForceQuasiImmutable => ExtRegistryEntryKey::JitForceQuasiImmutable,
             ExtRegistryEntry::BigIntFrom => ExtRegistryEntryKey::BigIntFrom,
             ExtRegistryEntry::Float2LongLong => ExtRegistryEntryKey::Float2LongLong,
             ExtRegistryEntry::LongLong2Float => ExtRegistryEntryKey::LongLong2Float,
@@ -546,6 +558,15 @@ impl ExtRegistryEntry {
                 None,
                 Some("jit_force_virtualizable".to_string()),
             ))),
+            // `InstanceRepr.hook_setfield` emits a Void
+            // `jit_force_quasi_immutable` operation.  The explicit Rust
+            // marker therefore has the ordinary ExtRegistry callable
+            // annotation and returns None at the call site.
+            ExtRegistryEntry::JitForceQuasiImmutable => Ok(SomeValue::Builtin(SomeBuiltin::new(
+                "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable",
+                None,
+                Some("jit_force_quasi_immutable".to_string()),
+            ))),
             // The annotation half is served by the `BigInt.from`
             // `BUILTIN_ANALYZERS` entry (`bigint_from`), which
             // `immutablevalue_hostobject` resolves before the
@@ -642,6 +663,7 @@ impl ExtRegistryEntry {
             // takes only `self` upstream).
             ExtRegistryEntry::LoopHeader { .. } => Ok(s_none()),
             ExtRegistryEntry::JitForceVirtualizable => Ok(s_none()),
+            ExtRegistryEntry::JitForceQuasiImmutable => Ok(s_none()),
             // upstream rarithmetic.py — `ForTypeEntry.\
             // compute_result_annotation(self, *args_s, **kwds_s)` returns
             // `SomeInteger(knowntype=int_type)`.  The instance is the int
@@ -757,6 +779,9 @@ impl ExtRegistryEntry {
             }
             ExtRegistryEntry::JitForceVirtualizable => {
                 Ok(super::rbuiltin::rtype_jit_force_virtualizable as BuiltinTyperFn)
+            }
+            ExtRegistryEntry::JitForceQuasiImmutable => {
+                Ok(super::rbuiltin::rtype_jit_force_quasi_immutable as BuiltinTyperFn)
             }
             // `BigInt.from` lowers to a residual `direct_call` to the
             // external `bigint_from` (extfunc.py:55-64
@@ -1045,6 +1070,9 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     if host.qualname() == "pyre_interpreter.executioncontext.jit_force_virtualizable" {
         return Some(ExtRegistryEntry::JitForceVirtualizable);
     }
+    if host.qualname() == "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable" {
+        return Some(ExtRegistryEntry::JitForceQuasiImmutable);
+    }
     // `rlib/nonconst.py class EntryNonConstant(ExtRegistryEntry): _about_ =
     // NonConstant` — keyed by the same qualname `annotator/builtin.rs`
     // registers for `BUILTIN_ANALYZERS`.
@@ -1317,6 +1345,23 @@ mod tests {
         assert!(is_registered(&cv));
         let entry = lookup(&cv).expect("force marker must surface an entry");
         assert!(matches!(entry, ExtRegistryEntry::JitForceVirtualizable));
+        assert!(entry.specialize_call().is_ok());
+        let bookkeeper = Rc::new(Bookkeeper::new());
+        assert!(matches!(
+            entry.compute_annotation_with_kwds(&bookkeeper, &std::collections::HashMap::new()),
+            Ok(SomeValue::None_(_))
+        ));
+    }
+
+    #[test]
+    fn jit_force_quasi_immutable_resolves_to_llop_specializer() {
+        let host = HostObject::new_builtin_callable(
+            "rpython.rtyper.lltypesystem.lloperation.llop.jit_force_quasi_immutable",
+        );
+        let cv = ConstValue::HostObject(host);
+        assert!(is_registered(&cv));
+        let entry = lookup(&cv).expect("quasi-immut marker must surface an entry");
+        assert!(matches!(entry, ExtRegistryEntry::JitForceQuasiImmutable));
         assert!(entry.specialize_call().is_ok());
         let bookkeeper = Rc::new(Bookkeeper::new());
         assert!(matches!(
