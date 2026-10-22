@@ -2326,15 +2326,6 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// This is shared logically across recursive MIFrame walks; catch routing
     /// writes the proven-class state back into the caller's copy.
     pub class_of_last_exc_is_const: bool,
-    /// JitCode pc a top-level bridge walk started at. The merge-point handler
-    /// skips one `jit_merge_point` when this is strictly before the marker and
-    /// `next_instr` matches the walk's Python pc: the walk resumed into that
-    /// header (`generate_guard` default `resumepc` at an opcode-boundary or
-    /// pre-merge diamond / `int_guard_value` / `ref_guard_value`), so that
-    /// crossing is not a loop close. A walk that already entered past the
-    /// marker (`jtransform.py handle_jit_marker__jit_merge_point` op2 `-live-`)
-    /// leaves this greater than the marker pc and takes the crossing.
-    pub bridge_entry_merge_pc: Option<usize>,
     /// Set for the sub-walk that resumes a suspended generator body in place of
     /// the `jit_next` residual a `FOR_ITER` over it would otherwise leave.
     /// `None` for every other walk, which is what keeps the yield interception
@@ -2411,7 +2402,6 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             carrier_resume: false,
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
-            bridge_entry_merge_pc: None,
             generator_resume: None,
         }
     }
@@ -17320,15 +17310,6 @@ fn handle<Sym: WalkSym>(
             {
                 ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
                 ctx.trace_ctx.seen_loop_header_jit_pc = None;
-            }
-            if ctx.is_top_level && ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
-                if let Some(entry_jit) = ctx.fbw_mode.bridge_entry_merge_pc.take() {
-                    if matches!(ctx.entry_py_pc,
-                        EntryPyPc::Py(py) if py as usize == next_instr && entry_jit < op.pc)
-                    {
-                        return Ok((DispatchOutcome::Continue, op.next_pc));
-                    }
-                }
             }
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py `if not any_operation: return`.

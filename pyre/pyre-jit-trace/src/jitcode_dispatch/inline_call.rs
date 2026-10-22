@@ -7141,7 +7141,7 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
         unsafe {
             let jc = &*sym.jitcode();
             let jc_index = jc.index as u32;
-            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+            let marker = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
             // Forward py twin first (#73 phase-3): equals the
             // containing coordinate plus trivia normalization by
             // construction; the containing lookup survives for the
@@ -7743,7 +7743,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         unsafe {
             let jc = &*sym.jitcode();
             let jc_index = jc.index as u32;
-            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+            let marker = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
             let mut py = jc
                 .payload
                 .forward_py_pc_for_jitcode_pc(op.pc)
@@ -10646,7 +10646,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                     (
                         jc_index,
-                        jc.payload.resume_marker_for_jitcode_pc(op.pc),
+                        super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc),
                         py_pc as u32,
                     )
                 };
@@ -20252,11 +20252,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
         current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
         outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
-        list_iter_class_guard_resume: ctx
-            .frame_state
-            .borrow()
-            .list_iter_class_guard_resume
-            .clone(),
         vstack_boxes: Vec::new(),
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_saved: None,

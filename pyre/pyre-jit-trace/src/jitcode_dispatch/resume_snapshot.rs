@@ -158,7 +158,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 ///
 /// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
 /// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
-fn jit_merge_point_pc_in_containing_floor(
+pub(super) fn jit_merge_point_pc_in_containing_floor(
     payload: &crate::PyJitCode,
     jit_pc: usize,
 ) -> Option<usize> {
@@ -189,7 +189,10 @@ fn jit_merge_point_pc_in_containing_floor(
 
 /// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise
 /// `op.next_pc` (`jtransform.py handle_jit_marker__jit_merge_point`).
-fn resume_pc_past_merge_point(payload: &crate::PyJitCode, merge_pc: usize) -> Option<usize> {
+pub(super) fn resume_pc_past_merge_point(
+    payload: &crate::PyJitCode,
+    merge_pc: usize,
+) -> Option<usize> {
     trailing_live_marker(payload, merge_pc).or_else(|| {
         crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), merge_pc)
             .map(|op| op.next_pc)
@@ -1117,27 +1120,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // the carried static outer JitCode coordinate; an absent coordinate
     // declines instead of reconstructing one from the Python pc.
     //
-    // The item class check inside `list_iter_descr_next` is recorded as
-    // `GuardNonnull` and `GuardClass`. `optimize_GUARD_CLASS` folds that
-    // pair into `GuardNonnullClass` and keeps the `GuardNonnull` resume,
-    // so both guards carry the post-merge `-live-`. Their boxes were
-    // collected at that pc. Every other guard keeps the preamble marker.
+    // A collapsed helper or inlined callee carries the parent resume
+    // coordinate on `outer_resume_marker_jit_pc`. On a loop-header opcode
+    // that is the op2 `-live-` after `jit_merge_point` (`jtransform.py
+    // handle_jit_marker__jit_merge_point`). Active boxes were collected
+    // at that same pc.
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    let guard_opcode = ctx.trace_ctx.last_op_opcode();
-    let class_guard_pc = if matches!(
-        guard_opcode,
-        Some(OpCode::GuardNonnull | OpCode::GuardClass)
-    ) {
-        ctx.frame_state
-            .borrow()
-            .list_iter_class_guard_resume
-            .as_ref()
-            .map(|(pc, _)| *pc)
-    } else {
-        None
-    };
-    let arm_word = class_guard_pc
-        .or(ctx.outer_resume_marker_jit_pc)
+    let arm_word = ctx
+        .outer_resume_marker_jit_pc
         .map(|m| m as i32)
         .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
     let Some(arm_pc_word) =
@@ -1152,16 +1142,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
-    let active = if class_guard_pc.is_some() {
-        ctx.frame_state
-            .borrow_mut()
-            .list_iter_class_guard_resume
-            .take()
-            .map(|(_, boxes)| boxes)
-            .unwrap_or_default()
-    } else {
-        std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes)
-    };
+    let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     publish_single_frame_snapshot(
         ctx,
         scope.guard_stamp,
@@ -1174,11 +1155,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         "carried",
         op_pc,
     );
-    if let Some(pc) = class_guard_pc {
-        ctx.frame_state.borrow_mut().list_iter_class_guard_resume = Some((pc, active));
-    } else {
-        ctx.frame_state.borrow_mut().outer_active_boxes = active;
-    }
+    ctx.frame_state.borrow_mut().outer_active_boxes = active;
     Ok(())
 }
 
@@ -2972,8 +2949,10 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Helper/NotPopulated"));
     }
-    let resume_marker_jit_pc = pjc
-        .resume_marker_for_jitcode_pc(call_jit_pc)
+    // Same parent resume as `run_orthodox_helper_subwalk`: the op2 `-live-`
+    // after `jit_merge_point` on a loop-header opcode
+    // (`jtransform.py handle_jit_marker__jit_merge_point`).
+    let resume_marker_jit_pc = super::specialize::collapsed_parent_resume_marker(&pjc, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = if caller_code.is_some() {
         collect_callee_active_boxes(
