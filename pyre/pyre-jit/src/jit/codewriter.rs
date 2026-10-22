@@ -2121,7 +2121,7 @@ fn vable_getfield_ref_graph_args(
 /// Returns the fresh result `Variable` if `reskind != Void`; callers
 /// at sites where the symbolic value is already provided by an
 /// `emit_frontend_*` HLOp discard it via `let _ = ...` (matching the
-/// `emit_vable_getfield_ref!` graph dual-write pattern).
+/// `emit_vable_getfield_ref` graph dual-write pattern).
 ///
 /// Mirrors `rpython/jit/codewriter/jtransform.py rewrite_call`
 /// SpaceOperation construction.
@@ -2296,6 +2296,52 @@ const VABLE_CODE_FIELD_IDX: u16 = 1;
 const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
 
+/// `jtransform.py rewrite_op_getfield` virtualizable branch:
+/// `getfield_vable_r` of `[v_inst, descr]`. Shared by the portal
+/// merge-point pycode green and `pyframe.py PyFrame.getcode` on a
+/// `jump_absolute` back-edge.
+fn emit_vable_getfield_ref(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame_var: super::flow::Variable,
+    field_idx: u16,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "getfield_vable_r",
+        vable_getfield_ref_graph_args(frame_var.into(), field_idx),
+        Kind::Ref,
+        offset,
+    )
+}
+
+/// `jtransform.py rewrite_op_hint` promote: `-live-` then
+/// `{kind}_guard_value`.
+fn emit_do_promote(
+    block: &super::flow::BlockRef,
+    guard_opname: &str,
+    green: super::flow::Variable,
+    offset: i64,
+) {
+    record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
+    let _ = emit_graph_op_void(block, guard_opname, vec![green.into()], offset);
+}
+
+/// `pyframe.py PyFrame.getcode`: `jit.promote(self.pycode)`, a vable
+/// `pycode` read then `rewrite_op_hint` promote.
+fn emit_getcode(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame_var: super::flow::Variable,
+    offset: i64,
+) -> super::flow::Variable {
+    let pycode_var = emit_vable_getfield_ref(graph, block, frame_var, VABLE_CODE_FIELD_IDX, offset);
+    emit_do_promote(block, "ref_guard_value", pycode_var, offset);
+    pycode_var
+}
+
 /// `pyframe.py PyFrame.get_is_being_profiled` as graph ops: the portal
 /// merge-point's second green. `interp_jit.py PyFrame.dispatch` calls
 /// that method; `debugdata` is a virtualizable field
@@ -2309,9 +2355,11 @@ const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
 /// Emitted at loop-header start because the merge-point site itself
 /// must not append exits: `block_closed_by_terminator` is computed
 /// before merge emission and reused as the opcode-dispatch gate.
-/// The diamond closes the header; the caller switches onto the join
-/// for pycode's `getfield_vable_r`, the promote, and the marker.
-/// Back-edges still mergeblock to the header so they re-read
+/// The diamond closes its source block. The portal-header caller
+/// switches onto the join for pycode's `getfield_vable_r`, the
+/// promote, and `jit_merge_point`. A `jump_absolute` back-edge emits
+/// `getcode` first, then this diamond, then `loop_header` on the join,
+/// and mergeblocks from the join to the loop header, which re-reads
 /// `debugdata`.
 fn emit_portal_is_being_profiled_read(
     graph: &mut super::flow::FunctionGraph,
@@ -2321,12 +2369,11 @@ fn emit_portal_is_being_profiled_read(
     py_pc: usize,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> (SpamBlockRef, super::flow::Variable) {
-    let debugdata_var = emit_graph_op_with_result(
+    let debugdata_var = emit_vable_getfield_ref(
         graph,
         &current_block.block(),
-        "getfield_vable_r",
-        vable_getfield_ref_graph_args(frame_var.into(), VABLE_DEBUGDATA_FIELD_IDX),
-        Kind::Ref,
+        frame_var,
+        VABLE_DEBUGDATA_FIELD_IDX,
         py_pc as i64,
     );
     // `jtransform.py optimize_goto_if_not`: a `ptr_iszero` whose result
@@ -2602,14 +2649,38 @@ fn emit_jump_absolute_tick(
         hot
     };
 
-    if emit_header {
-        emit_loop_header(graph, &header_block, ssarepr, jdindex, py_pc);
-    }
+    // `interp_jit.py PyFrame.jump_absolute` evaluates
+    // `pycode=self.getcode()` then `is_being_profiled=self.get_is_being_profiled()`
+    // before `can_enter_jit`. `jtransform.py handle_jit_marker__can_enter_jit`
+    // (`handle_jit_marker__loop_header`) drops those arguments; the
+    // computations stay in the jitcode ahead of `loop_header`.
+    // The diamond closes `header_block`, so `loop_header` and the
+    // `mergeblock` live on the join. That is the same predecessor/join
+    // split the portal header uses, so `flatten_graph` emits the diamond
+    // before the marker.
+    let goto_block = if emit_header {
+        let header_state = header_block
+            .framestate()
+            .unwrap_or_else(|| current_state.clone());
+        let _ = emit_getcode(graph, &header_block.block(), frame_var, py_pc as i64);
+        let (join, _) = emit_portal_is_being_profiled_read(
+            graph,
+            &header_block,
+            &header_state,
+            frame_var,
+            py_pc,
+            all_walker_blocks,
+        );
+        emit_loop_header(graph, &join, ssarepr, jdindex, py_pc);
+        join
+    } else {
+        header_block
+    };
     let _ = mergeblock(
         code,
         graph,
         joinpoints,
-        &header_block,
+        &goto_block,
         &{
             let mut branch_state = current_state.clone();
             branch_state.next_offset = target_py_pc;
@@ -8522,48 +8593,19 @@ impl CodeWriter {
         //   one-byte vable/value registers plus a two-byte descriptor-pool
         //   index, matching `assembler.py:80-138`.
         //
-        // Graph-side shadow for `getfield_vable_r` intentionally
-        // absent: jtransform.py `do_fixed_list_getitem`
-        // lowers `getfield_vable_r` to a fresh Variable result that
-        // subsequent ops consume as an input. Pyre does not yet
-        // thread that result through downstream graph ops, so emitting
-        // an unused
-        // Variable here would introduce a dangling shadow with no
-        // upstream backing. The graph mirror returns once a real
-        // consumer exists.
+        // `getfield_vable_r` production sites call `emit_vable_getfield_ref`
+        // (`jtransform.py rewrite_op_getfield` vable branch: `[v_inst, descr]`
+        // → result). `args[0]` is the live frame (`frame_var`, a startblock
+        // inputarg from `graph_entry_inputargs`); `portal_frame_reg` is
+        // filled by `BlackholeInterpreter::fill_portal_registers` at portal
+        // entry and encoded as the leading `r` operand. The result Variable
+        // is the pycode green: `rewrite_op_hint` promote, then either
+        // `jit_merge_point` or the dropped `can_enter_jit` argument.
         //
         // The remaining vable scalar variants (`getfield_vable_i/f`,
         // `setfield_vable_r/f`) have assembler dispatch arms but no
         // production emit site today; those arms already require the same
         // canonical `[v_inst, ... descr]` operand shape.
-        macro_rules! emit_vable_getfield_ref {
-            ($vable_reg:expr, $dst:expr, $field_idx:expr) => {{
-                let _dst = $dst;
-                let field_idx: u16 = $field_idx;
-                // `jtransform.py:846-847` getfield: `[v_inst, descr]` → result.
-                // `args[0]` is the vable register holding the live frame
-                // pointer — `portal_frame_reg` is filled by
-                // `BlackholeInterpreter::fill_portal_registers` at portal
-                // entry and encoded by the assembler as the canonical
-                // leading `r` operand.
-                // Graph dual-write threads `frame_var.into()`. `frame_var`
-                // is a startblock inputarg
-                // (`graph_entry_inputargs(code, frame_inputs)`), so the
-                // Variable always has a producer. Returns
-                // `Option<Variable>` so callsites that need the graph
-                // identity for downstream dual-writes can thread the
-                // same Variable.
-                let result = emit_graph_op_with_result(
-                    &mut graph,
-                    &current_block.block(),
-                    "getfield_vable_r",
-                    vable_getfield_ref_graph_args(frame_var.into(), field_idx),
-                    Kind::Ref,
-                    -1,
-                );
-                Some(result)
-            }};
-        }
 
         // `pushvalue` (pyframe.py) lowers to
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_object)`
@@ -9188,15 +9230,12 @@ impl CodeWriter {
                             let jdindex = PYTHON_PORTAL_JD_INDEX;
                             let scratch_pycode_reg =
                                 ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            let pycode_var = emit_vable_getfield_ref!(
-                                portal_frame_reg,
-                                scratch_pycode_reg,
-                                VABLE_CODE_FIELD_IDX
-                            )
-                            .expect(
-                                "portal jit_merge_point requires is_true_portal=true; \
-                             emit_vable_getfield_ref! must return a per-SpaceOp \
-                             Variable for the `pycode` green arg",
+                            let pycode_var = emit_vable_getfield_ref(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                VABLE_CODE_FIELD_IDX,
+                                py_pc as i64,
                             );
                             // `jtransform.py promote_greens`: `-live-` then
                             // `{kind}_guard_value` on every Variable green
@@ -18897,6 +18936,58 @@ mod tests {
         assert!(
             guard_pos < merge_pos,
             "promote_greens must precede jit_merge_point, got {opnames:?}"
+        );
+    }
+
+    #[test]
+    fn jump_absolute_reads_getcode_and_is_being_profiled_before_loop_header() {
+        let code = first_nested_function_code(
+            "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal while-loop must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        let loop_header_pos = opnames
+            .iter()
+            .position(|&name| name == "loop_header")
+            .expect("jump_absolute lowers can_enter_jit to loop_header");
+        let before = &opnames[..loop_header_pos];
+        let pycode_promote = before
+            .iter()
+            .rposition(|&name| name == "ref_guard_value")
+            .expect("getcode promotes pycode ahead of loop_header");
+        let diamond = before
+            .iter()
+            .rposition(|&name| name == "goto_if_not_ptr_iszero")
+            .expect("get_is_being_profiled null-tests debugdata ahead of loop_header");
+        assert!(
+            pycode_promote < diamond,
+            "getcode must precede get_is_being_profiled, got {opnames:?}"
+        );
+        assert!(
+            before[..pycode_promote]
+                .iter()
+                .rev()
+                .any(|&name| name == "getfield_vable_r"),
+            "getcode reads vable pycode before promoting it, got {opnames:?}"
+        );
+        assert!(
+            opnames.contains(&"getfield_gc_i"),
+            "non-null arm reads FrameDebugData.is_being_profiled, got {opnames:?}"
         );
     }
 
