@@ -787,6 +787,15 @@ pub enum FunctionEntryStep {
     NotHot,
 }
 
+/// Which door is asking [`WarmEnterState::maybe_compile_and_run_decision`].
+enum WarmEntryDoor {
+    /// `increment_threshold`; no function-entry diag slots.
+    BackEdge,
+    /// `increment_function_threshold`; slots 23/24/25/64/65/66.
+    /// `engine_is_tracing` is `MetaInterp::is_tracing`.
+    FunctionEntry { engine_is_tracing: bool },
+}
+
 impl std::fmt::Debug for WarmEnterState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WarmEnterState")
@@ -839,6 +848,128 @@ impl WarmEnterState {
         } else {
             true
         }
+    }
+
+    /// `warmstate.py maybe_compile_and_run` after the chain walk. Callers look
+    /// up `cell`, choose `hash` / `increment` / the veto greens, and map the
+    /// result; this body is the order.
+    fn maybe_compile_and_run_decision(
+        &mut self,
+        cell: Option<&BaseJitCell>,
+        hash: u64,
+        increment: f64,
+        greenargs: Option<&[i64]>,
+        is_runnable: bool,
+        door: WarmEntryDoor,
+    ) -> HotResult {
+        let (function_entry, engine_is_tracing) = match door {
+            WarmEntryDoor::BackEdge => (false, false),
+            WarmEntryDoor::FunctionEntry { engine_is_tracing } => (true, engine_is_tracing),
+        };
+        if increment == 0.0 {
+            return HotResult::NotHot;
+        }
+
+        fn tick_result(state: &mut WarmEnterState, hash: u64, increment: f64) -> HotResult {
+            if state.counter.tick(hash, increment) {
+                HotResult::StartTracing
+            } else {
+                HotResult::NotHot
+            }
+        }
+
+        let Some(cell) = cell else {
+            if engine_is_tracing {
+                return HotResult::StartTracing;
+            }
+            if function_entry {
+                crate::mc_diag_bump(25);
+            }
+            return tick_result(self, hash, increment);
+        };
+
+        let flags = cell.flags.get();
+        if flags.contains(JcFlags::JC_TRACING) || flags.contains(JcFlags::JC_TEMPORARY) {
+            if flags.contains(JcFlags::JC_TRACING) {
+                if engine_is_tracing {
+                    return HotResult::StartTracing;
+                }
+                if function_entry {
+                    crate::mc_diag_bump(23);
+                    crate::mc_diag_bump(65);
+                    // Production reaches this arm only with `!driver.is_tracing()`,
+                    // so 65 is a cell holding JC_TRACING while no trace runs.
+                    // 66 splits those leaks by age: a generation older than the
+                    // warm state's means a later start superseded the session
+                    // that set the flag. See MC_DIAG's legend.
+                    if cell.tracing_generation.get() < self.tracing_generation {
+                        crate::mc_diag_bump(66);
+                    }
+                }
+                return HotResult::AlreadyTracing;
+            }
+            if engine_is_tracing {
+                return HotResult::StartTracing;
+            }
+            if function_entry {
+                crate::mc_diag_bump(25);
+            }
+            return tick_result(self, hash, increment);
+        }
+
+        if cell.get_procedure_token().is_none() {
+            if engine_is_tracing {
+                return HotResult::StartTracing;
+            }
+            let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
+            let abort_count = cell.abort_count.get();
+            if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
+                if self.should_start_dont_trace_here_trace(
+                    hash,
+                    flags,
+                    has_seen_a_procedure_token,
+                    abort_count,
+                    increment,
+                ) {
+                    if function_entry && flags.contains(JcFlags::JC_TRACING_OCCURRED) {
+                        crate::mc_diag_bump(25);
+                    }
+                    return HotResult::StartTracing;
+                }
+                if abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81);
+                }
+                return HotResult::NotHot;
+            }
+            if function_entry {
+                crate::mc_diag_bump(24);
+            }
+            self.cleanup_chain(hash);
+            return HotResult::NotHot;
+        }
+
+        if is_runnable {
+            // warmstate.py maybe_compile_and_run: confirm_enter_jit before EnterJitAssembler.
+            if !self.confirm_enter_jit_if_available(greenargs) {
+                return HotResult::NotHot;
+            }
+            return HotResult::RunCompiled;
+        }
+        // `has_compiled_meta` is a pending upstream mismatch (`warmstate.py maybe_compile_and_run` enters on any non-temporary procedure token).
+        if engine_is_tracing {
+            return HotResult::StartTracing;
+        }
+        let not_hot = if function_entry {
+            crate::mc_diag_bump(23);
+            crate::mc_diag_bump(64);
+            true
+        } else {
+            flags.contains(JcFlags::JC_DONT_TRACE_HERE)
+        };
+        if not_hot {
+            return HotResult::NotHot;
+        }
+        tick_result(self, hash, increment)
     }
 
     /// `warmstate.py` `bound_reached` — the veto, then the mark.
@@ -952,37 +1083,20 @@ impl WarmEnterState {
     }
 
     pub fn counter_tick_checked(&mut self, cell_key: u64) -> bool {
-        let mut cleanup_tokenless_cell = false;
-        if let Some(cell) = self.cell_by_key(cell_key) {
-            if cell.is_compiled() || cell.is_tracing() {
-                return true;
-            }
-            let flags = cell.flags.get();
-            let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
-            let abort_count = cell.abort_count.get();
-            if cell.get_procedure_token().is_none() {
-                // `maybe_compile_and_run`: never-traced `JC_DONT_TRACE_HERE`
-                // retries; every other tokenless cell is `cleanup_chain`.
-                if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
-                    return self.should_start_dont_trace_here_trace(
-                        cell_key,
-                        flags,
-                        has_seen_a_procedure_token,
-                        abort_count,
-                        self.increment_threshold,
-                    );
-                }
-                cleanup_tokenless_cell = true;
-            } else if flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return false;
-            }
-        }
-        if cleanup_tokenless_cell {
-            self.cleanup_chain(self.bucket_of(cell_key));
-            return false;
-        }
-        let bucket = self.bucket_of(cell_key);
-        self.counter.tick(bucket, self.increment_threshold)
+        let cell = self.cell_by_key(cell_key);
+        let is_runnable = cell.as_ref().is_some_and(|c| c.is_compiled());
+        let hash = self.bucket_of(cell_key);
+        matches!(
+            self.maybe_compile_and_run_decision(
+                cell.as_deref(),
+                hash,
+                self.increment_threshold,
+                cell.as_ref().map(|c| &c.greens[..]),
+                is_runnable,
+                WarmEntryDoor::BackEdge,
+            ),
+            HotResult::StartTracing
+        )
     }
 
     /// `warmstate.py maybe_compile_and_run` `:465-469`: the chain walk found
@@ -1013,75 +1127,25 @@ impl WarmEnterState {
         self.cell_generation = self.cell_generation.wrapping_add(1);
     }
 
-    /// Tokenless arm of `maybe_compile_and_run`: an aborted compilation or a
-    /// freed token is `cleanup_chain`; a never-traced `JC_DONT_TRACE_HERE` cell
-    /// retries; `MAX_TRACE_ABORT_COUNT` bans through `JC_DONT_TRACE_HERE`.
+    /// Hash-form door of `warmstate.py maybe_compile_and_run`.
     pub(crate) fn maybe_compile_decision_with_meta(
         &mut self,
         cell_key: u64,
         has_compiled_meta: impl FnOnce(u64) -> bool,
     ) -> HotResult {
-        let mut cleanup_tokenless_cell = false;
-        if let Some(cell) = self.cell_by_key(cell_key) {
-            let has_procedure_token = cell.get_procedure_token().is_some();
-            let is_compiled = cell.is_compiled();
-            let is_tracing = cell.is_tracing();
-            let flags = cell.flags.get();
-            let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
-            if is_compiled && has_compiled_meta(cell_key) {
-                // warmstate.py:501 — the second veto position, between
-                // finding a live procedure token and `raise
-                // EnterJitAssembler`. A hook that refuses leaves the caller
-                // interpreting rather than entering the machine code. The
-                // cell retains the structured greens, so the hook sees them.
-                if !self.confirm_enter_jit_if_available(Some(&cell.greens[..])) {
-                    return HotResult::NotHot;
-                }
-                return HotResult::RunCompiled;
-            }
-            if is_tracing {
-                return HotResult::AlreadyTracing;
-            }
-            let abort_count = cell.abort_count.get();
-            if !has_procedure_token {
-                // `maybe_compile_and_run`: never-traced `JC_DONT_TRACE_HERE`
-                // retries; every other tokenless cell is `cleanup_chain`.
-                // `abort_tracing` stamps `JC_DONT_TRACE_HERE` at
-                // `MAX_TRACE_ABORT_COUNT`, so the abort-ceiling ban lives here.
-                if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
-                    if self.should_start_dont_trace_here_trace(
-                        cell_key,
-                        flags,
-                        has_seen_a_procedure_token,
-                        abort_count,
-                        self.increment_threshold,
-                    ) {
-                        return HotResult::StartTracing;
-                    }
-                    if abort_count >= MAX_TRACE_ABORT_COUNT {
-                        crate::mc_diag_bump(81);
-                    }
-                    return HotResult::NotHot;
-                }
-                cleanup_tokenless_cell = true;
-            } else if flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return HotResult::NotHot;
-            }
-        }
-
-        if cleanup_tokenless_cell {
-            self.cleanup_chain(self.bucket_of(cell_key));
-            return HotResult::NotHot;
-        }
-
-        if !self
-            .counter
-            .tick(self.bucket_of(cell_key), self.increment_threshold)
-        {
-            return HotResult::NotHot;
-        }
-
-        HotResult::StartTracing
+        let cell = self.cell_by_key(cell_key);
+        let is_runnable = cell
+            .as_ref()
+            .is_some_and(|c| c.is_compiled() && has_compiled_meta(cell_key));
+        let hash = self.bucket_of(cell_key);
+        self.maybe_compile_and_run_decision(
+            cell.as_deref(),
+            hash,
+            self.increment_threshold,
+            cell.as_ref().map(|c| &c.greens[..]),
+            is_runnable,
+            WarmEntryDoor::BackEdge,
+        )
     }
 
     /// Compatibility form for callers whose compiled-loop metadata is wholly
@@ -1149,69 +1213,24 @@ impl WarmEnterState {
         has_compiled_meta: impl FnOnce(u64) -> bool,
     ) -> HotResult {
         let hash = key.get_uhash();
-        let mut cleanup_tokenless_cell = false;
-        if let Some(cell) = self.lookup_chain_with_key(key) {
-            let has_procedure_token = cell.get_procedure_token().is_some();
-            let is_compiled = cell.is_compiled();
-            let is_tracing = cell.is_tracing();
-            let flags = cell.flags.get();
-            let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
-            if is_compiled {
-                // `compiled_loops` is filed under this cell's assigned key.
-                // `install_new_cell` mints `BaseJitCell::cell_key` when
-                // `get_uhash` is already taken, and `maybe_compile_and_run_step`
-                // resolves that same number with `cell_key_for` after
-                // `RunCompiled`. The raw hash names the bucket's first cell.
-                let cell_key = cell.cell_key.get().unwrap_or(hash);
-                if has_compiled_meta(cell_key) {
-                    // warmstate.py:501 — see `maybe_compile_decision`, whose
-                    // position this is the typed twin of.
-                    if !self.confirm_enter_jit(&key.values) {
-                        return HotResult::NotHot;
-                    }
-                    return HotResult::RunCompiled;
-                }
-            }
-            if is_tracing {
-                return HotResult::AlreadyTracing;
-            }
-            let abort_count = cell.abort_count.get();
-            if !has_procedure_token {
-                // `maybe_compile_and_run`: never-traced `JC_DONT_TRACE_HERE`
-                // retries; every other tokenless cell is `cleanup_chain`.
-                // `abort_tracing` stamps `JC_DONT_TRACE_HERE` at
-                // `MAX_TRACE_ABORT_COUNT`, so the abort-ceiling ban lives here.
-                if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
-                    if self.should_start_dont_trace_here_trace(
-                        hash,
-                        flags,
-                        has_seen_a_procedure_token,
-                        abort_count,
-                        self.increment_threshold,
-                    ) {
-                        return HotResult::StartTracing;
-                    }
-                    if abort_count >= MAX_TRACE_ABORT_COUNT {
-                        crate::mc_diag_bump(81);
-                    }
-                    return HotResult::NotHot;
-                }
-                cleanup_tokenless_cell = true;
-            } else if flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return HotResult::NotHot;
-            }
-        }
-
-        if cleanup_tokenless_cell {
-            self.cleanup_chain(hash);
-            return HotResult::NotHot;
-        }
-
-        if !self.counter.tick(hash, self.increment_threshold) {
-            return HotResult::NotHot;
-        }
-
-        HotResult::StartTracing
+        let cell = self.lookup_chain_with_key(key);
+        let is_runnable = cell.as_ref().is_some_and(|c| {
+            // `compiled_loops` is filed under this cell's assigned key.
+            // `install_new_cell` mints `BaseJitCell::cell_key` when
+            // `get_uhash` is already taken, and `maybe_compile_and_run_step`
+            // resolves that same number with `cell_key_for` after
+            // `RunCompiled`. The raw hash names the bucket's first cell.
+            let cell_key = c.cell_key.get().unwrap_or(hash);
+            c.is_compiled() && has_compiled_meta(cell_key)
+        });
+        self.maybe_compile_and_run_decision(
+            cell.as_deref(),
+            hash,
+            self.increment_threshold,
+            Some(&key.values),
+            is_runnable,
+            WarmEntryDoor::BackEdge,
+        )
     }
 
     /// Mutable chain-walk variant of [`Self::lookup_chain_with_key`].
@@ -2009,24 +2028,11 @@ impl WarmEnterState {
 
     /// The function-entry door's whole answer, from ONE walk of the cell chain.
     ///
-    /// `warmstate.py maybe_compile_and_run` matches the cell once and tests
-    /// `JC_TEMPORARY` before reading
-    /// `procedure_token = cell.get_procedure_token()`. A temporary cell takes
-    /// the counter path even though its callback token is live. Otherwise the
-    /// counter path is taken only when no runnable loop token is present. The
-    /// door used to ask three
-    /// separate questions of the same chain — `has_runnable_compiled_loop`
-    /// before the gate, `should_trace_function_entry` inside it, and
-    /// `has_runnable_compiled_loop` again to decide the run — so a call that
-    /// refused walked the chain three times to learn one thing.
-    ///
+    /// `warmstate.py maybe_compile_and_run` with `increment_function_threshold`.
     /// `has_compiled_meta` is the frontend half of `has_runnable_compiled_loop`
     /// (`compiled_loops`, a map the warm state does not own); the cell half is
-    /// read here. Both together make an ordinary token runnable; the
-    /// cell-owned `JC_TEMPORARY` flag precedes them and makes a callback fall
-    /// through to the counter even when retained frontend metadata also
-    /// exists. The metadata test is a closure because the cell/token half is
-    /// the cheaper question and answers no for most ordinary calls.
+    /// `is_compiled` plus `has_compiled_code`. Both together make an ordinary
+    /// token runnable; `JC_TRACING` and `JC_TEMPORARY` precede that test.
     ///
     /// `engine_is_tracing` is `MetaInterp::is_tracing` — one global Option, not
     /// a per-cell flag. The door consulted it to skip the counter gate entirely
@@ -2039,148 +2045,31 @@ impl WarmEnterState {
         has_compiled_meta: impl FnOnce() -> bool,
         engine_is_tracing: bool,
     ) -> FunctionEntryStep {
-        let mut cleanup_tokenless_cell = false;
-        if let Some(cell) = self.cell_by_key(cell_key) {
-            // `warmstate.py maybe_compile_and_run` tests
-            // `JC_TRACING | JC_TEMPORARY` before reading the procedure token.
-            // A temporary callback has real machine code, and pyre may still
-            // retain the displaced loop's frontend metadata, so neither code
-            // presence nor `has_compiled_meta()` identifies this flag. Count
-            // it normally exactly as upstream does; never mix the callback
-            // token with that displaced loop metadata and enter it as a loop.
-            if cell.flags.get().contains(JcFlags::JC_TEMPORARY) {
-                if engine_is_tracing {
-                    return FunctionEntryStep::Proceed;
-                }
-                crate::mc_diag_bump(25);
-                return if self
-                    .counter
-                    .tick(self.bucket_of(cell_key), self.increment_function_threshold)
-                {
-                    FunctionEntryStep::Proceed
-                } else {
-                    FunctionEntryStep::NotHot
-                };
-            }
-            // The token read `maybe_compile_and_run` performs for a
-            // non-temporary cell before it asks the counter anything. Only a
-            // runnable one returns here; the
-            // `is_compiled` / `is_tracing` census below still sees every other
-            // cell, which is what keeps slots 23/64/65 counting what they did.
-            if let Some(token) = cell
-                .get_procedure_token()
-                .filter(|token| token.has_compiled_code())
+        let cell = self.cell_by_key(cell_key);
+        let is_runnable = cell.as_ref().is_some_and(|c| {
+            c.is_compiled()
                 && has_compiled_meta()
-            {
-                if !self.confirm_enter_jit_if_available(green_key.map(|k| k.values.as_slice())) {
-                    return FunctionEntryStep::NotHot;
-                }
-                return FunctionEntryStep::RunCompiled(token);
-            }
-            if engine_is_tracing {
-                return FunctionEntryStep::Proceed;
-            }
-            // Slot 23 is the total; 64/65 are its two terms, evaluated
-            // independently rather than short-circuited so a cell that is both
-            // reaches both tallies. `is_compiled()` fires on every probe of
-            // every compiled key, so 23 alone cannot attribute a decline.
-            let compiled = cell.is_compiled();
-            let tracing = cell.is_tracing();
-            if compiled || tracing {
-                crate::mc_diag_bump(23);
-                if compiled {
-                    crate::mc_diag_bump(64);
-                }
-                if tracing {
-                    crate::mc_diag_bump(65);
-                    // 65 is NOT a "healthy while a trace runs" reading in
-                    // production, and an earlier version of this comment said
-                    // it was. The only production caller
-                    // (`pyre-jit`'s try_function_entry_jit) guards on
-                    // `!driver.is_tracing()`, which is
-                    // `MetaInterp::tracing.is_some()` — one global Option, not
-                    // a per-cell flag. So while the engine traces, the caller
-                    // returns a frame earlier and this gate is never reached.
-                    // Every production bump of 65 is therefore a cell holding
-                    // JC_TRACING while no trace is running, i.e. a leak on its
-                    // own. The function itself can still be called mid-trace
-                    // directly, and the unit tests below do exactly that.
-                    //
-                    // 66 splits those leaks by AGE, not into leak vs healthy:
-                    // a generation older than the warm state's means the
-                    // session that set the flag was superseded by a later
-                    // trace start. 65 > 0 with 66 == 0 is the flag leaking
-                    // from the most recent session, which is if anything the
-                    // more direct miss.
-                    //
-                    // A ZERO HERE NEEDS TWO WITNESSES, NOT ONE. That the
-                    // door ran (23 + 24 + 25 > 0) does not mean any probed
-                    // cell could ever have held the flag: a stale JC_TRACING
-                    // only sits on a cell that once started tracing, and a
-                    // workload that never arms function-entry tracing gives
-                    // 65 == 0 by construction. The arming witness is
-                    // `caro_funcentry` (slot 19), bumped at the top of
-                    // pyre-jit's `compile_and_run_once` above every early
-                    // return — but on the `FunctionEntry` arm ONLY, since the
-                    // slot is selected by `start` (`BackEdge` bumps 18). So a
-                    // back-edge-only workload leaves 19 at 0 while 18 climbs,
-                    // and 18 is NOT a substitute. Without 19 > 0 a 0 here is
-                    // NOT EXERCISED, not clean. See MC_DIAG's legend.
-                    if cell.tracing_generation.get() < self.tracing_generation {
-                        crate::mc_diag_bump(66);
-                    }
-                }
-                return FunctionEntryStep::NotHot;
-            }
-            // `maybe_compile_and_run`: a tokenless cell is either a never-traced
-            // `JC_DONT_TRACE_HERE` retry or `cleanup_chain` (aborted compilation
-            // or a freed token). `MAX_TRACE_ABORT_COUNT` bans through
-            // `JC_DONT_TRACE_HERE` (`abort_tracing`).
-            let flags = cell.flags.get();
-            let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
-            let abort_count = cell.abort_count.get();
-            if cell.get_procedure_token().is_none() {
-                if flags.contains(JcFlags::JC_DONT_TRACE_HERE) && !has_seen_a_procedure_token {
-                    if self.should_start_dont_trace_here_trace(
-                        cell_key,
-                        flags,
-                        has_seen_a_procedure_token,
-                        abort_count,
-                        self.increment_function_threshold,
-                    ) {
-                        if flags.contains(JcFlags::JC_TRACING_OCCURRED) {
-                            crate::mc_diag_bump(25);
-                        }
-                        return FunctionEntryStep::Proceed;
-                    }
-                    if abort_count >= MAX_TRACE_ABORT_COUNT {
-                        crate::mc_diag_bump(81);
-                    }
-                    return FunctionEntryStep::NotHot;
-                }
-                cleanup_tokenless_cell = true;
-            } else if flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
-                return FunctionEntryStep::NotHot;
-            }
-        }
-        // A cell the walk did not find takes the same skip the one it found
-        // takes above: while a trace runs the door never asked the counter.
-        if engine_is_tracing {
-            return FunctionEntryStep::Proceed;
-        }
-        if cleanup_tokenless_cell {
-            crate::mc_diag_bump(24);
-            self.cleanup_chain(self.bucket_of(cell_key));
-            return FunctionEntryStep::NotHot;
-        }
-        crate::mc_diag_bump(25);
-        if self
-            .counter
-            .tick(self.bucket_of(cell_key), self.increment_function_threshold)
-        {
-            FunctionEntryStep::Proceed
-        } else {
-            FunctionEntryStep::NotHot
+                && c.get_procedure_token()
+                    .is_some_and(|token| token.has_compiled_code())
+        });
+        let hash = self.bucket_of(cell_key);
+        match self.maybe_compile_and_run_decision(
+            cell.as_deref(),
+            hash,
+            self.increment_function_threshold,
+            green_key.map(|k| k.values.as_slice()),
+            is_runnable,
+            WarmEntryDoor::FunctionEntry { engine_is_tracing },
+        ) {
+            HotResult::RunCompiled => FunctionEntryStep::RunCompiled(
+                cell.and_then(|c| {
+                    c.get_procedure_token()
+                        .filter(|token| token.has_compiled_code())
+                })
+                .expect("runnable compiled token"),
+            ),
+            HotResult::StartTracing => FunctionEntryStep::Proceed,
+            HotResult::NotHot | HotResult::AlreadyTracing => FunctionEntryStep::NotHot,
         }
     }
 
@@ -2188,73 +2077,26 @@ impl WarmEnterState {
     ///
     /// `warmstate.py maybe_compile_and_run` walks the bucket chain
     /// with `comparekey` once and keeps that exact `JitCell` through the
-    /// JC_TEMPORARY / procedure-token / JC_DONT_TRACE_HERE decision.  A raw
-    /// hash names only the bucket in pyre, so using the hash form for this
-    /// first half and [`Self::force_start_tracing_for_key`] for the second can
-    /// inspect two different cells in a chained bucket.  Keep the whole
-    /// function-entry decision on the matching typed cell instead.
+    /// decision. A raw hash names only the bucket in pyre, so using the hash
+    /// form for this first half and [`Self::force_start_tracing_for_key`] for
+    /// the second can inspect two different cells in a chained bucket. Keep
+    /// the whole function-entry decision on the matching typed cell instead.
     pub fn should_trace_function_entry_for_key(&mut self, key: &GreenKey) -> bool {
-        let bucket = key.get_uhash();
-        let mut cleanup_dead_token_cell = false;
-        if let Some(cell) = self.lookup_chain_with_key(key) {
-            let compiled = cell.is_compiled();
-            let tracing = cell.is_tracing();
-            if compiled || tracing {
-                crate::mc_diag_bump(23);
-                if compiled {
-                    crate::mc_diag_bump(64);
-                }
-                if tracing {
-                    crate::mc_diag_bump(65);
-                    if cell.tracing_generation.get() < self.tracing_generation {
-                        crate::mc_diag_bump(66);
-                    }
-                }
-                return false;
-            }
-            // The same two gates the untyped twin runs, in the same order
-            // (`warmstate.py maybe_compile_and_run`). An invalidated procedure
-            // token has to reach `cleanup_chain` below rather than take any
-            // early return. `dont_trace_here` never-seen-token retry precedes
-            // the pyre-local abort ceiling, matching `maybe_compile_and_run`.
-            let dead_token =
-                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
-            if cell.flags.get().contains(JcFlags::JC_TEMPORARY) {
-                crate::mc_diag_bump(25);
-                return self.counter.tick(bucket, self.increment_function_threshold);
-            }
-            if self.should_start_dont_trace_here_trace(
-                bucket,
-                cell.flags.get(),
-                cell.has_seen_a_procedure_token(),
-                cell.abort_count.get(),
+        let hash = key.get_uhash();
+        let cell = self.lookup_chain_with_key(key);
+        matches!(
+            self.maybe_compile_and_run_decision(
+                cell.as_deref(),
+                hash,
                 self.increment_function_threshold,
-            ) {
-                if cell.flags.get().contains(JcFlags::JC_TRACING_OCCURRED) {
-                    crate::mc_diag_bump(25);
-                }
-                return true;
-            }
-            if !dead_token && cell.abort_count.get() >= MAX_TRACE_ABORT_COUNT {
-                crate::mc_diag_bump(81);
-                return false;
-            }
-            if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
-                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_some() {
-                    return false;
-                }
-            }
-            if dead_token {
-                cleanup_dead_token_cell = true;
-            }
-        }
-        if cleanup_dead_token_cell {
-            crate::mc_diag_bump(24);
-            self.cleanup_chain(bucket);
-            return false;
-        }
-        crate::mc_diag_bump(25);
-        self.counter.tick(bucket, self.increment_function_threshold)
+                Some(&key.values),
+                false,
+                WarmEntryDoor::FunctionEntry {
+                    engine_is_tracing: false,
+                },
+            ),
+            HotResult::StartTracing
+        )
     }
 
     // ── Quasi-immutable field invalidation ──
@@ -5087,9 +4929,8 @@ mod tests {
     ///
     /// `has_compiled_meta` is the caller's half of
     /// `JitDriver::has_runnable_compiled_loop`. A token WITHOUT frontend meta is
-    /// a bare `compile_tmp_callback` and was never runnable, so only both halves
-    /// together produce [`FunctionEntryStep::RunCompiled`]; with one half the
-    /// same cell falls through to the census that declines it.
+    /// not runnable, so only both halves together produce
+    /// [`FunctionEntryStep::RunCompiled`].
     #[test]
     fn function_entry_step_answers_the_whole_door_from_one_walk() {
         let mut ws = WarmEnterState::new(2);
@@ -5163,6 +5004,192 @@ mod tests {
         }
         assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
         assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
+    }
+
+    /// A compiled cell that is not runnable must not tick the function-entry
+    /// door: consecutive probes stay cold and the live token stays attached.
+    #[test]
+    fn function_entry_does_not_tick_a_compiled_not_runnable_cell() {
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = GreenKey::new(vec![0xC0, 0xDE]);
+        let token = token_with_compiled_code(&mut ws);
+        attach_alive_for_key(&mut ws, &key, Arc::clone(&token));
+
+        for _ in 0..50 {
+            assert!(!ws.should_trace_function_entry_for_key(&key));
+        }
+        let held = ws
+            .lookup_chain_with_key(&key)
+            .and_then(|cell| cell.get_procedure_token())
+            .expect("the compiled cell still holds a token");
+        assert!(
+            Arc::ptr_eq(&held, &token),
+            "the compiled cell still holds its token",
+        );
+
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = gk(0xC0DE);
+        let token = token_with_compiled_code(&mut ws);
+        attach_alive_for_key(&mut ws, &key, token);
+        for _ in 0..50 {
+            assert!(matches!(
+                ws.function_entry_step(ws.cell_key_for(&key).expect("cell"), None, || false, false),
+                FunctionEntryStep::NotHot
+            ));
+        }
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: `increment_threshold == 0` is
+    /// "jit is off" — not hot, no tick, no cleanup — before any cell lookup.
+    #[test]
+    fn zero_increment_returns_not_hot_without_ticking() {
+        let mut ws = WarmEnterState::new(2);
+        let key = gk(0xA11);
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key(&key, |_| true),
+            HotResult::NotHot
+        ));
+        ws.set_threshold(0);
+        for _ in 0..8 {
+            assert!(matches!(
+                ws.maybe_compile_decision_with_key(&key, |_| true),
+                HotResult::NotHot
+            ));
+        }
+        ws.set_threshold(2);
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key(&key, |_| true),
+            HotResult::StartTracing
+        ));
+
+        let mut ws = WarmEnterState::new(2);
+        let compiled = gk(0xA12);
+        attach_alive_for_key(&mut ws, &compiled, JitCellToken::new(1));
+        ws.set_threshold(0);
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key(&compiled, |_| true),
+            HotResult::NotHot
+        ));
+
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(0);
+        assert!(matches!(
+            ws.function_entry_step(
+                ws.cell_key_for(&gk(0xA12)).expect("cell"),
+                None,
+                || true,
+                false
+            ),
+            FunctionEntryStep::NotHot
+        ));
+
+        let mut ws = WarmEnterState::new(2);
+        let aborted = GreenKey::new(vec![0xA13]);
+        assert!(matches!(
+            ws.maybe_compile_with_key(&aborted),
+            HotResult::NotHot
+        ));
+        assert!(matches!(
+            ws.maybe_compile_with_key(&aborted),
+            HotResult::StartTracing
+        ));
+        ws.abort_tracing(aborted.get_uhash(), false);
+        assert!(ws.lookup_chain_with_key(&aborted).is_some());
+        ws.set_threshold(0);
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key(&aborted, |_| true),
+            HotResult::NotHot
+        ));
+        assert!(
+            ws.lookup_chain_with_key(&aborted).is_some(),
+            "increment 0 does not cleanup_chain",
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run` reads `JC_TRACING` before the
+    /// procedure token, so compiled+tracing chooses already-tracing.
+    #[test]
+    fn tracing_and_compiled_is_already_tracing() {
+        let mut ws = WarmEnterState::new(2);
+        let key = GreenKey::new(vec![0xA21, 0xA22]);
+        let token = token_with_compiled_code(&mut ws);
+        attach_alive_for_key(&mut ws, &key, token);
+        let cell = ws.lookup_chain_with_key(&key).expect("compiled cell");
+        cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
+        let cell_key = ws.cell_key_for(&key).expect("compiled cell key");
+
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key(&key, |_| true),
+            HotResult::AlreadyTracing
+        ));
+        assert!(matches!(
+            ws.maybe_compile_decision(cell_key),
+            HotResult::AlreadyTracing
+        ));
+        assert!(matches!(
+            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            FunctionEntryStep::NotHot
+        ));
+        assert!(matches!(
+            ws.function_entry_step(cell_key, Some(&key), || true, true),
+            FunctionEntryStep::Proceed
+        ));
+    }
+
+    /// `warmstate.py maybe_compile_and_run` counts `JC_TEMPORARY` normally,
+    /// including when `JC_DONT_TRACE_HERE` is also set.
+    #[test]
+    fn temporary_dont_trace_here_counts_toward_start() {
+        let mut ws = WarmEnterState::new(2);
+        let key = GreenKey::new(vec![0x7E, 0x11]);
+        let token = Arc::new(JitCellToken::new(0x7e11));
+        ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
+            .expect("tmp token");
+        ws.disable_noninlinable_function_for_key(&key);
+        let cell = ws.lookup_chain_with_key(&key).expect("tmp cell");
+        assert!(cell.flags.get().contains(JcFlags::JC_TEMPORARY));
+        assert!(cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
+
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key(&key, |_| true),
+            HotResult::NotHot
+        ));
+        assert!(matches!(
+            ws.maybe_compile_decision_with_key(&key, |_| true),
+            HotResult::StartTracing
+        ));
+
+        let mut ws = WarmEnterState::new(2);
+        ws.set_function_threshold(2);
+        let key = GreenKey::new(vec![0x7E, 0x12]);
+        let token = Arc::new(JitCellToken::new(0x7e12));
+        ws.get_assembler_token_with_key::<(), _>(&key, |_memmgr| Ok(token.clone()))
+            .expect("tmp token");
+        ws.disable_noninlinable_function_for_key(&key);
+        assert!(!ws.should_trace_function_entry_for_key(&key));
+        assert!(ws.should_trace_function_entry_for_key(&key));
+    }
+
+    /// `warmstate.py maybe_compile_and_run`: a tokenless aborted cell is
+    /// `cleanup_chain` on every door, including the typed function-entry one.
+    #[test]
+    fn tokenless_aborted_cell_function_entry_runs_cleanup_chain() {
+        let mut ws = WarmEnterState::new(2);
+        let key = GreenKey::new(vec![0xC1, 0xEA]);
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert!(matches!(
+            ws.maybe_compile_with_key(&key),
+            HotResult::StartTracing
+        ));
+        ws.abort_tracing(key.get_uhash(), false);
+        assert!(ws.lookup_chain_with_key(&key).is_some());
+        assert!(!ws.should_trace_function_entry_for_key(&key));
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "an ordinary tokenless aborted cell is cleanup_chain",
+        );
     }
 
     #[test]

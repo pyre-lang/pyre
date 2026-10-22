@@ -30,7 +30,7 @@
 # store -- `c.x` itself ends correct either way.
 #
 # Two things had to change, and the fixture needs both:
-#   * `try_walker_force_quasi_immut_class_body` now latches the operand-stack
+#   * the class-body `ABORT_FORCE_QUASIIMMUT` site now latches the operand-stack
 #     mirror its two sibling qmut sites already latched, so the leg has
 #     something to adopt;
 #   * the latch's own sanity check only exempted ONE disagreeing slot, the

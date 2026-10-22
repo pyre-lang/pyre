@@ -7696,96 +7696,6 @@ fn try_walker_force_quasi_immut_namespace_write<Sym: WalkSym>(
     Some(())
 }
 
-/// The `CodeObject` of the frame the walk is currently in: the innermost
-/// inlined callee while a sub-walk is in progress, else the portal frame.
-///
-/// A sub-walk inherits `FbwWalkMode::snapshot_sym` from its parent, so that
-/// field names the walk's outermost frame however deep the descent is. A
-/// helper holding a class statement is an ordinary inline candidate, so
-/// reading the snapshot root would decide a callee's class statement by its
-/// caller's returns. `WalkSession::framestack`
-/// carries the callee levels, and its top is the frame executing the opcode;
-/// this is the same derivation `ActiveResumeFrame::current` performs, so the
-/// gate and the snapshot encoder name one consistent active frame.
-fn walker_active_py_code<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-) -> Option<&'static pyre_interpreter::CodeObject> {
-    // Bound before the branch so the session borrow ends with this statement.
-    let innermost = super::fbw_state::fbw_innermost_inline_callee_key(ctx);
-    if let Some(callee_w_code) = innermost {
-        let index = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;
-        let payload = crate::state::pyjitcode_for_jitcode_index(index)?;
-        let code_ptr = payload.code_ptr;
-        return (!code_ptr.is_null()).then(|| unsafe { &*code_ptr });
-    }
-    let sym = ctx.fbw_mode.snapshot_sym;
-    if sym.is_null() {
-        return None;
-    }
-    // SAFETY: identical contract to the other `snapshot_sym` readers — the
-    // pointer is set only for the lifetime of the full-body walk.
-    let sym = unsafe { &*sym };
-    if sym.jitcode().is_null() {
-        return None;
-    }
-    let jitcode = unsafe { &*sym.jitcode() };
-    let code_ptr = jitcode.payload.code_ptr;
-    (!code_ptr.is_null()).then(|| unsafe { &*code_ptr })
-}
-
-/// Mirror `opimpl_jit_force_quasi_immutable` for a class body hidden inside the
-/// opaque `build_class` residual.
-///
-/// `build_class` executes the body in a module-strategy dict, whose first
-/// `STORE_NAME` installs and forces `version?`; upstream therefore aborts the
-/// trace.  Pyre detects the same condition at the residual boundary.  The
-/// namespace does not exist yet, so there is no watcher to record or invalidate
-/// before the abort.
-fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    ref_operand_offset: usize,
-    r_args: &[OpRef],
-) -> bool {
-    if r_args.len() < 2 {
-        return false;
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
-    // A bit-cast of a small int is a non-null `Ref` and not a callable.
-    // `is_build_class_builtin` loads the type word from it.
-    let aligned_object = |bits: usize| bits % std::mem::align_of::<usize>() == 0;
-    let mut callable = match arg_concretes.first() {
-        Some(ConcreteValue::Ref(value)) if aligned_object(*value as usize) => *value,
-        _ => std::ptr::null_mut(),
-    };
-    if callable.is_null()
-        && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[0])
-        && r != majit_ir::GcRef::NO_CONCRETE
-        && aligned_object(r.as_usize())
-        && r.as_usize() != 0
-    {
-        callable = r.as_usize() as pyre_object::PyObjectRef;
-    }
-    if !pyre_interpreter::builtins::is_build_class_builtin(callable) {
-        return false;
-    }
-    // Index 1 is the CALL's null-or-self slot; the builtin's own
-    // `&[PyObjectRef]` starts after it, exactly the tail
-    // `try_walker_inline_builtin_call` copies into its wrapper array.
-    let mut args = Vec::with_capacity(arg_concretes.len().saturating_sub(2));
-    for concrete in arg_concretes.iter().skip(2) {
-        let ConcreteValue::Ref(value) = *concrete else {
-            return false;
-        };
-        args.push(value);
-    }
-    if !pyre_interpreter::call::build_class_body_namespace_is_module_dict(&args) {
-        return false;
-    }
-    true
-}
-
 /// `nestedscope.py Cell.get` for the LOAD_DEREF residual.
 ///
 /// ```python
@@ -8736,22 +8646,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
-    }
-
-    // The class namespace does not exist until this residual runs, so the
-    // enclosing frame's non-constant return is the available signal that the
-    // fresh class can reach the trace.  Check before the call so forward resume
-    // executes the class body once.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && walker_active_py_code(ctx)
-            .is_none_or(|active| !pyre_interpreter::code_returns_only_constants(active))
-        && try_walker_force_quasi_immut_class_body(ctx, code, op, 1, &r_args)
-    {
-        crate::state::note_force_quasi_immut_abort();
-        prepare_force_quasi_immutable_abort(ctx, op.pc);
-        return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
     // `function.py funccall_valuestack`'s `_code_of_sys_exc_info` test
