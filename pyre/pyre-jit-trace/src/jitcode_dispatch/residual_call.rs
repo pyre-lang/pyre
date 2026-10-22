@@ -6649,12 +6649,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // which reads the same binding): an uncommitted walk has nothing to undo
     // for the exception carrier's clear, so the region it hands back is not
     // irreversible.
+    let entered_frame = heap_write_odometer_before
+        .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before);
     if !provably_side_effect_free
         && !is_idempotent_gc_barrier
         && !writes_gc_liveness_root_only
-        && (writes_live_heap
-            || heap_write_odometer_before
-                .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before))
+        && (writes_live_heap || entered_frame)
     {
         // `committed=false effects>0` is the double-apply signature, but the
         // odometer alone does not say WHICH residual made the region
@@ -6667,22 +6667,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 .map(|(n, _)| *n);
             eprintln!(
                 "[fbw-effect] pc={op_pc} helper={helper:?} rtype={:?} extraeffect={:?} \
-                 writes_live={writes_live_heap} entered_frame={} fn={:?}/{:#x}",
+                 writes_live={writes_live_heap} entered_frame={entered_frame} fn={:?}/{:#x}",
                 call_descr.result_type(),
                 ei.extraeffect,
-                heap_write_odometer_before
-                    .is_some_and(|before| pyre_interpreter::call::frame_entry_count() != before),
                 name,
                 func_ptr as usize,
             );
         }
         fbw_bump_executed_effect("residual");
+        // CALL-entry re-runs this residual. `writes_live_heap` is a Void /
+        // CallFn proxy: it counts allocation-only residuals (`make_pyerror`,
+        // `ll_vec_alloc_and_set_nonnull_r_trampoline`) and rvec housekeeping
+        // (`ll_vec_arrayclear_r`, Void `CannotRaise`) that must not move this
+        // odometer — refusing them drops `cffi_lib_attr_cell`. A tagged
+        // mutator or a user frame would apply twice. Journaled stores are
+        // refused through `journal_delta`, not this counter.
+        if entered_frame || helper_kind_writes_live_heap(helper) {
+            fbw_bump_heap_writing_effect("residual");
+        }
     } else if helper == majit_ir::RuntimeHelperKind::ForIterNext && !for_iter_journaled {
         // Unjournaled `__next__` does not write through `writes_live_heap` and
         // a dict/set/itertools iterator enters no user frame, so the arm above
         // would not see it.  The odometer is what `fbw_decline_inline_callee`
         // and the bridge drain consult before `try_adopt_blackhole`.
         fbw_bump_executed_effect("residual");
+        fbw_bump_heap_writing_effect("residual");
     }
     match exec_result {
         Ok(mut result_i64) => {
@@ -9241,12 +9250,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // parity suite folding function-entry helper appends on both backends.
     // Inside an inlined callee the same descent runs only when
     // `walker_inline_guard_resumes_in_callee` holds.  `w_list_append_inner`
-    // is a transparent helper: `walker_capture_transparent_helper_snapshot`
-    // resumes at the paused Python CALL from
-    // `compute_inline_helper_call_entry_frame`, so a guard re-executes that
-    // call rather than the caller's earlier stores.  A shorter parent chain
-    // still collapses onto `entry_py_pc` / `outer_active_boxes` and stays on
-    // the residual, whose resume is past the call.
+    // is a transparent helper: a complete parent chain numbers the paused
+    // Python CALL (`in_a_call`) plus the helper section at the guard
+    // (`capture_resumedata`). A shorter parent chain still collapses onto
+    // `entry_py_pc` / `outer_active_boxes` and stays on the residual, whose
+    // resume is past the call.
     // #171 ORTHODOX descent: descend the real `w_list_append` body,
     // recording its array ops native.
     // A recognition or body-sub-walk decline falls through to the generic

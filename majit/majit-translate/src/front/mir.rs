@@ -25403,6 +25403,16 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `prebuilt_str_storage(&'static str)` is the literal's prebuilt
+                // `STR` (`StringRepr.convert_const`), which the `&str` operand
+                // already is.
+                if args.len() == 1 && self.is_prebuilt_str_storage_identity(&reg) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), false);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `w_str_storage` is the same `_utf8` payload (`rstr.py` `STR`).
                 // Pin-free tuple eq compares two of these with `ll_streq`.
                 if args.len() == 1 && self.is_w_str_storage(&reg) {
@@ -35428,6 +35438,18 @@ impl<'a> Lowering<'a> {
             return false;
         };
         fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_wtf8")
+    }
+
+    /// `prebuilt_str_storage(&'static str) -> *mut UnicodeValueStorage` — the
+    /// prebuilt rstr `STR` of a literal, the value its `&str` already lowers to.
+    fn is_prebuilt_str_storage_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path() == "pyre_object::unicodeobject::prebuilt_str_storage"
     }
 
     /// `utf8_payload_bytes(*const UnicodeValueStorage) -> &[u8]` — byte view

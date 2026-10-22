@@ -89,7 +89,11 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
         }
     }
     for frame in &mut session.framestack {
-        for parent in &mut frame.parents {
+        let call_entry = match &mut frame.helper_call_entry {
+            HelperCallEntry::Frame(entry) => Some(entry),
+            HelperCallEntry::Unavailable | HelperCallEntry::CallerBoundary => None,
+        };
+        for parent in frame.parents.iter_mut().chain(call_entry) {
             replace_slots(&mut parent.boxes, oldbox, newbox);
             if let Some(state) = parent.frame_state.as_ref() {
                 state.replace_active_box(oldbox, newbox);
@@ -241,6 +245,11 @@ mod frame_replacement_tests {
                 result_slot: CallResultSlot::Unknown,
             }],
             entry_executed_effects: 0,
+            entry_heap_writing_effects: 0,
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume: HelperResume::Section,
+            helper_call_entry: HelperCallEntry::Unavailable,
+            helper_entry_array_len: None,
             live: None,
         });
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, middle);
@@ -398,6 +407,11 @@ mod frame_replacement_tests {
                 result_slot: CallResultSlot::Unknown,
             }],
             entry_executed_effects: 0,
+            entry_heap_writing_effects: 0,
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume: HelperResume::Section,
+            helper_call_entry: HelperCallEntry::Unavailable,
+            helper_entry_array_len: None,
             live: None,
         });
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);

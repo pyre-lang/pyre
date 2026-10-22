@@ -394,12 +394,19 @@ pub fn w_str_new_managed(s: &str) -> PyObjectRef {
 /// is shared and only the exact `W_UnicodeObject` wrapper is newly allocated,
 /// just as `space.newutf8(stringval, len(stringval))` does upstream.
 ///
-/// Look-inside: the length word, then [`w_str_from_storage_and_length`].
-/// The list-iterator residual calls [`jit_w_str_from_storage`] instead.
+/// Look-inside: `len(stringval)` read as `strlen`, then
+/// [`w_str_from_storage_and_length`]. The list-iterator residual calls
+/// [`jit_w_str_from_storage`] instead.
 pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
     // AsciiListStrategy accepts only `is_ascii()` values, for which the byte
-    // length and code-point length are identical (`len(_utf8)`).
-    let len = crate::lowlevel_string::bh_lowlevel_string_len(value as i64);
+    // length and code-point length are identical (`len(_utf8)`). Read it
+    // through the byte view, as `w_str_from_storage_and_length` does, so the
+    // body records `strlen` instead of casting the GC pointer to an integer.
+    let len = if value.is_null() {
+        0
+    } else {
+        unsafe { utf8_payload_bytes(value) }.len()
+    };
     w_str_from_storage_and_length(value, len)
 }
 
@@ -1154,6 +1161,16 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     // convert_const shape: pyre roots by hand and has no get_livevars_for_roots
     // insertion. Convergence is gctransformer root insertion, then newtext.
     intern_publish_const(w_str_from_wtf8_immortal(value.to_owned()), true)
+}
+
+/// The prebuilt rstr `STR` of a string literal (`StringRepr.convert_const`):
+/// the immortal storage of [`box_str_constant`], which is also what the JIT
+/// materializes for the literal's `__str_const`. The front end aliases the
+/// result to that `STR` operand, so a traced caller reads the constant
+/// without a call.
+#[majit_macros::dont_look_inside]
+pub fn prebuilt_str_storage(value: &'static str) -> *mut UnicodeValueStorage {
+    unsafe { w_str_storage(box_str_constant(Wtf8::new(value))) }
 }
 
 /// Kind of a `box_str_constant` residual operand.

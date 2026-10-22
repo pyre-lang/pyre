@@ -605,9 +605,91 @@ pub struct InlineFrame {
     /// level and its descendants did, so it is only sound while the odometer
     /// has not moved since.
     pub entry_executed_effects: usize,
+    /// [`FBW_HEAP_WRITING_EFFECT_COUNT`] when this level was entered. A
+    /// CALL-entry fallback re-runs the helper, so it is refused once this
+    /// odometer has moved — those residuals are not journaled.
+    pub(crate) entry_heap_writing_effects: usize,
+    /// The effect journals' lengths when this level was entered. The
+    /// journaled part of the odometer's movement since then is a live-heap
+    /// mutation a re-run of the CALL would apply twice.
+    pub(crate) entry_journal_mark: FbwEffectJournalMark,
+    /// How a guard inside this transparent helper level (`w_code == 0`)
+    /// resumes. Python levels ignore it.
+    pub helper_resume: HelperResume,
+    /// Where a guard inside this numbered helper level, the outermost of its
+    /// chain, resumes when the blackhole cannot run the helper sections.
+    pub(crate) helper_call_entry: HelperCallEntry,
+    /// Length of the argument array this helper level was entered with, when
+    /// the call site knows it.
+    pub(crate) helper_entry_array_len: Option<usize>,
     /// This level's own `MIFrame.registers_*` while a descendant (a helper
     /// sub-walk) is running. `None` until a child pauses this frame.
     live: Option<LiveFrameRegs>,
+}
+
+/// How the guards of a transparent helper level resume.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HelperResume {
+    /// The helper is its own resume section: `parents` ends with its caller
+    /// paused past the call (`get_list_of_active_boxes(in_a_call=True)`), and
+    /// `capture_resumedata` numbers the helper after it.
+    #[default]
+    Section,
+    /// `parents` ends with the Python caller at the CALL's entry, so a guard
+    /// re-runs the whole call. Used when the walk converts the helper's
+    /// return before it becomes the call's result: no `MIFrame` holds that
+    /// conversion, so the helper cannot resume on its own.
+    CallEntry,
+    /// The helper sits under a numbered level but has no section of its own.
+    /// A guard here has no resume and is refused.
+    Unresumable,
+}
+
+/// The CALL-entry resume of a numbered helper chain, used by a guard whose
+/// helper sections can reach a residual call the blackhole cannot resolve
+/// ([`inline_call::helper_resume_reaches_blocker`]). Resuming there re-runs
+/// the call, so it is refused once a heap-writing residual has executed
+/// (`InlineFrame::entry_heap_writing_effects`) or a journaled effect has
+/// executed since the helper level was entered
+/// (`InlineFrame::entry_journal_mark`).
+#[derive(Clone, Default)]
+pub(crate) enum HelperCallEntry {
+    /// No CALL-entry resume exists; such a guard is refused.
+    #[default]
+    Unavailable,
+    /// The root portal's CALL boundary.
+    CallerBoundary,
+    /// The inlined Python caller at the CALL's entry.
+    Frame(InlineParentFrame),
+}
+
+/// Whether a descended helper's return is the result of the call op that
+/// entered it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HelperReturn {
+    /// The call's result register receives the helper's return unchanged,
+    /// so the paused caller resumes past the call and
+    /// `_setup_return_value_*` (`blackhole.py`) fills that register.
+    #[default]
+    CallResult,
+    /// The walk converts the return, or runs more code after the helper,
+    /// before the call's result exists. The caller resumes at the CALL entry.
+    Converted,
+}
+
+/// The shape of the transparent helper levels above the innermost Python
+/// frame on `framestack`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HelperChain {
+    /// The innermost level is not a helper.
+    NoHelper,
+    /// Every helper level is its own section after a caller paused past
+    /// its call: a guard numbers them all.
+    Numbered,
+    /// No helper level has a section: guards resume at a Python CALL entry.
+    Collapsed,
+    /// A numbered level sits below one without a section.
+    Unresumable,
 }
 
 impl InlineFrame {
@@ -622,8 +704,21 @@ impl InlineFrame {
             debug_merge_point_py_pc: None,
             parents: Vec::new(),
             entry_executed_effects: 0,
+            entry_heap_writing_effects: 0,
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume: HelperResume::Section,
+            helper_call_entry: HelperCallEntry::Unavailable,
+            helper_entry_array_len: None,
             live: None,
         }
+    }
+
+    fn is_helper_level(&self) -> bool {
+        !self.is_portal && self.w_code == 0
+    }
+
+    fn is_numbered_helper_level(&self) -> bool {
+        self.helper_resume == HelperResume::Section && !self.parents.is_empty()
     }
 
     /// Register banks saved when a descendant paused this Python frame.
@@ -696,13 +791,20 @@ pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
 
-    /// Paused transparent-helper `SubWalkFrame` banks. Helpers are not
-    /// Python `MIFrame`s and must not sit on `framestack`.
+    /// Live register banks of helper `SubWalkFrame`s the explicit driver
+    /// currently owns. `MetaInterp.replace_box` writes these in place.
+    /// Each helper also has a `w_code == 0` `InlineFrame` on `framestack`
+    /// while it is walking or paused under a nested helper
+    /// (`capture_resumedata` numbers that `MIFrame`).
     pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// Inlined callee levels. Parent snapshots are outermost-first, matching
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
     /// when the callee sub-walk returns.
     pub framestack: Vec<InlineFrame>,
+    /// Helper level the nested sub-walk computed, held while the explicit
+    /// driver is active so `walk_session_roots` forwards its parent
+    /// concretes until `push_frame` publishes it (`MetaInterp.newframe`).
+    pub(crate) pending_helper_level: Option<HelperLevel>,
     /// `MetaInterp.current_call_id`: the root portal owns id 0 and each
     /// subsequently entered Python portal frame consumes the next id.
     pub next_call_id: u64,
@@ -868,6 +970,7 @@ impl Default for WalkSession {
         Self {
             helper_live: Vec::new(),
             framestack: Vec::new(),
+            pending_helper_level: None,
             next_call_id: 1,
             open_inline_activations: 0,
             root_debug_merge_point_py_pc: None,
@@ -954,6 +1057,29 @@ impl WalkSession {
 
     pub(crate) fn last_inline(&self) -> Option<&InlineFrame> {
         self.framestack.iter().rev().find(|frame| !frame.is_portal)
+    }
+
+    /// [`HelperChain`] of the helper levels on top of `framestack`.
+    pub(crate) fn helper_chain(&self) -> HelperChain {
+        let levels = || {
+            self.framestack
+                .iter()
+                .rev()
+                .take_while(|frame| frame.is_helper_level())
+        };
+        if levels().next().is_none() {
+            return HelperChain::NoHelper;
+        }
+        let numbered = levels()
+            .filter(|frame| frame.is_numbered_helper_level())
+            .count();
+        if numbered == 0 {
+            HelperChain::Collapsed
+        } else if numbered == levels().count() {
+            HelperChain::Numbered
+        } else {
+            HelperChain::Unresumable
+        }
     }
 
     pub(crate) fn first_inline(&self) -> Option<&InlineFrame> {
@@ -2133,6 +2259,11 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// `MIFrame.jitcode` (`pyjitpl.py`); abort recovery reads this, then
     /// [`SubJitCodeBody::jitcode_index`], and does not scan by code pointer.
     pub transparent_helper_jitcode_index: Option<usize>,
+    /// Whether the helper this walk is entering returns the result of the
+    /// call op that enters it. A nested helper level built while the
+    /// explicit driver runs reads it (`helper_subwalk_level`); a helper
+    /// sub-walk starts from [`HelperReturn::CallResult`].
+    pub helper_return: HelperReturn,
     /// [`fbw_executed_effect_count`] sampled when the outermost helper in
     /// this stack was entered. Nested helpers inherit it. Abort recovery
     /// uses the whole-walk odometer (`fbw_executed_effect_count`), not a
@@ -2242,6 +2373,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             immediate_inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
+            helper_return: HelperReturn::CallResult,
             transparent_helper_effects_at_entry: None,
             transparent_helper_journal_at_entry: None,
             cell_store_helper_subwalk: false,
@@ -5683,6 +5815,17 @@ pub(crate) fn find_catch_for_exc_resume(code: &[u8], resume_live_pos: usize) -> 
     find_catch_before_resume_live(code, resume_live_pos)
 }
 
+/// `catch_exception` target of a helper jitcode section at `jitcode_pc`.
+/// `None` when the section has no handler, so the exception continues to
+/// the caller (`handle_exception_in_frame` / `_handle_jitexception`).
+pub fn helper_section_catch_target(jitcode_index: i32, jitcode_pc: i32) -> Option<usize> {
+    if jitcode_pc < 0 {
+        return None;
+    }
+    let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+    find_catch_for_exc_resume(pjc.jitcode.code.as_slice(), jitcode_pc as usize)
+}
+
 /// Mirror of `blackhole.rs BlackholeInterpreter::find_catch_before_resume_live`
 /// for the walker.  An after-residual-call exception guard resumes at the
 /// no-exception fallthrough `-live-` (the next opcode after the call); the
@@ -8428,21 +8571,37 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
         visitor(&mut root);
         session.recording_frame_ptr = root.0;
     }
-    for frame in session.framestack.iter_mut() {
-        for parent in frame.parents.iter_mut() {
-            // history.py ConstPtr.value remains reachable through each
-            // paused frame's active boxes, including constructor tails.
-            for value in &mut parent.boxes {
-                value.walk_const_ptr_refs_mut(visitor);
-            }
-            for (_, value) in &mut parent.call_stack_overrides {
+    let mut walk_parent = |parent: &mut InlineParentFrame| {
+        // history.py ConstPtr.value remains reachable through each
+        // paused frame's active boxes, including constructor tails.
+        for value in &mut parent.boxes {
+            value.walk_const_ptr_refs_mut(visitor);
+        }
+        for (_, value) in &mut parent.call_stack_overrides {
+            walk_ptr(value, visitor);
+        }
+        if let Some(blackhole) = parent.blackhole.as_mut() {
+            for (_, value) in &mut blackhole.ref_values {
                 walk_ptr(value, visitor);
             }
-            if let Some(blackhole) = parent.blackhole.as_mut() {
-                for (_, value) in &mut blackhole.ref_values {
-                    walk_ptr(value, visitor);
-                }
-            }
+        }
+    };
+    for frame in session.framestack.iter_mut() {
+        let call_entry = match &mut frame.helper_call_entry {
+            HelperCallEntry::Frame(entry) => Some(entry),
+            HelperCallEntry::Unavailable | HelperCallEntry::CallerBoundary => None,
+        };
+        for parent in frame.parents.iter_mut().chain(call_entry) {
+            walk_parent(parent);
+        }
+    }
+    if let Some(level) = session.pending_helper_level.as_mut() {
+        let call_entry = match &mut level.call_entry {
+            HelperCallEntry::Frame(entry) => Some(entry),
+            HelperCallEntry::Unavailable | HelperCallEntry::CallerBoundary => None,
+        };
+        for parent in level.parents.iter_mut().chain(call_entry) {
+            walk_parent(parent);
         }
     }
 }
@@ -8453,6 +8612,39 @@ impl<'a> InlineFrameGuard<'a> {
         w_code: usize,
         recursion_greenkey: bool,
         parents: Vec<InlineParentFrame>,
+    ) -> Self {
+        Self::enter_with_resume(
+            session,
+            w_code,
+            recursion_greenkey,
+            parents,
+            HelperResume::Section,
+            HelperCallEntry::Unavailable,
+            None,
+        )
+    }
+
+    /// Push a transparent helper level (`w_code == 0`).
+    fn enter_helper(session: &'a std::cell::RefCell<WalkSession>, level: HelperLevel) -> Self {
+        Self::enter_with_resume(
+            session,
+            0,
+            false,
+            level.parents,
+            level.resume,
+            level.call_entry,
+            level.entry_array_len,
+        )
+    }
+
+    fn enter_with_resume(
+        session: &'a std::cell::RefCell<WalkSession>,
+        w_code: usize,
+        recursion_greenkey: bool,
+        parents: Vec<InlineParentFrame>,
+        helper_resume: HelperResume,
+        helper_call_entry: HelperCallEntry,
+        helper_entry_array_len: Option<usize>,
     ) -> Self {
         let mut walk = session.borrow_mut();
         let call_id = if w_code == 0 {
@@ -8470,6 +8662,11 @@ impl<'a> InlineFrameGuard<'a> {
             debug_merge_point_py_pc: None,
             parents,
             entry_executed_effects: fbw_executed_effect_count(),
+            entry_heap_writing_effects: fbw_heap_writing_effect_count(),
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume,
+            helper_call_entry,
+            helper_entry_array_len,
             live: None,
         });
         drop(walk);
@@ -8835,6 +9032,15 @@ thread_local! {
     /// CALL.  A nonzero count delta means the callee attempt cannot be
     /// discarded and re-executed without risking a double.
     static FBW_EXECUTED_EFFECT_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    /// Heap-writing / frame-entering residual odometer. Bumped only when a
+    /// completed residual writes the live heap, enters a user frame, or
+    /// runs an unjournaled `ForIterNext`. Allocation-only residuals still
+    /// move [`FBW_EXECUTED_EFFECT_COUNT`] and must not move this one: the
+    /// CALL-entry fallback re-runs those without a double apply
+    /// (`cffi_lib_attr_cell`).
+    static FBW_HEAP_WRITING_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
     /// `ABORT_FORCE_QUASIIMMUT` resume carrier: `(py_pc, operand-stack OpRef

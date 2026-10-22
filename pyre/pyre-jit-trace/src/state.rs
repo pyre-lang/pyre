@@ -1180,6 +1180,16 @@ pub fn pyjitcode_for_jitcode_index(jitcode_index: i32) -> Option<std::sync::Arc<
     jitcode_payload_at(jitcode_index)
 }
 
+/// A descended helper body (`list.pop`, `w_list_append`, …) with no Python
+/// `CodeObject`. Operator / ctor continuations are also `code_ptr` null but
+/// already resume as a Python-pc bridge (`is_installed_level`); those stay
+/// off this predicate so `handle_guard_failure` can still compile them.
+pub fn jitcode_is_transparent_helper(jitcode_index: i32) -> bool {
+    pyjitcode_for_jitcode_index(jitcode_index).is_some_and(|pjc| pjc.code_ptr.is_null())
+        && !crate::operator_continuation::is_installed_level(jitcode_index)
+        && !crate::ctor_continuation::is_installed_level(jitcode_index)
+}
+
 /// `PyFrame.frame_finished_execution = True` for a blackhole level that has
 /// left its caller.
 ///
@@ -8462,6 +8472,174 @@ fn overlay_stream_ref_slots(
     }
 }
 
+/// Live boxes of a helper recipe in bank order (`get_list_of_active_boxes`).
+/// The int/float/ref banks stay color-indexed; this flattens them to the
+/// resume-section order `frame_value_count_at` counts.
+pub(crate) fn recipe_live_boxes(recipe: &ReconstructRecipe) -> Vec<OpRef> {
+    let idx = frame_liveness_reg_indices_by_bank_from_pc(recipe.jitcode_index, recipe.jitcode_pc);
+    let mut boxes = Vec::with_capacity(idx.total_len());
+    for &color in &idx.int {
+        boxes.push(
+            recipe
+                .registers_i
+                .get(color as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    for &color in &idx.ref_ {
+        boxes.push(
+            recipe
+                .registers_r
+                .get(color as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    for &color in &idx.float {
+        boxes.push(
+            recipe
+                .registers_f
+                .get(color as usize)
+                .copied()
+                .unwrap_or(OpRef::NONE),
+        );
+    }
+    boxes
+}
+
+/// A descended helper body (`list.pop`, `w_list_getitem`, …) is a real
+/// `MIFrame` (`capture_resumedata`). Rebuild its color-indexed banks from
+/// the numbered section so the carrier can walk that jitcode from the
+/// guard (`blackhole.py` `_resume_mainloop`).
+fn reconstruct_transparent_helper_recipe(
+    ctx: &mut majit_metainterp::TraceCtx,
+    frame: &majit_ir::resumedata::RebuiltFrame,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
+    cache: &mut BridgeVirtualCache<'_>,
+    in_a_call: bool,
+) -> Option<ReconstructRecipe> {
+    macro_rules! decline {
+        ($class:literal) => {{
+            crate::jitcode_dispatch::census_record(concat!("P2Recipe::", $class));
+            return None;
+        }};
+    }
+    if frame.pc < 0 {
+        decline!("NoSnapshotPc");
+    }
+    // `get_list_of_active_boxes(in_a_call=True)` keeps the dest in the
+    // list and writes NULL/0 there. Decode that box into its color so
+    // `_setup_return_value_*` can overwrite it. A paused caller whose
+    // resume pc is not a call has no dest to fill.
+    if in_a_call {
+        let Some(pc) = usize::try_from(frame.pc).ok() else {
+            decline!("NoPendingResultColor");
+        };
+        let Some(p) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
+            decline!("NoPendingResultColor");
+        };
+        use crate::jitcode_dispatch::CallResultRegister;
+        if matches!(
+            crate::jitcode_dispatch::call_result_register_in(p.jitcode.code.as_slice(), pc),
+            CallResultRegister::Unknown
+        ) {
+            decline!("NoPendingResultColor");
+        }
+    }
+    let reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
+    if reg_indices.total_len() != frame.values.len() {
+        decline!("LivenessValueCountMismatch");
+    }
+    let int_len = reg_indices.int.len();
+    let mut registers_i: Vec<OpRef> = Vec::new();
+    for (pos, &reg_idx) in reg_indices.int.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            &frame.values[pos],
+            Type::Int,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_i.len() {
+            registers_i.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_i[reg_idx] = op;
+    }
+    let mut registers_r: Vec<OpRef> = Vec::new();
+    let ref_base = int_len;
+    for (pos, &reg_idx) in reg_indices.ref_.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            &frame.values[ref_base + pos],
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        if op.is_none() {
+            decline!("HelperRefBox");
+        }
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_r.len() {
+            registers_r.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_r[reg_idx] = op;
+    }
+    let mut registers_f: Vec<OpRef> = Vec::new();
+    let float_base = int_len + reg_indices.ref_.len();
+    for (pos, &reg_idx) in reg_indices.float.iter().enumerate() {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            &frame.values[float_base + pos],
+            Type::Float,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(op, val);
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= registers_f.len() {
+            registers_f.resize(reg_idx + 1, OpRef::NONE);
+        }
+        registers_f[reg_idx] = op;
+    }
+    Some(ReconstructRecipe {
+        code_ptr: std::ptr::null(),
+        jitcode_index: frame.jitcode_index,
+        jitcode_pc: frame.pc,
+        nlocals: 0,
+        valuestackdepth: 0,
+        registers_i,
+        registers_r,
+        registers_f,
+        concrete_r: Vec::new(),
+        frame: OpRef::NONE,
+        nargs: 0,
+        return_substitute: None,
+        len_tail: false,
+        rebuilt_frame: None,
+        rebuilt_ec: None,
+    })
+}
+
 /// Decode one suspended inline-callee frame's resume section into a
 /// [`ReconstructRecipe`], or `None` to decline the multi-frame inline rebuild.
 ///
@@ -8599,6 +8777,19 @@ fn reconstruct_inline_recipe(
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
+    }
+    if jitcode_is_transparent_helper(frame.jitcode_index) {
+        return reconstruct_transparent_helper_recipe(
+            ctx,
+            frame,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+            in_a_call,
+        );
     }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;

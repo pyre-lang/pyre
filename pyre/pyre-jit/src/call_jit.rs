@@ -1588,6 +1588,10 @@ pub struct ResumedFrame {
     /// is the raw, pre-adjustment value (before any Cache / ExtendedArg /
     /// NotTaken backtracking).
     pub py_pc: usize,
+    /// `resume.py` jitcode_pos / pc for this section. A helper body has
+    /// `code == null` and `py_pc == usize::MAX`; catch lookup uses these.
+    pub jitcode_index: i32,
+    pub jitcode_pc: i32,
     /// Raw frame.pc from rd_numb (= orgpc from snapshot).
     /// Some(pc): snapshot guard — orgpc known, liveness-based filling.
     ///   pc=0 is valid (function start / loop header at bytecode 0).
@@ -2856,7 +2860,17 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 return None;
             }
         };
-        if pyjitcode.has_abort_opcode() {
+        // Python jitcodes with `abort()` cannot be blackhole-dispatched
+        // (`has_abort` is pyre-only). A helper body still carries `abort()`
+        // on unlowered branches; `blackhole.py` `_resume_mainloop` runs that
+        // jitcode from the guard, and `bhimpl_abort` raises only if reached.
+        // Capture-time `helper_resume_reaches_blocker` treats a reachable
+        // `abort` as a blocker, so a numbered helper section never resumes
+        // at a pc that can reach one. Refusing the whole helper section here
+        // would collapse deopt onto the caller's CALL and re-run the helper.
+        if pyjitcode.has_abort_opcode()
+            && !pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
+        {
             if majit_gc::diag_p92_trace_io() {
                 eprintln!(
                     "P92_RESOLVE fail index={jitcode_index} pc={pc} why=abort name={}",
@@ -3080,14 +3094,16 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // frame red directly. Pyre's blackhole vable handlers address
     // `BlackholeInterpreter::virtualizable_ptr`, so bind that cache from
     // EACH frame's own red. An inlined callee (`nextblackholeinterp` is
-    // the caller) must have its own PyFrame. A codeless continuation
-    // (`ctor_continuation`, `OperatorTail`) is `from_core_degenerate`
-    // and keeps `portal_frame_reg` at `u16::MAX` — `convert_and_run_from_pyjitpl`
+    // the caller) must have its own PyFrame. A helper body and a
+    // codeless continuation (`ctor_continuation`, `OperatorTail`) are
+    // `from_core_degenerate` and keep `portal_frame_reg` at `u16::MAX` —
+    // `convert_and_run_from_pyjitpl`
     // copies that level with no virtualizable. The outermost keeps the
     // jitdriver virtualizable when the red is absent.
     {
         let mut current = Some(&mut *bh);
         let mut frame_index = 0usize;
+        let mut jitdriver_vable = 0i64;
         while let Some(frame) = current {
             let has_caller = frame.nextblackholeinterp.is_some();
             if majit_metainterp::bh_debug_enabled() {
@@ -3127,7 +3143,20 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 };
                 if has_caller {
                     if frame_reg == u16::MAX {
-                        // Codeless continuation: no Python frame red.
+                        // Helper / continuation: no Python frame red. A helper
+                        // body is not a Python frame level: the jitdriver
+                        // virtualizable `consume_vable_info` handed the
+                        // innermost frame belongs to the outermost section,
+                        // and a helper keeping it would close that Python
+                        // frame's execution scope when the helper returns.
+                        if pyre_jit_trace::state::jitcode_is_transparent_helper(
+                            jitcode_index as i32,
+                        ) {
+                            if frame.virtualizable_ptr != 0 {
+                                jitdriver_vable = frame.virtualizable_ptr;
+                            }
+                            frame.virtualizable_ptr = 0;
+                        }
                     } else if own == 0 {
                         panic!(
                             "blackhole inner section jitcode={jitcode_index} \
@@ -3140,6 +3169,8 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                     }
                 } else if own != 0 {
                     frame.virtualizable_ptr = own;
+                } else if frame.virtualizable_ptr == 0 {
+                    frame.virtualizable_ptr = jitdriver_vable;
                 }
             }
             current = frame.nextblackholeinterp.as_deref_mut();
@@ -4019,8 +4050,8 @@ pub fn trace_and_compile_from_bridge(
     // this frame, so a foreign pc left in `last_instr` would step a code
     // object the frame does not run. Keep the vable-derived position instead.
     let frame_code = bridge_frame_root.frame().pycode as usize;
-    let foreign_innermost =
-        is_multiframe_resume && resume_coords.last().map(|&(code, _)| code) != Some(frame_code);
+    let foreign_innermost = is_multiframe_resume
+        && resume_coords.last().map(|&(code, _, _, _)| code) != Some(frame_code);
     if foreign_innermost {
         pyre_jit_trace::jitcode_dispatch::census_record_frame_shape_decline(
             frame_code,
@@ -4031,6 +4062,10 @@ pub fn trace_and_compile_from_bridge(
             .frame()
             .set_last_instr_from_next_instr(resume_pc);
     }
+    // A helper innermost has no Python code object (`py_pc == usize::MAX`).
+    // The carrier drain walks that jitcode from the guard
+    // (`drive_helper_innermost_subwalk`). Reconstruct failure still
+    // leaves an empty carrier (`P2Drain::NoRecipes`) and blackholes.
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(bridge_frame_root.frame()) };
     let env = PyreEnv;
     let mut jit_state = build_jit_state(bridge_frame_root.frame(), &info);
@@ -4161,10 +4196,24 @@ pub fn trace_and_compile_from_bridge(
     /// `coords` is outermost-first, so `Some(0)` means the raise unwinds clear
     /// out of every inlined callee into the live frame; `None` means it
     /// escapes them all.
-    fn resumed_catch_level(coords: &[(usize, usize)]) -> Option<usize> {
-        for (level, &(w_code, py_pc)) in coords.iter().enumerate().rev() {
+    fn resumed_catch_level(coords: &[(usize, usize, i32, i32)]) -> Option<usize> {
+        for (level, &(w_code, py_pc, jitcode_index, jitcode_pc)) in coords.iter().enumerate().rev()
+        {
             if w_code == 0 {
-                return None;
+                // Helper section: consult that jitcode's `catch_exception`
+                // at the section pc (`handle_exception_in_frame`). A
+                // continuation with no helper jitcode keeps walking to the
+                // Python ancestor (`finishframe_exception`).
+                if pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
+                    && pyre_jit_trace::jitcode_dispatch::helper_section_catch_target(
+                        jitcode_index,
+                        jitcode_pc,
+                    )
+                    .is_some()
+                {
+                    return Some(level);
+                }
+                continue;
             }
             let raw = unsafe {
                 pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -4223,16 +4272,21 @@ pub fn trace_and_compile_from_bridge(
         && caught_in_frame
         && resume_coords
             .first()
-            .is_some_and(|&(outer_w_code, _)| outer_w_code == frame_pycode);
+            .is_some_and(|&(outer_w_code, _, _, _)| outer_w_code == frame_pycode);
     let route_exc_edge = catch_level.is_some();
     // Discard inlined levels only when the raise unwinds *to* the live
     // frame.  A catch inside a callee still needs those levels as the
     // carrier recipes.
-    pyre_jit_trace::jitcode_dispatch::set_exc_edge_discarded_levels(if unwind_to_live_frame {
-        resume_coords.get(1..).unwrap_or(&[])
+    let discarded_levels: Vec<(usize, usize)> = if unwind_to_live_frame {
+        resume_coords
+            .iter()
+            .skip(1)
+            .map(|&(w_code, py_pc, _, _)| (w_code, py_pc))
+            .collect()
     } else {
-        &[]
-    });
+        Vec::new()
+    };
+    pyre_jit_trace::jitcode_dispatch::set_exc_edge_discarded_levels(&discarded_levels);
     if route_exc_edge && guard_exc != 0 {
         // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
         // walker's `seed_standing_exception_for_walk` threads it into
@@ -4315,7 +4369,7 @@ pub fn trace_and_compile_from_bridge(
     // interpreter should resume at.  Only reachable where this function used
     // to decline outright, so no existing resume changes shape.
     let resume_pc = match resume_coords.first() {
-        Some(&(outer_w_code, outer_py_pc)) if unwind_to_live_frame => {
+        Some(&(outer_w_code, outer_py_pc, _, _)) if unwind_to_live_frame => {
             bridge_frame_root
                 .frame()
                 .set_last_instr_from_next_instr(outer_py_pc);
@@ -8864,7 +8918,13 @@ pub fn cranelift_resumedata_deopt(
             return None;
         }
         let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-        if pyjitcode.has_abort_opcode() {
+        // Capture-time `helper_resume_reaches_blocker` treats a reachable
+        // `abort` as a blocker, so a numbered helper section never resumes
+        // at a pc that can reach one. Refusing the whole helper section here
+        // would collapse deopt onto the caller's CALL and re-run the helper.
+        if pyjitcode.has_abort_opcode()
+            && !pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
+        {
             return None;
         }
         let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {

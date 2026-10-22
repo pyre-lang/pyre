@@ -1104,6 +1104,68 @@ fn descent_decline(
     summary.blocker_after_effect.map(DescentDecline::Helper)
 }
 
+/// Whether the blackhole, resuming the helper body `jitcode_index` at `pc`,
+/// can reach a residual call whose funcbox is a symbolic placeholder, an
+/// `abort` opcode (`bhimpl_abort`), or a region the scan cannot read.
+///
+/// `reject_unresolved_call` bails at such a call, and a helper section has no
+/// Python coordinate the interpreter could continue from, so a guard whose
+/// helper sections can reach one cannot be numbered. The scan runs from the
+/// body's entry with the facts the descent scan proves there
+/// (`entry_array_len`, the length of a gateway's argument array), so an arm
+/// those facts exclude on every path to `pc` is not counted. Callees named
+/// by `inline_call_*` past `pc` count with their whole-body summary.
+pub(crate) fn helper_resume_reaches_blocker(
+    jitcode_index: usize,
+    pc: usize,
+    entry_array_len: Option<usize>,
+) -> bool {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return true;
+    };
+    let scan = || {
+        let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
+            return true;
+        };
+        let descrs = crate::jitcode_runtime::descr_ref_table();
+        let entry_array_lengths: Vec<(usize, usize)> =
+            entry_array_len.map(|len| (0, len)).into_iter().collect();
+        let summary = summarize_body_blockers_from(
+            Some(pc),
+            jitcode.code.as_slice(),
+            jitcode.num_regs_i(),
+            jitcode.constants_i.as_slice(),
+            |descr_index, _caller_effect| {
+                descrs
+                    .at(descr_index)
+                    .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+                    .map(descent_blocker_summary)
+            },
+            &mut |_blocker, _effect| true,
+            &mut residual_call_is_effect_free,
+            &mut switch_descr_targets,
+            &entry_array_lengths,
+        );
+        summary.body_not_walked
+            || summary.blocker_effect_free.is_some()
+            || summary.blocker_after_effect.is_some()
+    };
+    // Only the entry without argument-array facts is memoized per pc; a
+    // gateway's answer depends on the call site's argument count.
+    if entry_array_len.is_some() {
+        return scan();
+    }
+    let memo = pjc.helper_resume_blockers.get_or_init(|| {
+        (0..pjc.jitcode.code.len())
+            .map(|_| std::cell::OnceCell::new())
+            .collect()
+    });
+    match memo.get(pc) {
+        Some(slot) => *slot.get_or_init(scan),
+        None => true,
+    }
+}
+
 /// Why a descent into a body is refused.
 enum DescentDecline {
     /// An un-lowered helper the descent reaches with an effect already
@@ -1426,6 +1488,9 @@ pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSum
 /// goes true to false — so the worklist converges.
 #[derive(Clone)]
 struct DescentPoint {
+    /// Whether some path to here passed the resume point a resume scan asks
+    /// about; always set for a scan without one.
+    resumed: bool,
     /// Whether some path from the body entry to here executed an effect.
     effect: bool,
     /// What each Int-bank slot is known to hold, in the same encoding
@@ -1920,6 +1985,36 @@ pub(crate) fn summarize_body_blockers_with(
     code: &[u8],
     num_regs_i: usize,
     constants_i: &[i64],
+    callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
+    on_blocker: &mut dyn FnMut(i64, bool) -> bool,
+    call_effect_free: &mut dyn FnMut(usize) -> bool,
+    switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
+    entry_array_lengths: &[(usize, usize)],
+) -> DescentBlockerSummary {
+    summarize_body_blockers_from(
+        None,
+        code,
+        num_regs_i,
+        constants_i,
+        callee_summary,
+        on_blocker,
+        call_effect_free,
+        switch_targets,
+        entry_array_lengths,
+    )
+}
+
+/// [`summarize_body_blockers_with`], or with `resume_pc` the blockers a
+/// resume at that instruction start can reach: the dataflow still starts at
+/// the body's entry, so the facts proven on every path to `resume_pc` hold
+/// there, but only ops reached through `resume_pc` report a blocker. A
+/// `resume_pc` the dataflow never reaches reports the body as not walked.
+#[allow(clippy::too_many_arguments)]
+fn summarize_body_blockers_from(
+    resume_pc: Option<usize>,
+    code: &[u8],
+    num_regs_i: usize,
+    constants_i: &[i64],
     mut callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
     on_blocker: &mut dyn FnMut(i64, bool) -> bool,
     call_effect_free: &mut dyn FnMut(usize) -> bool,
@@ -1971,11 +2066,15 @@ pub(crate) fn summarize_body_blockers_with(
             *value = Some(len);
         }
     }
+    if resume_pc.is_some_and(|pc| starts.binary_search(&pc).is_err()) {
+        return body_not_walked();
+    }
     let mut points: std::collections::HashMap<usize, DescentPoint> =
         std::collections::HashMap::new();
     points.insert(
         0,
         DescentPoint {
+            resumed: resume_pc.is_none(),
             effect: false,
             known_i: entry_known,
             known_array_len_r: entry_array_len_r,
@@ -1998,6 +2097,10 @@ pub(crate) fn summarize_body_blockers_with(
                     }
                     Some(existing) => {
                         let mut widened = false;
+                        if state.resumed && !existing.resumed {
+                            existing.resumed = true;
+                            widened = true;
+                        }
                         if state.effect && !existing.effect {
                             existing.effect = true;
                             widened = true;
@@ -2044,6 +2147,7 @@ pub(crate) fn summarize_body_blockers_with(
             summary.body_not_walked = true;
             continue;
         };
+        let resumed = point.resumed || resume_pc == Some(pc);
         let mut effect = point.effect;
         let mut known_i = point.known_i;
         let mut known_array_len_r = point.known_array_len_r;
@@ -2053,7 +2157,8 @@ pub(crate) fn summarize_body_blockers_with(
             // Every `residual_call_*` argcode string opens with the `i` funcbox
             // operand, so it is the byte right after the opcode.
             let funcbox = code.get(d.pc + 1).copied().unwrap_or(0) as usize;
-            if let Some(Some(fnaddr)) = known_i.get(funcbox)
+            if resumed
+                && let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_jitcode::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
                 let slot = if effect {
@@ -2072,7 +2177,16 @@ pub(crate) fn summarize_body_blockers_with(
             // index into the descriptor pool, naming the callee JitCode.
             let descr_index = code.get(d.pc + 1).copied().unwrap_or(0) as usize
                 | ((code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
-            if let Some(callee) = callee_summary(descr_index, effect) {
+            if !resumed {
+                // A callee entered before the resume point already ran in the
+                // trace; its section, if any, is counted on its own.
+                if callee_summary(descr_index, effect)
+                    .is_some_and(|callee| callee.may_execute_effect)
+                {
+                    effect = true;
+                    summary.first_effect_pc.get_or_insert(d.pc);
+                }
+            } else if let Some(callee) = callee_summary(descr_index, effect) {
                 // Entering with an effect behind us turns every blocker the
                 // callee holds into one that cannot be rewound.
                 let after = if effect {
@@ -2210,6 +2324,7 @@ pub(crate) fn summarize_body_blockers_with(
         }
 
         let state = DescentPoint {
+            resumed,
             effect,
             known_i: known_i.clone(),
             known_array_len_r: known_array_len_r.clone(),
@@ -2219,6 +2334,22 @@ pub(crate) fn summarize_body_blockers_with(
         match d.opname {
             // Frame exits: the walk leaves this body here.
             "ref_return" | "int_return" | "float_return" | "void_return" => {}
+            // `bhimpl_abort` cannot finish a helper section. Capture-time
+            // resume (`helper_resume_reaches_blocker`) treats a reachable
+            // `abort` as a blocker so the guard takes the CALL-entry fallback
+            // instead of numbering a section that cannot complete. The
+            // whole-body descent scan (`resume_pc` absent) still falls through
+            // so its blocker set is unchanged.
+            "abort" if resume_pc.is_some() => {
+                if resumed {
+                    let slot = if effect {
+                        &mut summary.blocker_after_effect
+                    } else {
+                        &mut summary.blocker_effect_free
+                    };
+                    slot.get_or_insert(0);
+                }
+            }
             // A raise leaves the body only when nothing in it catches.
             // `finishframe_lookahead_at` skips a `live/` and takes the
             // `catch_exception/L` that follows, so the handler edge of a caught
@@ -2241,6 +2372,9 @@ pub(crate) fn summarize_body_blockers_with(
                         work,
                         target,
                         DescentPoint {
+                            // A handler is entered from any op in its region,
+                            // so it may run after the resume point.
+                            resumed: true,
                             effect: true,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
@@ -2280,6 +2414,9 @@ pub(crate) fn summarize_body_blockers_with(
                         work,
                         target,
                         DescentPoint {
+                            // A handler is entered from any op in its region,
+                            // so it may run after the resume point.
+                            resumed: true,
                             effect: true,
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
@@ -2341,6 +2478,9 @@ pub(crate) fn summarize_body_blockers_with(
         }
     }
 
+    if resume_pc.is_some_and(|pc| !points.contains_key(&pc)) {
+        summary.body_not_walked = true;
+    }
     summary
 }
 
@@ -6272,17 +6412,30 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         builtin_inline_decline!(decline, fnaddr);
         return Ok(None);
     }
-    let Some(site) = capture_builtin_wrapper_call_site(
+    // `typeobject.py descr_call` runs `__init__` after `__new__` returns, so
+    // the wrapper's return is not the CALL's result yet.
+    let helper_return = if type_call_init.is_some() {
+        HelperReturn::Converted
+    } else {
+        HelperReturn::CallResult
+    };
+    let Some(mut site) = capture_builtin_wrapper_call_site(
         ctx,
         op,
         callable,
         callable_operand,
         fnaddr,
+        helper_return,
         "builtin_call",
         "builtin_wrapper_call_site",
     ) else {
         return Ok(None);
     };
+    // The descent scan above proved its facts for this argument count; a
+    // guard's resume scan proves them the same way.
+    if let Some(level) = site.nested_helper_entry.as_mut() {
+        level.entry_array_len = Some(wrapper_item_count);
+    }
     // Rewind point for the un-lowered-helper decline below.  Nothing above
     // this line records IR or touches the heap cache, so cutting back to it
     // leaves the caller's trace exactly as the ordinary residual call found it.
@@ -6476,7 +6629,8 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
 /// type pin.  The walk itself is [`walk_translated_builtin_wrapper`].
 struct BuiltinWrapperCallSite {
     nested_helper: bool,
-    nested_helper_entry: Option<InlineParentFrame>,
+    helper_return: HelperReturn,
+    nested_helper_entry: Option<HelperLevel>,
     call_site_py_pc: u32,
     vsd_value: i64,
     outer_jitcode_index: u32,
@@ -6502,39 +6656,18 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     callable: pyre_object::PyObjectRef,
     callable_operand: pyre_object::PyObjectRef,
     fnaddr: usize,
+    helper_return: HelperReturn,
     twin_tag: &'static str,
     active_tag: &'static str,
 ) -> Option<BuiltinWrapperCallSite> {
     let nested_helper = ctx.fbw_mode.inline_subwalk;
-    // A translated helper is transparent to blackhole execution, but its
-    // Python caller is not, so a nested inline preserves that caller at the
-    // helper's CALL entry.
-    //
-    // The root portal frame does NOT get the same treatment.  Pushing an entry
-    // frame there makes `parent_frames` non-empty, which is exactly the
-    // precondition `walker_capture_transparent_helper_snapshot` needs, so
-    // root-level helper guards start emitting a two-section snapshot whose
-    // innermost section is the helper JitCode with the no-Python-coordinate
-    // `py_pc`.  pyre's resume chain is Python-level: `build_resumed_frames`
-    // (`pyre-jit/src/eval.rs`) turns each section into a `ResumedFrame` and has
-    // nothing that executes a JitCode section, so the helper section decodes to
-    // a null `code`, borrows the caller's `vable_ni`, and — by making
-    // `resumed_frames.len() > 1` — reroutes the guard onto the multi-frame
-    // resume, where `resumed_catch_level` bails at the null `code` and the
-    // Python-level values come back wrong (`synth/gc_deque_backing_list`
-    // reported `grow_each_round 987334` against `2966`, and `test.test_pickle`
-    // lost its memo/`struct` round trip).  Keep the root level on the
-    // caller-boundary resume until the resume side can carry a non-Python
-    // section.
-    //
-    // Inside another canonical helper body there is no Python caller to
-    // preserve at this CALL: the enclosing helper already published its own
-    // caller's resume point, and this call inherits it
-    // (`specialize::HelperEntry::EnclosingHelper`).
-    let nested_helper_entry = if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
-        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
-            Ok(frame) => Some(frame),
-            Err(_) => {
+    // The helper level a guard inside the wrapper resumes through
+    // (`helper_subwalk_level`). Nested Python must name the caller or the
+    // descent declines.
+    let nested_helper_entry = match helper_subwalk_level(ctx, op.pc, helper_return) {
+        Ok(level) => level,
+        Err(_) => {
+            if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
                 if fbw_inline_diag_enabled() {
                     let name = if unsafe { pyre_interpreter::is_function(callable) } {
                         unsafe { pyre_interpreter::function_get_name(callable) }
@@ -6552,15 +6685,12 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
                 }
                 return None;
             }
+            None
         }
-    } else {
-        None
     };
-    // Guards inside the generated wrapper must resume at the outer Python
-    // CALL, because helper JitCodes have no blackhole entry point of their
-    // own.  The full-body symbol is the authority for that caller frame's
+    // The full-body symbol is the authority for the Python caller's
     // liveness and resume coordinate (the same setup used by the orthodox
-    // w_list_append descent below).  Resolve it before recording any guards
+    // w_list_append descent below). Resolve it before recording any guards
     // or synthetic allocations so a missing coordinate is a clean decline.
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
@@ -6646,7 +6776,7 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
             }
         }
     };
-    let call_site_active = if nested_helper_entry.is_some() {
+    let call_site_active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
         let call_site_word = call_site_marker
@@ -6670,6 +6800,7 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
     };
     Some(BuiltinWrapperCallSite {
         nested_helper,
+        helper_return,
         nested_helper_entry,
         call_site_py_pc,
         vsd_value,
@@ -6701,6 +6832,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let BuiltinWrapperCallSite {
         nested_helper,
+        helper_return,
         nested_helper_entry,
         call_site_py_pc,
         vsd_value,
@@ -6836,8 +6968,8 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     // `transparent_helper_subwalk` is set by `run_sub_jitcode_walk` on the
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
-    let helper_frame = nested_helper_entry
-        .map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
+    ctx.fbw_mode.helper_return = helper_return;
+    let helper_frame = enter_helper_level(ctx, nested_helper_entry);
     // Bracket the session-wide exception slot around the callee so a NULL
     // return only reads as a raise when the callee installed the exception.
     let exc_before_subwalk = ctx.last_exc_value();
@@ -7169,19 +7301,20 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     }
 
     let nested_helper = ctx.fbw_mode.inline_subwalk;
-    // Same entry rule as `try_walker_inline_builtin_call`: a call from inside
-    // a canonical helper body inherits that helper's resume point.
-    let nested_helper_entry = if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
-        match compute_inline_helper_call_entry_frame(ctx, op.pc) {
-            Ok(frame) => Some(frame),
-            Err(_) => {
+    // Same entry rule as `try_walker_inline_builtin_call`. The CALL's
+    // result is the instance, not `__init__`'s return, so a guard inside
+    // `__init__` resumes at the CALL entry. Nested Python must name the
+    // caller.
+    let nested_helper_entry = match helper_subwalk_level(ctx, op.pc, HelperReturn::Converted) {
+        Ok(level) => level,
+        Err(_) => {
+            if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
                 return Err(super::fbw_state::fbw_decline_inline_callee(
                     ctx, op.pc, None,
                 ));
             }
+            None
         }
-    } else {
-        None
     };
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
@@ -7233,7 +7366,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             }
         }
     };
-    let call_site_active = if nested_helper_entry.is_some() {
+    let call_site_active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
         let call_site_word = call_site_marker
@@ -7340,8 +7473,8 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
-    let helper_frame = nested_helper_entry
-        .map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
+    ctx.fbw_mode.helper_return = HelperReturn::Converted;
+    let helper_frame = enter_helper_level(ctx, nested_helper_entry);
     let exc_before_subwalk = ctx.last_exc_value();
     let walk_result = run_sub_jitcode_walk(
         ctx,
@@ -13166,6 +13299,7 @@ fn try_walker_descend_builtin_getattribute<Sym: WalkSym>(
         callable,
         callable,
         fnaddr,
+        HelperReturn::Converted,
         "builtin_getattribute",
         "builtin_getattribute_call_site",
     ) else {
@@ -18456,6 +18590,11 @@ impl Drop for HelperLiveGuard<'_> {
 
 struct SubWalkFrame<'a, Sym: WalkSym> {
     _helper_live: HelperLiveGuard<'a>,
+    /// Helper level published by [`SubWalkDriver::push_frame`] from
+    /// `WalkSession.pending_helper_level`. Nested `run_sub_jitcode_walk`
+    /// yields `SubWalkSuspended` before the caller's `InlineFrameGuard`
+    /// would otherwise drop; the pending level is the child's `MIFrame`.
+    _inline_frame: Option<InlineFrameGuard<'a>>,
     id: usize,
     caller_pc: usize,
     /// The caller's `last_exc_value` when this frame was pushed.  The slot is
@@ -18750,7 +18889,14 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
     /// Each registration retains the frame's actual shared slots. A `frames`
     /// realloc cannot move those slots, and guard retirement finds its bank
     /// by identity, including when setup and driver registrations overlap.
-    fn push_frame(&mut self, frame: SubWalkFrame<'a, Sym>) {
+    fn push_frame(&mut self, mut frame: SubWalkFrame<'a, Sym>) {
+        let mut level = frame.session.borrow_mut().pending_helper_level.take();
+        if let Some(level) = level.as_mut() {
+            super::resume_snapshot::refresh_helper_level_blackhole(level);
+        }
+        if let Some(level) = level {
+            frame._inline_frame = Some(InlineFrameGuard::enter_helper(frame.session, level));
+        }
         self.frames.push(frame);
         let bank = &self
             .frames
@@ -18999,6 +19145,36 @@ pub(crate) fn snapshot_residual_heap_before_suspend<Sym: WalkSym>(
 /// instead of walking the callee inline.
 pub(crate) fn subwalk_driver_is_active() -> bool {
     SUBWALK_DRIVER.with(|slot| !slot.get().is_null())
+}
+
+/// Push the helper level a helper sub-walk runs under. Refreshes parent
+/// concretes first: the level is built before guards / NewArrayClear,
+/// which may collect, and is not a `walk_session_roots` root until it is
+/// published.
+///
+/// While the explicit driver runs, the sub-walk suspends before the child
+/// walks and this guard would drop first. Stash the refreshed level on the
+/// session (`pending_helper_level`) so `push_frame` publishes the same
+/// object, `entry_array_len` included (`MetaInterp.newframe` keeps the
+/// callee frame). A recursive-portal Python callee never calls this, so
+/// that path stays without a helper level (`nested_loop`, `spectral_norm`).
+pub(crate) fn enter_helper_level<'sess, Sym: WalkSym>(
+    ctx: &WalkContext<'_, 'sess, Sym>,
+    level: Option<HelperLevel>,
+) -> Option<InlineFrameGuard<'sess>> {
+    let mut level = level?;
+    super::resume_snapshot::refresh_helper_level(ctx, &mut level);
+    if subwalk_driver_is_active() {
+        let mut session = ctx.session.borrow_mut();
+        debug_assert!(
+            session.pending_helper_level.is_none(),
+            "helper level pending across a second enter"
+        );
+        session.pending_helper_level = Some(level);
+        None
+    } else {
+        Some(InlineFrameGuard::enter_helper(ctx.session, level))
+    }
 }
 
 /// Copy ancestor helper MIFrames into the latched abort image, outermost
@@ -19382,6 +19558,9 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             if completed.result.is_ok() {
                 ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
             }
+            // `enter_helper_level` stashed a level for this CALL; the child
+            // already finished, so `push_frame` will not consume it.
+            ctx.session.borrow_mut().pending_helper_level = None;
             return completed.result.clone();
         }
     }
@@ -19397,6 +19576,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let _setup_bank_guard = crate::trace::InlineRegisterBankGuard::enter(&callee_regs_r);
 
     if int_args.len() > sub_body.num_regs_i {
+        ctx.session.borrow_mut().pending_helper_level = None;
         return Err(DispatchError::InlineCallIntArityMismatch {
             pc,
             provided: int_args.len(),
@@ -19404,6 +19584,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         });
     }
     if ref_args.len() > sub_body.num_regs_r {
+        ctx.session.borrow_mut().pending_helper_level = None;
         return Err(DispatchError::InlineCallArityMismatch {
             pc,
             provided: ref_args.len(),
@@ -19411,6 +19592,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         });
     }
     if float_args.len() > sub_body.num_regs_f {
+        ctx.session.borrow_mut().pending_helper_level = None;
         return Err(DispatchError::InlineCallFloatArityMismatch {
             pc,
             provided: float_args.len(),
@@ -19527,9 +19709,11 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         concrete_registers_i: callee_concrete_i,
 
         inline_callee_consts: None,
-        // `op_pc` belongs to the callee JitCode.  A canonical helper has no
-        // Python blackhole entry of its own, so it stays transparent while its
-        // actual MIFrame/register state lives in this heap-owned frame.
+        _inline_frame: None,
+        // Helper jitcodes are real `MIFrame`s (`capture_resumedata`).
+        // `transparent_helper_subwalk` keeps the walk on this body's
+        // jitcode so a guard numbers this section at its own pc; a
+        // nested suspend publishes the pending helper level in `push_frame`.
         fbw_mode: FbwWalkMode {
             inline_subwalk: true,
             transparent_helper_subwalk: true,
@@ -19550,6 +19734,9 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // Overwrite the parent's index: a nested helper is a different
             // `MIFrame.jitcode`.
             transparent_helper_jitcode_index: helper_index_for_sub_body(sub_body),
+            // Describes the call this frame is entered through, not the calls
+            // its own body makes.
+            helper_return: HelperReturn::CallResult,
             // A helper has no Python PC. Residual last_instr publication
             // reads this field when `current_inline_concrete_frame()==0`.
             inline_caller_py_pc: ctx
@@ -19585,8 +19772,13 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 
     if !driver_pointer.is_null() {
         // Nested descent: publish the heap frame and yield the parent at its
-        // CALL.  The outer driver pushes it without another Rust `walk()`
-        // activation.
+        // CALL. The outer driver pushes it without another Rust `walk()`
+        // activation. `enter_helper_level` already stashed the caller's
+        // computed level (`entry_array_len` included) on the session; keep
+        // it there so `walk_session_roots` forwards it across this yield
+        // and `push_frame` publishes it. A recursive-portal Python callee
+        // never called `enter_helper_level`, so pending stays empty
+        // (`nested_loop`, `spectral_norm`).
         let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
         snapshot_residual_heap_before_suspend::<Sym>(&*ctx.trace_ctx.heap_cache());
         assert!(exchange.pending.replace(frame).is_none());

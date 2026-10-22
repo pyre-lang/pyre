@@ -411,6 +411,10 @@ pub struct PyJitCodePayload {
     /// Lazily-built [`LoopScanIndex`] of this body, dropped with it by
     /// `replace_with`.
     pub(crate) loop_scan: std::cell::OnceCell<LoopScanIndex>,
+    /// Lazily-built per-pc answers of
+    /// [`crate::jitcode_dispatch::helper_resume_reaches_blocker`], dropped
+    /// with the body by `replace_with`.
+    pub(crate) helper_resume_blockers: std::cell::OnceCell<Box<[std::cell::OnceCell<bool>]>>,
 }
 
 impl PyJitCodePayload {
@@ -588,6 +592,7 @@ impl PyJitCode {
             sub_descr_pool: std::cell::OnceCell::new(),
             inline_body_facts: std::cell::OnceCell::new(),
             loop_scan: std::cell::OnceCell::new(),
+            helper_resume_blockers: std::cell::OnceCell::new(),
         })
     }
 
@@ -626,6 +631,7 @@ impl PyJitCode {
             sub_descr_pool,
             inline_body_facts,
             loop_scan,
+            helper_resume_blockers,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -646,6 +652,7 @@ impl PyJitCode {
             // being replaced, so they go with it rather than outliving it.
             current.inline_body_facts = inline_body_facts;
             current.loop_scan = loop_scan;
+            current.helper_resume_blockers = helper_resume_blockers;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;

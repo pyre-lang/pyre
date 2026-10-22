@@ -905,7 +905,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let list = pyre_object::gc_roots::shadow_stack_get(base);
     let length = unsafe { pyre_object::w_list_len(list) } as i64;
     if length == 0 {
-        return Err(crate::PyError::new(
+        return Err(crate::error::oefmt_noargs(
             crate::PyErrorKind::IndexError,
             "pop from empty list",
         ));
@@ -915,7 +915,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     if index == -1 {
         return match unsafe { pyre_object::listobject::w_list_pop_end(list) } {
             Some(v) => Ok(v),
-            None => Err(crate::PyError::new(
+            None => Err(crate::error::oefmt_noargs(
                 crate::PyErrorKind::IndexError,
                 "pop index out of range",
             )),
@@ -923,7 +923,7 @@ pub fn list_method_pop(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     match unsafe { pyre_object::listobject::w_list_pop(list, index) } {
         Some(v) => Ok(v),
-        None => Err(crate::PyError::new(
+        None => Err(crate::error::oefmt_noargs(
             crate::PyErrorKind::IndexError,
             "pop index out of range",
         )),

@@ -1358,6 +1358,11 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         debug_merge_point_py_pc: None,
         parents: Vec::new(),
         entry_executed_effects: 0,
+        entry_heap_writing_effects: 0,
+        entry_journal_mark: fbw_effect_journal_mark(),
+        helper_resume: HelperResume::Section,
+        helper_call_entry: HelperCallEntry::Unavailable,
+        helper_entry_array_len: None,
         live: None,
     });
     let regs_r = Vec::new();

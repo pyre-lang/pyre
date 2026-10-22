@@ -1580,23 +1580,49 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         regs_f[i] = box_ref;
     }
     if let Some(result) = child_result {
-        // `_setup_return_value_r` (`blackhole.py`): the callee's result
+        // `_setup_return_value_*` (`blackhole.py`): the callee's result
         // lands in `code[position - 1]` of the call it paused in.
-        let super::CallResultRegister::Reg('r', call_dst_reg) =
-            super::call_result_register_in(jc.code.as_slice(), entry)
-        else {
-            return None;
-        };
-        if call_dst_reg >= regs_r.len() {
-            return Some(Err(DispatchError::InlineCallArityMismatch {
-                pc: entry,
-                provided: call_dst_reg + 1,
-                callee_num_regs_r: regs_r.len(),
-            }));
-        }
-        regs_r.set(call_dst_reg, result);
-        if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
-            concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+        match super::call_result_register_in(jc.code.as_slice(), entry) {
+            super::CallResultRegister::Void => {}
+            super::CallResultRegister::Reg('r', call_dst_reg) => {
+                if call_dst_reg >= regs_r.len() {
+                    return Some(Err(DispatchError::InlineCallArityMismatch {
+                        pc: entry,
+                        provided: call_dst_reg + 1,
+                        callee_num_regs_r: regs_r.len(),
+                    }));
+                }
+                regs_r.set(call_dst_reg, result);
+                if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
+                    concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
+                }
+            }
+            super::CallResultRegister::Reg('i', call_dst_reg) => {
+                if call_dst_reg >= regs_i.len() {
+                    return Some(Err(DispatchError::InlineCallIntArityMismatch {
+                        pc: entry,
+                        provided: call_dst_reg + 1,
+                        callee_num_regs_i: regs_i.len(),
+                    }));
+                }
+                regs_i[call_dst_reg] = result;
+                if let Some(majit_ir::Value::Int(v)) = ctx.box_value(result) {
+                    concrete_i[call_dst_reg] = ConcreteValue::Int(v);
+                }
+            }
+            super::CallResultRegister::Reg('f', call_dst_reg) => {
+                if call_dst_reg >= regs_f.len() {
+                    return Some(Err(DispatchError::InlineCallFloatArityMismatch {
+                        pc: entry,
+                        provided: call_dst_reg + 1,
+                        callee_num_regs_f: regs_f.len(),
+                    }));
+                }
+                regs_f[call_dst_reg] = result;
+            }
+            super::CallResultRegister::Reg(..) | super::CallResultRegister::Unknown => {
+                return None;
+            }
         }
     }
 
@@ -1676,15 +1702,23 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     // every consecutive helper/operator tail in recipe order.
     let mut pending_tails: Vec<InlineParentFrame> = Vec::new();
     for parent_recipe in paused_parent_recipes {
-        if parent_recipe.len_tail {
+        if parent_recipe.len_tail
+            || crate::state::jitcode_is_transparent_helper(parent_recipe.jitcode_index)
+        {
             // The recipe's jitcode is the operator tail that was paused
-            // (`bh_len_tail` or `bh_truth_bool_tail`). Rebuilding `Len`
-            // unconditionally would run the length check on a `__bool__`
-            // result.
+            // (`bh_len_tail` or `bh_truth_bool_tail`), or a descended helper
+            // paused past its CALL. Rebuilding `Len` unconditionally would
+            // run the length check on a `__bool__` result.
             if parent_recipe.jitcode_pc < 0 {
                 return None;
             }
             let resume_pc = parent_recipe.jitcode_pc as usize;
+            let boxes = if parent_recipe.len_tail {
+                parent_recipe.registers_r.clone()
+            } else {
+                crate::state::recipe_live_boxes(parent_recipe)
+            };
+            let nboxes = boxes.len();
             pending_tails.push(InlineParentFrame {
                 jitcode_index: parent_recipe.jitcode_index as u32,
                 call_jitcode_pc: None,
@@ -1694,7 +1728,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 resume_marker_jit_pc: Some(resume_pc),
                 // The level's registers as its resume section rebuilt them;
                 // the snapshot carries every box its `-live-` names.
-                boxes: parent_recipe.registers_r.clone(),
+                boxes,
                 registers_r: None,
                 registers_i: None,
                 registers_f: None,
@@ -1703,7 +1737,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 result_slot: super::call_result_slot(
                     parent_recipe.jitcode_index as u32,
                     resume_pc,
-                    parent_recipe.registers_r.len(),
+                    nboxes,
                 ),
             });
             continue;
@@ -1771,6 +1805,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         })
         .collect();
 
+    let helper_index = callee_pjc.jitcode.try_index();
+    let helper_walk =
+        helper_index.is_some_and(|i| crate::state::jitcode_is_transparent_helper(i as i32));
+    // A build-time helper body resolves its `d`/`j` operands through the
+    // process-wide table, not a per-fn pool (`JitCode::from_canonical`), the
+    // same swap `run_orthodox_helper_subwalk` makes on the forward walk.
+    let global_pool = helper_walk && callee_pjc.jitcode.uses_global_descr_pool();
     let outcome = {
         let mut sub_wc = WalkContext {
             frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -1808,6 +1849,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
                 carrier_resume: true,
+                transparent_helper_subwalk: helper_walk,
+                transparent_helper_jitcode_index: if helper_walk { helper_index } else { None },
 
                 class_of_last_exc_is_const: root_sym.class_of_last_exc_is_const(),
                 ..Default::default()
@@ -1818,8 +1861,16 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             registers_f: &RegisterBank::with_constants(regs_f, num_regs_f),
 
             concrete_registers_i: &mut concrete_i,
-            descr_refs: &perfn_descr_refs,
-            raw_descrs: RawDescrPool::PerFn(perfn_descrs),
+            descr_refs: if global_pool {
+                crate::jitcode_runtime::descr_ref_table()
+            } else {
+                &perfn_descr_refs
+            },
+            raw_descrs: if global_pool {
+                RawDescrPool::Global
+            } else {
+                RawDescrPool::PerFn(perfn_descrs)
+            },
             // The carrier sub-walk IS the bridge-resume metainterp: after a
             // guard failure `handle_guard_failure` rebuilds the frame state and
             // drives it forward through the SAME `self.interpret()` the initial
@@ -1859,7 +1910,11 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             live_after_jit_pc: usize::MAX,
             trace_ctx: ctx,
             is_top_level: false,
-            sub_jitcode_lookup: lookup_ref,
+            sub_jitcode_lookup: if global_pool {
+                &super::GLOBAL_SUB_JITCODE_LOOKUP_FN
+            } else {
+                lookup_ref
+            },
             // The outer Python frame is the root, paused at `root_pc`.
             entry_py_pc: EntryPyPc::Jit(root_pc),
             outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,

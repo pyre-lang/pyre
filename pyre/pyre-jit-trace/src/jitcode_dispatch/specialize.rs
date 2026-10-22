@@ -6968,7 +6968,7 @@ fn descend_named_cell_helper<Sym: WalkSym>(
         return decline("SYM-NO-JITCODE");
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         return decline("NESTED-ENTRY");
     };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
@@ -7805,7 +7805,7 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(list_obj as usize)),
     );
 
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
@@ -8080,7 +8080,7 @@ fn prepare_orthodox_descent<Sym: WalkSym>(
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return decline("SYM-NO-JITCODE");
     }
-    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         return decline("NESTED-ENTRY");
     };
     Some(OrthodoxDescentPrep {
@@ -10101,7 +10101,7 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         return Ok(None);
     };
 
@@ -10212,7 +10212,7 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         return Ok(None);
     };
 
@@ -10342,7 +10342,7 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         return Ok(None);
     };
 
@@ -10441,7 +10441,7 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         return Ok(None);
     };
 
@@ -16172,34 +16172,30 @@ pub(crate) fn orthodox_list_append_body_and_sym<Sym: WalkSym>(
 }
 
 /// Where the guards of a helper sub-walk resume.
-pub(crate) enum HelperEntry {
-    /// Root level: the caller-boundary resume at the full-body sym's
-    /// coordinate for the call (see `try_walker_inline_builtin_call`).
-    Root,
-    /// Inside an inlined Python callee: the callee paused at the helper's
-    /// CALL, pushed as the helper's entry frame, so a guard in the helper
-    /// rebuilds it and re-executes the helper.
-    Callee(InlineParentFrame),
-    /// Inside another canonical helper body.  That helper has no Python
-    /// frame of its own, so a guard here resumes where the enclosing
-    /// helper's guards do: the coordinates and paused levels it already
-    /// published, re-executing the outermost helper call.
-    EnclosingHelper,
+pub(crate) struct HelperEntry {
+    /// Inside an inlined Python callee or another helper body: the call-site
+    /// coordinate and active boxes are the enclosing walk's. At the root
+    /// portal they come from the full-body sym at the call.
+    nested: bool,
+    /// Whether the helper's return is the call's result.
+    ret: HelperReturn,
+    /// The helper level pushed for the walk ([`helper_subwalk_level`]).
+    level: Option<HelperLevel>,
 }
 
 /// The [`HelperEntry`] for a helper call at `op_pc` of the current walk.
+/// `ret` says whether the helper's return is that call's result.
 /// An `Err` is a decline: nothing has been recorded.
 fn orthodox_helper_nested_entry<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
+    ret: HelperReturn,
 ) -> Result<HelperEntry, InlineCallerFrameDecline> {
-    if ctx.fbw_mode.transparent_helper_subwalk {
-        return Ok(HelperEntry::EnclosingHelper);
-    }
-    if !ctx.fbw_mode.inline_subwalk {
-        return Ok(HelperEntry::Root);
-    }
-    compute_inline_helper_call_entry_frame(ctx, op_pc).map(HelperEntry::Callee)
+    Ok(HelperEntry {
+        nested: ctx.fbw_mode.inline_subwalk,
+        ret,
+        level: helper_subwalk_level(ctx, op_pc, ret)?,
+    })
 }
 
 /// Post-merge `-live-` after a loop-header preamble.
@@ -16268,12 +16264,10 @@ fn loop_header_guard_resume_marker(
 /// `call_site_label` names it in the active-box collection.
 ///
 /// `nested_entry` is [`orthodox_helper_nested_entry`]'s answer for `op_pc`:
-/// inside an inlined callee or another helper the helper's guards resume at
-/// the enclosing coordinate (the entry frame pushed for a callee, plus the
-/// sub-walk's outer coordinate/active boxes), not at the full-body sym's --
-/// the same model `try_walker_inline_builtin_call` applies.  Resolving the
-/// full-body coordinate from a callee `op_pc` restored the wrong frame image after
-/// an overflow guard failed in `step` of `a, b = step(a, b)`.
+/// call-site box inheritance stays `Root` vs nested, and the helper level
+/// [`helper_subwalk_level`] names for its `HelperReturn` is pushed. Resolving
+/// the full-body coordinate from a callee `op_pc` restored the wrong frame
+/// image after an overflow guard failed in `step` of `a, b = step(a, b)`.
 #[allow(clippy::too_many_arguments)]
 fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -16289,7 +16283,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
-    let nested_helper = !matches!(nested_entry, HelperEntry::Root);
+    let nested_helper = nested_entry.nested;
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker, class_guard_marker) =
         if nested_helper {
             (
@@ -16449,12 +16443,8 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
-    let helper_frame = match nested_entry {
-        HelperEntry::Callee(frame) => {
-            Some(InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]))
-        }
-        HelperEntry::Root | HelperEntry::EnclosingHelper => None,
-    };
+    ctx.fbw_mode.helper_return = nested_entry.ret;
+    let helper_frame = enter_helper_level(ctx, nested_entry.level);
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op_pc,
@@ -16524,7 +16514,7 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
     let sym = unsafe { &*sym_ptr };
-    let nested_entry = orthodox_helper_nested_entry(ctx, op_pc)
+    let nested_entry = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
         .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
     run_orthodox_helper_subwalk(
         ctx,
@@ -16723,7 +16713,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // collapse to (mirror the full-body path's last_instr / valuestackdepth
     // publication, keyed to the append op's py_pc — the CALL for the method
     // form, the LIST_APPEND for the opcode form).
-    let nested_entry = orthodox_helper_nested_entry(ctx, op.pc)
+    let nested_entry = orthodox_helper_nested_entry(ctx, op.pc, HelperReturn::Converted)
         .map_err(|_| DispatchError::callee_inline_unsupported(op.pc))?;
     // Nested in an active `SubWalkDriver` (list.__init__ descending
     // `proxy_list_append`), the yield would cut this prefix and restore a
@@ -17019,7 +17009,7 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(self_ref, Value::Ref(majit_ir::GcRef(inner_self as usize)));
 
-    let nested_entry = orthodox_helper_nested_entry(ctx, op.pc)
+    let nested_entry = orthodox_helper_nested_entry(ctx, op.pc, HelperReturn::CallResult)
         .map_err(|_| DispatchError::callee_inline_unsupported(op.pc))?;
     let (walk_outcome, walk_start) = run_orthodox_helper_subwalk(
         ctx,
@@ -17190,7 +17180,7 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
 /// the same list. When the funcptr is that leaf, descend
 /// `w_list_append_inner` through [`orthodox_list_append_commit`] and write
 /// the list OpRef back as the result. A guard inside the helper resumes at
-/// the Python `CALL` that entered it (`HelperEntry::EnclosingHelper`), which
+/// the Python `CALL` that entered it (`HelperReturn::Converted`), which
 /// has not bound the temporary yet, so a declined attempt abandons the
 /// partial list. Any other funcptr, or a resume the parent chain cannot
 /// name, returns `None` and the wrapper residual runs.
@@ -19030,7 +19020,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(value_obj as usize)),
     );
 
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
@@ -19518,7 +19508,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     walker_guard_fold_class(ctx, op_pc, iter_op, type_addr)?;
     let iter_obj = pinned_obj(&iter_pin, iter_obj);
     let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::Converted) else {
         return Ok(None);
     };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();

@@ -180,6 +180,11 @@ mod recursion_depth_policy_tests {
             debug_merge_point_py_pc: None,
             parents: Vec::new(),
             entry_executed_effects: 0,
+            entry_heap_writing_effects: 0,
+            entry_journal_mark: fbw_effect_journal_mark(),
+            helper_resume: HelperResume::Section,
+            helper_call_entry: HelperCallEntry::Unavailable,
+            helper_entry_array_len: None,
             live: None,
         }
     }
@@ -565,6 +570,7 @@ pub(crate) fn fbw_store_journal_reset() {
     // gh#467: reset the executed-effect odometer and any stale
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
+    FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
     FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
     FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = None);
@@ -2854,6 +2860,12 @@ pub(crate) fn fbw_executed_effect_count() -> usize {
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.get())
 }
 
+/// Heap-writing / frame-entering residual odometer (see
+/// [`FBW_HEAP_WRITING_EFFECT_COUNT`]).
+pub(crate) fn fbw_heap_writing_effect_count() -> usize {
+    FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.get())
+}
+
 pub(crate) fn bump_keep_recording_too_long_once(session: &std::cell::RefCell<WalkSession>) {
     let mut session = session.borrow_mut();
     if !session.keep_recording_too_long_tallied {
@@ -2925,6 +2937,18 @@ pub(crate) fn fbw_bump_executed_effect(site: &'static str) {
         c.set(count);
         if fbw_debug_abort_enabled() {
             eprintln!("[fbw-effect-bump] site={site} count={count}");
+        }
+    });
+}
+
+/// Bump the heap-writing residual odometer (see
+/// [`FBW_HEAP_WRITING_EFFECT_COUNT`]).
+pub(crate) fn fbw_bump_heap_writing_effect(site: &'static str) {
+    FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| {
+        let count = c.get() + 1;
+        c.set(count);
+        if fbw_debug_abort_enabled() {
+            eprintln!("[fbw-heap-effect-bump] site={site} count={count}");
         }
     });
 }

@@ -745,6 +745,40 @@ fn make_pyerror_deferred_t(
     PyError(obj as pyre_object::PyObjectRef)
 }
 
+/// `error.py OpErrFmtNoArgs.__init__`: `self._value = value;
+/// self.setup(w_type)`. `value` is the literal's prebuilt `STR`, stored in
+/// `message` as it is, so `_compute_value` has nothing left to compute.
+///
+/// `#[inline(never)]` for the reason [`make_pyerror_deferred_t`] gives: the
+/// walker records `new_with_vtable` + setfield for this body.
+#[inline(never)]
+fn make_pyerror_noargs(
+    kind: PyErrorKind,
+    w_type: pyre_object::PyObjectRef,
+    value: pyre_object::gc_hook::GCREF,
+) -> PyError {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::lltype::malloc_typed_managed(PyErrorObject {
+        ob_header: pyre_object::PyObject {
+            ob_type: &PYERROR_TYPE,
+            w_class: pyre_object::pyobject::get_instantiate(&PYERROR_TYPE),
+        },
+        kind,
+        w_type,
+        message: value,
+        exc_object: std::ptr::null_mut(),
+        attach_tb: true,
+        context_recorded: false,
+        reraise_lasti: -1,
+        w_name_context: std::ptr::null_mut(),
+        w_obj_context: std::ptr::null_mut(),
+        w_fmt_x0: std::ptr::null_mut(),
+        fmt_valuefmt_ptr: std::ptr::null(),
+        fmt_valuefmt_len: 0,
+    });
+    PyError(obj as pyre_object::PyObjectRef)
+}
+
 impl PyError {
     /// The display text. Null storage is [`DisplayMessage::FromExcObject`].
     ///
@@ -5885,6 +5919,18 @@ pub fn type_name_of(w_obj: PyObjectRef) -> String {
     }
 }
 
+/// `oefmt(space.w_<kind>, valuefmt)` with no argument, for the builtin class
+/// `kind` names: `OpErrFmtNoArgs(w_type, valuefmt)`. The class comes from
+/// `lookup_exc_class_for_kind` and the message is the literal's prebuilt
+/// `STR`, so a raise on a walked path records the ctor's malloc + setfield
+/// and no residual call.
+pub fn oefmt_noargs(kind: PyErrorKind, valuefmt: &'static str) -> OperationError {
+    // `prebuilt_str_storage` may collect, so the class is read after it.
+    let value = pyre_object::unicodeobject::prebuilt_str_storage(valuefmt);
+    let w_type = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind_to_exc_kind(kind));
+    make_pyerror_noargs(kind, w_type, value as pyre_object::gc_hook::GCREF)
+}
+
 /// `error.py oefmt` — build an exception whose message is `valuefmt` with each
 /// format code filled from its own argument.
 ///
@@ -5927,13 +5973,28 @@ pub fn type_name_of(w_obj: PyObjectRef) -> String {
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
     // the message verbatim, `%` sequences and all.  Nothing on the way to the
-    // error runs application-level code, so the class needs no root here.
+    // error runs application-level code, but `prebuilt_str_storage` can
+    // collect, so the class is pinned across it.
     if args.is_empty() {
-        // The format string is the message verbatim. `from_string(to_string())`
-        // copied it into a `String` only to copy it again.
-        let mut message = Wtf8Buf::new();
-        message.push_str(valuefmt);
-        return operation_error_from_class(w_type, message);
+        if w_type.is_null() {
+            // The format string is the message verbatim. `from_string(to_string())`
+            // copied it into a `String` only to copy it again.
+            let mut message = Wtf8Buf::new();
+            message.push_str(valuefmt);
+            return operation_error_from_class(w_type, message);
+        }
+        let kind = pyre_object::interp_exceptions::kind_of_canonical_exc_class(w_type)
+            .map(PyError::kind_from_exc)
+            .unwrap_or(PyErrorKind::RuntimeError);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(w_type);
+        let value = pyre_object::unicodeobject::prebuilt_str_storage(valuefmt);
+        return make_pyerror_noargs(
+            kind,
+            _roots.get(type_slot),
+            value as pyre_object::gc_hook::GCREF,
+        );
     }
     // `OpErrFmt(w_type, strings, *args)` for a single `%T`: store, do not
     // call `type_name_of`. Mixed formats and the other conversions stay on
@@ -6747,6 +6808,19 @@ mod tests {
             Ok("property 'foo' of 'C' object has no setter")
         );
         assert_eq!(err.kind, PyErrorKind::AttributeError);
+    }
+
+    #[test]
+    fn oefmt_noargs_stores_the_prebuilt_literal_verbatim() {
+        let _ = crate::builtins::new_builtin_module_dict();
+        let err = super::oefmt_noargs(PyErrorKind::IndexError, "pop %s from empty list");
+        let index_error = crate::builtins::lookup_exc_class("IndexError").expect("IndexError");
+        assert_eq!(err.kind, PyErrorKind::IndexError);
+        assert_eq!(err.w_type, index_error);
+        assert_eq!(err.message_text(), "pop %s from empty list");
+        // `OpErrFmtNoArgs._value` is the constant itself, not a copy.
+        let again = super::oefmt_noargs(PyErrorKind::IndexError, "pop %s from empty list");
+        assert_eq!(err.message, again.message);
     }
 
     #[test]
