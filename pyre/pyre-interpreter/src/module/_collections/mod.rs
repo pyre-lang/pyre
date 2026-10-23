@@ -1179,12 +1179,20 @@ impl W_Deque {
                 pyre_object::gc_roots::shadow_stack_get(items_base + i),
                 pyre_object::gc_roots::shadow_stack_get(x_slot),
             )?;
-            // The comparison may have cleared or otherwise resized the live
-            // deque, so do not continue against the stale snapshot.
-            checklock(
+            // [3.15-spec] `deque_remove_impl` raises IndexError
+            // ("deque mutated during iteration") at both mutation
+            // checks. `interp_deque.py checklock` / `_find_or_count`
+            // raise RuntimeError. `find_jmp` greens are `is_find` and
+            // `tp`; they do not govern the exception type.
+            // lib-python/3/test/test_deque.py `test_remove` accepts both.
+            if !lock_valid(
                 pyre_object::gc_roots::shadow_stack_get(own_base),
                 pyre_object::gc_roots::shadow_stack_get(own_base + 1),
-            )?;
+            ) {
+                return Err(crate::PyError::index_error(
+                    "deque mutated during iteration",
+                ));
+            }
             if equal {
                 pos = Some(i);
                 break;
@@ -1202,7 +1210,11 @@ impl W_Deque {
                     unsafe { w_deque_lock(pyre_object::gc_roots::shadow_stack_get(own_base)) };
                 let self_obj = pyre_object::gc_roots::shadow_stack_get(own_base);
                 let lock = pyre_object::gc_roots::shadow_stack_get(own_base + 1);
-                checklock(self_obj, lock)?;
+                if !lock_valid(self_obj, lock) {
+                    return Err(crate::PyError::index_error(
+                        "deque mutated during iteration",
+                    ));
+                }
                 let mut items: Vec<PyObjectRef> = (0..items_len)
                     .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
                     .collect();

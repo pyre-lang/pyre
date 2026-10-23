@@ -233,8 +233,16 @@ pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     {
         // `numeric_formatting_impl` reads only these three `lconv` fields.
         let lp = unsafe { localeconv() };
-        let conv = localeconv_from_lconv(lp);
-        (conv.decimal_point, conv.thousands_sep, conv.grouping)
+        if lp.is_null() {
+            return (b".".to_vec(), Vec::new(), Vec::new());
+        }
+        unsafe {
+            (
+                charp_to_bytes((*lp).decimal_point),
+                charp_to_bytes((*lp).thousands_sep),
+                charp_to_bytes((*lp).grouping),
+            )
+        }
     }
     #[cfg(not(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
