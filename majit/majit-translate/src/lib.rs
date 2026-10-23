@@ -2152,9 +2152,21 @@ fn analyze_pipeline_from_module_paths(
     // required trait method.  Concrete impl graphs stay on the
     // receiver-driven inherent-method registration path below (so
     // name-based method lookup is unchanged), but their graph identities
-    // must also populate the independent indirect-call family row.
-    for (trait_leaf, _, method_name, owner, _, _, _) in &concrete_trait_methods {
-        call_control.register_trait_family_member(method_name, trait_leaf, owner);
+    // must also populate the independent indirect-call family row. The
+    // member is the function object's registry key — a trait-impl identity
+    // path when the impl has one — so a colliding inherent of the same
+    // leaf does not occupy the family (`Bookkeeper.getdesc`).
+    for func in &program.functions {
+        let (Some(owner), Some(trait_leaf)) = (&func.self_ty_root, &func.trait_root) else {
+            continue;
+        };
+        let path = match func.trait_impl_identity.as_deref() {
+            Some(identity) => crate::parse::CallPath::from_segments(
+                crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),
+            ),
+            None => crate::parse::CallPath::for_impl_method(owner, &func.name),
+        };
+        call_control.register_trait_family_path(&func.name, trait_leaf, path);
     }
     prof.mark("  register concrete indirect-call families");
     // Re-register free functions with their RPython-equivalent hints
