@@ -159,13 +159,15 @@ fn residual_path(leaf: &str) -> Vec<String> {
     path
 }
 
-/// Charon uses `<Impl>` for a trait shim owned by the current crate, but an
+/// Charon uses `<Impl>` for a trait shim owned by the current crate; an
 /// extracted dependency method is owner-resolved as
-/// `rbigint::RBigInt::<leaf>`. The operand-type gate in `front::mir` proves
-/// nominal identity in both cases; this helper only recognizes the two path
-/// spellings.
+/// `rbigint::RBigInt::<leaf>`; a trait-impl FunDecl uses the identity
+/// path (`trait_impl_identity_path`) `[rbigint, RBigInt, <impl …>, leaf]`.
+/// The operand-type gate in `front::mir` proves nominal identity; this
+/// helper only recognizes those path spellings.
 fn is_rbigint_operator_owner(segments: &[String], owner: &str) -> bool {
     owner == "<Impl>"
+        || owner.starts_with("<impl ")
         || matches!(
             segments,
             [.., module, ty, _] if module == "rbigint" && ty == "RBigInt"
@@ -257,6 +259,15 @@ mod tests {
         assert_eq!(
             bigint_binop_residual_path(&segs(&["rbigint", "RBigInt", "sub"])),
             Some(desc("jit_bigint_sub"))
+        );
+        assert_eq!(
+            bigint_binop_residual_path(&segs(&[
+                "rbigint",
+                "RBigInt",
+                "<impl core::ops::bit::BitAnd<majit_rlib::rbigint::RBigInt,majit_rlib::rbigint::RBigInt>>",
+                "bitand",
+            ])),
+            Some(desc("jit_bigint_and"))
         );
         // An operator not in either retarget set.
         assert!(

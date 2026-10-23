@@ -1683,6 +1683,21 @@ fn analyze_pipeline_from_module_paths(
         (&str, &str),
         (&str, &front::semantic::SemanticFunction),
     > = std::collections::HashMap::new();
+    // `method-call-expr`: an inherent method occupies `for_impl_method`.
+    // A same-named trait-impl on that owner is a different function object
+    // (`CallControl.graphs_from` / `Bookkeeper.getdesc`) and must not
+    // last-writer-win onto that key; it already has the identity path
+    // registered below.
+    let inherent_method_keys: std::collections::HashSet<(String, String)> = program
+        .functions
+        .iter()
+        .filter_map(
+            |func| match (&func.self_ty_root, &func.trait_impl_identity) {
+                (Some(owner), None) => Some((owner.clone(), func.name.clone())),
+                _ => None,
+            },
+        )
+        .collect();
     for func in &program.functions {
         match (&func.self_ty_root, &func.trait_root) {
             // Concrete trait-impl method: `impl Trait for Type { fn m }`.
@@ -1715,14 +1730,16 @@ fn analyze_pipeline_from_module_paths(
                     &mut trait_concrete_impl_types,
                     &mut trait_method_overrides,
                 );
-                canonical_inherent_methods.push(parse::InherentMethodInfo {
-                    for_type: owner.clone(),
-                    self_ty_root: Some(owner.clone()),
-                    name: func.name.clone(),
-                    graph: func.lazy_graph().clone(),
-                    return_type: func.return_type.clone(),
-                    hints: func.hints.clone(),
-                });
+                if !inherent_method_keys.contains(&(owner.clone(), func.name.clone())) {
+                    canonical_inherent_methods.push(parse::InherentMethodInfo {
+                        for_type: owner.clone(),
+                        self_ty_root: Some(owner.clone()),
+                        name: func.name.clone(),
+                        graph: func.lazy_graph().clone(),
+                        return_type: func.return_type.clone(),
+                        hints: func.hints.clone(),
+                    });
+                }
             }
             // Trait default-body: `trait T { fn m { … } }`.  The pseudo
             // `for_type` matches the extractor's sentinel so the loop's
@@ -1741,16 +1758,23 @@ fn analyze_pipeline_from_module_paths(
                     }],
                 });
             }
-            // Inherent method: `impl Type { fn m }`.
+            // Inherent method: `impl Type { fn m }`. A non-local trait
+            // impl (`Drop` / `PartialEq`) also lands here because
+            // `trait_root` is None; skip it when an inherent of the
+            // same owner and leaf already occupies `for_impl_method`.
             (Some(owner), None) => {
-                canonical_inherent_methods.push(parse::InherentMethodInfo {
-                    for_type: owner.clone(),
-                    self_ty_root: Some(owner.clone()),
-                    name: func.name.clone(),
-                    graph: func.lazy_graph().clone(),
-                    return_type: func.return_type.clone(),
-                    hints: func.hints.clone(),
-                });
+                let skip_colliding_trait_impl = func.trait_impl_identity.is_some()
+                    && inherent_method_keys.contains(&(owner.clone(), func.name.clone()));
+                if !skip_colliding_trait_impl {
+                    canonical_inherent_methods.push(parse::InherentMethodInfo {
+                        for_type: owner.clone(),
+                        self_ty_root: Some(owner.clone()),
+                        name: func.name.clone(),
+                        graph: func.lazy_graph().clone(),
+                        return_type: func.return_type.clone(),
+                        hints: func.hints.clone(),
+                    });
+                }
             }
             // Free function — registered by the dedicated loop below.
             (None, None) => {}
@@ -2560,11 +2584,18 @@ fn analyze_pipeline_from_module_paths(
         // above so a module-qualified call site finds both the graph
         // AND the hints (elidable/loopinvariant/cannot_collect/oopspec).
         let paths = if let Some(ref owner) = func.self_ty_root {
-            // impl method: ["owner", "method"]
-            let mut paths = vec![crate::parse::CallPath::from_segments([
-                owner.as_str(),
-                func.name.as_str(),
-            ])];
+            // impl method: ["owner", "method"]. A colliding trait-impl
+            // keeps only the identity path so its hints do not stamp the
+            // inherent's two-segment spelling.
+            let skip_two_segment = func.trait_impl_identity.is_some()
+                && inherent_method_keys.contains(&(owner.clone(), func.name.clone()));
+            let mut paths = Vec::new();
+            if !skip_two_segment {
+                paths.push(crate::parse::CallPath::from_segments([
+                    owner.as_str(),
+                    func.name.as_str(),
+                ]));
+            }
             if let Some(identity) = func.trait_impl_identity.as_deref() {
                 paths.push(crate::parse::CallPath::from_segments(
                     crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),

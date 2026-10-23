@@ -32587,12 +32587,15 @@ impl<'a> Lowering<'a> {
         } else {
             method_hint
         };
+        // Declined-Method impl-owned callees still name the FunDecl
+        // Charon recorded. `spec_segments` is that registry key
+        // (inherent `for_impl_method`, trait-impl identity path) so std
+        // matchers keep `[.., "<Impl>", leaf]` only on the `name_path`
+        // branch below.
         let segments: Vec<String> = if method_hint.is_none()
-            && let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
+            && let Some((_, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
         {
-            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
-            v.push(leaf);
-            v
+            spec_segments(self.llbc, fd, &leaf)
         } else {
             fd.item_meta
                 .name_path()
@@ -34002,11 +34005,9 @@ impl<'a> Lowering<'a> {
     fn assoc_fn_call_target(&self, fd: &FunDecl) -> CallTarget {
         let method_hint = self.impl_method_owner(fd);
         let segments = if method_hint.is_none()
-            && let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
+            && let Some((_, leaf)) = impl_method_owner_for_fundecl(self.llbc, fd)
         {
-            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
-            v.push(leaf);
-            v
+            spec_segments(self.llbc, fd, &leaf)
         } else {
             fd.item_meta
                 .name_path()
@@ -48217,6 +48218,18 @@ fn rdict_insert_get_cast_root(
 /// Call-path segments for a specialized leaf of this declaration.
 fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
     if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
+        // `method-call-expr`: inherent methods are looked up before trait
+        // methods for the same receiver. `CallControl.graphs_from` /
+        // `Bookkeeper.getdesc` keys on the function object; Charon
+        // records that callee as a FunDeclId. An ADT-owned trait-impl
+        // method shares the owner's leaf with an inherent of the same
+        // name, so it occupies the identity path `lib.rs` already
+        // registers; the inherent keeps `for_impl_method`.
+        if let Some(impl_id) = trait_impl_id_for_fundecl(fd)
+            && let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id)
+        {
+            return trait_impl_identity_path(&owner, &identity, leaf);
+        }
         return crate::parse::CallPath::for_impl_method(&owner, leaf).segments;
     }
     let stripped = strip_crate_prefix(&fd.item_meta.name_path());
@@ -57076,15 +57089,11 @@ fn impl_atomic_alias_leaf(llbc: &Llbc, impl_payload: &serde_json::Value) -> Opti
 /// Path segments used to *call* a function named by a `FnDef` constant or
 /// type — the same spelling `decode_constant` stores in a function-item
 /// value and `call_target_segments` emits for a direct call.  Impl-owned
-/// callees use `[qualified_owner, leaf]`; free functions keep `name_path()`
-/// split on `::`.
+/// callees use [`spec_segments`] (inherent `for_impl_method`, trait-impl
+/// identity path); free functions keep `name_path()` split on `::`.
 fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
     match impl_method_owner_for_fundecl(llbc, fd) {
-        Some((owner_qualified, leaf)) => {
-            let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
-            v.push(leaf);
-            v
-        }
+        Some((_, leaf)) => spec_segments(llbc, fd, &leaf),
         None => fd
             .item_meta
             .name_path()
@@ -61018,7 +61027,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         if fd.is_global_initializer().is_some() {
             continue;
         }
-        if let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+        if let Some((_owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
             let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
                 continue;
             };
@@ -61046,9 +61055,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
             else {
                 continue;
             };
-            let mut segments: Vec<String> =
-                owner_qualified.split("::").map(str::to_string).collect();
-            segments.push(leaf);
+            let segments = spec_segments(llbc, fd, &leaf);
             out.push((
                 segments,
                 Signature::new(fundecl_stub_argnames(fd), None, None),
@@ -91485,6 +91492,347 @@ mod tests {
             super::semantic_function_dedup_key(&char_fn),
             super::semantic_function_dedup_key(&char_other_artifact)
         );
+    }
+
+    /// Inherent `Owner::setitem` and `impl Store for Owner { fn setitem }`
+    /// share a leaf. Charon records two FunDeclIds; the call graph follows
+    /// each one (`method-call-expr`, `CallControl.graphs_from`).
+    fn inherent_vs_trait_setitem_fixture() -> Llbc {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+        let meta = |name: Vec<serde_json::Value>, is_local: bool| {
+            serde_json::json!({
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let owner_adt = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics.clone(), "builtin": null}
+        });
+        let owner_ty = serde_json::json!({"Value": [0, owner_adt.clone()]});
+        let self_ty = serde_json::json!({"Ref": [null, owner_ty.clone(), "Mut"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let owner = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(vec![
+                ident("fixture"), ident("celldict"), ident("Owner")
+            ], true),
+            "kind": {"Struct": [{
+                "name": "items",
+                "ty": {"Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}]},
+                "attr_info": field_attr
+            }]}
+        });
+        let inherent_impl = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": owner_ty.clone(),
+            "kind": "InherentImplBlock"
+        }}});
+        let trait_impl_seg = serde_json::json!({"Impl": {"Trait": 0}});
+        let method_locals = serde_json::json!([
+            {"index": 0, "name": null, "span": span.clone(), "ty": bool_ty.clone()},
+            {"index": 1, "name": "self", "span": span.clone(), "ty": self_ty.clone()}
+        ]);
+        let return_body = serde_json::json!({
+            "Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 1, "locals": method_locals},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span.clone(), "kind": "Return"}
+                }]
+            }
+        });
+        let inherent_setitem = serde_json::json!({
+            "def_id": 2,
+            "item_meta": meta(vec![
+                ident("fixture"), ident("celldict"), inherent_impl, ident("setitem")
+            ], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [self_ty.clone()],
+                "output": bool_ty.clone()
+            },
+            "body": return_body.clone()
+        });
+        let trait_setitem = serde_json::json!({
+            "def_id": 3,
+            "item_meta": meta(vec![
+                ident("fixture"), ident("celldict"), trait_impl_seg, ident("setitem")
+            ], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [self_ty.clone()],
+                "output": bool_ty.clone()
+            },
+            "body": return_body
+        });
+        let caller = |def_id: u64, name: &str, callee: u64| {
+            let locals = vec![
+                serde_json::json!({
+                    "index": 0, "name": null, "span": span.clone(), "ty": bool_ty.clone()
+                }),
+                serde_json::json!({
+                    "index": 1, "name": "self", "span": span.clone(), "ty": self_ty.clone()
+                }),
+            ];
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(vec![ident("fixture"), ident(name)], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [self_ty.clone()],
+                    "output": bool_ty.clone()
+                },
+                "body": {"Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 1, "locals": locals},
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span.clone(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": callee},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": [{
+                                                "Copy": {
+                                                    "kind": {"Local": 1},
+                                                    "ty": self_ty.clone()
+                                                }
+                                            }],
+                                            "dest": {
+                                                "kind": {"Local": 0},
+                                                "ty": bool_ty.clone()
+                                            }
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span.clone(), "kind": "Return"}
+                        }
+                    ]
+                }}
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [owner],
+                "fun_decls": [
+                    caller(0, "call_inherent", 2),
+                    caller(1, "call_trait", 3),
+                    inherent_setitem,
+                    trait_setitem
+                ],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(vec![
+                        ident("fixture"), ident("celldict"), ident("Store")
+                    ], true),
+                    "methods": [{"skip_binder": {"name": "setitem"}}]
+                }],
+                "trait_impls": [{
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {"types": [owner_ty]}
+                    },
+                    "methods": []
+                }]
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes())
+            .expect("inherent vs trait setitem fixture parses")
+    }
+
+    fn first_call_binding(graph: &crate::model::FunctionGraph) -> (Option<u64>, Vec<String>) {
+        use crate::model::{CallTarget, OpKind};
+        for op in graph_ops(graph) {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            return match target {
+                CallTarget::Method {
+                    resolved_path,
+                    fun_decl_id,
+                    ..
+                } => (
+                    *fun_decl_id,
+                    resolved_path
+                        .as_ref()
+                        .map(|path| path.segments.clone())
+                        .unwrap_or_default(),
+                ),
+                CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id,
+                } => (*fun_decl_id, segments.clone()),
+                other => panic!("expected a FunDecl call, got {other:?}"),
+            };
+        }
+        panic!("caller graph has no Call")
+    }
+
+    #[test]
+    fn spec_segments_distinguishes_inherent_and_trait_impl_methods() {
+        use crate::parse::CallPath;
+
+        let llbc = inherent_vs_trait_setitem_fixture();
+        let inherent = llbc.fn_by_id(2).expect("inherent setitem");
+        let trait_impl = llbc.fn_by_id(3).expect("trait setitem");
+        let inherent_owner =
+            super::impl_method_owner_for_fundecl(&llbc, inherent).expect("inherent Owner");
+        let trait_owner =
+            super::impl_method_owner_for_fundecl(&llbc, trait_impl).expect("trait Owner");
+        assert_eq!(
+            inherent_owner,
+            ("celldict::Owner".to_string(), "setitem".to_string())
+        );
+        assert_eq!(trait_owner, inherent_owner);
+        assert_eq!(super::trait_impl_id_for_fundecl(inherent), None);
+        assert_eq!(super::trait_impl_id_for_fundecl(trait_impl), Some(0));
+        let inherent_path = super::spec_segments(&llbc, inherent, "setitem");
+        let trait_path = super::spec_segments(&llbc, trait_impl, "setitem");
+        let identity = crate::front::clause_spec::render_trait_impl(&llbc, 0)
+            .expect("Store for Owner identity");
+        assert_eq!(
+            inherent_path,
+            CallPath::for_impl_method("celldict::Owner", "setitem").segments
+        );
+        assert_eq!(
+            trait_path,
+            super::trait_impl_identity_path("celldict::Owner", &identity, "setitem")
+        );
+        assert_ne!(inherent_path, trait_path);
+        assert!(!inherent_path.iter().any(|s| s.starts_with("<impl ")));
+        assert!(trait_path.iter().any(|s| s.starts_with("<impl ")));
+        assert_eq!(
+            super::registered_path_for_fun_decl(&llbc, inherent).segments,
+            inherent_path
+        );
+        assert_eq!(
+            super::registered_path_for_fun_decl(&llbc, trait_impl).segments,
+            trait_path
+        );
+
+        let inherent_graph =
+            super::lower_function(&llbc, "call_inherent").expect("lower call_inherent");
+        let trait_graph = super::lower_function(&llbc, "call_trait").expect("lower call_trait");
+        let (inherent_id, inherent_bound) = first_call_binding(&inherent_graph);
+        let (trait_id, trait_bound) = first_call_binding(&trait_graph);
+        assert_eq!(inherent_id, Some(2));
+        assert_eq!(trait_id, Some(3));
+        assert_eq!(inherent_bound, inherent_path);
+        assert_eq!(trait_bound, trait_path);
+    }
+
+    /// Production `w_module_dict_setitem_str_internal` names the inherent
+    /// `ModuleDictStrategy::setitem_str` FunDecl, not the trait trampoline.
+    #[test]
+    fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        if !std::path::Path::new(path).is_file() {
+            eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+            return;
+        }
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .ends_with("::w_module_dict_setitem_str_internal")
+            })
+            .expect("w_module_dict_setitem_str_internal in pyre-object LLBC");
+        let context = super::LowerContext::new(&llbc);
+        let graph =
+            super::lower_fun_decl(&context, fd).expect("lower w_module_dict_setitem_str_internal");
+        let mut bindings = Vec::new();
+        for op in graph_ops(&graph) {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            match target {
+                CallTarget::Method {
+                    name,
+                    resolved_path,
+                    fun_decl_id,
+                    ..
+                } if name == "setitem_str" => bindings.push((
+                    *fun_decl_id,
+                    resolved_path
+                        .as_ref()
+                        .map(|p| p.segments.clone())
+                        .unwrap_or_default(),
+                )),
+                CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id,
+                } if segments.last().map(String::as_str) == Some("setitem_str") => {
+                    bindings.push((*fun_decl_id, segments.clone()))
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !bindings.is_empty(),
+            "module-dict store must call setitem_str; ops={:?}",
+            graph_ops(&graph)
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::Call { target, .. } => Some(target.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+        for (fun_decl_id, bound) in bindings {
+            let id = fun_decl_id.expect("setitem_str call carries a FunDeclId");
+            let callee = llbc.fn_by_id(id).expect("setitem_str FunDecl");
+            assert_eq!(
+                super::trait_impl_id_for_fundecl(callee),
+                None,
+                "module arm must name the inherent setitem_str, bound={bound:?} path={}",
+                callee.item_meta.name_path()
+            );
+            assert_eq!(
+                bound,
+                super::registered_path_for_fun_decl(&llbc, callee).segments
+            );
+            assert!(
+                !bound.iter().any(|s| s.starts_with("<impl ")),
+                "inherent path must not be a trait-impl identity: {bound:?}"
+            );
+        }
     }
 
     /// Two one-call graphs sharing a synthetic `core::intrinsics::transmute`

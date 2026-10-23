@@ -151,8 +151,8 @@ fn str_key_eqv_spec_calls_the_str_key_borrow_and_str_eq() {
     );
     for spec in &eqv {
         assert!(
-            graph_calls_path(&spec.graph(), &["celldict", "StrKey", "borrow"]),
-            "{} does not call StrKey::borrow: {:?}",
+            graph_calls_strkey_borrow_impl(&spec.graph()),
+            "{} does not call StrKey's Borrow impl: {:?}",
             spec.name,
             op_kinds(&spec.graph())
         );
@@ -657,20 +657,6 @@ fn call_leaf_is_borrow(segments: &[String]) -> bool {
     segments.last().map(String::as_str) == Some("borrow")
 }
 
-fn graph_calls_path(graph: &majit_translate::model::FunctionGraph, path: &[&str]) -> bool {
-    graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .any(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } => segments.iter().map(String::as_str).eq(path.iter().copied()),
-            _ => false,
-        })
-}
-
 fn call_path_leaf(op: &majit_translate::model::SpaceOperation) -> Option<&str> {
     match &op.kind {
         OpKind::Call {
@@ -723,6 +709,49 @@ fn graph_calls_core_ptr_arith_spec(graph: &majit_translate::model::FunctionGraph
         .iter()
         .flat_map(|block| &block.operations)
         .any(|op| call_path_leaf(op).is_some_and(core_ptr_arith_spec_leaf))
+}
+
+/// `impl Borrow<str> for StrKey` (`CallControl.graphs_from` identity path).
+fn graph_calls_strkey_borrow_impl(graph: &majit_translate::model::FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.len() >= 3
+                    && segments[0] == "celldict"
+                    && segments[1] == "StrKey"
+                    && call_leaf_is_borrow(segments)
+                    && segments
+                        .iter()
+                        .any(|s| s.starts_with("<impl ") && s.contains("Borrow"))
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        ..
+                    },
+                ..
+            } => {
+                name == "borrow"
+                    && resolved_path.as_ref().is_some_and(|path| {
+                        path.segments.len() >= 3
+                            && path.segments[0] == "celldict"
+                            && path.segments[1] == "StrKey"
+                            && path
+                                .segments
+                                .iter()
+                                .any(|s| s.starts_with("<impl ") && s.contains("Borrow"))
+                    })
+            }
+            _ => false,
+        })
 }
 
 /// A `borrow` call still dispatched through the trait: a `Method` call,
