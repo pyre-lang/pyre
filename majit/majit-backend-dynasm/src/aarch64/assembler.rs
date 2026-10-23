@@ -225,7 +225,21 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
         Loc::Reg(reg) => Some(
             reg_position_in_jitframe(*reg).expect("deadframe slot: register is not managed") as u16,
         ),
-        Loc::Frame(frame) => Some((frame.get_position() + JITFRAME_FIXED_SIZE) as u16),
+        Loc::Frame(frame) => {
+            // `store_info_on_descr`: `(loc.value - base_ofs) // WORD`, with
+            // the misalignment and overflow assertions; 0xFFFF is the hole.
+            assert_eq!(
+                frame.ebp_loc.value & (WORD as i32 - 1),
+                0,
+                "store_info_on_descr: misaligned"
+            );
+            let position = frame.get_position() + JITFRAME_FIXED_SIZE;
+            assert!(
+                0 < position && position < 0xFFFF,
+                "store_info_on_descr: overflow!"
+            );
+            Some(position as u16)
+        }
         Loc::Immed(_)
         | Loc::ImmedFloat(_)
         | Loc::ConstFloat(_)

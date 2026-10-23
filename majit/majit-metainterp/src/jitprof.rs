@@ -1013,9 +1013,9 @@ fn fmt_line_time(string: &str, i: usize, tim: f64) -> String {
 }
 
 /// jitprof.py `Profiler._print_intline` layout:
-/// `"%s:%s\t%d" % (string, " " * max(0, 13-len(string)), i)`.
+/// `string + ':' + " " * max(0, 16-len(string)) + '\t' + str(i)`.
 fn fmt_intline(string: &str, i: usize) -> String {
-    let pad = " ".repeat(13usize.saturating_sub(string.len()));
+    let pad = " ".repeat(16usize.saturating_sub(string.len()));
     format!("{string}:{pad}\t{i}")
 }
 
@@ -1372,14 +1372,14 @@ mod tests {
             fmt_line_time("Tracing", 2, 0.5),
             "Tracing:      \t2\t0.500000"
         );
-        assert_eq!(fmt_intline("ops", 42), "ops:          \t42");
-        // A label longer than 13 chars gets no padding (max(0, ..)).
+        assert_eq!(fmt_intline("ops", 42), "ops:             \t42");
+        // A label longer than 16 chars gets no padding (max(0, ..)).
         assert_eq!(
             fmt_intline("abort: trace too long", 1),
             "abort: trace too long:\t1"
         );
         // The calls line keeps its two-space indent inside the label.
-        assert_eq!(fmt_intline("  calls", 7), "  calls:      \t7");
+        assert_eq!(fmt_intline("  calls", 7), "  calls:         \t7");
     }
 
     #[test]

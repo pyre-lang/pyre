@@ -5795,7 +5795,7 @@ impl OpcodeStepExecutor for PyFrame {
         let locals_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(self.getdictscope()?);
         crate::importing::import_all_from_w(roots.get(module_slot), roots.get(locals_slot))?;
-        unsafe { &mut *anchor.live() }.setdictscope(roots.get(locals_slot))?;
+        unsafe { &mut *anchor.live() }.setdictscope(roots.get(locals_slot), false)?;
         Ok(())
     }
 

@@ -42,14 +42,14 @@ pub struct LocaleConv {
     pub mon_grouping: Vec<u8>,
     pub positive_sign: Vec<u8>,
     pub negative_sign: Vec<u8>,
-    pub int_frac_digits: core::ffi::c_char,
-    pub frac_digits: core::ffi::c_char,
-    pub p_cs_precedes: core::ffi::c_char,
-    pub p_sep_by_space: core::ffi::c_char,
-    pub n_cs_precedes: core::ffi::c_char,
-    pub n_sep_by_space: core::ffi::c_char,
-    pub p_sign_posn: core::ffi::c_char,
-    pub n_sign_posn: core::ffi::c_char,
+    pub int_frac_digits: u8,
+    pub frac_digits: u8,
+    pub p_cs_precedes: u8,
+    pub p_sep_by_space: u8,
+    pub n_cs_precedes: u8,
+    pub n_sep_by_space: u8,
+    pub p_sign_posn: u8,
+    pub n_sign_posn: u8,
 }
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -192,28 +192,9 @@ unsafe fn charp_to_bytes(ptr: *mut core::ffi::c_char) -> Vec<u8> {
     feature = "host_env"
 ))]
 fn localeconv_from_lconv(lp: *mut lconv) -> LocaleConv {
-    if lp.is_null() {
-        return LocaleConv {
-            decimal_point: b".".to_vec(),
-            thousands_sep: Vec::new(),
-            grouping: Vec::new(),
-            int_curr_symbol: Vec::new(),
-            currency_symbol: Vec::new(),
-            mon_decimal_point: Vec::new(),
-            mon_thousands_sep: Vec::new(),
-            mon_grouping: Vec::new(),
-            positive_sign: Vec::new(),
-            negative_sign: Vec::new(),
-            int_frac_digits: 127,
-            frac_digits: 127,
-            p_cs_precedes: 127,
-            p_sep_by_space: 127,
-            n_cs_precedes: 127,
-            n_sep_by_space: 127,
-            p_sign_posn: 127,
-            n_sign_posn: 127,
-        };
-    }
+    // `rlocale.localeconv` reads the `lconv` pointer `localeconv()` returns.
+    // Numeric fields are `rffi.UCHAR`.
+    assert!(!lp.is_null());
     unsafe {
         LocaleConv {
             decimal_point: charp_to_bytes((*lp).decimal_point),
@@ -226,14 +207,14 @@ fn localeconv_from_lconv(lp: *mut lconv) -> LocaleConv {
             mon_grouping: charp_to_bytes((*lp).mon_grouping),
             positive_sign: charp_to_bytes((*lp).positive_sign),
             negative_sign: charp_to_bytes((*lp).negative_sign),
-            int_frac_digits: (*lp).int_frac_digits,
-            frac_digits: (*lp).frac_digits,
-            p_cs_precedes: (*lp).p_cs_precedes,
-            p_sep_by_space: (*lp).p_sep_by_space,
-            n_cs_precedes: (*lp).n_cs_precedes,
-            n_sep_by_space: (*lp).n_sep_by_space,
-            p_sign_posn: (*lp).p_sign_posn,
-            n_sign_posn: (*lp).n_sign_posn,
+            int_frac_digits: (*lp).int_frac_digits as u8,
+            frac_digits: (*lp).frac_digits as u8,
+            p_cs_precedes: (*lp).p_cs_precedes as u8,
+            p_sep_by_space: (*lp).p_sep_by_space as u8,
+            n_cs_precedes: (*lp).n_cs_precedes as u8,
+            n_sep_by_space: (*lp).n_sep_by_space as u8,
+            p_sign_posn: (*lp).p_sign_posn as u8,
+            n_sign_posn: (*lp).n_sign_posn as u8,
         }
     }
 }

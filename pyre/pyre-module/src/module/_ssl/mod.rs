@@ -689,10 +689,11 @@ mod context_methods {
         #[staticmethod]
         fn __new__(
             mut cls: PyObjectRef,
-            protocol_obj: PyObjectRef,
+            protocol: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
-            let protocol = pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::int_w(protocol_obj))?;
+            let protocol =
+                pyre_object::with_roots!(cls => pyre_interpreter::baseobjspace::int_w(protocol))?;
             let protocol = i32::try_from(protocol).map_err(|_| {
                 pyre_interpreter::PyError::value_error("invalid or unsupported protocol version")
             })?;
@@ -1473,7 +1474,9 @@ mod context_methods {
             &mut self,
             _data: PyObjectRef,
         ) -> Result<(), pyre_interpreter::PyError> {
-            Err(ssl_error("NPN is not supported by rustls"))
+            Err(pyre_interpreter::PyError::not_implemented(
+                "The NPN extension has been dropped.",
+            ))
         }
     }
 
@@ -3029,6 +3032,12 @@ fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErro
 
 fn nid2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let nid = pyre_interpreter::baseobjspace::int_w(args[0])?;
+    // `_stdssl.nid2obj`: `nid < NID_undef` (`NID_undef` is 0).
+    if nid < 0 {
+        return Err(pyre_interpreter::PyError::value_error(
+            "NID must be positive.",
+        ));
+    }
     let Ok(nid32) = i32::try_from(nid) else {
         return Err(pyre_interpreter::PyError::value_error(format!(
             "unknown NID {nid}"

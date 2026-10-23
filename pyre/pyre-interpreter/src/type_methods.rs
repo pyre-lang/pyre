@@ -6187,7 +6187,7 @@ pub fn descr_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // non-positive `tabsize` drops tabs entirely. The expanded length is
     // tracked with checked arithmetic so a pathological `tabsize` raises
     // OverflowError instead of attempting an unbounded allocation.
-    let overflow = || crate::PyError::overflow_error("result is too long");
+    let overflow = || crate::PyError::overflow_error("new string is too long");
     let mut total: i64 = 0;
     let mut col: i64 = 0;
     for cp in s.code_points() {

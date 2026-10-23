@@ -4358,7 +4358,11 @@ impl PyFrame {
     /// share this path and `STORE_NAME` / `LOAD_NAME` / `DELETE_NAME` route
     /// through `space.setitem` / `space.getitem` / `space.delitem` on it.
     #[inline]
-    pub fn setdictscope(&mut self, w_locals: PyObjectRef) -> Result<(), crate::PyError> {
+    pub fn setdictscope(
+        &mut self,
+        w_locals: PyObjectRef,
+        skip_free_vars: bool,
+    ) -> Result<(), crate::PyError> {
         // A frame with no debug block yet allocates one below, which
         // `getorcreate_debug_data` names as a collection point.  It anchors the
         // frame it is called on; `w_locals` is the caller's word and nothing
@@ -4369,7 +4373,7 @@ impl PyFrame {
         let _ = roots.pin_root(w_locals);
         let debug = self.getorcreate_debug_data(-1);
         debug.w_locals = roots.get(locals_slot);
-        self.locals2fast(false)
+        self.locals2fast(skip_free_vars)
     }
 
     /// Read the frame's locals mapping registered by `setdictscope`
@@ -7940,7 +7944,7 @@ x = 7
         frame.set_locals_w(0, pyre_object::w_int_new(1));
         frame.set_locals_w(1, pyre_object::w_int_new(2));
         let err = frame
-            .setdictscope(roots.get(map_slot))
+            .setdictscope(roots.get(map_slot), false)
             .expect_err("second name must raise");
         assert_eq!(err.kind, crate::PyErrorKind::RuntimeError);
         let still = locals_w!(frame)[0];

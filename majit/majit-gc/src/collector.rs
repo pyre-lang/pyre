@@ -381,25 +381,23 @@ fn env_is_set(varname: &str) -> bool {
 /// upstream where `int(inf)`/`r_uint(inf)` raise.
 fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     let raw = env_var(varname)?;
-    let mut value = raw.trim();
-    if value.is_empty() {
+    // env.py `_read_float_and_factor_from_env`: `if value:` (non-empty), then
+    // the suffix is the last raw character. `float(realvalue)` is what strips
+    // surrounding whitespace of the number, not a trim of the env string.
+    if raw.is_empty() {
         return None;
     }
-    // env.py:20-21 — a trailing b/B is dropped before the k/m/g check.
+    let mut value = raw.as_str();
     if value.len() > 1 && matches!(value.as_bytes().last(), Some(b'b' | b'B')) {
         value = &value[..value.len() - 1];
     }
-    if value.is_empty() {
-        return None;
-    }
-    // env.py:22-31 — a k/m/g suffix sets the factor; otherwise factor 1.
     let (number, factor) = match value.as_bytes().last().copied() {
         Some(b'k') | Some(b'K') => (&value[..value.len() - 1], 1024.0),
         Some(b'm') | Some(b'M') => (&value[..value.len() - 1], 1024.0 * 1024.0),
         Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1024.0 * 1024.0 * 1024.0),
         _ => (value, 1.0),
     };
-    let parsed = number.parse::<f64>().ok()?;
+    let parsed = number.trim().parse::<f64>().ok()?;
     Some((parsed, factor))
 }
 

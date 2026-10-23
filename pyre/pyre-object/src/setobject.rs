@@ -167,6 +167,21 @@ pub enum SetStrategyKind {
     Identity,
 }
 
+impl SetStrategyKind {
+    /// `interp_magic.py strategy` reads the concrete strategy class name.
+    #[inline]
+    pub const fn class_name(self) -> &'static str {
+        match self {
+            Self::Empty => "EmptySetStrategy",
+            Self::Object => "ObjectSetStrategy",
+            Self::Bytes => "BytesSetStrategy",
+            Self::Ascii => "AsciiSetStrategy",
+            Self::Int => "IntegerSetStrategy",
+            Self::Identity => "IdentitySetStrategy",
+        }
+    }
+}
+
 /// Failure modes of `ObjectSetStrategy.update`'s table merge.
 pub enum SetUpdateError {
     /// An equality callback raised; its concrete exception is parked in the
@@ -2538,6 +2553,15 @@ pub unsafe fn is_frozenset(obj: PyObjectRef) -> bool {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_set_or_frozenset(obj: PyObjectRef) -> bool {
     unsafe { is_set(obj) || is_frozenset(obj) }
+}
+
+/// `interp_magic.py strategy` — concrete set strategy class name.
+///
+/// # Safety
+/// `obj` must point to a live `W_SetObject`.
+#[inline]
+pub unsafe fn w_set_strategy_name(obj: PyObjectRef) -> &'static str {
+    unsafe { (*(obj as *const W_SetObject)).strategy.kind.class_name() }
 }
 
 /// Fire the write barrier on a set whose `items` field was just replaced.
@@ -5423,6 +5447,20 @@ mod tests {
 
     fn strategy_kind(obj: PyObjectRef) -> SetStrategyKind {
         unsafe { (*(obj as *const W_SetObject)).strategy.kind }
+    }
+
+    #[test]
+    fn strategy_class_name_tracks_empty_int_and_bytes() {
+        install_test_hash_hook();
+        unsafe {
+            let empty = w_set_new();
+            assert_eq!(w_set_strategy_name(empty), "EmptySetStrategy");
+            w_set_add(empty, crate::w_int_new(1));
+            assert_eq!(w_set_strategy_name(empty), "IntegerSetStrategy");
+            let bytes = w_set_new();
+            w_set_add(bytes, crate::w_bytes_from_bytes(b"ab"));
+            assert_eq!(w_set_strategy_name(bytes), "BytesSetStrategy");
+        }
     }
 
     #[test]

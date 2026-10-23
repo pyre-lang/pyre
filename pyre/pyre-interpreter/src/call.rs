@@ -6668,7 +6668,7 @@ fn build_class_inner(
     // `*mut DictStorage` w_locals.  Compiler-made `__classdict__` cells
     // close over this same object (`LOAD_LOCALS` / `STORE_DEREF`).
     let body_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-    frame.setdictscope(body_ns)?;
+    frame.setdictscope(body_ns, false)?;
 
     // Route the class body through the JIT portal (like the exec / import
     // run-sites) so a hot class-level loop can warm and compile.  The body's

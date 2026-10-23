@@ -137,9 +137,8 @@ fn hidden_applevel(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
 /// dict, list, set, or mapdict-backed instance.
 ///
 /// This is intentionally a diagnostic of the representation pyre actually
-/// uses. In particular, ascii lists and integer sets currently report their
-/// Object strategies; that makes those remaining PyPy strategy ports
-/// visible instead of hiding them behind a missing `__pypy__` function.
+/// uses. In particular, ascii lists and integer sets report the live
+/// strategy class name.
 fn strategy(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let obj = args[0];
     let _roots = pyre_object::gc_roots::push_roots();
@@ -165,10 +164,11 @@ fn strategy(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
             obj_slot,
         ))
     } {
-        // W_SetObject currently has one ObjectKey-backed representation.  The
-        // helper reports that real shape; EmptySetStrategy and
-        // IntegerSetStrategy remain explicit builtin-type porting work.
-        return Ok(pyre_object::w_str_new_managed("ObjectSetStrategy"));
+        return Ok(pyre_object::w_str_new_managed(unsafe {
+            pyre_object::setobject::w_set_strategy_name(pyre_object::gc_roots::shadow_stack_get(
+                obj_slot,
+            ))
+        }));
     }
     if let Some(name) = unsafe {
         crate::objspace::std::mapdict::mapdict_strategy_repr(

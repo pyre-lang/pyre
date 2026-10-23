@@ -219,8 +219,8 @@ pub fn decode_timeval(t: &TIMEVAL) -> f64 {
 /// `rtime.decode_timeval_ns`.
 pub fn decode_timeval_ns(t: &TIMEVAL) -> i64 {
     (t.tv_sec as i64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add((t.tv_usec as i64).saturating_mul(1000))
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add((t.tv_usec as i64).wrapping_mul(1000))
 }
 
 // `rtime.c_select` (`save_err=RFFI_SAVE_ERRNO`; default `releasegil=True`).
@@ -326,6 +326,19 @@ mod tests {
             "c_clock_getres errno {}",
             crate::rposix::get_saved_errno()
         );
+    }
+
+    #[test]
+    fn decode_timeval_ns_uses_wrapping_int64() {
+        let mut t = unsafe { std::mem::zeroed::<TIMEVAL>() };
+        t.tv_sec = i64::MAX as TIME_T;
+        t.tv_usec = 2;
+        let got = decode_timeval_ns(&t);
+        let expected = (t.tv_sec as i64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add((t.tv_usec as i64).wrapping_mul(1000));
+        assert_eq!(got, expected);
+        assert_ne!(got, i64::MAX);
     }
 
     #[test]

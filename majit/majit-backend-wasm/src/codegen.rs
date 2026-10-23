@@ -8305,7 +8305,8 @@ fn build_function(
                     // The length is a word-sized field (`Signed`/`WORD`): read it
                     // at its real width, like `bh_arraylen_gc`. A fixed i64_load
                     // would fold the next field into the high half on wasm32.
-                    emit_sized_int_load(&mut sink, len_offset, len_size, false);
+                    // `bh_arraylen_gc` passes sign=1 to `read_int_at_mem`.
+                    emit_sized_int_load(&mut sink, len_offset, len_size, true);
                     sink.local_set(value_types.local(vi));
                 }
             }
