@@ -2409,7 +2409,7 @@ pub(crate) unsafe fn str_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // `w_str_concat` joins the surrogate-aware WTF-8 views, so concatenating a
     // surrogateescape/surrogatepass-decoded string does not go through
     // `w_str_get_value` (which rejects lone surrogates).
-    Ok(pyre_object::unicodeobject::w_str_concat(a, b))
+    crate::runtime_ops::obj_or_memory_error(pyre_object::unicodeobject::w_str_concat(a, b))
 }
 
 /// Extract a non-negative repeat count from an int or long.
@@ -2555,6 +2555,9 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             pyre_object::bytesobject::w_bytes_block(b_src)
                 as *mut pyre_object::unicodeobject::Utf8Str,
         );
+        if out.is_null() {
+            return Err(crate::builtins::reservation_failed());
+        }
         return Ok(pyre_object::bytesobject::w_bytes_from_block(
             out as *const pyre_object::bytesobject::BytesBlock,
         ));
@@ -9468,6 +9471,34 @@ mod tests {
                 *w_long_get_value(result),
                 !(BigInt::from(i64::MAX) + BigInt::from(1))
             );
+        }
+    }
+
+    fn write_bytes_ll_len(s: *mut pyre_object::unicodeobject::Utf8Str, len: usize) {
+        unsafe {
+            ((s as *mut u8).add(pyre_object::lowlevel_string::LOWLEVEL_STRING_LEN_OFFSET)
+                as *mut usize)
+                .write(len);
+        }
+    }
+
+    #[test]
+    fn bytes_concat_honors_ll_strconcat_null() {
+        unsafe {
+            let a = w_bytes_from_bytes(b"a");
+            let b = w_bytes_from_bytes(b"b");
+            let a_block = w_bytes_block(a) as *mut pyre_object::unicodeobject::Utf8Str;
+            let b_block = w_bytes_block(b) as *mut pyre_object::unicodeobject::Utf8Str;
+            let orig_a = pyre_object::lowlevel_string::bh_lowlevel_string_len(a_block as i64);
+            let orig_b = pyre_object::lowlevel_string::bh_lowlevel_string_len(b_block as i64);
+            // `len1 + len2` overflow without allocating: each length is just
+            // over half of `usize::MAX` (`LLHelpers.ll_strconcat`).
+            write_bytes_ll_len(a_block, usize::MAX / 2 + 1);
+            write_bytes_ll_len(b_block, usize::MAX / 2 + 1);
+            let err = bytes_concat(a, b).unwrap_err();
+            write_bytes_ll_len(a_block, orig_a);
+            write_bytes_ll_len(b_block, orig_b);
+            assert_eq!(err.kind, PyErrorKind::MemoryError);
         }
     }
 }

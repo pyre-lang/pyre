@@ -313,6 +313,14 @@ pub enum CallTarget {
     Indirect {
         trait_root: String,
         method_name: String,
+        /// Selected call-family row (`rpbc.py FunctionsPBCRepr.call` /
+        /// `row_of_graphs.values()`), stamped by
+        /// `annotate_access_directly` so discovery and
+        /// `lower_indirect_calls` follow the specialized graphs.
+        /// Transient (`#[serde(skip)]`) — the rtyper rewrite copies it
+        /// onto [`OpKind::IndirectCall::graphs`].
+        #[serde(skip, default)]
+        graphs: Option<Vec<crate::parse::CallPath>>,
     },
     UnsupportedExpr,
 }
@@ -437,6 +445,7 @@ impl CallTarget {
         Self::Indirect {
             trait_root: trait_root.into(),
             method_name: method_name.into(),
+            graphs: None,
         }
     }
 
@@ -600,6 +609,7 @@ impl fmt::Display for CallTarget {
             CallTarget::Indirect {
                 trait_root,
                 method_name,
+                ..
             } => write!(f, "<dyn {trait_root}>::{method_name}"),
             CallTarget::UnsupportedExpr => f.write_str("<unsupported-call-expr>"),
         }
@@ -7943,6 +7953,82 @@ impl fmt::Debug for LazyGraph {
     }
 }
 
+/// Keys of `SomeInstance.flags` this pass tracks (`model.py SomeInstance`).
+///
+/// `binaryop.py pairtype(SomeInstance, SomeInstance).union` keeps a flag
+/// only when both sides have the same value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InstanceFlags {
+    pub access_directly: bool,
+    pub fresh_virtualizable: bool,
+}
+
+impl InstanceFlags {
+    pub const EMPTY: Self = Self {
+        access_directly: false,
+        fresh_virtualizable: false,
+    };
+
+    pub fn any(self) -> bool {
+        self.access_directly || self.fresh_virtualizable
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            access_directly: self.access_directly && other.access_directly,
+            fresh_virtualizable: self.fresh_virtualizable && other.fresh_virtualizable,
+        }
+    }
+}
+
+/// Annotation of `graph.getreturnvar()` for the AccessDirect flags, or
+/// `s_ImpossibleValue` when the returnblock has not been reached.
+///
+/// `annrpython.py recursivecall` returns `binding(graph.getreturnvar())`
+/// (`KeyError` → `s_ImpossibleValue`). `unionof` treats
+/// `SomeImpossibleValue` as the identity (`binaryop.py`
+/// `pairtype(SomeImpossibleValue, SomeObject).union`); known flags
+/// intersect like `SomeInstance` union. `consider_op` blocks on an
+/// impossible argument rather than binding the caller unflagged.
+/// `annrpython.py complete` leaves a never-reached return as
+/// `s_ImpossibleValue`; it does not convert blocked bindings to unflagged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlagReturn {
+    /// Returnblock not yet reached (`s_ImpossibleValue`).
+    #[default]
+    Impossible,
+    /// Returnblock reached; `SomeInstance.flags` (possibly empty).
+    Known(InstanceFlags),
+}
+
+impl FlagReturn {
+    pub const UNFLAGGED: Self = Self::Known(InstanceFlags::EMPTY);
+    pub const FLAGGED: Self = Self::Known(InstanceFlags {
+        access_directly: true,
+        fresh_virtualizable: false,
+    });
+    pub const FRESH: Self = Self::Known(InstanceFlags {
+        access_directly: true,
+        fresh_virtualizable: true,
+    });
+
+    pub fn is_flagged(self) -> bool {
+        matches!(self, Self::Known(flags) if flags.access_directly)
+    }
+
+    pub fn is_fresh(self) -> bool {
+        matches!(self, Self::Known(flags) if flags.fresh_virtualizable)
+    }
+
+    /// `unionof`: `SomeImpossibleValue` is the identity.
+    pub fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Impossible, x) | (x, Self::Impossible) => x,
+            (Self::Known(a), Self::Known(b)) => Self::Known(a.union(b)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
@@ -8040,14 +8126,17 @@ pub struct FunctionGraph {
     /// Same `None` / `Some(ids)` / shrink-only contract as
     /// `access_directly_inputs`; a subset of those formals.
     pub fresh_virtualizable_inputs: Option<Vec<u64>>,
-    /// Call-result Variable ids whose annotation carries `access_directly`.
-    /// `annrpython.py binding(op.result)` after `recursivecall` returns
-    /// `binding(graph.getreturnvar())`. Empty until a call's callee return
-    /// is flagged.
-    pub access_directly_call_results: Vec<u64>,
-    /// Whether `binding(graph.getreturnvar())` carries `access_directly`.
+    /// Call-result Variable ids with a known `SomeInstance.flags` binding
+    /// (`annrpython.py binding(op.result)` after `recursivecall` returns
+    /// `binding(graph.getreturnvar())`). Empty-flag and
+    /// `s_ImpossibleValue` results are omitted: the former is unflagged,
+    /// the latter is `consider_op` `BlockedInference`.
+    pub call_result_flags: Vec<(u64, InstanceFlags)>,
+    /// `binding(graph.getreturnvar())` for the AccessDirect flags.
     /// `annrpython.py recursivecall` reads this to flag the caller's result.
-    pub access_directly_return: bool,
+    /// Starts [`FlagReturn::Impossible`] (`s_ImpossibleValue`) until
+    /// the returnblock is reached with a known value.
+    pub return_flags: FlagReturn,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
     /// (all unset) for `FunctionGraph::new` fixtures; production
@@ -8120,6 +8209,14 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
             .cloned()
             .expect("copygraph: every block-owned Variable must be interned")
     };
+    // `flowspace/model.py copygraph.copyvar`: one varmap dict, lookup
+    // each var. These lists store Variable ids, so project that table
+    // once and remap every id through it.
+    let id_map: HashMap<u64, u64> = varmap
+        .iter()
+        .map(|(old, new)| (old.id(), new.id()))
+        .collect();
+    let remap_id = |id: &u64| id_map.get(id).copied();
     let blocks = graph
         .blocks
         .iter()
@@ -8168,37 +8265,20 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_container_root: graph.return_container_root.clone(),
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
-        access_directly_inputs: graph.access_directly_inputs.as_ref().map(|ids| {
-            ids.iter()
-                .filter_map(|id| {
-                    varmap
-                        .iter()
-                        .find(|(var, _)| var.id() == *id)
-                        .map(|(_, copied)| copied.id())
-                })
-                .collect()
-        }),
-        fresh_virtualizable_inputs: graph.fresh_virtualizable_inputs.as_ref().map(|ids| {
-            ids.iter()
-                .filter_map(|id| {
-                    varmap
-                        .iter()
-                        .find(|(var, _)| var.id() == *id)
-                        .map(|(_, copied)| copied.id())
-                })
-                .collect()
-        }),
-        access_directly_call_results: graph
-            .access_directly_call_results
+        access_directly_inputs: graph
+            .access_directly_inputs
+            .as_ref()
+            .map(|ids| ids.iter().filter_map(remap_id).collect()),
+        fresh_virtualizable_inputs: graph
+            .fresh_virtualizable_inputs
+            .as_ref()
+            .map(|ids| ids.iter().filter_map(remap_id).collect()),
+        call_result_flags: graph
+            .call_result_flags
             .iter()
-            .filter_map(|id| {
-                varmap
-                    .iter()
-                    .find(|(var, _)| var.id() == *id)
-                    .map(|(_, copied)| copied.id())
-            })
+            .filter_map(|(id, flags)| remap_id(id).map(|new_id| (new_id, *flags)))
             .collect(),
-        access_directly_return: graph.access_directly_return,
+        return_flags: graph.return_flags,
         func: graph.func.clone(),
     }
 }
@@ -8310,8 +8390,8 @@ impl FunctionGraph {
             access_directly: false,
             access_directly_inputs: None,
             fresh_virtualizable_inputs: None,
-            access_directly_call_results: Vec::new(),
-            access_directly_return: false,
+            call_result_flags: Vec::new(),
+            return_flags: FlagReturn::Impossible,
             func: FuncEffects::default(),
         }
     }
@@ -10211,6 +10291,101 @@ mod tests {
             original_ids.is_disjoint(&copied_ids),
             "copygraph must not share any operative Variable identity"
         );
+    }
+
+    /// `copygraph.copyvar` looks each var up in one varmap dict. The
+    /// AccessDirect / fresh-virtualizable / call-result lists store ids,
+    /// so `copygraph` projects that table once and remaps every list
+    /// through it (original order, drop ids the copyvar table does not
+    /// hold).
+    #[test]
+    fn copygraph_remaps_flag_id_lists_through_copyvar_varmap() {
+        let mut graph = FunctionGraph::new("copy_flag_ids");
+        let start = graph.startblock;
+        let lhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let rhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let orphan = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(start).inputargs = vec![lhs.clone(), rhs.clone()];
+        graph.block_mut(start).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::BinOp {
+                op: "int_add".into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+        let returnblock = graph.returnblock;
+        graph.block_mut(returnblock).inputargs = vec![result.copy()];
+        graph.recloseblock(
+            start,
+            vec![Link::from_variables(
+                &graph,
+                vec![result.clone()],
+                returnblock,
+                None,
+            )],
+        );
+
+        graph.access_directly = true;
+        graph.return_flags = FlagReturn::FRESH;
+        // Reverse of intern order; an id copyvar never saw is dropped.
+        graph.access_directly_inputs = Some(vec![rhs.id(), orphan.id(), lhs.id()]);
+        graph.fresh_virtualizable_inputs = Some(vec![lhs.id()]);
+        graph.call_result_flags = vec![
+            (
+                result.id(),
+                InstanceFlags {
+                    access_directly: true,
+                    fresh_virtualizable: true,
+                },
+            ),
+            (
+                orphan.id(),
+                InstanceFlags {
+                    access_directly: true,
+                    fresh_virtualizable: false,
+                },
+            ),
+        ];
+
+        let copied = copygraph(&graph);
+        let copied_lhs = &copied.block(start).inputargs[0];
+        let copied_rhs = &copied.block(start).inputargs[1];
+        let copied_result = copied.block(start).operations[0]
+            .result
+            .as_ref()
+            .expect("copied add keeps its result");
+
+        assert_ne!(copied_lhs.id(), lhs.id());
+        assert_ne!(copied_rhs.id(), rhs.id());
+        assert_ne!(copied_result.id(), result.id());
+        assert_eq!(
+            copied.access_directly_inputs.as_deref(),
+            Some([copied_rhs.id(), copied_lhs.id()].as_slice())
+        );
+        assert_eq!(
+            copied.fresh_virtualizable_inputs.as_deref(),
+            Some([copied_lhs.id()].as_slice())
+        );
+        assert_eq!(
+            copied.call_result_flags,
+            vec![(
+                copied_result.id(),
+                InstanceFlags {
+                    access_directly: true,
+                    fresh_virtualizable: true,
+                }
+            )]
+        );
+        assert_eq!(copied.return_flags, FlagReturn::FRESH);
+        assert!(copied.access_directly);
+
+        let empty = FunctionGraph::new("copy_flag_ids_empty");
+        assert!(copygraph(&empty).access_directly_inputs.is_none());
+        assert!(copygraph(&empty).fresh_virtualizable_inputs.is_none());
+        assert!(copygraph(&empty).call_result_flags.is_empty());
     }
 
     #[test]

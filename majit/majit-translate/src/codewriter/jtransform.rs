@@ -171,6 +171,12 @@ pub struct GraphTransformConfig {
     /// `rstr.py ll_int2dec` via `rint.py rtype_str`.
     #[serde(default = "default_int_str_helper")]
     pub int_str_helper: String,
+    /// The host's own `str(f)` helper, called for a `str` over a Float operand.
+    ///
+    /// Same contract as [`Self::int_str_helper`]; `rfloat.py FloatRepr.ll_str`
+    /// → `formatd`.
+    #[serde(default = "default_float_str_helper")]
+    pub float_str_helper: String,
     /// The host's own `s1 == s2` helper, called for an `eq` / `ne` over two
     /// Ref operands one of which is an rstr `STR`.
     ///
@@ -215,6 +221,15 @@ fn default_int_str_helper() -> String {
     "jit_ll_int2dec".to_string()
 }
 
+/// The [`GraphTransformConfig::float_str_helper`] default: pyre's own, in
+/// `pyre_interpreter::display`, whose address `jit_fnaddr.rs` binds.  It
+/// is `rfloat.py FloatRepr.ll_str` → `formatd` over a Float, returning
+/// `Ptr(STR)`, the same one-word `STR` residual `rfloat_call.rs`
+/// `FLOAT_RESIDUAL` names.
+fn default_float_str_helper() -> String {
+    "pyre_interpreter::display::jit_format_float_repr_rstr".to_string()
+}
+
 /// The [`GraphTransformConfig::str_eq_helper`] default, on the same terms:
 /// the `ll_streq` port over `rstr.STR` payloads.
 fn default_str_eq_helper() -> String {
@@ -240,6 +255,7 @@ impl Default for GraphTransformConfig {
             jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
             str_concat_helper: default_str_concat_helper(),
             int_str_helper: default_int_str_helper(),
+            float_str_helper: default_float_str_helper(),
             str_eq_helper: default_str_eq_helper(),
             rust_string_str_helper: default_rust_string_str_helper(),
         }
@@ -3682,6 +3698,13 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
+            } if unop_name == "str" && self.get_value_kind_var(operand) == 'f' => {
+                Some(self.config.float_str_helper.as_str())
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
             } if unop_name == "str"
                 && self.get_value_kind_var(operand) == 'r'
                 && crate::front::mir::interpolant_is_rust_heap_string(graph, operand) =>
@@ -4275,6 +4298,63 @@ impl<'a> Transformer<'a> {
                     kind: OpKind::Live,
                 });
                 RewriteResult::Replace(ops)
+            }
+            // `str` over an unboxed float. `rfloat.py FloatRepr.ll_str`
+            // lowers to `formatd` + `llstr`, a residual call returning
+            // `Ptr(STR)`. Pyre keeps leftover `str(x)` as
+            // `UnaryOp { op: "str" }` through the graph; over a Float
+            // operand it lowers to the registered float-repr helper
+            // (`rfloat_call.rs FLOAT_RESIDUAL` /
+            // `jit_format_float_repr_rstr`). The helper is
+            // `dont_look_inside` and `alloc_utf8_payload` can raise
+            // MemoryError, so the residual is `EF_CAN_RAISE` — the same
+            // extraeffect the codewriter assigns the helper's own call.
+            // Stamp `GcRef` so assembler coloring stays `'r'`. Without
+            // this the op assembles as the unwired `int_str/f>r`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str"
+                && self.get_value_kind_var(operand) == 'f'
+                && !self.config.float_str_helper.is_empty() =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
+                let target = CallTarget::function_path([self.config.float_str_helper.as_str()]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                let mut ops = vec![funcptr_op];
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Float],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![],
+                        args_r: vec![],
+                        args_f: vec![operand.clone()],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str" && self.get_value_kind_var(operand) == 'f' => {
+                self.abort_unwired_ref_result(op.result.clone())
             }
             // Leftover `str` of a Ref that is not rstr `STR`. A rust-heap
             // `String` copies into `STR` (`Repr.rtype_str` of a non-STR
@@ -13877,6 +13957,7 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
         CallTarget::Indirect {
             trait_root,
             method_name,
+            ..
         } => crate::parse::CallPath::from_segments([trait_root.as_str(), method_name.as_str()]),
         CallTarget::UnsupportedExpr => crate::parse::CallPath::from_segments(["<unsupported>"]),
     }
@@ -14523,10 +14604,17 @@ pub(crate) fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     path_segments_end_with(segments, &["lltype", name])
 }
 
-/// Residual stand-in for the GC transform's livevar reload. `rewrite_op_direct_call`
-/// folds it to the operand alias (`current_gc_ref`).
+/// Residual stand-in for the GC transform's livevar reload.
+/// `rewrite_op_direct_call` folds it to the operand alias.
+///
+/// Matched on the owner path `[.., "listobject", "current_gc_ref"]` (the
+/// FunDecl `pyre_object::listobject::current_gc_ref`, including a crate-stripped
+/// prefix) and the crate-root re-export `["pyre_object", "current_gc_ref"]`
+/// (`pub use listobject::*`). A user function named `current_gc_ref` is an
+/// ordinary call.
 pub(crate) fn is_current_gc_ref_path(segments: &[String]) -> bool {
-    segments.last().is_some_and(|s| s == "current_gc_ref")
+    path_segments_end_with(segments, &["listobject", "current_gc_ref"])
+        || segments == ["pyre_object", "current_gc_ref"]
 }
 
 /// `direct_ptradd`'s pointer argument as the front emitted it, before
@@ -18607,6 +18695,47 @@ mod tests {
         assert!(matches!(ops[3].kind, OpKind::Live));
     }
 
+    #[test]
+    fn transform_graph_lowers_float_str_to_formatd_residual_call() {
+        let (graph, x_var) = float_str_graph();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+                "pyre_interpreter::display::jit_format_float_repr_rstr",
+            ]));
+        assert!(
+            matches!(&ops[1].kind, OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr)
+        );
+        match &ops[2].kind {
+            OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets,
+            } => {
+                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
+                assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+                assert!(
+                    descriptor.extra_info.can_collect,
+                    "alloc_utf8_payload can collect; live GC refs must be rooted across the residual"
+                );
+                assert!(args_i.is_empty());
+                assert!(args_r.is_empty());
+                assert_eq!(args_f, &vec![x_var.clone()]);
+                assert_eq!(*result_kind, 'r');
+                assert!(indirect_targets.is_none());
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+        assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
     /// `str(int)` over an Int operand, as one graph, for the two tests below.
     fn int_str_graph() -> (FunctionGraph, crate::flowspace::model::Variable) {
         let mut graph = FunctionGraph::new("int_str");
@@ -18670,6 +18799,105 @@ mod tests {
         let (graph, _n_var) = int_str_graph();
         let config = GraphTransformConfig {
             int_str_helper: String::new(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "no helper is named, so nothing is called: {ops:?}",
+        );
+        assert!(
+            matches!(
+                &ops[1].kind,
+                OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::HostHelperRefused,
+                    },
+                }
+            ),
+            "the host refusal must be explicit: {ops:?}",
+        );
+        assert!(
+            matches!(&ops[2].kind, OpKind::UnaryOp { op: name, .. } if name == "str"),
+            "the original op stays residual after the abort: {ops:?}",
+        );
+    }
+
+    /// `str(float)` over a Float operand, as one graph, for the tests below.
+    fn float_str_graph() -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("float_str");
+        let x_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "str".into(),
+                    operand: x_var.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&x_var, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        (graph, x_var)
+    }
+
+    /// The callee is the host's: a pipeline that names its own float-repr
+    /// helper gets a call to that one.
+    #[test]
+    fn a_named_float_str_helper_is_the_call_target() {
+        let (graph, x_var) = float_str_graph();
+        let config = GraphTransformConfig {
+            float_str_helper: "grain_render_float".to_string(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
+        let expected = crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+            "grain_render_float",
+        ]));
+        assert!(
+            matches!(&ops[1].kind, OpKind::ConstFnAddr { value, .. } if *value == expected),
+            "the fnptr names the configured helper, not this layer's default",
+        );
+        match &ops[2].kind {
+            OpKind::CallResidual {
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                ..
+            } => {
+                assert!(args_i.is_empty());
+                assert!(args_r.is_empty());
+                assert_eq!(args_f, &vec![x_var.clone()]);
+                assert_eq!(*result_kind, 'r');
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+    }
+
+    /// An unnamed helper emits the host-refusal abort before the original op.
+    #[test]
+    fn an_unnamed_float_str_helper_aborts_before_the_original_op() {
+        let (graph, _x_var) = float_str_graph();
+        let config = GraphTransformConfig {
+            float_str_helper: String::new(),
             ..Default::default()
         };
         let transformed = Transformer::new(&config).transform(&graph);
@@ -18923,6 +19151,31 @@ mod tests {
             ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. })),
             "leftover ref add aborts: {ops:?}",
         );
+    }
+
+    /// `str` of a Float must not assemble as `int_str/f>r`.
+    /// `rfloat.py FloatRepr.ll_str` is `formatd`; leftover unary `str`
+    /// residualizes to the float-repr helper with the operand in `args_f`.
+    #[test]
+    fn a_float_str_is_not_int_str() {
+        let (graph, operand) = float_str_graph();
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op: name, .. } if name == "str")),
+            "leftover float str must not stay UnaryOp (int_str/f>r): {ops:?}",
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Abort { .. })),
+            "default float_str_helper residualizes, it does not abort: {ops:?}",
+        );
+        match &ops[2].kind {
+            OpKind::CallResidual { args_f, .. } => {
+                assert_eq!(args_f, &vec![operand.clone()]);
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
     }
 
     /// `str` of a Ref that is not `Ptr(STR)` must not assemble as `int_str/r>r`.
@@ -25497,6 +25750,88 @@ mod tests {
                 ),
                 "ordinary call to {name} must not alias its argument"
             );
+        }
+    }
+
+    /// `current_gc_ref` is identified by its owner path, not the leaf.
+    /// A user function of that name is an ordinary call.
+    #[test]
+    fn current_gc_ref_matches_owner_path_not_leaf() {
+        let user: Vec<String> = ["user", "current_gc_ref"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !is_same_as_identity_call_path(&user),
+            "ordinary call to current_gc_ref must not alias its argument"
+        );
+
+        let helpers: [&[&str]; 2] = [
+            &["pyre_object", "listobject", "current_gc_ref"],
+            &["pyre_object", "current_gc_ref"],
+        ];
+        for segs in helpers {
+            let segments: Vec<String> = segs.iter().map(|s| (*s).to_string()).collect();
+            assert!(
+                is_same_as_identity_call_path(&segments),
+                "helper spelling {segs:?} is an identity call path"
+            );
+        }
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("current_gc_ref_calls");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_ty = ValueType::Ref(None);
+
+        let user_target = CallTarget::function_path(["user", "current_gc_ref"]);
+        let user_result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let user_op = SpaceOperation {
+            result: Some(user_result),
+            kind: OpKind::Call {
+                target: user_target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        assert!(
+            !matches!(
+                transformer.rewrite_op_direct_call(
+                    &user_op,
+                    &user_target,
+                    std::slice::from_ref(&arg),
+                    &result_ty,
+                    "current_gc_ref_calls",
+                    &mut graph,
+                ),
+                RewriteResult::Identity(_)
+            ),
+            "ordinary call to current_gc_ref must not alias its argument"
+        );
+
+        for segs in helpers {
+            let target = CallTarget::function_path(segs.iter().copied());
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            let rewritten = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                "current_gc_ref_calls",
+                &mut graph,
+            );
+            match rewritten {
+                RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+                _ => panic!("expected Identity alias for {segs:?}"),
+            }
         }
     }
 

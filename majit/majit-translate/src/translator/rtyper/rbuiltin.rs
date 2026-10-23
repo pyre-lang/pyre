@@ -2372,7 +2372,8 @@ pub fn rtype_builtin_unichr_as_utf8(
 
 /// `get_raw_address_of_string(s)` — the front's
 /// `__majit_get_raw_address_of_string` spelling of
-/// `rffi.get_raw_address_of_string`.  Returns `CCHARP`.
+/// `rffi.py get_raw_address_of_string`.  The `string` argument is a
+/// SomeString converted by `rstr.string_repr`.  Returns `CCHARP`.
 pub fn rtype_builtin_get_raw_address_of_string(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
@@ -2381,8 +2382,10 @@ pub fn rtype_builtin_get_raw_address_of_string(
         CCHARP, build_ll_get_raw_address_of_string_helper_graph,
     };
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    use crate::translator::rtyper::rstr::string_repr;
 
-    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&*STRPTR)])?;
+    let r_str = string_repr();
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_str.as_ref())])?;
     hop.exception_cannot_occur()?;
     let helper = hop.rtyper.lowlevel_helper_function_with_builder(
         "ll_get_raw_address_of_string".to_string(),
@@ -5203,6 +5206,71 @@ mod tests {
         HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops)
     }
 
+    /// `simple_call(get_raw_address_of_string, arg)` hop after
+    /// `BuiltinFunctionRepr` has popped the callable.  `arg` is a
+    /// SomeString variable or a byte-string constant; `rstr.string_repr`
+    /// is the source repr (`rffi.py get_raw_address_of_string`).
+    fn get_raw_address_of_string_hop(
+        arg: Hlvalue,
+    ) -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        HighLevelOp,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomeString;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::rstr::string_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "simple_call",
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        let r_str: Arc<dyn Repr> = string_repr();
+        hop.args_v.borrow_mut().push(arg);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::String(SomeString::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(r_str));
+        (ann, hop)
+    }
+
+    fn assert_get_raw_address_direct_call(hop: &HighLevelOp, result: &Hlvalue) {
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert_eq!(&ops.ops[0].result, result);
+        let Hlvalue::Variable(v) = result else {
+            panic!("direct_call result is a Variable, got {result:?}");
+        };
+        assert_eq!(v.concretetype(), Some((*CCHARP).clone()));
+        let Hlvalue::Constant(func) = &ops.ops[0].args[0] else {
+            panic!("direct_call arg0 is the helper");
+        };
+        let rendered = format!("{:?}", func.value);
+        assert!(
+            rendered.contains("ll_get_raw_address_of_string"),
+            "must call ll_get_raw_address_of_string, got {rendered}"
+        );
+    }
+
     fn typer_calls_exception_cannot_occur(
         hop: &HighLevelOp,
         _kwds_i: &HashMap<String, usize>,
@@ -6549,6 +6617,42 @@ mod tests {
         let hop = dummy_hop();
         let err = rtype_builtin_unichr(&hop, &HashMap::new()).unwrap_err();
         assert!(err.to_string().contains("rtype_builtin_unichr"));
+    }
+
+    #[test]
+    fn rtype_builtin_get_raw_address_of_string_converts_somestring_variable_via_string_repr() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rstr::string_repr;
+
+        let r_str = string_repr();
+        let v = Variable::new();
+        v.set_concretetype(Some(r_str.lowleveltype().clone()));
+        let (_ann, hop) = get_raw_address_of_string_hop(Hlvalue::Variable(v));
+        let result = rtype_builtin_get_raw_address_of_string(&hop, &HashMap::new())
+            .expect("rtype")
+            .expect("direct_call result");
+        assert_get_raw_address_direct_call(&hop, &result);
+    }
+
+    #[test]
+    fn rtype_builtin_get_raw_address_of_string_converts_constant_string_via_string_repr() {
+        use crate::translator::rtyper::rstr::string_repr;
+
+        let (_ann, hop) = get_raw_address_of_string_hop(Hlvalue::Constant(
+            Constant::with_concretetype(ConstValue::ByteStr(b"fmt".to_vec()), LowLevelType::Void),
+        ));
+        let result = rtype_builtin_get_raw_address_of_string(&hop, &HashMap::new())
+            .expect("rtype")
+            .expect("direct_call result");
+        assert_get_raw_address_direct_call(&hop, &result);
+        let ops = hop.llops.borrow();
+        match &ops.ops[0].args[1] {
+            Hlvalue::Constant(c) => {
+                assert!(matches!(c.value, ConstValue::LLPtr(_)));
+                assert_eq!(c.concretetype.as_ref(), Some(string_repr().lowleveltype()));
+            }
+            other => panic!("constant string must convert to an LLPtr, got {other:?}"),
+        }
     }
 
     #[test]

@@ -4478,23 +4478,23 @@ pub fn funccall_valuestack(
         && fast_natural_arity == crate::BuiltinCodeFlags::PASSTHROUGHARGS1.bits() as usize
         && nargs >= 1
     {
-        let w_obj = frame.peekvalue(nargs - 1);
-        let rest = frame.make_arguments(nargs - 1, false, func);
         // Same live-variable set as the fixed-arity arm above, for the same
         // two reasons: `dropvalues()` retires the frame slots that root these
-        // values, and `args_w` is a native Vec no root walker updates.
-        // `builtin_code_call` roots nothing of its own, so the whole
-        // `[code, w_obj, ...rest]` set has to be published here and read back
-        // for the call.
+        // values, and the native Vec is not a root walker target.
+        // `builtin_code_call` roots nothing of its own, so pin `code` first,
+        // then read the `[w_obj, ...rest]` window from the live frame and
+        // publish it in one `pin_roots`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = _roots.base();
         let _ = _roots.pin_root(code as PyObjectRef);
-        let _ = _roots.pin_root(w_obj);
-        let _ = _roots.pin_roots(&rest);
+        let mut args = unsafe { &*caller.live() }.make_arguments(nargs, false, func);
+        let _ = _roots.pin_roots(&args.arguments_w);
         unsafe { &mut *caller.live() }.dropvalues(dropvalues);
-        let mut args_w = vec![pyre_object::PY_NULL; nargs];
-        pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args_w);
-        return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args_w) } {
+        pyre_object::gc_roots::shadow_stack_copy_range_into_vec(
+            root_base + 1,
+            &mut args.arguments_w,
+        );
+        return match unsafe { crate::builtin_code_call(_roots.get(root_base), &args.arguments_w) } {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);
@@ -4505,7 +4505,7 @@ pub fn funccall_valuestack(
 
     // function.py:201-203 — fallback: build Arguments via make_arguments
     // (carries methodcall + w_function for diagnostics) and dispatch through
-    // call_args.
+    // Function.call_args (`getcode().funcrun`).
     //
     // `dropvalues` retires the frame slots, so pin `func` and the
     // `peekvalues` slice on the shadow stack (`framework.py push_roots`)
@@ -4525,11 +4525,17 @@ pub fn funccall_valuestack(
     let _ = _roots.pin_root(func);
     let mut args =
         unsafe { &*caller.live() }.make_arguments(nargs, methodcall, _roots.get(root_base));
-    let _ = _roots.pin_roots(&args);
+    let _ = _roots.pin_roots(&args.arguments_w);
     unsafe { &mut *caller.live() }.dropvalues(dropvalues);
     let func_now = _roots.get(root_base);
-    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args);
-    funccall(func_now, &args)
+    pyre_object::gc_roots::shadow_stack_copy_range_into_vec(root_base + 1, &mut args.arguments_w);
+    match crate::call::function_call_args(func_now, &args) {
+        Ok(v) => v,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            pyre_object::PY_NULL
+        }
+    }
 }
 
 /// function.py `_flat_pycall` — create frame directly from stack.
@@ -4872,6 +4878,86 @@ mod tests {
             <Function as pyre_object::lltype::GcType>::SIZE,
             std::mem::size_of::<Function>()
         );
+    }
+
+    /// `argument.py ArgErrTooManyMethod.getmsg` is reached from
+    /// `function.py funccall_valuestack` via `pyframe.py make_arguments`
+    /// storing `methodcall` on `Arguments`. A bound-method arity error
+    /// whose first parameter is not named `self` appends the forgotten-self
+    /// hint; a matching `self` parameter, and a plain function call, do not.
+    #[test]
+    fn funccall_valuestack_methodcall_arity_error_carries_self_hint() {
+        crate::test_hooks::install_hash_hook();
+        let source = "\
+class A:
+    def f0():
+        pass
+    def f1(x):
+        pass
+    def fself(self):
+        pass
+def g0():
+    pass
+try:
+    A().f0()
+except TypeError as e:
+    r_f0 = str(e)
+try:
+    A().f1(1)
+except TypeError as e:
+    r_f1 = str(e)
+try:
+    A().fself(1)
+except TypeError as e:
+    r_fself = str(e)
+try:
+    g0(1)
+except TypeError as e:
+    r_g0 = str(e)
+";
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("methodcall arity snippet");
+        let w_globals = frame.get_w_globals();
+        let get = |name: &str| {
+            let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
+            unsafe { pyre_object::w_str_get_wtf8(value) }
+                .as_str()
+                .expect(name)
+                .to_string()
+        };
+        let r_f0 = get("r_f0");
+        let r_f1 = get("r_f1");
+        let r_fself = get("r_fself");
+        let r_g0 = get("r_g0");
+        assert!(
+            r_f0.contains("Did you forget 'self' in the function definition?"),
+            "f0: {r_f0}"
+        );
+        assert!(
+            r_f1.contains("Did you forget 'self' in the function definition?"),
+            "f1: {r_f1}"
+        );
+        assert!(
+            !r_fself.contains("Did you forget 'self'"),
+            "fself: {r_fself}"
+        );
+        assert!(!r_g0.contains("Did you forget 'self'"), "g0: {r_g0}");
+        assert_eq!(
+            r_f0,
+            "A.f0() takes 0 positional arguments but 1 was given. Did you forget 'self' in the function definition?"
+        );
+        assert_eq!(
+            r_f1,
+            "A.f1() takes 1 positional argument but 2 were given. Did you forget 'self' in the function definition?"
+        );
+        assert_eq!(
+            r_fself,
+            "A.fself() takes 1 positional argument but 2 were given"
+        );
+        assert_eq!(r_g0, "g0() takes 0 positional arguments but 1 was given");
     }
 
     /// `FUNCTION_GC_PTR_OFFSETS` must list every inline

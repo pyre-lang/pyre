@@ -22860,7 +22860,7 @@ unsafe fn property_no_accessor(prop: PyObjectRef, obj: PyObjectRef, kind: &str) 
     // the field without `space.str`. `w_name` alone chooses the named
     // format — `fget.__name__` is `property.__name__`'s getter, not this
     // path. `%R` is eager: `OpErrFmt` on `PyErrorObject` stores one `%T`
-    // (`w_fmt_x0`); a mixed `%R`+`%s` payload has no extra slots, so
+    // (`fmt_x0`); a mixed `%R`+`%s` payload has no extra slots, so
     // `_compute_value` runs here, including `'<repr raised>'` +
     // `write_unraisable` when `space.repr` fails.
     // `W_Property._properror` (`descriptor.py`) builds the message via

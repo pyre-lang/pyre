@@ -2648,17 +2648,19 @@ impl SemanticFunctionHeader {
         } else {
             dont_look_inside_return_token(&signature.output, llbc, error_carrier, gc_struct_ids)
         };
-        // `dont_look_inside_return_token` spells a raw scalar address as
-        // `i64`, which [`scalar_result_token`] would stamp onto every
-        // ordinary function. A cast of an integer to `*mut usize`
-        // (`HashStateStorage::as_mut_ptr`) still has CFG kind `ref`, and
-        // `func_result_kind` rejects the stamp. Residual and trait-method
-        // callees take `stamp_return_token` and keep the token, so a stub
-        // matches the call result.
+        // `dont_look_inside_return_token` spells a raw address word as
+        // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
+        // pointer, or a declared-Raw ADT pointer
+        // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`).
+        // `scalar_result_token` matches that spelling. Ordinary
+        // looked-inside graphs keep FUNC.RESULT unstamped so
+        // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
+        // Residual and trait-method callees take `stamp_return_token` and
+        // keep the token, so a stub matches the call result.
         let mut return_type = if gcref_result || stamp_return_token {
             signature_token
         } else if signature_token.as_deref().is_some_and(scalar_result_token)
-            && !output_is_raw_scalar_address(&signature.output, llbc, error_carrier)
+            && !output_is_raw_address_word(&signature.output, llbc, error_carrier, gc_struct_ids)
         {
             signature_token
         } else {
@@ -6529,6 +6531,10 @@ fn simplify_lowered_graph_expanding(
     // eagerly so the direct-scan passes see the same surface
     // `iterblocks()` exposes upstream.
     crate::model::clear_unreachable_blocks(graph);
+    // `reload_top_root` / `try_gc_current_object_address` are gctransform
+    // identities pyre spells in source. Peel a `cast(x, GCREF)` that only
+    // feeds them so the annotator sees `x` (`peel_recast_to_source`).
+    crate::front::result_exc::retarget_gc_erasure_identity_args(graph);
     // Rust's `ptr::write(raw as *mut T, T { .. })` is the source spelling of
     // RPython's already-allocated object followed by one setfield per member.
     // Lower that aggregate copy before allocation fusion so generic
@@ -25597,12 +25603,23 @@ impl<'a> Lowering<'a> {
                 // `ll_chr2str` / `ll_int2dec`). A string-family receiver is
                 // the identity arm below. A missing receiver type still
                 // takes this arm: the dest is `String`, and identity would
-                // alias a non-string header.
+                // alias a non-string header. A Float receiver is excluded:
+                // `rfloat.py` `FloatRepr.ll_str` / `floatobject.py`
+                // `float_repr` residualizes through
+                // `rfloat_call::repr_residual_path`.
                 if args.len() == 1
                     && self.is_to_string_path(&reg)
                     && !first_arg_ty
                         .as_ref()
                         .is_some_and(|ty| tyref_is_string_family(ty, self.llbc))
+                    && !first_arg_ty.as_ref().is_some_and(|ty| {
+                        to_string_receiver_is_float(
+                            ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                        )
+                    })
                 {
                     let res = self
                         .graph
@@ -28285,6 +28302,34 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
                                         .to_string(),
                                 ],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::str::<Impl>::len` on a string-family receiver
+                // is `len(s)` = `ll_strlen` (`rstr.py
+                // AbstractStringRepr.rtype_len`), planted as the
+                // `__strlen` marker the rtyper adapter and `jtransform`
+                // both lower. Slice/Vec/Wtf8 `len` have their own arms.
+                if args.len() == 1
+                    && self.is_str_len(&reg, first_arg_ty.as_ref(), const_arg_ty.as_ref())
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
@@ -37266,6 +37311,33 @@ impl<'a> Lowering<'a> {
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next();
         if leaf != Some("as_ptr") || !path.split("::").any(|seg| seg == "str") {
+            return false;
+        }
+        first_arg_ty.or(const_arg_ty).is_some_and(|ty| {
+            tyref_is_string_family(ty, self.llbc) || tyref_strips_to_str(ty, self.llbc)
+        })
+    }
+
+    /// `core::str::<Impl>::len` on a string-family receiver is
+    /// `len(s)` = `ll_strlen` (`rstr.py AbstractStringRepr.rtype_len`),
+    /// planted as the `__strlen` marker the rtyper adapter and
+    /// `jtransform` both lower. Slice/Vec/Wtf8 `len` have their own
+    /// arms.
+    fn is_str_len(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        const_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        if leaf != Some("len") || !path.split("::").any(|seg| seg == "str") {
             return false;
         }
         first_arg_ty.or(const_arg_ty).is_some_and(|ty| {
@@ -60745,6 +60817,29 @@ fn output_is_raw_scalar_address(
     false
 }
 
+/// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a raw
+/// address word: a primitive scalar pointer, or a declared-Raw ADT
+/// pointer (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`).
+/// Ordinary looked-inside functions skip the `i64` FUNC.RESULT stamp
+/// for these.
+fn output_is_raw_address_word(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    if output_is_raw_scalar_address(output, llbc, spec) {
+        return true;
+    }
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    let kind_src = payload.as_ref().unwrap_or(output);
+    ty_is_raw_address(kind_src, llbc, gc_struct_ids)
+}
+
 /// `ty` itself is a Charon primitive scalar, not a pointer to one.
 fn tyref_is_primitive_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
@@ -64241,6 +64336,32 @@ fn scalar_result_token(token: &str) -> bool {
     matches!(token, "bool" | "i64" | "u64" | "f32" | "f64")
 }
 
+/// FUNC.RESULT token for a non-unit tuple return: `Tuple<t0,t1,…>` of
+/// each element's residual token. `model.py SomeTuple` / `rtuple.py`.
+/// `None` when `ty` is not a non-unit tuple.
+fn tuple_residual_return_token(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<String> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let stripped = TyRef::Other(node.clone());
+    if tyref_tuple_suffix(&stripped, llbc).is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut idx = 0usize;
+    while let Some(elem) = tyref_tuple_element(&stripped, idx, llbc) {
+        items.push(
+            dont_look_inside_return_token(&elem, llbc, spec, gc_struct_ids)
+                .unwrap_or_else(|| "()".to_string()),
+        );
+        idx += 1;
+    }
+    (!items.is_empty()).then(|| format!("Tuple<{}>", items.join(",")))
+}
+
 /// Encode the FUNC.RESULT of a `dont_look_inside` callee into the
 /// canonical `FunctionGraph.return_type` token the rtyper stub
 /// classifier (`cutover.rs` `dont_look_inside` arm) decodes, so the
@@ -64305,6 +64426,14 @@ fn dont_look_inside_return_token(
         .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
     {
         return Some("u64".to_string());
+    }
+    // A function-return tuple is `model.py SomeTuple` (`rtuple.py`).
+    // Stamp each element's residual token *before* `tyref_to_value_type`
+    // collapses the ADT to `Ref` / `"ref"` — a two-word
+    // `(PyObjectRef, PyObjectRef)` is not one GC word, and the collector
+    // would skip that `"ref"` as multiword.
+    if let Some(token) = tuple_residual_return_token(kind_src, llbc, spec, gc_struct_ids) {
+        return Some(token);
     }
     let token =
         match tyref_to_value_type_with(kind_src, llbc, no_tombstoned_leaves(), gc_struct_ids) {
@@ -78574,6 +78703,23 @@ pub(crate) fn interpolant_is_rust_heap_string(
         })
 }
 
+/// True when a `ToString::to_string` receiver is a float kind, looking
+/// through `&`/`&mut`. `tyref_to_value_type_with` yields Ref for `&f64`;
+/// [`tyref_deref_value_type_with`] peels that borrow. `FloatRepr.ll_str`
+/// (`rfloat.py`) / `float_repr` (`floatobject.py`) residualizes through
+/// [`crate::front::rfloat_call::repr_residual_path`].
+fn to_string_receiver_is_float(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    matches!(
+        tyref_deref_value_type_with(ty, llbc, tombstoned, gc_struct_ids),
+        crate::model::ValueType::Float | crate::model::ValueType::SingleFloat
+    )
+}
+
 fn str_render_kind(operand: &crate::flowspace::model::Variable) -> crate::model::OpKind {
     use crate::model::{OpKind, ValueType};
     // `Repr.rtype_str`: int → `ll_int2dec`, rstr `STR` → identity,
@@ -81226,10 +81372,11 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, adt_field_read_value_type, bitflags_trait_empty_const,
         cast_call_segments, cast_kind_is_raw_ptr, cast_pointer_marker_op,
-        charon_type_value_to_ast_string, decode_literal, fn_ptr_family_for,
-        int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-        primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
+        charon_type_value_to_ast_string, decode_literal, dont_look_inside_return_token,
+        fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
+        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, no_tombstoned_leaves, primitive_float_const,
+        push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
         simplify_lowered_graph, static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
         tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
@@ -84068,6 +84215,129 @@ mod tests {
         assert_eq!(
             tyref_ref_param_class_root(&tupled, &fn_llbc, no_tombstoned_leaves(), None),
             Some(shaped)
+        );
+        let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+            std::collections::HashSet::new();
+        assert_eq!(
+            dont_look_inside_return_token(
+                &by_value,
+                &llbc,
+                crate::ErrorCarrierSpec::default(),
+                &empty_gc,
+            )
+            .as_deref(),
+            Some("Tuple<i64,bool>"),
+            "a pair tuple must keep SomeTuple items, not collapse to ref"
+        );
+    }
+
+    /// A declared-Raw ADT pointer is a raw address word (`history.py`
+    /// `getkind` of a raw `Ptr` is `"int"`), so
+    /// `dont_look_inside_return_token` is `"raw:Owner"` — the int-bank
+    /// token `raw_address_owner_root` names. An ordinary looked-inside
+    /// function leaves FUNC.RESULT unstamped; the CFG return of
+    /// `get_raw_owner` is a reference (`flatten.py` `make_return`).
+    /// Residual callees keep the token through `stamp_return_token`.
+    #[test]
+    fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
+        use std::collections::{HashMap, HashSet};
+        let owner = struct_decl(0, ident_path(&["fixture", "Owner"]), i64_field(), false);
+        let fun = |def_id: u64, leaf: &str, output: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": fixture_item_meta(ident_path(&["fixture", leaf])),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": output
+                },
+                "body": "Opaque"
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [owner],
+                "fun_decls": [
+                    fun(0, "get_raw_owner", serde_json::json!({
+                        "RawPtr": [
+                            {"Adt": {"id": 0, "generics": {
+                                "regions": [], "types": [],
+                                "const_generics": [], "trait_refs": []
+                            }, "builtin": null}},
+                            "Const"
+                        ]
+                    })),
+                    fun(1, "returns_i64", serde_json::json!({
+                        "Scalar": {"Integer": {"Signed": "I64"}}
+                    }))
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let empty_gc: HashSet<majit_ir::descr::StructId> = HashSet::new();
+        let empty_names: HashSet<String> = HashSet::new();
+        let empty_hints: HashMap<String, Vec<String>> = HashMap::new();
+        let spec = crate::ErrorCarrierSpec::default();
+        let header_of = |fd: &majit_charon_reader::ullbc::FunDecl| {
+            super::SemanticFunctionHeader::new(
+                &llbc,
+                fd,
+                fd.item_meta
+                    .name_path()
+                    .rsplit("::")
+                    .next()
+                    .unwrap()
+                    .to_string(),
+                "fixture".into(),
+                &fd.signature,
+                &empty_names,
+                &empty_names,
+                &empty_names,
+                &empty_hints,
+                spec,
+                &empty_gc,
+                &format!(
+                    "fixture::{}",
+                    fd.item_meta.name_path().rsplit("::").next().unwrap()
+                ),
+            )
+        };
+
+        let ptr_fd = llbc.fn_by_id(0).expect("get_raw_owner");
+        assert_eq!(
+            dont_look_inside_return_token(&ptr_fd.signature.output, &llbc, spec, &empty_gc)
+                .as_deref(),
+            Some("raw:Owner"),
+            "declared-Raw ADT pointer stays an int-bank residual token"
+        );
+        let ptr_header = header_of(ptr_fd);
+        assert_ne!(
+            ptr_header.return_type.as_deref(),
+            Some("i64"),
+            "ordinary looked-inside declared-Raw ADT pointer must not stamp FUNC.RESULT=i64"
+        );
+        assert!(
+            ptr_header.return_type.is_none(),
+            "CFG kind r is kept by leaving FUNC.RESULT unstamped, got {:?}",
+            ptr_header.return_type
+        );
+
+        let i64_fd = llbc.fn_by_id(1).expect("returns_i64");
+        assert_eq!(
+            dont_look_inside_return_token(&i64_fd.signature.output, &llbc, spec, &empty_gc)
+                .as_deref(),
+            Some("i64")
+        );
+        assert_eq!(
+            header_of(i64_fd).return_type.as_deref(),
+            Some("i64"),
+            "a machine i64 result still stamps FUNC.RESULT"
         );
     }
 
@@ -110198,6 +110468,39 @@ mod tests {
         );
     }
 
+    /// A Float `to_string` receiver, including `&f64`, is excluded from
+    /// `UnaryOp("str")`. Int/Bool/Char and a non-float Ref are not.
+    #[test]
+    fn to_string_receiver_is_float_looks_through_refs() {
+        use majit_charon_reader::ullbc::TyRef;
+        let llbc = empty_llbc();
+        let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let tomb = super::no_tombstoned_leaves();
+        let is_float = |ty: &TyRef| super::to_string_receiver_is_float(ty, &llbc, tomb, &gc);
+        let ty = |value: serde_json::Value| -> TyRef { serde_json::from_value(value).unwrap() };
+        assert!(is_float(&ty(
+            serde_json::json!({"Scalar": {"Float": "F64"}})
+        )));
+        assert!(is_float(&ty(serde_json::json!({
+            "Ref": ["Erased", {"Scalar": {"Float": "F64"}}, "Shared"]
+        }))));
+        assert!(is_float(&ty(serde_json::json!({
+            "Ref": [
+                "Erased",
+                {"Ref": ["Erased", {"Scalar": {"Float": "F64"}}, "Shared"]},
+                "Shared"
+            ]
+        }))));
+        assert!(!is_float(&ty(
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})
+        )));
+        assert!(!is_float(&ty(serde_json::json!({"Scalar": "Bool"}))));
+        assert!(!is_float(&ty(serde_json::json!({"Scalar": "Char"}))));
+        assert!(!is_float(&ty(serde_json::json!({
+            "Ref": ["Erased", {"Scalar": {"Integer": {"Signed": "I64"}}}, "Shared"]
+        }))));
+    }
+
     /// PyPy `float_repr` reaches `rfloat.formatd`, whose translated return is
     /// one low-level string pointer. The real interpreter LLBC must therefore
     /// retarget RustPython's three-word `String` formatter to the one-word
@@ -110213,6 +110516,14 @@ mod tests {
         let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
         let graph =
             super::lower_function(&llbc, "format_float_repr").expect("lower format_float_repr");
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "str")),
+            "float to_string must not lower to UnaryOp str (int_str/f>r): {graph:#?}"
+        );
         let paths: Vec<Vec<String>> = graph
             .blocks
             .iter()
@@ -115703,7 +116014,7 @@ mod tests {
         );
     }
 
-    /// `PyError::new` initializes four `PyObjectRef` fields with
+    /// `PyError::new` initializes three `PyObjectRef` fields with
     /// `null_mut()`. These are typed nullable W_Root slots, not erased root
     /// references; each aggregate write must consume a PyObject-narrowed
     /// value so `InstanceRepr._setup_repr` and later reads agree.
@@ -115718,7 +116029,7 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "pyre_interpreter::error::<Impl>::new")
             .expect("lower PyError::new");
-        for field_name in ["exc_object", "w_name_context", "w_obj_context", "w_fmt_x0"] {
+        for field_name in ["exc_object", "w_name_context", "w_obj_context"] {
             let value = graph
                 .blocks
                 .iter()
@@ -120917,6 +121228,29 @@ mod tests {
         assert!(
             !graph_calls_leaf(&graph, "as_ptr"),
             "str::as_ptr must not remain residual, graph: {graph:#?}"
+        );
+    }
+
+    #[test]
+    fn str_len_rewrites_to_strlen_marker() {
+        let dest = usize_ty();
+        let graph = super::lower_function(
+            &std_extern_call_fixture(
+                "str_len",
+                &["core", "str", "<Impl>", "len"],
+                &[str_ref_ty()],
+                dest,
+            ),
+            "str_len",
+        )
+        .expect("lower str::len");
+        assert!(
+            graph_calls_leaf(&graph, "__strlen"),
+            "str::len must rewrite to __strlen, graph: {graph:#?}"
+        );
+        assert!(
+            !graph_calls_leaf(&graph, "len"),
+            "str::len must not remain residual, graph: {graph:#?}"
         );
     }
 

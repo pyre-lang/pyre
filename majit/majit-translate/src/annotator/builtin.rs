@@ -533,6 +533,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "pyre_object.gc_roots.reload_top_root_at",
         gc_root_reload_identity,
     );
+    analyzer_for(
+        &mut reg,
+        "pyre_object.gc_hook.try_gc_current_object_address",
+        gc_root_reload_identity,
+    );
     // `rlib/debug.py` — the assertion half of `check_not_access_directly`.
     analyzer_for(
         &mut reg,
@@ -1969,15 +1974,11 @@ fn cast_instance_intrinsic(
         };
     }
     if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+        // `lltype.py ann_cast_opaque_ptr` always returns the destination
+        // annotation. A GC-erasure identity around the cast
+        // (`reload_top_root`, `try_gc_current_object_address`) is peeled
+        // before annotation (`retarget_gc_erasure_identity_args`).
         return match operand {
-            // A pin/reload of a flagged virtualizable is an identity at
-            // annotation time (`gctransform` has not yet erased the type).
-            // Projecting to GCREF would drop `access_directly`.
-            SomeValue::Instance(inst)
-                if inst.flags.get("access_directly").copied().unwrap_or(false) =>
-            {
-                Ok(operand.clone())
-            }
             SomeValue::String(_)
             | SomeValue::Instance(_)
             | SomeValue::List(_)
@@ -2268,23 +2269,45 @@ fn jit_hint_access_directly(
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Ok(hint_virtualizable_flags(args_s, false))
+    Ok(hint_virtualizable_flags(args_s))
 }
 
 /// RPython `rlib/jit.py`, same entry, for the `fresh_virtualizable=True`
 /// spelling.
 ///
-/// Upstream carries both kwargs on one call and asserts against the lone
-/// form — `assert s_access_directly, "lone fresh_virtualizable hint"`. Pyre
-/// splits the call in two, so this helper sets BOTH flags rather than
-/// `fresh_virtualizable` alone; the state upstream asserts against is then
-/// unreachable instead of merely undiagnosed.
+/// Upstream carries both kwargs on one call, asserts
+/// `access_directly` on the kwarg shape, then for a non-`SomeInstance`
+/// or a class whose `classdesc.get_param('_virtualizable_')` is None
+/// returns `s_x` unchanged. Pyre splits that call into nested helpers
+/// `hint_fresh_virtualizable(hint_access_directly(x))`. The inner helper
+/// is the `access_directly=True` kwarg; this helper is the
+/// `fresh_virtualizable=True` kwarg. A virtualizable instance that does
+/// not already carry `access_directly` is the lone-fresh assertion.
 fn jit_hint_fresh_virtualizable(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    Ok(hint_virtualizable_flags(args_s, true))
+    let Some(Some(s_x)) = args_s.first() else {
+        return Ok(s_impossible_value());
+    };
+    let s_x = super::model::not_const(s_x);
+    let SomeValue::Instance(inst) = &s_x else {
+        return Ok(s_x);
+    };
+    if !instance_is_virtualizable(inst) {
+        return Ok(s_x);
+    }
+    if !inst.flags.get("access_directly").copied().unwrap_or(false) {
+        return Err(AnnotatorError::new("lone fresh_virtualizable hint"));
+    }
+    let mut flags = inst.flags.clone();
+    flags.insert("fresh_virtualizable".to_string(), true);
+    Ok(SomeValue::Instance(super::model::SomeInstance::new(
+        inst.classdef.clone(),
+        inst.can_be_none,
+        flags,
+    )))
 }
 
 /// Identity of the reloaded root (`gctransform` insert after annotate).
@@ -2309,13 +2332,16 @@ fn instance_is_virtualizable(inst: &SomeInstance) -> bool {
     })
 }
 
-/// Bind `access_directly` / `fresh_virtualizable` onto a reconstructed
-/// startblock cell the way `annrpython.py bindinputargs` copies the
-/// actual's `SomeInstance.flags`. The recorded formal ids
-/// (`FunctionGraph.access_directly_inputs` /
-/// `fresh_virtualizable_inputs`) are the filter; `unionof` already
-/// intersected them across callers. `fresh_virtualizable=True` sets
-/// both flags (`rlib/jit.py` hint).
+/// Stamp `access_directly` (and `fresh_virtualizable` when `fresh`) on
+/// whatever `SomeInstance` is given. This function filters nothing:
+/// callers pass only the cells of formals recorded in
+/// `FunctionGraph.access_directly_inputs` /
+/// `fresh_virtualizable_inputs`. The production caller is
+/// `derive_subject_inputcells`. Copies the flags the way
+/// `annrpython.py bindinputargs` copies the actual's
+/// `SomeInstance.flags`. `unionof` already intersected the recorded
+/// ids across callers. `fresh_virtualizable=True` sets both flags
+/// (`rlib/jit.py` hint).
 pub(crate) fn stamp_bound_virtualizable_flags(s: &mut SomeValue, fresh: bool) {
     let SomeValue::Instance(inst) = s else {
         return;
@@ -2326,9 +2352,9 @@ pub(crate) fn stamp_bound_virtualizable_flags(s: &mut SomeValue, fresh: bool) {
     }
 }
 
-/// The body both `hint` spellings share — `rlib/jit.py`'s
+/// The body of the `access_directly=True` spelling — `rlib/jit.py`'s
 /// `SomeInstance` branch.
-fn hint_virtualizable_flags(args_s: &[Option<SomeValue>], fresh_virtualizable: bool) -> SomeValue {
+fn hint_virtualizable_flags(args_s: &[Option<SomeValue>]) -> SomeValue {
     let Some(Some(s_x)) = args_s.first() else {
         // `hint` is an identity on its argument; with nothing bound there is
         // nothing to annotate and nothing to flag.
@@ -2343,9 +2369,6 @@ fn hint_virtualizable_flags(args_s: &[Option<SomeValue>], fresh_virtualizable: b
     let mut flags = inst.flags.clone();
     if instance_is_virtualizable(inst) {
         flags.insert("access_directly".to_string(), true);
-        if fresh_virtualizable {
-            flags.insert("fresh_virtualizable".to_string(), true);
-        }
     } else {
         flags.remove("access_directly");
         flags.remove("fresh_virtualizable");
@@ -3428,12 +3451,15 @@ mod tests {
     fn the_hint_mints_access_directly_on_a_virtualizable() {
         let bk = bk();
         let s = instance_of(&bk, "PyFrame", true, &[]);
-        let out = hint_virtualizable_flags(&[Some(s)], false);
+        let out = hint_virtualizable_flags(&[Some(s)]);
         assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
     }
 
     /// `annrpython.py bindinputargs` copies the actual's flags onto the
-    /// reconstructed cell; the recorded formal ids are the filter.
+    /// reconstructed cell. Callers pass only the cells of formals
+    /// recorded in `FunctionGraph.access_directly_inputs` /
+    /// `fresh_virtualizable_inputs`; this helper stamps whatever
+    /// `SomeInstance` it is given.
     #[test]
     fn stamp_bound_virtualizable_flags_copies_access_directly() {
         let bk = bk();
@@ -3456,13 +3482,35 @@ mod tests {
         );
     }
 
-    /// The `fresh_virtualizable` spelling carries `access_directly` with it,
-    /// so the lone form upstream asserts against is unreachable.
+    /// `rlib/jit.py` `assert access_directly, "lone fresh_virtualizable hint"`:
+    /// a virtualizable instance that does not already carry `access_directly`.
     #[test]
-    fn the_fresh_virtualizable_hint_carries_access_directly_too() {
+    fn lone_fresh_virtualizable_hint_is_an_error() {
         let bk = bk();
         let s = instance_of(&bk, "PyFrame", true, &[]);
-        let out = hint_virtualizable_flags(&[Some(s)], true);
+        let err = jit_hint_fresh_virtualizable(&bk, &[Some(s)], &HashMap::new()).unwrap_err();
+        assert_eq!(err.msg.as_deref(), Some("lone fresh_virtualizable hint"));
+    }
+
+    /// Upstream returns `s_x` unchanged when the class did not declare
+    /// `_virtualizable_`.
+    #[test]
+    fn fresh_virtualizable_on_a_non_virtualizable_leaves_the_annotation() {
+        let bk = bk();
+        let s = instance_of(&bk, "Plain", false, &[]);
+        let out = jit_hint_fresh_virtualizable(&bk, &[Some(s.clone())], &HashMap::new())
+            .expect("non-virtualizable is a passthrough");
+        assert_eq!(out, super::super::model::not_const(&s));
+    }
+
+    /// Nested spelling: the inner helper minted `access_directly`, the
+    /// outer helper adds `fresh_virtualizable`.
+    #[test]
+    fn fresh_virtualizable_on_an_access_directly_instance_adds_the_flag() {
+        let bk = bk();
+        let s = instance_of(&bk, "PyFrame", true, &["access_directly"]);
+        let out = jit_hint_fresh_virtualizable(&bk, &[Some(s)], &HashMap::new())
+            .expect("input already carries access_directly");
         assert_eq!(
             flags_of(&out),
             vec![
@@ -3483,14 +3531,14 @@ mod tests {
             false,
             &["access_directly", "fresh_virtualizable", "other"],
         );
-        let out = hint_virtualizable_flags(&[Some(s)], false);
+        let out = hint_virtualizable_flags(&[Some(s)]);
         assert_eq!(flags_of(&out), vec!["other".to_string()]);
     }
 
-    /// A GCREF recast of a flagged virtualizable is the pin/reload identity
-    /// at annotation time: the flag must still be on the result.
+    /// An explicit GCREF cast is `ann_cast_opaque_ptr`: the destination
+    /// SomePtr, even when the operand carries `access_directly`.
     #[test]
-    fn cast_instance_gcref_keeps_access_directly_on_the_operand() {
+    fn cast_instance_gcref_of_access_directly_instance_is_someptr() {
         let bk = bk();
         let flagged = instance_of(&bk, "PyFrame", true, &["access_directly"]);
         let s_root = {
@@ -3503,7 +3551,10 @@ mod tests {
         let out =
             cast_instance_intrinsic(&bk, &[Some(flagged.clone()), Some(s_root)], &HashMap::new())
                 .expect("GCREF recast of a flagged instance");
-        assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
+        assert!(
+            matches!(out, SomeValue::Ptr(_)),
+            "GCREF must project dest as SomePtr, got {out:?}"
+        );
     }
 
     #[test]
@@ -3513,6 +3564,58 @@ mod tests {
         let out = gc_root_reload_identity(&bk, &[Some(flagged.clone())], &HashMap::new())
             .expect("reload is an identity");
         assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
+    }
+
+    /// `PyFrame::live_mut` after the GCREF pair is peeled: identity of
+    /// `self`, then the same-class back-cast, keeps `access_directly`.
+    #[test]
+    fn live_mut_forwarding_lookup_keeps_access_directly() {
+        let bk = bk();
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "LiveMutFrame".to_string(),
+            vec![("pycode".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("LiveMutFrame")
+            .expect("LiveMutFrame classdef");
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("access_directly".to_string(), true);
+        let flagged = SomeValue::Instance(SomeInstance::new(Some(classdef), false, flags));
+
+        let s_gcref = {
+            let mut s = crate::annotator::model::s_str0();
+            s.set_const_box(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::byte_str("GCREF"),
+            ));
+            s
+        };
+        let projected = cast_instance_intrinsic(
+            &bk,
+            &[Some(flagged.clone()), Some(s_gcref)],
+            &HashMap::new(),
+        )
+        .expect("GCREF recast of a flagged instance");
+        assert!(
+            matches!(projected, SomeValue::Ptr(_)),
+            "GCREF must project dest as SomePtr, got {projected:?}"
+        );
+
+        let current = gc_root_reload_identity(&bk, &[Some(flagged.clone())], &HashMap::new())
+            .expect("try_gc_current_object_address is an identity");
+        assert_eq!(flags_of(&current), vec!["access_directly".to_string()]);
+
+        let s_frame = {
+            let mut s = crate::annotator::model::s_str0();
+            s.set_const_box(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::byte_str("LiveMutFrame"),
+            ));
+            s
+        };
+        let live = cast_instance_intrinsic(&bk, &[Some(current), Some(s_frame)], &HashMap::new())
+            .expect("back-cast to LiveMutFrame");
+        assert_eq!(flags_of(&live), vec!["access_directly".to_string()]);
     }
 
     /// `rlib/debug.py` asserts; the port raises instead of dropping the
@@ -3540,7 +3643,7 @@ mod tests {
     #[test]
     fn the_hint_leaves_a_non_instance_alone() {
         let s = SomeValue::Integer(SomeInteger::default());
-        let out = hint_virtualizable_flags(&[Some(s.clone())], false);
+        let out = hint_virtualizable_flags(&[Some(s.clone())]);
         assert_eq!(out, super::super::model::not_const(&s));
     }
 
@@ -3688,6 +3791,9 @@ mod tests {
         ));
         assert!(is_registered("pyre_object.gc_roots.reload_top_root"));
         assert!(is_registered("pyre_object.gc_roots.reload_top_root_at"));
+        assert!(is_registered(
+            "pyre_object.gc_hook.try_gc_current_object_address"
+        ));
         assert!(is_registered("rpython.rlib.objectmodel.instantiate"));
         assert!(is_registered("rpython.rlib.objectmodel.hlinvoke"));
         assert!(is_registered("weakref.ref"));

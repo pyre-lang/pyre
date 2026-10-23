@@ -960,9 +960,10 @@ impl CodeWriter {
         //   NON_VOID_ARGS = [ARG for ARG in FUNC.ARGS if ARG is not lltype.Void]
         //   calldescr = cpu.calldescrof(FUNC, NON_VOID_ARGS, FUNC.RESULT,
         //                               EffectInfo.MOST_GENERAL)
-        // Arg kinds and the result kind come from the function type. The
-        // flattened CFG return kind must agree; a disagreement is a hard
-        // error in every build (`graph_result_kind` is that colour).
+        // Arg kinds and the result kind come from the function type
+        // (`call.py get_jitcode_calldescr` reads FUNC.RESULT). A live
+        // CFG colour that disagrees is a hard error; a Void CFG return
+        // is `s_ImpossibleValue` / `impossible_repr`, not FUNC.RESULT.
         {
             let arg_classes = match callcontrol.declared_non_void_arg_classes(path) {
                 Some(classes) => classes,
@@ -973,18 +974,16 @@ impl CodeWriter {
             // A body that only aborts never assigns the return place
             // (`|| missing_hash_hook()`, `FnOnce::call_once` → `i64`).
             // `annrpython.py` `complete` binds that return var to
-            // `s_ImpossibleValue`; it is not `FUNC.RESULT`. The call
-            // descriptor still reads the function type
+            // `s_ImpossibleValue`; unfollowed return vars stay Void
+            // even when a dead link still targets `returnblock`.
+            // That Void is not `FUNC.RESULT`. The call descriptor
+            // still reads the function type
             // (`call.py` `get_jitcode_calldescr`).
-            let cfg_kind = match declared_kind {
-                Some(declared)
-                    if declared != cfg_kind
-                        && returnblock_predecessor_count(rewritten_graph) == 0 =>
-                {
-                    declared
-                }
-                _ => cfg_kind,
-            };
+            let cfg_kind = reconcile_impossible_return(
+                declared_kind,
+                cfg_kind,
+                returnblock_predecessor_count(rewritten_graph),
+            );
             let result_type =
                 func_result_kind(rewritten_graph.name.as_str(), declared_kind, cfg_kind);
             // `map_type_to_argclass(SingleFloat) == 'S'` while `getkind` is
@@ -1422,6 +1421,16 @@ fn cfg_non_void_arg_classes(graph: &FunctionGraph) -> String {
     arg_classes
 }
 
+/// `s_ImpossibleValue.rtyper_makerepr` is `impossible_repr` (Void).
+/// `get_jitcode_calldescr` still stamps FUNC.RESULT. A Void CFG return
+/// (or a returnblock with no predecessor) is not a live kind disagreement.
+fn reconcile_impossible_return(declared: Option<char>, cfg_kind: char, pred_count: usize) -> char {
+    match declared {
+        Some(declared) if declared != cfg_kind && (cfg_kind == 'v' || pred_count == 0) => declared,
+        _ => cfg_kind,
+    }
+}
+
 /// `call.py` `get_jitcode_calldescr` result kind is `FUNC.RESULT`.
 /// When the declaration is present it must equal the CFG return colour.
 fn func_result_kind(graph_name: &str, declared: Option<char>, cfg_kind: char) -> char {
@@ -1517,6 +1526,23 @@ mod result_kind_tests {
     fn func_result_kind_uses_the_function_type_when_it_matches() {
         assert_eq!(func_result_kind("g", Some('r'), 'r'), 'r');
         assert_eq!(func_result_kind("g", None, 'i'), 'i');
+    }
+
+    /// Unfollowed / impossible return vars stay Void; the calldescr is
+    /// still FUNC.RESULT (`get_jitcode_calldescr`).
+    #[test]
+    fn void_cfg_return_uses_declared_func_result() {
+        assert_eq!(reconcile_impossible_return(Some('i'), 'v', 2), 'i');
+        assert_eq!(reconcile_impossible_return(Some('i'), 'v', 0), 'i');
+        assert_eq!(reconcile_impossible_return(Some('r'), 'i', 1), 'i');
+        assert_eq!(
+            func_result_kind(
+                "w_dict_delitem_object_strategy",
+                Some('i'),
+                reconcile_impossible_return(Some('i'), 'v', 2)
+            ),
+            'i'
+        );
     }
 
     /// `|| missing_hash_hook()` aborts. Nothing links to `returnblock`,

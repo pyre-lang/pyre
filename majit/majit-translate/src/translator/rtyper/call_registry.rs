@@ -312,11 +312,17 @@ impl FunctionEntry {
 /// The per-graph publish reads this back instead of re-running the real path,
 /// reproducing upstream's `translator.annotate()` → `rtyper.specialize()` →
 /// `codewriter.make_jitcodes()` phase ordering (`driver.py:306/345/361`).
+#[derive(Clone)]
 pub struct TwoPhaseSubject {
     /// The lifted subject graph itself. Phase B rtypes this graph in place;
     /// retaining the `GraphRef` lets post-rtype consumers inspect the exact
     /// low-level operations that succeeded.
     pub graph: crate::flowspace::model::GraphRef,
+    /// The annotator's `PyGraph` for an AccessDirect subject: the origin
+    /// FunctionDesc's `cachedgraph((AccessDirect, None))` entry. Publish
+    /// identity-checks this against the desc cache (`Rc::ptr_eq`). Regular
+    /// subjects leave it empty.
+    pub pygraph: Option<Rc<PyGraph>>,
     pub graph_key: crate::flowspace::model::GraphKey,
     pub value_to_var: crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
     pub value_to_var_candidates:
@@ -877,8 +883,8 @@ impl CallRegistry {
     /// `leaf__inst_<types>` (`annlowlevel.specialize` /
     /// `getfunctionptr`); `collect_policy_opaque_fn_stubs_from_llbc`
     /// only registers the template FunDecl. Copy the template's
-    /// residual signature and annotator stub graph onto this path so
-    /// the caller can annotate, while the instantiation keeps a
+    /// residual signature, annotator stub graph, and funcobj onto this
+    /// path so the caller can annotate, while the instantiation keeps a
     /// distinct callable identity.
     ///
     /// `func_with_new_name` copies `_annspecialcase_`. `newfuncdesc`
@@ -886,6 +892,13 @@ impl CallRegistry {
     /// `specialize_argtype` before the codewriter residualizes
     /// (`policy.py look_inside_graph`). Sharing the template stub
     /// `Rc` would `mergeinputargs` Instance ∪ Tuple on one startblock.
+    ///
+    /// `sourcetools.py func_with_new_name` copies `__dict__` (including
+    /// `_jit_look_inside_`) onto the renamed function. `specialize.py
+    /// default_specialize` then reads that attribute off
+    /// `funcdesc.pyobj`. A blank `GraphFunc::new` would drop every hint
+    /// and mint an `(AccessDirect, key)` graph for a
+    /// `dont_look_inside` trait-default method.
     fn materialize_residual_inst(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         let template_segs = residual_inst_template_segments(key.segments())?;
         let template = self.lookup_residual_template(&template_segs)?;
@@ -936,7 +949,7 @@ impl CallRegistry {
     }
 
     /// [`Self::lookup`] over the entries made so far.
-    fn lookup_registered(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
+    pub(crate) fn lookup_registered(&self, key: &FunctionPathKey) -> Option<Rc<FunctionEntry>> {
         let entry = self.entries.borrow().get(key).cloned();
         if entry.is_some() {
             return entry;
@@ -992,6 +1005,16 @@ impl CallRegistry {
         let mut keys = vec![canonical.clone()];
         keys.extend(aliases);
         keys
+    }
+
+    /// The canonical `entries` key that owns `entry`, if this registry
+    /// created it. Aliases resolve through [`Self::lookup_registered`];
+    /// [`Self::alias`] needs the canonical key.
+    pub(crate) fn canonical_key_of(&self, entry: &Rc<FunctionEntry>) -> Option<FunctionPathKey> {
+        self.entries
+            .borrow()
+            .iter()
+            .find_map(|(key, existing)| Rc::ptr_eq(existing, entry).then(|| key.clone()))
     }
 
     /// Same as [`Self::lookup`] with a narrowly-scoped cross-module
@@ -1142,6 +1165,14 @@ impl CallRegistry {
     /// "create once, share thereafter" contract at
     /// `bookkeeper.py`).
     ///
+    /// Existing-entry identity is [`Self::lookup_registered`] (exact
+    /// key plus `alias` rows), not the stripping [`Self::lookup`].
+    /// `Bookkeeper.getdesc` keys by `Constant(pyobj)` identity; a
+    /// `crate::m::f` spelling is the same callable only when populate
+    /// registered it as an alias (`canonical_dedup_key` /
+    /// `free_function_alias_paths`). Callsite resolution still uses
+    /// [`Self::lookup`].
+    ///
     /// Re-registration with a *different* `Signature` panics — upstream
     /// `description.py FunctionDesc.__init__` binds the signature
     /// to the underlying Python function object once at creation time,
@@ -1151,7 +1182,7 @@ impl CallRegistry {
     /// than silently route the second caller through the first
     /// caller's signature.
     pub fn get_or_register(&self, key: FunctionPathKey, signature: Signature) -> Rc<FunctionEntry> {
-        if let Some(existing) = self.lookup(&key) {
+        if let Some(existing) = self.lookup_registered(&key) {
             assert_eq!(
                 existing.function_desc.borrow().signature,
                 signature,
@@ -1163,6 +1194,24 @@ impl CallRegistry {
                 key.segments(),
             );
             return existing.clone();
+        }
+        // `annlowlevel.specialize` / `getfunctionptr` name residual
+        // instantiations `leaf__inst_<types>`. `lookup_registered` does
+        // not strip a crate root (`bookkeeper.py` `getdesc` identity);
+        // it also does not materialize. Minting `GraphFunc::new` would
+        // drop `_annspecialcase_` (`specialize.py` `specialize_argtype`).
+        if let Some(existing) = self.materialize_residual_inst(&key) {
+            assert_eq!(
+                existing.function_desc.borrow().signature,
+                signature,
+                "CallRegistry.get_or_register: conflicting signatures for \
+                 FunctionPath {:?} — FunctionDesc.__init__ binds the \
+                 signature to the underlying function object once at \
+                 creation time, so a single callable cannot legally \
+                 project to two distinct signatures.",
+                key.segments(),
+            );
+            return existing;
         }
         let name = key.name().to_string();
         // upstream `description.py FunctionDesc.__init__` reads
@@ -1363,7 +1412,7 @@ impl CallRegistry {
 /// (`annlowlevel.specialize` shares the specialized graph's signature
 /// with the declaration) and binds each instantiation to its own
 /// FunctionDesc (`getfunctionptr`).
-fn residual_inst_template_leaf(leaf: &str) -> Option<&str> {
+pub(crate) fn residual_inst_template_leaf(leaf: &str) -> Option<&str> {
     let (stem, rest) = leaf.split_once("__inst_")?;
     if stem.is_empty() || rest.is_empty() {
         return None;
@@ -1563,6 +1612,83 @@ mod tests {
         });
     }
 
+    /// `annlowlevel.specialize` / `getfunctionptr` mint a distinct
+    /// FunctionDesc per residual instantiation. That copy must keep the
+    /// template funcobj's `_jit_look_inside_` so `specialize.py
+    /// default_specialize` strips `access_directly` instead of creating
+    /// an `(AccessDirect, key)` graph.
+    #[test]
+    fn residual_inst_of_dont_look_inside_template_strips_access_directly() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = CallRegistry::new(bk);
+        let template_sig = signature(&["self"]);
+        let mut template_func =
+            GraphFunc::new("dispatch", Constant::new(ConstValue::Dict(HashMap::new())));
+        template_func._jit_look_inside_ = Some(false);
+        template_func._jit_unroll_safe_ = true;
+        let template = registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(["TraitOps", "dispatch"]),
+            template_sig.clone(),
+            template_func,
+        );
+        template.prefill_default_cache(make_pygraph("dispatch", template_sig.clone()));
+
+        let inst = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "TraitOps",
+                "dispatch__inst_Receiver",
+            ]))
+            .expect("residual inst binds the template stub");
+        let inst_func = inst
+            .host_object
+            .user_function()
+            .expect("residual inst HostObject is a user function");
+        assert_eq!(
+            inst_func._jit_look_inside_,
+            Some(false),
+            "func_with_new_name copies `_jit_look_inside_` onto the inst desc"
+        );
+        assert!(
+            inst_func._jit_unroll_safe_,
+            "func_with_new_name copies every funcobj hint, not only look-inside"
+        );
+
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("access_directly".into(), true);
+        let mut inputcells = vec![Some(SomeValue::Instance(SomeInstance::new(
+            None, false, flags,
+        )))];
+        let graph = inst
+            .function_desc
+            .borrow()
+            .specialize(&mut inputcells, None)
+            .unwrap()
+            .expect_graph()
+            .unwrap();
+        assert!(!graph.access_directly.get());
+        assert!(
+            inst.function_desc
+                .borrow()
+                .cached_access_direct_none()
+                .is_none()
+        );
+        assert!(
+            !inst
+                .function_desc
+                .borrow()
+                .cache
+                .borrow()
+                .keys()
+                .any(GraphCacheKey::is_access_direct)
+        );
+        match &inputcells[0] {
+            Some(SomeValue::Instance(cell)) => {
+                assert!(!cell.flags.contains_key("access_directly"))
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
     #[test]
     fn lookup_hits_a_stripped_foreign_body_crate_prefix() {
         crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
@@ -1742,6 +1868,175 @@ mod tests {
                 .expect_graph()
                 .unwrap();
             assert!(!Rc::ptr_eq(&g_inst, &g_tuple));
+        });
+    }
+
+    #[test]
+    fn get_or_register_residual_inst_keeps_template_argtype() {
+        // `get_or_register` keys by callable identity (`bookkeeper.py
+        // Bookkeeper.getdesc`) and must not strip a crate root. An
+        // `__inst_` spelling is still `annlowlevel.specialize` /
+        // `getfunctionptr`: `materialize_residual_inst` copies
+        // `_annspecialcase_` via `func_with_new_name`. A blank
+        // `GraphFunc::new` would `default_specialize` and
+        // `mergeinputargs` `SomeRustVec` ∪ `SomeList`.
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            use crate::annotator::argument::ArgumentsForTranslation;
+            use crate::annotator::listdef::ListDef;
+            use crate::annotator::model::{SomeInteger, SomeList, SomeRustVec};
+            use crate::annotator::policy::Specializer;
+
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let registry = CallRegistry::new(ann.bookkeeper.clone());
+            let mut func = GraphFunc::new(
+                "gc_alloc_young_storage_box",
+                Constant::new(ConstValue::Dict(HashMap::new())),
+            );
+            func.annspecialcase = Some("specialize:argtype(0)".into());
+            func._jit_look_inside_ = Some(false);
+            let sig = signature(&["value", "tid"]);
+            let template = registry.get_or_register_with_func(
+                FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "gc_storage",
+                    "gc_alloc_young_storage_box",
+                ]),
+                sig.clone(),
+                func,
+            );
+            template.prefill_default_cache(stub_pygraph_with_formals(
+                "pyre_object::gc_storage::gc_alloc_young_storage_box",
+                sig.clone(),
+            ));
+
+            let inst_key = FunctionPathKey::from_segments([
+                "gc_storage",
+                "gc_alloc_young_storage_box__inst_tuple",
+            ]);
+            let inst_entry = registry.get_or_register(inst_key, sig.clone());
+            assert!(
+                matches!(
+                    inst_entry.function_desc.borrow().specializer.as_ref(),
+                    Some(Specializer::Argtype { parms }) if parms == &["0".to_string()]
+                ),
+                "get_or_register of a residual inst must copy specialize:argtype"
+            );
+
+            let list = SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::default()),
+                false,
+                false,
+            )));
+            let rustvec =
+                SomeValue::RustVec(SomeRustVec::new(SomeValue::Integer(SomeInteger::default())));
+            let tid = SomeValue::Integer(SomeInteger::default());
+            inst_entry
+                .function_desc
+                .borrow()
+                .pycall(
+                    None,
+                    &ArgumentsForTranslation::new(
+                        vec![Some(list.clone()), Some(tid.clone())],
+                        None,
+                        None,
+                    ),
+                    &SomeValue::Impossible,
+                    None,
+                )
+                .expect("list pycall");
+            inst_entry
+                .function_desc
+                .borrow()
+                .pycall(
+                    None,
+                    &ArgumentsForTranslation::new(
+                        vec![Some(rustvec.clone()), Some(tid)],
+                        None,
+                        None,
+                    ),
+                    &SomeValue::Impossible,
+                    None,
+                )
+                .expect("rustvec pycall");
+            let g_list = inst_entry
+                .function_desc
+                .borrow()
+                .specialize(
+                    &mut vec![Some(list), Some(SomeValue::Integer(SomeInteger::default()))],
+                    None,
+                )
+                .expect("list specialize")
+                .expect_graph()
+                .unwrap();
+            let g_vec = inst_entry
+                .function_desc
+                .borrow()
+                .specialize(
+                    &mut vec![
+                        Some(rustvec),
+                        Some(SomeValue::Integer(SomeInteger::default())),
+                    ],
+                    None,
+                )
+                .expect("rustvec specialize")
+                .expect_graph()
+                .unwrap();
+            assert!(
+                !Rc::ptr_eq(&g_list, &g_vec),
+                "List and RustVec must not share the unique default graph"
+            );
+        });
+    }
+
+    #[test]
+    fn get_or_register_does_not_reuse_bare_entry_for_crate_qualified_key() {
+        // `lookup` strips a leading `crate` / local-crate root so a
+        // callsite can resolve the same FunctionDesc. `get_or_register`
+        // must not: `Bookkeeper.getdesc` keys by `Constant(pyobj)`
+        // identity (`bookkeeper.py`). Crate-qualified spellings of one
+        // callable become the same desc only through `alias` (populate
+        // `canonical_dedup_key` / GraphStore `free_function_alias_paths`).
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let bk = Rc::new(Bookkeeper::new());
+            let registry = CallRegistry::new(bk);
+            let sig = signature(&["x"]);
+            let bare =
+                registry.get_or_register(FunctionPathKey::from_segments(["m", "f"]), sig.clone());
+            let crate_key = FunctionPathKey::from_segments(["crate", "m", "f"]);
+            let crate_entry = registry.get_or_register(crate_key.clone(), sig.clone());
+            assert!(
+                !Rc::ptr_eq(&bare, &crate_entry),
+                "get_or_register(crate::m::f) must not reuse the bare m::f entry"
+            );
+            let local_key = FunctionPathKey::from_segments(["pyre_interpreter", "m", "f"]);
+            let local_entry = registry.get_or_register(local_key, sig.clone());
+            assert!(
+                !Rc::ptr_eq(&bare, &local_entry),
+                "get_or_register(local_crate::m::f) must not reuse the bare m::f entry"
+            );
+            assert_eq!(registry.len(), 3);
+
+            let other =
+                registry.get_or_register(FunctionPathKey::from_segments(["n", "g"]), sig.clone());
+            let stripped_hit = registry
+                .lookup(&FunctionPathKey::from_segments(["crate", "n", "g"]))
+                .expect("lookup still strips for callsite resolution");
+            assert!(
+                Rc::ptr_eq(&other, &stripped_hit),
+                "stripped lookup must keep resolving an unregistered crate spelling"
+            );
+
+            let canonical = FunctionPathKey::from_segments(["p", "h"]);
+            let aliased = registry.get_or_register(canonical.clone(), sig.clone());
+            let alias = FunctionPathKey::from_segments(["crate", "p", "h"]);
+            registry.alias(alias.clone(), &canonical);
+            let via_alias = registry.get_or_register(alias, sig);
+            assert!(
+                Rc::ptr_eq(&aliased, &via_alias),
+                "get_or_register must reuse a registered crate-qualified alias"
+            );
+            assert_eq!(registry.len(), 5);
         });
     }
 

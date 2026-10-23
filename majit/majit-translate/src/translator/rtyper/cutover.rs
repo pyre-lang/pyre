@@ -52,10 +52,12 @@ use std::rc::Rc;
 use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
-    AlwaysInline, Block, BlockRefExt, ConstValue, Constant, GraphFunc, Hlvalue, Link, Variable,
+    AlwaysInline, Block, BlockRefExt, ConstValue, Constant, GraphFunc, GraphKey, GraphRef, Hlvalue,
+    Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::FunctionGraph as LegacyGraph;
+use crate::translator::backendopt::inline::collect_called_graphs;
 use crate::translator::rtyper::call_registry::{CallRegistry, FunctionEntry, FunctionPathKey};
 use crate::translator::rtyper::call_registry::{
     exception_object_result_annotation, is_exception_object_materializer,
@@ -65,6 +67,7 @@ use crate::translator::rtyper::flowspace_adapter::{
     FlowspaceAdapterOutput, LegacyToTyped, LegacyToTypedCandidates,
 };
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::translator::TranslationContext;
 
 /// The `graph.return_type` marker the front-end stamps on a
 /// `dont_look_inside` callee that returns `*mut PyObject` (a
@@ -326,7 +329,7 @@ pub(crate) fn dual_gate_check_with_registry(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drive_subject(legacy_graph, call_registry, true)
     }));
-    let (graph, mut real_value_to_var, mut real_constants) = match result {
+    let (graph, real_value_to_var, real_constants) = match result {
         Ok(Ok((graph, value_to_var, _, constants, _))) => (graph, value_to_var, constants),
         Ok(Err(e)) => {
             unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
@@ -390,19 +393,13 @@ pub(crate) fn dual_gate_check_with_registry(
             "dual-gate compared set empty".to_string(),
         ));
     }
-    // `follow_link` records `links_followed` only for an edge the
-    // annotator walks (`annrpython.py`). Phase B still
-    // `setconcretetype`s an unfollowed Variable to `Void` after
-    // `force_return_var_annotation` seeds `s_ImpossibleValue`.
-    // Publishing that twin would replace the legacy walker's kind
-    // (`func_result_kind` of a return, `getcalldescr` NON_VOID_ARGS of
-    // a residual call). A followed Variable typed `Void` still
-    // diverges above and skips.
-    keep_legacy_kind_when_unfollowed_void(
-        &mut real_value_to_var,
-        &mut real_constants,
-        excluded_legacy.as_ref(),
-    );
+    // Unfollowed Variables may be typed Void
+    // (`force_return_var_annotation` seeds `s_ImpossibleValue`;
+    // `SomeImpossibleValue.rtyper_makerepr` is `impossible_repr`).
+    // A Void value has no register; residual args drop it
+    // (`jtransform.py add_in_correct_list`, `call.py getcalldescr`
+    // NON_VOID_ARGS). A followed Variable typed Void still diverges
+    // above and skips.
     Ok(DualGateOutcome::Match {
         real_value_to_var,
         real_constants,
@@ -2428,35 +2425,31 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // user graph — silently, with the four reasons below indistinguishable
     // from one another at the callsite.
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
-    // Dedupe by canonical path — RPython `Bookkeeper.getdesc(pyobj)`
-    // (`bookkeeper.py`) returns the *same* FunctionDesc for
-    // any reference to the same callable, keyed by `Constant(pyobj)`
-    // identity. This port's `function_graphs: HashMap<CallPath, FunctionGraph>`
-    // can carry the same callable under multiple keys (`lib.rs`
-    // registers free functions under both their canonical path AND a
-    // `crate::`-prefixed alias for callsite matching); without dedupe,
-    // each path key would create a separate HostObject / FunctionDesc
-    // pair, violating upstream's "create once, share thereafter"
-    // contract.
+    // Dedupe by GraphStore funcobj identity, then by canonical path —
+    // RPython `Bookkeeper.getdesc(pyobj)` (`bookkeeper.py`) returns the
+    // *same* FunctionDesc for any reference to the same callable, keyed
+    // by `Constant(pyobj)` identity. GraphStore already shares one
+    // `GraphKey` across `free_function_alias_paths` spellings of one
+    // funcobj (leaf, module-qualified, crate-prefixed). `canonical_dedup_key`
+    // only strips a leading crate root, so `["foo"]` and `["eval", "foo"]`
+    // would otherwise mint two FunctionDescs for one pyobj.
     //
-    // The dedupe key strips a leading crate-prefix segment so the alias
-    // spellings registered by `lib.rs` for each free function (`[mod, foo]`,
-    // `[crate, mod, foo]`, `[loaded_crate, mod, foo]`, and a harvested
-    // foreign-body crate such as `[core, mod, foo]`) collapse to a
-    // single canonical entry `[mod, foo]`. Stripping only `crate` (the
-    // previous heuristic) left the external crate-name aliases as distinct canonical
-    // entries with distinct `Rc<FunctionEntry>` HostObjects, and
-    // `lookup_with_leaf_match`'s multi-match convergence check
-    // (`all_same` on `host_object` Arc identity) then failed —
-    // callsites like `["crate", "w_str_new"]` (a `use crate::w_str_new`
-    // bare callsite from another module) found four matches with four
-    // distinct hosts and rejected the cluster. Stripping all registered
-    // prefixes preserves the rule that genuinely distinct
-    // functions in different modules (`a::foo` vs `b::foo`) stay
-    // separate (`a` / `b` aren't in the stripped set), and the
-    // bare-name dedupe trap (using `FunctionGraph::name`) is still
-    // avoided because we key on the post-strip segment sequence, not
-    // on the bare leaf.
+    // The crate-prefix strip still collapses `[mod, foo]`, `[crate, mod, foo]`,
+    // `[loaded_crate, mod, foo]`, and a harvested foreign-body crate such as
+    // `[core, mod, foo]` when GraphKey is not yet known.
+    // Stripping only `crate` (the previous heuristic) left the external
+    // crate-name aliases as distinct canonical entries with distinct
+    // `Rc<FunctionEntry>` HostObjects, and `lookup_with_leaf_match`'s
+    // multi-match convergence check (`all_same` on `host_object` Arc
+    // identity) then failed — callsites like `["crate", "w_str_new"]`
+    // (a `use crate::w_str_new` bare callsite from another module) found
+    // four matches with four distinct hosts and rejected the cluster.
+    // Stripping all registered prefixes preserves the rule that genuinely
+    // distinct functions in different modules (`a::foo` vs `b::foo`) stay
+    // separate (`a` / `b` aren't in the stripped set), and the bare-name
+    // dedupe trap (using `FunctionGraph::name`) is still avoided because
+    // we key on GraphKey / the post-strip segment sequence, not on the
+    // bare leaf.
     let mut pending: Vec<(
         FunctionPathKey,
         Rc<LegacyGraph>,
@@ -2561,6 +2554,15 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // verbatim single-key stub cannot collide.  `register_unsafe_fn_stubs`
     // is non-overwriting (skips keys the `function_graphs` pass already
     // registered) and idempotent.
+    //
+    // `collect_fn_stubs_from_llbc_if` keys residuals on Charon `name_path()`.
+    // `free_function_alias_paths` omits that crate-prefixed spelling when
+    // `local_crate_roots()` is empty, so Pass 1 never aliases it. Point the
+    // stub key at the GraphStore funcobj's FunctionDesc before the stub
+    // pass mints `GraphFunc::new(leaf)`. `leaf__inst_*` keys stay off this
+    // pass (`annlowlevel.specialize` / `getfunctionptr`); aliasing them
+    // onto the template unique graph would `mergeinputargs` List ∪ RustVec.
+    alias_opaque_stub_keys_onto_graphstore(function_graphs, registry, unsafe_fn_stubs);
     register_unsafe_fn_stubs(registry, unsafe_fn_stubs, Some(function_graphs));
     // `__deref_write(ptr, value)` is the MIR front end's opaque store
     // marker.  Give the annotator the same declared-external carrier as the
@@ -2719,6 +2721,134 @@ fn describe_declared_funcobj(
     Some(entry)
 }
 
+/// Already-registered GraphStore alias of `path`'s funcobj, if any.
+/// `Bookkeeper.getdesc(pyobj)` identity: every spelling of one graph
+/// object is one FunctionDesc. Walks GraphStore alias paths; does not
+/// look up attributes by name.
+fn existing_graphstore_entry(
+    store: &crate::codewriter::call::GraphStore,
+    registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+) -> Option<Rc<FunctionEntry>> {
+    for alias in store.alias_paths(path) {
+        let alias_key = FunctionPathKey::from_segments(alias.segments.iter().cloned());
+        if let Some(entry) = registry.lookup_registered(&alias_key) {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// Point `key` at the canonical `entries` row that owns `entry`.
+fn alias_key_onto_entry(registry: &CallRegistry, key: &FunctionPathKey, entry: &Rc<FunctionEntry>) {
+    let Some(canonical) = registry.canonical_key_of(entry) else {
+        return;
+    };
+    if canonical != *key {
+        registry.alias(key.clone(), &canonical);
+    }
+}
+
+/// `lookup()` already found a FunctionDesc for `key` (verbatim or after
+/// stripping a local crate root). Record that spelling as an alias so
+/// `lookup_registered` / `get_or_register` share it
+/// (`bookkeeper.py Bookkeeper.getdesc` identity). A strip-hit without
+/// this row leaves the Charon `name_path()` unregistered.
+fn alias_existing_lookup(registry: &CallRegistry, key: &FunctionPathKey) -> bool {
+    if crate::translator::rtyper::call_registry::residual_inst_template_leaf(key.name()).is_some() {
+        // `annlowlevel.specialize` / `getfunctionptr` mint a distinct
+        // callable. `lookup()` would materialize it, then this alias would
+        // point the inst spelling at whatever desc lookup returned first
+        // — including the template unique graph (`specialize.py`
+        // `default_specialize`).
+        return false;
+    }
+    let Some(existing) = registry.lookup(key) else {
+        return false;
+    };
+    alias_key_onto_entry(registry, key, &existing);
+    true
+}
+
+/// GraphStore spelling of the funcobj `key` names.
+///
+/// A policy-opaque stub is keyed on Charon `name_path()`. Pass 1 registers
+/// `free_function_alias_paths` (`crate::m::f` and each local crate root).
+/// `canonical_dedup_key` / `callable_graph_path` / `strip_local_crate_prefix`
+/// treat a leading `crate` or local crate root as the same funcobj
+/// (`bookkeeper.py Bookkeeper.getdesc` identity). An unknown first
+/// segment is a different callable.
+fn graphstore_path_for_lookup_key(
+    store: &crate::codewriter::call::GraphStore,
+    key: &FunctionPathKey,
+) -> Option<crate::parse::CallPath> {
+    let path = crate::parse::CallPath::from_segments(key.segments().iter().cloned());
+    if store.names_funcobj(&path) {
+        return Some(path);
+    }
+    let stripped = canonical_dedup_key(&path);
+    if stripped.as_slice() != key.segments() {
+        let stripped_path = crate::parse::CallPath::from_segments(stripped);
+        if store.names_funcobj(&stripped_path) {
+            return Some(stripped_path);
+        }
+    }
+    None
+}
+
+/// Alias each policy-opaque stub key onto the GraphStore funcobj's
+/// FunctionDesc so `register_unsafe_fn_stubs` does not mint
+/// `GraphFunc::new(leaf)`.
+fn alias_opaque_stub_keys_onto_graphstore(
+    store: &crate::codewriter::call::GraphStore,
+    registry: &Rc<CallRegistry>,
+    stubs: &[(Vec<String>, Signature, Option<String>)],
+) {
+    for (segments, _signature, _return_token) in stubs {
+        let key = FunctionPathKey::from_segments(segments.iter().cloned());
+        if crate::translator::rtyper::call_registry::residual_inst_template_leaf(key.name())
+            .is_some()
+        {
+            continue;
+        }
+        if alias_existing_lookup(registry, &key) {
+            continue;
+        }
+        let Some(path) = graphstore_path_for_lookup_key(store, &key) else {
+            continue;
+        };
+        if let Some(existing) = existing_graphstore_entry(store, registry, &path) {
+            alias_key_onto_entry(registry, &key, &existing);
+            continue;
+        }
+        let Some(header) = store.funcobj_header(&path) else {
+            continue;
+        };
+        // Pass 1 skipped this GraphStore funcobj (`declared_funcobj`).
+        // A blank `GraphFunc::new(leaf)` would drop `_jit_look_inside_`.
+        if header.func.jit_look_inside != Some(false) {
+            continue;
+        }
+        let canonical_key = FunctionPathKey::from_segments(path.segments.iter().cloned());
+        let signature = crate::codewriter::call::StoreCore::signature_from_graph(&header);
+        let entry = registry.get_or_register_with_func(
+            canonical_key.clone(),
+            signature.clone(),
+            source_graph_func(&header),
+        );
+        alias_key_onto_entry(registry, &key, &entry);
+        for alias in store.alias_paths(&path) {
+            let alias_key = FunctionPathKey::from_segments(alias.segments.iter().cloned());
+            alias_key_onto_entry(registry, &alias_key, &entry);
+        }
+        publish_source_signature(&header, &entry);
+        seed_declared_funcptr_type(&header, &entry);
+        if let Some(body) = store.body(&path) {
+            install_source_graph(registry, &canonical_key, &header, &entry, &signature, &body);
+        }
+    }
+}
+
 // There is no program-wide `build_program_annotator` /
 // `build_program_rtyper` / `ensure_program_specialize` pre-pass and no
 // `ProgramSpecializeState` flag.  Per-session
@@ -2830,6 +2960,12 @@ fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
         AlwaysInline::Absent
     };
     func._dont_inline_ = graph.func.dont_inline;
+    // `specialize.py default_specialize` and `jtransform` read these off
+    // `funcdesc.pyobj` (`GraphFunc`). The legacy graph already projected
+    // the source attributes onto `graph.func` (`FuncEffects`); copy them,
+    // do not re-derive from hint names.
+    func._jit_look_inside_ = graph.func.jit_look_inside;
+    func._jit_unroll_safe_ = graph.func.unroll_safe;
     func.annspecialcase = graph
         .hints
         .iter()
@@ -2983,7 +3119,8 @@ pub(crate) fn default_someshell_for_lltype(
 ///
 /// The token is the canonical spelling
 /// [`crate::front::mir::dont_look_inside_return_token`] stamps from the
-/// callee's return `ValueType`.  Scalar tokens decode to their primitive
+/// callee's return `ValueType`.  A `Tuple<…>` token is `model.py
+/// SomeTuple` (`rtuple.py`).  Scalar tokens decode to their primitive
 /// lltype (`getkind` equals the legacy walker's
 /// `valuetype_to_concrete(result_ty)`).
 ///
@@ -3040,6 +3177,27 @@ pub(crate) fn residual_return_shell(
         return crate::codewriter::annotation_state::valuetype_to_someshell(
             &crate::model::ValueType::Str,
         );
+    }
+    // A function-return tuple is `model.py SomeTuple` (`rtuple.py`).
+    // Each item is the residual token `dont_look_inside_return_token`
+    // stamps for that element (`Tuple<*mut PyObject,*mut PyObject>`).
+    if let Some(inner) = token
+        .and_then(|t| t.strip_prefix("Tuple<"))
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        let args = crate::front::mir::split_top_level_type_args(inner);
+        if args.is_empty() {
+            return None;
+        }
+        let items: Option<Vec<_>> = args
+            .into_iter()
+            .map(|arg| residual_return_shell(Some(arg)))
+            .collect();
+        return items.map(|items| {
+            crate::annotator::model::SomeValue::Tuple(crate::annotator::model::SomeTuple::new(
+                items,
+            ))
+        });
     }
     return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
 }
@@ -3314,6 +3472,24 @@ pub(crate) fn register_unsafe_fn_stubs(
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
             continue;
         }
+        let key = FunctionPathKey::from_segments(segments.iter().cloned());
+        if crate::translator::rtyper::call_registry::residual_inst_template_leaf(key.name())
+            .is_some()
+        {
+            // `annlowlevel.specialize` / `getfunctionptr`: the template
+            // already carries `_annspecialcase_`. Minting `GraphFunc::new`
+            // here would `default_specialize` and `mergeinputargs`
+            // `SomeList` ∪ `SomeRustVec`. `lookup` materializes from the
+            // template once it exists.
+            let _ = registry.lookup(&key);
+            continue;
+        }
+        if alias_existing_lookup(registry, &key) {
+            // Already registered via the function_graphs pass (e.g. a
+            // safe fn with the same path).  Don't overwrite; alias the
+            // Charon `name_path()` spelling onto that FunctionDesc.
+            continue;
+        }
         let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
             .or_else(|| residual_return_shell(return_token.as_deref()))
         else {
@@ -3324,12 +3500,6 @@ pub(crate) fn register_unsafe_fn_stubs(
             signature.clone(),
             result_shell,
         );
-        let key = FunctionPathKey::from_segments(segments.iter().cloned());
-        if registry.lookup(&key).is_some() {
-            // Already registered via the function_graphs pass (e.g. a
-            // safe fn with the same path).  Don't overwrite.
-            continue;
-        }
         let graph_func =
             declared_source_graph_func(function_graphs, segments).unwrap_or_else(|| {
                 GraphFunc::new(
@@ -3534,11 +3704,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         LowLevelType::Float,
     ),
     (
-        &["std", "f64", "<Impl>", "fract"],
-        &["self"],
-        LowLevelType::Float,
-    ),
-    (
         &["std", "f64", "<Impl>", "ceil"],
         &["self"],
         LowLevelType::Float,
@@ -3559,16 +3724,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (
         &["std", "f64", "<Impl>", "powf"],
         &["self", "n"],
-        LowLevelType::Float,
-    ),
-    (
-        &["std", "f64", "<Impl>", "fract"],
-        &["self"],
-        LowLevelType::Float,
-    ),
-    (
-        &["core", "f64", "<Impl>", "fract"],
-        &["self"],
         LowLevelType::Float,
     ),
     (
@@ -3598,6 +3753,19 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     (
         &["vec", "Vec", "set_len"],
         &["self", "new_len"],
+        LowLevelType::Void,
+    ),
+    // `String::push_str(&mut self, s)` / `String::push(&mut self, ch)`
+    // append in place and return `()`. Same Void `register_external`
+    // shape as `Vec::set_len` (`extfunc.py` / `extfuncregistry.py`).
+    (
+        &["string", "String", "push_str"],
+        &["self", "s"],
+        LowLevelType::Void,
+    ),
+    (
+        &["string", "String", "push"],
+        &["self", "ch"],
         LowLevelType::Void,
     ),
 ];
@@ -3719,7 +3887,7 @@ fn register_opaque_external(
         return;
     };
     let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
-    if registry.lookup(&key).is_some() {
+    if alias_existing_lookup(registry, &key) {
         return;
     }
     registry.register_callee(key, signature, stub_pygraph);
@@ -3985,6 +4153,39 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
 /// `specialize_more_blocks` + lltype validation, committing the subject's
 /// blocks after rtype (the original behaviour, byte-identical).
 ///
+/// Annotate-half output stored on a two-phase subject: the flowspace
+/// graph plus the adapter maps that name its Variables.
+type DrivenSubject = (
+    crate::flowspace::model::GraphRef,
+    LegacyToTyped,
+    LegacyToTypedCandidates,
+    HashMap<Variable, LowLevelType>,
+    HashMap<Variable, Hlvalue>,
+);
+
+fn subject_with_pygraph(
+    driven: DrivenSubject,
+    pygraph: Option<Rc<PyGraph>>,
+) -> (
+    crate::flowspace::model::GraphRef,
+    LegacyToTyped,
+    LegacyToTypedCandidates,
+    HashMap<Variable, LowLevelType>,
+    HashMap<Variable, Hlvalue>,
+    Option<Rc<PyGraph>>,
+) {
+    let (graph, value_to_var, value_to_var_candidates, constant_concretetypes, constant_hlvalues) =
+        driven;
+    (
+        graph,
+        value_to_var,
+        value_to_var_candidates,
+        constant_concretetypes,
+        constant_hlvalues,
+        pygraph,
+    )
+}
+
 /// `do_rtype = false` is the two-phase Phase-A annotate-only path: it runs the
 /// annotate-half and commits the subject's blocks into the shared session
 /// WITHOUT rtyping, so a later whole-program Phase-B `specialize_more_blocks`
@@ -3996,6 +4197,32 @@ fn drive_subject(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
     do_rtype: bool,
+) -> Result<
+    (
+        crate::flowspace::model::GraphRef,
+        LegacyToTyped,
+        LegacyToTypedCandidates,
+        HashMap<Variable, LowLevelType>,
+        HashMap<Variable, Hlvalue>,
+    ),
+    TyperError,
+> {
+    let lifted = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
+        legacy,
+        call_registry,
+    )?;
+    drive_lifted_subject(legacy, call_registry, do_rtype, lifted)
+}
+
+/// Annotate (and optionally rtype) a subject whose flowspace graph is
+/// already lifted. AccessDirect two-phase subjects obtain that graph
+/// from `FunctionDesc.cachedgraph((AccessDirect, None))` before this
+/// call so the annotated object is the desc cache entry.
+fn drive_lifted_subject(
+    legacy: &LegacyGraph,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+    do_rtype: bool,
+    lifted: FlowspaceAdapterOutput,
 ) -> Result<
     (
         crate::flowspace::model::GraphRef,
@@ -4027,10 +4254,7 @@ fn drive_subject(
         mut constant_concretetypes,
         mut constant_hlvalues,
         ..
-    } = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
-        legacy,
-        call_registry,
-    )?;
+    } = lifted;
 
     // Same buildflowgraph stage as the cached-callee path above. Do not wait
     // until annotator.simplify: unused native projection preimages can block
@@ -4291,6 +4515,258 @@ fn drive_subject(
     ))
 }
 
+fn origin_function_entry(
+    call_registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+) -> Option<Rc<FunctionEntry>> {
+    let origin =
+        crate::codewriter::call::access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+    call_registry.lookup(&FunctionPathKey::from_segments(
+        origin.segments.iter().cloned(),
+    ))
+}
+
+/// Wrap the AccessDirect subject's lifted body as the `PyGraph`
+/// `default_specialize` would `cachedgraph`.
+fn wrap_access_direct_pygraph(
+    legacy: &LegacyGraph,
+    graph: &crate::flowspace::model::GraphRef,
+    desc: &crate::annotator::description::FunctionDesc,
+) -> Rc<PyGraph> {
+    let func = desc
+        .base
+        .pyobj
+        .as_ref()
+        .and_then(|pyobj| pyobj.user_function())
+        .cloned()
+        .unwrap_or_else(|| source_graph_func(legacy));
+    Rc::new(PyGraph {
+        graph: graph.clone(),
+        func,
+        signature: RefCell::new(desc.signature.clone()),
+        defaults: RefCell::new(Some(desc.defaults.clone())),
+        access_directly: Cell::new(true),
+    })
+}
+
+#[cfg(test)]
+fn push_hlvalue_vars(out: &mut Vec<Variable>, seen: &mut HashSet<u64>, hl: &Hlvalue) {
+    if let Hlvalue::Variable(v) = hl
+        && seen.insert(v.id())
+    {
+        out.push(v.clone());
+    }
+}
+
+#[cfg(test)]
+fn push_block_copy_order_vars(
+    out: &mut Vec<Variable>,
+    seen: &mut HashSet<u64>,
+    block: &crate::flowspace::model::BlockRef,
+) {
+    let b = block.borrow();
+    for a in &b.inputargs {
+        push_hlvalue_vars(out, seen, a);
+    }
+    for op in &b.operations {
+        for a in &op.args {
+            push_hlvalue_vars(out, seen, a);
+        }
+        push_hlvalue_vars(out, seen, &op.result);
+    }
+    if let Some(sw) = &b.exitswitch {
+        push_hlvalue_vars(out, seen, sw);
+    }
+    for link in &b.exits {
+        let l = link.borrow();
+        for arg in &l.args {
+            if let Some(hl) = arg {
+                push_hlvalue_vars(out, seen, hl);
+            }
+        }
+        if let Some(x) = &l.last_exception {
+            push_hlvalue_vars(out, seen, x);
+        }
+        if let Some(x) = &l.last_exc_value {
+            push_hlvalue_vars(out, seen, x);
+        }
+    }
+}
+
+/// Variables of `graph` in first-seen walk order (iterblocks, then
+/// returnblock/exceptblock). A later `recloseblock` that swaps exits
+/// changes this order while `copygraph`/`copyvar`'s varmap stays
+/// original→copy identity (`flowspace/model.py`).
+#[cfg(test)]
+fn flowspace_copy_order_vars(graph: &crate::flowspace::model::FunctionGraph) -> Vec<Variable> {
+    let mut out = Vec::new();
+    let mut seen_vars = HashSet::new();
+    let mut seen_blocks = HashSet::new();
+    for block in graph.iterblocks() {
+        if seen_blocks.insert(crate::flowspace::model::BlockKey::of(&block)) {
+            push_block_copy_order_vars(&mut out, &mut seen_vars, &block);
+        }
+    }
+    for extra in [&graph.returnblock, &graph.exceptblock] {
+        if seen_blocks.insert(crate::flowspace::model::BlockKey::of(extra)) {
+            push_block_copy_order_vars(&mut out, &mut seen_vars, extra);
+        }
+    }
+    out
+}
+
+fn flowspace_startblock_is_annotated(
+    call_registry: &CallRegistry,
+    graph: &crate::flowspace::model::GraphRef,
+) -> bool {
+    let Ok((annotator, _)) = call_registry.ensure_session() else {
+        return false;
+    };
+    let start = graph.borrow().startblock.clone();
+    // `annotated[block] is graph` after `processblock` (`annrpython.py`).
+    // A `None` (False) sentinel is queued but not flowed; a different
+    // owner is another specialization's block. Neither is this graph's
+    // completed annotation, so `default_specialize`'s cache hit still
+    // drives `recursivecall` analog (`drive_lifted_subject`).
+    matches!(
+        annotator
+            .annotated
+            .borrow()
+            .get(&crate::flowspace::model::BlockKey::of(&start)),
+        Some(Some(owner)) if Rc::ptr_eq(owner, graph)
+    )
+}
+
+fn phase_a_failure_reason<T>(
+    attempt: &Result<Result<T, TyperError>, Box<dyn std::any::Any + Send>>,
+) -> Option<String> {
+    match attempt {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(format!("annotate Err: {e:?}")),
+        Err(p) => {
+            let msg = crate::annotator::model::panic_payload_text(&**p)
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            Some(format!("annotate PANIC: {msg}"))
+        }
+    }
+}
+
+fn record_phase_a_skip(
+    call_registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+    reason: String,
+    phase_a_reasons: &mut Vec<String>,
+) {
+    {
+        let mut tp = call_registry.two_phase();
+        tp.annotate_skipped
+            .insert(path.canonical_key(), reason.clone());
+    }
+    if rtyper_verbose_enabled() {
+        eprintln!("[PREPASS phaseA fail] {:?}: {reason}", path);
+        phase_a_reasons.push(reason);
+        // MAJIT_RTYPER_FRONTIER: the adapter's whole call-wall set
+        // for this subject, not just the wall it stopped at. One
+        // line per wall, so the record splits without a banner.
+        for wall in crate::translator::rtyper::flowspace_adapter::take_frontier_walls() {
+            eprintln!("[PREPASS phaseA wall] {:?}: {wall}", path);
+        }
+    }
+}
+
+/// Lift the AccessDirect subject's body and bind it as the origin
+/// FunctionDesc's `(AccessDirect, None)` cachedgraph when that key is
+/// vacant (`description.py FunctionDesc.cachedgraph` miss →
+/// `buildgraph`). A later `default_specialize` hit returns this graph;
+/// `annrpython.py RPythonAnnotator.recursivecall` annotates it in place.
+fn seed_access_direct_lift(
+    legacy: &LegacyGraph,
+    call_registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+) -> Result<FlowspaceAdapterOutput, TyperError> {
+    // `cachedgraph` HIT appends to `translator.graphs`; that needs the
+    // session annotator (`description.py FunctionDesc.cachedgraph`).
+    let _ = call_registry.ensure_session()?;
+    let lifted = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
+        legacy,
+        call_registry,
+    )?;
+    let Some(entry) = origin_function_entry(call_registry, path) else {
+        return Err(TyperError::message(format!(
+            "AccessDirect subject {path}: origin FunctionDesc is not in CallRegistry"
+        )));
+    };
+    {
+        let desc = entry.function_desc.borrow();
+        let provided = wrap_access_direct_pygraph(legacy, &lifted.graph, &desc);
+        desc.record_access_directly_graph_from(provided)
+            .map_err(|err| TyperError::message(err.to_string()))?;
+    }
+    Ok(lifted)
+}
+
+/// Annotate the origin FunctionDesc's `(AccessDirect, None)` PyGraph
+/// (`description.py FunctionDesc.cachedgraph` / `specialize.py
+/// default_specialize`) — or reuse the annotation `recursivecall`
+/// already wrote on that same graph.
+///
+/// `lifted` is the adapter output seeding recorded for this subject.
+/// A cache entry whose graph is not that lift is a foreign
+/// `cachedgraph` object; refuse it rather than replacing its blocks.
+fn drive_access_direct_subject(
+    legacy: &LegacyGraph,
+    call_registry: &CallRegistry,
+    path: &crate::parse::CallPath,
+    lifted: FlowspaceAdapterOutput,
+) -> Result<(DrivenSubject, Rc<PyGraph>), TyperError> {
+    let _ = call_registry.ensure_session()?;
+    let Some(entry) = origin_function_entry(call_registry, path) else {
+        return Err(TyperError::message(format!(
+            "AccessDirect subject {path}: origin FunctionDesc is not in CallRegistry"
+        )));
+    };
+    let cached = entry
+        .function_desc
+        .borrow()
+        .cached_access_direct_none()
+        .ok_or_else(|| {
+            TyperError::message(format!(
+                "AccessDirect subject {path}: cache holds a graph this subject did not provide"
+            ))
+        })?;
+    if !Rc::ptr_eq(&cached.graph, &lifted.graph) {
+        return Err(TyperError::message(format!(
+            "AccessDirect subject {path}: cache holds a graph this subject did not provide"
+        )));
+    }
+    // Reuse when `pycall` / `recursivecall` left the cachedgraph in
+    // `annotator.annotated`. A rolled-back drive is now clean
+    // (`clear_block_bindings` resets raise-link extravars too) and
+    // takes `drive_lifted_subject` as an independent root. Vacant
+    // annotate still simplifies inside `drive_lifted_subject`.
+    let reuse = flowspace_startblock_is_annotated(call_registry, &lifted.graph);
+    if rtyper_verbose_enabled() {
+        let kind = if reuse {
+            "seeded reuse"
+        } else {
+            "seeded annotate"
+        };
+        eprintln!("[PREPASS AccessDirect cache] {kind}: {path}");
+    }
+    let driven = if reuse {
+        (
+            lifted.graph,
+            lifted.value_to_var,
+            lifted.value_to_var_candidates,
+            lifted.constant_concretetypes,
+            lifted.constant_hlvalues,
+        )
+    } else {
+        drive_lifted_subject(legacy, call_registry, false, lifted)?
+    };
+    Ok((driven, cached))
+}
+
 /// Whole-program two-phase rtyper prepass.
 ///
 /// Mirrors upstream `translator.annotate()` → `rtyper.specialize()`
@@ -4302,15 +4778,19 @@ fn drive_subject(
 /// re-running the fused per-graph path, so no callee is rtyped before all its
 /// callers are annotated, removing the `fixed_graphs` late-stage-modify Skip.
 ///
-/// Populates `call_registry.two_phase()`. The prepass is fully panic-contained
-/// and ALWAYS sets `prepass_done = true`: `make_jitcodes` runs in a spawned
-/// worker thread, so any escaping panic (the annrpython late-stage `panic!`, a
-/// `call_all_setups` failure, an unported repr setup) would unwind the thread
-/// and fail the build. The publish path ([`dual_gate_outcome_from_cache`]) is
-/// session-independent — it reads cached `Variable`s and re-runs the legacy
-/// walker, never the flowspace session — so a partial cache from an aborted
-/// prepass still yields Match for the graphs that completed and a safe
-/// legacy-walker Skip for the rest (zero regression, never the poisoned session).
+/// Populates `call_registry.two_phase()`. Phase A/B stay panic-contained
+/// inside `_inner` so a failed subject cannot abort the rest of the
+/// program: `make_jitcodes` runs in a spawned worker thread, and an
+/// escaping annotate/rtype panic would unwind that thread and fail the
+/// build. The publish path ([`dual_gate_outcome_from_cache`]) is
+/// session-independent — it reads cached `Variable`s and re-runs the
+/// legacy walker, never the flowspace session — so a partial cache from
+/// an aborted prepass still yields Match for the graphs that completed
+/// and a safe legacy-walker Skip for the rest.
+///
+/// `check_access_directly_sanity` (`warmspot.py WarmRunnerDesc.__init__`)
+/// is fatal to translation. It runs after `_inner` returns so a failing
+/// graph cannot skip Phase B, and so its panic is not swallowed.
 pub(crate) fn run_two_phase_prepass(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
@@ -4319,6 +4799,7 @@ pub(crate) fn run_two_phase_prepass(
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_two_phase_prepass_inner(call_registry, candidate_graphs, function_graphs)
     }));
+    check_access_directly_sanity(call_registry, candidate_graphs);
     call_registry.two_phase().prepass_done = true;
 }
 
@@ -4579,64 +5060,159 @@ fn emit_determinism_trace(phase: &str, index: usize, canonical_key: &str) {
     );
 }
 
+/// Session translator (`annrpython.py` `self.translator`). Prefer the
+/// prepass session; a fixture that never called `ensure_session` still
+/// has the Bookkeeper annotator `RPythonAnnotator::new` attached.
+fn prepass_translator(call_registry: &CallRegistry) -> Option<Rc<TranslationContext>> {
+    if let Some((ann, _)) = call_registry.session_if_started() {
+        return Some(ann.translator.clone());
+    }
+    call_registry
+        .bookkeeper()
+        .try_annotator()
+        .map(|ann| ann.translator.clone())
+}
+
+/// `inline.py collect_called_graphs(graph, translator)` plus the
+/// annotate-time `translator.callgraph` edges `recursivecall` recorded
+/// (`translator.py update_call_graph`). Phase A still has `simple_call`;
+/// the callgraph is the same one-hop caller→callee set `direct_call`
+/// would name after rtype.
+fn collect_called_from_entry(
+    entry: &GraphRef,
+    translator: &TranslationContext,
+) -> HashSet<GraphKey> {
+    let mut called = HashSet::new();
+    for thing in collect_called_graphs(entry, translator) {
+        if let crate::translator::backendopt::inline::CalledThing::Graph(g) = thing {
+            called.insert(GraphKey::of(&g));
+        }
+    }
+    let entry_key = GraphKey::of(entry);
+    for edge in translator.callgraph.borrow().values() {
+        if GraphKey::of(&edge.caller) == entry_key {
+            called.insert(GraphKey::of(&edge.callee));
+        }
+    }
+    called
+}
+
 /// `warmspot.py WarmRunnerDesc.check_access_directly_sanity`: no graph
-/// outside the JIT graph set is `access_directly`.
+/// `collect_called_graphs(entry_point_graph)` reaches outside the JIT
+/// graph set is `access_directly`.
 ///
 /// `specialize.py default_specialize` (`description.rs`) writes the flag on
 /// the annotator's graphs, and upstream's codewriter reads it after the
 /// annotator ran. Here `find_all_graphs` runs before the prepass annotates,
-/// so the flag is first readable after Phase A. Upstream walks
-/// `collect_called_graphs(entry_point_graph)`; the graphs the annotator
-/// reached are the ones its `FunctionDesc`s cached. The JIT graph set is
-/// taken per function: a candidate `{name}__AccessDirect_None` path maps
-/// to that function's FunctionDesc (the `(AccessDirect, key)` PyGraph
-/// lives on the same desc as the regular graph).
+/// so the flag is first readable after Phase A — which is also when
+/// AccessDirect subjects store `TwoPhaseSubject.pygraph`. Upstream membership
+/// is per graph object (`jit_graphs = set(graphs)`; `if graph in jit_graphs`),
+/// not per function. `jit_graphs` is therefore a set of `Rc<PyGraph>`
+/// identities:
+///
+/// * AccessDirect candidate: `TwoPhaseSubject.pygraph` when Phase A stored
+///   the subject, and `FunctionDesc.cachedgraph((AccessDirect, None))`
+///   (`cached_access_direct_none`). They are the same object on a
+///   successful drive (`function_desc_access_direct_pygraph_is_subject`
+///   `Rc::ptr_eq`). Phase A records the cache graph before annotate, so a
+///   failed AccessDirect candidate still has that `find_all_graphs` graph.
+/// * Regular candidate: `FunctionDesc.cache[None]`, the graph
+///   `prefill_default_cache` / `cachedgraph(None)` stores. A regular
+///   subject's `TwoPhaseSubject.graph` is a fresh adapter lift and is
+///   not that cache entry; walking `desc.cache` can only match the
+///   cached `PyGraph`.
+///
+/// The checked population is `collect_called_graphs(entry)` minus
+/// `jit_graphs`, not every `FunctionDesc` cache. `entry_point_graph` is
+/// `RPythonAnnotator.build_types(main_entry_point=True)`; when the
+/// prepass never set it, the portal/driver graphs `find_all_graphs`
+/// seeded (`candidate_graphs`) stand in.
 fn check_access_directly_sanity(
     call_registry: &CallRegistry,
     candidate_graphs: &HashSet<crate::parse::CallPath>,
 ) {
-    let jit_descs: HashSet<*const RefCell<crate::annotator::description::FunctionDesc>> =
-        candidate_graphs
-            .iter()
-            .filter_map(|path| {
+    let mut jit_graphs: HashSet<*const PyGraph> = HashSet::new();
+    let mut candidate_flow_graphs: Vec<GraphRef> = Vec::new();
+    {
+        let tp = call_registry.two_phase();
+        for path in candidate_graphs {
+            if crate::codewriter::call::is_access_directly_path(path) {
+                if let Some(pygraph) = tp
+                    .subjects
+                    .get(&path.canonical_key())
+                    .and_then(|s| s.pygraph.as_ref())
+                {
+                    jit_graphs.insert(Rc::as_ptr(pygraph));
+                    candidate_flow_graphs.push(pygraph.graph.clone());
+                }
                 let origin = crate::codewriter::call::access_directly_origin_path(path)
                     .unwrap_or_else(|| path.clone());
-                call_registry.lookup(&FunctionPathKey::from_segments(
+                if let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
                     origin.segments.iter().cloned(),
-                ))
-            })
-            .map(|entry| Rc::as_ptr(&entry.function_desc))
-            .collect();
+                )) && let Some(graph) = entry.function_desc.borrow().cached_access_direct_none()
+                {
+                    jit_graphs.insert(Rc::as_ptr(&graph));
+                    candidate_flow_graphs.push(graph.graph.clone());
+                }
+                continue;
+            }
+            let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
+                path.segments.iter().cloned(),
+            )) else {
+                continue;
+            };
+            let desc = entry.function_desc.borrow();
+            let cache = desc.cache.borrow();
+            if let Some(graph) = cache.get(&crate::annotator::description::GraphCacheKey::None) {
+                jit_graphs.insert(Rc::as_ptr(graph));
+                candidate_flow_graphs.push(graph.graph.clone());
+            }
+        }
+    }
+    let Some(translator) = prepass_translator(call_registry) else {
+        return;
+    };
+    let entry_points: Vec<GraphRef> =
+        if let Some(entry) = translator.entry_point_graph.borrow().clone() {
+            vec![entry]
+        } else {
+            candidate_flow_graphs
+        };
+    let mut called: HashSet<GraphKey> = HashSet::new();
+    for entry in &entry_points {
+        called.extend(collect_called_from_entry(entry, translator.as_ref()));
+    }
+    let mut offenders: Vec<String> = Vec::new();
     for entry in call_registry.bookkeeper().descs.borrow().values() {
         let crate::annotator::description::DescEntry::Func(func) = entry else {
             continue;
         };
         let desc = func.func();
-        if jit_descs.contains(&Rc::as_ptr(&desc)) {
-            continue;
-        }
         let desc = desc.borrow();
-        // `default_specialize` writes `(AccessDirect, key)` onto a callee
-        // the annotator reached with flagged args. That callee is a JIT
-        // graph even when `find_all_graphs` did not list it as a candidate
-        // (`warmspot.py collect_called_graphs` is the annotator's reach
-        // set, not only the codewriter's).
-        if desc
-            .cache
-            .borrow()
-            .keys()
-            .any(crate::annotator::description::GraphCacheKey::is_access_direct)
-        {
-            continue;
-        }
         for graph in desc.cache.borrow().values() {
-            assert!(
-                !graph.access_directly.get(),
-                "access_directly on {}, which is outside the JIT graph set",
-                desc.name
-            );
+            if !called.contains(&GraphKey::of(&graph.graph)) {
+                continue;
+            }
+            if jit_graphs.contains(&Rc::as_ptr(graph)) {
+                continue;
+            }
+            if graph.access_directly.get() {
+                let graph_name = graph.graph.borrow().name.clone();
+                if rtyper_verbose_enabled() {
+                    eprintln!(
+                        "[PREPASS access_directly] {} graph {}",
+                        desc.name, graph_name
+                    );
+                }
+                offenders.push(desc.name.clone());
+            }
         }
     }
+    assert!(
+        offenders.is_empty(),
+        "access_directly on {}, which is outside the JIT graph set",
+        offenders.join(", ")
+    );
 }
 
 fn run_two_phase_prepass_inner(
@@ -4662,18 +5238,93 @@ fn run_two_phase_prepass_inner(
         .collect();
     paths.sort_by_key(|p| p.canonical_key());
 
-    // ── Phase A — annotate-all over the portal closure ───────────────
+    // Alias spellings of one GraphStore slot are one prepass subject:
+    // `description.py FunctionDesc.cachedgraph` returns the cached graph
+    // on a hit, and `GraphStore::alias_paths` lists every spelling bound
+    // to that GraphKey.
+    let mut access_direct_alias_rep: HashMap<
+        String,
+        (&crate::parse::CallPath, &crate::parse::CallPath),
+    > = HashMap::new();
+    for path in paths.iter().copied() {
+        if !crate::codewriter::call::is_access_directly_path(path) {
+            continue;
+        }
+        let aliases = function_graphs.alias_paths(path);
+        let Some(rep) = paths
+            .iter()
+            .copied()
+            .find(|candidate| aliases.contains(candidate))
+        else {
+            continue;
+        };
+        if path != rep {
+            access_direct_alias_rep.insert(path.canonical_key(), (path, rep));
+        }
+    }
+
+    // Seed every AccessDirect key with that subject's own lift before
+    // any Phase A caller can `cachedgraph` the None-key template
+    // (`description.py FunctionDesc.cachedgraph`: first asker builds,
+    // later askers reuse). `recursivecall` then annotates that graph
+    // in place.
     let mut phase_a_reasons: Vec<String> = Vec::new();
-    for (index, path) in paths.iter().enumerate() {
+    let mut seeded_access_direct: HashMap<String, FlowspaceAdapterOutput> = HashMap::new();
+    for path in paths.iter() {
+        if access_direct_alias_rep.contains_key(&path.canonical_key()) {
+            continue;
+        }
+        if !crate::codewriter::call::is_access_directly_path(path) {
+            continue;
+        }
         let Some(legacy) = function_graphs.get(path) else {
             continue;
         };
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            seed_access_direct_lift(&legacy, call_registry, path)
+        }));
+        match attempt {
+            Ok(Ok(lifted)) => {
+                seeded_access_direct.insert(path.canonical_key(), lifted);
+            }
+            other => {
+                if let Some(reason) = phase_a_failure_reason(&other) {
+                    record_phase_a_skip(call_registry, path, reason, &mut phase_a_reasons);
+                }
+            }
+        }
+    }
+
+    // ── Phase A — annotate-all over the portal closure ───────────────
+    for (index, path) in paths.iter().enumerate() {
+        if access_direct_alias_rep.contains_key(&path.canonical_key()) {
+            continue;
+        }
+        let Some(legacy) = function_graphs.get(path) else {
+            continue;
+        };
+        if crate::codewriter::call::is_access_directly_path(path)
+            && !seeded_access_direct.contains_key(&path.canonical_key())
+        {
+            continue;
+        }
         let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
         if determinism_trace {
             emit_determinism_trace("phaseA", index, &path.canonical_key());
         }
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drive_subject(&legacy, call_registry, /* do_rtype = */ false)
+            if crate::codewriter::call::is_access_directly_path(path) {
+                let Some(lifted) = seeded_access_direct.remove(&path.canonical_key()) else {
+                    return Err(TyperError::message(format!(
+                        "AccessDirect subject {path}: cache holds a graph this subject did not provide"
+                    )));
+                };
+                drive_access_direct_subject(&legacy, call_registry, path, lifted)
+                    .map(|(driven, pygraph)| subject_with_pygraph(driven, Some(pygraph)))
+            } else {
+                drive_subject(&legacy, call_registry, /* do_rtype = */ false)
+                    .map(|driven| subject_with_pygraph(driven, None))
+            }
         }));
         match attempt {
             Ok(Ok((
@@ -4682,12 +5333,14 @@ fn run_two_phase_prepass_inner(
                 value_to_var_candidates,
                 constant_concretetypes,
                 constant_hlvalues,
+                pygraph,
             ))) => {
                 let key = path.canonical_key();
                 call_registry.two_phase().subjects.insert(
                     key,
                     crate::translator::rtyper::call_registry::TwoPhaseSubject {
                         graph: graph.clone(),
+                        pygraph,
                         graph_key: crate::flowspace::model::GraphKey::of(&graph),
                         value_to_var,
                         value_to_var_candidates,
@@ -4695,16 +5348,8 @@ fn run_two_phase_prepass_inner(
                         constant_hlvalues,
                     },
                 );
-                // Independent AccessDirect subjects never go through
-                // `pycall` → `default_specialize`. Record the
-                // `(AccessDirect, None)` PyGraph on the origin FunctionDesc
-                // so dual_gate finds the annotator's cache key
-                // (`specialize.py cachedgraph`).
-                if crate::codewriter::call::is_access_directly_path(path) {
-                    record_access_direct_pygraph_for_path(call_registry, path);
-                }
             }
-            ref other @ (Ok(Err(_)) | Err(_)) => {
+            other => {
                 // The graph was a prepass subject: record the annotate-half
                 // failure so publish classifies it as annotate-skipped, not
                 // never-a-subject. Upstream `translator.graphs` contains every
@@ -4712,30 +5357,8 @@ fn run_two_phase_prepass_inner(
                 // then task_rtype_lltype); a failed annotate is still a
                 // subject. `downcast_ref::<String>` misses `AnnotatorError`
                 // payloads (`panic_payload_text`).
-                let reason = match other {
-                    Ok(Err(e)) => format!("annotate Err: {e:?}"),
-                    Err(p) => {
-                        let msg = crate::annotator::model::panic_payload_text(&**p)
-                            .unwrap_or_else(|| "<non-string panic>".to_string());
-                        format!("annotate PANIC: {msg}")
-                    }
-                    Ok(Ok(_)) => unreachable!(),
-                };
-                {
-                    let mut tp = call_registry.two_phase();
-                    tp.annotate_skipped
-                        .insert(path.canonical_key(), reason.clone());
-                }
-                if rtyper_verbose_enabled() {
-                    eprintln!("[PREPASS phaseA fail] {:?}: {reason}", path);
-                    phase_a_reasons.push(reason);
-                    // MAJIT_RTYPER_FRONTIER: the adapter's whole call-wall set
-                    // for this subject, not just the wall it stopped at. One
-                    // line per wall, so the record splits without a banner.
-                    for wall in crate::translator::rtyper::flowspace_adapter::take_frontier_walls()
-                    {
-                        eprintln!("[PREPASS phaseA wall] {:?}: {wall}", path);
-                    }
+                if let Some(reason) = phase_a_failure_reason(&other) {
+                    record_phase_a_skip(call_registry, path, reason, &mut phase_a_reasons);
                 }
                 // Annotate-half failed (or panicked): repair shared-callee state.
                 // unpoison is itself contained — a panic here must not
@@ -4752,7 +5375,28 @@ fn run_two_phase_prepass_inner(
         }
     }
 
-    check_access_directly_sanity(call_registry, candidate_graphs);
+    let mut alias_keys: Vec<String> = access_direct_alias_rep.keys().cloned().collect();
+    alias_keys.sort();
+    for alias_key in alias_keys {
+        let (alias_path, rep) = access_direct_alias_rep[&alias_key];
+        let rep_key = rep.canonical_key();
+        let subject = call_registry.two_phase().subjects.get(&rep_key).cloned();
+        if let Some(subject) = subject {
+            call_registry
+                .two_phase()
+                .subjects
+                .insert(alias_key, subject);
+            continue;
+        }
+        let reason = call_registry
+            .two_phase()
+            .annotate_skipped
+            .get(&rep_key)
+            .cloned();
+        if let Some(reason) = reason {
+            record_phase_a_skip(call_registry, alias_path, reason, &mut phase_a_reasons);
+        }
+    }
 
     if rtyper_verbose_enabled() {
         emit_disposition_histogram("phaseA", &phase_a_reasons);
@@ -5451,12 +6095,20 @@ fn reconcile_projection_aliases(
     }
 }
 
-/// Whether `FunctionDesc.cache` holds a `(AccessDirect, key)` PyGraph for
-/// the callable `diag_key` names. The AccessDirect copy shares that
-/// FunctionDesc (`cachedgraph`); a miss means the annotator never
-/// specialized a call as AccessDirect even if the codewriter cloned a
-/// `{name}__AccessDirect_None` graph.
-fn function_desc_has_access_direct_pygraph(call_registry: &CallRegistry, diag_key: &str) -> bool {
+/// Whether the origin FunctionDesc's `(AccessDirect, None)` cachedgraph
+/// is the subject's annotated `PyGraph` (`description.py
+/// FunctionDesc.cachedgraph` / `specialize.py default_specialize`).
+/// A mere AccessDirect key in the cache is not enough: a post-hoc
+/// clone would pass that test while being a different graph than the
+/// one Phase A annotated.
+fn function_desc_access_direct_pygraph_is_subject(
+    call_registry: &CallRegistry,
+    diag_key: &str,
+    subject_pygraph: Option<&Rc<PyGraph>>,
+) -> bool {
+    let Some(subject_pygraph) = subject_pygraph else {
+        return false;
+    };
     let path = crate::parse::CallPath::from_segments(diag_key.split("::"));
     let origin = crate::codewriter::call::access_directly_origin_path(&path).unwrap_or(path);
     let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
@@ -5464,27 +6116,10 @@ fn function_desc_has_access_direct_pygraph(call_registry: &CallRegistry, diag_ke
     )) else {
         return false;
     };
-    let desc = entry.function_desc.borrow();
-    desc.cache
-        .borrow()
-        .keys()
-        .any(crate::annotator::description::GraphCacheKey::is_access_direct)
-}
-
-/// `FunctionDesc.cachedgraph` the `(AccessDirect, None)` copy for an
-/// independent AccessDirect two-phase subject.
-fn record_access_direct_pygraph_for_path(
-    call_registry: &CallRegistry,
-    path: &crate::parse::CallPath,
-) {
-    let origin =
-        crate::codewriter::call::access_directly_origin_path(path).unwrap_or_else(|| path.clone());
-    let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
-        origin.segments.iter().cloned(),
-    )) else {
-        return;
+    let Some(cached) = entry.function_desc.borrow().cached_access_direct_none() else {
+        return false;
     };
-    let _ = entry.function_desc.borrow().record_access_directly_graph();
+    Rc::ptr_eq(&cached, subject_pygraph)
 }
 
 /// Two-phase publish: derive the [`DualGateOutcome`] for `legacy` from the
@@ -5524,7 +6159,13 @@ pub(crate) fn dual_gate_outcome_from_cache(
                 // `(AccessDirect, key)` PyGraph of the same FunctionDesc.
                 // Falling back to the regular graph's subject would type
                 // the copy as if it were the unflagged specialization.
-                if is_ad && !function_desc_has_access_direct_pygraph(call_registry, diag_key) {
+                if is_ad
+                    && !function_desc_access_direct_pygraph_is_subject(
+                        call_registry,
+                        diag_key,
+                        subj.pygraph.as_ref(),
+                    )
+                {
                     Err(
                         "two-phase: AccessDirect PyGraph missing from FunctionDesc cache"
                             .to_string(),
@@ -5626,63 +6267,10 @@ pub(crate) fn dual_gate_outcome_from_cache(
             "two-phase compared set empty".to_string(),
         ));
     }
-    keep_legacy_kind_when_unfollowed_void(
-        &mut value_to_var,
-        &mut constants,
-        excluded_legacy.as_ref(),
-    );
     Ok(DualGateOutcome::Match {
         real_value_to_var: value_to_var,
         real_constants: constants,
     })
-}
-
-/// Drop an unfollowed Variable whose real concretetype is `Void` when the
-/// legacy cell already has a kind. See the call in
-/// [`dual_gate_check_with_registry`].
-///
-/// Phase B `setconcretetype`s `Void` on an unfollowed cell after
-/// `s_ImpossibleValue` (`force_return_var_annotation`). The AccessDirect
-/// copy is a fresh `copygraph` (`cachedgraph` copies before rtyping);
-/// `emit_one_word_guard_release` already stamped the residual ABI word
-/// Signed, and the skip-arm `IntegerRepr` analog keeps it. Publishing the
-/// Void twin would make `getcalldescr` drop that actual (`call.py`
-/// NON_VOID_ARGS) while `FUNC.ARGS` still has Int.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
-fn keep_legacy_kind_when_unfollowed_void(
-    value_to_var: &mut LegacyToTyped,
-    constants: &mut HashMap<Variable, LowLevelType>,
-    excluded_legacy: Option<&HashSet<Variable>>,
-) {
-    let Some(excluded) = excluded_legacy else {
-        return;
-    };
-    let drop_keys: Vec<Variable> = value_to_var
-        .iter()
-        .filter_map(|(legacy, typed)| {
-            if !excluded.contains(legacy) {
-                return None;
-            }
-            let ll = typed.concretetype()?;
-            let kind = lowleveltype_to_concrete(&ll).ok()?;
-            if kind != crate::model::ConcreteType::Void {
-                return None;
-            }
-            match LegacyGraph::concretetype_of(legacy) {
-                crate::model::ConcreteType::Void | crate::model::ConcreteType::Unknown => None,
-                crate::model::ConcreteType::Signed
-                | crate::model::ConcreteType::GcRef
-                | crate::model::ConcreteType::Float => Some(legacy.clone()),
-            }
-        })
-        .collect();
-    for key in drop_keys {
-        value_to_var.remove(&key);
-        constants.remove(&key);
-    }
 }
 
 #[cfg(test)]
@@ -6304,12 +6892,176 @@ mod tests {
         (registry, path)
     }
 
+    fn flagged_function_entry(registry: &CallRegistry) -> Rc<FunctionEntry> {
+        registry
+            .lookup(&FunctionPathKey::from_segments(["owner", "flagged"]))
+            .expect("flagged FunctionDesc")
+    }
+
+    /// `(AccessDirect, None)` cache graph of `owner::flagged`, with the
+    /// regular `None` graph unflagged so only the AccessDirect copy
+    /// carries `access_directly`.
+    fn flagged_access_direct_cache_graph(registry: &CallRegistry) -> Rc<PyGraph> {
+        let entry = flagged_function_entry(registry);
+        let none = entry
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                crate::annotator::description::GraphCacheKey::None,
+                None,
+                None,
+            )
+            .unwrap();
+        none.access_directly.set(false);
+        entry
+            .function_desc
+            .borrow()
+            .record_access_directly_graph()
+            .unwrap()
+    }
+
+    fn insert_access_direct_subject(
+        registry: &CallRegistry,
+        ad_path: &crate::parse::CallPath,
+        pygraph: &Rc<PyGraph>,
+    ) {
+        registry.two_phase().subjects.insert(
+            ad_path.canonical_key(),
+            crate::translator::rtyper::call_registry::TwoPhaseSubject {
+                graph: pygraph.graph.clone(),
+                pygraph: Some(pygraph.clone()),
+                graph_key: crate::flowspace::model::GraphKey::of(&pygraph.graph),
+                value_to_var: HashMap::new(),
+                value_to_var_candidates: HashMap::new(),
+                constant_concretetypes: HashMap::new(),
+                constant_hlvalues: HashMap::new(),
+            },
+        );
+    }
+
+    /// `collect_called_graphs(entry_point_graph)` fixture: `entry` has a
+    /// `direct_call` whose `funcobj.graph` is `callee`.
+    fn install_entry_point_calling(registry: &CallRegistry, callee: &GraphRef) {
+        use crate::flowspace::model::SpaceOperation;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, functionptr_for_graph_with_type,
+        };
+        let (ann, _) = registry
+            .ensure_session()
+            .expect("ensure_session for entry_point_graph");
+        let translator = ann.translator.clone();
+        let fptr = functionptr_for_graph_with_type(
+            callee,
+            FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            },
+        );
+        let arg0 = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(fptr.clone())),
+            LowLevelType::Ptr(Box::new(fptr._TYPE.clone())),
+        ));
+        let result = Hlvalue::Variable(Variable::named("r"));
+        let start = crate::flowspace::model::Block::shared(vec![]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![arg0],
+            result.clone(),
+        ));
+        let graph = crate::flowspace::model::FunctionGraph::new("entry_point", start.clone());
+        start.closeblock(vec![
+            Link::new(vec![result], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        let entry = Rc::new(RefCell::new(graph));
+        {
+            let mut graphs = translator.graphs.borrow_mut();
+            if !graphs.iter().any(|g| Rc::ptr_eq(g, callee)) {
+                graphs.push(callee.clone());
+            }
+            graphs.push(entry.clone());
+        }
+        *translator.entry_point_graph.borrow_mut() = Some(entry);
+    }
+
     /// `warmspot.py check_access_directly_sanity`: a JIT graph may be
     /// `access_directly`.
     #[test]
     fn an_access_directly_jit_graph_passes_the_sanity_check() {
         let (registry, path) = registry_with_a_flagged_graph();
+        let flagged = flagged_function_entry(&registry)
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                crate::annotator::description::GraphCacheKey::None,
+                None,
+                None,
+            )
+            .unwrap();
+        install_entry_point_calling(&registry, &flagged.graph);
         check_access_directly_sanity(&registry, &HashSet::from([path]));
+    }
+
+    /// An AccessDirect candidate is in `find_all_graphs` even when Phase A
+    /// does not store `TwoPhaseSubject`; `cachedgraph((AccessDirect, None))`
+    /// is still that candidate's graph.
+    #[test]
+    fn an_access_direct_candidate_cache_graph_passes_without_a_stored_subject() {
+        let (registry, path) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        assert!(ad.access_directly.get());
+        let ad_path = crate::codewriter::call::access_directly_path(&path);
+        install_entry_point_calling(&registry, &ad.graph);
+        check_access_directly_sanity(&registry, &HashSet::from([ad_path]));
+    }
+
+    /// An AccessDirect cache graph is not a JIT graph merely because
+    /// its FunctionDesc holds that key. `collect_called_graphs(entry)`
+    /// does not reach it, so sanity does not fire
+    /// (`warmspot.py check_access_directly_sanity`).
+    #[test]
+    fn an_access_directly_graph_not_reachable_from_the_entry_point_does_not_fail_sanity() {
+        let (registry, _) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        assert!(ad.access_directly.get());
+        let unrelated = test_pygraph("unrelated");
+        install_entry_point_calling(&registry, &unrelated.graph);
+        check_access_directly_sanity(&registry, &HashSet::new());
+    }
+
+    /// Membership is the graph object, not the FunctionDesc: the
+    /// AccessDirect subject's cache graph is in `jit_graphs`; another
+    /// cached graph of the same function is not.
+    #[test]
+    fn access_direct_sanity_is_per_graph_not_per_function_desc() {
+        let (registry, path) = registry_with_a_flagged_graph();
+        let ad = flagged_access_direct_cache_graph(&registry);
+        let ad_path = crate::codewriter::call::access_directly_path(&path);
+        insert_access_direct_subject(&registry, &ad_path, &ad);
+        check_access_directly_sanity(&registry, &HashSet::from([ad_path.clone()]));
+
+        let none = flagged_function_entry(&registry)
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                crate::annotator::description::GraphCacheKey::None,
+                None,
+                None,
+            )
+            .unwrap();
+        none.access_directly.set(true);
+        install_entry_point_calling(&registry, &none.graph);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_access_directly_sanity(&registry, &HashSet::from([ad_path]));
+        }));
+        let err = panicked.expect_err(
+            "a non-subject cache graph of the same FunctionDesc must fail the per-graph check",
+        );
+        let msg = crate::annotator::model::panic_payload_text(&*err)
+            .unwrap_or_else(|| "<non-string panic>".to_string());
+        assert!(
+            msg.contains("access_directly on flagged, which is outside the JIT graph set"),
+            "unexpected panic: {msg}"
+        );
     }
 
     fn empty_return_graph(name: &str) -> LegacyGraph {
@@ -6414,13 +7166,449 @@ mod tests {
         );
     }
 
-    /// `warmspot.py check_access_directly_sanity`: a graph outside the JIT
-    /// graph set may not.
+    fn origin_and_access_direct_fixture() -> (
+        std::rc::Rc<CallRegistry>,
+        crate::parse::CallPath,
+        crate::parse::CallPath,
+        LegacyGraph,
+        crate::codewriter::call::GraphStore,
+    ) {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let origin_path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "pop".into()],
+        };
+        let ad_path = crate::codewriter::call::access_directly_path(&origin_path);
+        let mut origin = empty_return_graph("pop");
+        origin.source_identity = Some("owner::pop".into());
+        let mut ad = empty_return_graph("pop__AccessDirect_None");
+        ad.source_identity = Some("owner::pop".into());
+        ad.access_directly = true;
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(origin_path.clone(), origin);
+        graphs.insert(ad_path.clone(), ad.clone());
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            .expect("origin FunctionDesc");
+        (registry, origin_path, ad_path, ad, graphs)
+    }
+
+    /// After Phase A annotates an AccessDirect subject, the origin
+    /// FunctionDesc's `(AccessDirect, None)` cachedgraph is that subject's
+    /// PyGraph (`specialize.py default_specialize`).
+    #[test]
+    fn access_direct_subject_annotates_the_function_desc_cache_graph() {
+        let (registry, origin_path, ad_path, _, graphs) = origin_and_access_direct_fixture();
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::from([origin_path.clone(), ad_path.clone()]),
+            &graphs,
+        );
+        let tp = registry.two_phase();
+        let subj = tp
+            .subjects
+            .get(&ad_path.canonical_key())
+            .expect("AccessDirect subject");
+        let subject_pygraph = subj
+            .pygraph
+            .as_ref()
+            .expect("AccessDirect subject keeps the annotated PyGraph");
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["owner", "pop"]))
+            .expect("origin FunctionDesc");
+        let cached = entry
+            .function_desc
+            .borrow()
+            .cached_access_direct_none()
+            .expect("AccessDirect cache graph");
+        assert!(
+            Rc::ptr_eq(&cached, subject_pygraph),
+            "desc cache (AccessDirect, None) must be the annotated subject graph"
+        );
+        assert!(cached.access_directly.get());
+        assert!(Rc::ptr_eq(&cached.graph, &subj.graph));
+    }
+
+    /// After seeding, the subject's `value_to_var` typed Variables live
+    /// on `subj.graph`, which is the `(AccessDirect, None)` cache graph
+    /// (`description.py FunctionDesc.cachedgraph`).
+    #[test]
+    fn access_direct_hit_path_value_to_var_belongs_to_subject_graph() {
+        let (registry, origin_path, ad_path, _, graphs) = origin_and_access_direct_fixture();
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["owner", "pop"]))
+            .expect("origin FunctionDesc");
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::from([origin_path.clone(), ad_path.clone()]),
+            &graphs,
+        );
+        let tp = registry.two_phase();
+        let subj = tp
+            .subjects
+            .get(&ad_path.canonical_key())
+            .expect("AccessDirect hit-path subject");
+        let on_graph: HashSet<Variable> = flowspace_copy_order_vars(&subj.graph.borrow())
+            .into_iter()
+            .collect();
+        for typed in subj.value_to_var.values() {
+            assert!(
+                on_graph.contains(typed),
+                "value_to_var typed Variable must belong to subj.graph"
+            );
+        }
+        for typeds in subj.value_to_var_candidates.values() {
+            for typed in typeds {
+                assert!(
+                    on_graph.contains(typed),
+                    "value_to_var_candidates typed Variable must belong to subj.graph"
+                );
+            }
+        }
+        let cached = entry
+            .function_desc
+            .borrow()
+            .cached_access_direct_none()
+            .expect("AccessDirect cache graph");
+        assert!(Rc::ptr_eq(&cached.graph, &subj.graph));
+    }
+
+    /// `description.py FunctionDesc.cachedgraph` returns the existing
+    /// graph on a hit; `annrpython.py RPythonAnnotator.recursivecall`
+    /// merges into that startblock. A caller that annotated the
+    /// AccessDirect key first must leave the subject drive on the same
+    /// graph object and the same startblock.
+    #[test]
+    fn access_direct_subject_reuses_caller_annotated_graph_and_startblock() {
+        let (registry, _, ad_path, ad_legacy, _) = origin_and_access_direct_fixture();
+        let _ = registry.ensure_session().expect("session");
+        let lifted = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
+            &ad_legacy, &registry,
+        )
+        .expect("lift AccessDirect body");
+        let entry = origin_function_entry(&registry, &ad_path).expect("origin FunctionDesc");
+        let cached = {
+            let desc = entry.function_desc.borrow();
+            let provided = wrap_access_direct_pygraph(&ad_legacy, &lifted.graph, &desc);
+            desc.record_access_directly_graph_from(provided)
+                .expect("seed (AccessDirect, None)")
+        };
+        let start_before = cached.graph.borrow().startblock.clone();
+        let bkey_before = crate::flowspace::model::BlockKey::of(&start_before);
+        let (ann, _) = registry.ensure_session().expect("session");
+        ann.annotated
+            .borrow_mut()
+            .insert(bkey_before.clone(), Some(cached.graph.clone()));
+        ann.all_blocks
+            .borrow_mut()
+            .insert(bkey_before.clone(), start_before);
+        let (driven, pygraph) =
+            drive_access_direct_subject(&ad_legacy, &registry, &ad_path, lifted).expect("drive");
+        assert!(
+            Rc::ptr_eq(&driven.0, &cached.graph),
+            "subject graph must be the cache graph object"
+        );
+        assert!(Rc::ptr_eq(&pygraph.graph, &cached.graph));
+        let bkey_after = crate::flowspace::model::BlockKey::of(&cached.graph.borrow().startblock);
+        assert_eq!(
+            bkey_before, bkey_after,
+            "subject drive must keep the caller-annotated startblock"
+        );
+    }
+
+    /// A cache entry that is not this subject's lift is not overwritten
+    /// (`description.py FunctionDesc.cachedgraph` keeps the first graph).
+    #[test]
+    fn access_direct_drive_rejects_a_foreign_cache_graph() {
+        let (registry, _, ad_path, ad_legacy, _) = origin_and_access_direct_fixture();
+        let _ = registry.ensure_session().expect("session");
+        let entry = origin_function_entry(&registry, &ad_path).expect("origin FunctionDesc");
+        let foreign = test_pygraph("foreign_access_direct");
+        foreign.access_directly.set(true);
+        entry.function_desc.borrow().cache.borrow_mut().insert(
+            crate::annotator::description::GraphCacheKey::access_direct_none(),
+            foreign,
+        );
+        let lifted = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
+            &ad_legacy, &registry,
+        )
+        .expect("lift AccessDirect body");
+        let err = drive_access_direct_subject(&ad_legacy, &registry, &ad_path, lifted)
+            .expect_err("foreign cache graph must not be overwritten");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cache holds a graph this subject did not provide"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains(&ad_path.to_string()),
+            "error must name the path, got {msg}"
+        );
+    }
+
+    /// Alias spellings of one AccessDirect GraphStore slot are one
+    /// prepass subject (`description.py FunctionDesc.cachedgraph` hit).
+    #[test]
+    fn access_direct_alias_spellings_are_one_prepass_subject() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let origin_path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "pop".into()],
+        };
+        let ad_path = crate::codewriter::call::access_directly_path(&origin_path);
+        let alias_origin = crate::parse::CallPath {
+            segments: vec!["crate".into(), "owner".into(), "pop".into()],
+        };
+        let alias_ad = crate::codewriter::call::access_directly_path(&alias_origin);
+        let mut origin = empty_return_graph("pop");
+        origin.source_identity = Some("owner::pop".into());
+        let mut ad = empty_return_graph("pop__AccessDirect_None");
+        ad.source_identity = Some("owner::pop".into());
+        ad.access_directly = true;
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(origin_path.clone(), origin);
+        graphs.insert(ad_path.clone(), ad);
+        graphs.share_path(alias_ad.clone(), &ad_path);
+        let aliases = graphs.alias_paths(&ad_path);
+        assert_eq!(aliases, graphs.alias_paths(&alias_ad));
+        assert!(aliases.contains(&ad_path) && aliases.contains(&alias_ad));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            .expect("origin FunctionDesc");
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::from([origin_path, ad_path.clone(), alias_ad.clone()]),
+            &graphs,
+        );
+        let tp = registry.two_phase();
+        let ad_key = ad_path.canonical_key();
+        let alias_key = alias_ad.canonical_key();
+        let both_subjects =
+            tp.subjects.contains_key(&ad_key) && tp.subjects.contains_key(&alias_key);
+        let both_skipped = match (
+            tp.annotate_skipped.get(&ad_key),
+            tp.annotate_skipped.get(&alias_key),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        assert!(
+            both_subjects || both_skipped,
+            "alias AccessDirect keys must share a subject or the same skip; subjects={:?} skipped={:?}",
+            tp.subjects.keys().collect::<Vec<_>>(),
+            tp.annotate_skipped,
+        );
+        for reason in tp.annotate_skipped.values() {
+            assert!(
+                !reason.contains("did not provide"),
+                "alias spelling must not re-lift: {reason}"
+            );
+        }
+    }
+
+    /// `stack_base`-shaped getter: one Int formal returned. Live Signed
+    /// the legacy walker types and the real path must keep paired.
+    fn int_identity_getter(name: &str) -> LegacyGraph {
+        let mut graph = LegacyGraph::new(name);
+        let vars = mint_vars(&mut graph, 2);
+        let v1 = vars[1].clone();
+        setbinding(&v1, ValueType::Int);
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v1, ConcreteType::Signed);
+        let exceptblock = graph.blocks[2].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(v1.clone()),
+                kind: crate::model::OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(v1.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock];
+        graph
+    }
+
+    /// Two-phase AccessDirect getter: seeding records the subject's own
+    /// lift (`description.py FunctionDesc.cachedgraph`), then Phase A
+    /// annotates that graph. The Int formal must stay Signed.
+    #[test]
+    fn access_direct_hit_int_getter_does_not_diverge_signed_unknown() {
+        let _lock = anchor_lock();
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let origin_path = crate::parse::CallPath {
+            segments: vec!["owner".into(), "stack_base".into()],
+        };
+        let ad_path = crate::codewriter::call::access_directly_path(&origin_path);
+        let mut origin = int_identity_getter("stack_base");
+        origin.source_identity = Some("owner::stack_base".into());
+        let mut ad = crate::model::copygraph(&origin);
+        ad.name = format!(
+            "{}{}",
+            ad.name,
+            crate::codewriter::call::ACCESS_DIRECT_ALT_SUFFIX
+        );
+        ad.access_directly = true;
+        ad.source_identity = Some("owner::stack_base".into());
+        let signed = ad
+            .blocks
+            .iter()
+            .find(|b| b.id == ad.startblock)
+            .expect("startblock")
+            .inputargs[0]
+            .clone();
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(origin_path.clone(), origin);
+        graphs.insert(ad_path.clone(), ad.clone());
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            .expect("origin FunctionDesc");
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::from([origin_path.clone(), ad_path.clone()]),
+            &graphs,
+        );
+        let outcome = dual_gate_outcome_from_cache(&ad, &registry, &ad_path.canonical_key())
+            .expect("publish reads the cache");
+        match outcome {
+            DualGateOutcome::Skip(reason) => {
+                assert!(
+                    !reason.contains("legacy=Signed, real=Unknown"),
+                    "AccessDirect getter must type Signed like the plain twin, got {reason}"
+                );
+            }
+            DualGateOutcome::Match {
+                real_value_to_var, ..
+            } => {
+                assert_eq!(
+                    kind_of_in(&real_value_to_var, &signed),
+                    ConcreteType::Signed,
+                    "AccessDirect Int formal must publish Signed"
+                );
+            }
+        }
+    }
+
+    fn test_pygraph(name: &str) -> Rc<PyGraph> {
+        use crate::flowspace::model::{Block as FlowBlock, GraphFunc, Hlvalue, Link, Variable};
+        let arg = Hlvalue::Variable(Variable::named("x"));
+        let startblock = FlowBlock::shared(vec![arg.clone()]);
+        let graph = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
+        let link = Rc::new(RefCell::new(Link::new(
+            vec![arg],
+            Some(graph.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        Rc::new(PyGraph {
+            graph: Rc::new(RefCell::new(graph)),
+            func: GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default()))),
+            signature: RefCell::new(Signature::new(vec!["x".to_string()], None, None)),
+            defaults: RefCell::new(None),
+            access_directly: Cell::new(false),
+        })
+    }
+
+    /// A manufactured `(AccessDirect, None)` cache entry that is not the
+    /// subject's annotated graph fails the publish identity gate.
+    #[test]
+    fn manufactured_access_direct_cache_graph_fails_the_identity_gate() {
+        let (registry, origin_path, ad_path, ad_legacy, graphs) =
+            origin_and_access_direct_fixture();
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::from([origin_path.clone(), ad_path.clone()]),
+            &graphs,
+        );
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["owner", "pop"]))
+            .expect("origin FunctionDesc");
+        let manufactured = test_pygraph("manufactured_access_direct");
+        manufactured.access_directly.set(true);
+        entry.function_desc.borrow().cache.borrow_mut().insert(
+            crate::annotator::description::GraphCacheKey::access_direct_none(),
+            manufactured.clone(),
+        );
+        let outcome = dual_gate_outcome_from_cache(&ad_legacy, &registry, &ad_path.canonical_key())
+            .expect("publish reads the cache");
+        let DualGateOutcome::Skip(reason) = outcome else {
+            panic!("manufactured AccessDirect cache graph must Skip, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("AccessDirect PyGraph missing from FunctionDesc cache"),
+            "identity miss must use the AccessDirect PyGraph missing reason, got {reason}"
+        );
+        assert_eq!(
+            non_arm_skip_category(&reason),
+            Some("two-phase-accessdirect-pygraph-missing")
+        );
+        let subject_pygraph = registry
+            .two_phase()
+            .subjects
+            .get(&ad_path.canonical_key())
+            .and_then(|s| s.pygraph.clone())
+            .expect("subject PyGraph");
+        assert!(!Rc::ptr_eq(&manufactured, &subject_pygraph));
+    }
+
+    /// `warmspot.py check_access_directly_sanity`: a graph
+    /// `collect_called_graphs(entry_point_graph)` reaches that is not
+    /// in `jit_graphs` may not be `access_directly`.
     #[test]
     #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
-    fn an_access_directly_graph_outside_the_jit_set_fails_the_sanity_check() {
+    fn an_access_directly_graph_reachable_from_the_entry_point_fails_the_sanity_check() {
         let (registry, _) = registry_with_a_flagged_graph();
+        let flagged = flagged_function_entry(&registry)
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                crate::annotator::description::GraphCacheKey::None,
+                None,
+                None,
+            )
+            .unwrap();
+        install_entry_point_calling(&registry, &flagged.graph);
         check_access_directly_sanity(&registry, &HashSet::new());
+    }
+
+    /// `WarmRunnerDesc.__init__` runs `check_access_directly_sanity` after
+    /// `find_all_graphs` and the panic is fatal to translation. A catch
+    /// around Phase A/B must not swallow it.
+    #[test]
+    #[should_panic(expected = "access_directly on flagged, which is outside the JIT graph set")]
+    fn run_two_phase_prepass_propagates_access_directly_sanity() {
+        let (registry, _) = registry_with_a_flagged_graph();
+        let flagged = flagged_function_entry(&registry)
+            .function_desc
+            .borrow()
+            .cachedgraph(
+                crate::annotator::description::GraphCacheKey::None,
+                None,
+                None,
+            )
+            .unwrap();
+        install_entry_point_calling(&registry, &flagged.graph);
+        run_two_phase_prepass(
+            &registry,
+            &HashSet::new(),
+            &crate::codewriter::call::GraphStore::default(),
+        );
     }
 
     #[test]
@@ -6525,6 +7713,439 @@ mod tests {
             *value,
             crate::annotator::model::SomeValue::Integer(_)
         ));
+    }
+
+    #[test]
+    fn source_graph_func_carries_legacy_jit_look_inside() {
+        let mut graph = LegacyGraph::new("h");
+        graph.func.jit_look_inside = Some(false);
+        graph.func.unroll_safe = true;
+        let func = source_graph_func(&graph);
+        assert_eq!(func._jit_look_inside_, Some(false));
+        assert!(func._jit_unroll_safe_);
+    }
+
+    /// `specialize.py default_specialize` + `test_rvirtualizable
+    /// test_access_directly_stop_at_dont_look_inside`: a `dont_look_inside`
+    /// callee of an `access_directly` instance does not mint
+    /// `(AccessDirect, None)`; the flag is deleted from the argument.
+    #[test]
+    fn dont_look_inside_drops_access_directly_and_skips_access_direct_cache() {
+        use crate::annotator::description::{FunctionDesc, GraphCacheKey};
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::flowspace::model::HostObject;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let mut graph = LegacyGraph::new("h");
+        graph.func.jit_look_inside = Some(false);
+        let func = source_graph_func(&graph);
+        let host = HostObject::new_user_function(func);
+        let fd = FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            Some(host),
+            "h",
+            Signature::new(vec!["a".into()], None, None),
+            None,
+            None,
+        );
+        fd.cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, test_pygraph("h"));
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("access_directly".into(), true);
+        let mut inputcells = vec![Some(SomeValue::Instance(SomeInstance::new(
+            None, false, flags,
+        )))];
+        let pygraph = fd
+            .specialize(&mut inputcells, None)
+            .unwrap()
+            .expect_graph()
+            .unwrap();
+        assert!(!pygraph.access_directly.get());
+        assert!(fd.cached_access_direct_none().is_none());
+        assert!(
+            !fd.cache
+                .borrow()
+                .keys()
+                .any(GraphCacheKey::is_access_direct)
+        );
+        match &inputcells[0] {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(!inst.flags.contains_key("access_directly"))
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    /// A policy-opaque stub keyed on Charon `name_path()` must reuse the
+    /// GraphStore funcobj when the first segment is a local crate root
+    /// (`canonical_dedup_key` / `strip_local_crate_prefix`). The
+    /// crate-stripped GraphStore path is the same funcobj; the stub is
+    /// not a second `GraphFunc::new`.
+    #[test]
+    fn opaque_stub_name_path_reuses_graphstore_funcobj_without_that_spelling() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+            let mut graph = empty_return_graph("handle_exception_with_context");
+            graph.source_identity = Some("eval::handle_exception_with_context".into());
+            graph.func.jit_look_inside = Some(false);
+            graph.push_hint("dont_look_inside");
+            let mut graphs = crate::codewriter::call::GraphStore::default();
+            let qualified = crate::parse::CallPath {
+                segments: vec!["eval".into(), "handle_exception_with_context".into()],
+            };
+            graphs.insert(qualified.clone(), graph);
+            let stubs = vec![(
+                vec![
+                    "pyre_interpreter".into(),
+                    "eval".into(),
+                    "handle_exception_with_context".into(),
+                ],
+                Signature::new(vec![], None, None),
+                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+            )];
+            populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
+            let qualified_entry = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "eval",
+                    "handle_exception_with_context",
+                ]))
+                .expect("GraphStore spelling");
+            let stub_entry = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyre_interpreter",
+                    "eval",
+                    "handle_exception_with_context",
+                ]))
+                .expect("name_path stub spelling");
+            assert!(
+                Rc::ptr_eq(&qualified_entry, &stub_entry),
+                "the name_path stub must be an alias of the GraphStore FunctionDesc"
+            );
+            assert_eq!(
+                qualified_entry
+                    .host_object
+                    .user_function()
+                    .unwrap()
+                    ._jit_look_inside_,
+                Some(false)
+            );
+        });
+    }
+
+    /// Pass 1 skips a front-end declared funcobj (`describe_declared_funcobj`
+    /// on first lookup). A Charon `name_path()` stub must not mint
+    /// `GraphFunc::new(leaf)`: the stub is an alias of a FunctionDesc that
+    /// already carries `_jit_look_inside_`.
+    #[test]
+    fn opaque_stub_of_a_declared_funcobj_reuses_the_source_callable() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
+            use crate::model::LazyGraph;
+
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+            let mut graph = empty_return_graph("handle_exception_with_context");
+            graph.source_identity =
+                Some("pyre_interpreter::eval::handle_exception_with_context".into());
+            graph.func.jit_look_inside = Some(false);
+            graph.push_hint("dont_look_inside");
+            let qualified = crate::parse::CallPath {
+                segments: vec!["eval".into(), "handle_exception_with_context".into()],
+            };
+            let decls = FuncObjDeclarations::default();
+            decls.push(DeclaredFuncObj {
+                path: qualified,
+                graph: LazyGraph::built(graph),
+                transform: GraphTransform::default(),
+            });
+            let mut graphs = crate::codewriter::call::GraphStore::default();
+            graphs.use_declarations(decls);
+            let stubs = vec![(
+                vec![
+                    "pyre_interpreter".into(),
+                    "eval".into(),
+                    "handle_exception_with_context".into(),
+                ],
+                Signature::new(vec![], None, None),
+                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+            )];
+            populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
+            let stub_entry = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyre_interpreter",
+                    "eval",
+                    "handle_exception_with_context",
+                ]))
+                .expect("name_path stub spelling");
+            let qualified_entry = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "eval",
+                    "handle_exception_with_context",
+                ]))
+                .expect("GraphStore spelling");
+            assert!(
+                Rc::ptr_eq(&stub_entry, &qualified_entry),
+                "the name_path stub must be an alias of the declared FunctionDesc"
+            );
+            assert_eq!(
+                stub_entry
+                    .host_object
+                    .user_function()
+                    .unwrap()
+                    ._jit_look_inside_,
+                Some(false)
+            );
+        });
+    }
+
+    /// `other::f` is not a crate-root spelling of `f`.
+    /// `bookkeeper.py Bookkeeper.getdesc` keys a desc by callable
+    /// identity; a blind `segments[1..]` strip would merge them.
+    #[test]
+    fn opaque_stub_other_f_does_not_alias_unrelated_f() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graph = empty_return_graph("f");
+        graph.source_identity = Some("f".into());
+        graph.func.jit_look_inside = Some(false);
+        graph.push_hint("dont_look_inside");
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(
+            crate::parse::CallPath {
+                segments: vec!["f".into()],
+            },
+            graph,
+        );
+        let stubs = vec![(
+            vec!["other".into(), "f".into()],
+            Signature::new(vec![], None, None),
+            Some(OBJECTPTR_RETURN_TYPE.to_string()),
+        )];
+        populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
+        let f_entry = registry
+            .lookup(&FunctionPathKey::from_segments(["f"]))
+            .expect("GraphStore f");
+        let other_entry = registry
+            .lookup(&FunctionPathKey::from_segments(["other", "f"]))
+            .expect("other::f stub");
+        assert!(
+            !Rc::ptr_eq(&f_entry, &other_entry),
+            "other::f must not alias the unrelated GraphStore funcobj f"
+        );
+    }
+
+    /// `register_unsafe_fn_stubs` + `declared_source_graph_func` copy
+    /// `specialize:argtype` onto the template (`bookkeeper.py getdesc` /
+    /// `specialize.py specialize_argtype`). `materialize_residual_inst`
+    /// (`annlowlevel.specialize` / `getfunctionptr`) then gives each
+    /// `leaf__inst_*` its own FunctionDesc. Aliasing an inst key onto the
+    /// template unique graph would `mergeinputargs` `SomeRustVec` ∪
+    /// `SomeList` (`annrpython.py`).
+    #[test]
+    fn populate_argtype_residual_inst_does_not_merge_rustvec_and_list() {
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            use crate::annotator::argument::ArgumentsForTranslation;
+            use crate::annotator::listdef::ListDef;
+            use crate::annotator::model::{SomeInteger, SomeList, SomeRustVec, SomeValue};
+            use crate::annotator::policy::Specializer;
+            use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations, GraphTransform};
+            use crate::model::LazyGraph;
+
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+            let mut graph = empty_return_graph("gc_alloc_young_storage_box");
+            let args = mint_vars(&mut graph, 2);
+            graph.block_mut(graph.startblock).inputargs = args;
+            graph.source_identity =
+                Some("pyre_object::gc_storage::gc_alloc_young_storage_box".into());
+            graph.func.jit_look_inside = Some(false);
+            graph.push_hint("dont_look_inside");
+            graph.push_hint("specialize:argtype(0)");
+            let qualified = crate::parse::CallPath {
+                segments: vec!["gc_storage".into(), "gc_alloc_young_storage_box".into()],
+            };
+            let decls = FuncObjDeclarations::default();
+            decls.push(DeclaredFuncObj {
+                path: qualified,
+                graph: LazyGraph::built(graph),
+                transform: GraphTransform::default(),
+            });
+            let mut graphs = crate::codewriter::call::GraphStore::default();
+            graphs.use_declarations(decls);
+            let sig = Signature::new(vec!["value".into(), "tid".into()], None, None);
+            let stubs = vec![
+                (
+                    vec![
+                        "pyre_object".into(),
+                        "gc_storage".into(),
+                        "gc_alloc_young_storage_box".into(),
+                    ],
+                    sig.clone(),
+                    Some("i64".to_string()),
+                ),
+                (
+                    vec![
+                        "pyre_object".into(),
+                        "gc_storage".into(),
+                        "gc_alloc_young_storage_box__inst_tuple".into(),
+                    ],
+                    sig.clone(),
+                    Some("i64".to_string()),
+                ),
+            ];
+            populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
+            let template = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "gc_storage",
+                    "gc_alloc_young_storage_box",
+                ]))
+                .expect("template stub");
+            let inst = registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "gc_storage",
+                    "gc_alloc_young_storage_box__inst_tuple",
+                ]))
+                .expect("residual inst");
+            assert!(
+                !Rc::ptr_eq(&template, &inst),
+                "an instantiation is a distinct callable (`func_with_new_name`)"
+            );
+            assert!(
+                matches!(
+                    inst.function_desc.borrow().specializer.as_ref(),
+                    Some(Specializer::Argtype { parms }) if parms == &["0".to_string()]
+                ),
+                "residual inst must keep specialize:argtype"
+            );
+
+            let list = SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::default()),
+                false,
+                false,
+            )));
+            let rustvec =
+                SomeValue::RustVec(SomeRustVec::new(SomeValue::Integer(SomeInteger::default())));
+            let tid = SomeValue::Integer(SomeInteger::default());
+            inst.function_desc
+                .borrow()
+                .pycall(
+                    None,
+                    &ArgumentsForTranslation::new(
+                        vec![Some(list.clone()), Some(tid.clone())],
+                        None,
+                        None,
+                    ),
+                    &SomeValue::Impossible,
+                    None,
+                )
+                .expect("list pycall");
+            inst.function_desc
+                .borrow()
+                .pycall(
+                    None,
+                    &ArgumentsForTranslation::new(
+                        vec![Some(rustvec.clone()), Some(tid)],
+                        None,
+                        None,
+                    ),
+                    &SomeValue::Impossible,
+                    None,
+                )
+                .expect("rustvec pycall");
+        });
+    }
+
+    /// `Bookkeeper.getdesc` identity: a Charon `name_path()` stub is the
+    /// same callable as the crate-stripped GraphStore funcobj. `lookup()`
+    /// already finds it by stripping a local crate root; `alias` must still
+    /// record that spelling so `lookup_registered` / `get_or_register`
+    /// share the FunctionDesc (`bookkeeper.py`).
+    #[test]
+    fn opaque_stub_name_path_is_alias_when_strip_lookup_already_hits() {
+        crate::local_crates::with_local_crate_root("pyre_interpreter", || {
+            let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+            let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+            let mut graph = empty_return_graph("_cached_lookup_where_name");
+            graph.source_identity = Some("baseobjspace::_cached_lookup_where_name".into());
+            let mut graphs = crate::codewriter::call::GraphStore::default();
+            graphs.insert(
+                crate::parse::CallPath {
+                    segments: vec!["baseobjspace".into(), "_cached_lookup_where_name".into()],
+                },
+                graph,
+            );
+            let stubs = vec![(
+                vec![
+                    "pyre_interpreter".into(),
+                    "baseobjspace".into(),
+                    "_cached_lookup_where_name".into(),
+                ],
+                Signature::new(vec![], None, None),
+                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+            )];
+            populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
+            let stripped =
+                FunctionPathKey::from_segments(["baseobjspace", "_cached_lookup_where_name"]);
+            let crate_qualified = FunctionPathKey::from_segments([
+                "pyre_interpreter",
+                "baseobjspace",
+                "_cached_lookup_where_name",
+            ]);
+            let stripped_entry = registry.lookup(&stripped).expect("GraphStore spelling");
+            let via_lookup = registry
+                .lookup(&crate_qualified)
+                .expect("callsite lookup strips a local crate root");
+            assert!(Rc::ptr_eq(&stripped_entry, &via_lookup));
+            let via_registered = registry
+                .lookup_registered(&crate_qualified)
+                .expect("name_path spelling is a registered alias of the GraphStore FunctionDesc");
+            assert!(
+                Rc::ptr_eq(&stripped_entry, &via_registered),
+                "strip-hit must still alias the Charon name_path onto the GraphStore desc"
+            );
+        });
+    }
+
+    /// An unsafe fn whose body never lowered still needs a FunctionDesc
+    /// under Charon `name_path()`. `_cached_lookup_where_name` returns
+    /// `(PyObjectRef, PyObjectRef)` — `rtuple.py` `SomeTuple` of two
+    /// object pointers — so the stub carrier must admit that token.
+    #[test]
+    fn unsafe_fn_objectptr_pair_stub_registers_crate_qualified_name_path() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let graphs = crate::codewriter::call::GraphStore::default();
+        let token = format!("Tuple<{OBJECTPTR_RETURN_TYPE},{OBJECTPTR_RETURN_TYPE}>");
+        let stubs = vec![(
+            vec![
+                "pyre_interpreter".into(),
+                "baseobjspace".into(),
+                "_cached_lookup_where_name".into(),
+            ],
+            Signature::new(
+                vec!["w_type".into(), "name".into(), "version_tag".into()],
+                None,
+                None,
+            ),
+            Some(token),
+        )];
+        populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
+        let key = FunctionPathKey::from_segments([
+            "pyre_interpreter",
+            "baseobjspace",
+            "_cached_lookup_where_name",
+        ]);
+        let entry = registry
+            .lookup(&key)
+            .expect("crate-qualified name_path stub must register without a GraphStore body");
+        assert!(
+            entry.lift_error().is_none(),
+            "a declaration stub has no body to fail on"
+        );
     }
 
     #[test]
@@ -10015,6 +11636,26 @@ mod tests {
     }
 
     #[test]
+    fn residual_return_shell_admits_objectptr_pair_tuple() {
+        use crate::annotator::model::SomeValue;
+        let token = format!("Tuple<{OBJECTPTR_RETURN_TYPE},{OBJECTPTR_RETURN_TYPE}>");
+        let shell = residual_return_shell(Some(&token))
+            .expect("a (PyObjectRef, PyObjectRef) residual is SomeTuple");
+        let SomeValue::Tuple(tuple) = shell else {
+            panic!("expected SomeTuple, got {shell:?}");
+        };
+        assert_eq!(tuple.items.len(), 2);
+        assert!(
+            tuple
+                .items
+                .iter()
+                .all(|item| matches!(item, SomeValue::Ptr(_))),
+            "each item is the typed object-pointer shell, got {:?}",
+            tuple.items
+        );
+    }
+
+    #[test]
     fn default_someshell_for_lltype_void_yields_somenone() {
         use crate::annotator::model::SomeValue;
         let s = default_someshell_for_lltype(&LowLevelType::Void)
@@ -10512,6 +12153,37 @@ mod tests {
     }
 
     #[test]
+    fn foreign_stdlib_externals_registers_string_push_str() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_foreign_stdlib_externals(&registry);
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "string", "String", "push_str",
+            ]))
+            .expect("String::push_str is a Void register_external analog");
+        assert_eq!(
+            entry.function_desc.borrow().signature.argnames,
+            vec!["self".to_string(), "s".to_string()]
+        );
+        assert!(
+            !entry.function_desc.borrow().cache.borrow().is_empty(),
+            "annotator stub graph required"
+        );
+        let push = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "string", "String", "push",
+            ]))
+            .expect("String::push is a Void register_external analog");
+        assert_eq!(
+            push.function_desc.borrow().signature.argnames,
+            vec!["self".to_string(), "ch".to_string()]
+        );
+    }
+
+    #[test]
     fn foreign_stdlib_externals_does_not_register_refcell_get_lookalike() {
         use crate::annotator::bookkeeper::Bookkeeper;
         use crate::translator::rtyper::call_registry::CallRegistry;
@@ -10523,6 +12195,24 @@ mod tests {
                 .lookup(&FunctionPathKey::from_segments(["cell", "RefCell", "get"]))
                 .is_none(),
             "RefCell::get is not Cell::get"
+        );
+    }
+
+    /// `extfuncregistry.py` `_register` / `register_external` declare one
+    /// row per callable. `register_opaque_external` skips a key already
+    /// in the registry, so a second table row is dead and can drift.
+    #[test]
+    fn foreign_stdlib_externals_has_no_duplicate_key() {
+        let mut seen = HashSet::new();
+        let mut duplicates = Vec::new();
+        for (segments, _, _) in FOREIGN_STDLIB_EXTERNALS {
+            if !seen.insert(*segments) {
+                duplicates.push(*segments);
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "FOREIGN_STDLIB_EXTERNALS duplicate keys: {duplicates:?}"
         );
     }
 
@@ -11405,11 +13095,11 @@ mod tests {
         );
     }
 
-    /// An unfollowed return whose real twin is `Void` must not overwrite a
-    /// legacy `Signed` cell. A followed return, and a session that never
-    /// recorded `links_followed`, keeps the twin.
+    /// An unfollowed return whose real twin is `Void` stays in the
+    /// publish map. `SomeImpossibleValue.rtyper_makerepr` is
+    /// `impossible_repr` (Void); a Void value has no register.
     #[test]
-    fn unfollowed_void_return_keeps_the_legacy_kind() {
+    fn unfollowed_void_return_publishes_the_void_twin() {
         use crate::model::ConcreteType;
 
         let legacy = LegacyGraph::new("unfollowed_void_return");
@@ -11425,55 +13115,26 @@ mod tests {
         value_to_var.insert(ret.clone(), typed);
         let mut constants = HashMap::new();
         constants.insert(ret.clone(), LowLevelType::Void);
-        let excluded = HashSet::from([ret.clone()]);
-        keep_legacy_kind_when_unfollowed_void(&mut value_to_var, &mut constants, Some(&excluded));
         assert!(
-            !value_to_var.contains_key(&ret),
-            "unfollowed void twin stays out of the publish map"
+            value_to_var.contains_key(&ret),
+            "unfollowed void twin stays in the publish map"
         );
-        assert!(!constants.contains_key(&ret));
+        assert_eq!(constants.get(&ret), Some(&LowLevelType::Void));
+        crate::codewriter::type_state::apply_from_flowspace_variables(&value_to_var);
+        crate::codewriter::type_state::apply_from_flowspace_constants(&constants);
         assert_eq!(
             LegacyGraph::concretetype_of(&ret),
-            ConcreteType::Signed,
-            "legacy kind is the CFG return `history.getkind` reads"
-        );
-
-        let typed = Variable::new();
-        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
             ConcreteType::Void,
-        ));
-        let mut followed_map = LegacyToTyped::new();
-        followed_map.insert(ret.clone(), typed);
-        let mut followed_constants = HashMap::new();
-        keep_legacy_kind_when_unfollowed_void(
-            &mut followed_map,
-            &mut followed_constants,
-            Some(&HashSet::new()),
-        );
-        assert!(
-            followed_map.contains_key(&ret),
-            "a followed return keeps its void twin"
-        );
-
-        let typed = Variable::new();
-        typed.set_concretetype(crate::model::concrete_to_canonical_lltype(
-            ConcreteType::Void,
-        ));
-        let mut unscoped = LegacyToTyped::new();
-        unscoped.insert(ret.clone(), typed);
-        let mut unscoped_constants = HashMap::new();
-        keep_legacy_kind_when_unfollowed_void(&mut unscoped, &mut unscoped_constants, None);
-        assert!(
-            unscoped.contains_key(&ret),
-            "no links_followed record leaves the twin in place"
+            "s_ImpossibleValue publishes Void; consumers drop it"
         );
     }
 
-    /// Residual-call actual (`emit_one_word_guard_release` Signed stamp)
-    /// whose AccessDirect copy was unfollowed: Phase B Void must not
-    /// publish over the skip-arm kind, or `getcalldescr` drops the actual.
+    /// Residual-call actual whose AccessDirect copy was unfollowed:
+    /// Phase B Void is published. `jtransform.py add_in_correct_list`
+    /// returns on `kind == 'void'`; `call.py getcalldescr` drops Void
+    /// from `NON_VOID_ARGS`.
     #[test]
-    fn unfollowed_void_call_arg_keeps_the_legacy_kind() {
+    fn unfollowed_void_call_arg_publishes_the_void_twin() {
         use crate::model::ConcreteType;
 
         let arg = Variable::new();
@@ -11488,17 +13149,17 @@ mod tests {
         value_to_var.insert(arg.clone(), typed);
         let mut constants = HashMap::new();
         constants.insert(arg.clone(), LowLevelType::Void);
-        let excluded = HashSet::from([arg.clone()]);
-        keep_legacy_kind_when_unfollowed_void(&mut value_to_var, &mut constants, Some(&excluded));
         assert!(
-            !value_to_var.contains_key(&arg),
-            "unfollowed void call-arg twin stays out of the publish map"
+            value_to_var.contains_key(&arg),
+            "unfollowed void call-arg twin stays in the publish map"
         );
-        assert!(!constants.contains_key(&arg));
+        assert_eq!(constants.get(&arg), Some(&LowLevelType::Void));
+        crate::codewriter::type_state::apply_from_flowspace_variables(&value_to_var);
+        crate::codewriter::type_state::apply_from_flowspace_constants(&constants);
         assert_eq!(
             LegacyGraph::concretetype_of(&arg),
-            ConcreteType::Signed,
-            "legacy kind is the residual ABI word getcalldescr reads"
+            ConcreteType::Void,
+            "residual actual of an impossible value is Void"
         );
     }
 }

@@ -1090,7 +1090,9 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     }
     if matches!(
         host.qualname(),
-        "pyre_object.gc_roots.reload_top_root" | "pyre_object.gc_roots.reload_top_root_at"
+        "pyre_object.gc_roots.reload_top_root"
+            | "pyre_object.gc_roots.reload_top_root_at"
+            | "pyre_object.gc_hook.try_gc_current_object_address"
     ) {
         return Some(ExtRegistryEntry::GcRootReload);
     }
@@ -1303,6 +1305,12 @@ mod tests {
         let at = HostObject::new_builtin_callable("pyre_object.gc_roots.reload_top_root_at");
         assert!(matches!(
             lookup(&ConstValue::HostObject(at)),
+            Some(ExtRegistryEntry::GcRootReload)
+        ));
+        let live_mut =
+            HostObject::new_builtin_callable("pyre_object.gc_hook.try_gc_current_object_address");
+        assert!(matches!(
+            lookup(&ConstValue::HostObject(live_mut)),
             Some(ExtRegistryEntry::GcRootReload)
         ));
     }

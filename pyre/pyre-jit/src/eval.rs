@@ -341,7 +341,11 @@ fn reload_cached(raw_slot: usize, frame: *mut PyFrame) -> *mut PyFrame {
     if raw_slot == 0 {
         FrameView::reload(frame)
     } else {
-        FrameView::reload_entered(majit_gc::shadow_stack::slot_from_cached(raw_slot), frame)
+        // SAFETY: `raw_slot` is the word `cache_root_stack_slot` stored for this thread.
+        FrameView::reload_entered(
+            unsafe { majit_gc::shadow_stack::slot_from_cached(raw_slot) },
+            frame,
+        )
     }
 }
 
@@ -4898,7 +4902,7 @@ fn build_gc() -> Box<MiniMarkGC> {
                 pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
                 pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
                 pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
-                pyre_interpreter::error::PYERROR_W_FMT_X0_OFFSET,
+                pyre_interpreter::error::PYERROR_FMT_X0_OFFSET,
             ],
         ));
         debug_assert_eq!(pyerror_tid, pyre_interpreter::error::pyerror_gc_type_id());
@@ -10690,7 +10694,7 @@ fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
     else {
         return false;
     };
-    lasti && frame.valuestackdepth < frame.nlocals() + frame.ncells() + depth as usize
+    lasti && frame.valuestackdepth < frame.stack_base() + depth as usize
 }
 
 /// Whether `PYRE_EXIT_FRAME_DIAG` is set.
@@ -10715,7 +10719,7 @@ fn report_exit_frame_delivery(site: &str, frame: &PyFrame, refused: bool) {
         "[exit-frame] site={site} last_instr={} vsd={} floor={} refused={refused}",
         frame.last_instr,
         frame.valuestackdepth,
-        frame.nlocals() + frame.ncells(),
+        frame.stack_base(),
     );
 }
 
@@ -11070,7 +11074,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         f = if raw_slot == 0 {
             gc_roots::reload_top_root(f as *mut PyFrame as pyre_object::PyObjectRef) as *mut PyFrame
         } else {
-            reload_loop_frame!(f, majit_gc::shadow_stack::slot_from_cached(raw_slot))
+            // SAFETY: `raw_slot` is the word `cache_root_stack_slot` stored for this thread.
+            reload_loop_frame!(f, unsafe {
+                majit_gc::shadow_stack::slot_from_cached(raw_slot)
+            })
         };
 
         let pc = unsafe { &*f }.next_instr();
@@ -11103,7 +11110,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let root_slot = if marker_ec.is_null() {
             majit_gc::shadow_stack::shadow_stack_slot()
         } else {
-            majit_gc::shadow_stack::slot_from_cached(unsafe { (*marker_ec).root_stack_slot.get() })
+            // SAFETY: the word is `root_stack_slot` as `cache_root_stack_slot` stored for this thread.
+            unsafe { majit_gc::shadow_stack::slot_from_cached((*marker_ec).root_stack_slot.get()) }
         };
         // `f` is the marker's red `frame` — the one frame value declared
         // live across the split, as PyFrame.dispatch's `self` is upstream.

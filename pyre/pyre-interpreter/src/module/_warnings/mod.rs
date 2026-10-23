@@ -169,9 +169,10 @@ fn is_internal_frame(frame: *mut crate::PyFrame) -> bool {
     if frame.is_null() {
         return false;
     }
-    let filename = unsafe { &*crate::pyframe::pyframe_get_pycode(&*frame) }
-        .source_path
-        .as_str();
+    // `interp_warnings.py is_internal_frame`: `code = frame.getcode()`.
+    let frame = unsafe { &*frame };
+    let code = frame.getcode();
+    let filename = code.source_path.as_str();
     filename.contains("importlib") && filename.contains("_bootstrap")
 }
 
@@ -179,9 +180,9 @@ fn filename_has_prefix(frame: *mut crate::PyFrame, skip_file_prefixes: &[String]
     if frame.is_null() {
         return false;
     }
-    let filename = unsafe { &*crate::pyframe::pyframe_get_pycode(&*frame) }
-        .source_path
-        .as_str();
+    let frame = unsafe { &*frame };
+    let code = frame.getcode();
+    let filename = code.source_path.as_str();
     skip_file_prefixes
         .iter()
         .any(|prefix| filename.starts_with(prefix))

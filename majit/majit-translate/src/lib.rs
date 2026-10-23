@@ -4124,7 +4124,7 @@ mod portal_driver_tests {
             ops.iter().any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
-                    target: CallTarget::Indirect { trait_root, method_name },
+                    target: CallTarget::Indirect { trait_root, method_name, .. },
                     ..
                 } if trait_root == "Unregistered" && method_name == "go"
             )),

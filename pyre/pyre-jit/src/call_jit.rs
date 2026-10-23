@@ -5972,7 +5972,7 @@ fn scope_args_for_jit_callee(
         &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
     };
     if let Ok(filled) =
-        pyre_interpreter::call::fill_user_function_args(callable, code_ref, &positional)
+        pyre_interpreter::call::fill_user_function_args(callable, code_ref, &positional, false)
     {
         return filled;
     }
@@ -6895,7 +6895,8 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
         // `GUARD_NO_EXCEPTION` as a spurious pending exception (the failure
         // `drain_backend_jit_exc` names for the walker's snapshot side).
         let parked = park_residual_call_exception();
-        let result = pyre_interpreter::call::call_user_function_with_ctx(ec, callable, &call_args);
+        let result =
+            pyre_interpreter::call::call_user_function_with_ctx(ec, callable, &call_args, false);
         unpark_residual_call_exception(parked);
         pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
         return match result {

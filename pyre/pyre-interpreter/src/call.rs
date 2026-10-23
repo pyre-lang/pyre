@@ -863,25 +863,87 @@ pub fn register_depth_bump(f: DepthBumpFn) {
     let _ = DEPTH_BUMP_OVERRIDE.set(f);
 }
 
+/// `argument.py ArgErrTooMany.getmsg` / `ArgErrTooManyMethod.getmsg`
+/// for a user-function positional overflow.
+///
+/// `fill_user_function_args` is `_match_signature`'s positional analog;
+/// `methodcall` is the `Arguments.methodcall` field that site reads.
+#[cold]
+fn user_function_too_many_error(
+    callable: PyObjectRef,
+    code_ref: &crate::CodeObject,
+    args: &[PyObjectRef],
+    methodcall: bool,
+) -> crate::PyError {
+    let defaults = unsafe { crate::function_get_defaults(callable) };
+    let nparams = code_ref.arg_count as usize;
+    let nargs = args.len();
+    let fname = unsafe { crate::function_get_qualname(callable) };
+    let ndefaults = if !defaults.is_null() {
+        if unsafe { pyre_object::is_tuple(defaults) } {
+            unsafe { pyre_object::w_tuple_len(defaults) }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    let takes_str = if ndefaults > 0 {
+        format!(
+            "from {} to {} positional arguments",
+            nparams as isize - ndefaults as isize,
+            nparams
+        )
+    } else {
+        format!(
+            "{} positional argument{}",
+            nparams,
+            if nparams != 1 { "s" } else { "" }
+        )
+    };
+    let given_str = format!("{} {}", nargs, if nargs != 1 { "were" } else { "was" });
+    // `fname` is WTF-8: `format!` would render it through `Display`, which
+    // substitutes U+FFFD for a lone surrogate.
+    let mut msg = Wtf8Buf::new();
+    msg.push_wtf8(&fname);
+    msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
+    // argument.py `ArgErrTooManyMethod.getmsg`: append the forgotten-self
+    // hint when the extra argument is exactly one past `num_argnames`
+    // and the first parameter is not already named `self`.
+    if methodcall {
+        let first = code_ref.varnames.first().map(|name| name.as_str());
+        if nargs == nparams + 1 && (nparams == 0 || first != Some("self")) {
+            msg.push_str(". Did you forget 'self' in the function definition?");
+        }
+    }
+    crate::builtins::applevel_binding_error(callable, args, &[], crate::PyError::type_error(msg))
+}
+
 /// Fill positional defaults, kw-only defaults, and pack varargs for a
 /// user-function call.  Shared by `call_user_function_with_eval`,
-/// `call_user_function_plain_with_ctx` and `call_user_function_with_args`
-/// so all positional-only entries apply the same
+/// `call_user_function_plain_with_ctx`, `call_user_function_with_args`
+/// and `function_call_args` so every positional-only entry applies the same
 /// `function.py` `_flat_pycall_defaults` + `argument.py` `_match_signature`
 /// subset (positional-only — no kwargs path). The JIT callee-frame helpers
 /// go through the same function: `createframe` stores this slice straight
 /// into locals, and a `*args` parameter is one of those locals.
 ///
+/// `methodcall` is `Arguments.methodcall`: `_match_signature` reads that
+/// field at the too-many site and raises `ArgErrTooManyMethod` instead of
+/// `ArgErrTooMany`. Positional callers pass `false`; `function_call_args`
+/// passes `args.methodcall`.
+///
 /// Raises TypeError on too-many positional args (no `*args` to absorb
 /// overflow) and on missing required positional / keyword-only args after
-/// defaults application, mirroring `argument.py` `ArgErrTooMany` and
-/// `argument.py` `ArgErrMissing`.
+/// defaults application, mirroring `argument.py` `ArgErrTooMany` /
+/// `ArgErrTooManyMethod` and `argument.py` `ArgErrMissing`.
 /// `argument.py _match_signature` is `@jit.unroll_safe`.
 #[majit_macros::unroll_safe]
 pub fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
     args: &[PyObjectRef],
+    methodcall: bool,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     let defaults = unsafe { crate::function_get_defaults(callable) };
     let nparams = code_ref.arg_count as usize;
@@ -890,41 +952,10 @@ pub fn fill_user_function_args(
     let has_varargs = code_ref.flags.contains(crate::CodeFlags::VARARGS);
 
     // argument.py:235-236 — too_many_args when no *vararg to absorb.
+    // argument.py Arguments._match_signature — `self.methodcall` selects `ArgErrTooManyMethod`.
     if nargs > nparams && !has_varargs {
-        let fname = unsafe { crate::function_get_qualname(callable) };
-        let ndefaults = if !defaults.is_null() {
-            if unsafe { pyre_object::is_tuple(defaults) } {
-                unsafe { pyre_object::w_tuple_len(defaults) }
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let takes_str = if ndefaults > 0 {
-            format!(
-                "from {} to {} positional arguments",
-                nparams as isize - ndefaults as isize,
-                nparams
-            )
-        } else {
-            format!(
-                "{} positional argument{}",
-                nparams,
-                if nparams != 1 { "s" } else { "" }
-            )
-        };
-        let given_str = format!("{} {}", nargs, if nargs != 1 { "were" } else { "was" });
-        // `fname` is WTF-8: `format!` would render it through `Display`, which
-        // substitutes U+FFFD for a lone surrogate.
-        let mut msg = Wtf8Buf::new();
-        msg.push_wtf8(&fname);
-        msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
-        return Err(crate::builtins::applevel_binding_error(
-            callable,
-            args,
-            &[],
-            crate::PyError::type_error(msg),
+        return Err(user_function_too_many_error(
+            callable, code_ref, args, methodcall,
         ));
     }
 
@@ -1247,6 +1278,7 @@ fn prepare_user_call(
     execution_context: *const crate::PyExecutionContext,
     mut callable: PyObjectRef,
     args: &[PyObjectRef],
+    methodcall: bool,
 ) -> Result<PreparedUserCall, crate::PyError> {
     let mut w_code = unsafe { crate::getcode(callable) };
     let mut w_globals = unsafe { function_get_globals_obj(callable) };
@@ -1255,7 +1287,7 @@ fn prepare_user_call(
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
     let code_ref = unsafe { &*func_code };
-    let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args))?;
+    let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args, methodcall))?;
     let func_frame = pyre_object::with_roots!(callable => make_user_call_frame(w_code, &final_args, w_globals, execution_context, closure))?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
@@ -1271,7 +1303,7 @@ fn call_user_function_with_eval(
     args: &[PyObjectRef],
     eval_fn: EvalFn,
 ) -> PyResult {
-    let mut func_frame = match prepare_user_call(getexecutioncontext(), callable, args)? {
+    let mut func_frame = match prepare_user_call(getexecutioncontext(), callable, args, false)? {
         PreparedUserCall::Frame(func_frame) => func_frame,
         PreparedUserCall::Generator(generator) => return Ok(generator),
     };
@@ -1325,8 +1357,9 @@ pub fn call_user_function_with_ctx(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     args: &[PyObjectRef],
+    methodcall: bool,
 ) -> PyResult {
-    let mut func_frame = match prepare_user_call(execution_context, callable, args)? {
+    let mut func_frame = match prepare_user_call(execution_context, callable, args, methodcall)? {
         PreparedUserCall::Frame(func_frame) => func_frame,
         PreparedUserCall::Generator(generator) => return Ok(generator),
     };
@@ -1338,6 +1371,35 @@ pub fn call_user_function_with_ctx(
     } else {
         Ok(result)
     }
+}
+
+/// `function.py Function.call_args` — `self.getcode().funcrun(self, args)`.
+/// Keywords bind through the shared keyword path (`_match_signature` with
+/// keywords); positional-only calls keep `fill_user_function_args`.
+pub fn function_call_args(func: PyObjectRef, args: &crate::argument::Arguments) -> PyResult {
+    let names = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let values = args.keywords_w.as_deref().unwrap_or(&[]);
+    if !names.is_empty() {
+        return call_with_kwargs_in_ctx_impl(
+            getexecutioncontext(),
+            func,
+            &args.arguments_w,
+            names,
+            values,
+            true,
+            std::ptr::null_mut(),
+        );
+    }
+    let code = unsafe { crate::getcode(func) };
+    if unsafe { crate::gateway::is_builtin_code(code as PyObjectRef) } {
+        return call_function_impl_result(func, &args.arguments_w);
+    }
+    call_user_function_with_ctx(
+        getexecutioncontext(),
+        func,
+        &args.arguments_w,
+        args.methodcall,
+    )
 }
 
 /// Call a user function with pre-resolved args (scope already packed by
@@ -1695,7 +1757,7 @@ fn call_function_carrier_with_mode(
             call_builtin_code_positional(callable, args)
         }
         CallableKind::User => match mode {
-            CallMode::Jit => call_user_function_with_ctx(execution_context, callable, args),
+            CallMode::Jit => call_user_function_with_ctx(execution_context, callable, args, false),
             CallMode::Plain => call_user_function_plain_with_ctx(execution_context, callable, args),
         },
     }
@@ -2602,7 +2664,7 @@ pub fn call_user_function_plain_with_ctx(
         crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
     };
     let code_ref = unsafe { &*func_code };
-    let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args))?;
+    let final_args = pyre_object::with_roots!(callable, closure, w_code, w_globals => fill_user_function_args(callable, code_ref, args, false))?;
 
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame = crate::pyframe::FrameBox::new(
@@ -5353,7 +5415,7 @@ fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> 
     let exec_ctx = take_last_exec_ctx();
 
     let code_ref = unsafe { &*func_code };
-    let final_args = match pyre_object::with_roots!(closure, func, w_code, w_globals => fill_user_function_args(func, code_ref, args))
+    let final_args = match pyre_object::with_roots!(closure, func, w_code, w_globals => fill_user_function_args(func, code_ref, args, false))
     {
         Ok(v) => v,
         Err(e) => {
@@ -6158,6 +6220,45 @@ mod pack_varargs_tests {
                         .unwrap()
                 ),
                 2
+            );
+        }
+    }
+}
+
+/// `Function.call_args` must forward `Arguments.keyword_names_w` /
+/// `keywords_w`. The compile-and-run host is the same as
+/// `eval.rs::run_exec_frame` / `function.rs` tests: `compile_exec` then
+/// `execute_frame`, then fetch the function from globals.
+#[cfg(test)]
+mod function_call_args_tests {
+    #[test]
+    fn function_call_args_forwards_keyword_arguments() {
+        crate::test_hooks::install_hash_hook();
+        let source = "def f(a, b=2, *, c=3):\n    return (a, b, c)\n";
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("define f");
+        let w_globals = frame.get_w_globals();
+        let f = unsafe { pyre_object::w_dict_getitem_str(w_globals, "f") }.expect("f");
+        let w_1 = pyre_object::w_int_new(1);
+        let w_name_c = pyre_object::w_str_new("c");
+        let w_30 = pyre_object::w_int_new(30);
+        let args = crate::argument::Arguments::with_kw(&[w_1], &[w_name_c], &[w_30]);
+        let result = super::function_call_args(f, &args).expect("function_call_args");
+        unsafe {
+            assert!(pyre_object::is_tuple(result));
+            assert_eq!(pyre_object::w_tuple_len(result), 3);
+            assert_eq!(
+                pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(result, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(result, 1).unwrap()),
+                2
+            );
+            assert_eq!(
+                pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(result, 2).unwrap()),
+                30
             );
         }
     }

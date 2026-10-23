@@ -738,7 +738,7 @@ fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
 }
 
 /// An executed residual call the effectinfo names effect-free -- elidable,
-/// loop-invariant, or `not_in_trace` -- applies nothing a rollback would have
+/// loop-invariant, or a known-empty write set -- applies nothing a rollback would have
 /// to undo, so a blocker behind it stays on the rewind leg.  The scan asks
 /// through the `call_effect_free` hook; the helper without the hook keeps the
 /// conservative reading.
@@ -13405,6 +13405,82 @@ fn extra_info_rewindable_allocation_includes_can_raise_with_empty_writes() {
     elidable.extraeffect = majit_ir::ExtraEffect::ElidableCanRaise;
     assert!(super::inline_call::extra_info_is_rewindable_allocation(
         &elidable
+    ));
+}
+
+#[test]
+fn extra_info_rewindable_allocation_does_not_exempt_not_in_trace() {
+    // `rlib/jit.py not_in_trace` omits the call from the assembler.
+    // `pyjitpl.py do_not_in_trace_call` still executes it; abort then
+    // copies `MIFrame.pc` already past the residual (`_get_opimpl_method`),
+    // so `convert_and_run_from_pyjitpl` does not replay it.  `jtransform.py`
+    // `jit.not_in_trace` does not pass an extraeffect that blanks writes
+    // (`effectinfo.py EffectInfo.__new__`).  Writes and random effects
+    // therefore take the same checks as any other residual.
+    let mut random = majit_ir::EffectInfo::MOST_GENERAL;
+    random.oopspecindex = majit_ir::descr::OopSpecIndex::NotInTrace;
+    assert!(
+        !super::inline_call::extra_info_is_rewindable_allocation(&random),
+        "OS_NOT_IN_TRACE does not make random effects rewindable",
+    );
+
+    let mut writes = majit_ir::EffectInfo::default();
+    writes.oopspecindex = majit_ir::descr::OopSpecIndex::NotInTrace;
+    writes._write_descrs_fields = None;
+    writes.write_descrs_fields = Some(vec![0x01]);
+    writes.write_descrs_arrays = Some(Vec::new());
+    writes.write_descrs_interiorfields = Some(Vec::new());
+    assert!(
+        !super::inline_call::extra_info_is_rewindable_allocation(&writes),
+        "OS_NOT_IN_TRACE does not make a known write set rewindable",
+    );
+
+    let mut empty = majit_ir::EffectInfo::default();
+    empty.oopspecindex = majit_ir::descr::OopSpecIndex::NotInTrace;
+    assert!(
+        super::inline_call::extra_info_is_rewindable_allocation(&empty),
+        "OS_NOT_IN_TRACE with a known-empty write set still matches the normal check",
+    );
+}
+
+#[test]
+fn extra_info_rewindable_allocation_absent_raw_write_set_is_not_empty() {
+    // Serialized descrs skip the raw `_write_descrs_*` lists (`None`)
+    // while the bitstrings still record writes.  `None` is unknown,
+    // not "no writes" (`effectinfo.py EffectInfo.__new__`).
+    let mut info = majit_ir::EffectInfo::default();
+    info._write_descrs_fields = None;
+    info._write_descrs_arrays = None;
+    info._write_descrs_interiorfields = None;
+
+    // (a) raw None + bitstring with a set bit → not rewindable
+    info.write_descrs_fields = Some(vec![0x01]);
+    info.write_descrs_arrays = Some(Vec::new());
+    info.write_descrs_interiorfields = Some(Vec::new());
+    assert!(!super::inline_call::extra_info_is_rewindable_allocation(
+        &info
+    ));
+
+    // (b) raw None + all-zero bitstring → rewindable
+    info.write_descrs_fields = Some(vec![0x00]);
+    assert!(super::inline_call::extra_info_is_rewindable_allocation(
+        &info
+    ));
+
+    // (c) raw None + bitstring None → not rewindable
+    info.write_descrs_fields = None;
+    info.write_descrs_arrays = None;
+    info.write_descrs_interiorfields = None;
+    assert!(!super::inline_call::extra_info_is_rewindable_allocation(
+        &info
+    ));
+
+    // (d) raw Some(empty) → rewindable
+    info._write_descrs_fields = Some(Vec::new());
+    info._write_descrs_arrays = Some(Vec::new());
+    info._write_descrs_interiorfields = Some(Vec::new());
+    assert!(super::inline_call::extra_info_is_rewindable_allocation(
+        &info
     ));
 }
 

@@ -2572,6 +2572,38 @@ pub fn memory_error_singleton() -> PyObjectRef {
 
 static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// Residual-call exception publisher: the same write
+/// `runtime_ops::jit_publish_residual_error` performs (`BH_LAST_EXC_VALUE`
+/// plus the raiser that fills backend `JIT_EXC_VALUE`).
+///
+/// pyre-object cannot name those cells (no majit-backend / majit-metainterp
+/// dependency). `register_jit_exc_raiser` installs this hook so rstr helpers
+/// raise through that existing pair instead of a parallel channel.
+type ResidualExcPublisher = extern "C" fn(i64);
+static RESIDUAL_EXC_PUBLISHER: std::sync::OnceLock<ResidualExcPublisher> =
+    std::sync::OnceLock::new();
+
+pub fn register_residual_exc_publisher(f: ResidualExcPublisher) {
+    let _ = RESIDUAL_EXC_PUBLISHER.set(f);
+}
+
+/// Raise MemoryError from a residual helper that is about to return null.
+///
+/// `rstr.py` `LLHelpers.ll_strconcat` / `ll_str_mul` and `ll_str.py`
+/// `ll_int2dec` raise MemoryError synchronously (`mallocstr` / `ovfcheck`).
+/// `exceptiontransform.py` carries that in the one ll exception state; the
+/// JIT reads it after a residual call (`llmodel.py` `_store_exception`,
+/// `pyjitpl.py` `handle_possible_exception`).
+///
+/// With a publisher this writes `memory_error_singleton` into that pair
+/// (`JIT_EXC_VALUE` / `BH_LAST_EXC_VALUE`). With none, do nothing: the
+/// null return is the interpreter's carrier (`runtime_ops::obj_or_memory_error`).
+pub fn publish_memory_error() {
+    if let Some(publish) = RESIDUAL_EXC_PUBLISHER.get() {
+        publish(memory_error_singleton() as i64);
+    }
+}
+
 static STANDARD_EXC_INSTANCES: [std::sync::OnceLock<usize>; EXC_KIND_COUNT] =
     [const { std::sync::OnceLock::new() }; EXC_KIND_COUNT];
 

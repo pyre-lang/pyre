@@ -5389,16 +5389,27 @@ impl std::hash::Hash for LinkKey {
 /// by a fresh Variable (new identity) unless `shallowvars` is true,
 /// in which case the original Variable is reused. When `shallow` is
 /// true, operation lists are also kept as-is.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
 pub fn copygraph(
     graph: &FunctionGraph,
     shallow: bool,
     varmap: &HashMap<Variable, Variable>,
     shallowvars: bool,
 ) -> FunctionGraph {
+    copygraph_with_varmap(graph, shallow, varmap, shallowvars).0
+}
+
+/// [`copygraph`] plus the original→copy `Variable` map `copyvar` builds
+/// (`flowspace/model.py` `copygraph` / `copyvar`).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+pub fn copygraph_with_varmap(
+    graph: &FunctionGraph,
+    shallow: bool,
+    varmap: &HashMap<Variable, Variable>,
+    shallowvars: bool,
+) -> (FunctionGraph, HashMap<Variable, Variable>) {
     let mut varmap: HashMap<Variable, Variable> = varmap.clone();
     let shallowvars = shallowvars || shallow;
 
@@ -5505,7 +5516,7 @@ pub fn copygraph(
     newgraph.tag = graph.tag.clone();
     newgraph.func = graph.func.clone();
     newgraph._source = graph._source.clone();
-    newgraph
+    (newgraph, varmap)
 }
 
 /// RPython `flowspace/model.py` — `summary(graph)`.
