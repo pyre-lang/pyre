@@ -280,11 +280,12 @@ fn pycode_code_ptr_is_raw_int_kind() {
             "w_code_addr2line",
             "w_code_firstlineno_raw",
             "w_code_filename_obj",
+            "code_filename_bytes",
             "is_coroutine",
         ],
     )
     .expect(
-        "lower pycode::w_code_get_ptr, w_code_addr2line, w_code_firstlineno_raw, w_code_filename_obj, and baseobjspace::is_coroutine",
+        "lower pycode::w_code_get_ptr, w_code_addr2line, w_code_firstlineno_raw, w_code_filename_obj, code_filename_bytes, and baseobjspace::is_coroutine",
     );
     let spelling = program
         .struct_fields
@@ -317,6 +318,30 @@ fn pycode_code_ptr_is_raw_int_kind() {
         .iter()
         .find(|f| f.name == "w_code_filename_obj")
         .expect("w_code_filename_obj graph");
+    assert!(
+        filename
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "w_filename"
+            )),
+        "w_code_filename_obj reads PyCode.w_filename"
+    );
+    assert!(
+        !filename
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "code_ptr"
+            )),
+        "w_code_filename_obj does not load code_ptr; w_filename is realized at construction"
+    );
 
     // Same annotation as the two-phase prepass (`dual_gate_publish_concretetypes`).
     // A `*const CodeObject` value that is dereferenced must not annotate as
@@ -424,19 +449,6 @@ fn pycode_code_ptr_is_raw_int_kind() {
         );
     }
 
-    let filename_graph = filename.graph();
-    let filename_code_ptr = filename_graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .find_map(|op| match &op.kind {
-            OpKind::FieldRead { field, .. } if field.name == "code_ptr" => {
-                Some(op.result.clone().expect("code_ptr FieldRead result"))
-            }
-            _ => None,
-        })
-        .expect("w_code_filename_obj reads PyCode.code_ptr");
-
     fn run_legacy(graph: &FunctionGraph, raw: &HashSet<String>) {
         for var in graph.iter_variables() {
             *var.annotation.borrow_mut() = None;
@@ -446,16 +458,33 @@ fn pycode_code_ptr_is_raw_int_kind() {
         legacy_resolve::resolve_types(graph, raw);
     }
 
-    run_legacy(filename_graph, &program.raw_alloc_flavor_structs);
+    let filename_bytes = program
+        .functions
+        .iter()
+        .find(|f| f.name == "code_filename_bytes")
+        .expect("code_filename_bytes graph");
+    let filename_bytes_graph = filename_bytes.graph();
+    let filename_bytes_code_ptr = filename_bytes_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "code_ptr" => {
+                Some(op.result.clone().expect("code_ptr FieldRead result"))
+            }
+            _ => None,
+        })
+        .expect("code_filename_bytes reads PyCode.code_ptr");
+    run_legacy(filename_bytes_graph, &program.raw_alloc_flavor_structs);
     assert_eq!(
-        FunctionGraph::concretetype_of(&filename_code_ptr),
+        FunctionGraph::concretetype_of(&filename_bytes_code_ptr),
         ConcreteType::Signed,
-        "legacy resolve of w_code_filename_obj code_ptr FieldRead is Signed"
+        "legacy resolve of code_filename_bytes code_ptr FieldRead is Signed"
     );
 
-    run_legacy(filename_graph, &HashSet::new());
+    run_legacy(filename_bytes_graph, &HashSet::new());
     assert_eq!(
-        FunctionGraph::concretetype_of(&filename_code_ptr),
+        FunctionGraph::concretetype_of(&filename_bytes_code_ptr),
         ConcreteType::GcRef,
         "legacy resolve with an empty raw set leaves code_ptr as GcRef"
     );

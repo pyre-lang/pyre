@@ -16489,6 +16489,7 @@ unsafe fn mro_subclasses(
         old_mro_root,
         new_mro_root,
     });
+    let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
     let subclasses = pyre_object::typeobject::w_type_get_subclasses(w_type, false);
     let subclass_roots = pyre_object::gc_roots::shadow_stack_len();
     for &w_sc in &subclasses {

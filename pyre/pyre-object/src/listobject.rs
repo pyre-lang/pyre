@@ -34,6 +34,12 @@ use std::cell::UnsafeCell;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// `rstr.py` `AbstractStringRepr.ll_strcmp` — `StringSort.lt` is `a < b`.
+#[inline(always)]
+pub fn string_sort_chars_cmp(left: &[u8], right: &[u8]) -> isize {
+    crate::object_array::ll_chars_strcmp(left, right)
+}
+
 // PyPy's list strategy/storage transitions are indivisible under its GIL.
 // Pyre keeps the list itself as the sole semantic owner and uses only narrow
 // address-striped reentrant synchronization around those transitions.
@@ -3491,6 +3497,37 @@ pub fn ll_list_bytes_getitem_fast(
     l.bytes_items[index]
 }
 
+/// `ll_setitem_fast` for BytesListStrategy: store the erased bytes payload
+/// at a known-in-bounds index. The host body is `setarrayitem_gc`. The fold
+/// replaces this leaf with `getfield_gc_r(bytes_items.block)` +
+/// `setarrayitem_gc_r`.
+///
+/// `rlist.py ll_setitem_fast` stores `item` into a same-type `GcArray`.
+/// Bytes items are `*const STR`; the store is typed through
+/// [`BytesArray`]'s STR slot after the array barrier so the annotator
+/// never sees a STR→PyObject cast.
+///
+/// The barrier is `gc_hook::try_gc_write_barrier_from_array`
+/// (`dont_look_inside`), the same spelling `items_block_set_ref` uses:
+/// `GCFLAG_TRACK_YOUNG_PTRS` is mutable, and looking inside
+/// `majit_gc::gc_write_barrier_from_array` can fold the clear bit from a
+/// young birth and skip the barrier after the array is promoted
+/// (`incminimark.py write_barrier_from_array`). The nursery / flag /
+/// forwarded tests live first inside that hook. The from_array call stays
+/// residual: `framework.py transform_generic_set` emits it as
+/// `direct_call` and `jtransform.py` does not drop it.
+#[majit_macros::oopspec("list.bytes_setitem(l, index, item)")]
+pub fn ll_list_bytes_setitem_fast(
+    l: &mut W_ListObject,
+    index: usize,
+    item: *const crate::bytesobject::BytesBlock,
+) {
+    let block = l.bytes_items.block;
+    debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
+    crate::gc_hook::try_gc_write_barrier_from_array(block as crate::gc_hook::GCREF, index);
+    l.bytes_items[index] = item;
+}
+
 /// `ll_length` for AsciiListStrategy. The length word sits at the same
 /// offset as `ascii_items`; the oopspec reads that word.
 #[majit_macros::oopspec("list.ascii_len(l)")]
@@ -5166,6 +5203,14 @@ pub unsafe fn w_list_uses_ascii_storage(obj: PyObjectRef) -> bool {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_list_uses_bytes_storage(obj: PyObjectRef) -> bool {
+    let list = &*(obj as *const W_ListObject);
+    list.strategy == ListStrategy::Bytes
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_uses_int_or_float_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::IntOrFloat
@@ -5811,38 +5856,6 @@ pub unsafe fn w_list_sort_int_or_float(obj: PyObjectRef, reverse: bool) -> bool 
     });
     if reverse {
         items.reverse();
-    }
-    true
-}
-
-/// `BytesListStrategy.sort` / `AsciiListStrategy.sort` (`listobject.py`):
-/// order the erased RPython string payloads directly with `StringSort`, then
-/// apply the upstream reverse step without allocating Python wrappers.
-pub unsafe fn w_list_sort_strings(obj: PyObjectRef, reverse: bool) -> bool {
-    let list = &mut *(obj as *mut W_ListObject);
-    match list.strategy {
-        ListStrategy::Bytes => list.bytes_items.as_mut_slice().sort_by(|a, b| {
-            crate::object_array::ll_chars_strcmp(
-                crate::bytesobject::bytes_block_chars(*a),
-                crate::bytesobject::bytes_block_chars(*b),
-            )
-            .cmp(&0)
-        }),
-        ListStrategy::Ascii => list.ascii_items.as_mut_slice().sort_by(|a, b| unsafe {
-            crate::object_array::ll_chars_strcmp(
-                crate::unicodeobject::utf8_payload_bytes(*a),
-                crate::unicodeobject::utf8_payload_bytes(*b),
-            )
-            .cmp(&0)
-        }),
-        _ => return false,
-    }
-    if reverse {
-        match list.strategy {
-            ListStrategy::Bytes => list.bytes_items.reverse(),
-            ListStrategy::Ascii => list.ascii_items.reverse(),
-            _ => unreachable!(),
-        }
     }
     true
 }
@@ -7417,39 +7430,6 @@ mod tests {
     }
 
     #[test]
-    fn ascii_strategy_mutations_and_sort_stay_unwrapped() {
-        let list = w_list_new(vec![crate::w_str_new("c"), crate::w_str_new("a")]);
-        let donor = w_list_new(vec![crate::w_str_new("b")]);
-        unsafe {
-            w_list_insert(list, 1, crate::w_str_new("d"));
-            assert_eq!(
-                (*(list as *const W_ListObject)).strategy,
-                ListStrategy::Ascii
-            );
-            w_list_delslice(list, 1, 2);
-            w_list_setslice(list, 1, 1, donor).unwrap();
-            assert!(w_list_sort_strings(list, false));
-            assert_eq!(crate::w_str_get_wtf8(w_list_getitem(list, 0).unwrap()), "a");
-            assert_eq!(crate::w_str_get_wtf8(w_list_getitem(list, 1).unwrap()), "b");
-            assert_eq!(crate::w_str_get_wtf8(w_list_getitem(list, 2).unwrap()), "c");
-            w_list_reverse(list);
-            assert_eq!(crate::w_str_get_wtf8(w_list_pop(list, 0).unwrap()), "c");
-            assert_eq!(
-                (*(list as *const W_ListObject)).strategy,
-                ListStrategy::Ascii
-            );
-
-            let empty = w_list_new(Vec::new());
-            w_list_setslice(empty, 0, 0, list).unwrap();
-            assert_eq!(
-                (*(empty as *const W_ListObject)).strategy,
-                ListStrategy::Ascii
-            );
-            assert_eq!(w_list_len(empty), 2);
-        }
-    }
-
-    #[test]
     fn empty_typed_storage_grows_on_first_append() {
         // The empty form has capacity 0, so the first write must reach `grow`
         // rather than the no-resize leg.
@@ -7614,6 +7594,19 @@ mod tests {
         assert_eq!(
             oopspec_ll_list_ascii_setitem_fast,
             "list.ascii_setitem(l, index, item)"
+        );
+    }
+
+    #[test]
+    fn bytes_strategy_oopspec_tags_present() {
+        assert_eq!(oopspec_ll_list_bytes_length, "list.bytes_len(l)");
+        assert_eq!(
+            oopspec_ll_list_bytes_getitem_fast,
+            "list.bytes_getitem(l, index)"
+        );
+        assert_eq!(
+            oopspec_ll_list_bytes_setitem_fast,
+            "list.bytes_setitem(l, index, item)"
         );
     }
 

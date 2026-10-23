@@ -263,8 +263,37 @@ impl BytesArray {
         value
     }
 
+    /// `rlist.py ll_reverse`: swap through `ll_setitem_fast`. Each store is
+    /// `setarrayitem_gc`, whose barrier is `write_barrier_from_array(array,
+    /// index)` (`framework.py` `transform_generic_set`). Nothing collects
+    /// inside the loop, so the slot write is raw (no pin).
     pub fn reverse(&mut self) {
-        self.as_mut_slice().reverse();
+        let length = self.len_relaxed() as isize;
+        let mut i = 0;
+        let mut length_1_i = length - 1 - i;
+        while i < length_1_i {
+            let tmp = unsafe { *self.base().add(i as usize) };
+            if !self.block.is_null() {
+                crate::gc_hook::try_gc_write_barrier_from_array(
+                    self.block as crate::gc_hook::GCREF,
+                    i as usize,
+                );
+            }
+            unsafe {
+                *self.base().add(i as usize) = *self.base().add(length_1_i as usize);
+            }
+            if !self.block.is_null() {
+                crate::gc_hook::try_gc_write_barrier_from_array(
+                    self.block as crate::gc_hook::GCREF,
+                    length_1_i as usize,
+                );
+            }
+            unsafe {
+                *self.base().add(length_1_i as usize) = tmp;
+            }
+            i += 1;
+            length_1_i -= 1;
+        }
     }
 
     pub fn splice(&mut self, start: usize, remove_count: usize, values: &[*const BytesBlock]) {

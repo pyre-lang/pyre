@@ -195,4 +195,52 @@ a_list_traced_empty_then_filled_keeps_young_interned_strs()
 young_objects_stored_into_an_old_cap7_list_survive_minors()
 young_ascii_strs_stored_into_a_cap7_ascii_list_survive_minors()
 young_ascii_strs_appended_into_an_old_cap7_ascii_list_survive_minors()
+
+
+def _permute_old_list_keeps_young_payloads(kind, make, fresh, is_ok):
+    n = 200
+    lst = [make(i) for i in range(n)]
+    gc.collect()
+    gc.collect()
+    for k in range(10):
+        for j in range(20):
+            lst[(j * 9 + k) % n] = fresh(k, j)
+        if k % 2:
+            lst.reverse()
+        else:
+            lst.sort(reverse=True)
+        junk = [make(i) for i in range(300)]
+        del junk
+        for x in lst:
+            if not is_ok(x):
+                raise AssertionError((kind, k, type(x), x))
+    out = sorted(lst, reverse=True)
+    for x in out:
+        if not is_ok(x):
+            raise AssertionError((kind, "sorted", type(x), x))
+    lst.sort()
+    print("%s reverse/sort kept %d" % (kind, n))
+    print(lst[:3], lst[-3:])
+
+
+def old_ascii_str_list_reverse_or_sort_keeps_young_payloads():
+    _permute_old_list_keeps_young_payloads(
+        "ascii-str",
+        lambda i: "s%d" % i,
+        lambda k, j: "n%d_%d" % (k, j),
+        lambda x: isinstance(x, str) and (x.startswith("s") or x.startswith("n")),
+    )
+
+
+def old_bytes_list_reverse_or_sort_keeps_young_payloads():
+    _permute_old_list_keeps_young_payloads(
+        "bytes",
+        lambda i: b"s%d" % i,
+        lambda k, j: b"n%d_%d" % (k, j),
+        lambda x: isinstance(x, bytes) and (x.startswith(b"s") or x.startswith(b"n")),
+    )
+
+
+old_ascii_str_list_reverse_or_sort_keeps_young_payloads()
+old_bytes_list_reverse_or_sort_keeps_young_payloads()
 print("OK")

@@ -8,14 +8,17 @@
 # value (pycode.py replace); array.array and _SSLContext/MemoryBIO reject
 # unexpected keywords; clinic reports a duplicate as
 # "argument for fname() given by name ('x') and position (n)" with n
-# counted without the receiver.
+# counted without the receiver. gc.get_objects validates generation,
+# then returns every object for any accepted value.
 #
 # pyre-check: pypy-diverges: pypy3 words _sre.compile() as Pattern.__new__
 # missing three arguments; str.split(" ", sep=",") as "takes no keyword
 # arguments"; array.array as "does not take keyword arguments";
 # _opcode.stack_effect(opcode=1) succeeds; start_new_thread takes no
 # keywords in the text signature but pypy still binds some names
-# differently; ssl.SSLContext.__new__ accepts unexpected keywords.
+# differently; ssl.SSLContext.__new__ accepts unexpected keywords;
+# gc.get_objects(generation) raises NotImplementedError for a
+# non-None generation.
 
 import sys
 
@@ -202,6 +205,22 @@ def omitted_gc_generation_and_stats():
     gc.collect()
     gc.get_objects()
     gc.get_stats()
+
+    class Sentinel:
+        pass
+
+    sentinel = Sentinel()
+    print("none", any(obj is sentinel for obj in gc.get_objects()))
+    print("-1", any(obj is sentinel for obj in gc.get_objects(-1)))
+    for generation in (0, 1, 2):
+        print("list", generation, isinstance(gc.get_objects(generation), list))
+    for generation in (3, -2, "x"):
+        try:
+            gc.get_objects(generation)
+        except Exception as exc:
+            print("err", generation, type(exc).__name__, str(exc))
+    if sys.implementation.name == "pyre":
+        assert any(obj is sentinel for obj in gc.get_objects(1))
 
 
 def contextvar_omitted_default_is_absent():

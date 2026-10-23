@@ -426,6 +426,7 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
         "ctypes",
         false,
     ));
+    ARGUMENT_ERROR_TYPE_OBJ.set(argument_error);
     pyre_interpreter::__pyre_store!(ns, "ArgumentError", argument_error);
 
     // ── aggregate + array/pointer types: real `Structure`/`Union`/`Array`/
@@ -832,6 +833,38 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
     ));
     COMERROR_TYPE_OBJ.set(comerror);
     pyre_interpreter::__pyre_store!(ns, "COMError", comerror);
+}
+
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+static ARGUMENT_ERROR_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+
+/// `CFuncPtr.__call__` `raise ArgumentError(...)`.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+#[majit_macros::dont_look_inside]
+pub(super) fn argument_error(msg: impl Into<String>) -> pyre_interpreter::PyError {
+    argument_error_wtf8(&rustpython_wtf8::Wtf8Buf::from_string(msg.into()))
+}
+
+/// ArgumentError whose message may hold a lone surrogate (`_ctypes_extend_error`
+/// keeps `PyObject_Str` as unicode).
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+#[majit_macros::dont_look_inside]
+pub(super) fn argument_error_wtf8(msg: &rustpython_wtf8::Wtf8) -> pyre_interpreter::PyError {
+    let Some(cls) = ARGUMENT_ERROR_TYPE_OBJ.get() else {
+        return pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::TypeError,
+            msg.to_wtf8_buf(),
+        );
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = pyre_object::w_str_from_wtf8_managed_borrowed(msg);
+    pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        w_value,
+    )
 }
 
 #[cfg(all(windows, feature = "host_env"))]

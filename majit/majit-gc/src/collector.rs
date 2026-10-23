@@ -99,6 +99,23 @@ impl Drop for ConstPtrTableTestGuard {
     }
 }
 
+/// minimarkpage.py `out_of_memory`.
+///
+/// Translated `fatalerror` (`OP_DEBUG_FATALERROR`) writes the message to
+/// stderr and `abort()`s. Tests take the untranslated `FatalError` raise so
+/// the fatal rung stays catchable in-process.
+fn out_of_memory(errmsg: &'static str) -> ! {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = err.write_all(errmsg.as_bytes());
+    let _ = err.write_all(b"\n");
+    let _ = err.flush();
+    #[cfg(test)]
+    panic!("{errmsg}");
+    #[cfg(not(test))]
+    std::process::abort();
+}
+
 impl HeapDumpWriter {
     const BUFSIZE: usize = 8192;
 
@@ -9172,7 +9189,7 @@ impl MiniMarkGC {
             if self.max_heap_size_already_raised
                 && !majit_ir::eval_breaker_word::memory_error_armed()
             {
-                panic!("using too much memory, aborting");
+                out_of_memory("using too much memory, aborting");
             }
             self.max_heap_size_already_raised = true;
             self.oom_signalled_this_step = true;
@@ -9674,7 +9691,7 @@ impl MiniMarkGC {
     /// startup; this is the same limit set from inside a running process, and
     /// it pulls the pending major-collection thresholds down with it so a limit
     /// lowered below them takes effect before the next major rather than after.
-    pub fn set_max_heap_size(&mut self, size: usize) {
+    pub fn set_max_heap_size(&mut self, size: i64) {
         self.max_heap_size = size as f64;
         if self.max_heap_size > 0.0 {
             if self.max_heap_size < self.next_major_collection_initial {
@@ -13341,7 +13358,7 @@ mod tests {
             "an allocation-driven breach owes the dispatch loop nothing"
         );
 
-        // Second bounded breach aborts (out_of_memory -> fatalerror == panic).
+        // Second bounded breach aborts (`out_of_memory` -> `fatalerror`).
         // The take above is what the waiting allocation does the moment the
         // collection returns, and it is what makes this a second arrival.
         gc.pending_reserving_size = 4096;
@@ -19450,6 +19467,13 @@ cache size\t: 8192 kB\n";
         // Unbounded leaves them alone entirely.
         gc.set_max_heap_size(0);
         assert_eq!(gc.max_heap_size, 0.0);
+        assert_eq!(gc.next_major_collection_threshold, 1024.0);
+
+        // A negative size is unbounded too: only a positive value lowers
+        // the thresholds (`incminimark.py set_max_heap_size`).
+        gc.set_max_heap_size(-1);
+        assert_eq!(gc.max_heap_size, -1.0);
+        assert_eq!(gc.next_major_collection_initial, 1024.0);
         assert_eq!(gc.next_major_collection_threshold, 1024.0);
     }
 

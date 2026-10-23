@@ -1,6 +1,7 @@
 //! `CFuncPtr` (imported as `_CFuncPtr`) — the foreign-function object.
 //!
-//! `__new__` resolves and stores a function-pointer address (`"_ptr"`) from a
+//! `__new__` resolves and stores a function-pointer address in the instance's
+//! CData buffer (`CFuncPtr._set_address`) from a
 //! `(name, dll)` pair, a bare integer address, or nothing (NULL).  `__call__`
 //! marshals scalar Python arguments into libffi values and performs the call
 //! through [`super::callproc`], then decodes the scalar result.
@@ -35,7 +36,6 @@ pub(super) const FUNCFLAG_USE_LASTERROR: i64 = ctypes_h::FUNCFLAG_USE_LASTERROR 
 const DEFAULT_RESTYPE_CODE: TypeCode = TypeCode::from_char('i');
 
 /// Reserved instance-dict keys.
-const PTR_KEY: &str = "_ptr";
 const RESTYPE_KEY: &str = "_restype";
 const ARGTYPES_KEY: &str = "_argtypes";
 pub(super) const CALLABLE_KEY: &str = "_callable";
@@ -201,20 +201,20 @@ fn init_cfuncptr_type(ns: PyObjectRef) {
 }
 
 fn cfuncptr_del(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    // CFuncPtr.__del__: `if self._needs_free: self._buffer.free(); self._buffer = None`
-    // and `if isinstance(self._ptr, _rawffi.CallbackPtr): self._ptr.free(); self._ptr = None`.
-    // The stored address is cleared only for an owned callback thunk; a
-    // function built from a native address keeps that address.  A second
-    // `__del__` finds no thunk and is a no-op for the address.
+    // CFuncPtr.__del__: everything nested under `self._needs_free`
+    // (`cdata::owns_buffer`).  `free_prepared` has no counterpart there;
+    // dropping it would leak the `NativeFuncState` box `__del__` owns.
     if let Some(&obj) = args.first() {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = _roots.pin_roots(&[obj]);
-        if super::callbacks::has_thunk(_roots.get(obj_slot)) {
-            super::callbacks::free_thunk(_roots.get(obj_slot));
-            if cdata::owns_buffer(_roots.get(obj_slot)) {
-                let _ = store_funcptr_addr(_roots.get(obj_slot), 0);
-            } else {
-                instance_set(_roots.get(obj_slot), PTR_KEY, pyre_object::w_int_new(0));
+        if cdata::owns_buffer(_roots.get(obj_slot)) {
+            if cdata::cdata_buffer(_roots.get(obj_slot)).is_none() {
+                free_prepared(_roots.get(obj_slot));
+                return Ok(pyre_object::w_none());
+            }
+            cdata::release_owned_buffer(_roots.get(obj_slot));
+            if super::callbacks::has_thunk(_roots.get(obj_slot)) {
+                super::callbacks::free_thunk(_roots.get(obj_slot));
             }
         }
         free_prepared(_roots.get(obj_slot));
@@ -241,13 +241,35 @@ fn cfuncptr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
 
 /// A COM method is true whether or not it holds an address, because the vtable
 /// slot it names is all it ever needed.
+///
+/// `CFuncPtr.__bool__`: `self._com_index is not None or bool(self._buffer[0])`.
 fn cfuncptr_bool(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let obj = args[0];
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = _roots.pin_roots(&[obj]);
     #[cfg(windows)]
-    if com_index(obj).is_some() {
+    if com_index(_roots.get(obj_slot)).is_some() {
         return Ok(pyre_object::w_bool_from(true));
     }
-    Ok(pyre_object::w_bool_from(funcptr_addr(obj) != 0))
+    Ok(pyre_object::w_bool_from(
+        funcptr_buffer_word(_roots.get(obj_slot))? != 0,
+    ))
+}
+
+/// What `None[0]` raises — `CFuncPtr.__bool__` after `_buffer = None`.
+fn none_not_subscriptable() -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::type_error("'NoneType' object is not subscriptable")
+}
+
+/// `CFuncPtr._get_address` after a buffer check: `__bool__` raises when
+/// `_buffer` is gone.
+fn funcptr_buffer_word(obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = _roots.pin_roots(&[obj]);
+    if cdata::cdata_addr(_roots.get(obj_slot)).is_none() {
+        return Err(none_not_subscriptable());
+    }
+    Ok(funcptr_addr(_roots.get(obj_slot)))
 }
 
 /// The vtable slot a COM method lives in, or `None` for an ordinary function.
@@ -669,9 +691,12 @@ enum Settled {
 /// `_ctypes/function.py` keeps the prepared call in `self._ptr` and drops it in
 /// `_setargtypes` / `_setrestype`; this is the same cache under the same
 /// invalidation — [`instance_set`] and [`store_funcptr_addr`] are every write
-/// that can change an answer in it.  A class-level `_restype_` / `_argtypes_` /
-/// `_flags_` write goes through neither, so the record also carries the type's
-/// version tag and is re-derived once that moves.
+/// that can change an answer in it.  A store through the CData buffer
+/// (`memmove` into `addressof`) does not go through those, so a plan is
+/// re-checked against `CFuncPtr._get_address` before it is used.  A
+/// class-level `_restype_` / `_argtypes_` / `_flags_` write goes through
+/// neither, so the record also carries the type's version tag and is
+/// re-derived once that moves.
 ///
 /// The carrier is an opaque `bytes` in the instance dict rather than a Rust
 /// side table so that it holds no object reference across a collection and dies
@@ -1275,16 +1300,26 @@ pub(super) fn funcptr_flags(obj: PyObjectRef) -> i64 {
     }
 }
 
+/// `CFuncPtr._get_address`: `return self._buffer[0]`.
+///
+/// Decodes the pointer-sized `"P"` word at the start of the instance's CData
+/// buffer; 0 when there is no buffer.
 pub(super) fn funcptr_addr(obj: PyObjectRef) -> usize {
-    instance_get(obj, PTR_KEY)
-        .filter(|o| unsafe { pyre_object::is_int(*o) })
-        .map(|o| unsafe { pyre_object::w_int_get_value(o) } as usize)
-        .unwrap_or(0)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = _roots.pin_roots(&[obj]);
+    let Some(base) = cdata::cdata_addr(_roots.get(obj_slot)) else {
+        return 0;
+    };
+    cfield::read_pointer_from_buffer(unsafe {
+        cfield::borrow_memory(base as *const u8, cfield::pointer_size())
+    })
 }
 
-/// Store a function address in both `_ptr` and the pointer-sized CData buffer.
-/// The object and boxed integer are rooted independently because either the
-/// integer allocation or the dict write may move the instance.
+/// `CFuncPtr._set_address`: write the pointer-sized buffer word.
+///
+/// Drops the settled call plan: it captured the address being replaced.
+/// The instance is rooted because the dict delete and the `"P"` encode can
+/// allocate.
 pub(super) fn store_funcptr_addr(
     obj: PyObjectRef,
     addr: usize,
@@ -1292,11 +1327,9 @@ pub(super) fn store_funcptr_addr(
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
-    let w_addr = pyre_object::w_int_new(addr as i64);
-    let addr_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_addr);
-    let current_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let d = pyre_interpreter::baseobjspace::getdict_native(current_obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
     if d.is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "CFuncPtr instance has no instance dict",
@@ -1305,12 +1338,6 @@ pub(super) fn store_funcptr_addr(
     let _ = pyre_object::gc_roots::pin_root(d);
     let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
-        pyre_object::w_dict_setitem_str(
-            pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            PTR_KEY,
-            pyre_object::gc_roots::shadow_stack_get(addr_slot),
-        );
-        // The address a plan calls through is the one being replaced here.
         drop_settled(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     };
     let bytes = cfield::simple_storage_value_to_bytes_endian(
@@ -1340,15 +1367,345 @@ pub(super) fn is_simple_subclass(ty: PyObjectRef) -> bool {
             .is_some_and(|base| cdata::type_code_of(base).is_some())
 }
 
-fn callback_argument(
-    ty: PyObjectRef,
-    value: PyObjectRef,
-) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if is_simple_subclass(ty) {
-        pyre_interpreter::call::type_call_instantiate(ty, &[value])
-    } else {
-        Ok(value)
+/// `CFuncPtr._is_primitive`: `argtype.__bases__[0] is _SimpleCData`.
+fn is_primitive_argtype(argtype: PyObjectRef) -> bool {
+    if argtype.is_null() || !unsafe { pyre_object::is_type(argtype) } {
+        return false;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let argtype_slot = pyre_object::gc_roots::pin_roots(&[argtype]);
+    let simple = cdata::simplecdata_type();
+    let simple_slot = pyre_object::gc_roots::pin_roots(&[simple]);
+    let bases = unsafe {
+        pyre_object::typeobject::w_type_get_bases(pyre_object::gc_roots::shadow_stack_get(
+            argtype_slot,
+        ))
+    };
+    !bases.is_null()
+        && unsafe { pyre_object::w_tuple_getitem(bases, 0) }
+            .is_some_and(|base| base == pyre_object::gc_roots::shadow_stack_get(simple_slot))
+}
+
+fn argtype_is_void_p(argtype: PyObjectRef) -> bool {
+    cdata::declared_type_str(argtype) == Some("P")
+}
+
+fn is_struct_or_union_instance(param: PyObjectRef) -> bool {
+    if param.is_null() {
+        return false;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let param_slot = pyre_object::gc_roots::pin_roots(&[param]);
+    let structure = super::metaclass::structure_type();
+    if unsafe {
+        pyre_interpreter::baseobjspace::isinstance_w(
+            pyre_object::gc_roots::shadow_stack_get(param_slot),
+            structure,
+        )
+    } {
+        return true;
+    }
+    let union = super::metaclass::union_type();
+    unsafe {
+        pyre_interpreter::baseobjspace::isinstance_w(
+            pyre_object::gc_roots::shadow_stack_get(param_slot),
+            union,
+        )
+    }
+}
+
+fn carg_kept_obj(param: PyObjectRef) -> Option<PyObjectRef> {
+    if !super::interp_ctypes::is_carg(param) {
+        return None;
+    }
+    let d = pyre_interpreter::baseobjspace::getdict_native(param);
+    if d.is_null() {
+        return None;
+    }
+    unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
+        .filter(|o| !o.is_null() && !unsafe { pyre_object::is_none(*o) })
+}
+
+fn unwrap_simple_param(param: PyObjectRef) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let param_slot = pyre_object::gc_roots::pin_roots(&[param]);
+    match carg_kept_obj(pyre_object::gc_roots::shadow_stack_get(param_slot)) {
+        Some(obj) => obj,
+        None => pyre_object::gc_roots::shadow_stack_get(param_slot),
+    }
+}
+
+fn error_matches_class(error: &mut pyre_interpreter::PyError, name: &str) -> bool {
+    pyre_interpreter::builtins::lookup_exc_class(name)
+        .is_some_and(|cls| error.match_(pyre_object::w_none(), cls))
+}
+
+fn is_python_exception(error: &mut pyre_interpreter::PyError) -> bool {
+    error_matches_class(error, "Exception")
+}
+
+fn callback_error_type_name(error: &pyre_interpreter::PyError) -> String {
+    if !error.w_type.is_null() && unsafe { pyre_object::is_type(error.w_type) } {
+        return unsafe { pyre_object::w_type_get_name(error.w_type) }.to_string();
+    }
+    if !error.exc_object.is_null()
+        && let Some(tp) = pyre_interpreter::typedef::r#type(error.exc_object)
+    {
+        return unsafe { pyre_object::w_type_get_name(tp.as_ptr()) }.to_string();
+    }
+    match error.kind {
+        pyre_interpreter::PyErrorKind::TypeError => "TypeError".to_string(),
+        pyre_interpreter::PyErrorKind::ValueError => "ValueError".to_string(),
+        pyre_interpreter::PyErrorKind::UnicodeError => "UnicodeError".to_string(),
+        pyre_interpreter::PyErrorKind::UnicodeDecodeError => "UnicodeDecodeError".to_string(),
+        pyre_interpreter::PyErrorKind::UnicodeEncodeError => "UnicodeEncodeError".to_string(),
+        pyre_interpreter::PyErrorKind::UnicodeTranslateError => "UnicodeTranslateError".to_string(),
+        _ => "Exception".to_string(),
+    }
+}
+
+fn wrap_callback_argument_error(
+    index: usize,
+    mut error: pyre_interpreter::PyError,
+) -> pyre_interpreter::PyError {
+    // [3.15-spec] measured python3.15t (v3.15.1, free-threaded): callback
+    // from_param raising KeyError -> ArgumentError wrapping it; __context__
+    // is None.  `_ctypes_callproc` calls `_ctypes_extend_error` for any
+    // failure (`v3.15.1` `Modules/_ctypes/callproc.c` `_ctypes_callproc` /
+    // `_ctypes_extend_error`).  Message is "argument {i}: " + PyType_GetName
+    // + ": " + str(exc), or "???" if str(exc) raises.  PyPy CFuncPtr.__call__
+    // catches (UnicodeError, TypeError, ValueError) and raises
+    // ArgumentError(str(e)).
+    let msg = {
+        let roots = pyre_object::gc_roots::push_roots();
+        let error_slot = error.pin(&roots);
+        let w_exc = error.to_exc_object();
+        error.reload(&roots, error_slot);
+        let exc_slot = pyre_object::gc_roots::pin_roots(&[w_exc]);
+        let name = callback_error_type_name(&error);
+        let body = match unsafe {
+            pyre_interpreter::display::py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                exc_slot,
+            ))
+        } {
+            Ok(s) => s,
+            Err(_) => rustpython_wtf8::Wtf8Buf::from_string("???".to_string()),
+        };
+        pyre_interpreter::display::wtf8_format!(format!("argument {index}: {name}: "), body)
+    };
+    let mut wrapped = super::interp_ctypes::argument_error_wtf8(&msg);
+    wrapped.set_context_recorded(true);
+    wrapped
+}
+
+fn copy_struct_or_union(param: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    // CFuncPtr._convert_args_for_callback: `StructOrUnion.__new__(type(param))`
+    // then `param._copy_to(newparam._buffer.buffer)`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let param_slot = pyre_object::gc_roots::pin_roots(&[param]);
+    let cls = unsafe {
+        pyre_object::w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(param_slot))
+    };
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    let bytes = cdata::cdata_buffer_copy(pyre_object::gc_roots::shadow_stack_get(param_slot))
+        .unwrap_or_default();
+    make_aggregate_instance(pyre_object::gc_roots::shadow_stack_get(cls_slot), &bytes)
+}
+
+fn convert_one_callback_arg_inner(
+    argtype: PyObjectRef,
+    arg: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::publish_roots(&[argtype, arg]);
+    let param = pyre_interpreter::baseobjspace::call_method_result(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        "from_param",
+        &[pyre_object::gc_roots::shadow_stack_get(base + 1)],
+    )?;
+    let param_slot = pyre_object::gc_roots::pin_roots(&[param]);
+    // [3.15-spec] measured python3.15t (v3.15.1, free-threaded):
+    // type(c_int.from_param(5)).__name__ -> 'CArgObject'.  PyPy
+    // CFuncPtr._convert_args_for_callback receives the c_int instance, so the
+    // callback path unwraps it before _convert_args_for_callback's branches.
+    let cdata = unwrap_simple_param(pyre_object::gc_roots::shadow_stack_get(param_slot));
+    let cdata_slot = pyre_object::gc_roots::pin_roots(&[cdata]);
+    if argtype_is_void_p(pyre_object::gc_roots::shadow_stack_get(base)) {
+        // CFuncPtr._convert_args_for_callback: `_type_ == 'P'` passes
+        // `param._get_buffer_value()` (the pointer word).  A null word is int 0
+        // there; `P_get` answers None, which is the 3.15 observable.
+        let bytes = cdata::cdata_buffer_copy(pyre_object::gc_roots::shadow_stack_get(cdata_slot))
+            .unwrap_or_default();
+        return Ok(cdata::decode_slot("P", &bytes));
+    }
+    if is_primitive_argtype(pyre_object::gc_roots::shadow_stack_get(base)) {
+        return pyre_interpreter::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(cdata_slot),
+            "value",
+        );
+    }
+    if is_struct_or_union_instance(pyre_object::gc_roots::shadow_stack_get(cdata_slot)) {
+        return copy_struct_or_union(pyre_object::gc_roots::shadow_stack_get(cdata_slot));
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(cdata_slot))
+}
+
+fn convert_one_callback_arg(
+    argtype: PyObjectRef,
+    arg: PyObjectRef,
+    index: usize,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    match convert_one_callback_arg_inner(argtype, arg) {
+        Ok(value) => Ok(value),
+        Err(mut error) => {
+            // [3.15-spec] measured python3.15t (v3.15.1, free-threaded):
+            // callback from_param raising KeyError -> ArgumentError wrapping
+            // it.  `_ctypes_callproc` calls `_ctypes_extend_error` for any
+            // failure (`v3.15.1` `Modules/_ctypes/callproc.c`
+            // `_ctypes_callproc` / `_ctypes_extend_error`).  PyPy
+            // CFuncPtr.__call__ catches (UnicodeError, TypeError, ValueError).
+            if is_python_exception(&mut error) {
+                Err(wrap_callback_argument_error(index + 1, error))
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn python_callback_restype(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let rt = pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY))
+        .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") })?;
+    if unsafe { pyre_object::is_none(rt) } {
+        None
+    } else {
+        Some(rt)
+    }
+}
+
+fn convert_python_callback_result(
+    obj: PyObjectRef,
+    res: PyObjectRef,
+    callable: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::publish_roots(&[obj, res, callable]);
+    let Some(restype) = python_callback_restype(pyre_object::gc_roots::shadow_stack_get(base))
+    else {
+        return Ok(pyre_object::w_none());
+    };
+    let restype_slot = pyre_object::gc_roots::pin_roots(&[restype]);
+    if cdata::type_code_of(pyre_object::gc_roots::shadow_stack_get(restype_slot))
+        .is_some_and(|tc| tc == "O")
+    {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(base + 1));
+    }
+    let converted = match pyre_interpreter::call::type_call_instantiate(
+        pyre_object::gc_roots::shadow_stack_get(restype_slot),
+        &[pyre_object::gc_roots::shadow_stack_get(base + 1)],
+    ) {
+        Ok(inst) => inst,
+        Err(error) => {
+            return ignore_result_conversion_error(
+                error,
+                pyre_object::gc_roots::shadow_stack_get(base + 2),
+            );
+        }
+    };
+    let inst_slot = pyre_object::gc_roots::pin_roots(&[converted]);
+    match pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(inst_slot),
+        "value",
+    ) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            ignore_result_conversion_error(error, pyre_object::gc_roots::shadow_stack_get(base + 2))
+        }
+    }
+}
+
+fn callback_callable_repr(callable: PyObjectRef) -> rustpython_wtf8::Wtf8Buf {
+    let unknown = || rustpython_wtf8::Wtf8Buf::from_string("<unknown>".to_string());
+    let callable_slot = pyre_object::gc_roots::pin_roots(&[callable]);
+    if pyre_object::gc_roots::shadow_stack_get(callable_slot).is_null() {
+        unknown()
+    } else {
+        unsafe {
+            pyre_interpreter::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                callable_slot,
+            ))
+        }
+        .unwrap_or_else(|_| unknown())
+    }
+}
+
+fn ignore_result_conversion_error(
+    mut error: pyre_interpreter::PyError,
+    callable: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    if !is_python_exception(&mut error) {
+        return Err(error);
+    }
+    // [3.15-spec] measured python3.15t (v3.15.1, free-threaded): restype
+    // conversion failure -> unraisable (lib-python/3/test/test_ctypes/
+    // test_callbacks.py test_convert_result_error: "don't test the result"),
+    // so the value follows PyPy CFuncPtr.__call__ (falls through to a bare
+    // return).  The err_msg follows that test's assertion.
+    let roots = pyre_object::gc_roots::push_roots();
+    let error_slot = error.pin(&roots);
+    let rendered = callback_callable_repr(callable);
+    error.reload(&roots, error_slot);
+    error.write_unraisable(
+        pyre_object::w_none(),
+        &pyre_interpreter::display::wtf8_format!(
+            "Exception ignored while converting result of ctypes callback function ",
+            rendered
+        ),
+        pyre_object::PY_NULL,
+    );
+    Ok(pyre_object::w_none())
+}
+
+fn handle_python_callback_system_exit(
+    mut error: pyre_interpreter::PyError,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    // CFuncPtr.__call__ `except SystemExit` + `handle_system_exit`.
+    if pyre_interpreter::importing::inspect_flag() {
+        return Err(error);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let error_slot = error.pin(&roots);
+    error.reload(&roots, error_slot);
+    let code = pyre_interpreter::error::system_exit_code(&error);
+    error.reload(&roots, error_slot);
+    #[cfg(unix)]
+    unsafe {
+        majit_rlib::rposix::c_exit(code);
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code);
+    #[allow(unreachable_code)]
+    Err(error)
+}
+
+fn ignore_python_callback_exception(
+    mut error: pyre_interpreter::PyError,
+    callable: PyObjectRef,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let error_slot = error.pin(&roots);
+    let rendered = callback_callable_repr(callable);
+    error.reload(&roots, error_slot);
+    error.write_unraisable(
+        pyre_object::w_none(),
+        &pyre_interpreter::display::wtf8_format!(
+            "Exception ignored while calling ctypes callback function ",
+            rendered
+        ),
+        pyre_object::PY_NULL,
+    );
+    pyre_object::w_int_new(0)
 }
 
 pub(super) fn callback_result(
@@ -1403,6 +1760,14 @@ fn call_python_callback(
     // before the first lookup.  Each argument is read from its slot at the
     // conversion that consumes it, because that conversion can allocate.
     let n_args = args.len();
+    // CFuncPtr.__call__: the callable path refuses more than CTYPES_MAX_ARGCOUNT
+    // arguments before the cdecl surplus truncation.
+    if n_args > ctypes_h::CTYPES_MAX_ARGCOUNT {
+        return Err(super::interp_ctypes::argument_error(format!(
+            "too many arguments ({n_args}), maximum is {}",
+            ctypes_h::CTYPES_MAX_ARGCOUNT
+        )));
+    }
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::publish_roots(&[obj]);
     let args_base = pyre_object::gc_roots::publish_roots(args);
@@ -1437,10 +1802,19 @@ fn call_python_callback(
             "This function takes {n_declared} argument{plural} ({n_args} given)"
         )));
     };
+    let argtypes_slot = pyre_object::gc_roots::pin_roots(&argtypes);
     let converted_base = pyre_object::gc_roots::shadow_stack_len();
-    for (i, ty) in argtypes.into_iter().enumerate() {
-        let converted =
-            callback_argument(ty, pyre_object::gc_roots::shadow_stack_get(args_base + i))?;
+    for i in 0..n_used {
+        let arg = pyre_object::gc_roots::shadow_stack_get(args_base + i);
+        let converted = if i < n_declared {
+            convert_one_callback_arg(
+                pyre_object::gc_roots::shadow_stack_get(argtypes_slot + i),
+                arg,
+                i,
+            )?
+        } else {
+            arg
+        };
         let _ = pyre_object::gc_roots::publish_roots(&[converted]);
     }
     pyre_object::gc_roots::normalize_roots(converted_base, n_used);
@@ -1450,7 +1824,27 @@ fn call_python_callback(
         pyre_object::gc_roots::shadow_stack_get(callable_slot),
         &converted,
     );
-    callback_result(pyre_object::gc_roots::shadow_stack_get(obj_slot), result)
+    match result {
+        Ok(res) => convert_python_callback_result(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            res,
+            pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        ),
+        Err(mut error) => {
+            if error_matches_class(&mut error, "SystemExit")
+                || error.kind == pyre_interpreter::PyErrorKind::SystemExit
+            {
+                return handle_python_callback_system_exit(error);
+            }
+            if is_python_exception(&mut error) {
+                return Ok(ignore_python_callback_exception(
+                    error,
+                    pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// `_CFuncPtr.__call__(self, *args)`.
@@ -1502,6 +1896,20 @@ fn cfuncptr_call_from(
         pyre_object::gc_roots::shadow_stack_copy_range(inargs_base, &mut reloaded);
         reloaded
     };
+    // CFuncPtr.__call__: `if self.callable is not None` before any buffer /
+    // prepared-cif read, so a released callback still reaches the Python
+    // callable.
+    if instance_get(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        CALLABLE_KEY,
+    )
+    .is_some_and(|c| !unsafe { pyre_object::is_none(c) })
+    {
+        return call_python_callback(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            &reload_inargs(),
+        );
+    }
     let settled_already = settled(pyre_object::gc_roots::shadow_stack_get(self_slot));
     // A plan that turns out not to describe this call after all leaves the
     // general path to derive it again and record what it finds.
@@ -1517,18 +1925,6 @@ fn cfuncptr_call_from(
         }
     }
     let addr = funcptr_addr(pyre_object::gc_roots::shadow_stack_get(self_slot));
-    if addr == 0
-        && instance_get(
-            pyre_object::gc_roots::shadow_stack_get(self_slot),
-            CALLABLE_KEY,
-        )
-        .is_some()
-    {
-        return call_python_callback(
-            pyre_object::gc_roots::shadow_stack_get(self_slot),
-            &reload_inargs(),
-        );
-    }
     match addr {
         INTERNAL_CAST_ADDR => return internal_cast(&reload_inargs()),
         INTERNAL_STRING_AT_ADDR => return internal_string_at(&reload_inargs()),
@@ -1709,7 +2105,7 @@ fn cfuncptr_call_from(
 }
 
 /// The address a call is made through: a COM method's comes out of the
-/// interface vtable, everything else calls the stored `_ptr`.
+/// interface vtable, everything else calls `CFuncPtr._get_address`.
 fn call_address(addr: usize, com: Option<(usize, usize)>) -> usize {
     match com {
         Some((_, method)) => method,
@@ -1865,9 +2261,14 @@ fn call_settled(
             None => marshal_default_arg(arg, &mut keepalive)?,
         });
     }
+    // CFuncPtr._get_address is the live word.  A plan that captured an older
+    // `_buffer[0]` does not describe this call; invoke through the buffer
+    // when it is present.
+    let live = funcptr_addr(_roots.get(self_slot));
+    let addr = if live != 0 { live } else { plan.addr };
     let result = invoke(
         _roots.get(self_slot),
-        plan.addr,
+        addr,
         &owned,
         plan.ret,
         plan.flags,
@@ -2224,7 +2625,7 @@ fn argument_address(mut obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyE
         return Ok(unsafe { pyre_object::bytesobject::w_bytes_data(obj) }.as_ptr() as usize);
     }
     if is_funcptr_instance(obj) {
-        return Ok(funcptr_addr(obj));
+        return funcptr_buffer_word(obj);
     }
     if cdata::is_cdata_instance(obj) {
         let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
@@ -2283,8 +2684,7 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
     )?;
     let result_slot = pyre_object::gc_roots::pin_roots(&[result]);
     if is_funcptr_type(pyre_object::gc_roots::shadow_stack_get(args_base + 2)) {
-        // A foreign function keeps its address beside the buffer, and that is
-        // the copy a call reads.
+        // CFuncPtr._set_address: the buffer word is the address a call reads.
         store_funcptr_addr(
             pyre_object::gc_roots::shadow_stack_get(result_slot),
             address,
@@ -2897,7 +3297,7 @@ fn marshal_default_arg(
         return Ok(OwnedArg::Pointer(super::interp_ctypes::carg_ptr(arg)));
     }
     if is_funcptr_instance(arg) {
-        return Ok(OwnedArg::Pointer(funcptr_addr(arg)));
+        return Ok(OwnedArg::Pointer(funcptr_buffer_word(arg)?));
     }
     // A scalar cdata is passed by value.
     if cdata::is_simplecdata_instance(arg) {
@@ -3004,7 +3404,7 @@ pub(super) fn resolve_pointer_addr(
         return Ok(super::interp_ctypes::carg_ptr(arg));
     }
     if is_funcptr_instance(arg) {
-        return Ok(funcptr_addr(arg));
+        return funcptr_buffer_word(arg);
     }
     if cdata::is_simplecdata_instance(arg) {
         // A pointer-typed scalar stores the target address in its buffer.

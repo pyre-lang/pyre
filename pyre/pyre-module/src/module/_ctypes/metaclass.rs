@@ -1787,10 +1787,20 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 cdata::cdata_addr(_roots.get(base + 1)).unwrap_or(0) + offset,
             );
             cdata::cdata_write(_roots.get(base + 1), offset, &bytes);
+            let keep_array_for_pointer_field = is_array_instance(_roots.get(base))
+                && proto_kind(_roots.get(base + 2)) == ParamFunc::Pointer;
             let value = _roots.get(base);
-            if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes) {
+            if let Some(keep) =
+                cdata::value_for_keep(&tc, value, &bytes, keep_array_for_pointer_field)
+            {
                 cdata::keep_ref(_roots.get(base + 1), &index.to_string(), keep);
             }
+            cdata::keep_charp_owner(
+                tc.as_str(),
+                _roots.get(base + 1),
+                &index.to_string(),
+                _roots.get(base),
+            );
             Ok(pyre_object::w_none())
         }
         ParamFunc::Pointer => {
@@ -1825,12 +1835,11 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 return Err(pyre_interpreter::PyError::type_error("incompatible types"));
             };
             pyre_object::with_roots!(obj, value => cdata::cdata_write(obj, offset, &bytes[..size.min(bytes.len())]));
-            let keep = if array_decay {
-                value
-            } else {
-                pyre_object::with_roots!(obj => cdata::objects_for_keep(value))
-            };
-            cdata::keep_ref(obj, &index.to_string(), keep);
+            if let Some(keep) = pyre_object::with_roots!(obj, value => {
+                cdata::value_for_keep("", value, &bytes, array_decay)
+            }) {
+                cdata::keep_ref(obj, &index.to_string(), keep);
+            }
             Ok(pyre_object::w_none())
         }
         ParamFunc::Array => {
@@ -2567,9 +2576,15 @@ fn array_set_index(
             );
             cdata::cdata_write(_roots.get(base + 1), offset, &bytes);
             let value = _roots.get(base);
-            if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes) {
+            if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes, false) {
                 cdata::keep_ref(_roots.get(base + 1), &idx.to_string(), keep);
             }
+            cdata::keep_charp_owner(
+                tc.as_str(),
+                _roots.get(base + 1),
+                &idx.to_string(),
+                _roots.get(base),
+            );
             Ok(pyre_object::w_none())
         }
         ParamFunc::Struct | ParamFunc::Union | ParamFunc::Array | ParamFunc::Pointer => {
@@ -3204,9 +3219,15 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
             cdata::release_bstr_slot(&tc, addr);
             unsafe { cfield::copy_bytes_to_address(addr, &bytes, element_size) };
             let value = _roots.get(base);
-            if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes) {
+            if let Some(keep) = cdata::value_for_keep(&tc, value, &bytes, false) {
                 cdata::keep_ref(_roots.get(base + 1), &index.to_string(), keep);
             }
+            cdata::keep_charp_owner(
+                tc.as_str(),
+                _roots.get(base + 1),
+                &index.to_string(),
+                _roots.get(base),
+            );
             Ok(pyre_object::w_none())
         }
         _ => {

@@ -455,40 +455,48 @@ pub(super) fn get_stats(#[default(false)] memory_pressure: bool) -> PyObjectRef 
 pub(super) fn get_objects(
     #[default(w_none())] generation: PyObjectRef,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    // `referents.py get_objects` returns "a list of all
-    // app-level objects" and takes no generation, but `do_get_objects`
-    // already filters by one: -1 is every object, 0 is the nursery, 2
-    // is what is not in it, and 1 is the generation this collector
-    // keeps empty.  So the argument is passed through rather than
-    // refused, bounded the way `gc_get_objects_impl` bounds it.  The
-    // audit event always reports -1 and fires before the argument is
-    // examined, so an out-of-range value is still audited.
+    // [3.15-spec] `referents.py get_objects` accepts only None and
+    // returns every app-level object via `rgc.do_get_objects`.
+    // `_PyGC_GetObjects` ignores generation after the same bounds
+    // check `gc_get_objects_impl` already applies.  Validate the
+    // argument, then walk the None path for every accepted value.
+    // The audit event always reports -1 and fires before the
+    // argument is examined, so an out-of-range value is still audited.
     let _generation_root = pyre_object::gc_roots::push_roots();
     let generation_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(generation);
     pyre_interpreter::module::sys::vm::audit("gc.get_objects", &[w_int_new(-1)])?;
     let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
-    let generation = if unsafe { is_none(generation) } {
-        -1
-    } else {
-        pyre_interpreter::baseobjspace::int_w(pyre_interpreter::baseobjspace::space_index(
-            generation,
-        )?)?
-    };
-    if generation >= NUM_GENERATIONS {
-        return Err(pyre_interpreter::PyError::value_error(format!(
-            "generation parameter must be less than the number of \
-             available generations ({NUM_GENERATIONS})"
-        )));
-    }
-    if generation < -1 {
-        return Err(pyre_interpreter::PyError::value_error(
-            "generation parameter cannot be negative",
-        ));
+    if !unsafe { is_none(generation) } {
+        if unsafe {
+            !is_int_or_long(generation)
+                && pyre_interpreter::baseobjspace::lookup(generation, "__index__").is_none()
+        } {
+            let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
+            let tp_name = pyre_interpreter::type_methods::arg_type_name(generation);
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "argument should be integer or None, not '{tp_name}'"
+            )));
+        }
+        let generation = pyre_object::gc_roots::shadow_stack_get(generation_slot);
+        let generation = pyre_interpreter::baseobjspace::int_w(
+            pyre_interpreter::baseobjspace::space_index(generation)?,
+        )?;
+        if generation >= NUM_GENERATIONS {
+            return Err(pyre_interpreter::PyError::value_error(format!(
+                "generation parameter must be less than the number of \
+                 available generations ({NUM_GENERATIONS})"
+            )));
+        }
+        if generation < -1 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "generation parameter cannot be negative",
+            ));
+        }
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let first = pyre_object::gc_roots::shadow_stack_len();
-    majit_gc::get_objects(generation as i8, pin_cpython_tracked_object);
+    majit_gc::get_objects(-1, pin_cpython_tracked_object);
     Ok(list_from_roots(first))
 }
 

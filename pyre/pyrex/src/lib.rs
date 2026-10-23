@@ -373,6 +373,68 @@ fn parse_heapsize(value: &str) -> Result<u64, lexopt::Error> {
     Ok(bytes)
 }
 
+/// Base-10 `LLHelpers.ll_int`, the translation of
+/// `targetpypystandalone.py entry_point`'s `int(argv[2])`. A `ValueError`
+/// there is `None` here; out of i64 range is also `None`.
+fn parse_python_int_i64(raw: &str) -> Option<i64> {
+    let chars = raw.as_bytes();
+    let strlen = chars.len();
+    let mut i = 0;
+    // only space is allowed as white space
+    while i < strlen && chars[i] == b' ' {
+        i += 1;
+    }
+    if !(i < strlen) {
+        return None;
+    }
+    let mut sign = 1i64;
+    if chars[i] == b'-' {
+        sign = -1;
+        i += 1;
+    } else if chars[i] == b'+' {
+        i += 1;
+    }
+    while i < strlen && chars[i] == b' ' {
+        i += 1;
+    }
+    let base = 10u64;
+    let mut val = 0u64;
+    let oldpos = i;
+    while i < strlen {
+        let c = chars[i];
+        let digit = if b'a' <= c && c <= b'z' {
+            (c - b'a') as u64 + 10
+        } else if b'A' <= c && c <= b'Z' {
+            (c - b'A') as u64 + 10
+        } else if b'0' <= c && c <= b'9' {
+            (c - b'0') as u64
+        } else {
+            break;
+        };
+        if digit >= base {
+            break;
+        }
+        val = val.checked_mul(base)?.checked_add(digit)?;
+        i += 1;
+    }
+    if i == oldpos {
+        return None;
+    }
+    while i < strlen && chars[i] == b' ' {
+        i += 1;
+    }
+    if i != strlen {
+        return None;
+    }
+    // `return sign * val`. Overflow raises; keep the existing miss.
+    if sign < 0 && val == (i64::MAX as u64) + 1 {
+        Some(i64::MIN)
+    } else {
+        let magnitude = i64::try_from(val).ok()?;
+        Some(if sign < 0 { -magnitude } else { magnitude })
+    }
+}
+
 /// `targetpypystandalone.py entry_point`: `--heapsize N`, in that position and
 /// no other, is an undocumented interp-level option that exists to support
 /// sandboxing — `pypy_interact.py` is what puts it there. Taking it out here
@@ -382,19 +444,16 @@ fn parse_heapsize(value: &str) -> Result<u64, lexopt::Error> {
 fn take_heapsize_option(
     binary_name: &str,
     mut argv: Vec<std::ffi::OsString>,
-) -> (Vec<std::ffi::OsString>, Option<u64>) {
+) -> (Vec<std::ffi::OsString>, Option<i64>) {
     if argv.len() <= 2 || argv[1] != "--heapsize" {
         return (argv, None);
     }
-    // `int(argv[2])` — the controller has already resolved any suffix, so a
-    // value that is not a plain byte count came from somewhere that does not
-    // speak this protocol.  `sys.maxsize` bounds it on this side too: the
-    // controller refuses a larger count rather than write one here, and a
-    // value the limit cannot hold would otherwise be taken and then silently
-    // clamped.
-    let size = match argv[2].to_str().map(str::parse::<u64>) {
-        Some(Ok(size)) if size <= i64::MAX as u64 => size,
-        _ => {
+    // `int(argv[2])` (`targetpypystandalone.py entry_point`) is
+    // `LLHelpers.ll_int` at base 10. A value that does not match or does
+    // not fit i64 is refused rather than taken.
+    let size = match argv[2].to_str().and_then(parse_python_int_i64) {
+        Some(size) => size,
+        None => {
             eprintln!("{binary_name}: --heapsize: not a byte count");
             std::process::exit(2);
         }
@@ -938,7 +997,7 @@ fn real_main(binary_name: &str) {
         // when the heap is far below it. The process charge is the ceiling.
         if let Some(size) = heapsize {
             let _entry = majit_gc::gc_sync::enter_external_callback();
-            majit_gc::gc_set_max_heap_size(usize::try_from(size).unwrap_or(usize::MAX));
+            majit_gc::gc_set_max_heap_size(size);
         }
     }
 
@@ -2194,8 +2253,8 @@ fn run_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        RunMode, dedent_command, parse_heapsize, parse_interact, set_last_exec_ctx,
-        setup_exec_context, take_heapsize_option,
+        RunMode, dedent_command, parse_heapsize, parse_interact, parse_python_int_i64,
+        set_last_exec_ctx, setup_exec_context, take_heapsize_option,
     };
 
     #[test]
@@ -2362,6 +2421,49 @@ mod tests {
         let (rest, size) = take_heapsize_option("pyre", argv(&["pyre", "--heapsize"]));
         assert_eq!(size, None);
         assert_eq!(rest, argv(&["pyre", "--heapsize"]));
+
+        // `int(argv[2])`: a negative count is taken; only a positive value
+        // lowers the collector thresholds.
+        let (rest, size) =
+            take_heapsize_option("pyre", argv(&["pyre", "--heapsize", "-1", "x.py"]));
+        assert_eq!(size, Some(-1));
+        assert_eq!(rest, argv(&["pyre", "x.py"]));
+
+        // `LLHelpers.ll_int` accepts a space between the sign and the digits.
+        let (rest, size) =
+            take_heapsize_option("pyre", argv(&["pyre", "--heapsize", "- 1", "x.py"]));
+        assert_eq!(size, Some(-1));
+        assert_eq!(rest, argv(&["pyre", "x.py"]));
+
+        let (rest, size) =
+            take_heapsize_option("pyre", argv(&["pyre", "--heapsize", " 5 ", "x.py"]));
+        assert_eq!(size, Some(5));
+        assert_eq!(rest, argv(&["pyre", "x.py"]));
+
+        let (rest, size) =
+            take_heapsize_option("pyre", argv(&["pyre", "--heapsize", "+7", "x.py"]));
+        assert_eq!(size, Some(7));
+        assert_eq!(rest, argv(&["pyre", "x.py"]));
+
+        let (rest, size) =
+            take_heapsize_option("pyre", argv(&["pyre", "--heapsize", "16777216", "x.py"]));
+        assert_eq!(size, Some(16777216));
+        assert_eq!(rest, argv(&["pyre", "x.py"]));
+
+        let (rest, size) = take_heapsize_option("pyre", argv(&["pyre", "x.py"]));
+        assert_eq!(size, None);
+        assert_eq!(rest, argv(&["pyre", "x.py"]));
+    }
+
+    #[test]
+    fn heapsize_ll_int_grammar() {
+        // `LLHelpers.ll_int` at base 10: no `_`, and only `' '` is whitespace.
+        assert_eq!(parse_python_int_i64("1_000"), None);
+        assert_eq!(parse_python_int_i64("\t5"), None);
+        assert_eq!(parse_python_int_i64("5\n"), None);
+        assert_eq!(parse_python_int_i64(" 5 "), Some(5));
+        assert_eq!(parse_python_int_i64("- 1"), Some(-1));
+        assert_eq!(parse_python_int_i64("+7"), Some(7));
     }
 
     #[test]
