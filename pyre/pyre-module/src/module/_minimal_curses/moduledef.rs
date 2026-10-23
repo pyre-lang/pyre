@@ -29,11 +29,19 @@ pyre_interpreter::py_module! {
             func: pyre_interpreter::BuiltinCodeFn,
             arity: u16,
             sig: Option<pyre_interpreter::Signature>,
+            ndef: usize,
         ) -> pyre_object::PyObjectRef {
+            // `interp2app._getdefaults`: trailing optional positionals live
+            // on `Function.defs_w`. `setupterm(space, w_termname=None, fd=-1)`
+            // needs both slots; without them the binder treats the names as
+            // required.
             let mut value = pyre_object::with_roots!(ns => pyre_interpreter::gateway::with_module(
                 "_minimal_curses",
-                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
-                    name, func, arity, sig,
+                pyre_interpreter::gateway::function_set_null_positional_defaults(
+                    pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
+                        name, func, arity, sig,
+                    ),
+                    ndef,
                 ),
             ));
             pyre_interpreter::__pyre_store!(ns, name, value);
@@ -45,6 +53,7 @@ pyre_interpreter::py_module! {
             interp_curses::setupterm,
             interp_curses::setupterm_pyre_arity(),
             interp_curses::setupterm_pyre_sig(),
+            interp_curses::setupterm_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -52,6 +61,7 @@ pyre_interpreter::py_module! {
             interp_curses::tigetstr,
             interp_curses::tigetstr_pyre_arity(),
             interp_curses::tigetstr_pyre_sig(),
+            interp_curses::tigetstr_pyre_ndef(),
         );
         ns = install(
             ns,
@@ -59,6 +69,7 @@ pyre_interpreter::py_module! {
             interp_curses::tparm,
             pyre_interpreter::HOPELESS,
             Some(interp_curses::tparm_sig()),
+            0,
         );
         let _ = ns;
     },

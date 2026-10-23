@@ -713,12 +713,6 @@ pub(crate) fn do_warn_explicit(
     let source_slot = pin_root_slot(source);
 
     let input_module = pyre_object::gc_roots::shadow_stack_get(input_module_slot);
-    // A warning issued this late during shutdown has lost the `warnings`
-    // module, so no filter can be matched and there is nothing safe to do
-    // with it.
-    if !input_module.is_null() && unsafe { is_none(input_module) } {
-        return Ok(());
-    }
     let registry = pyre_object::gc_roots::shadow_stack_get(registry_slot);
     if !registry.is_null()
         && unsafe { !crate::baseobjspace::isinstance_dict_w(registry) && !is_none(registry) }
@@ -727,7 +721,10 @@ pub(crate) fn do_warn_explicit(
             "'registry' must be a dict or None".to_owned(),
         ));
     }
-    let module = if input_module.is_null() {
+    // `do_warn_explicit`: `if space.is_w(w_module, space.w_None):
+    // w_module = normalize_module(...)`. `_py_warnings.warn_explicit`
+    // treats `module is None` the same way.
+    let module = if input_module.is_null() || unsafe { is_none(input_module) } {
         let filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
         if unsafe { !is_str(filename) } {
             // Preserve `space.fsencode_w`'s TypeError for non-text filenames.
