@@ -2394,6 +2394,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["some".to_string(), "str".to_string(), "make".to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -2408,6 +2409,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec![crate::runtime_names::shims::UTF8_ITER.to_string()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![s]),
                     result_ty: ValueType::Ref(None),
@@ -2535,6 +2537,7 @@ mod tests {
                             .map(|s| (*s).to_string())
                             .collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![k]),
                     result_ty: ValueType::Ref(None),

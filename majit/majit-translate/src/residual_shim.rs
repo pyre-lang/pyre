@@ -665,10 +665,6 @@ fn optional_dep_enabled(dep_name: &str, enabled_features: &BTreeSet<String>) -> 
     enabled_features.contains(dep_name) || enabled_features.contains(&dep_name.replace('-', "_"))
 }
 
-fn public_modules_from_sources(source_paths: &[String]) -> BTreeSet<String> {
-    public_items_from_sources(source_paths).0
-}
-
 fn public_items_from_sources(source_paths: &[String]) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut public_modules = BTreeSet::new();
     let mut public_types = BTreeSet::new();
@@ -737,6 +733,17 @@ pub fn emit_residual_shim_source(
             census.generic += 1;
             continue;
         }
+        // Call-site args must be Rust types the shim can turbofish.
+        // A Charon `TraitType` JSON blob is not one (`spec_type_name`
+        // spells an unresolved projection as `?TraitType`).
+        if target
+            .generic_rust_args
+            .iter()
+            .any(|ty| !rust_ty_convertible(ty))
+        {
+            census.generic += 1;
+            continue;
+        }
         if target.unsupported_type {
             census.unsupported_type += 1;
             continue;
@@ -780,7 +787,7 @@ fn target_types_nameable(target: &ResidualShimTarget, nameability: &Nameability)
 }
 
 fn rust_ty_written_in_shim(ty: &str) -> bool {
-    rust_ty_abi_words(ty) == 2 || is_object_pointer_slice_ty(ty)
+    rust_ty_abi_words(ty) == 2 || is_object_gcarray_slice(ty)
 }
 
 fn rust_type_nameable(ty: &str, nameability: &Nameability) -> bool {
@@ -2087,6 +2094,34 @@ mod tests {
         assert_eq!(census.generic, 0);
         assert_eq!(census.emitted, 1);
         assert!(src.contains("w_method_new::<pyre_object::pyobject::PyObject>"));
+    }
+
+    /// A Charon `TraitType` blob is not a turbofish argument. The shim
+    /// table skips it (`census.generic`) rather than emitting invalid Rust.
+    #[test]
+    fn emit_skips_a_charon_traittype_generic_arg() {
+        let mut generic = sample_target();
+        generic.is_generic = true;
+        generic.path = "rordereddict_entries::entries_item_ptr".into();
+        generic.rust_path = "pyre_object::rordereddict_entries::entries_item_ptr".into();
+        generic.generic_rust_args = vec![
+            r#"{"TraitType":[{"kind":{"Clause":{"Bound":[0,0]}}},0,{}]}"#.into(),
+            "()".into(),
+        ];
+        generic.arg_classes = "i".into();
+        generic.arg_rust_types = vec!["i64".into()];
+        generic.result_type = 'i';
+        generic.ret_rust_type = "i64".into();
+        let nameability = Nameability {
+            reachable_crates: BTreeSet::from(["pyre_object".into()]),
+            public_modules: BTreeSet::from(["pyre_object::rordereddict_entries".into()]),
+            public_types: BTreeSet::new(),
+        };
+        let (src, census) = emit_residual_shim_source(&[generic], &nameability);
+        assert_eq!(census.generic, 1);
+        assert_eq!(census.emitted, 0);
+        assert!(!src.contains("TraitType"));
+        assert!(!src.contains("entries_item_ptr::<"));
     }
 
     #[test]

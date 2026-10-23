@@ -39,16 +39,18 @@ fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
 /// A sequence *subclass* that defines its own `__imul__` is exempt — that
 /// override is a real numeric slot and runs whatever the multiplier is, so
 /// `x = LI([1]); x *= "s"` is `LI.__imul__`, not the multiplier TypeError.
-fn skips_inplace_special(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> bool {
+fn skips_inplace_special(mut a: PyObjectRef, mut b: PyObjectRef, op: BinaryOperator) -> bool {
     matches!(op, BinaryOperator::InplaceMultiply)
         && unsafe { crate::objspace::descroperation::is_repeat_sequence(a) }
         && !unsafe {
-            crate::objspace::descroperation::seq_repeat_override(
+            pyre_object::with_roots!(a, b => crate::objspace::descroperation::seq_repeat_override(
                 a,
                 crate::objspace::descroperation::RepeatDunder::IMul,
-            )
+            ))
         }
-        && unsafe { crate::baseobjspace::lookup(b, "__index__").is_none() }
+        && unsafe {
+            pyre_object::with_roots!(a, b => crate::baseobjspace::lookup(b, "__index__")).is_none()
+        }
 }
 
 pub fn binary_value(
@@ -65,7 +67,7 @@ pub fn binary_value(
     // walk of this handler stops at that residual.  The chain evaluates the
     // guard only in the `Some` arm, exactly as `filter` did.
     if let Some(idunder) = inplace_dunder_name(op)
-        && !skips_inplace_special(a, b, op)
+        && !pyre_object::with_roots!(a, b => skips_inplace_special(a, b, op))
     {
         // `seq_bug_compat` applies only to `+=` / `*=`; pass the reflected
         // name so the builtin-sequence rhs-first branch can fire.
@@ -111,7 +113,8 @@ pub fn binary_value(
         _ => None,
     };
     if let Some(dunder) = dunder
-        && let Some(w_res) = desc::try_binop_shortcut(a, b, dunder)?
+        && let Some(w_res) =
+            pyre_object::with_roots!(a, b => desc::try_binop_shortcut(a, b, dunder))?
     {
         return Ok(w_res);
     }
@@ -782,20 +785,29 @@ pub fn newlist_from_iter_hint(last_val: PyObjectRef) -> Result<PyObjectRef, PyEr
 /// `bh_list_extend_fn`.  Mirrors `list.extend`: fast paths for list/tuple
 /// sources, generic iterator-protocol fallback otherwise (which surfaces
 /// "Value after * must be an iterable, not <T>" when not iterable).
-pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result<(), PyError> {
+pub fn list_extend_value(mut list: PyObjectRef, mut iterable: PyObjectRef) -> Result<(), PyError> {
     // pyopcode.py LIST_EXTEND calls the target list's `extend` method.  The
     // builtin body preserves exact-list/tuple storage fast paths while list
     // and tuple subclasses go through `iter()` so an overridden `__iter__`
     // is observed.
-    match pyre_object::with_roots!(iterable => crate::type_methods::list_method_extend(&[list, iterable]))
+    match pyre_object::with_roots!(list, iterable => crate::type_methods::list_method_extend(&[list, iterable]))
     {
         Ok(_) => Ok(()),
-        Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
-        Err(_) => {
-            let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
-            Err(PyError::type_error(format!(
-                "Value after * must be an iterable, not {type_name}"
-            )))
+        Err(mut error) => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let err_slot = error.pin(&roots);
+            let ok = pyre_object::with_roots!(list, iterable => {
+                crate::baseobjspace::is_iterable(iterable)
+            });
+            error.reload(&roots, err_slot);
+            if ok {
+                Err(error)
+            } else {
+                let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
+                Err(PyError::type_error(format!(
+                    "Value after * must be an iterable, not {type_name}"
+                )))
+            }
         }
     }
 }

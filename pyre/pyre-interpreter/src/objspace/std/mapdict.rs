@@ -1850,7 +1850,7 @@ unsafe fn fill_cache(
 /// # Safety
 /// `w_type` and `w_descr` (when `Some`) must be live objects.
 unsafe fn classify_attr(
-    w_type: PyObjectRef,
+    mut w_type: PyObjectRef,
     w_descr: Option<PyObjectRef>,
     for_store: bool,
 ) -> (u16, bool) {
@@ -1858,7 +1858,7 @@ unsafe fn classify_attr(
         // mapdict.py:1509-1510 — no such attr in the class: the common case,
         // read/write the instance dict.
         None => (DICT, false),
-        Some(d) => {
+        Some(mut d) => {
             // mapdict.py:1511-1512 — a MutableCell can change without bumping the
             // version_tag, so give up.  Reaching this arm is why every caller
             // reads the namespace entry through `type_attr_stored` rather than
@@ -1871,7 +1871,8 @@ unsafe fn classify_attr(
             }
             // mapdict.py:1513-1519 — a data descriptor shadows the instance dict;
             // only a `__slots__` Member that belongs to this type is cacheable.
-            if unsafe { crate::baseobjspace::is_data_descr(d) } {
+            if pyre_object::with_roots!(w_type, d => unsafe { crate::baseobjspace::is_data_descr(d) })
+            {
                 if unsafe { pyre_object::is_member(d) }
                     && !unsafe { pyre_object::w_member_is_direct(d) }
                     && unsafe {
@@ -1998,7 +1999,9 @@ unsafe fn load_attr_slowpath(
     map: MapRef,
 ) -> Result<PyObjectRef, PyError> {
     // mapdict.py:1490 `w_name = pycode.co_names_w[nameindex]`.
-    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name) };
+    let mut w_name = pyre_object::with_roots!(pycode, w_obj => unsafe {
+        crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name)
+    });
     // mapdict.py:1495 `if map is not None:`.
     if !map.is_null() {
         // mapdict.py:1496 `w_type = map.terminator.w_cls`.
@@ -2006,7 +2009,11 @@ unsafe fn load_attr_slowpath(
         // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access.
         // pyre has no separate `_handle_getattribute`; `space.getattr`
         // re-dispatches the custom `__getattribute__`, the same result.
-        if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        if pyre_object::with_roots!(pycode, w_obj, w_name, w_type => unsafe {
+            crate::baseobjspace::getattribute_if_not_from_object(w_type)
+        })
+        .is_some()
+        {
             return crate::baseobjspace::getattr(w_obj, w_name);
         }
         // mapdict.py:1500 `version_tag = w_type.version_tag()`.
@@ -2020,7 +2027,7 @@ unsafe fn load_attr_slowpath(
             // `classify_attr` gives up on one.
             let w_descr = unsafe { crate::baseobjspace::type_attr_stored(w_type, Wtf8::new(name)) };
             // mapdict.py:1507-1524 classify.
-            let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+            let (attrkind, is_slot) = pyre_object::with_roots!(w_type, pycode, w_name, w_obj => unsafe { classify_attr(w_type, w_descr, false) });
             // mapdict.py `if attrkind != INVALID:`.
             if attrkind != INVALID {
                 let attrname = if is_slot { "slot" } else { name };
@@ -2049,8 +2056,10 @@ unsafe fn load_attr_slowpath(
                     // mapdict.py `_fill_cache(...,
                     // valid_for_store=w_type.setattr_if_not_from_object() is None)`.
                     let valid_for_store =
-                        unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }
-                            .is_none();
+                        pyre_object::with_roots!(pycode, w_name, w_obj, w_type => unsafe {
+                            crate::baseobjspace::setattr_if_not_from_object(w_type)
+                        })
+                        .is_none();
                     unsafe {
                         fill_cache(
                             pycode,
@@ -2102,13 +2111,17 @@ pub unsafe fn load_attr_fast_path(
         return None;
     }
     // mapdict.py:1496 `w_type = map.terminator.w_cls`.
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
     // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access;
     // not soundly foldable to a storage read.
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe {
+        crate::baseobjspace::getattribute_if_not_from_object(w_type)
+    })
+    .is_some()
+    {
         return None;
     }
     // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
@@ -2124,13 +2137,14 @@ pub unsafe fn load_attr_fast_path(
         return None;
     }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
+    let w_descr = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    };
-    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+    });
+    let (attrkind, is_slot) =
+        pyre_object::with_roots!(w_type => unsafe { classify_attr(w_type, w_descr, false) });
     // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
         return None;
@@ -2202,11 +2216,11 @@ pub unsafe fn class_attr_fast_path(
     if unsafe { map_is_devolved(map) } {
         return None;
     }
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
@@ -2221,22 +2235,23 @@ pub unsafe fn class_attr_fast_path(
     } {
         return None;
     }
-    let w_descr = unsafe {
+    let mut w_descr = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    }?;
-    if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+    })?;
+    if pyre_object::with_roots!(w_type, w_descr => unsafe { crate::baseobjspace::is_data_descr(w_descr) })
+    {
         return None;
     }
-    let value_type = crate::typedef::r#type(w_descr)?.as_ptr();
-    if unsafe {
+    let mut value_type = crate::typedef::r#type(w_descr)?.as_ptr();
+    if pyre_object::with_roots!(w_type, w_descr, value_type => unsafe {
         crate::baseobjspace::lookup_in_type(
             value_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
         )
-    }
+    })
     .is_some()
         || unsafe { pyre_object::w_type_is_heaptype(value_type) }
     {
@@ -2279,7 +2294,7 @@ pub unsafe fn class_descr_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, 
     if unsafe { map_is_devolved(map) } {
         return None;
     }
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
@@ -2291,23 +2306,24 @@ pub unsafe fn class_descr_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, 
     // `object.__getattribute__`, and `__class__` still `object`'s descriptor.
     // The memo flag that predicate reads stays cold until some other lookup
     // sets it, so the trace computes the lookup (`has_object_getattribute`).
-    if !unsafe { crate::baseobjspace::has_object_getattribute(w_type) } {
+    if !pyre_object::with_roots!(w_type => unsafe {
+        crate::baseobjspace::has_object_getattribute(w_type)
+    }) {
         return None;
     }
-    let class_name =
-        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__class__"));
+    let mut class_name = pyre_object::with_roots!(w_type => {
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__class__"))
+    });
     // First lookup may allocate; pin the boxed name so the second lookup
     // still sees it.
-    let roots = pyre_object::gc_roots::push_roots();
-    let name_at = roots.pin_roots(&[class_name]);
-    let Some(actual_class_descr) =
-        (unsafe { crate::baseobjspace::lookup_in_type_where(w_type, roots.get(name_at)) })
-    else {
+    let Some(actual_class_descr) = (pyre_object::with_roots!(w_type, class_name => unsafe {
+        crate::baseobjspace::lookup_in_type_where(w_type, class_name)
+    })) else {
         return None;
     };
-    let Some(object_class_descr) = (unsafe {
-        crate::baseobjspace::lookup_in_type_where(crate::typedef::w_object(), roots.get(name_at))
-    }) else {
+    let Some(object_class_descr) = (pyre_object::with_roots!(w_type, class_name => unsafe {
+        crate::baseobjspace::lookup_in_type_where(crate::typedef::w_object(), class_name)
+    })) else {
         return None;
     };
     if !std::ptr::eq(actual_class_descr, object_class_descr) {
@@ -2346,13 +2362,13 @@ pub unsafe fn getattr_hook_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef, PyObjectRef)> {
-    let (w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
-    let w_getattr = unsafe {
+    let (mut w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
+    let w_getattr = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
         )
-    }?;
+    })?;
     // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
     // cell is what `write_cell` updates; the caller getfields its payload.
     let cell = unsafe {
@@ -2391,7 +2407,7 @@ pub unsafe fn getattribute_hook_fast_path(
     if map.is_null() || unsafe { map_is_devolved(map) } {
         return None;
     }
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
@@ -2399,17 +2415,15 @@ pub unsafe fn getattribute_hook_fast_path(
     if version_tag == 0 {
         return None;
     }
-    let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
-        )
-    }
-    .is_some()
-    {
+    let w_getattr_name = pyre_object::with_roots!(w_type => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__"))
+    });
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, w_getattr_name) }.is_some() {
         return None;
     }
+    let w_getattribute = pyre_object::with_roots!(w_type => unsafe {
+        crate::baseobjspace::getattribute_if_not_from_object(w_type)
+    })?;
     // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
     // cell is what `write_cell` updates; the caller getfields its payload.
     let cell = unsafe {
@@ -2442,7 +2456,7 @@ pub unsafe fn own_getattribute_fast_path(
     {
         return None;
     }
-    let w_type = unsafe { (*w_obj).w_class };
+    let mut w_type = unsafe { (*w_obj).w_class };
     if w_type.is_null() || !unsafe { pyre_object::w_type_dispatches_own_getattribute(w_type) } {
         return None;
     }
@@ -2450,17 +2464,15 @@ pub unsafe fn own_getattribute_fast_path(
     if version_tag == 0 {
         return None;
     }
-    let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
-    if unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
-        )
-    }
-    .is_some()
-    {
+    let w_getattr_name = pyre_object::with_roots!(w_type => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__"))
+    });
+    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, w_getattr_name) }.is_some() {
         return None;
     }
+    let w_getattribute = pyre_object::with_roots!(w_type => unsafe {
+        crate::baseobjspace::getattribute_if_not_from_object(w_type)
+    })?;
     let cell = unsafe {
         crate::baseobjspace::type_attr_object_cell(
             w_type,
@@ -2529,21 +2541,21 @@ pub unsafe fn getattr_absent_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef)> {
-    let pins = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
+    let (mut w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
     // A hook would run application code whose answer neither pin describes,
     // and which can return a value or raise something other than
     // AttributeError.
-    if unsafe {
+    if pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
-            pins.0,
+            w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
         )
-    }
+    })
     .is_some()
     {
         return None;
     }
-    Some(pins)
+    Some((w_type, version_tag, map))
 }
 
 /// The shared miss proof behind [`getattr_hook_fast_path`] and
@@ -2568,13 +2580,13 @@ unsafe fn getattr_resolves_nowhere(
         return None;
     }
     // mapdict.py:1496 `w_type = map.terminator.w_cls`.
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
     // mapdict.py:1497-1499 — a custom `__getattribute__` runs its own lookup,
     // which neither pin describes.
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
@@ -2586,12 +2598,12 @@ unsafe fn getattr_resolves_nowhere(
     // `classify_attr` reads a `__slots__` member under the `"slot"` name rather
     // than its own, so a descriptor found here says nothing about what
     // `find_map_attr(name)` below would answer.
-    if unsafe {
+    if pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    }
+    })
     .is_some()
     {
         return None;
@@ -2654,12 +2666,14 @@ pub unsafe fn instance_dict_attr_fast_path(
 )> {
     // mapdict.py:1496 `w_type = map.terminator.w_cls` — the carrier's own
     // terminator is the shared fake one, so the type comes off the receiver.
-    let w_type = unsafe { (*w_obj).w_class };
+    let mut w_obj = w_obj;
+    let mut w_dict = w_dict;
+    let mut w_type = unsafe { (*w_obj).w_class };
     if w_type.is_null() {
         return None;
     }
     // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access.
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type, w_obj, w_dict => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
@@ -2675,13 +2689,11 @@ pub unsafe fn instance_dict_attr_fast_path(
         return None;
     }
     // mapdict.py:1504-1526 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        )
-    };
-    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+    let w_name = pyre_object::with_roots!(w_type, w_dict => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+    });
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, w_name) };
+    let (attrkind, is_slot) = pyre_object::with_roots!(w_type, w_dict => unsafe { classify_attr(w_type, w_descr, false) });
     if attrkind != DICT || is_slot {
         return None;
     }
@@ -2748,7 +2760,7 @@ unsafe fn property_descr_fast_path_wtf8(
     if map.is_null() {
         return None;
     }
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
@@ -2759,12 +2771,10 @@ unsafe fn property_descr_fast_path_wtf8(
     if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, name) } {
         return None;
     }
-    let w_descr = unsafe {
-        crate::baseobjspace::lookup_in_type_where_wtf8(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(name),
-        )
-    }?;
+    let w_name = pyre_object::with_roots!(w_type => {
+        pyre_object::unicodeobject::box_str_constant(name)
+    });
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(w_type, w_name) }?;
     // Exact type: the fold calls `fget`/`fset` directly, which stands in for
     // `type(w_descr).__get__` only where that cannot have been overridden
     // (`descroperation.py get_and_call_function`). A property subclass is
@@ -2804,8 +2814,9 @@ pub unsafe fn property_get_fast_path_wtf8(
     w_obj: PyObjectRef,
     name: &Wtf8,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
-    let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path_wtf8(w_obj, name) }?;
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    let (mut w_type, version_tag, mut w_descr) =
+        unsafe { property_descr_fast_path_wtf8(w_obj, name) }?;
+    if pyre_object::with_roots!(w_type, w_descr => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     let fget = unsafe { pyre_object::descriptor::w_property_get_fget(w_descr) };
@@ -2922,15 +2933,18 @@ pub unsafe fn data_descriptor_get_fast_path(
     if receiver_map.is_null() {
         return None;
     }
-    let w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null()
-        || unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some()
-        || unsafe {
+        || pyre_object::with_roots!(w_type => unsafe {
+            crate::baseobjspace::getattribute_if_not_from_object(w_type)
+        })
+        .is_some()
+        || pyre_object::with_roots!(w_type => unsafe {
             crate::baseobjspace::lookup_in_type_where(
                 w_type,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
             )
-        }
+        })
         .is_some()
     {
         return None;
@@ -2944,13 +2958,15 @@ pub unsafe fn data_descriptor_get_fast_path(
     } {
         return None;
     }
-    let w_descr = unsafe {
+    let w_descr = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    }?;
-    if !unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+    })?;
+    let mut w_descr = w_descr;
+    if !pyre_object::with_roots!(w_type, w_descr => unsafe { crate::baseobjspace::is_data_descr(w_descr) })
+    {
         return None;
     }
     // Exact `property` has its own fold. A `_getusercls` property
@@ -2973,12 +2989,14 @@ pub unsafe fn data_descriptor_get_fast_path(
     if unsafe { crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__")) } {
         return None;
     }
-    let w_get = unsafe {
+    let mut descr_type = descr_type;
+    let mut w_descr = w_descr;
+    let w_get = pyre_object::with_roots!(w_type, w_descr, descr_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             descr_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
         )
-    }?;
+    })?;
     Some((
         w_type,
         version_tag,
@@ -3101,7 +3119,7 @@ unsafe fn nondatadescr_instance_get_fast_path(
     if receiver_map.is_null() || unsafe { map_is_devolved(receiver_map) } {
         return None;
     }
-    let w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
@@ -3279,8 +3297,8 @@ pub unsafe fn property_set_fast_path(
     w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
-    let (w_type, version_tag, w_descr) = unsafe { property_descr_fast_path(w_obj, name) }?;
-    if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+    let (mut w_type, version_tag, mut w_descr) = unsafe { property_descr_fast_path(w_obj, name) }?;
+    if pyre_object::with_roots!(w_type, w_descr => unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     let fset = unsafe { pyre_object::descriptor::w_property_get_fset(w_descr) };
@@ -3307,13 +3325,13 @@ pub unsafe fn load_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1496 `w_type = map.terminator.w_cls`.
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
     // mapdict.py:1497-1499 — a custom `__getattribute__` handles the access;
     // not soundly foldable to a storage read.
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1500-1501 `version_tag = w_type.version_tag(); if is not None:`.
@@ -3329,13 +3347,14 @@ pub unsafe fn load_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
+    let w_descr = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    };
-    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
+    });
+    let (attrkind, is_slot) =
+        pyre_object::with_roots!(w_type => unsafe { classify_attr(w_type, w_descr, false) });
     // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
         return None;
@@ -3390,17 +3409,17 @@ pub unsafe fn store_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1592 `w_type = map.terminator.w_cls`.
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
     // mapdict.py — a custom `__setattr__` owns the write.
-    if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1630-1631 — STORE caching also requires the standard
     // `__getattribute__` so the cached map invariant remains valid.
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1616 `if version_tag is not None:`.
@@ -3416,13 +3435,14 @@ pub unsafe fn store_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
+    let w_descr = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    };
-    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
+    });
+    let (attrkind, is_slot) =
+        pyre_object::with_roots!(w_type => unsafe { classify_attr(w_type, w_descr, true) });
     if attrkind == INVALID {
         return None;
     }
@@ -3465,17 +3485,17 @@ pub unsafe fn store_attr_boxed_fast_path(
         return None;
     }
     // mapdict.py:1592 `w_type = map.terminator.w_cls`.
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }
     // mapdict.py — a custom `__setattr__` owns the write.
-    if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1630-1631 — STORE caching also requires the standard
     // `__getattribute__` so the cached map invariant remains valid.
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_type => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1616 `if version_tag is not None:`.
@@ -3491,13 +3511,14 @@ pub unsafe fn store_attr_boxed_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
+    let w_descr = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    };
-    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
+    });
+    let (attrkind, is_slot) =
+        pyre_object::with_roots!(w_type => unsafe { classify_attr(w_type, w_descr, true) });
     if attrkind == INVALID {
         return None;
     }
@@ -3573,9 +3594,9 @@ pub struct StoreAttrAdd {
 /// # Safety
 /// `w_obj` must be a live object and `w_value` a live value.
 pub unsafe fn store_attr_add_fast_path(
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     name: &str,
-    w_value: PyObjectRef,
+    mut w_value: PyObjectRef,
 ) -> Option<StoreAttrAdd> {
     if name == "__class__" {
         return None;
@@ -3587,16 +3608,16 @@ pub unsafe fn store_attr_add_fast_path(
     }
     let terminator = unsafe { (*map).terminator() };
     let term = unsafe { (*terminator).as_terminator() };
-    let w_type = term.w_cls;
+    let mut w_type = term.w_cls;
     if w_type.is_null() {
         return None;
     }
     // mapdict.py:1612-1614 / 1630-1631 — a custom `__setattr__` owns the
     // write, and STORE caching also requires the standard `__getattribute__`.
-    if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_obj, w_type, w_value => unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }).is_some() {
         return None;
     }
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if pyre_object::with_roots!(w_obj, w_type, w_value => unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }).is_some() {
         return None;
     }
     // mapdict.py:1616 `if version_tag is not None:`.
@@ -3612,13 +3633,13 @@ pub unsafe fn store_attr_add_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe {
+    let w_descr = pyre_object::with_roots!(w_obj, w_type, w_value => unsafe {
         crate::baseobjspace::lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
         )
-    };
-    let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
+    });
+    let (attrkind, is_slot) = pyre_object::with_roots!(w_obj, w_type, w_value => unsafe { classify_attr(w_type, w_descr, true) });
     if attrkind == INVALID {
         return None;
     }
@@ -3900,7 +3921,9 @@ unsafe fn store_attr_slowpath(
     entry: Option<MapdictCacheEntry>,
 ) -> Result<(), PyError> {
     // mapdict.py:1590 `w_name = pycode.co_names_w[nameindex]`.
-    let w_name = unsafe { crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name) };
+    let mut w_name = pyre_object::with_roots!(pycode, w_obj, w_value => unsafe {
+        crate::pycode::w_code_getname_w_or_new(pycode, nameindex, name)
+    });
     // `object.__class__` is a getset data descriptor in PyPy, so `_classify_attr`
     // (classify_attr) marks it INVALID and the store falls through to
     // `space.setattr` (mapdict.py) — the assignment re-roots the instance
@@ -3944,7 +3967,8 @@ unsafe fn store_attr_slowpath(
                 };
                 if typsafe {
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let base = pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value]);
+                    let base =
+                        pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value, w_name]);
                     let switched = {
                         let (_instance_guard, _live) =
                             instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
@@ -3973,6 +3997,7 @@ unsafe fn store_attr_slowpath(
                     w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                     w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                     w_value = pyre_object::gc_roots::shadow_stack_get(base + 3);
+                    w_name = pyre_object::gc_roots::shadow_stack_get(base + 4);
                     if switched {
                         return Ok(());
                     }
@@ -3981,7 +4006,7 @@ unsafe fn store_attr_slowpath(
         }
         // mapdict.py:1612-1614 — a custom `__setattr__` handles the store. pyre
         // re-dispatches through `space.setattr` (no separate helper).
-        if unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }.is_some() {
+        if pyre_object::with_roots!(pycode, w_name, w_obj, w_type, w_value => unsafe { crate::baseobjspace::setattr_if_not_from_object(w_type) }).is_some() {
             return crate::baseobjspace::setattr(w_obj, w_name, w_value).map(|_| ());
         }
         // mapdict.py:1616 `if version_tag is not None:` (0 = None).
@@ -3990,7 +4015,7 @@ unsafe fn store_attr_slowpath(
             // -- the raw entry, so `classify_attr` can give up on a MutableCell.
             let w_descr = unsafe { crate::baseobjspace::type_attr_stored(w_type, Wtf8::new(name)) };
             // mapdict.py:1620-1626 classify (no non-data heaptype branch for STORE).
-            let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
+            let (attrkind, is_slot) = pyre_object::with_roots!(pycode, w_name, w_obj, w_type, w_value => unsafe { classify_attr(w_type, w_descr, true) });
             // mapdict.py `if attrkind != INVALID:`.
             if attrkind != INVALID {
                 let attrname = if is_slot { "slot" } else { name };
@@ -3998,8 +4023,9 @@ unsafe fn store_attr_slowpath(
                 match unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) } {
                     Some(attr) => {
                         let _roots = pyre_object::gc_roots::push_roots();
-                        let base =
-                            pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value]);
+                        let base = pyre_object::gc_roots::pin_roots(&[
+                            pycode, w_obj, w_type, w_value, w_name,
+                        ]);
                         let written = {
                             let (_instance_guard, _live) =
                                 instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
@@ -4040,14 +4066,17 @@ unsafe fn store_attr_slowpath(
                         w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                         w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                         w_value = pyre_object::gc_roots::shadow_stack_get(base + 3);
+                        w_name = pyre_object::gc_roots::shadow_stack_get(base + 4);
                         if !written {
                             return crate::baseobjspace::setattr(w_obj, w_name, w_value)
                                 .map(|_| ());
                         }
                         // mapdict.py:1630-1631 — fill only when there is no custom
                         // `__getattribute__` to upset the cache invariant.
-                        if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }
-                            .is_none()
+                        if pyre_object::with_roots!(pycode, w_name, w_obj, w_type, w_value => unsafe {
+                            crate::baseobjspace::getattribute_if_not_from_object(w_type)
+                        })
+                        .is_none()
                         {
                             unsafe {
                                 fill_cache(
@@ -4073,8 +4102,9 @@ unsafe fn store_attr_slowpath(
                         {
                             let term = unsafe { (*map).terminator() };
                             let _roots = pyre_object::gc_roots::push_roots();
-                            let base =
-                                pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value]);
+                            let base = pyre_object::gc_roots::pin_roots(&[
+                                pycode, w_obj, w_type, w_value, w_name,
+                            ]);
                             let mapnew = {
                                 let (_instance_guard, _live) = instance_lock(
                                     pyre_object::gc_roots::shadow_stack_get(base + 1),
@@ -4112,6 +4142,7 @@ unsafe fn store_attr_slowpath(
                             w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                             w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                             w_value = pyre_object::gc_roots::shadow_stack_get(base + 3);
+                            w_name = pyre_object::gc_roots::shadow_stack_get(base + 4);
                             if mapnew.is_null() {
                                 return crate::baseobjspace::setattr(w_obj, w_name, w_value)
                                     .map(|_| ());
@@ -4121,9 +4152,9 @@ unsafe fn store_attr_slowpath(
                             // `back` is the pre-write map).
                             if unsafe { (*mapnew).is_plain() }
                                 && std::ptr::eq(unsafe { (*mapnew).as_plain() }.back, map)
-                                && unsafe {
+                                && pyre_object::with_roots!(pycode, w_name, w_obj, w_type, w_value => unsafe {
                                     crate::baseobjspace::getattribute_if_not_from_object(w_type)
-                                }
+                                })
                                 .is_none()
                             {
                                 unsafe {
@@ -5740,7 +5771,7 @@ pub unsafe fn classify_mapdict_write_attr(w_obj: PyObjectRef, name: &str) -> Opt
     if map.is_null() {
         return None;
     }
-    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null() {
         return None;
     }

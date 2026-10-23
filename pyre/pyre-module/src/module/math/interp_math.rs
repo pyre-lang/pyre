@@ -1128,22 +1128,19 @@ fn math_unary_int(
     // than a function or method descriptor, and neither of those runs user
     // code to bind.  `lookup` reads the type MRO only, so an instance
     // attribute of the same name stays ignored.
-    if let Some(w_descr) = unsafe { pyre_interpreter::baseobjspace::lookup(args[0], dunder) }
-        && let Some(w_type) = pyre_interpreter::typedef::r#type(args[0])
+    let mut obj = args[0];
+    if let Some(mut w_descr) = pyre_object::with_roots!(obj => unsafe { pyre_interpreter::baseobjspace::lookup(obj, dunder) })
+        && let Some(w_type) = pyre_interpreter::typedef::r#type(obj)
     {
-        return unsafe {
-            pyre_interpreter::baseobjspace::get_and_call_function(
-                w_descr,
-                args[0],
-                w_type.as_ptr(),
-                &[],
-            )
-        };
+        let mut w_type = w_type.as_ptr();
+        return pyre_object::with_roots!(obj, w_descr, w_type => unsafe {
+            pyre_interpreter::baseobjspace::get_and_call_function(w_descr, obj, w_type, &[])
+        });
     }
     if !fallback_float {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "type {} doesn't define {dunder} method",
-            pyre_interpreter::baseobjspace::object_functionstr_type_name(args[0])
+            pyre_interpreter::baseobjspace::object_functionstr_type_name(obj)
         )));
     }
     // Fall back to `__float__` coercion.  `try_get_double` already reports
@@ -1151,7 +1148,7 @@ fn math_unary_int(
     // interpretation, and its contract is that everything else — a raising
     // `__float__`, or the `OverflowError` for an int too wide for an f64 —
     // propagates; relabelling here would swallow exactly those.
-    let v = try_get_double(args[0])?;
+    let v = try_get_double(obj)?;
     // `float_to_pyint` is `newlong_from_float`: NaN raises, an infinity raises,
     // and a finite value outside the machine range becomes a long.  A direct
     // `as i64` saturates instead, so `floor(FloatLike(1e300))` answered
@@ -1455,13 +1452,15 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
     // reason strings are rather than by a numeric-value test. `dir(n)` only
     // reports membership, so the check must not bind the descriptor — the one
     // binding belongs to `get_bigint` below.
-    if unsafe { pyre_interpreter::baseobjspace::lookup(args[0], "__index__") }.is_none() {
+    let mut n = args[0];
+    if pyre_object::with_roots!(n => unsafe { pyre_interpreter::baseobjspace::lookup(n, "__index__") }).is_none()
+    {
         return Err(pyre_interpreter::PyError::type_error(format!(
             "'{}' object cannot be interpreted as an integer",
-            pyre_interpreter::baseobjspace::object_functionstr_type_name(args[0])
+            pyre_interpreter::baseobjspace::object_functionstr_type_name(n)
         )));
     }
-    let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
+    let n_big = RBigIntGcRoot::new(pyre_object::with_roots!(n => get_bigint(n))?);
     if n_big.int_lt(0) {
         return Err(pyre_interpreter::PyError::value_error(
             "factorial() not defined for negative values",

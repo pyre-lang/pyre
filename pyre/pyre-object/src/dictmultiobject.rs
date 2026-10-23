@@ -2069,20 +2069,13 @@ pub fn w_module_dict_new() -> PyObjectRef {
 /// hashing or equality may collect, so callers still publish and reload every
 /// live `PyObjectRef` across the operation.
 pub struct DictOperationGuard {
-    /// One-word cell pointer. `RootScope` is a two-word ADT the residual
-    /// ABI collapses, so the guard stores the cell and save-point itself.
-    stack_slot: *const crate::gc_roots::RootStack,
-    save_point: usize,
+    /// The opened bracket. `RootScope` is the save_point word
+    /// (`#[repr(transparent)]`); Drop rewinds the shadow stack.
+    roots: crate::gc_roots::RootScope,
     root_base: usize,
 }
 
 impl DictOperationGuard {
-    fn open_scope() -> (*const crate::gc_roots::RootStack, usize) {
-        let stack_slot = crate::gc_roots::shadow_stack_cell();
-        let save_point = crate::gc_roots::shadow_stack_cell_len(stack_slot);
-        (stack_slot, save_point)
-    }
-
     /// Slice form for native callers. `&[PyObjectRef]` is two words, so
     /// the residual ABI cannot describe it; translated sites use the
     /// fixed-arity constructors below.
@@ -2098,17 +2091,14 @@ impl DictOperationGuard {
             [a, b] => unsafe { Self::new2(obj, *a, *b) },
             [a, b, c] => unsafe { Self::new3(obj, *a, *b, *c) },
             _ => {
-                let (stack_slot, save_point) = Self::open_scope();
+                let roots = crate::gc_roots::push_roots();
+                let stack_slot = crate::gc_roots::shadow_stack_cell();
                 let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
                 for &r in refs {
                     let _ = crate::gc_roots::publish_one_at(stack_slot, r);
                 }
                 crate::gc_roots::normalize_at(stack_slot, root_base, 1 + refs.len());
-                Self {
-                    stack_slot,
-                    save_point,
-                    root_base,
-                }
+                Self { roots, root_base }
             }
         }
     }
@@ -2116,59 +2106,47 @@ impl DictOperationGuard {
     /// # Safety
     /// Same contract as [`Self::new`].
     pub unsafe fn new0(obj: PyObjectRef) -> Self {
-        let (stack_slot, save_point) = Self::open_scope();
+        let roots = crate::gc_roots::push_roots();
+        let stack_slot = crate::gc_roots::shadow_stack_cell();
         let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
         crate::gc_roots::normalize_at(stack_slot, root_base, 1);
-        Self {
-            stack_slot,
-            save_point,
-            root_base,
-        }
+        Self { roots, root_base }
     }
 
     /// # Safety
     /// Same contract as [`Self::new`].
     pub unsafe fn new1(obj: PyObjectRef, a: PyObjectRef) -> Self {
-        let (stack_slot, save_point) = Self::open_scope();
+        let roots = crate::gc_roots::push_roots();
+        let stack_slot = crate::gc_roots::shadow_stack_cell();
         let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
         let _ = crate::gc_roots::publish_one_at(stack_slot, a);
         crate::gc_roots::normalize_at(stack_slot, root_base, 2);
-        Self {
-            stack_slot,
-            save_point,
-            root_base,
-        }
+        Self { roots, root_base }
     }
 
     /// # Safety
     /// Same contract as [`Self::new`].
     pub unsafe fn new2(obj: PyObjectRef, a: PyObjectRef, b: PyObjectRef) -> Self {
-        let (stack_slot, save_point) = Self::open_scope();
+        let roots = crate::gc_roots::push_roots();
+        let stack_slot = crate::gc_roots::shadow_stack_cell();
         let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
         let _ = crate::gc_roots::publish_one_at(stack_slot, a);
         let _ = crate::gc_roots::publish_one_at(stack_slot, b);
         crate::gc_roots::normalize_at(stack_slot, root_base, 3);
-        Self {
-            stack_slot,
-            save_point,
-            root_base,
-        }
+        Self { roots, root_base }
     }
 
     /// # Safety
     /// Same contract as [`Self::new`].
     pub unsafe fn new3(obj: PyObjectRef, a: PyObjectRef, b: PyObjectRef, c: PyObjectRef) -> Self {
-        let (stack_slot, save_point) = Self::open_scope();
+        let roots = crate::gc_roots::push_roots();
+        let stack_slot = crate::gc_roots::shadow_stack_cell();
         let root_base = crate::gc_roots::publish_one_at(stack_slot, obj);
         let _ = crate::gc_roots::publish_one_at(stack_slot, a);
         let _ = crate::gc_roots::publish_one_at(stack_slot, b);
         let _ = crate::gc_roots::publish_one_at(stack_slot, c);
         crate::gc_roots::normalize_at(stack_slot, root_base, 4);
-        Self {
-            stack_slot,
-            save_point,
-            root_base,
-        }
+        Self { roots, root_base }
     }
 
     /// Re-read a rooted operand.
@@ -2181,13 +2159,7 @@ impl DictOperationGuard {
     /// `object_key_for_checked`, which runs the key's own `__hash__`.
     #[inline]
     pub fn root(&self, index: usize) -> PyObjectRef {
-        crate::gc_roots::get_at(self.stack_slot, self.root_base + index)
-    }
-}
-
-impl Drop for DictOperationGuard {
-    fn drop(&mut self) {
-        crate::gc_roots::shadow_stack_cell_truncate(self.stack_slot, self.save_point);
+        self.roots.get(self.root_base + index)
     }
 }
 

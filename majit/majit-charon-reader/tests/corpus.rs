@@ -119,10 +119,13 @@ fn loads_fixture_corpus() {
     // `option_raw_struct_from_int`. `SomeRawStruct` is a type, so it
     // contributes no body.
     //
+    // + 1 for `charon_corpus::<Impl>::ccharp_to_voidp` (`CastCcharpToVoidP`
+    // of `*const u8`), added when GCREF re-extracted the fixture corpus.
+    //
     // Measured on Charon 0.1.281 (nightly-2026.10.04) with
     // `--reconstruct-panic-calls --inline-anon-consts`: drop glue is no
-    // longer its own local item, and this artefact holds 105.
-    assert_eq!(local_count, 105, "105 local fns expected");
+    // longer its own local item, and this artefact holds 106.
+    assert_eq!(local_count, 106, "106 local fns expected");
 }
 
 #[test]

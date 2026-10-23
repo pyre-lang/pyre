@@ -1633,6 +1633,10 @@ pub struct ResumedFrame {
     /// Structure: [live_registers...] — no scalar inputarg header.
     /// RPython parity: vable values come from snapshot, not fail_args.
     pub values: Vec<majit_ir::Value>,
+    /// Whether this section's jitcode maps to a Python `CodeObject`
+    /// (`raw_code_for_jitcode_index`). Helper jitcodes have none; an
+    /// inlined Python callee does, including when its mapped `py_pc` is 0.
+    pub has_python_twin: bool,
 }
 
 /// resume.py decode_ref / getvirtual_ptr parity.

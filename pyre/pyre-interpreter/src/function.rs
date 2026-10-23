@@ -1650,7 +1650,7 @@ pub unsafe fn get_pycode(obj: PyObjectRef) -> *const () {
             !crate::is_builtin_code(code as PyObjectRef),
             "get_pycode called on a builtin function"
         );
-        crate::w_code_get_ptr(code as PyObjectRef)
+        crate::w_code_get_ptr(code as PyObjectRef) as *const ()
     }
 }
 
@@ -4220,7 +4220,8 @@ fn funccall_flat_from_args(
         }
         _ => unreachable!(),
     }
-    crate::pyframe::remember_frame_locals(&new_frame);
+    // `function.py funccall` writes locals through `setarrayitem_gc`;
+    // `set_locals_w` is that store.
     new_frame.fix_array_ptrs();
     // function.py `Function.funccall` — `new_frame.run(self.name, self.qualname)`
     // → `initialize_as_generator(name, qualname)` / `GeneratorIterator`.
@@ -4326,12 +4327,11 @@ pub fn funccall_valuestack(
     // it on the shadow stack beside the anchored frame.
     let _entry_roots = pyre_object::gc_roots::push_roots();
     let func = _entry_roots.pin_root(func);
-    // `function.py funccall_valuestack` does not register an extra root: the
-    // caller frame is already a GC object kept live by `FrameAnchor` and the
-    // execution-context chain, and `pyframe_object_custom_trace` visits
-    // `locals_cells_stack_w`. Value-stack stores can still leave a young
-    // pointer in an old array, so the write barrier runs before anything allocates.
-    crate::pyframe::remember_frame_locals(frame);
+    // `function.py funccall_valuestack` never extracts `locals_cells_stack_w`.
+    // Value-stack stores go through `set_ref` (`setarrayitem_gc`) in the same
+    // block as the virtualizable array field read (`jtransform.py
+    // _check_no_vable_array`).
+
     // A compiled callee prologue can publish an overflow before control
     // returns to this dispatcher.  The fresh stack check belongs to the
     // Python frame entry (`PyFrame.execute_frame.insert_stack_check_here`),
@@ -4599,12 +4599,8 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
-    // `PyFrame.__init__` allocates `locals_cells_stack_w` as a fresh
-    // `[None] * size` nursery array.  Arguments just written into it are
-    // also young.  `remember_frame_locals_array` still runs: a full nursery
-    // can spill the array to old-gen, and until the callee sits on
-    // `f_backref` nothing else exposes these slots.
-    crate::pyframe::remember_frame_locals(&new_frame);
+    // function.py `_flat_pycall` writes `new_frame.locals_cells_stack_w[i]`
+    // through `set_locals_w` (`setarrayitem_gc`).
     let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
@@ -4701,9 +4697,7 @@ fn _flat_pycall_defaults(
         }
     }
 
-    // Same barrier as `_flat_pycall`: a full nursery can spill the callee's
-    // locals array to old-gen, and the arguments and defaults in it are young.
-    crate::pyframe::remember_frame_locals(&new_frame);
+    // Same as `_flat_pycall`: `set_locals_w` is `setarrayitem_gc`.
     let frame = unsafe { &mut *caller.live() };
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();

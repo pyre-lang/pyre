@@ -701,12 +701,17 @@ pub fn complete_struct_or_union(
                 // A nested anonymous struct or union: its fields are spliced
                 // in at this offset under their own names.
                 for w_srcfld in super::ctypestruct::fields_list_of(ftype)? {
-                    let srcfld = super::ctypestruct::W_CField::from_obj(w_srcfld)
+                    // `append` (`w_list_append`) can collect; `w_srcfld` is
+                    // still live for `name_of_field` after it.
+                    let src_slot = roots.pin_roots(&[w_srcfld]);
+                    let srcfld = super::ctypestruct::W_CField::from_obj(roots.get(src_slot))
                         .ok_or_else(|| PyError::system_error("field list holds a non-field"))?;
                     let w_fld = super::ctypestruct::make_shifted(srcfld, byteoffset, fflags);
                     let fld_slot = roots.pin_roots(&[w_fld]);
                     append(roots.get(fld_slot));
-                    if let Some(name) = super::ctypestruct::name_of_field(ftype, w_srcfld)? {
+                    if let Some(name) =
+                        super::ctypestruct::name_of_field(ftype, roots.get(src_slot))?
+                    {
                         record(&name, roots.get(fld_slot));
                     }
                 }

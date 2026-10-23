@@ -65,6 +65,41 @@ pub(crate) struct RangeNewSite {
     /// The `SyntheticTransparentCtor` result (the `Range` value) — locates
     /// the ctor op and the `next` iterator's backward-traced origin.
     pub result_var: Variable,
+    /// `FrameState.copy` / `union` mint a fresh Variable for the same
+    /// MIR local (`framestate.py` `_copy`). The loop-header iterator phi
+    /// is fed those copies, not the ctor result identity.
+    pub aliases: Vec<Variable>,
+}
+
+impl RangeNewSite {
+    pub(crate) fn new(result_var: Variable) -> Self {
+        Self {
+            result_var,
+            aliases: Vec::new(),
+        }
+    }
+
+    pub(crate) fn note_alias(&mut self, src: &Variable, dst: &Variable) {
+        if dst.id() == self.result_var.id() {
+            return;
+        }
+        let src_known = src.id() == self.result_var.id()
+            || self.aliases.iter().any(|alias| alias.id() == src.id());
+        if src_known && self.aliases.iter().all(|alias| alias.id() != dst.id()) {
+            self.aliases.push(dst.clone());
+        }
+    }
+
+    pub(crate) fn note_alias_id(&mut self, src_id: u64, dst: &Variable) {
+        if dst.id() == self.result_var.id() {
+            return;
+        }
+        let src_known =
+            src_id == self.result_var.id() || self.aliases.iter().any(|alias| alias.id() == src_id);
+        if src_known && self.aliases.iter().all(|alias| alias.id() != dst.id()) {
+            self.aliases.push(dst.clone());
+        }
+    }
 }
 
 /// Rewrite every captured exclusive-int-`Range` aggregate that feeds a
@@ -171,9 +206,18 @@ fn rewire_one_range_iter_site(
     // 2. Backward-trace the iterator operand to a captured int-`Range`
     //    aggregate (the reflexive `into_iter` aliases the range value into
     //    the loop iterator, so the trace reaches the ctor result var).
+    //    The ctor is also the origin when it is a link arg into a
+    //    predecessor of the `next()` block: the preheader may then emit
+    //    `ConstNone` in the iterator slot (`emit_unit` of an unbound
+    //    into_iter dest) while still receiving the range.
+    let next_block = graph.blocks[na].id;
     let site = range_sites
         .iter()
-        .find(|s| range_iter_origin_matches(flow, &iter_arg, &s.result_var))
+        .find(|s| {
+            iter_arg
+                .as_variable()
+                .is_some_and(|v| range_iter_origin_matches_site(graph, flow, v, s, next_block))
+        })
         .ok_or_else(|| {
             format!(
                 "{name}: next() iterator does not originate from a captured int-Range aggregate"
@@ -286,7 +330,7 @@ fn rewire_one_range_iter_site(
         let keep = match graph.blocks[bi].exits[ei].args.get(pos) {
             Some(LinkArg::Value(v))
                 if graph.variable_defined_in_block(src, v)
-                    && iterator_alias_of(flow, v, &iter_var, &iter_phi) =>
+                    && iterator_alias_of(graph, flow, v, &iter_var, &iter_phi) =>
             {
                 true
             }
@@ -299,6 +343,17 @@ fn rewire_one_range_iter_site(
             iter_var.clone()
         } else if graph.variable_defined_in_block(src, &iter_phi) {
             iter_phi.clone()
+        } else if let Some(incoming) = graph.blocks[bi]
+            .inputargs
+            .iter()
+            .find(|iv| iterator_alias_of(graph, flow, iv, &iter_var, &iter_phi))
+            .cloned()
+        {
+            // Preheader received the range as an inputarg and then
+            // planted `ConstNone` in the iterator slot (`emit_unit`).
+            // Forward that incoming copy — after the divert it is the
+            // `iter()` result.
+            incoming
         } else if let Some(local) = graph.ensure_variable_at_block_local(src, &iter_phi) {
             local
         } else {
@@ -315,12 +370,69 @@ fn rewire_one_range_iter_site(
 /// a block-inputarg alias that traces to the range value through
 /// `ValueFlow` (`range_iter_origin_matches`).
 fn iterator_alias_of(
+    graph: &FunctionGraph,
     flow: &ValueFlow,
     v: &Variable,
     iter_var: &Variable,
     iter_phi: &Variable,
 ) -> bool {
-    v == iter_var || v == iter_phi || range_iter_origin_matches(flow, v, iter_var)
+    v == iter_var || v == iter_phi || range_iter_origin_matches(graph, flow, v, iter_var)
+}
+
+fn range_iter_origin_matches_site(
+    graph: &FunctionGraph,
+    flow: &ValueFlow,
+    iter_arg: &Variable,
+    site: &RangeNewSite,
+    next_block: crate::model::BlockId,
+) -> bool {
+    if range_iter_origin_matches(graph, flow, iter_arg, &site.result_var) {
+        return true;
+    }
+    if site
+        .aliases
+        .iter()
+        .any(|alias| range_iter_origin_matches(graph, flow, iter_arg, alias))
+    {
+        return true;
+    }
+    range_feeds_loop_preheader(graph, &site.result_var, next_block)
+        || site
+            .aliases
+            .iter()
+            .any(|alias| range_feeds_loop_preheader(graph, alias, next_block))
+}
+
+/// The range value is a link argument into the `next()` block, or into a
+/// predecessor of that block. The preheader may drop the range from the
+/// iterator phi (`ConstNone` / `emit_unit`) while still receiving it.
+fn range_feeds_loop_preheader(
+    graph: &FunctionGraph,
+    range_result: &Variable,
+    next_block: crate::model::BlockId,
+) -> bool {
+    for block in &graph.blocks {
+        for link in &block.exits {
+            if !link
+                .args
+                .iter()
+                .any(|arg| arg.as_variable() == Some(range_result))
+            {
+                continue;
+            }
+            if link.target == next_block {
+                return true;
+            }
+            if graph
+                .blocks
+                .get(link.target.0)
+                .is_some_and(|pred| pred.exits.iter().any(|exit| exit.target == next_block))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `true` iff `iter_arg` traces — directly or through loop-carried block
@@ -335,6 +447,7 @@ fn iterator_alias_of(
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
 fn range_iter_origin_matches(
+    graph: &FunctionGraph,
     flow: &ValueFlow,
     iter_arg: &Variable,
     range_result: &Variable,
@@ -349,10 +462,40 @@ fn range_iter_origin_matches(
             return true;
         }
         // A var that is a block inputarg traces back to each predecessor's
-        // link arg in the matching slot (`flow.back`); anything else
-        // dead-ends.
+        // link arg in the matching slot (`flow.back`).
         if let Some(srcs) = flow.back.get(&v) {
             stack.extend(srcs.iter().cloned());
+        }
+        // `simplify_lowered_graph` can plant a `same_as` or a 1-arg
+        // identity Call (`into_iter`) between the ctor result and the
+        // `next` receiver; those are not link args, so walk the defining
+        // op's identity operand.
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if op.result.as_ref() != Some(&v) {
+                    continue;
+                }
+                match &op.kind {
+                    OpKind::UnaryOp { operand, .. } => {
+                        stack.push(operand.clone());
+                    }
+                    OpKind::FieldRead { base, .. } => {
+                        stack.push(base.clone());
+                    }
+                    OpKind::Call { args, .. } => {
+                        for arg in args {
+                            if let LinkArg::Value(src) = arg {
+                                stack.push(src.clone());
+                            }
+                        }
+                    }
+                    OpKind::BinOp { lhs, rhs, .. } => {
+                        stack.push(lhs.clone());
+                        stack.push(rhs.clone());
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     false
@@ -641,13 +784,8 @@ mod tests {
         g.set_return(h, Some(opt.clone()));
         g.set_goto(n, h, vec![range.clone()]);
 
-        let rewritten = rewire_range_iter_sites(
-            &mut g,
-            &[RangeNewSite {
-                result_var: range.clone(),
-            }],
-            &[opt],
-        );
+        let rewritten =
+            rewire_range_iter_sites(&mut g, &[RangeNewSite::new(range.clone())], &[opt]);
         assert_eq!(rewritten, 1, "the range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
@@ -714,13 +852,8 @@ mod tests {
         g.set_goto(n, m, vec![range.clone()]);
         g.set_goto(m, h, vec![mid.clone()]);
 
-        let rewritten = rewire_range_iter_sites(
-            &mut g,
-            &[RangeNewSite {
-                result_var: range.clone(),
-            }],
-            &[opt],
-        );
+        let rewritten =
+            rewire_range_iter_sites(&mut g, &[RangeNewSite::new(range.clone())], &[opt]);
         assert_eq!(rewritten, 1, "two-hop range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
@@ -734,6 +867,82 @@ mod tests {
             "one iter op emitted"
         );
         assert_link_args_defined_in_source(&g);
+    }
+
+    /// Preheader receives the range as an inputarg, then plants `ConstNone`
+    /// in the header iterator slot (`emit_unit` of an unbound into_iter
+    /// dest). Origin still matches because the range is a link arg into
+    /// that predecessor; the rewrite forwards the incoming copy.
+    #[test]
+    fn rewrite_forwards_preheader_incoming_over_constnone() {
+        let mut g = FunctionGraph::new("test_range_iter_constnone_preheader");
+        let n = g.startblock;
+        let a = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let b = g.push_op_var(n, OpKind::ConstInt(10), true).unwrap();
+        let live = g.push_op_var(n, OpKind::ConstInt(1), true).unwrap();
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: range_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::Range".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "start", &a),
+        });
+        g.block_mut(n).operations.push(SpaceOperation {
+            result: None,
+            kind: field_write(&range, "end", &b),
+        });
+
+        let (m, m_args) = g.create_block_with_arg_vars(2);
+        let live_m = m_args[0].clone();
+        let range_m = m_args[1].clone();
+        let none = g.push_op_var(m, OpKind::ConstNone, true).unwrap();
+
+        let (h, h_args) = g.create_block_with_arg_vars(2);
+        let it = h_args[1].clone();
+        let opt = g
+            .push_op_var(
+                h,
+                OpKind::Call {
+                    target: CallTarget::method("next", Some("Range".to_string())),
+                    args: crate::model::call_args(vec![it.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(h, Some(opt.clone()));
+        g.set_goto(n, m, vec![live.clone(), range.clone()]);
+        g.set_goto(m, h, vec![live_m.clone(), none.clone()]);
+
+        let rewritten =
+            rewire_range_iter_sites(&mut g, &[RangeNewSite::new(range.clone())], &[opt]);
+        assert_eq!(rewritten, 1, "ConstNone preheader must still divert");
+        assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
+        assert_eq!(
+            count_calls_ending(&g, &[crate::runtime_names::shims::RANGE]),
+            1,
+            "one range() builtin emitted"
+        );
+        assert_link_args_defined_in_source(&g);
+        let forwarded = g.block(m).exits[0].args[1]
+            .as_variable()
+            .expect("iterator slot is a value");
+        assert_eq!(
+            forwarded, &range_m,
+            "preheader must forward the incoming range copy, got {forwarded:?}"
+        );
+        assert_ne!(
+            forwarded, &none,
+            "preheader must not keep ConstNone in the iterator slot"
+        );
     }
 
     /// A predecessor that still names a non-iterator dummy must receive
@@ -784,13 +993,8 @@ mod tests {
         g.set_goto(n, mid, vec![]);
         g.set_goto(mid, header, vec![dummy]);
 
-        let rewritten = rewire_range_iter_sites(
-            &mut g,
-            &[RangeNewSite {
-                result_var: range.clone(),
-            }],
-            &[opt],
-        );
+        let rewritten =
+            rewire_range_iter_sites(&mut g, &[RangeNewSite::new(range.clone())], &[opt]);
         assert_eq!(rewritten, 1, "the range for-loop must be diverted");
         assert_link_args_defined_in_source(&g);
         let passed = g.block(mid).exits[0].args[0]
@@ -890,13 +1094,8 @@ mod tests {
         g.set_goto(h, body, vec![it.clone(), live_h.clone()]);
         g.set_goto(body, h, vec![it_b.clone(), live_b.clone()]);
 
-        let rewritten = rewire_range_iter_sites(
-            &mut g,
-            &[RangeNewSite {
-                result_var: range.clone(),
-            }],
-            &[opt],
-        );
+        let rewritten =
+            rewire_range_iter_sites(&mut g, &[RangeNewSite::new(range.clone())], &[opt]);
         assert_eq!(rewritten, 1, "the looping range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_link_args_defined_in_source(&g);
@@ -1201,13 +1400,8 @@ mod tests {
         g.set_return(h, Some(opt.clone()));
         g.set_goto(n, h, vec![range.clone()]);
 
-        let rewritten = rewire_range_iter_sites(
-            &mut g,
-            &[RangeNewSite {
-                result_var: range.clone(),
-            }],
-            &[opt],
-        );
+        let rewritten =
+            rewire_range_iter_sites(&mut g, &[RangeNewSite::new(range.clone())], &[opt]);
         assert_eq!(rewritten, 0, "a second range consumer declines the divert");
         assert_eq!(count_range_ctors(&g), 1, "range ctor survives");
         assert_eq!(
@@ -1270,13 +1464,8 @@ mod tests {
         let carried = latch_args[0].clone();
         g.set_goto(latch, h, vec![carried.clone()]);
 
-        let rewritten = rewire_range_iter_sites(
-            &mut g,
-            &[RangeNewSite {
-                result_var: range.clone(),
-            }],
-            &[opt],
-        );
+        let rewritten =
+            rewire_range_iter_sites(&mut g, &[RangeNewSite::new(range.clone())], &[opt]);
         assert_eq!(rewritten, 1, "the range for-loop must be diverted");
         let entry_arg = &g.block(n).exits[0].args[0];
         assert!(

@@ -1147,73 +1147,28 @@ fn header_read_narrows_to_a_typed_field_read() {
     );
 }
 
-/// A boxing allocation becomes `NewWithVtable` only after its class-static
-/// address is known. Exercise the fusion directly so the unresolved and
-/// resolved cases differ by that input alone.
+/// A boxing allocation becomes `NewWithVtable` once its class-static
+/// address is a constant. An immutable static is that constant
+/// (`bookkeeper.py immutablevalue`); a residual FunctionPath of the
+/// static's name was the deviation this branch deleted.
 #[test]
 fn boxing_cluster_fuses_once_the_class_address_resolves() {
-    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    use majit_translate::model::{CallTarget, OpKind};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
-    let attrs = std::collections::HashMap::from([
-        (
-            "ObjectHeader".to_string(),
-            vec![
-                ("ob_type".to_string(), ValueType::Ref(None)),
-                ("w_class".to_string(), ValueType::Ref(None)),
-            ],
-        ),
-        (
-            "W_IntObject".to_string(),
-            vec![
-                ("ob_header".to_string(), ValueType::Ref(None)),
-                ("intval".to_string(), ValueType::Int),
-            ],
-        ),
-    ]);
 
     let llbc = load_corpus();
 
-    // Without a resolvable class address the cluster is left alone.
-    let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
-    assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
-        0,
-        "an unresolvable class-static address declines the fuse, silently",
-    );
-
-    // Stand in for the driver-supplied static address.
-    let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
-    let mut substituted = 0usize;
-    for b in &mut graph.blocks {
-        for op in &mut b.operations {
-            let is_class_static = matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().map(String::as_str) == Some("INT_CLASS")
-            );
-            if is_class_static {
-                op.kind = OpKind::ConstRefAddr(CLASS_ADDR);
-                substituted += 1;
-            }
-        }
-    }
-    assert_eq!(
-        substituted, 2,
-        "ob_type and w_class each read the class static",
-    );
-
-    assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
-        1,
-        "the cluster fuses once the class address is a constant",
-    );
-
+    // `bookkeeper.py immutablevalue`: an immutable class static is a
+    // ConstRefAddr of the declaration itself, never a residual
+    // FunctionPath of the static's name. Lowering fuses from that
+    // identity; the host-registered address is the sibling
+    // `boxing_cluster_fuses_from_the_host_supplied_class_address`.
+    let graph = lower_function(llbc, "w_new_int").expect("lowering");
     let mut fused = Vec::new();
     let mut payload_stores = 0usize;
     let mut residual_mallocs = 0usize;
+    let mut residual_class_reads = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
             match &op.kind {
@@ -1222,27 +1177,42 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().map(String::as_str) == Some("malloc_typed") => {
-                    residual_mallocs += 1
-                }
+                } => match segments.last().map(String::as_str) {
+                    Some("malloc_typed") => residual_mallocs += 1,
+                    Some("INT_CLASS") => residual_class_reads += 1,
+                    _ => {}
+                },
                 _ => {}
             }
         }
     }
     assert_eq!(
-        fused,
-        vec![("W_IntObject".to_string(), CLASS_ADDR)],
-        "one NewWithVtable carrying the real class pointer",
+        residual_class_reads, 0,
+        "INT_CLASS is a ConstRefAddr, not a residual call",
     );
-    // Two: the re-emitted store after the `NewWithVtable`, plus the original
-    // aggregate store, which is dead but not yet swept — `fuse_boxing_alloc`
-    // leaves that to the `remove_dead_aggregates` pass in
-    // `simplify_lowered_graph`.
-    assert_eq!(payload_stores, 2, "the intval payload store is re-emitted");
     assert_eq!(
         residual_mallocs, 0,
         "the malloc_typed call is consumed, not left residual",
     );
+    assert_eq!(
+        fused.len(),
+        1,
+        "the cluster fuses from the immutable static"
+    );
+    assert_eq!(
+        fused[0].0, "W_IntObject",
+        "one NewWithVtable carrying the class static"
+    );
+    assert_ne!(
+        fused[0].1, 0,
+        "vtable is the static's identity, not a null placeholder"
+    );
+    assert_ne!(
+        fused[0].1, CLASS_ADDR,
+        "without HostStaticAddrs the vtable is the declaration sentinel"
+    );
+    // Whole-graph lowering runs `remove_dead_aggregates` after the fuse.
+    assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
 }
 
 /// The production lowering receives class-static addresses through
@@ -3412,6 +3382,29 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
             "{source} still calls an option/drop of the guard: {calls:?}"
         );
     }
+}
+
+/// `from_type_and_value` does `unwrap_or(PyErrorKind::RuntimeError)`.
+/// `PyErrorKind` is a fieldless enum (Int). Recasting the tag onto the
+/// enum class (`rclass.py` `cast_instance`) is the non-pointer operand
+/// the annotator rejects, and dual-gate Skip then hydrates a Ref first
+/// arg for residual `make_pyerror` (FUNC.ARGS Int).
+#[test]
+fn from_type_and_value_does_not_cast_fieldless_kind() {
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let graph = lower_named(llbc, "from_type_and_value")
+        .unwrap_or_else(|e| panic!("lower from_type_and_value: {e}"));
+    let kind_casts: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| majit_translate::model::cast_instance_root(&op.kind))
+        .filter(|root| *root == "PyErrorKind")
+        .collect();
+    assert!(
+        kind_casts.is_empty(),
+        "PyErrorKind is a fieldless enum; must not __cast_instance_intrinsic the tag; roots={kind_casts:?}"
+    );
 }
 
 /// Graphs that pass a guard-containing pointer to a residual callee are

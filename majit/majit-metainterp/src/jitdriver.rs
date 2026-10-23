@@ -11685,7 +11685,6 @@ impl<S: JitState> JitDriver<S> {
                 .unwrap_or(self.index().unwrap_or(0)),
             green_key,
         );
-        let structured_entry_keys = self.meta.structured_entry_keys;
         // pyjitpl.py `rebuild_state_after_failure` ends with
         // `synchronize_virtualizable()` / `check_synchronized_virtualizable()`,
         // both of which read the LIVE virtualizable.  Resolve it here (the same
@@ -11720,7 +11719,6 @@ impl<S: JitState> JitDriver<S> {
         // can apply bridge-only behavior without overloading
         // `has_compiled_targets_fn` presence.
         ctx.is_bridge_trace = true;
-        ctx.green_key_prepends_pc = structured_entry_keys;
         // pyjitpl.py `_handle_guard_failure`:
         //
         //     self.seen_loop_header_for_jdindex = -1

@@ -15478,6 +15478,12 @@ fn handle<Sym: WalkSym>(
             write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        "int_isvirtual/r>i" => {
+            let src = read_ref_reg(code, op, 0, ctx)?;
+            let dst = code[op.pc + 2] as usize;
+            write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "ref_isvirtual/r>i" => {
             let src = read_ref_reg(code, op, 0, ctx)?;
             let dst = code[op.pc + 2] as usize;

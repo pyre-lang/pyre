@@ -1526,7 +1526,9 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
         Some(unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf())
     } else {
-        Some(pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?)
+        Some(
+            pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?,
+        )
     };
     let mut w_object = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
     // `vm.py unraisablehook`: `space.text_w(space.getattr(w_hookargs,
@@ -2252,7 +2254,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
         let lazy_imports_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_int_new(
-            crate::importing::lazy_imports_config() as i64,
+            crate::importing::lazy_imports_config() as i64
         ));
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL

@@ -3647,16 +3647,17 @@ fn exc_object_class_name(exc: PyObjectRef) -> Option<String> {
             return pyre_object::w_type_get_name(w_type).to_string();
         }
         let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
-        let module = crate::baseobjspace::lookup_in_type(
-            w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__module__")),
-        )
-        .filter(|value| pyre_object::is_str(*value))
-        .and_then(|value| {
-            crate::baseobjspace::str_utf8_w(value)
-                .ok()
-                .map(str::to_string)
+        let mut w_type = w_type;
+        let w_module_name = pyre_object::with_roots!(w_type => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__module__"))
         });
+        let module = crate::baseobjspace::lookup_in_type(w_type, w_module_name)
+            .filter(|value| pyre_object::is_str(*value))
+            .and_then(|value| {
+                crate::baseobjspace::str_utf8_w(value)
+                    .ok()
+                    .map(str::to_string)
+            });
         match module.as_deref() {
             Some(module) if module != "builtins" && module != "__main__" => {
                 format!("{module}.{qualname}")

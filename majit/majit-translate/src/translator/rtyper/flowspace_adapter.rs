@@ -9372,11 +9372,7 @@ mod tests {
             .push_op_var(
                 entry,
                 OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath {
-                        segments: vec!["vec".into(), "Vec".into(), "index".into()],
-                        fun_decl_id: None,
-                        generic_rust_args: Vec::new(),
-                    },
+                    target: crate::model::CallTarget::function_path(["vec", "Vec", "index"]),
                     args: crate::model::call_args(vec![v_var, i_var]),
                     result_ty: ValueType::Int,
                 },

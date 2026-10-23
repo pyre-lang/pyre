@@ -774,7 +774,7 @@ fn check_min_field_width(spec: &CFormatSpec) -> Result<(), PyError> {
     Ok(())
 }
 
-unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
+unsafe fn spec_format_bytes(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
     if let CFormatType::Unsupported { ch, index } = spec.format_type {
         return Err(unsupported_format_error(ch.to_u32(), index, true));
     }
@@ -791,7 +791,9 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
             if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
                 return Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(src)));
             }
-            let Some(method) = crate::baseobjspace::lookup(obj, "__bytes__") else {
+            let Some(method) = (pyre_object::with_roots!(obj => {
+                crate::baseobjspace::lookup(obj, "__bytes__")
+            })) else {
                 return Err(PyError::type_error(format!(
                     "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
                     crate::baseobjspace::object_functionstr_type_name(obj)
@@ -859,7 +861,7 @@ fn unsupported_format_error(cp: u32, index: usize, bytes: bool) -> PyError {
     ))
 }
 
-unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
+unsafe fn bytes_char_arg(mut obj: PyObjectRef) -> Result<u8, PyError> {
     if pyre_object::bytesobject::is_bytes(obj) || pyre_object::bytearrayobject::is_bytearray(obj) {
         let data = pyre_object::bytesobject::bytes_like_data(obj);
         if data.len() == 1 {
@@ -877,7 +879,7 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
     }
     let value = if pyre_object::pyobject::is_int_or_long(obj) {
         arg_to_bigint(obj)
-    } else if has_dunder(obj, "__index__") {
+    } else if pyre_object::with_roots!(obj => has_dunder(obj, "__index__")) {
         crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
     } else {
         let type_name = match crate::typedef::r#type(obj) {
@@ -904,13 +906,16 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
 
 /// True when `obj`'s type carries `__getitem__` (`PyMapping_Check`), so a
 /// `%(key)s` spec can index it.
-unsafe fn has_getitem(obj: PyObjectRef) -> bool {
+unsafe fn has_getitem(mut obj: PyObjectRef) -> bool {
     match crate::typedef::r#type(obj) {
-        Some(tp) => crate::baseobjspace::lookup_in_type(
-            tp.as_ptr(),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-        )
-        .is_some(),
+        Some(tp) => {
+            let mut tp = tp.as_ptr();
+            pyre_object::with_roots!(obj, tp => crate::baseobjspace::lookup_in_type(
+                tp,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
+            ))
+            .is_some()
+        }
         None => false,
     }
 }
@@ -980,13 +985,15 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result
         )?;
         return Ok(arg_to_bigint(pyint));
     }
-    if let Some(method) = crate::baseobjspace::lookup(obj, "__int__") {
+    if let Some(method) =
+        pyre_object::with_roots!(obj => crate::baseobjspace::lookup(obj, "__int__"))
+    {
         let r = pyre_object::with_roots!(obj => crate::builtins::call_and_check(method, &[obj]))?;
         if is_int_like(r) || is_long(r) {
             return Ok(arg_to_bigint(r));
         }
     }
-    if has_dunder(obj, "__index__") {
+    if pyre_object::with_roots!(obj => has_dunder(obj, "__index__")) {
         // `format_num_helper`: a TypeError from the numeric decoder (a non-int
         // `__index__` return included) is reported as the operand-type error,
         // naming the original argument, not the coerced result.
@@ -1007,7 +1014,7 @@ unsafe fn number_arg_integer(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result
     if is_int_like(obj) || is_long(obj) {
         return Ok(arg_to_bigint(obj));
     }
-    if has_dunder(obj, "__index__") {
+    if pyre_object::with_roots!(obj => has_dunder(obj, "__index__")) {
         // `format_num_helper` (maybe_index): a TypeError from `space.index`
         // is reported as the operand-type error naming the original argument.
         return match pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj)) {
@@ -1032,7 +1039,7 @@ unsafe fn number_type_error(spec: &CFormatSpec, obj: PyObjectRef, what: &str) ->
 
 /// `fmt_c` argument coercion — a single-character str, or an integer /
 /// `__index__` in `range(0x110000)`.
-unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
+unsafe fn char_arg(mut obj: PyObjectRef) -> Result<CodePoint, PyError> {
     if is_str(obj) {
         let s = w_str_get_wtf8(obj);
         let mut cps = s.code_points();
@@ -1048,7 +1055,7 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
     }
     let value = if is_int_like(obj) || is_long(obj) {
         arg_to_bigint(obj)
-    } else if has_dunder(obj, "__index__") {
+    } else if pyre_object::with_roots!(obj => has_dunder(obj, "__index__")) {
         crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
     } else {
         let tn = match crate::typedef::r#type(obj) {
@@ -1073,13 +1080,16 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
 }
 
 /// True when `obj`'s type carries `name` above `object`'s default.
-unsafe fn has_dunder(obj: PyObjectRef, name: &str) -> bool {
+unsafe fn has_dunder(mut obj: PyObjectRef, name: &str) -> bool {
     match crate::typedef::r#type(obj) {
-        Some(tp) => crate::baseobjspace::lookup_in_type(
-            tp.as_ptr(),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        )
-        .is_some(),
+        Some(tp) => {
+            let mut tp = tp.as_ptr();
+            pyre_object::with_roots!(obj, tp => crate::baseobjspace::lookup_in_type(
+                tp,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+            ))
+            .is_some()
+        }
         None => false,
     }
 }

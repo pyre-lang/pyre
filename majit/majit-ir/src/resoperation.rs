@@ -6045,7 +6045,7 @@ mod tests {
 
     #[test]
     fn wide_stamp_ids_recycle_when_ops_drop() {
-        let start = crate::operand::wide_high_water();
+        let start = crate::operand::wide_ids_minted();
         {
             let ops: Vec<_> = (0..100)
                 .map(|i| {
@@ -6064,7 +6064,7 @@ mod tests {
                     op
                 })
                 .collect();
-            let grown = crate::operand::wide_high_water() - start;
+            let grown = crate::operand::wide_ids_minted() - start;
             assert!(
                 grown <= 100,
                 "second wave reused released stamp ids, grown={grown}"

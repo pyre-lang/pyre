@@ -608,12 +608,10 @@ pub unsafe fn _getdictvalue_no_unwrapping_pure_w(
     let Some(key) = (unsafe { crate::unicodeobject::w_str_get_value_opt(w_key) }) else {
         return std::ptr::null_mut();
     };
-    unsafe {
-        module_dict_entries_get(
-            crate::dictmultiobject::w_module_dict_module_storage(w_dict),
-            key,
-        )
-    }
+    module_dict_entries_get(
+        unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict) },
+        key,
+    )
     .unwrap_or(std::ptr::null_mut())
 }
 

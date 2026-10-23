@@ -380,6 +380,7 @@ fn build_semantic_program_via_active_frontend(
                 front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
                 llbc.register_raw_struct_paths(raw_structs.iter().cloned());
+                llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
                 front::mir::apply_published_structs(&mut llbc, &published_structs);
                 if !eval_hook_graphs.is_empty() {
                     llbc.set_eval_hook_graphs(eval_hook_graphs.clone());

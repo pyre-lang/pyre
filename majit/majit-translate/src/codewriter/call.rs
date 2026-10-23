@@ -18,7 +18,10 @@ use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
-use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
+use crate::codewriter::jtransform::{
+    GraphTransformConfig, LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY,
+    VirtualizableFieldDescriptor,
+};
 use crate::flowspace::argument::Signature;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
@@ -4696,6 +4699,8 @@ impl CallControl {
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
     ) -> majit_ir::descr::DescrRef {
+        let named = named_length_prefixed_gcarray_id(item_ty, array_type_id, len_offset);
+        let array_type_id = &named;
         let idx = self.descr_indices.array_index(
             value_type_discriminant(item_ty),
             array_type_id,
@@ -9183,22 +9188,7 @@ impl CallControl {
     /// the constant so the runtime patcher rewrites the slot by name
     /// rather than by matching integer bits.
     pub fn fnaddr_binding_for_target(&self, target: &CallTarget) -> FnAddrBinding {
-        let binding = |path: CallPath, addr: i64, symbolic: bool| FnAddrBinding {
-            path: self
-                .fnaddr_registry_keys
-                .get(&path)
-                .cloned()
-                .unwrap_or_else(|| path.canonical_key()),
-            addr,
-            symbolic,
-        };
-        let from_table = |path: CallPath| match self.resolved_function_fnaddr(&path) {
-            Some((resolved, addr)) => binding(resolved, addr, false),
-            None => {
-                let addr = symbolic_fnaddr_for_path(&path);
-                binding(path, addr, true)
-            }
-        };
+        let from_table = |path: CallPath| self.fnaddr_binding_for_path(&path);
 
         // A `__majit_wrap_*` wrapper takes `&[PyObjectRef]` (two words) and
         // returns `Result<PyObjectRef, PyError>` (sret), neither of which the
@@ -9222,7 +9212,7 @@ impl CallControl {
                 .is_some_and(|leaf| leaf.starts_with(crate::runtime_names::shims::WRAP_PREFIX))
         {
             let addr = symbolic_fnaddr_for_path(path);
-            return binding(path.clone(), addr, true);
+            return self.bind_fnaddr(path.clone(), addr, true);
         }
 
         if let Some(segments) = crate::model::fn_const_segments(target) {
@@ -9262,7 +9252,7 @@ impl CallControl {
             for candidate in candidates {
                 let qualified = CallPath::for_impl_method(candidate, name.as_str());
                 if let Some(&addr) = self.function_fnaddrs.get(&qualified) {
-                    return binding(qualified, addr, false);
+                    return self.bind_fnaddr(qualified, addr, false);
                 }
             }
         }
@@ -9292,6 +9282,30 @@ impl CallControl {
     /// shim for source-only analysis.
     pub fn fnaddr_for_target(&self, target: &CallTarget) -> i64 {
         self.fnaddr_binding_for_target(target).addr
+    }
+
+    /// `assembler.py emit_const` object for a residual funcptr named by path.
+    ///
+    /// Same table as [`Self::fnaddr_binding_for_target`]: a bound address
+    /// when the host published one, otherwise the symbolic hash, with the
+    /// registry key the patcher rebinds by.
+    pub fn fnaddr_binding_for_path(&self, path: &CallPath) -> FnAddrBinding {
+        match self.resolved_function_fnaddr(path) {
+            Some((resolved, addr)) => self.bind_fnaddr(resolved, addr, false),
+            None => self.bind_fnaddr(path.clone(), symbolic_fnaddr_for_path(path), true),
+        }
+    }
+
+    fn bind_fnaddr(&self, path: CallPath, addr: i64, symbolic: bool) -> FnAddrBinding {
+        FnAddrBinding {
+            path: self
+                .fnaddr_registry_keys
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| path.canonical_key()),
+            addr,
+            symbolic,
+        }
     }
 
     /// Strict lookup variant of [`fnaddr_for_target`].
@@ -11903,6 +11917,8 @@ impl CallControl {
         let headerless =
             nolength || crate::front::typestr::nolength_from_array_type_id(resolved_id.as_deref());
         let len_offset = if headerless { None } else { Some(0) };
+        let named = named_length_prefixed_gcarray_id(item_ty, &resolved_id, len_offset);
+        let resolved_id = named.or(resolved_id);
         let index = self.descr_indices.array_index(
             value_type_discriminant(item_ty),
             &resolved_id,
@@ -13225,23 +13241,26 @@ pub(crate) fn get_type_flag(
                 crate::layout::target_word_size(),
             )
         }
-        // descr.py get_type_flag: a Ptr whose pointee has `_gckind == 'raw'`
-        // is FLAG_UNSIGNED. A one-word-item Vec is
-        // `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs rust_vec_lltype`);
-        // `Bookkeeper::project_rust_vec` names that header with the same
-        // recognizer (`rust_vec_item_kind_for_spelling`).
-        s if majit_ir::rvec::rust_vec_item_kind_for_spelling(
-            s,
+        // `{cap, ptr, len}`. A by-value `Vec<T>` field is the three-word
+        // inline substruct (`lltype._note_inlined_into`); loading one word
+        // at the field offset reads `cap`. The field *value* is the
+        // interior address (`direct_fieldptr`).
+        s if crate::vec_layout::field_layout_is_inline_vec(s) => (
+            ArrayFlag::Struct,
+            majit_ir::value::Type::Ref,
+            3 * crate::layout::target_word_size(),
+        ),
+        // Stored `*mut Vec<T>` / `&Vec<T>`: one-word raw header pointer
+        // (`rrustvec.rs rust_vec_lltype`, `descr.py get_type_flag` of a
+        // raw Ptr is FLAG_UNSIGNED). Broader than
+        // `rust_vec_item_kind_for_spelling` (any item type, not only
+        // one-word items); after the inline-vec arm every spelling that
+        // narrower arm classified is still classified here.
+        s if majit_ir::rvec::vec_item_spelling(s).is_some() => (
+            ArrayFlag::Unsigned,
+            majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
-        )
-        .is_some() =>
-        {
-            (
-                ArrayFlag::Unsigned,
-                majit_ir::value::Type::Int,
-                crate::layout::target_word_size(),
-            )
-        }
+        ),
         // A `&dyn Trait` / `Box<dyn Trait>` field is two words: the data
         // pointer and the vtable (metadata) pointer. A one-word descr would
         // keep only the data word, and `ptr_metadata` would then load a
@@ -13571,6 +13590,30 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
                 .and_then(|arg| arg.as_variable())
         })
         .any(|value| families.find_rep(value.clone()) == except_rep)
+}
+
+/// `cpu.arraydescrof(GcArray(ITEM))` when the op carried no ARRAY
+/// spelling. A headerless C array (`len_offset is None`) is a different
+/// lltype and stays unnamed. `ArrayLen` emit passes `ty = Ref(None)`
+/// when it has no item kind, so Ref is left unnamed here.
+fn named_length_prefixed_gcarray_id(
+    item_ty: &crate::model::ValueType,
+    array_type_id: &Option<String>,
+    len_offset: Option<usize>,
+) -> Option<String> {
+    if array_type_id.is_some() {
+        return array_type_id.clone();
+    }
+    if len_offset != Some(0) {
+        return None;
+    }
+    match item_ty {
+        crate::model::ValueType::Int | crate::model::ValueType::Unsigned => {
+            Some(LIST_INT_ITEMS_ARRAY.to_string())
+        }
+        crate::model::ValueType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+        _ => None,
+    }
 }
 
 /// Map ValueType to a small integer for array descriptor indexing.
@@ -21747,9 +21790,10 @@ mod tests {
         assert_eq!(get_type_flag("AtomicPtr<PyObject>", &empty), fallback);
     }
 
-    /// A one-word-item Vec field is `Ptr(Struct(raw) "RustVec")`
+    /// A `Vec<T>` header is `Ptr(Struct(raw) "RustVec")`
     /// (`rrustvec.rs rust_vec_lltype`). `descr.py get_type_flag` of a raw
-    /// Ptr is FLAG_UNSIGNED; the header address is int-banked, one word.
+    /// Ptr is FLAG_UNSIGNED; a stored `*mut Vec<T>` is that one-word
+    /// address. A by-value `Vec<T>` field is the inline three-word value.
     #[test]
     fn rust_vec_header_pointer_is_int_banked() {
         use majit_ir::descr::ArrayFlag;
@@ -21759,7 +21803,14 @@ mod tests {
         let expected = (ArrayFlag::Unsigned, Type::Int, word);
         let known = std::collections::HashSet::new();
         let sizes = std::collections::HashMap::new();
-        for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
+        for spelling in [
+            "*mut Vec<usize>",
+            "*mut Vec<*mut u8>",
+            "*mut Vec<f64>",
+            "*mut Vec<Utf8LocElem>",
+            "&Vec<usize>",
+            "&mut Vec<f64>",
+        ] {
             assert_eq!(get_type_flag(spelling, &known), expected, "{spelling}");
             assert_eq!(
                 super::field_metadata(spelling, &known, &sizes, &known),
@@ -23253,6 +23304,81 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_module", 0), 4);
         assert_eq!(field_pos_in(&cc, "PyObject", "w_class"), 0);
         assert_eq!(field_pos_in(&cc, "Method", "w_class"), 3);
+    }
+
+    /// An inlined raw STRUCT (`QuasiImmutField`) is two leaves
+    /// (`heaptracker.py all_fielddescrs` recursion). `get_fielddescr_index_in`
+    /// numbers them before the next payload field, so `jit_shape`'s minted
+    /// index is its listed position.
+    #[test]
+    fn inlined_quasiimmut_field_is_two_leaves_in_parent_index() {
+        use crate::codewriter::heaptracker::get_fielddescr_index_in;
+        let mut cc = CallControl::new();
+        cc.struct_fields.fields.insert(
+            "PyObject".to_string(),
+            vec![
+                ("ob_type".to_string(), "*const PyType".to_string()),
+                ("w_class".to_string(), "*mut PyObject".to_string()),
+            ],
+        );
+        cc.struct_fields.fields.insert(
+            "QuasiImmutField".to_string(),
+            vec![
+                ("ptr".to_string(), "*mut u8".to_string()),
+                ("lock".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        cc.struct_fields.fields.insert(
+            "PyCode".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("code_ptr".to_string(), "*const u8".to_string()),
+                (
+                    "w_globals_watchers".to_string(),
+                    "QuasiImmutField".to_string(),
+                ),
+                ("jit_shape".to_string(), "u8".to_string()),
+            ],
+        );
+        cc.set_known_struct_names(
+            ["PyObject", "QuasiImmutField"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+
+        // `ob_header.w_class`=0, `code_ptr`=1, `watchers.ptr`=2,
+        // `watchers.lock`=3, `jit_shape`=4.
+        assert_eq!(get_fielddescr_index_in(&cc, "PyCode", "code_ptr", 0), 1);
+        assert_eq!(
+            get_fielddescr_index_in(&cc, "PyCode", "w_globals_watchers.ptr", 0),
+            2
+        );
+        assert_eq!(
+            get_fielddescr_index_in(&cc, "PyCode", "w_globals_watchers.lock", 0),
+            3
+        );
+        assert_eq!(get_fielddescr_index_in(&cc, "PyCode", "jit_shape", 0), 4);
+        assert_eq!(field_pos_in(&cc, "PyCode", "jit_shape"), 4);
+        let names = [
+            "w_class",
+            "code_ptr",
+            "w_globals_watchers.ptr",
+            "w_globals_watchers.lock",
+            "jit_shape",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            let owner = if *name == "w_class" {
+                "PyObject"
+            } else {
+                "PyCode"
+            };
+            let walked = get_fielddescr_index_in(&cc, owner, name, 0);
+            assert_eq!(
+                walked, i as isize,
+                "{owner}.{name} index_in_parent {walked} at listed position {i}"
+            );
+        }
     }
 
     /// A `()`-payload enum variant is what makes a mint site's own field

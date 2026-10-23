@@ -1556,11 +1556,10 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         // the builtin's gateway descends this body.
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.pin_roots(&[obj, classinfo]);
+        let w_instancecheck =
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__instancecheck__"));
         if let Some(cls_type) = crate::typedef::r#type(roots.get(base + 1))
-            && let Some(check) = lookup_in_type(
-                cls_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__instancecheck__")),
-            )
+            && let Some(check) = lookup_in_type(cls_type.as_ptr(), w_instancecheck)
         {
             // abstractinst.py:122 `space.get_and_call_function(w_check,
             // w_klass_or_tuple, w_obj)` — bind the descriptor to
@@ -1637,11 +1636,10 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
         let issubclass_base = pyre_object::gc_roots::pin_roots(&[derived, classinfo]);
         let derived = || pyre_object::gc_roots::shadow_stack_get(issubclass_base);
         let classinfo = || pyre_object::gc_roots::shadow_stack_get(issubclass_base + 1);
+        let w_subclasscheck =
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__subclasscheck__"));
         if let Some(cls_type) = crate::typedef::r#type(classinfo())
-            && let Some(check) = lookup_in_type(
-                cls_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__subclasscheck__")),
-            )
+            && let Some(check) = lookup_in_type(cls_type.as_ptr(), w_subclasscheck)
         {
             // abstractinst.py:195 `space.get_and_call_function(w_check,
             // w_klass_or_tuple, w_derived)` — bind the descriptor to
@@ -1728,21 +1726,16 @@ pub(crate) unsafe fn subclass_special_override(
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let obj = pyre_object::gc_roots::pin_root(obj);
+    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
     let w_type = crate::typedef::r#type(obj)?;
-    let method = lookup_in_type_where(
-        w_type.as_ptr(),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    )?;
+    let method = lookup_in_type_where(w_type.as_ptr(), w_name)?;
     // The builtin layout type for `obj` — the canonical type object for its
     // `ob_type`.  When the MRO resolution matches that type's own slot the
     // method is inherited, not overridden.
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let base = pyre_object::get_instantiate(&*(*obj).ob_type);
     if !base.is_null()
-        && let Some(inherited) = lookup_in_type_where(
-            base,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        )
+        && let Some(inherited) = lookup_in_type_where(base, w_name)
         && std::ptr::eq(inherited, method)
     {
         return None;
@@ -1814,43 +1807,37 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
     if let Some(w_type) =
         crate::typedef::r#type(unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) })
     {
-        if let Some(w_descr) = unsafe {
-            lookup_in_type(
-                w_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__bool__")),
-            )
-        } {
-            let w_res = unsafe {
-                get_and_call_function0(
-                    w_descr,
-                    pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                    w_type.as_ptr(),
-                )
-            };
-            if w_res.is_null() {
-                return Err(crate::call::take_call_error()
-                    .unwrap_or_else(|| PyError::type_error("call failed")));
+        {
+            let w_bool_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__bool__"));
+            if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), w_bool_name) } {
+                let w_res = unsafe {
+                    get_and_call_function0(
+                        w_descr,
+                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                        w_type.as_ptr(),
+                    )
+                };
+                if w_res.is_null() {
+                    return Err(crate::call::take_call_error()
+                        .unwrap_or_else(|| PyError::type_error("call failed")));
+                }
+                // The only instances of bool are `w_False` / `w_True`, so any
+                // other box is the TypeError, and what it names is the type of
+                // what `__bool__` RETURNED.  The docstring above transcribes
+                // `%T` on `w_obj`, which is upstream's own slip -- it computes
+                // `w_restype` on the line before and then does not use it.
+                if unsafe { is_bool(w_res) } {
+                    return Ok(unsafe { w_bool_get_value(w_res) });
+                }
+                // Keep that `format!` off the look-inside graph:
+                // `__majit_stringbuilder_new` is an un-lowered helper, and a red
+                // `__bool__` result would otherwise decline every descent that has
+                // already executed an effect (the `__import__` `sys.modules` read).
+                return Err(bool_must_return_bool(w_res));
             }
-            // The only instances of bool are `w_False` / `w_True`, so any
-            // other box is the TypeError, and what it names is the type of
-            // what `__bool__` RETURNED.  The docstring above transcribes
-            // `%T` on `w_obj`, which is upstream's own slip -- it computes
-            // `w_restype` on the line before and then does not use it.
-            if unsafe { is_bool(w_res) } {
-                return Ok(unsafe { w_bool_get_value(w_res) });
-            }
-            // Keep that `format!` off the look-inside graph:
-            // `__majit_stringbuilder_new` is an un-lowered helper, and a red
-            // `__bool__` result would otherwise decline every descent that has
-            // already executed an effect (the `__import__` `sys.modules` read).
-            return Err(bool_must_return_bool(w_res));
         }
-        if let Some(w_descr) = unsafe {
-            lookup_in_type(
-                w_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__len__")),
-            )
-        } {
+        let w_len_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__len__"));
+        if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), w_len_name) } {
             let w_res = unsafe {
                 get_and_call_function0(
                     w_descr,
@@ -2226,11 +2213,14 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
         }
         return Ok(w_obj);
     }
-    let w_await = crate::typedef::r#type(w_obj).and_then(|w_type| unsafe {
-        lookup_in_type(
-            w_type.as_ptr(),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__await__")),
-        )
+    let w_await = crate::typedef::r#type(w_obj).and_then(|w_type| {
+        let mut w_type = w_type.as_ptr();
+        unsafe {
+            pyre_object::with_roots!(w_type => lookup_in_type(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__await__")),
+            ))
+        }
     });
     let Some(w_await) = w_await else {
         let msg = match context {
@@ -2271,11 +2261,13 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
     // iterators expose `__next__` on their type.
     let has_next = unsafe { pyre_object::generator::is_generator(w_res) }
         || crate::typedef::r#type(w_res).is_some_and(|w_type| {
+            let mut w_type = w_type.as_ptr();
+            let mut w_res = w_res;
             unsafe {
-                lookup_in_type(
-                    w_type.as_ptr(),
+                pyre_object::with_roots!(w_res, w_type => lookup_in_type(
+                    w_type,
                     pyre_object::unicodeobject::box_str_constant(Wtf8::new("__next__")),
-                )
+                ))
             }
             .is_some()
         });
@@ -2508,8 +2500,8 @@ pub(crate) fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) ->
     if let Some(w_type_obj) = crate::typedef::r#type(obj) {
         let type_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_type_obj.as_ptr());
-        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
         let w_missing_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__missing__"));
+        let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
         let w_type_obj = pyre_object::gc_roots::shadow_stack_get(type_slot);
         if !dict_type.is_null()
             && !std::ptr::eq(w_type_obj, dict_type)
@@ -2536,7 +2528,7 @@ pub(crate) fn dict_missing_or_key_error(obj: PyObjectRef, index: PyObjectRef) ->
 ///
 /// Dispatches based on the type of `obj`.
 
-pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+pub fn getitem(obj: PyObjectRef, mut index: PyObjectRef) -> PyResult {
     // `pypy/objspace/std/dictproxyobject.py descr_getitem` →
     // `space.getitem(self.w_mapping, w_key)` — forward through the
     // proxy to its wrapped mapping.  The unwrap happens at the
@@ -2544,7 +2536,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     // overrides via the wrapped W_DictObject) see the underlying
     // mapping unchanged.
     unsafe {
-        let obj = if pyre_object::is_dict_proxy(obj) {
+        let mut obj = if pyre_object::is_dict_proxy(obj) {
             pyre_object::w_dict_proxy_get_mapping(obj)
         } else {
             obj
@@ -2558,7 +2550,7 @@ pub fn getitem(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
             || is_str(obj)
             || pyre_object::bytesobject::is_bytes_like(obj)
             || pyre_object::is_w_range(obj))
-            && let Some((method, w_type)) = subclass_special_override(obj, "__getitem__")
+            && let Some((method, w_type)) = pyre_object::with_roots!(obj, index => subclass_special_override(obj, "__getitem__"))
         {
             return get_and_call_function(method, obj, w_type, &[index]);
         }
@@ -2745,10 +2737,10 @@ pub(crate) unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyRes
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index)
-        || lookup_w(
+        || pyre_object::with_roots!(obj, index => lookup_w(
             index,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
         .is_some()
     {
         let indexed = {
@@ -3035,10 +3027,10 @@ pub(crate) unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyRe
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index)
-        || lookup_w(
+        || pyre_object::with_roots!(obj, index => lookup_w(
             index,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
         .is_some()
     {
         let indexed = {
@@ -3142,10 +3134,10 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index)
-        || lookup_w(
+        || pyre_object::with_roots!(obj, index => lookup_w(
             index,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
         .is_some()
     {
         let indexed = {
@@ -3523,20 +3515,20 @@ pub unsafe fn getitem_fast_path(
             || pyre_object::bytesobject::is_bytes_like(w_obj)
             || pyre_object::is_w_range(w_obj)
         {
-            let (method, w_type) = subclass_special_override(w_obj, "__getitem__")?;
+            let mut w_obj = w_obj;
+            let (method, w_type) =
+                pyre_object::with_roots!(w_obj => subclass_special_override(w_obj, "__getitem__"))?;
             (w_type, method)
         } else if is_instance(w_obj) {
-            let w_type = w_instance_get_type(w_obj);
+            let mut w_type = w_instance_get_type(w_obj);
             if w_type.is_null() {
                 return None;
             }
-            (
+            let method = pyre_object::with_roots!(w_type => lookup_in_type_where(
                 w_type,
-                lookup_in_type_where(
-                    w_type,
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-                )?,
-            )
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
+            ))?;
+            (w_type, method)
         } else {
             return None;
         };
@@ -3572,14 +3564,14 @@ pub unsafe fn iter_fast_path(
         if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
             return None;
         }
-        let w_type = w_instance_get_type(w_obj);
+        let mut w_type = w_instance_get_type(w_obj);
         if w_type.is_null() {
             return None;
         }
-        let method = lookup_in_type_where(
+        let method = pyre_object::with_roots!(w_type => lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-        )?;
+        ))?;
         // descroperation.py:339-341 — an explicit `__iter__ = None` marks the
         // type non-iterable even though the lookup succeeds.
         if is_none(method) {
@@ -3614,14 +3606,14 @@ pub unsafe fn next_fast_path(
         if crate::module::r#struct::is_unpack_iter(w_obj) || !is_instance(w_obj) {
             return None;
         }
-        let w_type = w_instance_get_type(w_obj);
+        let mut w_type = w_instance_get_type(w_obj);
         if w_type.is_null() {
             return None;
         }
-        let method = lookup_in_type_where(
+        let method = pyre_object::with_roots!(w_type => lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__next__")),
-        )?;
+        ))?;
         let version_tag = w_type_version_tag(w_type);
         if version_tag == 0 {
             return None;
@@ -4345,24 +4337,24 @@ pub(crate) fn seq_iter_setstate_method(args: &[PyObjectRef]) -> PyResult {
 /// the observable behaviour target is 3.14.
 pub(crate) fn seq_iter_length_hint_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
-        let seq = pyre_object::w_seq_iter_seq(args[0]);
+        let mut seq = pyre_object::w_seq_iter_seq(args[0]);
         // A negative cursor is `bytearray_iterator`'s exhausted sentinel; it
         // keeps its source referenced but reports nothing remaining.
         if seq.is_null() || pyre_object::w_seq_iter_index(args[0]) < 0 {
             return Ok(w_int_new(0));
         }
+        let mut w_iter = args[0];
         if is_instance(seq)
-            && lookup_w(
+            && pyre_object::with_roots!(seq, w_iter => lookup_w(
                 seq,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__len__")),
-            )
+            ))
             .is_none()
         {
             return Ok(pyre_object::special::w_not_implemented());
         }
         // `args` is the gateway's native copy; `len_w` can run `__len__`.
-        let mut w_iter = args[0];
-        let length = pyre_object::with_roots!(w_iter => len_w(seq))?;
+        let length = pyre_object::with_roots!(seq, w_iter => len_w(seq))?;
         let remaining =
             length - pyre_object::seq_index_to_i64(pyre_object::w_seq_iter_index(w_iter));
         Ok(w_int_new(remaining.max(0)))
@@ -5517,7 +5509,7 @@ pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectR
 // return value.  STORE_SUBSCR and the `jit_setitem` residual drop this
 // result, so the void-ness lives at the opcode boundary, not in this
 // method's `PyResult` type.
-pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub fn setitem(mut obj: PyObjectRef, mut index: PyObjectRef, mut value: PyObjectRef) -> PyResult {
     unsafe {
         // `pypy/objspace/std/dictproxyobject.py` exposes neither
         // `__setitem__` nor `__delitem__`, so `space.setitem` on a
@@ -5533,7 +5525,7 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
         // override; exact instances and non-overriding subclasses fall through
         // to the by-layout assignment slot below.
         if (is_list(obj) || pyre_object::bytearrayobject::is_bytearray(obj))
-            && let Some((method, w_type)) = subclass_special_override(obj, "__setitem__")
+            && let Some((method, w_type)) = pyre_object::with_roots!(obj, index, value => subclass_special_override(obj, "__setitem__"))
         {
             return get_and_call_function(method, obj, w_type, &[index, value]);
         }
@@ -5548,9 +5540,9 @@ pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyRe
 /// inherited builtin assignment instead of re-entering override dispatch
 /// (which would recurse).
 pub(crate) fn setitem_slot(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     mut index: PyObjectRef,
-    value: PyObjectRef,
+    mut value: PyObjectRef,
 ) -> PyResult {
     unsafe {
         if is_list(obj) {
@@ -5575,11 +5567,14 @@ pub(crate) fn setitem_slot(
         // containers).  Mirrors the generic `__getitem__` fallback in
         // `getitem_slot`; covers native W_Root types like `memoryview`
         // whose typedef registers `__setitem__`.
+        let w_setitem_name = pyre_object::with_roots!(obj, index, value => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setitem__"))
+        });
         if let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = lookup_in_type_where(
+            && let Some(method) = pyre_object::with_roots!(obj, index, value => lookup_in_type_where(
                 w_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setitem__")),
-            )
+                w_setitem_name,
+            ))
         {
             return get_and_call_function(method, obj, w_type.as_ptr(), &[index, value]);
         }
@@ -5607,10 +5602,10 @@ pub(crate) unsafe fn setitem_list(
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index)
-        || lookup_w(
+        || pyre_object::with_roots!(obj, index, value => lookup_w(
             index,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
         .is_some()
     {
         let indexed = {
@@ -5779,10 +5774,10 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
 /// repr stays concrete in the rtyper.
 unsafe fn subscript_index_w(descr: &str, mut index: PyObjectRef) -> Result<i64, PyError> {
     if !pyre_object::pyobject::is_int_or_long(index)
-        && lookup_w(
+        && pyre_object::with_roots!(index => lookup_w(
             index,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
         .is_none()
     {
         return Err(index_type_error(descr, index));
@@ -5850,7 +5845,7 @@ pub(crate) unsafe fn getindex_w_index(mut index: PyObjectRef) -> Result<i64, PyE
 /// complex.  Looked up on the type, so an instance attribute does not answer.
 /// Deliberately wider than what [`getindex_w_written`] accepts: an
 /// `__int__`-only operand has to enter the numeric branch and fail there.
-pub(crate) unsafe fn number_check(w_obj: PyObjectRef) -> bool {
+pub(crate) unsafe fn number_check(mut w_obj: PyObjectRef) -> bool {
     if w_obj.is_null() {
         return false;
     }
@@ -5858,20 +5853,20 @@ pub(crate) unsafe fn number_check(w_obj: PyObjectRef) -> bool {
         pyre_object::pyobject::is_int_or_long(w_obj)
             || pyre_object::is_float(w_obj)
             || pyre_object::pyobject::is_complex(w_obj)
-            || lookup_w(
+            || pyre_object::with_roots!(w_obj => lookup_w(
                 w_obj,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-            )
+            ))
             .is_some()
-            || lookup_w(
+            || pyre_object::with_roots!(w_obj => lookup_w(
                 w_obj,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__int__")),
-            )
+            ))
             .is_some()
-            || lookup_w(
+            || pyre_object::with_roots!(w_obj => lookup_w(
                 w_obj,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__float__")),
-            )
+            ))
             .is_some()
     }
 }
@@ -5913,10 +5908,10 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index)
-        || lookup_w(
+        || pyre_object::with_roots!(obj, index, value => lookup_w(
             index,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
         .is_some()
     {
         // `STORE_SUBSCR` pops all three operands before dispatching here.
@@ -6032,10 +6027,10 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
     // → the "can assign only ..." hint; any other non-iterable is "cannot convert".
     if is_str(value)
         || pyre_object::pyobject::is_int_or_long(value)
-        || lookup_w(
+        || pyre_object::with_roots!(value => lookup_w(
             value,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
         .is_some()
     {
         return Err(PyError::type_error(
@@ -6051,13 +6046,14 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
     // error raised *by* `__iter__`/`__next__` propagates unchanged.
     let it = match pyre_object::with_roots!(value => crate::baseobjspace::iter(value)) {
         Ok(it) => it,
-        Err(e) => {
-            if lookup_w(
-                value,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-            )
-            .is_none()
-            {
+        Err(mut e) => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let err_slot = e.pin(&roots);
+            let w_iter_name = pyre_object::with_roots!(value => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__"))
+            });
+            e.reload(&roots, err_slot);
+            if pyre_object::with_roots!(value => lookup_w(value, w_iter_name)).is_none() {
                 return Err(PyError::type_error(format!(
                     "cannot convert '{}' object to bytearray",
                     object_functionstr_type_name(value),
@@ -6180,15 +6176,19 @@ unsafe fn setitem_bytearray_slice(
 }
 
 #[inline(never)]
-unsafe fn setitem_instance(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
+unsafe fn setitem_instance(
+    mut obj: PyObjectRef,
+    mut index: PyObjectRef,
+    mut value: PyObjectRef,
+) -> PyResult {
     // descroperation.py `space.get_and_call_function(w_descr, w_obj,
     // w_key, w_value)` — bind the `__setitem__` descriptor to the receiver
     // before calling with `(index, value)`.
-    let w_type = w_instance_get_type(obj);
-    if let Some(method) = lookup_in_type_where(
+    let mut w_type = w_instance_get_type(obj);
+    if let Some(method) = pyre_object::with_roots!(obj, index, value, w_type => lookup_in_type_where(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setitem__")),
-    ) {
+    )) {
         return get_and_call_function(method, obj, w_type, &[index, value]);
     }
     Err(PyError::type_error(format!(
@@ -6543,14 +6543,16 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
 /// rather than a nested CALL whose `symbolic_fnaddr` aborts
 /// `BuiltinLenDescent` with `OrthodoxSubWalkTraceUnsupported`.
 #[inline]
-fn _len(obj: PyObjectRef) -> PyResult {
+fn _len(mut obj: PyObjectRef) -> PyResult {
     // descroperation.py `_len` — a builtin subclass overriding
     // `__len__` dispatches the override (bound via `get_and_call_function`);
     // exact builtins and non-overriding subclasses fall through to the
     // by-layout slot body, which gives the inherited builtin length without
     // re-entering override dispatch.
     unsafe {
-        if let Some((method, w_type)) = subclass_special_override(obj, "__len__") {
+        if let Some((method, w_type)) =
+            pyre_object::with_roots!(obj => subclass_special_override(obj, "__len__"))
+        {
             return get_and_call_function(method, obj, w_type, &[]);
         }
     }
@@ -6579,7 +6581,9 @@ pub unsafe fn len_fast_path(
         if w_obj.is_null() {
             return None;
         }
-        let (method, w_type) = subclass_special_override(w_obj, "__len__")?;
+        let mut w_obj = w_obj;
+        let (method, w_type) =
+            pyre_object::with_roots!(w_obj => subclass_special_override(w_obj, "__len__"))?;
         let version_tag = w_type_version_tag(w_type);
         if version_tag == 0 {
             return None;
@@ -6633,7 +6637,7 @@ pub fn len(obj: PyObjectRef) -> PyResult {
 pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
     // `pypy/objspace/std/dictproxyobject.py descr_len` →
     // `space.len(self.w_mapping)`.
-    let obj = unsafe {
+    let mut obj = unsafe {
         if pyre_object::is_dict_proxy(obj) {
             pyre_object::w_dict_proxy_get_mapping(obj)
         } else {
@@ -6701,11 +6705,14 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         // `len(SomeClass)` with the class's OWN unbound `__len__` bound to the
         // class — `len` of a class is a TypeError unless its METAclass defines
         // the slot, which the lookup above already covers.
+        let w_len_name = pyre_object::with_roots!(obj => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__len__"))
+        });
         if let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = lookup_in_type_where(
+            && let Some(method) = pyre_object::with_roots!(obj => lookup_in_type_where(
                 w_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__len__")),
-            )
+                w_len_name,
+            ))
         {
             return get_and_call_function(method, obj, w_type.as_ptr(), &[]);
         }
@@ -7316,8 +7323,10 @@ pub fn getattr_str_impl(
     // dedicated deref opcodes; a cell that reaches ordinary object-space
     // operations is a user-visible object in its own right.
     //
-    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. Pin into the
-    // caller's `push_roots` (`ShadowStackFrameworkGCTransformer.push_roots`).
+    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. Open the
+    // bracket here: pin_root without push_roots does not cover this body's
+    // collecting intern of dunder names.
+    let _scope = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     // Reload at each use: a live `obj` local across collecting helpers is an
@@ -7340,10 +7349,11 @@ pub fn getattr_str_impl(
         && let Some(obj_type) =
             crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
     {
-        let module_type = crate::typedef::gettypeobject(&pyre_object::MODULE_TYPE);
-        let shadows_with_foreign_instance_dict = unsafe {
+        let mut obj_type = obj_type.as_ptr();
+        let mut module_type = crate::typedef::gettypeobject(&pyre_object::MODULE_TYPE);
+        let shadows_with_foreign_instance_dict = pyre_object::with_roots!(obj_type, module_type => unsafe {
             lookup_where_with_method_cache(
-                obj_type.as_ptr(),
+                obj_type,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__dict__")),
             )
             .is_some_and(|(owner, _)| {
@@ -7354,9 +7364,9 @@ pub fn getattr_str_impl(
                         &pyre_object::pyobject::INSTANCE_TYPE,
                     )
             })
-        };
+        });
         if !module_type.is_null()
-            && unsafe { issubtype_w(obj_type.as_ptr(), module_type) }
+            && unsafe { issubtype_w(obj_type, module_type) }
             && shadows_with_foreign_instance_dict
         {
             let dict = if unsafe { is_module(pyre_object::gc_roots::shadow_stack_get(obj_slot)) } {
@@ -7384,22 +7394,29 @@ pub fn getattr_str_impl(
     if name == "__annotations__"
         && unsafe { pyre_object::is_type(pyre_object::gc_roots::shadow_stack_get(obj_slot)) }
     {
-        let owns_default = unsafe {
-            let metatype =
+        let owns_default = {
+            let mut metatype =
                 crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
                     .map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-            let found = lookup_in_type(
-                metatype,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__annotations__")),
-            );
+            let found = pyre_object::with_roots!(metatype => unsafe {
+                lookup_in_type(
+                    metatype,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__annotations__")),
+                )
+            });
             match found {
                 None => true,
-                Some(descr) => {
-                    let type_obj = crate::typedef::gettypeobject(&pyre_object::pyobject::TYPE_TYPE);
-                    lookup_in_type(
-                        type_obj,
-                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__annotations__")),
-                    )
+                Some(mut descr) => {
+                    let mut type_obj =
+                        crate::typedef::gettypeobject(&pyre_object::pyobject::TYPE_TYPE);
+                    pyre_object::with_roots!(metatype, descr, type_obj => unsafe {
+                        lookup_in_type(
+                            type_obj,
+                            pyre_object::unicodeobject::box_str_constant(Wtf8::new(
+                                "__annotations__",
+                            )),
+                        )
+                    })
                     .is_some_and(|builtin| std::ptr::eq(descr, builtin))
                 }
             }
@@ -7421,14 +7438,16 @@ pub fn getattr_str_impl(
             let w_type = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(obj_slot))
                 .map_or(PY_NULL, |p| p.as_ptr());
             let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
-            let w_type = pyre_object::gc_roots::pin_root(w_type);
+            let mut w_type = pyre_object::gc_roots::pin_root(w_type);
             // module.py Module.descr_getattribute is the default module slot
             // inlined below.  A retagged module may replace that slot (for
             // example importlib.util._LazyModule), in which case space.getattr
             // must dispatch the replacement before touching the module dict.
             // The default result is memoized on the live, possibly retagged
             // type so ordinary modules retain the hot path.
-            if call_getattr && let Some(slot) = module_getattribute_if_not_from_default(w_type) {
+            if call_getattr
+                && let Some(slot) = pyre_object::with_roots!(w_type => module_getattribute_if_not_from_default(w_type))
+            {
                 let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
@@ -7458,7 +7477,10 @@ pub fn getattr_str_impl(
             let w_descr = if w_type.is_null() {
                 None
             } else {
-                lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(w_type_slot), w_name)
+                lookup_in_type_where(
+                    pyre_object::gc_roots::shadow_stack_get(w_type_slot),
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                )
             };
             // The receiver, its type and the descriptor are read back from
             // their slots after each call below: a descriptor `__get__` and
@@ -7473,7 +7495,11 @@ pub fn getattr_str_impl(
             // AttributeError; the bare `object.__getattribute__` slot
             // (`!call_getattr`) still propagates so `module_getattribute`'s own
             // `try`/`except` performs the routing.
-            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+            if has_descr
+                && pyre_object::with_roots!(w_type => {
+                    is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot))
+                })
+            {
                 match get(
                     pyre_object::gc_roots::shadow_stack_get(descr_slot),
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -7595,7 +7621,8 @@ pub fn getattr_str_impl(
             // descroperation.py — `space.getattr(pyre_object::gc_roots::shadow_stack_get(obj_slot), "__getattribute__")`
             // still routes through the type's custom `__getattribute__`, so the
             // slot dispatch runs for every name, including "__getattribute__".
-            if let Some(slot) = getattribute_if_not_from_object(w_type) {
+            let mut w_type = w_type;
+            if let Some(mut slot) = getattribute_if_not_from_object(w_type) {
                 // A builtin owner dispatches its own `__getattribute__`
                 // only after `w_type_set_dispatch_own_getattribute`
                 // (`descriptor.py W_Super.getattribute`,
@@ -7607,12 +7634,12 @@ pub fn getattr_str_impl(
                 // is skipped for it.
                 let owner_dispatches_getattribute =
                     is_instance(pyre_object::gc_roots::shadow_stack_get(obj_slot))
-                        || lookup_where_with_method_cache(
+                        || pyre_object::with_roots!(w_type, slot => lookup_where_with_method_cache(
                             w_type,
                             pyre_object::unicodeobject::box_str_constant(Wtf8::new(
                                 "__getattribute__",
                             )),
-                        )
+                        ))
                         .is_some_and(|(owner, found)| {
                             std::ptr::eq(found, slot)
                                 && (pyre_object::w_type_is_heaptype(owner)
@@ -7647,6 +7674,7 @@ pub fn getattr_str_impl(
                     }
                     return getattr_miss(call_getattr, suppress);
                 }
+                let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
                 let _name_roots = pyre_object::gc_roots::push_roots();
                 let name_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_name);
@@ -7675,10 +7703,11 @@ pub fn getattr_str_impl(
         if is_instance(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
             let w_type = w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
-            let w_type = pyre_object::gc_roots::pin_root(w_type);
+            let mut w_type = pyre_object::gc_roots::pin_root(w_type);
 
             // Step 1: look up in type MRO
-            let w_descr = lookup_in_type_where(w_type, w_name);
+            let w_descr =
+                lookup_in_type_where(w_type, pyre_object::gc_roots::shadow_stack_get(name_slot));
             // A descriptor `__get__` and the dict read below can run Python;
             // the descriptor is read back from its slot after each.
             let has_descr = w_descr.is_some();
@@ -7690,7 +7719,11 @@ pub fn getattr_str_impl(
             // Step 2: data descriptor takes priority over instance dict.
             // objspace.py — a descriptor `__get__` raising
             // AttributeError falls back to `__getattr__`, not propagated.
-            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+            if has_descr
+                && pyre_object::with_roots!(w_type => {
+                    is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot))
+                })
+            {
                 match get(
                     pyre_object::gc_roots::shadow_stack_get(descr_slot),
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -7823,7 +7856,8 @@ pub fn getattr_str_impl(
                 // a metaclass override on the descriptor-call path, but do
                 // not wrap and then unwrap an already validated name merely
                 // to re-enter that same canonical body.
-                if !is_type_getattribute_descr(slot) {
+                let mut slot = slot;
+                if !pyre_object::with_roots!(slot => is_type_getattribute_descr(slot)) {
                     let _name_roots = pyre_object::gc_roots::push_roots();
                     let name_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(name));
@@ -8241,40 +8275,55 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
         if let Some(w_type) = crate::typedef::r#type(obj())
             && let Some(slot) = getattribute_if_not_from_object(w_type.as_ptr())
         {
+            let mut w_type = w_type.as_ptr();
+            let mut slot = slot;
+            let type_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_type);
+            let slot_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(slot);
+            w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+            slot = pyre_object::gc_roots::shadow_stack_get(slot_slot);
             // DescrOperation._handle_getattribute calls the receiver's slot
             // before the default descriptor lookup, irrespective of the
             // attribute name's encoding. Keep getattr_str_impl's existing
             // owner admission: builtin forwarding slots must not recurse
             // through this object-space entry point.
             let owner_dispatches_getattribute = is_instance(obj())
-                || lookup_where_with_method_cache(
-                    w_type.as_ptr(),
+                || pyre_object::with_roots!(w_type, slot => lookup_where_with_method_cache(
+                    w_type,
                     pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-                )
+                ))
                 .is_some_and(|(owner, found)| {
                     std::ptr::eq(found, slot)
                         && (pyre_object::w_type_is_heaptype(owner)
                             || pyre_object::w_type_dispatches_own_getattribute(owner))
                 });
+            w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+            slot = pyre_object::gc_roots::shadow_stack_get(slot_slot);
             if !owner_dispatches_getattribute && pyre_object::descriptor::is_super(obj()) {
                 return match super_getattribute(obj(), w_name()) {
                     Ok(value) => Ok(value),
                     Err(err) if err.kind == PyErrorKind::AttributeError => {
-                        instance_getattr_hook_or_err_wtf8(w_type.as_ptr(), obj(), w_name(), err)
+                        instance_getattr_hook_or_err_wtf8(
+                            pyre_object::gc_roots::shadow_stack_get(type_slot),
+                            obj(),
+                            w_name(),
+                            err,
+                        )
                     }
                     Err(err) => Err(err),
                 };
             }
             if owner_dispatches_getattribute {
-                match get_and_call_function(slot, obj(), w_type.as_ptr(), &[w_name()]) {
+                match get_and_call_function(
+                    pyre_object::gc_roots::shadow_stack_get(slot_slot),
+                    obj(),
+                    pyre_object::gc_roots::shadow_stack_get(type_slot),
+                    &[w_name()],
+                ) {
                     Ok(value) => return Ok(value),
                     Err(err) if err.kind == PyErrorKind::AttributeError => {
-                        return instance_getattr_hook_or_err_wtf8(
-                            w_type.as_ptr(),
-                            obj(),
-                            w_name(),
-                            err,
-                        );
+                        return instance_getattr_hook_or_err_wtf8(w_type, obj(), w_name(), err);
                     }
                     Err(err) => return Err(err),
                 }
@@ -8338,13 +8387,14 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
                 // hook through `__get__` before calling it, so a
                 // staticmethod / classmethod / custom-descriptor `__getattr__`
                 // is handled.  The hook's result or its own exception is final.
+                let err_slot = e.pin(&_roots);
+                let w_getattr_name =
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__"));
+                e.reload(&_roots, err_slot);
                 let w_objtype =
                     crate::typedef::r#type(obj()).map_or(std::ptr::null_mut(), |p| p.as_ptr());
                 if !w_objtype.is_null()
-                    && let Some(getattr_fn) = lookup_in_type_where(
-                        w_objtype,
-                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
-                    )
+                    && let Some(getattr_fn) = lookup_in_type_where(w_objtype, w_getattr_name)
                 {
                     return get_and_call_function(getattr_fn, obj(), w_objtype, &[w_name()]);
                 }
@@ -8368,13 +8418,15 @@ unsafe fn instance_getattr_hook_or_err_wtf8(
     w_type: PyObjectRef,
     obj: PyObjectRef,
     w_name: PyObjectRef,
-    err: PyError,
+    mut err: PyError,
 ) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[w_type, obj, w_name]);
+    let err_slot = err.pin(&roots);
+    let w_getattr_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__"));
     if let Some(hook) = lookup_in_type_where(
         pyre_object::gc_roots::shadow_stack_get(base),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
+        w_getattr_name,
     ) {
         return get_and_call_function(
             hook,
@@ -8383,6 +8435,7 @@ unsafe fn instance_getattr_hook_or_err_wtf8(
             &[pyre_object::gc_roots::shadow_stack_get(base + 2)],
         );
     }
+    err.reload(&roots, err_slot);
     Err(err)
 }
 
@@ -8427,8 +8480,10 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             let descr_roots = pyre_object::gc_roots::push_roots();
             let descr_slot = descr_roots.pin_roots(&[w_descr_obj]);
             if has_w_descr
-                && is_data_descr(descr_roots.get(descr_slot))
-                && let Some(result) = pyre_object::with_roots!(metatype, obj => get(
+                && pyre_object::with_roots!(metatype, obj, w_name => {
+                    is_data_descr(descr_roots.get(descr_slot))
+                })
+                && let Some(result) = pyre_object::with_roots!(metatype, obj, w_name => get(
                     descr_roots.get(descr_slot),
                     obj,
                     metatype,
@@ -8478,7 +8533,9 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         let descr_roots = pyre_object::gc_roots::push_roots();
         let descr_slot = descr_roots.pin_roots(&[w_descr_obj]);
         if has_w_descr
-            && is_data_descr(descr_roots.get(descr_slot))
+            && pyre_object::with_roots!(obj, w_name, w_type => {
+                is_data_descr(descr_roots.get(descr_slot))
+            })
             && let Some(result) = pyre_object::with_roots!(obj, w_name, w_type => get(
                 descr_roots.get(descr_slot),
                 obj,
@@ -8535,15 +8592,17 @@ unsafe fn setattr_surrogate(
     name: &Wtf8,
     mut value: PyObjectRef,
 ) -> PyResult {
-    let obj = pyre_object::with_roots!(value, w_name => crate::module::_weakref::interp__weakref::force(obj))?;
+    let mut obj = pyre_object::with_roots!(value, w_name => crate::module::_weakref::interp__weakref::force(obj))?;
     unsafe {
-        let w_type = if is_instance(obj) {
+        let mut w_type = if is_instance(obj) {
             w_instance_get_type(obj)
         } else {
             crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr())
         };
         if !w_type.is_null()
-            && let Some(sa) = setattr_if_not_from_object(w_type)
+            && let Some(sa) = pyre_object::with_roots!(obj, w_name, value, w_type => {
+                setattr_if_not_from_object(w_type)
+            })
         {
             return get_and_call_function(sa, obj, w_type, &[w_name, value]).map(|_| w_none());
         }
@@ -8584,7 +8643,7 @@ pub unsafe fn object_setattr_surrogate(
             // descroperation.py:124-126 — `__delete__` but no `__set__`
             // is a read-only data descriptor; reject rather than shadow
             // it with the namespace store.
-            if descr_has_delete(descr) {
+            if pyre_object::with_roots!(descr, obj, value, w_name => descr_has_delete(descr)) {
                 return Err(descr_not_settable_error(descr));
             }
         }
@@ -8630,27 +8689,31 @@ pub unsafe fn object_setattr_surrogate(
 
 /// `space.delattr` for a lone-surrogate name — mirrors `delattr_str`.
 unsafe fn delattr_surrogate(obj: PyObjectRef, mut w_name: PyObjectRef, name: &Wtf8) -> PyResult {
-    let obj =
+    let mut obj =
         pyre_object::with_roots!(w_name => crate::module::_weakref::interp__weakref::force(obj))?;
     unsafe {
-        let w_type = if is_instance(obj) {
+        let mut w_type = if is_instance(obj) {
             w_instance_get_type(obj)
         } else {
             crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr())
         };
-        if !w_type.is_null()
-            && let Some(da) = lookup_in_type(
+        if !w_type.is_null() {
+            let w_delattr_name = pyre_object::with_roots!(obj, w_name, w_type => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__"))
+            });
+            if let Some(mut da) = pyre_object::with_roots!(obj, w_name, w_type => lookup_in_type(
                 w_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-            )
-        {
-            let is_default = lookup_in_type(
-                crate::typedef::w_object(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-            )
-            .is_some_and(|d| std::ptr::eq(da, d));
-            if !is_default {
-                return get_and_call_function(da, obj, w_type, &[w_name]).map(|_| w_none());
+                w_delattr_name,
+            )) {
+                let is_default =
+                    pyre_object::with_roots!(obj, w_name, w_type, da => lookup_in_type(
+                        crate::typedef::w_object(),
+                        w_delattr_name,
+                    ))
+                    .is_some_and(|d| std::ptr::eq(da, d));
+                if !is_default {
+                    return get_and_call_function(da, obj, w_type, &[w_name]).map(|_| w_none());
+                }
             }
         }
     }
@@ -8678,9 +8741,9 @@ pub(crate) unsafe fn object_delattr_surrogate(
             crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr())
         };
         if !w_type.is_null()
-            && let Some(descr) =
+            && let Some(mut descr) =
                 lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v))
-            && is_data_descr(descr)
+            && pyre_object::with_roots!(descr, obj, w_name => is_data_descr(descr))
         {
             delete(descr, obj)?;
             return Ok(w_none());
@@ -8803,7 +8866,9 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
             } else {
                 crate::typedef::r#type(obj).map_or(PY_NULL, |p| p.as_ptr())
             };
-            let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+            let w_name = pyre_object::with_roots!(obj, w_type => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+            });
             let w_descr = lookup_in_type_where(w_type, w_name);
             let has_w_descr = w_descr.is_some();
             let w_descr_obj = w_descr.unwrap_or(PY_NULL);
@@ -9998,8 +10063,8 @@ pub(crate) fn object_getattr_miss_str(
 /// function; those callers take `getattr_surrogate`.
 #[majit_macros::dont_look_inside]
 pub(crate) fn object_getattr_miss(
-    obj: PyObjectRef,
-    w_name: PyObjectRef,
+    mut obj: PyObjectRef,
+    mut w_name: PyObjectRef,
     call_getattr: bool,
     suppress: bool,
 ) -> PyResult {
@@ -10013,12 +10078,13 @@ pub(crate) fn object_getattr_miss(
     let _ = pyre_object::gc_roots::pin_root(obj);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_name);
+    w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
     let name: &str = unsafe {
         pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(pyre_object::w_str_get_wtf8(
             pyre_object::gc_roots::shadow_stack_get(name_slot),
         ))
     };
-    let mut obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if name == "__dict__" && unsafe { is_module(obj) } {
         let dict = unsafe { pyre_object::w_module_get_w_dict(obj) };
         if !dict.is_null() {
@@ -10089,10 +10155,13 @@ pub(crate) fn object_getattr_miss(
                     if !is_type(w_metaclass) {
                         continue;
                     }
-                    if let Some((owner, descr)) = lookup_where_with_method_cache(
-                        w_metaclass,
-                        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-                    ) {
+                    let mut w_metaclass = w_metaclass;
+                    let w_attr_name = pyre_object::with_roots!(w_metaclass, obj, w_name => {
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+                    });
+                    if let Some((owner, mut descr)) =
+                        lookup_where_with_method_cache(w_metaclass, w_attr_name)
+                    {
                         // A `__dict__` descriptor is a genuine metatype override
                         // only when its owner is a proper metaclass (a subclass
                         // of `type`).  A plain base mixed into the metaclass MRO
@@ -10103,9 +10172,13 @@ pub(crate) fn object_getattr_miss(
                         let w_type_type = pyre_object::gc_roots::shadow_stack_get(w_type_type_slot);
                         if !std::ptr::eq(owner, w_type_type)
                             && issubtype_w(owner, w_type_type)
-                            && is_data_descr(descr)
+                            && pyre_object::with_roots!(descr, w_metaclass, obj, w_name => {
+                                is_data_descr(descr)
+                            })
                         {
-                            match get(descr, obj, w_metaclass) {
+                            match pyre_object::with_roots!(descr, w_metaclass, obj, w_name => {
+                                get(descr, obj, w_metaclass)
+                            }) {
                                 Ok(Some(result)) => return Ok(result),
                                 Ok(None) => {}
                                 Err(e) => {
@@ -10150,24 +10223,30 @@ pub(crate) fn object_getattr_miss(
                     }
                 };
                 mc_i2 += 1;
-                if is_type(w_metaclass)
-                    && let Some(descr) = lookup_in_type_where(
-                        w_metaclass,
-                        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-                    )
-                    && is_data_descr(descr)
-                {
-                    match get(descr, obj, w_metaclass) {
-                        Ok(Some(result)) => return Ok(result),
-                        Ok(None) => {}
-                        Err(e) => {
-                            return type_getattr_hook_or_err(
-                                obj,
-                                &w_metaclasses,
-                                name,
-                                e,
-                                call_getattr,
-                            );
+                let mut w_metaclass = w_metaclass;
+                if is_type(w_metaclass) {
+                    let w_attr_name = pyre_object::with_roots!(w_metaclass, obj, w_name => {
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+                    });
+                    if let Some(mut descr) = lookup_in_type_where(w_metaclass, w_attr_name)
+                        && pyre_object::with_roots!(descr, w_metaclass, obj, w_name => {
+                            is_data_descr(descr)
+                        })
+                    {
+                        match pyre_object::with_roots!(descr, w_metaclass, obj, w_name => {
+                            get(descr, obj, w_metaclass)
+                        }) {
+                            Ok(Some(result)) => return Ok(result),
+                            Ok(None) => {}
+                            Err(e) => {
+                                return type_getattr_hook_or_err(
+                                    obj,
+                                    &w_metaclasses,
+                                    name,
+                                    e,
+                                    call_getattr,
+                                );
+                            }
                         }
                     }
                 }
@@ -10314,13 +10393,14 @@ pub(crate) fn object_getattr_miss(
             // descriptor sees `obj is None`).  A null internal receiver keeps
             // this distinct from looking up a descriptor on the actual None
             // singleton; `get` materialises `w_None` for custom `__get__`.
-            if let Some(value) = lookup_in_type_where(
-                obj,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-            ) {
+            if let Some(value) = pyre_object::with_roots!(obj, w_name => {
+                let w_attr_name =
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+                lookup_in_type_where(obj, w_attr_name)
+            }) {
                 let value_slot = pyre_object::gc_roots::shadow_stack_len();
                 let value = pyre_object::gc_roots::pin_root(value);
-                match get(value, PY_NULL, obj) {
+                match pyre_object::with_roots!(obj, w_name => get(value, PY_NULL, obj)) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => return Ok(pyre_object::gc_roots::shadow_stack_get(value_slot)),
                     Err(e) => {
@@ -10346,15 +10426,18 @@ pub(crate) fn object_getattr_miss(
                     }
                 };
                 mc_i3 += 1;
+                let mut w_metaclass = w_metaclass;
                 if is_type(w_metaclass)
-                    && let Some(value) = lookup_in_type_where(
-                        w_metaclass,
-                        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-                    )
+                    && let Some(value) = pyre_object::with_roots!(w_metaclass, obj, w_name => {
+                        let w_attr_name =
+                            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+                        lookup_in_type_where(w_metaclass, w_attr_name)
+                    })
                 {
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
                     let value = pyre_object::gc_roots::pin_root(value);
-                    match get(value, obj, w_metaclass) {
+                    match pyre_object::with_roots!(obj, w_name, w_metaclass => get(value, obj, w_metaclass))
+                    {
                         Ok(Some(result)) => return Ok(result),
                         Ok(None) => return Ok(pyre_object::gc_roots::shadow_stack_get(value_slot)),
                         Err(e) => {
@@ -10375,7 +10458,9 @@ pub(crate) fn object_getattr_miss(
             // raise. The terminal AttributeError carries the obj/name context.
             // `_PyObject_LookupAttr` (`suppress`): the hook still runs; the
             // absent result is `Ok(null)` so the AttributeError is not built.
-            if call_getattr && let Some(result) = try_type_getattr_hook(obj, &w_metaclasses, name) {
+            if call_getattr
+                && let Some(result) = pyre_object::with_roots!(obj, w_name => try_type_getattr_hook(obj, &w_metaclasses, name))
+            {
                 return result;
             }
             if suppress {
@@ -10428,10 +10513,11 @@ pub(crate) fn object_getattr_miss(
         if is_property(obj)
             && let Some(w_type) = crate::typedef::r#type(obj)
         {
-            let w_descr = lookup_in_type_where(
-                w_type.as_ptr(),
+            let mut w_type = w_type.as_ptr();
+            let w_descr = pyre_object::with_roots!(w_type => lookup_in_type_where(
+                w_type,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-            );
+            ));
             // `get` and `getdictvalue` can run Python; the descriptor is read
             // back from its slot after each.
             let has_descr = w_descr.is_some();
@@ -10439,25 +10525,31 @@ pub(crate) fn object_getattr_miss(
             if let Some(descr) = w_descr {
                 let _ = pyre_object::gc_roots::pin_root(descr);
             }
-            if has_descr && is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
-                match get(
+            if has_descr
+                && pyre_object::with_roots!(w_type, obj, w_name => {
+                    is_data_descr(pyre_object::gc_roots::shadow_stack_get(descr_slot))
+                })
+            {
+                match pyre_object::with_roots!(w_type, obj, w_name => get(
                     pyre_object::gc_roots::shadow_stack_get(descr_slot),
                     obj,
-                    w_type.as_ptr(),
-                ) {
+                    w_type,
+                )) {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
-                        return instance_getattr_hook_or_err(w_type.as_ptr(), obj, name, e);
+                        return instance_getattr_hook_or_err(w_type, obj, name, e);
                     }
                     Err(e) => return Err(e),
                 }
             }
-            if let Some(value) = getdictvalue(obj, name)? {
+            if let Some(value) =
+                pyre_object::with_roots!(obj, w_name, w_type => getdictvalue(obj, name))?
+            {
                 return Ok(value);
             }
             if has_descr {
-                let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
+                let mut descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
                 // A plain Python function is the one callable `get` leaves
                 // unhandled; bind it here.  A builtin-code carrier is not:
                 // a `method_descriptor` binds to a
@@ -10469,13 +10561,14 @@ pub(crate) fn object_getattr_miss(
                         crate::function_get_code(descr) as pyre_object::PyObjectRef
                     )
                 {
-                    return Ok(pyre_object::w_method_new(descr, obj, w_type.as_ptr()));
+                    return Ok(pyre_object::w_method_new(descr, obj, w_type));
                 }
-                match get(descr, obj, w_type.as_ptr()) {
+                match pyre_object::with_roots!(descr, obj, w_name, w_type => get(descr, obj, w_type))
+                {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == PyErrorKind::AttributeError => {
-                        return instance_getattr_hook_or_err(w_type.as_ptr(), obj, name, e);
+                        return instance_getattr_hook_or_err(w_type, obj, name, e);
                     }
                     Err(e) => return Err(e),
                 }
@@ -10498,11 +10591,13 @@ pub(crate) fn object_getattr_miss(
         // non-data descriptor / class var. Exact builtins carry no instance
         // dict (`hasdict` false) and take the direct class-attr fast path.
         if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
+            let mut w_type = w_type.as_ptr();
             let w_descr = unsafe {
-                lookup_in_type_where(
-                    w_type.as_ptr(),
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-                )
+                pyre_object::with_roots!(w_type, obj, w_name => {
+                    let w_attr_name =
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+                    lookup_in_type_where(w_type, w_attr_name)
+                })
             };
             // `get` and `getdictvalue` can run Python; the descriptor is read
             // back from its slot after each.
@@ -10512,33 +10607,39 @@ pub(crate) fn object_getattr_miss(
                 let _ = pyre_object::gc_roots::pin_root(descr);
             }
             if has_descr
-                && unsafe { is_data_descr(pyre_object::gc_roots::shadow_stack_get(method_slot)) }
+                && pyre_object::with_roots!(w_type, obj, w_name => unsafe {
+                    is_data_descr(pyre_object::gc_roots::shadow_stack_get(method_slot))
+                })
             {
                 let descr = pyre_object::gc_roots::shadow_stack_get(method_slot);
-                match unsafe { get(descr, obj, w_type.as_ptr()) } {
+                match unsafe {
+                    pyre_object::with_roots!(w_type, obj, w_name => get(descr, obj, w_type))
+                } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-                        return unsafe {
-                            instance_getattr_hook_or_err(w_type.as_ptr(), obj, name, e)
-                        };
+                        return unsafe { instance_getattr_hook_or_err(w_type, obj, name, e) };
                     }
                     Err(e) => return Err(e),
                 }
             }
-            if let Some(value) = getdictvalue(obj, name)? {
+            if let Some(value) =
+                pyre_object::with_roots!(obj, w_name, w_type => getdictvalue(obj, name))?
+            {
                 return Ok(value);
             }
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             if has_descr {
-                let method = pyre_object::gc_roots::shadow_stack_get(method_slot);
-                match unsafe { get(method, obj, w_type.as_ptr()) } {
+                let mut method = pyre_object::gc_roots::shadow_stack_get(method_slot);
+                match unsafe {
+                    pyre_object::with_roots!(w_type, obj, w_name, method => get(method, obj, w_type))
+                } {
                     Ok(Some(result)) => return Ok(result),
                     Ok(None) => {}
                     Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                         return unsafe {
                             instance_getattr_hook_or_err(
-                                w_type.as_ptr(),
+                                w_type,
                                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
                                 name,
                                 e,
@@ -10559,7 +10660,7 @@ pub(crate) fn object_getattr_miss(
                             crate::function_get_code(method) as pyre_object::PyObjectRef
                         )
                 } {
-                    return Ok(pyre_object::w_method_new(method, obj, w_type.as_ptr()));
+                    return Ok(pyre_object::w_method_new(method, obj, w_type));
                 }
                 return Ok(method);
             }
@@ -10567,11 +10668,15 @@ pub(crate) fn object_getattr_miss(
             // matched.  Fall through to the shared resolvers below (exception
             // typed slots, function/code attributes, the generic type-dict
             // path) — the terminal `__getattr__` hook runs at the final miss.
-        } else if let Some(method) = unsafe {
-            lookup_in_type_where(
-                w_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-            )
+        } else if let Some(method) = {
+            let mut w_type = w_type.as_ptr();
+            unsafe {
+                pyre_object::with_roots!(w_type, obj, w_name => {
+                    let w_attr_name =
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+                    lookup_in_type_where(w_type, w_attr_name)
+                })
+            }
         } {
             // Same split as the type-dict arm above: only a plain Python
             // function binds here, every builtin-code carrier goes to `get`.
@@ -10584,8 +10689,10 @@ pub(crate) fn object_getattr_miss(
                 return Ok(pyre_object::w_method_new(method, obj, w_type.as_ptr()));
             }
             let method_slot = pyre_object::gc_roots::shadow_stack_len();
-            let method = pyre_object::gc_roots::pin_root(method);
-            match unsafe { get(method, obj, w_type.as_ptr()) } {
+            let mut method = pyre_object::gc_roots::pin_root(method);
+            match unsafe {
+                pyre_object::with_roots!(method, obj, w_name => get(method, obj, w_type.as_ptr()))
+            } {
                 Ok(Some(result)) => return Ok(result),
                 Ok(None) => {}
                 // `_handle_getattribute` runs the hook for an AttributeError
@@ -10860,7 +10967,7 @@ pub(crate) fn object_getattr_miss(
     // A tagged immediate has no `w_class` slot to deref; its class is the
     // `int` type object (via the tag-safe `typedef::r#type`). Gated on
     // `CAN_BE_TAGGED` (default false).
-    let w_class =
+    let mut w_class =
         if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
             crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr())
         } else {
@@ -10868,12 +10975,12 @@ pub(crate) fn object_getattr_miss(
         };
     if !w_class.is_null()
         && unsafe { is_type(w_class) }
-        && let Some(method) = unsafe {
+        && let Some(method) = pyre_object::with_roots!(w_class => unsafe {
             lookup_in_type_where(
                 w_class,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
             )
-        }
+        })
     {
         if unsafe {
             crate::is_function(method)
@@ -10933,22 +11040,22 @@ pub(crate) fn object_getattr_miss(
 /// Note: `__trunc__` is NOT consulted here. `__trunc__` belongs to the
 /// `int(...)` builtin path (`intobject.py _new_baseint`), not to
 /// `space.int()` / `space.int_w()`.
-pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn space_int(mut obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     // baseobjspace.py `w_impl = space.lookup(self, '__int__')`
     let w_impl = unsafe {
-        lookup_w(
-            obj,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__int__")),
-        )
+        pyre_object::with_roots!(obj => {
+            let w_int_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__int__"));
+            lookup_w(obj, w_int_name)
+        })
     }
     // baseobjspace.py `w_impl = space.lookup(self, '__index__')`
     .or_else(|| unsafe {
-        lookup_w(
-            obj,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        pyre_object::with_roots!(obj => {
+            let w_index_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__"));
+            lookup_w(obj, w_index_name)
+        })
     });
-    let Some(method) = w_impl else {
+    let Some(mut method) = w_impl else {
         // baseobjspace.py `self._typed_unwrap_error(space, "integer")`,
         // whose body (:316-318) is `"expected %s, got %T object"`.
         return Err(PyError::type_error(format!(
@@ -10957,10 +11064,12 @@ pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         )));
     };
     // baseobjspace.py `w_result = space.get_and_call_function(w_impl, self)`
-    let w_type = crate::typedef::r#type(obj)
+    let mut w_type = crate::typedef::r#type(obj)
         .map(|w_type| w_type.as_ptr())
         .unwrap_or(obj);
-    let mut w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
+    let mut w_result = unsafe {
+        pyre_object::with_roots!(obj, method, w_type => get_and_call_function(method, obj, w_type, &[]))
+    }?;
     // baseobjspace.py — an exact int returns directly.
     let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
@@ -11655,11 +11764,11 @@ pub unsafe fn lookup_w(obj: PyObjectRef, w_name: PyObjectRef) -> Option<PyObject
 /// portal residual. Traced callers intern the name in their own graph and
 /// enter through [`lookup_w`].
 #[majit_macros::dont_look_inside]
-pub unsafe fn lookup(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    lookup_w(
+pub unsafe fn lookup(mut obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    pyre_object::with_roots!(obj => lookup_w(
         obj,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    )
+    ))
 }
 
 /// `_PyObject_LookupSpecial(obj, name)` — resolve a special method on the
@@ -11674,13 +11783,13 @@ pub unsafe fn lookup(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
 /// invariant required by the object and pointer arguments for the entire call.
 #[majit_macros::dont_look_inside]
 pub unsafe fn lookup_special(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     name: &str,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
-    let Some(mut descr) = lookup_w(
+    let Some(mut descr) = pyre_object::with_roots!(obj => lookup_w(
         obj,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    ) else {
+    )) else {
         return Ok(None);
     };
     let Some(w_type) = crate::typedef::r#type(obj) else {
@@ -11710,11 +11819,11 @@ pub unsafe fn lookup_in_type(w_type: PyObjectRef, w_name: PyObjectRef) -> Option
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn type_lookup_is_data_descr(w_type: PyObjectRef, name: &str) -> bool {
-    match lookup_in_type(
+pub unsafe fn type_lookup_is_data_descr(mut w_type: PyObjectRef, name: &str) -> bool {
+    match pyre_object::with_roots!(w_type => lookup_in_type(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    ) {
+    )) {
         Some(descr) => is_data_descr(descr),
         None => false,
     }
@@ -13073,24 +13182,28 @@ pub unsafe fn type_attr_cell_fast_path(
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
-    let w_type = w_obj;
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    if !metaclass_keeps_type_getattribute(w_obj) {
+    let mut w_type = w_obj;
+    let mut metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    if !pyre_object::with_roots!(w_type, metatype => metaclass_keeps_type_getattribute(w_type)) {
         return None;
     }
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
     if version_tag == 0 {
         return None;
     }
-    let w_name = pyre_object::unicodeobject::box_str_constant(name);
-    if lookup_in_type_where_wtf8(metatype, w_name).is_some_and(|descr| is_data_descr(descr)) {
+    let mut w_name = pyre_object::with_roots!(w_type, metatype => {
+        pyre_object::unicodeobject::box_str_constant(name)
+    });
+    if pyre_object::with_roots!(w_type, metatype, w_name => {
+        lookup_in_type_where_wtf8(metatype, w_name).is_some_and(|descr| is_data_descr(descr))
+    }) {
         return None;
     }
-    let stored = type_attr_stored(w_type, name)?;
+    let mut stored = type_attr_stored(w_type, name)?;
     if !pyre_object::celldict::is_mutable_cell(stored) {
         return None;
     }
-    let unwrapped = pyre_object::celldict::unwrap_cell(stored);
+    let mut unwrapped = pyre_object::celldict::unwrap_cell(stored);
     if unwrapped.is_null() {
         return None;
     }
@@ -13098,11 +13211,11 @@ pub unsafe fn type_attr_cell_fast_path(
     // unbound value `get` returns unchanged.  A heap type may later grow
     // `__get__`; `walker_fold_type_attr_cell` pins that type's version tag,
     // so the absence checked here is the compiled answer.
-    let value_type = crate::typedef::r#type(unwrapped)?.as_ptr();
-    if lookup_in_type(
+    let mut value_type = crate::typedef::r#type(unwrapped)?.as_ptr();
+    if pyre_object::with_roots!(w_type, unwrapped, stored, value_type => lookup_in_type(
         value_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
-    )
+    ))
     .is_some()
         || pyre_object::is_exact_type(unwrapped, &pyre_object::function::STATICMETHOD_TYPE)
         || std::ptr::eq((*unwrapped).ob_type, &crate::FUNCTION_TYPE as *const _)
@@ -13123,15 +13236,17 @@ pub unsafe fn type_attr_cell_fast_path(
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub unsafe fn load_method_cell_fast_path(
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, PyObjectRef)> {
     if w_obj.is_null() {
         return None;
     }
-    let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
+    let mut w_type = crate::typedef::r#type(w_obj)?.as_ptr();
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
-    if version_tag == 0 || !has_object_getattribute(w_type) {
+    if version_tag == 0
+        || !pyre_object::with_roots!(w_obj, w_type => has_object_getattribute(w_type))
+    {
         return None;
     }
     let stored = type_attr_stored(w_type, Wtf8::new(name))?;
@@ -13216,7 +13331,7 @@ pub unsafe fn type_owner_is_in_dict(w_type: PyObjectRef) -> bool {
 ///
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
-pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> Wtf8Buf {
+pub unsafe fn getfulltypename_of_type(mut w_type: PyObjectRef) -> Wtf8Buf {
     if !unsafe { type_owner_is_in_dict(w_type) } {
         let mut out = Wtf8Buf::new();
         out.push_str(w_type_get_name(w_type));
@@ -13227,10 +13342,10 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> Wtf8Buf {
     // non-string `__module__` is ignored (`utf8_w` raises `TypeError`).
     // A string module is `W_UnicodeObject.text_w`: the raw buffer, so a
     // lone surrogate stays in the rendered name.
-    match lookup_in_type(
+    match pyre_object::with_roots!(w_type => lookup_in_type(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__module__")),
-    ) {
+    )) {
         Some(m) if is_str(m) => {
             let mut out = Wtf8Buf::new();
             out.push_wtf8(unsafe { w_str_get_wtf8(m) });
@@ -13253,7 +13368,7 @@ pub unsafe fn getfulltypename_of_type(w_type: PyObjectRef) -> Wtf8Buf {
 ///
 /// # Safety
 /// `w_type` must be a valid `W_TypeObject`.
-pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
+pub unsafe fn type_repr_qualified_name(mut w_type: PyObjectRef) -> Wtf8Buf {
     let name = w_type_get_name(w_type);
     if !unsafe { type_owner_is_in_dict(w_type) } {
         let mut out = Wtf8Buf::new();
@@ -13262,10 +13377,10 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
     }
     // `descr_repr` reads the module string. A lone surrogate has a WTF-8
     // spelling (`text_w`) and is part of `<class '…'>`.
-    let module = lookup_in_type_where(
+    let module = pyre_object::with_roots!(w_type => lookup_in_type_where(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__module__")),
-    )
+    ))
     .filter(|m| is_str(*m));
     match module {
         Some(m) => {
@@ -13296,12 +13411,21 @@ pub unsafe fn type_repr_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
 /// bypassing the instance dict and any `__getattribute__` override, so a pure
 /// `lookup_in_type` followed by the descriptor's `__get__` keeps both engines
 /// calling the same method even when the receiver overrides `__getattribute__`.
-pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
-    let w_type = crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
+pub fn load_special_resolve(
+    mut obj: PyObjectRef,
+    name: &str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut w_type =
+        crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
     let mut descr = if w_type.is_null() {
         None
     } else {
-        unsafe { lookup_in_type(w_type, pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))) }
+        unsafe {
+            pyre_object::with_roots!(obj, w_type => {
+                let w_attr_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+                lookup_in_type(w_type, w_attr_name)
+            })
+        }
     }
     .ok_or_else(|| {
         // PyPy `pyopcode.py BEFORE_WITH` / `BEFORE_ASYNC_WITH` converts a
@@ -13317,14 +13441,41 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
         };
         let suggestion = if !w_type.is_null()
             && name == "__exit__"
-            && unsafe { lookup_in_type(w_type, pyre_object::unicodeobject::box_str_constant(Wtf8::new("__aenter__"))) }.is_some()
-            && unsafe { lookup_in_type(w_type, pyre_object::unicodeobject::box_str_constant(Wtf8::new("__aexit__"))) }.is_some()
+            && unsafe {
+                pyre_object::with_roots!(obj, w_type => {
+                    let w_aenter =
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__aenter__"));
+                    lookup_in_type(w_type, w_aenter)
+                })
+            }
+            .is_some()
+            && unsafe {
+                pyre_object::with_roots!(obj, w_type => {
+                    let w_aexit =
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__aexit__"));
+                    lookup_in_type(w_type, w_aexit)
+                })
+            }
+            .is_some()
         {
             " but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?"
         } else if !w_type.is_null()
             && name == "__aexit__"
-            && unsafe { lookup_in_type(w_type, pyre_object::unicodeobject::box_str_constant(Wtf8::new("__enter__"))) }.is_some()
-            && unsafe { lookup_in_type(w_type, pyre_object::unicodeobject::box_str_constant(Wtf8::new("__exit__"))) }.is_some()
+            && unsafe {
+                pyre_object::with_roots!(obj, w_type => {
+                    let w_enter =
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__enter__"));
+                    lookup_in_type(w_type, w_enter)
+                })
+            }
+            .is_some()
+            && unsafe {
+                pyre_object::with_roots!(obj, w_type => {
+                    let w_exit = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__exit__"));
+                    lookup_in_type(w_type, w_exit)
+                })
+            }
+            .is_some()
         {
             " but it supports the context manager protocol. Did you mean to use 'with'?"
         } else {
@@ -13335,8 +13486,8 @@ pub fn load_special_resolve(obj: PyObjectRef, name: &str) -> Result<PyObjectRef,
             object_functionstr_type_name(obj),
         ))
     })?;
-    let bound =
-        unsafe { pyre_object::with_roots!(descr => get(descr, obj, w_type)) }?.unwrap_or(descr);
+    let bound = unsafe { pyre_object::with_roots!(descr, obj, w_type => get(descr, obj, w_type)) }?
+        .unwrap_or(descr);
     Ok(bound)
 }
 
@@ -13380,11 +13531,12 @@ pub unsafe fn load_special_fast_path(
     }
     // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
     // cell is stable under the tag; the caller getfields `w_value` and guards it.
+    let mut w_type = w_type;
+    let w_attr_name = pyre_object::with_roots!(w_type => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+    });
     let cell = type_attr_object_cell(w_type, Wtf8::new(name));
-    let w_descr = lookup_in_type(
-        w_type,
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    )?;
+    let w_descr = pyre_object::with_roots!(w_type => lookup_in_type(w_type, w_attr_name))?;
     if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
         return None;
     }
@@ -13462,14 +13614,14 @@ pub unsafe fn type_fully_qualified_name(w_type: PyObjectRef) -> Wtf8Buf {
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub unsafe fn load_method_fast_path(
-    w_obj: PyObjectRef,
-    w_name: PyObjectRef,
+    mut w_obj: PyObjectRef,
+    mut w_name: PyObjectRef,
 ) -> Option<(PyObjectRef, u64, PyObjectRef)> {
     if w_obj.is_null() || w_name.is_null() {
         return None;
     }
     // callmethod.py `w_type = space.type(w_obj)`.
-    let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
+    let mut w_type = crate::typedef::r#type(w_obj)?.as_ptr();
     // typeobject.py `version_tag = self.version_tag()`; `None`
     // (uncacheable) is `0` here.
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -13481,7 +13633,7 @@ pub unsafe fn load_method_fast_path(
     // computing form looks `__getattribute__` up and memoizes the default
     // in `uses_object_getattribute`, so the first access takes the fast
     // path too (not only after the interpreter `getattr` primed the flag).
-    if !has_object_getattribute(w_type) {
+    if !pyre_object::with_roots!(w_obj, w_name, w_type => has_object_getattribute(w_type)) {
         return None;
     }
     // A cell's payload moves without `_version_tag`.  The cell fold reads
@@ -13541,14 +13693,14 @@ pub unsafe fn classmethod_on_type_fast_path(
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
-    let w_type = w_obj;
+    let mut w_type = w_obj;
     // `is_type` answers for the object's physical layout — every type object
     // carries the same `ob_type` — so it says nothing about the metaclass.
     // `getclass()` (baseobjspace.py) reads the metaclass off `w_class`; only
     // `type` itself resolves the name through `type.__getattribute__`, so any
     // other metaclass declines rather than have its `__getattribute__`
     // override bypassed.
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    let mut metatype = crate::typedef::r#type(w_obj)?.as_ptr();
     if !std::ptr::eq(metatype, crate::typedef::w_type()) {
         return None;
     }
@@ -13557,7 +13709,7 @@ pub unsafe fn classmethod_on_type_fast_path(
     // descriptor, and otherwise `self.lookup(name)` is what gets selected.
     // Decline exactly that case; a non-data metatype attribute loses to the
     // class's classmethod, which is the value this fold emits.
-    if type_lookup_is_data_descr(metatype, name) {
+    if pyre_object::with_roots!(w_type, metatype => type_lookup_is_data_descr(metatype, name)) {
         return None;
     }
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -13567,10 +13719,10 @@ pub unsafe fn classmethod_on_type_fast_path(
     if type_attr_stored_is_cell(w_type, Wtf8::new(name)) {
         return None;
     }
-    let w_descr = lookup_in_type(
+    let w_descr = pyre_object::with_roots!(w_type => lookup_in_type(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    )?;
+    ))?;
     // EXACT, for the reason the `__getattr__`-hook arm records: a `classmethod`
     // subclass overriding `__get__` binds through that override, so unwrapping
     // `w_function` in its place calls the wrong callable.
@@ -13675,12 +13827,12 @@ pub unsafe fn type_attr_value_fast_path(
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
-    let w_type = w_obj;
+    let mut w_type = w_obj;
     // `is_type` answers for the object's physical layout, not which
     // `__getattribute__` the metaclass runs. `metaclass_keeps_type_getattribute`
     // admits `ABCMeta`, whose slot is still `type.__getattribute__`.
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    if !metaclass_keeps_type_getattribute(w_obj) {
+    let mut metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    if !pyre_object::with_roots!(w_type, metatype => metaclass_keeps_type_getattribute(w_type)) {
         return None;
     }
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -13689,8 +13841,12 @@ pub unsafe fn type_attr_value_fast_path(
     }
     // typeobject.py:814-823: a metatype data descriptor preempts the class's
     // own MRO, while a non-data metatype entry loses to the class value.
-    let w_name = pyre_object::unicodeobject::box_str_constant(name);
-    if lookup_in_type_where_wtf8(metatype, w_name).is_some_and(|descr| is_data_descr(descr)) {
+    let mut w_name = pyre_object::with_roots!(w_type, metatype => {
+        pyre_object::unicodeobject::box_str_constant(name)
+    });
+    if pyre_object::with_roots!(w_type, metatype, w_name => {
+        lookup_in_type_where_wtf8(metatype, w_name).is_some_and(|descr| is_data_descr(descr))
+    }) {
         return None;
     }
     // `try_walker_specialize_load_type_attr` and
@@ -13700,7 +13856,7 @@ pub unsafe fn type_attr_value_fast_path(
     if type_attr_stored_is_cell(w_type, name) {
         return None;
     }
-    let w_value = lookup_in_type_where_wtf8(w_type, w_name)?;
+    let mut w_value = lookup_in_type_where_wtf8(w_type, w_name)?;
     // typeobject.py:822 calls `space.get(w_value, w_None, self)`; `get`'s arms
     // for a null instance decide what that answers.
     // `gateway.py descr_function_get` with no instance returns the function
@@ -13737,11 +13893,11 @@ pub unsafe fn type_attr_value_fast_path(
     // retarget the instance; [`TypeAttrBinding::UnboundHeap`] names those
     // two extra pins.  A heap type whose version tag is 0 has no channel
     // for the first, so it declines.
-    let value_type = crate::typedef::r#type(w_value)?.as_ptr();
-    if lookup_in_type(
+    let mut value_type = crate::typedef::r#type(w_value)?.as_ptr();
+    if pyre_object::with_roots!(w_type, w_value, value_type => lookup_in_type(
         value_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
-    )
+    ))
     .is_some()
     {
         return None;
@@ -13871,7 +14027,7 @@ pub unsafe fn bound_method_attr_fast_path(
 /// # Safety
 /// Same contract as [`bound_method_attr_fast_path`].
 pub unsafe fn bound_method_attr_fast_path_wtf8(
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     name: &Wtf8,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, bool)> {
     if w_obj.is_null() {
@@ -13891,7 +14047,7 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
         return None;
     }
     // Only the default `__getattribute__` is sound to reproduce.
-    if !has_object_getattribute(w_type) {
+    if !pyre_object::with_roots!(w_obj, w_type => has_object_getattribute(w_type)) {
         return None;
     }
     // `Local.getdict` runs app-level code (os_local.py), which a fold
@@ -13979,8 +14135,8 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
 /// # Safety
 /// `start_type` and `obj` must be valid object pointers (null tolerated).
 pub unsafe fn super_check_apparent_fast_path(
-    start_type: PyObjectRef,
-    obj: PyObjectRef,
+    mut start_type: PyObjectRef,
+    mut obj: PyObjectRef,
 ) -> Option<(
     PyObjectRef,
     u64,
@@ -13995,8 +14151,10 @@ pub unsafe fn super_check_apparent_fast_path(
     if pyre_object::is_none(obj) {
         return None;
     }
-    let (receiver_type, receiver_version_tag, receiver_map, objtype) =
-        crate::objspace::std::mapdict::class_attr_fast_path(obj, "__class__")?;
+    let (receiver_type, receiver_version_tag, receiver_map, objtype) = pyre_object::with_roots!(
+        start_type,
+        obj => crate::objspace::std::mapdict::class_attr_fast_path(obj, "__class__")
+    )?;
     // `_super_check`'s `if space.issubtype_w(w_type, w_starttype)`.  The arm
     // yields the apparent class only when that holds; otherwise `_super_check`
     // raises, which is not an answer this predicate offers.
@@ -14215,10 +14373,12 @@ pub unsafe fn super_attr_returns_descr_unchanged(w_descr: PyObjectRef, class_mod
     let Some(descr_type) = crate::typedef::r#type(w_descr) else {
         return true;
     };
-    lookup_in_type_where(
-        descr_type.as_ptr(),
+    let mut descr = w_descr;
+    let mut descr_type = descr_type.as_ptr();
+    pyre_object::with_roots!(descr, descr_type => lookup_in_type_where(
+        descr_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
-    )
+    ))
     .is_none()
 }
 
@@ -14244,45 +14404,45 @@ pub unsafe fn super_attr_slot_wrapper_binds(w_descr: PyObjectRef, obj: PyObjectR
 /// `object.__getattribute__` descriptor used as the identity anchor for
 /// the `uses_object_getattribute` fast path.  Returns true iff `w_descr`
 /// is that descriptor.
-unsafe fn is_object_getattribute_descr(w_descr: PyObjectRef) -> bool {
-    match lookup_in_type_where(
-        crate::typedef::w_object(),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-    ) {
-        Some(d) => std::ptr::eq(w_descr, d),
-        None => false,
-    }
+unsafe fn is_object_getattribute_descr(mut w_descr: PyObjectRef) -> bool {
+    pyre_object::with_roots!(w_descr => {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__"));
+        match lookup_in_type_where(crate::typedef::w_object(), w_name) {
+            Some(d) => std::ptr::eq(w_descr, d),
+            None => false,
+        }
+    })
 }
 
 /// `typeobject.py:1322` — identity anchor for the canonical
 /// `W_TypeObject.descr_getattribute` wrapper installed on `type`.
-unsafe fn is_type_getattribute_descr(w_descr: PyObjectRef) -> bool {
-    match lookup_in_type_where(
-        crate::typedef::w_type(),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-    ) {
-        Some(d) => std::ptr::eq(w_descr, d),
-        None => false,
-    }
+unsafe fn is_type_getattribute_descr(mut w_descr: PyObjectRef) -> bool {
+    pyre_object::with_roots!(w_descr => {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__"));
+        match lookup_in_type_where(crate::typedef::w_type(), w_name) {
+            Some(d) => std::ptr::eq(w_descr, d),
+            None => false,
+        }
+    })
 }
 
 /// module.py `Module.descr_getattribute` is the default attribute slot for
 /// module objects.  Module subclasses inherit it unless they explicitly
 /// replace `__getattribute__`.
-unsafe fn is_module_getattribute_descr(w_descr: PyObjectRef) -> bool {
-    let w_module_type =
+unsafe fn is_module_getattribute_descr(mut w_descr: PyObjectRef) -> bool {
+    let mut w_module_type =
         crate::typedef::gettypefor(&pyre_object::MODULE_TYPE as *const pyre_object::PyType)
             .map_or(PY_NULL, |p| p.as_ptr());
     if w_module_type.is_null() {
         return false;
     }
-    match lookup_in_type_where(
-        w_module_type,
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-    ) {
-        Some(d) => std::ptr::eq(w_descr, d),
-        None => false,
-    }
+    pyre_object::with_roots!(w_descr, w_module_type => {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__"));
+        match lookup_in_type_where(w_module_type, w_name) {
+            Some(d) => std::ptr::eq(w_descr, d),
+            None => false,
+        }
+    })
 }
 
 /// Module-specialized companion of `getattribute_if_not_from_object`.
@@ -14291,23 +14451,28 @@ unsafe fn is_module_getattribute_descr(w_descr: PyObjectRef) -> bool {
 /// `object.__getattribute__`, but it uses the same per-type memoized flag and
 /// mutation invalidation as the object-default path.
 pub(crate) unsafe fn module_getattribute_if_not_from_default(
-    w_type: PyObjectRef,
+    mut w_type: PyObjectRef,
 ) -> Option<PyObjectRef> {
     if majit_metainterp::jit::we_are_jitted() {
-        return lookup_in_type_where(
+        if let Some(mut w_descr) = pyre_object::with_roots!(w_type => lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-        )
-        .filter(|&w_descr| !is_module_getattribute_descr(w_descr));
+        )) {
+            if pyre_object::with_roots!(w_type, w_descr => is_module_getattribute_descr(w_descr)) {
+                return None;
+            }
+            return Some(w_descr);
+        }
+        return None;
     }
     if pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
         return None;
     }
-    if let Some(w_descr) = lookup_in_type_where(
+    if let Some(mut w_descr) = pyre_object::with_roots!(w_type => lookup_in_type_where(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-    ) {
-        if is_module_getattribute_descr(w_descr) {
+    )) {
+        if pyre_object::with_roots!(w_type, w_descr => is_module_getattribute_descr(w_descr)) {
             pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
             return None;
         }
@@ -14319,40 +14484,40 @@ pub(crate) unsafe fn module_getattribute_if_not_from_default(
 /// descroperation.py `object_setattr(space)` — the canonical
 /// `object.__setattr__` descriptor anchor (see
 /// [`is_object_getattribute_descr`]).
-unsafe fn is_object_setattr_descr(w_descr: PyObjectRef) -> bool {
-    match lookup_in_type_where(
-        crate::typedef::w_object(),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setattr__")),
-    ) {
-        Some(d) => std::ptr::eq(w_descr, d),
-        None => false,
-    }
+unsafe fn is_object_setattr_descr(mut w_descr: PyObjectRef) -> bool {
+    pyre_object::with_roots!(w_descr => {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setattr__"));
+        match lookup_in_type_where(crate::typedef::w_object(), w_name) {
+            Some(d) => std::ptr::eq(w_descr, d),
+            None => false,
+        }
+    })
 }
 
 /// The canonical `type.__setattr__` slot wrapper (`init_type_type`,
 /// typedef.rs), distinct from `object.__setattr__` for the Carlo Verre
 /// hackcheck but a thin forward to `object_setattr` — so it still reaches
 /// the terminal non-heaptype raise rather than diverting to user code.
-unsafe fn is_type_setattr_descr(w_descr: PyObjectRef) -> bool {
-    match lookup_in_type_where(
-        crate::typedef::w_type(),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setattr__")),
-    ) {
-        Some(d) => std::ptr::eq(w_descr, d),
-        None => false,
-    }
+unsafe fn is_type_setattr_descr(mut w_descr: PyObjectRef) -> bool {
+    pyre_object::with_roots!(w_descr => {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setattr__"));
+        match lookup_in_type_where(crate::typedef::w_type(), w_name) {
+            Some(d) => std::ptr::eq(w_descr, d),
+            None => false,
+        }
+    })
 }
 
 /// The `type.__delattr__` companion of [`is_type_setattr_descr`] — the
 /// canonical `type`'s own slot forwarding to `object_delattr`.
-unsafe fn is_type_delattr_descr(w_descr: PyObjectRef) -> bool {
-    match lookup_in_type_where(
-        crate::typedef::w_type(),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-    ) {
-        Some(d) => std::ptr::eq(w_descr, d),
-        None => false,
-    }
+unsafe fn is_type_delattr_descr(mut w_descr: PyObjectRef) -> bool {
+    pyre_object::with_roots!(w_descr => {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__"));
+        match lookup_in_type_where(crate::typedef::w_type(), w_name) {
+            Some(d) => std::ptr::eq(w_descr, d),
+            None => false,
+        }
+    })
 }
 
 /// typeobject.py `getattribute_if_not_from_object` — returns the
@@ -14361,14 +14526,16 @@ unsafe fn is_type_delattr_descr(w_descr: PyObjectRef) -> bool {
 /// in `uses_object_getattribute` so repeat accesses skip the MRO walk +
 /// identity compare; under the JIT the lookup is left raw and folded away
 /// by the type's `version_tag`.
-pub(crate) unsafe fn getattribute_if_not_from_object(w_type: PyObjectRef) -> Option<PyObjectRef> {
+pub(crate) unsafe fn getattribute_if_not_from_object(
+    mut w_type: PyObjectRef,
+) -> Option<PyObjectRef> {
     if majit_metainterp::jit::we_are_jitted() {
         // typeobject.py — just a lookup, folded by version_tag.
-        if let Some(w_descr) = lookup_in_type_where(
+        if let Some(mut w_descr) = pyre_object::with_roots!(w_type => lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-        ) {
-            if is_object_getattribute_descr(w_descr) {
+        )) {
+            if pyre_object::with_roots!(w_type, w_descr => is_object_getattribute_descr(w_descr)) {
                 return None;
             }
             return Some(w_descr);
@@ -14379,11 +14546,11 @@ pub(crate) unsafe fn getattribute_if_not_from_object(w_type: PyObjectRef) -> Opt
     if pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
         return None;
     }
-    if let Some(w_descr) = lookup_in_type_where(
+    if let Some(mut w_descr) = pyre_object::with_roots!(w_type => lookup_in_type_where(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattribute__")),
-    ) {
-        if is_object_getattribute_descr(w_descr) {
+    )) {
+        if pyre_object::with_roots!(w_type, w_descr => is_object_getattribute_descr(w_descr)) {
             // typeobject.py:313-315 — remember the default (`_side_effects_ok()`
             // is true in normal builds).
             pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
@@ -14412,32 +14579,33 @@ pub(crate) unsafe fn has_object_getattribute(w_type: PyObjectRef) -> bool {
 /// `__getattribute__` and the canonical `object.__class__` descriptor.
 /// `W_TypeObject.mutated` invalidates the memoized flag and the method cache
 /// whenever either lookup shape changes.
-pub unsafe fn isinstance_miss_class_lookup_is_pure(w_type: PyObjectRef) -> bool {
+pub unsafe fn isinstance_miss_class_lookup_is_pure(mut w_type: PyObjectRef) -> bool {
     if !pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
         return false;
     }
-    let Some(actual_class_descr) = lookup_in_type_where(
-        w_type,
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__class__")),
-    ) else {
+    let w_class_name = pyre_object::with_roots!(w_type => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__class__"))
+    });
+    let Some(mut actual_class_descr) =
+        pyre_object::with_roots!(w_type => lookup_in_type_where(w_type, w_class_name))
+    else {
         return false;
     };
-    lookup_in_type_where(
-        crate::typedef::w_object(),
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__class__")),
-    )
+    pyre_object::with_roots!(w_type, actual_class_descr => {
+        lookup_in_type_where(crate::typedef::w_object(), w_class_name)
+    })
     .is_some_and(|object_class_descr| std::ptr::eq(actual_class_descr, object_class_descr))
 }
 
 /// typeobject.py `setattr_if_not_from_object` — the `__setattr__`
 /// companion of [`getattribute_if_not_from_object`].
-pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<PyObjectRef> {
+pub(crate) unsafe fn setattr_if_not_from_object(mut w_type: PyObjectRef) -> Option<PyObjectRef> {
     if majit_metainterp::jit::we_are_jitted() {
-        if let Some(w_descr) = lookup_in_type_where(
+        if let Some(mut w_descr) = pyre_object::with_roots!(w_type => lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setattr__")),
-        ) {
-            if is_object_setattr_descr(w_descr) {
+        )) {
+            if pyre_object::with_roots!(w_type, w_descr => is_object_setattr_descr(w_descr)) {
                 return None;
             }
             return Some(w_descr);
@@ -14447,11 +14615,11 @@ pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<P
     if pyre_object::typeobject::w_type_get_uses_object_setattr(w_type) {
         return None;
     }
-    if let Some(w_descr) = lookup_in_type_where(
+    if let Some(mut w_descr) = pyre_object::with_roots!(w_type => lookup_in_type_where(
         w_type,
         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__setattr__")),
-    ) {
-        if is_object_setattr_descr(w_descr) {
+    )) {
+        if pyre_object::with_roots!(w_type, w_descr => is_object_setattr_descr(w_descr)) {
             pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, true);
             return None;
         }
@@ -14505,12 +14673,12 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     let default_mro =
         |index: usize| pyre_object::gc_roots::shadow_stack_get(default_mro_start + index);
     if pyre_object::w_type_is_cpython_heaptype(w_self) {
+        let w_mro_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("mro"));
+        let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
         let w_metaclass = (*w_self).w_class;
         if !w_metaclass.is_null()
-            && let Some((w_where, w_mro_func)) = lookup_where_with_method_cache(
-                w_metaclass,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("mro")),
-            )
+            && let Some((w_where, w_mro_func)) =
+                lookup_where_with_method_cache(w_metaclass, w_mro_name)
             && !std::ptr::eq(w_where, crate::typedef::w_type())
         {
             let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
@@ -14959,7 +15127,7 @@ pub fn descr_call_mismatch(
     ))
 }
 
-pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
+pub(crate) unsafe fn is_data_descr(mut descr: PyObjectRef) -> bool {
     if descr.is_null() {
         return false;
     }
@@ -14985,16 +15153,14 @@ pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
     if is_instance(descr) {
         let w_type = w_instance_get_type(descr);
         if !w_type.is_null() && is_type(w_type) {
-            return lookup_in_type_where(
-                w_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__set__")),
-            )
-            .is_some()
-                || lookup_in_type_where(
-                    w_type,
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delete__")),
-                )
-                .is_some();
+            let mut w_type = w_type;
+            return pyre_object::with_roots!(descr, w_type => {
+                let w_set = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__set__"));
+                let has_set = lookup_in_type_where(w_type, w_set).is_some();
+                let w_delete =
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delete__"));
+                has_set || lookup_in_type_where(w_type, w_delete).is_some()
+            });
         }
     }
     false
@@ -15004,7 +15170,7 @@ pub(crate) unsafe fn is_data_descr(descr: PyObjectRef) -> bool {
 /// descriptor exposes a `__delete__`.  `setattr` consults this after a
 /// failed `__set__` lookup to reject a data descriptor that has a deleter
 /// but no setter (descroperation.py).
-unsafe fn descr_has_delete(descr: PyObjectRef) -> bool {
+unsafe fn descr_has_delete(mut descr: PyObjectRef) -> bool {
     if descr.is_null() {
         return false;
     }
@@ -15015,10 +15181,11 @@ unsafe fn descr_has_delete(descr: PyObjectRef) -> bool {
         return true;
     }
     if let Some(descr_type) = crate::typedef::r#type(descr) {
-        return lookup_in_type_where(
-            descr_type.as_ptr(),
+        let mut descr_type = descr_type.as_ptr();
+        return pyre_object::with_roots!(descr, descr_type => lookup_in_type_where(
+            descr_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delete__")),
-        )
+        ))
         .is_some();
     }
     false
@@ -15093,7 +15260,7 @@ unsafe fn member_missing_error(obj: PyObjectRef, slot_name: &str) -> crate::PyEr
 pub(crate) unsafe fn get(
     mut descr: PyObjectRef,
     mut obj: PyObjectRef,
-    w_type: PyObjectRef,
+    mut w_type: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     if descr.is_null() {
         return Ok(None);
@@ -15268,16 +15435,18 @@ pub(crate) unsafe fn get(
     }
 
     // General __get__: look up __get__ on the descriptor's own type MRO
-    if let Some(descr_type) = crate::typedef::r#type(descr)
-        && let Some(get_fn) = lookup_in_type_where(
-            descr_type.as_ptr(),
+    if let Some(descr_type) = crate::typedef::r#type(descr) {
+        let mut descr_type = descr_type.as_ptr();
+        if let Some(get_fn) = pyre_object::with_roots!(descr, obj, w_type, descr_type => lookup_in_type_where(
+            descr_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
-        )
-        && !get_fn.is_null()
-    {
-        let visible_obj = if obj.is_null() { w_none() } else { obj };
-        let result = crate::call::call_function_impl_result(get_fn, &[descr, visible_obj, w_type])?;
-        return Ok(if result.is_null() { None } else { Some(result) });
+        )) && !get_fn.is_null()
+        {
+            let visible_obj = if obj.is_null() { w_none() } else { obj };
+            let result =
+                crate::call::call_function_impl_result(get_fn, &[descr, visible_obj, w_type])?;
+            return Ok(if result.is_null() { None } else { Some(result) });
+        }
     }
     Ok(None)
 }
@@ -15287,9 +15456,9 @@ pub(crate) unsafe fn get(
 /// PyPy: descroperation.py `descr__setattr__` →
 /// `space.get_and_call_function(w_set, w_descr, w_obj, w_value)`
 unsafe fn set(
-    descr: PyObjectRef,
+    mut descr: PyObjectRef,
     mut obj: PyObjectRef,
-    value: PyObjectRef,
+    mut value: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
     if descr.is_null() {
         return Ok(false);
@@ -15376,12 +15545,12 @@ unsafe fn set(
     // `get_and_call_function(w_set, w_descr, w_obj, w_value)`.  interp2app
     // of `descr_property_set` is `FunctionWithFixedCode`, so that call
     // looks inside `funccall` / `BuiltinCode3.fastcall_3`.
-    let descr_type = crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+    let mut descr_type = crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     if !descr_type.is_null()
-        && let Some(set_fn) = lookup_in_type_where(
+        && let Some(set_fn) = pyre_object::with_roots!(descr, obj, value, descr_type => lookup_in_type_where(
             descr_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__set__")),
-        )
+        ))
         && !set_fn.is_null()
     {
         get_and_call_function(set_fn, descr, descr_type, &[obj, value])?;
@@ -15393,7 +15562,7 @@ unsafe fn set(
 /// Call a descriptor's __delete__ method.
 ///
 /// descroperation.py `space.delete(w_descr, w_obj)`
-unsafe fn delete(mut descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyError> {
+unsafe fn delete(mut descr: PyObjectRef, mut obj: PyObjectRef) -> Result<(), crate::PyError> {
     // property: call fdel(obj).  Exact type only — see the `__get__` twin.
     if is_exact_property(descr) {
         let fdel = w_property_get_fdel(descr);
@@ -15446,12 +15615,12 @@ unsafe fn delete(mut descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::
     }
     // General __delete__: look up on descriptor's type MRO — same shape as
     // `set` above.
-    let descr_type = crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+    let mut descr_type = crate::typedef::r#type(descr).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     if !descr_type.is_null()
-        && let Some(del_fn) = lookup_in_type_where(
+        && let Some(del_fn) = pyre_object::with_roots!(descr, obj, descr_type => lookup_in_type_where(
             descr_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delete__")),
-        )
+        ))
         && !del_fn.is_null()
     {
         crate::call::call_function_impl_result(del_fn, &[descr, obj])?;
@@ -15587,16 +15756,17 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
 /// `space.setattr` for a borrowed UTF-8 name. A proven literal folds to an
 /// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
 /// [`setattr`] instead.
-pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
-    setattr(
-        obj,
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        value,
-    )
+pub fn setattr_str(mut obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> PyResult {
+    let w_name = pyre_object::with_roots!(obj, value => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+    });
+    setattr(obj, w_name, value)
 }
 
-fn setattr_utf8(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
-    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+fn setattr_utf8(obj: PyObjectRef, mut w_name: PyObjectRef, mut value: PyObjectRef) -> PyResult {
+    let obj = pyre_object::with_roots!(w_name, value => {
+        crate::module::_weakref::interp__weakref::force(obj)
+    })?;
     // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
     // no `__setattr__`, so `super().name = value` uses the object default and
     // raises AttributeError rather than resolving a descriptor setter.
@@ -15690,8 +15860,12 @@ fn setattr_utf8(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> Py
 /// a metaclass `__setattr__`/`__delattr__` override, or a `name` that
 /// resolves to a metaclass descriptor such as `type.__name__`, whose
 /// setter has its own value-dependent behaviour).
-pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_delete: bool) -> bool {
-    unsafe {
+pub fn type_immutable_attr_raise_is_stable(
+    mut obj: PyObjectRef,
+    name: &str,
+    is_delete: bool,
+) -> bool {
+    pyre_object::with_roots!(obj => unsafe {
         if obj.is_null()
             || !pyre_object::typeobject::is_type(obj)
             || pyre_object::w_type_is_cpython_heaptype(obj)
@@ -15701,50 +15875,45 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
         let Some(metaclass) = crate::typedef::r#type(obj) else {
             return false;
         };
-        let metaclass = metaclass.as_ptr();
+        let mut metaclass = metaclass.as_ptr();
         if !std::ptr::eq(
             metaclass,
             pyre_object::get_instantiate(&pyre_object::pyobject::TYPE_TYPE),
         ) {
             return false;
         }
-        if is_delete {
-            // `delattr_str`'s type-receiver branch: a non-default metaclass
-            // `__delattr__` routes to a descriptor call instead of the
-            // terminal raise.  The metaclass is the canonical `type` (checked
-            // above), whose own `__delattr__` slot forwards to
-            // `object_delattr` — that still reaches the immutable raise, so it
-            // is accepted alongside `object`'s default.
-            if let Some(da) = lookup_in_type(
-                metaclass,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-            ) {
-                let is_default = lookup_in_type(
-                    crate::typedef::w_object(),
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-                )
-                .is_some_and(|d| std::ptr::eq(da, d));
-                if !is_default && !is_type_delattr_descr(da) {
+        pyre_object::with_roots!(obj, metaclass => {
+            if is_delete {
+                // `delattr_str`'s type-receiver branch: a non-default metaclass
+                // `__delattr__` routes to a descriptor call instead of the
+                // terminal raise.  The metaclass is the canonical `type` (checked
+                // above), whose own `__delattr__` slot forwards to
+                // `object_delattr` — that still reaches the immutable raise, so it
+                // is accepted alongside `object`'s default.
+                let w_delattr_name =
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__"));
+                if let Some(da) = lookup_in_type(metaclass, w_delattr_name) {
+                    let is_default = lookup_in_type(crate::typedef::w_object(), w_delattr_name)
+                        .is_some_and(|d| std::ptr::eq(da, d));
+                    if !is_default && !is_type_delattr_descr(da) {
+                        return false;
+                    }
+                }
+            } else if let Some(sa) = setattr_if_not_from_object(metaclass) {
+                // Same reasoning for setattr: the canonical `type`'s own
+                // `__setattr__` slot forwards to `object_setattr`, so only a
+                // genuine metaclass override (neither `object`'s nor `type`'s
+                // standard slot) diverts away from the terminal raise.
+                if !is_type_setattr_descr(sa) {
                     return false;
                 }
             }
-        } else if let Some(sa) = setattr_if_not_from_object(metaclass) {
-            // Same reasoning for setattr: the canonical `type`'s own
-            // `__setattr__` slot forwards to `object_setattr`, so only a
-            // genuine metaclass override (neither `object`'s nor `type`'s
-            // standard slot) diverts away from the terminal raise.
-            if !is_type_setattr_descr(sa) {
-                return false;
-            }
-        }
-        // The terminal's metaclass-MRO descriptor walk runs before the
-        // heaptype guard; any hit (`__name__`, `__dict__`, …) diverts.
-        lookup_in_type_where(
-            metaclass,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        )
-        .is_none()
-    }
+            // The terminal's metaclass-MRO descriptor walk runs before the
+            // heaptype guard; any hit (`__name__`, `__dict__`, …) diverts.
+            let w_attr_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+            lookup_in_type_where(metaclass, w_attr_name).is_none()
+        })
+    })
 }
 
 /// Trace-time predicate for the read-only-data-descriptor STORE_ATTR raise.
@@ -15759,7 +15928,10 @@ pub fn type_immutable_attr_raise_is_stable(obj: PyObjectRef, name: &str, is_dele
 /// dedicated arms in `set` and `descr_has_delete` have value- and
 /// descriptor-specific behaviour rather than the general
 /// `descroperation.py` terminal.
-pub fn readonly_descr_attr_raise_is_stable(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+pub fn readonly_descr_attr_raise_is_stable(
+    mut obj: PyObjectRef,
+    name: &str,
+) -> Option<PyObjectRef> {
     unsafe {
         if obj.is_null()
             || !is_instance(obj)
@@ -15768,31 +15940,37 @@ pub fn readonly_descr_attr_raise_is_stable(obj: PyObjectRef, name: &str) -> Opti
         {
             return None;
         }
-        let w_type = w_instance_get_type(obj);
-        if w_type.is_null() || setattr_if_not_from_object(w_type).is_some() {
+        let mut w_type = w_instance_get_type(obj);
+        if w_type.is_null()
+            || pyre_object::with_roots!(obj, w_type => setattr_if_not_from_object(w_type)).is_some()
+        {
             return None;
         }
-        let descr = lookup_in_type_where(
+        let w_attr_name = pyre_object::with_roots!(obj, w_type => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+        });
+        let mut descr = pyre_object::with_roots!(obj, w_type => lookup_in_type_where(
             w_type,
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        )?;
+            w_attr_name,
+        ))?;
         if is_property(descr)
             || pyre_object::is_member(descr)
             || pyre_object::typedef::is_getset_property(descr)
         {
             return None;
         }
-        let descr_type = crate::typedef::r#type(descr)?.as_ptr();
+        let mut descr_type = crate::typedef::r#type(descr)?.as_ptr();
         if descr_type.is_null()
-            || lookup_in_type_where(
-                descr_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__set__")),
-            )
+            || pyre_object::with_roots!(obj, descr, descr_type => {
+                let w_set = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__set__"));
+                lookup_in_type_where(descr_type, w_set)
+            })
             .is_some()
-            || lookup_in_type_where(
-                descr_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delete__")),
-            )
+            || pyre_object::with_roots!(obj, descr, descr_type => {
+                let w_delete =
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delete__"));
+                lookup_in_type_where(descr_type, w_delete)
+            })
             .is_none()
         {
             return None;
@@ -16167,13 +16345,13 @@ pub fn object_setattr(
         if w_type.is_null() {
             None
         } else if let Some(mut descr) = lookup_in_type_where(w_type, w_name) {
-            if pyre_object::with_roots!(descr, obj, value => set(descr, obj, value))? {
+            if pyre_object::with_roots!(descr, obj, value, w_name => set(descr, obj, value))? {
                 return Ok(w_none());
             }
             // descroperation.py:124-126 — `__delete__` but no `__set__`
             // is a read-only data descriptor; reject rather than shadow
             // it with an instance/type dict store.
-            if descr_has_delete(descr) {
+            if pyre_object::with_roots!(descr, obj, value, w_name => descr_has_delete(descr)) {
                 return Err(descr_not_settable_error(descr));
             }
             Some(descr)
@@ -16627,11 +16805,14 @@ pub unsafe fn exception_attr_slot_fold(
     {
         return None;
     }
-    let w_type = crate::typedef::r#type(obj)?;
+    let mut obj = obj;
+    let mut w_type = crate::typedef::r#type(obj)?.as_ptr();
     // mapdict.py `LOAD_ATTR_slowpath` — a custom `__getattribute__`
     // handles the access and never reaches the descriptor, so no slot read is
     // equivalent to it.
-    if unsafe { getattribute_if_not_from_object(w_type.as_ptr()) }.is_some() {
+    if unsafe { pyre_object::with_roots!(obj, w_type => getattribute_if_not_from_object(w_type)) }
+        .is_some()
+    {
         return None;
     }
     // Any hit other than the class's own `interp_exceptions.py` typedef
@@ -16640,16 +16821,16 @@ pub unsafe fn exception_attr_slot_fold(
     // version-tag guard below pins this decision across later heap-subclass
     // mutations.
     if let Some(descr) = unsafe {
-        lookup_in_type_where(
-            w_type.as_ptr(),
+        pyre_object::with_roots!(obj, w_type => lookup_in_type_where(
+            w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-        )
+        ))
     } && !is_exception_typedef_getset(descr)
         && !is_exception_typedef_member(descr, slot)
     {
         return None;
     }
-    let version_tag = unsafe { w_type_version_tag(w_type.as_ptr()) };
+    let version_tag = unsafe { w_type_version_tag(w_type) };
     if version_tag == 0 {
         return None;
     }
@@ -16708,7 +16889,7 @@ pub unsafe fn exception_attr_slot_fold(
             return None;
         }
     }
-    Some((slot, kind, w_type.as_ptr(), version_tag, stored))
+    Some((slot, kind, w_type, version_tag, stored))
 }
 
 /// `W_BaseException.descr_setargs`:
@@ -16932,28 +17113,34 @@ fn missing_attribute_subject(obj: PyObjectRef) -> String {
 /// `space.delattr` for a borrowed UTF-8 name. A proven literal folds to an
 /// interned unicode Ref; traced opcode paths intern via `getname_w` and enter
 /// [`delattr`] instead.
-pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
-    delattr(
-        obj,
-        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-    )
+pub fn delattr_str(mut obj: PyObjectRef, name: &str) -> PyResult {
+    let w_name = pyre_object::with_roots!(obj => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+    });
+    delattr(obj, w_name)
 }
 
-fn delattr_utf8(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
-    let obj = crate::module::_weakref::interp__weakref::force(obj)?;
+fn delattr_utf8(obj: PyObjectRef, mut w_name: PyObjectRef) -> PyResult {
+    let mut obj = pyre_object::with_roots!(w_name => {
+        crate::module::_weakref::interp__weakref::force(obj)
+    })?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
     unsafe {
         if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-            if let Some(da) = lookup_in_type(
+            let mut w_type = w_instance_get_type(obj);
+            let w_delattr_name = pyre_object::with_roots!(obj, w_name, w_type => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__"))
+            });
+            if let Some(mut da) = pyre_object::with_roots!(obj, w_name, w_type => lookup_in_type(
                 w_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-            ) {
-                let is_default = lookup_in_type(
-                    crate::typedef::w_object(),
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-                )
-                .is_some_and(|d| std::ptr::eq(da, d));
+                w_delattr_name,
+            )) {
+                let is_default =
+                    pyre_object::with_roots!(obj, w_name, w_type, da => lookup_in_type(
+                        crate::typedef::w_object(),
+                        w_delattr_name,
+                    ))
+                    .is_some_and(|d| std::ptr::eq(da, d));
                 if !is_default {
                     let _name_roots = pyre_object::gc_roots::push_roots();
                     let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -16972,15 +17159,20 @@ fn delattr_utf8(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
             // regardless of receiver kind.  This includes a module retagged
             // to a subclass as well as a type receiver whose metaclass
             // customises deletion.
-            if let Some(da) = lookup_in_type(
-                w_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-            ) {
-                let is_default = lookup_in_type(
-                    crate::typedef::w_object(),
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__")),
-                )
-                .is_some_and(|d| std::ptr::eq(da, d));
+            let mut w_type_ptr = w_type.as_ptr();
+            let w_delattr_name = pyre_object::with_roots!(obj, w_name, w_type_ptr => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delattr__"))
+            });
+            if let Some(mut da) = pyre_object::with_roots!(obj, w_name, w_type_ptr => lookup_in_type(
+                w_type_ptr,
+                w_delattr_name,
+            )) {
+                let is_default =
+                    pyre_object::with_roots!(obj, w_name, w_type_ptr, da => lookup_in_type(
+                        crate::typedef::w_object(),
+                        w_delattr_name,
+                    ))
+                    .is_some_and(|d| std::ptr::eq(da, d));
                 if !is_default {
                     let _name_roots = pyre_object::gc_roots::push_roots();
                     let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -17065,11 +17257,11 @@ pub(crate) fn exception_attr_delete(obj: PyObjectRef, name: &str) -> PyResult {
         // `interp_exceptions.py W_OSError.descr_del_written`.
         "characters_written" => return descr_del_written(obj),
         _ if unsafe { exception_deletable_slot(obj, name) } => {
-            return object_setattr(
-                obj,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-                w_none(),
-            );
+            let mut obj = obj;
+            let w_name = pyre_object::with_roots!(obj => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+            });
+            return object_setattr(obj, w_name, w_none());
         }
         _ => {}
     }
@@ -17104,8 +17296,8 @@ pub fn object_delattr(obj: PyObjectRef, mut w_name: PyObjectRef) -> PyResult {
         };
         if w_type.is_null() {
             None
-        } else if let Some(descr) = lookup_in_type_where(w_type, w_name) {
-            if is_data_descr(descr) {
+        } else if let Some(mut descr) = lookup_in_type_where(w_type, w_name) {
+            if pyre_object::with_roots!(descr, obj, w_name => is_data_descr(descr)) {
                 delete(descr, obj)?;
                 return Ok(w_none());
             }
@@ -17680,7 +17872,7 @@ pub fn call_method_result(
 /// code (a mapping proxy's `__eq__` on a colliding key), so its error is
 /// surfaced rather than swallowed into a decline.
 fn method_descriptor_shortcut(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     methname: &str,
 ) -> Result<Option<PyObjectRef>, PyError> {
     if obj.is_null() {
@@ -17690,16 +17882,17 @@ fn method_descriptor_shortcut(
     let Some(w_type) = crate::typedef::r#type(obj) else {
         return Ok(None);
     };
+    let mut w_type = w_type.as_ptr();
     // `callmethod.py:135` — `if w_type.has_object_getattribute():`.
-    if !unsafe { has_object_getattribute(w_type.as_ptr()) } {
+    if !unsafe { pyre_object::with_roots!(obj, w_type => has_object_getattribute(w_type)) } {
         return Ok(None);
     }
     // `callmethod.py` — `w_descr = space.lookup(w_obj, methname)`.
     let Some(w_descr) = (unsafe {
-        lookup_in_type(
-            w_type.as_ptr(),
+        pyre_object::with_roots!(obj, w_type => lookup_in_type(
+            w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(methname)),
-        )
+        ))
     }) else {
         return Ok(None);
     };
@@ -17744,10 +17937,11 @@ pub fn callable_w(obj: PyObjectRef) -> bool {
             || pyre_object::function::is_staticmethod(obj)
             || crate::typedef::r#type(obj)
                 .and_then(|t| {
-                    lookup_in_type(
-                        t.as_ptr(),
+                    let mut t = t.as_ptr();
+                    pyre_object::with_roots!(t => lookup_in_type(
+                        t,
                         pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
-                    )
+                    ))
                 })
                 .is_some()
     }
@@ -17763,10 +17957,10 @@ pub fn callable(obj: PyObjectRef) -> PyObjectRef {
 }
 
 /// PyPy `ObjSpace.call_function_or_identity`.
-pub fn call_function_or_identity(obj: PyObjectRef, dunder: &str) -> PyObjectRef {
+pub fn call_function_or_identity(mut obj: PyObjectRef, dunder: &str) -> PyObjectRef {
     unsafe {
         if is_instance(obj)
-            && let Some(method) = lookup(obj, dunder)
+            && let Some(method) = pyre_object::with_roots!(obj => lookup(obj, dunder))
         {
             return call_function(method, &[obj]);
         }
@@ -18284,16 +18478,12 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
     // instance (is_instance) is excluded entirely so its instance dict is
     // never consulted; a type miss there takes the default.
     w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_length_hint = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__length_hint__"));
     let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     let w_descr = if w_type.is_null() {
         None
     } else {
-        unsafe {
-            lookup_in_type_where(
-                w_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__length_hint__")),
-            )
-        }
+        unsafe { lookup_in_type_where(w_type, w_length_hint) }
     };
     // baseobjspace.py `space.get_and_call_function(w_descr, w_obj)` — a
     // type-MRO descriptor is called with the object as self; the builtin
@@ -18322,7 +18512,7 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
                 "__length_hint__",
                 false,
                 false,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__length_hint__")),
+                w_length_hint,
             ) {
                 Ok(m) => {
                     let meth_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -18489,11 +18679,11 @@ pub unsafe fn index_fast_path(
         if w_obj.is_null() || pyre_object::pyobject::is_int_or_long(w_obj) {
             return None;
         }
-        let w_type = crate::typedef::r#type(w_obj)?.as_ptr();
-        let method = lookup_in_type_where(
+        let mut w_type = crate::typedef::r#type(w_obj)?.as_ptr();
+        let method = pyre_object::with_roots!(w_type => lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )?;
+        ))?;
         let version_tag = w_type_version_tag(w_type);
         if version_tag == 0 {
             return None;
@@ -18506,7 +18696,7 @@ pub unsafe fn index_fast_path(
     }
 }
 
-pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn space_index(mut obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if obj.is_null() {
         return Err(PyError::type_error("space.index: null object"));
     }
@@ -18514,10 +18704,10 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         return Ok(obj);
     }
     let Some(method) = (unsafe {
-        lookup_w(
+        pyre_object::with_roots!(obj => lookup_w(
             obj,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
-        )
+        ))
     }) else {
         return Err(PyError::type_error(format!(
             "'{}' object cannot be interpreted as an integer",
@@ -18597,10 +18787,10 @@ pub fn float_w(mut obj: PyObjectRef) -> Result<f64, PyError> {
         }
     }
     let Some(method) = (unsafe {
-        lookup_w(
+        pyre_object::with_roots!(obj => lookup_w(
             obj,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__float__")),
-        )
+        ))
     }) else {
         return Err(unsafe { PyError::from_exc_object(float_w_must_be_real(obj)) });
     };
@@ -19302,7 +19492,7 @@ pub fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
 /// `W_TypeObject` flag may not be reachable through `typedef::r#type`;
 /// heap types (dict subclasses included) carry the inherited flag via
 /// `inherit_flag_map_or_seq`.
-pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
+pub fn ismapping_w(mut w_obj: PyObjectRef) -> bool {
     unsafe {
         if is_any_dict(w_obj) {
             return true;
@@ -19315,10 +19505,10 @@ pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
         if flag == b'S' {
             return false;
         }
-        lookup_w(
+        pyre_object::with_roots!(w_obj => lookup_w(
             w_obj,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-        )
+        ))
         .is_some()
     }
 }
@@ -19327,7 +19517,7 @@ pub fn ismapping_w(w_obj: PyObjectRef) -> bool {
 /// The `is_dict` arm mirrors `ismapping_w`'s, for the same reason: the builtin
 /// mapping's flag may not be reachable through `typedef::r#type`, while a dict
 /// subclass carries the inherited flag.
-pub fn issequence_w(w_obj: PyObjectRef) -> bool {
+pub fn issequence_w(mut w_obj: PyObjectRef) -> bool {
     unsafe {
         if is_any_dict(w_obj) {
             return false;
@@ -19340,10 +19530,10 @@ pub fn issequence_w(w_obj: PyObjectRef) -> bool {
         if flag == b'S' {
             return true;
         }
-        lookup_w(
+        pyre_object::with_roots!(w_obj => lookup_w(
             w_obj,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-        )
+        ))
         .is_some()
     }
 }
@@ -19354,17 +19544,17 @@ pub fn issequence_w(w_obj: PyObjectRef) -> bool {
 /// consult `flag_map_or_seq`, which makes a list non-mapping and a dict
 /// non-sequence before their shared type-level `__getitem__` fallback.  The C
 /// API predicate is only that fallback, and ignores instance attributes.
-pub fn py_mapping_check(w_obj: PyObjectRef) -> bool {
+pub fn py_mapping_check(mut w_obj: PyObjectRef) -> bool {
     unsafe {
-        lookup_w(
+        pyre_object::with_roots!(w_obj => lookup_w(
             w_obj,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-        )
+        ))
         .is_some()
     }
 }
 
-pub fn is_iterable(obj: PyObjectRef) -> bool {
+pub fn is_iterable(mut obj: PyObjectRef) -> bool {
     if obj.is_null() {
         return false;
     }
@@ -19404,10 +19594,10 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
         }
         // descroperation.py:320 — `space.lookup(w_obj, '__iter__')`.
         // MRO-only walk; no `__getattr__` / descriptor execution.
-        if lookup_w(
+        if pyre_object::with_roots!(obj => lookup_w(
             obj,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-        )
+        ))
         .is_some()
         {
             return true;
@@ -19422,10 +19612,10 @@ pub fn is_iterable(obj: PyObjectRef) -> bool {
         let w_type = crate::typedef::r#type(obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
         let is_mapping = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type) == b'M';
         if !is_mapping
-            && lookup_w(
+            && pyre_object::with_roots!(obj => lookup_w(
                 obj,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-            )
+            ))
             .is_some()
         {
             return true;
@@ -19625,12 +19815,13 @@ unsafe fn not_iterable_type_name(obj: PyObjectRef) -> String {
 }
 
 unsafe fn iter_check_is_iterator(mut w_obj: PyObjectRef, mut w_iterator: PyObjectRef) -> PyResult {
-    let w_type = crate::typedef::r#type(w_iterator).map_or(std::ptr::null_mut(), |p| p.as_ptr());
+    let mut w_type =
+        crate::typedef::r#type(w_iterator).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     let has_next = if !w_type.is_null()
-        && lookup_in_type_where(
+        && pyre_object::with_roots!(w_obj, w_iterator, w_type => lookup_in_type_where(
             w_type,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__next__")),
-        )
+        ))
         .is_some()
     {
         true
@@ -19672,19 +19863,19 @@ unsafe fn iter_check_is_iterator(mut w_obj: PyObjectRef, mut w_iterator: PyObjec
 /// # Safety
 /// `obj` must point to a valid object whose header is readable.
 pub(crate) unsafe fn builtin_iter_replacement(
-    obj: PyObjectRef,
+    mut obj: PyObjectRef,
     base: &'static pyre_object::PyType,
 ) -> Option<PyObjectRef> {
-    let exact = get_instantiate(base);
-    let w_class = unsafe { (*obj).w_class };
+    let mut exact = get_instantiate(base);
+    let mut w_class = unsafe { (*obj).w_class };
     if w_class.is_null() || std::ptr::eq(w_class, exact) {
         return None;
     }
     let (src, method) = unsafe {
-        lookup_where_with_method_cache(
+        pyre_object::with_roots!(obj, exact, w_class => lookup_where_with_method_cache(
             w_class,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-        )
+        ))
     }?;
     if std::ptr::eq(src, exact) {
         None
@@ -19939,14 +20130,16 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             return Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot));
         }
         if pyre_object::interp_itertools::is_combinations_with_replacement(obj) {
-            let exact =
+            let mut exact =
                 get_instantiate(&pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE);
             let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            if !std::ptr::eq((*obj).w_class, exact)
-                && let Some((src, method)) = lookup_where_with_method_cache(
-                    (*obj).w_class,
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-                )
+            let mut w_class = (*obj).w_class;
+            if !std::ptr::eq(w_class, exact)
+                && let Some((src, method)) = pyre_object::with_roots!(exact, w_class => {
+                    let w_iter_name =
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__"));
+                    lookup_where_with_method_cache(w_class, w_iter_name)
+                })
                 && !std::ptr::eq(src, exact)
             {
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
@@ -20063,11 +20256,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         // `obj.__iter__ = method`); those paths are non-orthodox in
         // both CPython and PyPy and have been removed.
         if is_instance(obj) {
-            let w_type = w_instance_get_type(obj);
-            if let Some(method) = lookup_in_type_where(
+            let mut w_type = w_instance_get_type(obj);
+            if let Some(method) = pyre_object::with_roots!(w_type => lookup_in_type_where(
                 w_type,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-            ) {
+            )) {
                 // descroperation.py:339-341 — explicit `__iter__ = None`
                 // marks the type as non-iterable even though the lookup
                 // succeeds.
@@ -20098,10 +20291,10 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             // the instance dict, so an `obj.__getitem__ = f` instance attribute
             // does not enable sequence iteration.
             if !is_mapping
-                && lookup_in_type_where(
+                && pyre_object::with_roots!(w_type => lookup_in_type_where(
                     w_type,
                     pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-                )
+                ))
                 .is_some()
             {
                 // descroperation.py — `space.newseqiter(w_obj)` wraps the
@@ -20129,11 +20322,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     None
                 }
             };
-            if let Some(w_metaclass) = w_metaclass
-                && let Some(method) = lookup_in_type_where(
+            if let Some(mut w_metaclass) = w_metaclass
+                && let Some(method) = pyre_object::with_roots!(w_metaclass => lookup_in_type_where(
                     w_metaclass,
                     pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-                )
+                ))
             {
                 let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
                 return iter_check_is_iterator(
@@ -20143,10 +20336,13 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
             }
             // Fallback: check type type's MRO
             if let Some(w_type_type) = crate::typedef::gettypefor(&pyre_object::pyobject::TYPE_TYPE)
-                && let Some(method) = lookup_in_type_where(
-                    w_type_type.as_ptr(),
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-                )
+                && let Some(method) = {
+                    let mut w_type_type = w_type_type.as_ptr();
+                    pyre_object::with_roots!(w_type_type => lookup_in_type_where(
+                        w_type_type,
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+                    ))
+                }
             {
                 let w_iter = crate::call::call_function_impl_result(method, &[obj])?;
                 return iter_check_is_iterator(
@@ -20165,10 +20361,11 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
         if !is_instance(obj)
             && let Some(w_type) = crate::typedef::r#type(obj)
         {
-            if let Some(method) = lookup_in_type_where(
-                w_type.as_ptr(),
+            let mut w_type = w_type.as_ptr();
+            if let Some(method) = pyre_object::with_roots!(w_type => lookup_in_type_where(
+                w_type,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-            ) {
+            )) {
                 if is_none(method) {
                     return Err(PyError::type_error(format!(
                         "'{}' object is not iterable",
@@ -20181,13 +20378,12 @@ pub fn iter(obj: PyObjectRef) -> PyResult {
                     w_iter,
                 );
             }
-            let is_mapping =
-                pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type.as_ptr()) == b'M';
+            let is_mapping = pyre_object::typeobject::w_type_get_flag_map_or_seq(w_type) == b'M';
             if !is_mapping
-                && lookup_in_type_where(
-                    w_type.as_ptr(),
+                && pyre_object::with_roots!(w_type => lookup_in_type_where(
+                    w_type,
                     pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
-                )
+                ))
                 .is_some()
             {
                 return Ok(pyre_object::w_seq_iter_new(obj, 0));
@@ -20492,12 +20688,23 @@ unsafe fn zip_two_tuple_first_stopped(zip_obj: PyObjectRef, it1: PyObjectRef) ->
 
 /// Second `next` stopped after the first yielded (`W_Zip.next_w`, progress
 /// 1). Non-strict stops. Strict is the shorter `ValueError`.
+/// `zip_strict_shorter` is LeavesAbove (`@dont_look_inside` residual);
+/// a `RootScope` rewinds it so this helper is depth-neutral, matching
+/// `zip_two_tuple_first_stopped` (`body_is_depth_neutral`).
 #[inline(never)]
 unsafe fn zip_two_tuple_second_stopped(zip_obj: PyObjectRef) -> PyObjectRef {
-    if !pyre_object::functional::w_zip_get_strict(zip_obj) {
-        return PY_NULL;
-    }
-    zip_strict_shorter()
+    let _roots = pyre_object::gc_roots::push_roots();
+    let zip_slot = pyre_object::gc_roots::pin_roots(&[zip_obj]);
+    let result = {
+        if !pyre_object::functional::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(
+            zip_slot,
+        )) {
+            PY_NULL
+        } else {
+            zip_strict_shorter()
+        }
+    };
+    result
 }
 
 /// `functional.py` `W_Zip._raise_strict_error`. `format!` does not record,
@@ -23429,16 +23636,14 @@ fn shortcut_fallback_next(mut obj: PyObjectRef) -> PyResult {
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let w_next_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__next__"));
         let w_type = if is_instance(obj) {
             w_instance_get_type(obj)
         } else {
             crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr())
         };
         if !w_type.is_null()
-            && let Some(method) = lookup_in_type_where(
-                w_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__next__")),
-            )
+            && let Some(method) = lookup_in_type_where(w_type, w_next_name)
         {
             obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let w_type = if is_instance(obj) {
@@ -26536,7 +26741,7 @@ fn contains_list(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyE
 }
 
 pub(crate) fn contains_slot(
-    haystack: PyObjectRef,
+    mut haystack: PyObjectRef,
     mut needle: PyObjectRef,
 ) -> Result<bool, PyError> {
     use pyre_object::*;
@@ -26622,11 +26827,14 @@ pub(crate) fn contains_slot(
     // Instance __contains__ — PyPy: descroperation.py contains_w
     unsafe {
         if is_instance(haystack) {
+            let w_contains_name = pyre_object::with_roots!(haystack, needle => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__contains__"))
+            });
             let w_type = w_instance_get_type(haystack);
-            if let Some(method) = lookup_in_type_where(
+            if let Some(method) = pyre_object::with_roots!(haystack, needle => lookup_in_type_where(
                 w_type,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__contains__")),
-            ) {
+                w_contains_name,
+            )) {
                 if is_none(method) {
                     return Err(not_container_error(haystack));
                 }
@@ -26643,11 +26851,13 @@ pub(crate) fn contains_slot(
     // is the int storage type but its w_class carries `__contains__`).  The
     // is_instance receivers are already handled above.
     unsafe {
+        let w_contains_name = pyre_object::with_roots!(haystack, needle => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__contains__"))
+        });
         if let Some(w_type) = crate::typedef::r#type(haystack)
-            && let Some(method) = lookup_in_type_where(
-                w_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__contains__")),
-            )
+            && let Some(method) = pyre_object::with_roots!(haystack, needle => {
+                lookup_in_type_where(w_type.as_ptr(), w_contains_name)
+            })
         {
             if is_none(method) {
                 return Err(not_container_error(haystack));
@@ -26758,7 +26968,7 @@ pub fn side_effects_ok() -> bool {
 /// `inline(never)` so the codewriter mints the graph named by
 /// `flatten.rs` `DELITEM` (`space.delitem`).
 #[inline(never)]
-pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
+pub fn delitem(mut obj: PyObjectRef, mut index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
         // `pypy/objspace/std/dictproxyobject.py` exposes no
@@ -26774,7 +26984,7 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
         // override; exact instances and non-overriding subclasses fall through
         // to the by-layout deletion slot below.
         if (is_list(obj) || pyre_object::bytearrayobject::is_bytearray(obj))
-            && let Some((method, w_type)) = subclass_special_override(obj, "__delitem__")
+            && let Some((method, w_type)) = pyre_object::with_roots!(obj, index => subclass_special_override(obj, "__delitem__"))
         {
             get_and_call_function(method, obj, w_type, &[index])?;
             return Ok(());
@@ -26975,42 +27185,42 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             crate::builtins::memoryview_delitem(&[obj, index])?;
             return Ok(());
         }
-    }
-    // Instance __delitem__ — PyPy: descroperation.py delitem.  Errors from
-    // user `__delitem__` propagate (PyPy `space.delitem` raises directly);
-    // pyre's `call_function` stashes errors as PY_NULL so use
-    // `call_and_check` to recover them.
-    unsafe {
-        if pyre_object::is_instance(obj)
-            && let Some(method) = lookup_in_type_where(
-                pyre_object::w_instance_get_type(obj),
+        // Instance __delitem__ — PyPy: descroperation.py delitem.  Errors from
+        // user `__delitem__` propagate (PyPy `space.delitem` raises directly);
+        // pyre's `call_function` stashes errors as PY_NULL so use
+        // `call_and_check` to recover them.
+        if pyre_object::is_instance(obj) {
+            let mut w_type = pyre_object::w_instance_get_type(obj);
+            if let Some(method) = pyre_object::with_roots!(obj, index, w_type => lookup_in_type_where(
+                w_type,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delitem__")),
-            )
-        {
-            crate::builtins::call_and_check(method, &[obj, index])?;
-            return Ok(());
+            )) {
+                crate::builtins::call_and_check(method, &[obj, index])?;
+                return Ok(());
+            }
         }
         // descroperation.py delitem — any object whose type registers a
         // `__delitem__` on its MRO supports deletion; the arms above are fast
         // paths for the builtin sequence/mapping layouts.  Covers typed-payload
         // types like `deque` whose typedef binds `__delitem__`.
-        if let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = lookup_in_type_where(
-                w_type.as_ptr(),
+        if let Some(w_type) = crate::typedef::r#type(obj) {
+            let mut w_type = w_type.as_ptr();
+            if let Some(method) = pyre_object::with_roots!(obj, index, w_type => lookup_in_type_where(
+                w_type,
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__delitem__")),
-            )
-        {
-            crate::builtins::call_and_check(method, &[obj, index])?;
-            return Ok(());
+            )) {
+                crate::builtins::call_and_check(method, &[obj, index])?;
+                return Ok(());
+            }
         }
+        if container_is_frozendict(obj) {
+            return Err(PyError::type_error(format!(
+                "'{}' object does not support item deletion",
+                crate::error::type_name_of(obj),
+            )));
+        }
+        Err(PyError::type_error("object does not support item deletion"))
     }
-    if container_is_frozendict(obj) {
-        return Err(PyError::type_error(format!(
-            "'{}' object does not support item deletion",
-            crate::error::type_name_of(obj),
-        )));
-    }
-    Err(PyError::type_error("object does not support item deletion"))
 }
 
 /// Delete item from dict by key.  `pypy/objspace/std/dictmultiobject.py descr_delitem

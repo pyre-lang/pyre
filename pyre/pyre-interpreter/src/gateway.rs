@@ -3054,12 +3054,11 @@ fn path_or_fd_w(
             // without losing that observable descriptor value.
             (Vec::new(), obj_slot, fd, true)
         } else {
-            let Some(fspath_descr) = crate::typedef::r#type(obj).and_then(|pt| {
-                crate::baseobjspace::lookup_in_type(
-                    pt.as_ptr(),
-                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__fspath__")),
-                )
-            }) else {
+            let w_fspath_name =
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__fspath__"));
+            let Some(fspath_descr) = crate::typedef::r#type(obj)
+                .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), w_fspath_name))
+            else {
                 return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();

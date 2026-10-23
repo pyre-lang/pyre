@@ -573,6 +573,11 @@ pub const SLICE_BUFFER_FREE: &str = "majit_rlib::lltypesystem::rvec::ll_slice_bu
 /// `AssertionError`, so `remove_assertion_errors` leaves the fail arm.
 pub const SLICE_BOUNDS_PANIC: &str = "majit_rlib::lltypesystem::rvec::ll_slice_bounds_panic";
 
+/// `ll_slice_contains_c`: `ll_listcontains` over a byte slice. Item stride
+/// is one (`Array(Char)`); the one-word `ll_slice_contains_i` helpers are
+/// not this path.
+pub const SLICE_CONTAINS_C: &str = "majit_rlib::lltypesystem::rvec::ll_slice_contains_c";
+
 /// `ll_slice_len_slot_new`: the caller allocates the one-word out-param slot
 /// a slice-returning callee stores the length into.
 pub const SLICE_LEN_SLOT_NEW: &str = "majit_rlib::lltypesystem::rvec::ll_slice_len_slot_new";

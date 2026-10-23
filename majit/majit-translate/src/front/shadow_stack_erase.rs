@@ -56,7 +56,7 @@ use std::collections::{HashMap, VecDeque};
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
     FunDecl, Operand, Place, PlaceKind, ProjectionElem, Rvalue, SpanRef, StmtKind, TermKind, TyRef,
-    Unstructured,
+    TypeDeclKind, Unstructured,
 };
 use serde_json::{Value, json};
 
@@ -346,6 +346,74 @@ fn tuple_field_of_local(place: &Place) -> Option<(usize, u64)> {
     let index = field.get(1)?.as_u64()?;
     let base = place_local(inner).or_else(|| deref_of_local(inner))?;
     Some((base, index))
+}
+
+/// A field type that is a pointer or GC handle. Copying it does not inherit
+/// the base parameter's slot-index identity: the word is a reference, not
+/// the usize the caller supplied as a Get index. A usize field of a
+/// parameter is still ParamSlots when used as a Get. Unresolved
+/// `Deduplicated` (synthetic fixtures mint `ty()` as id 0) keeps the
+/// inherit so those bodies stay ParamSlots.
+fn field_ty_is_pointer_or_gc(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_json_node(ty, llbc) else {
+        return false;
+    };
+    field_node_is_pointer_or_gc(node, llbc, 0)
+}
+
+fn tyref_json_node<'a>(ty: &'a TyRef, llbc: &'a Llbc) -> Option<&'a Value> {
+    match ty {
+        TyRef::Inline { value: (_, v) } => Some(v),
+        TyRef::Other(v) => Some(v),
+        TyRef::Dedup { id } => llbc.dedup_body(*id),
+    }
+}
+
+fn field_node_is_pointer_or_gc(node: &Value, llbc: &Llbc, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    if let Some(id) = node.get("Deduplicated").and_then(Value::as_u64) {
+        return llbc
+            .dedup_body(id)
+            .is_some_and(|inner| field_node_is_pointer_or_gc(inner, llbc, depth + 1));
+    }
+    if let Some(arr) = node.get("Value").and_then(Value::as_array)
+        && arr.len() == 2
+    {
+        return field_node_is_pointer_or_gc(&arr[1], llbc, depth + 1);
+    }
+    if node.get("RawPtr").is_some() || node.get("Ref").is_some() {
+        return true;
+    }
+    let Some(def_id) = field_adt_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    match &td.kind {
+        TypeDeclKind::Alias(body) => {
+            let inner = body.get("aliased_ty").unwrap_or(body);
+            field_node_is_pointer_or_gc(inner, llbc, depth + 1)
+        }
+        TypeDeclKind::Struct(fields) if td.is_repr_transparent() => fields
+            .iter()
+            .any(|field| field_ty_is_pointer_or_gc(&field.ty, llbc)),
+        _ => false,
+    }
+}
+
+fn field_adt_def_id(node: &Value) -> Option<u64> {
+    let adt = node.get("Adt")?;
+    if let Some(obj) = adt.as_object() {
+        match obj.get("builtin").and_then(Value::as_str) {
+            None | Some("Box") => obj.get("id")?.as_u64(),
+            Some(_) => None,
+        }
+    } else {
+        adt.as_array()?.first()?.as_u64()
+    }
 }
 
 /// Whether a `Ref` / `RawPtr` kind writes through the borrowed place.
@@ -722,6 +790,19 @@ fn classify_or_look_through(
 /// wrapper with no RootScope (reload of the held frame, a handle, or only
 /// a cache). Runtime `shadow_stack` / `gc_roots` bodies stay opaque: those
 /// are the implementations, not wrappers. `SlotTop` stays `SlotTop`.
+///
+/// ReloadTop is [`classify_call`] on the `gc_roots` reload primitive
+/// (`reload_top_root` / `reload_top_root_at`) and the `shadow_stack`
+/// `top_ref` / `slot_top_ref` leaves. A wrapper is copies and casts
+/// around those classified leaves, with no unmodeled Call
+/// (`ExtEnterLeaveMarker` methods stay Calls).
+///
+/// A single Get/Set/CopyRange is that wrap only when its index is the
+/// wrapper's argument 0 (local 1). `classify_or_look_through` then
+/// treats the wrapper Call as that leaf with `method = false`, so the
+/// walk's index is the wrapper's first argument. `PyError::reload` is
+/// `roots.get(slot)`: the index is argument 2, and looking through as
+/// Get of the receiver would treat the GC handle as a slot index.
 fn look_through(
     call: &majit_charon_reader::ullbc::CallPayload,
     llbc: &Llbc,
@@ -748,6 +829,7 @@ fn look_through(
     nested.extend_from_slice(in_flight);
     nested.push(id);
     let mut found: Option<Leaf> = None;
+    let mut found_index_local: Option<usize> = None;
     let mut many = false;
     let mut opaque = false;
     for block in &body.body {
@@ -757,15 +839,25 @@ fn look_through(
         let Ok(TermKind::Call { call: inner, .. }) = block.term_ref(llbc) else {
             continue;
         };
-        let leaf = match classify_call(inner, llbc) {
+        let (leaf, index_local) = match classify_call(inner, llbc) {
             Some((Leaf::Unmodeled, _)) if allow_cached => {
                 opaque = true;
                 continue;
             }
             Some((Leaf::Unmodeled, _)) => return Err(unmodeled_use(&path)),
-            Some((leaf, _)) => leaf,
+            Some((leaf, method)) => (
+                leaf,
+                matches!(leaf, Leaf::Get | Leaf::Set | Leaf::CopyRange)
+                    .then(|| inner.args.get(usize::from(method)).and_then(operand_local))
+                    .flatten(),
+            ),
             None => match look_through(inner, llbc, &nested, false) {
-                Ok(leaf) => leaf,
+                Ok(leaf) => (
+                    leaf,
+                    matches!(leaf, Leaf::Get | Leaf::Set | Leaf::CopyRange)
+                        .then(|| inner.args.first().and_then(operand_local))
+                        .flatten(),
+                ),
                 Err(_) if allow_cached => {
                     opaque = true;
                     continue;
@@ -778,11 +870,17 @@ fn look_through(
             break;
         }
         found = Some(leaf);
+        found_index_local = index_local;
     }
     if let Some(leaf) = found.filter(|_| !many && !opaque) {
-        return Ok(leaf);
+        if !matches!(leaf, Leaf::Get | Leaf::Set | Leaf::CopyRange) || found_index_local == Some(1)
+        {
+            return Ok(leaf);
+        }
     }
-    if !allow_cached {
+    // Unmodeled inners (`opaque`) mean this body is not the reload
+    // primitive and not a cached-slot wrapper of only classified leaves.
+    if !allow_cached || opaque {
         return Err(unmodeled_use(&path));
     }
     match analyze_in(&body, llbc, &nested, false) {
@@ -1104,6 +1202,14 @@ fn analyze_in(
                                 Some(Special::IndexPair(k)) => Some(Special::Index(*k)),
                                 Some(Special::Index(k)) => Some(Special::Index(*k)),
                                 Some(Special::ReloadedRoot) => Some(Special::ReloadedRoot),
+                                // `RootScope { save_point, _not_send }`:
+                                // rustc inlines `base()` to a copy of
+                                // field 0, the save_point index.
+                                Some(Special::Guard(d)) => Some(Special::Index(*d)),
+                                Some(Special::Alias(g)) => match plan.specials.get(g) {
+                                    Some(Special::Guard(d)) => Some(Special::Index(*d)),
+                                    _ => None,
+                                },
                                 _ => None,
                             }
                         } else {
@@ -2510,21 +2616,28 @@ fn stack_walk(
                         // >= entry. A usize field of a parameter is a
                         // value the caller supplied, so it records that
                         // parameter in param_slots when used as a Get.
+                        // A pointer / GC field is the handle itself
+                        // (`PyError.0`, a GCREF message), not a slot index.
                         if field == 0 {
                             index_from = pairs.get(&base).copied();
                             param_from = param_pairs.get(&base).copied();
+                            if index_from.is_none() {
+                                let guard_base = aliases.get(&base).copied().unwrap_or(base);
+                                index_from = guards.get(&guard_base).copied();
+                            }
                         }
+                        let pointer_field = field_ty_is_pointer_or_gc(&src.ty, llbc);
                         if index_from.is_none() {
-                            index_from = field_indices
-                                .get(&(base, field))
-                                .copied()
-                                .or_else(|| indices.get(&base).copied());
+                            index_from = field_indices.get(&(base, field)).copied();
+                            if index_from.is_none() && !pointer_field {
+                                index_from = indices.get(&base).copied();
+                            }
                         }
                         if param_from.is_none() {
-                            param_from = field_params
-                                .get(&(base, field))
-                                .copied()
-                                .or_else(|| params.get(&base).copied());
+                            param_from = field_params.get(&(base, field)).copied();
+                            if param_from.is_none() && !pointer_field {
+                                param_from = params.get(&base).copied();
+                            }
                         }
                     }
                     clear_tracked(
@@ -4224,6 +4337,158 @@ mod tests {
     }
 
     #[test]
+    fn inlined_guard_base_field_is_own_index() {
+        let llbc = stack_ops_llbc();
+        let copy = |i| json!({"Copy": place(i)});
+        let field0 = json!({
+            "kind": {"Projection": [place(1), {"Field": [null, 0]}]},
+            "ty": ty()
+        });
+        // Open, two Pins, copy Guard.0 (inlined `RootScope::base`),
+        // Get(base+1). rustc inlines `roots.base()` to a copy of field
+        // 0; that word is the save_point index, so Get of it (or of
+        // base+1) is still own. `set_add_value` is this shape.
+        let body = body_of(
+            7,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![copy(0)], 2, 2)),
+                bb(call_fun(4, vec![copy(0)], 3, 3)),
+                bb_stmts(
+                    vec![
+                        assign_local(4, json!({"Use": [{"Copy": field0}, "No"]})),
+                        assign_local(5, json!({"BinaryOp": ["Add", copy(4), usize_lit(1)]})),
+                    ],
+                    call_fun(2, vec![copy(5)], 6, 4),
+                ),
+                bb(drop_local(1, 5)),
+                bb(json!("Return")),
+            ],
+        );
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+        assert!(
+            is_neutral(&body, &llbc),
+            "Get of inlined Guard.0 + 1 must be own"
+        );
+    }
+
+    #[test]
+    fn look_through_get_of_later_param_is_not_arg0() {
+        let copy = |i| json!({"Copy": place(i)});
+        let wrapper_body = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 3,
+                "locals": (0..5u64).map(local_decl).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call_fun(2, vec![copy(3)], 4, 1)),
+                bb(json!("Return")),
+            ]
+        });
+        let arg0_wrapper_body = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": (0..3u64).map(local_decl).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call_fun(2, vec![copy(1)], 2, 1)),
+                bb(json!("Return")),
+            ]
+        });
+        let caller_body = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": (0..6u64).map(local_decl).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(4, vec![copy(0)], 2, 2)),
+                bb(call_fun(3, vec![], 3, 3)),
+                bb(call_fun(5, vec![copy(0), copy(1), copy(3)], 4, 4)),
+                bb(drop_local(1, 5)),
+                bb(json!("Return")),
+            ]
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(
+                        5,
+                        &["lib", "reload_slot"],
+                        json!({ "Unstructured": wrapper_body })
+                    ),
+                    opaque_fun(
+                        6,
+                        &["lib", "get_arg0"],
+                        json!({ "Unstructured": arg0_wrapper_body })
+                    ),
+                    opaque_fun(
+                        7,
+                        &["lib", "caller"],
+                        json!({ "Unstructured": caller_body })
+                    )
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let wrapper = llbc
+            .fn_by_id(5)
+            .expect("reload_slot")
+            .unstructured()
+            .unwrap();
+        let walk = stack_walk(&wrapper, &llbc, &|_| CalleeEffect::none());
+        assert!(
+            !walk.effect().observes && walk.effect().param_slots == vec![2],
+            "Get of argument 2 is ParamSlots[2]: {:?}",
+            walk.effect()
+        );
+        let caller = llbc.fn_by_id(7).expect("caller").unstructured().unwrap();
+        let reload_call = match caller.body[3].term_ref(&llbc) {
+            Ok(TermKind::Call { call, .. }) => call,
+            other => panic!("expected wrapper Call, got {other:?}"),
+        };
+        assert!(
+            classify_or_look_through(reload_call, &llbc, &[], false).is_none(),
+            "Get of argument 2 must not look through as Get of the receiver"
+        );
+        let arg0_caller = body_of(
+            2,
+            vec![bb(call_fun(6, vec![copy(0)], 1, 1)), bb(json!("Return"))],
+        );
+        let arg0_call = match arg0_caller.body[0].term_ref(&llbc) {
+            Ok(TermKind::Call { call, .. }) => call,
+            other => panic!("expected arg0 wrapper Call, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                classify_or_look_through(arg0_call, &llbc, &[], false),
+                Some((Leaf::Get, false))
+            ),
+            "Get of argument 0 still looks through as Get"
+        );
+        assert!(
+            body_is_depth_neutral(&caller, &llbc, &|_| CalleeEffect::none()),
+            "look-through as Get of the handle would Observe an untracked index"
+        );
+    }
+
+    #[test]
     fn field_of_param_used_as_index_is_param_slots() {
         let llbc = stack_ops_llbc();
         let field0 = json!({
@@ -4274,6 +4539,35 @@ mod tests {
         assert!(
             !walk.effect().observes && walk.effect().param_slots == vec![0],
             "Get of (*param).field is ParamSlots: {:?}",
+            walk.effect()
+        );
+    }
+
+    #[test]
+    fn pointer_field_of_param_is_not_param_slots() {
+        let llbc = stack_ops_llbc();
+        let ptr_ty = json!({"RawPtr": [ty(), "Mut"]});
+        let field0 = json!({
+            "kind": {"Projection": [place(1), {"Field": [null, 0]}]},
+            "ty": ptr_ty
+        });
+        // Get of a pointer field of argument 0: the word is a handle,
+        // not the usize the caller supplied as a slot index.
+        let callee = body_of_args(
+            1,
+            4,
+            vec![
+                bb_stmts(
+                    vec![assign_local(2, json!({"Use": [{"Copy": field0}, "No"]}))],
+                    call_fun(2, vec![json!({"Copy": place(2)})], 3, 1),
+                ),
+                bb(json!("Return")),
+            ],
+        );
+        let walk = stack_walk(&callee, &llbc, &|_| CalleeEffect::none());
+        assert!(
+            walk.effect().observes && walk.effect().param_slots.is_empty(),
+            "Get of param.pointer_field is Observes, not ParamSlots: {:?}",
             walk.effect()
         );
     }
@@ -4904,6 +5198,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ReloadTop is [`classify_call`] on the `gc_roots` reload primitive.
+    /// A body that also has an unmodeled Call is not that primitive, so
+    /// the wrapper Call stays (`ExtEnterLeaveMarker` methods).
+    #[test]
+    fn erase_does_not_look_through_reload_beside_unmodeled() {
+        let copy = |i| json!({"Copy": place(i)});
+        let wrapper_body = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": (0..4u64).map(local_decl).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call_fun(3, vec![], 2, 1)),
+                bb(call_fun(1, vec![copy(1)], 0, 2)),
+                bb(json!("Return")),
+            ]
+        });
+        let caller_body = json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": (0..3u64).map(local_decl).collect::<Vec<_>>()
+            },
+            "body": [
+                bb(call_fun(4, vec![copy(1)], 0, 1)),
+                bb(json!("Return")),
+            ]
+        });
+        let funs = vec![
+            json!(null),
+            opaque_fun(
+                1,
+                &["pyre_object", "gc_roots", "reload_top_root"],
+                json!("Opaque"),
+            ),
+            json!(null),
+            opaque_fun(3, &["lib", "warm_work"], json!("Opaque")),
+            opaque_fun(
+                4,
+                &["lib", "warm_enter"],
+                json!({ "Unstructured": wrapper_body }),
+            ),
+            opaque_fun(
+                5,
+                &["lib", "caller"],
+                json!({ "Unstructured": caller_body }),
+            ),
+        ];
+        let llbc = cached_slot_llbc(funs);
+        let fd = llbc.fn_by_id(5).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let kept = erase_or_keep(fd, body, &llbc);
+        assert!(
+            !no_call_path_contains(&kept, &llbc, "warm_enter"),
+            "a reload beside unmodeled work is not a ReloadTop wrapper"
+        );
     }
 
     /// The shadow-stack runtime keeps executing the source; only callers

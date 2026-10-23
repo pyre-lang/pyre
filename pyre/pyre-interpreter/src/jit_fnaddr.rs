@@ -4989,6 +4989,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // leaf — the crate-root alias leaf must stay un-prefixed (strips to
     // `["ll_append_res0"]`) to satisfy both the leaf-name gate and the
     // `function_fnaddrs.contains_key` lookup; the real symbols carry `jit_`.
+    // `jit_ll_build` is the 1-arg residual of `__majit_stringbuilder_build`
+    // (`jtransform` retargets the marker onto `["jit_ll_build"]`, matching
+    // this crate-root alias). The runtime `ll_build` FunDecl stays `(i64, usize)`.
+    cpa1!(
+        &mut entries,
+        "pyre_object::rbuilder::jit_ll_build",
+        "pyre_object::jit_ll_build",
+        pyre_object::rbuilder::rbuilder_runtime::jit_ll_build,
+    );
     cpa2!(
         &mut entries,
         "pyre_object::rbuilder::ll_append_res0",
@@ -7912,6 +7921,22 @@ mod tests {
         std::borrow::Cow::Owned(format!("{parent}::{name}"))
     }
 
+    /// `look_inside_iff` publishes both `<name>` and `<name>_trampoline`
+    /// on the residual wrapper (`rlib/jit.py` `trampoline.__name__ =
+    /// func.__name__ + "_trampoline"`). Same parent, same item.
+    fn look_inside_iff_trampoline_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+        let Some((parent, leaf)) = path.rsplit_once("::") else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        let Some(name) = leaf.strip_suffix("_trampoline") else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        if name.is_empty() {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        std::borrow::Cow::Owned(format!("{parent}::{name}"))
+    }
+
     /// Crate-root glob re-exports in `lib.rs`: a top-level `pub use <module>::*;`
     /// after trimming whitespace and dropping comments. `gateway::{...}` and
     /// `majit_rlib::…` are not globs of a first-level module.
@@ -7980,6 +8005,8 @@ mod tests {
     fn are_alias_spellings(a: &str, b: &str) -> bool {
         let a_norm = elidable_body_spelling(a);
         let b_norm = elidable_body_spelling(b);
+        let a_norm = look_inside_iff_trampoline_spelling(a_norm.as_ref());
+        let b_norm = look_inside_iff_trampoline_spelling(b_norm.as_ref());
         let a = a_norm.as_ref();
         let b = b_norm.as_ref();
         if let (Some((crate_a, sym_a)), Some((crate_b, sym_b))) =
@@ -8134,6 +8161,20 @@ mod tests {
         assert!(are_alias_spellings(
             "pyre_interpreter::_pure_version_tag",
             "pyre_interpreter::baseobjspace::_orig__pure_version_tag_unlikely_name",
+        ));
+        // `look_inside_iff` publishes `<name>` and `<name>_trampoline` on
+        // the residual wrapper (`rlib/jit.py` `trampoline.__name__`).
+        assert!(are_alias_spellings(
+            "pyre_interpreter::_pow_mod",
+            "pyre_interpreter::_pow_mod_trampoline",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_interpreter::_pow_mod",
+            "pyre_interpreter::objspace::descroperation::_pow_mod_trampoline",
+        ));
+        assert!(!are_alias_spellings(
+            "pyre_interpreter::_pow_mod_trampoline",
+            "pyre_interpreter::_pow_nomod_trampoline",
         ));
         assert!(!are_alias_spellings(
             "pyre_interpreter::baseobjspace::_orig_should_not_inline_unlikely_name",
@@ -8323,8 +8364,8 @@ mod tests {
         );
     }
 
-    /// A `PyResult`-returning residual with a pair-slice argument and one with
-    /// only word arguments both publish a trampoline.
+    /// A `PyResult`-returning residual with a slice argument (`&[PyObjectRef]`,
+    /// one Ref word) and one with only word arguments both publish a trampoline.
     #[test]
     fn helper_fnaddrs_cover_pyresult_residuals() {
         let mut getattr_miss = false;
@@ -8333,7 +8374,7 @@ mod tests {
             if row.path == "pyre_interpreter::baseobjspace::object_getattr_miss" && row.arity == 4 {
                 getattr_miss = true;
             }
-            if row.path == "pyre_interpreter::gateway::builtin_code_call" && row.arity == 3 {
+            if row.path == "pyre_interpreter::gateway::builtin_code_call" && row.arity == 2 {
                 builtin_call = true;
             }
         });
@@ -8343,7 +8384,7 @@ mod tests {
         );
         assert!(
             builtin_call,
-            "builtin_code_call must be registered at arity 3"
+            "builtin_code_call must be registered at arity 2"
         );
     }
 

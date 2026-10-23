@@ -2837,28 +2837,27 @@ impl FrameState {
     /// Constants and None slots pass through unchanged.
     pub fn copy(&self, graph: &mut FunctionGraph) -> FrameState {
         use crate::flowspace::model::{Hlvalue, Variable};
-        // `_copy(v)` — each call independently mints a fresh Variable.
-        // `Variable(v)` (model.py) copies the source's name
-        // prefix via `rename(v)`, which reads `v._name`; carry the
-        // source slot's name onto the fresh Variable so the freshened
-        // state's phi inputs keep their human-readable names.
-        let copy_hlvalue = |h: &Hlvalue, graph: &mut FunctionGraph| -> Hlvalue {
-            match h {
-                Hlvalue::Variable(src) => {
-                    // `_copy(v) -> Variable(v)` (framestate.py): fresh
-                    // Variable carrying the source's `_name` prefix
-                    // (annotation stays None).
-                    let mut nv = graph.alloc_value_var();
-                    nv.rename_from(src);
-                    Hlvalue::Variable(nv)
-                }
-                other => other.clone(),
-            }
-        };
+        // `_copy(v) -> Variable(v)` (framestate.py / model.py): a fresh
+        // Variable carrying the source's `_name` prefix via `rename(v)`.
+        // RPython leaves `annotation` / `concretetype` None because
+        // rtyping has not run (`Variable.__init__`). Pyre stamps
+        // `concretetype` at the producer (`rtyper.py` `setconcretetype`
+        // analogue on the Call result), and a Call is a MIR terminator,
+        // so the successor's Discriminant reads this copied Variable
+        // (`rnone.py` `rtype_is_None` is `getkind(v.concretetype)`).
+        // `Variable.copy` already copies that cell (`copygraph`,
+        // `SSA_to_SSI`); annotation stays None as in `Variable(v)`.
         let copy_var = |v: &Variable, graph: &mut FunctionGraph| -> Variable {
             let mut nv = graph.alloc_value_var();
             nv.rename_from(v);
+            nv.set_concretetype(v.concretetype());
             nv
+        };
+        let copy_hlvalue = |h: &Hlvalue, graph: &mut FunctionGraph| -> Hlvalue {
+            match h {
+                Hlvalue::Variable(src) => Hlvalue::Variable(copy_var(src, graph)),
+                other => other.clone(),
+            }
         };
         // `locals_w` is the authoritative carrier (framestate.py __init__).
         // When `locals_w` is empty (pre-Z4.A.6 fixtures), fall back
@@ -8747,6 +8746,31 @@ impl FunctionGraph {
         res
     }
 
+    /// Address `NULL` (`history.py` `getkind` of a raw `Ptr` is `'int'`).
+    /// `rnone.py` `rtype_is_None` of an Address is `adr_eq(v, NULL)`, which
+    /// becomes `int_eq` then `int_is_zero`. A `null_mut()` call is a GC
+    /// `SomeInstance` and would mix that int word with a Ref.
+    /// Used when the producer Variable is already Signed
+    /// (`var_result_is_int_bank`) and the dest place type is still a
+    /// generic `Option` (`rtyper.py` `setconcretetype`).
+    pub fn push_address_null(&mut self, block: BlockId) -> crate::flowspace::model::Variable {
+        let res = self.alloc_value_var_with_type(ConcreteType::Signed);
+        self.block_mut(block).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        res
+    }
+
+    /// The value lives in the int bank: `Variable.concretetype` `getkind`
+    /// is Signed (`rtyper.py` `setconcretetype`, `history.py` `getkind`).
+    /// `rnone.py` `rtype_is_None` dispatches on that repr, not on a later
+    /// consumer's place type (a generic `Option` place can type Ref while
+    /// the producer Call already stamped Int).
+    pub fn var_result_is_int_bank(var: &crate::flowspace::model::Variable) -> bool {
+        matches!(Self::concretetype_of(var), ConcreteType::Signed)
+    }
+
     /// Mint a fresh value [`crate::flowspace::model::Variable`] with its
     /// [`ConcreteType`] stamped at construction — pyre's analogue of
     /// upstream `Variable(concretetype=...)` (RPython
@@ -9022,6 +9046,15 @@ impl FunctionGraph {
             target,
             self.name,
         );
+        // A Call is a MIR terminator; the successor Discriminant reads
+        // these inputargs. Stamp an empty `concretetype` from the link
+        // arg (`rtyper.py` `setconcretetype` on the merge Variable).
+        let inputargs = self.block(target).inputargs.clone();
+        for (dst, src) in inputargs.iter().zip(args.iter()) {
+            if dst.concretetype().is_none() {
+                dst.set_concretetype(src.concretetype());
+            }
+        }
         let link = Link::from_variables(self, args, target, None);
         self.set_control_flow_metadata(block, None, vec![link]);
     }
@@ -16282,6 +16315,75 @@ mod tests {
         assert!(
             merged.locals_w[1].is_none() && merged.locals_w[2].is_none(),
             "None-killed slots stay None in locals_w",
+        );
+    }
+
+    /// `FrameState.copy` is `Variable(v)` (framestate.py) plus the
+    /// producer `concretetype` already stamped on `v` (`rtyper.py`
+    /// `setconcretetype`). The successor Discriminant reads that cell.
+    #[test]
+    fn copy_propagates_signed_concretetype_onto_fresh_phi() {
+        let mut graph = FunctionGraph::new("copy_ct");
+        let src = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let fs = FrameState {
+            entries: vec![Some(src.clone())],
+            ..Default::default()
+        };
+        let copied = fs.copy(&mut graph);
+        let dst = copied.entries[0].as_ref().expect("copied slot");
+        assert_ne!(dst.id(), src.id(), "copy mints a fresh Variable");
+        assert_eq!(
+            FunctionGraph::concretetype_of(dst),
+            ConcreteType::Signed,
+            "successor phi carries the producer's Signed bindingrepr"
+        );
+    }
+
+    /// Disagreeing Variables mint a phi (`framestate.py` `Variable()`)
+    /// whose `concretetype` is the shared bindingrepr.
+    #[test]
+    fn union_phi_carries_signed_concretetype_when_both_sides_are_signed() {
+        let mut graph = FunctionGraph::new("union_ct");
+        let v_a = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let v_b = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let pred_a = FrameState {
+            entries: vec![Some(v_a.clone())],
+            ..Default::default()
+        };
+        let pred_b = FrameState {
+            entries: vec![Some(v_b.clone())],
+            ..Default::default()
+        };
+        let merged = pred_a
+            .union(&pred_b, &mut graph)
+            .expect("disagreeing-Variable union must succeed");
+        let phi = merged.entries[0].as_ref().expect("unioned slot");
+        assert_ne!(phi.id(), v_a.id());
+        assert_ne!(phi.id(), v_b.id());
+        assert_eq!(
+            FunctionGraph::concretetype_of(phi),
+            ConcreteType::Signed,
+            "merge phi carries Signed when both predecessors do"
+        );
+    }
+
+    /// Monotonic successor inputargs are minted Unknown at construction.
+    /// `set_goto` copies the predecessor Call dest's `concretetype`
+    /// (`rtyper.py` `setconcretetype` on the merge Variable) so a
+    /// successor Discriminant can read `getkind(var.concretetype)`.
+    #[test]
+    fn set_goto_stamps_unknown_inputarg_from_signed_link_arg() {
+        let mut graph = FunctionGraph::new("goto_ct");
+        let pred = graph.create_block();
+        let succ = graph.create_block();
+        let phi = graph.alloc_value_var();
+        graph.block_mut(succ).inputargs.push(phi.clone());
+        let src = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.set_goto(pred, succ, vec![src]);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&phi),
+            ConcreteType::Signed,
+            "successor inputarg carries the link arg's Signed bindingrepr"
         );
     }
 

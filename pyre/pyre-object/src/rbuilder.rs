@@ -671,6 +671,14 @@ pub mod rbuilder_runtime {
         true
     }
 
+    /// Residual `ll_build` (`rbuilder.py AbstractStringBuilderRepr.rtype_method_build`).
+    /// The front's `__majit_stringbuilder_build` marker retargets here; `item_size`
+    /// is the STR width RPython's `ll_build` closes over.
+    #[majit_macros::dont_look_inside]
+    pub extern "C" fn jit_ll_build(builder: crate::PyObjectRef) -> crate::PyObjectRef {
+        ll_build(builder as i64, STR_ITEM_SIZE) as crate::PyObjectRef
+    }
+
     /// `ll_append_res0(ll_builder, ll_str)` = `_ll_append(ll_builder, ll_str, 0,
     /// len(ll_str.chars))` (`rbuilder.py`). The `dont_look_inside` residual
     /// target the codewriter binds when an append cannot be inlined; mutates the

@@ -1749,15 +1749,6 @@ pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
     }
 }
 
-/// Same barrier as [`remember_frame_locals_array`], taking the frame so a
-/// looked-inside caller (`function.py funccall_valuestack`, `_flat_pycall`)
-/// does not pass `locals_cells_stack_w` (`jtransform.py check_no_vable_array`).
-#[inline]
-#[majit_macros::dont_look_inside]
-pub fn remember_frame_locals(frame: &PyFrame) {
-    remember_frame_locals_array(frame.locals_cells_stack_w);
-}
-
 /// Deallocate a `FixedObjectArray` allocated with
 /// [`alloc_fixed_array_with_header`].
 /// # Safety

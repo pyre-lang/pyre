@@ -1875,8 +1875,12 @@ pub fn proxy_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 }
 
 pub fn proxy_next(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_obj0 = force(args[0])?;
-    if unsafe { crate::baseobjspace::lookup(w_obj0, "__next__") }.is_none() {
+    let mut w_obj0 = force(args[0])?;
+    if unsafe {
+        pyre_object::with_roots!(w_obj0 => crate::baseobjspace::lookup(w_obj0, "__next__"))
+    }
+    .is_none()
+    {
         return Err(PyError::type_error(
             "Weakref proxy referenced a non-iterator".to_string(),
         ));

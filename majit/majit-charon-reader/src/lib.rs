@@ -85,6 +85,12 @@ pub struct Llbc {
     /// list; membership here is that missing layout, so `getkind` of the
     /// raw `Ptr` stays `'int'` across the linked input.
     raw_struct_paths: parking_lot::RwLock<Vec<String>>,
+    /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`
+    /// (`rclass.py getgcflavor` / `classdesc.get_param('_alloc_flavor_')`).
+    /// A pointer to one is a raw-flavored `Ptr` in the annotator; `history.py`
+    /// `getkind` `'int'` is the JIT kind only. Sorted; lookup matches the
+    /// intern-key leaf as well as the qualified path.
+    raw_alloc_flavor_paths: parking_lot::RwLock<Vec<String>>,
     /// Folded initializer of one global, keyed by that global's `def_id`
     /// inside this artefact. The encoded literal is owned by the global
     /// the lowering already loads with `global_by_id`; it is not a path
@@ -328,6 +334,7 @@ impl Llbc {
             span_bodies,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
             raw_struct_paths: parking_lot::RwLock::new(Vec::new()),
+            raw_alloc_flavor_paths: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
@@ -618,6 +625,44 @@ impl Llbc {
             .read()
             .binary_search_by(|known| known.as_str().cmp(path))
             .is_ok()
+    }
+
+    /// Merge harvested `_alloc_flavor_ = raw` struct names. Entries are
+    /// kept sorted; both the bare leaf (`CodeObject`) and a crate-stripped
+    /// qualified path are stored, matching the harvest set.
+    pub fn register_raw_alloc_flavor_paths(&self, entries: impl IntoIterator<Item = String>) {
+        let mut paths = self.raw_alloc_flavor_paths.write();
+        for path in entries {
+            if let Err(index) = paths.binary_search(&path) {
+                paths.insert(index, path);
+            }
+        }
+    }
+
+    /// Whether `path` names a struct harvested as `_alloc_flavor_ = raw`.
+    /// Matches the intern key's leaf (`bytecode::CodeObject` against
+    /// harvested `CodeObject` / `pycode::CodeObject`).
+    pub fn is_raw_alloc_flavor_path(&self, path: &str) -> bool {
+        let paths = self.raw_alloc_flavor_paths.read();
+        if paths.is_empty() {
+            return false;
+        }
+        if paths
+            .binary_search_by(|known| known.as_str().cmp(path))
+            .is_ok()
+        {
+            return true;
+        }
+        let leaf = path.rsplit("::").next().unwrap_or(path);
+        let leaf = leaf.split('<').next().unwrap_or(leaf);
+        if leaf != path
+            && paths
+                .binary_search_by(|known| known.as_str().cmp(leaf))
+                .is_ok()
+        {
+            return true;
+        }
+        false
     }
 
     /// Resolve a Charon `Deduplicated: <id>` type reference to the

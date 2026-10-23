@@ -11897,8 +11897,8 @@ mod tests {
         };
         assert_eq!(
             vec.item_kind(),
-            Some(majit_ir::rvec::VecItemKind::Ref),
-            "Vec<*mut u8> items are managed references"
+            Some(majit_ir::rvec::VecItemKind::Int),
+            "Vec<*mut u8> items are CCHARP / Address words (`history.py` getkind of a primitive pointer is int)"
         );
     }
 

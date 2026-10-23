@@ -285,6 +285,12 @@ fn mapdict_get_reads_slots_map_pointer_as_int() {
     );
 }
 
+/// `IntArray::base` / `FloatArray::base` collapse onto the GC block
+/// header (`l.items`). `history.py` `getkind` of a GC pointer is `ref`.
+/// The spelled `*mut i64` / `*mut f64` interior is `rffi.cast` after
+/// the call (`lltype.py` `cast_ptr_to_int` then `cast_int_to_ptr`) so
+/// `ann_direct_ptradd` sees `SomePtr`. This test previously asserted
+/// the dest-spelling deviation (`getkind` int on that CALL).
 #[test]
 fn typed_array_base_call_stays_int() {
     let llbc = load_llbc(OBJECT_LLBC);
@@ -303,10 +309,15 @@ fn typed_array_base_call_stays_int() {
             graph.name
         );
         assert!(
-            bases
-                .iter()
-                .all(|ty| matches!(ty, ValueType::Int | ValueType::Unsigned)),
-            "{path} base() is an interior raw Ptr (`getkind` int), got {bases:?}"
+            bases.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+            "{path} base() is the GcArray header (`getkind` ref), got {bases:?}"
+        );
+        let leaves: Vec<_> = ops(&graph)
+            .filter_map(|op| call_result(&op.kind).and_then(|(_, leaf)| leaf))
+            .collect();
+        assert!(
+            leaves.contains(&"cast_int_to_ptr"),
+            "{path} must rffi.cast the header onto CArrayPtr, got {leaves:?}"
         );
     }
 }
@@ -474,7 +485,7 @@ fn copy_string_to_raw_residual_keeps_gc_src_and_ccharp_dst() {
     let tys = residual_input_types(&copy);
     assert_eq!(tys.len(), 3, "copy_string_to_raw takes src, dst, length");
     assert!(
-        matches!(tys[0], ValueType::Ref(_)),
+        matches!(tys[0], ValueType::Str),
         "src is the GC string (`rstr.py copy_string_to_raw`), got {:?}",
         tys[0]
     );
@@ -524,6 +535,30 @@ fn copy_string_to_raw_residual_keeps_gc_src_and_ccharp_dst() {
             _ => false,
         }),
         "charpsize2str residual-calls copy_raw_to_string (`rffi.py charpsize2str`)"
+    );
+}
+
+/// `IntArray::as_slice` is looked-inside `rlist.py` `ll_items`: the body
+/// is a `[i64]` GcArray. The pair-slice `u64` token is the pointer word
+/// of a residual fat slice and must not become FUNC.RESULT.
+#[test]
+fn int_array_as_slice_does_not_stamp_pair_slice_token() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
+    let program = build_semantic_program_from_llbc(&llbc).expect("build object SemanticProgram");
+    let func = program
+        .functions
+        .iter()
+        .find(|func| {
+            func.name == "as_slice" && func.self_ty_root.as_deref() == Some("int_array::IntArray")
+        })
+        .expect("IntArray::as_slice in SemanticProgram");
+    assert_eq!(
+        func.return_type.as_deref(),
+        None,
+        "looked-inside IntArray::as_slice FUNC.RESULT follows the CFG GcArray, \
+         not the pair-slice u64 token; got {:?} trait_root={:?}",
+        func.return_type,
+        func.trait_root
     );
 }
 

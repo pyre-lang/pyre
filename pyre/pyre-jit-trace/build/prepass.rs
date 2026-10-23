@@ -1231,6 +1231,26 @@ fn real_main() {
                 // `dont_look_inside`, so `call.py find_all_graphs` never
                 // scans the hub. Seed it the way that walk seeds
                 // `inline_calls_to` helpers the codewriter residualizes.
+                //
+                // `_float_mul` / `_float_truediv` are the same unboxed
+                // leaves the walker descends (`FLOAT_MUL_DESCENT` /
+                // `FLOAT_TRUEDIV_DESCENT`). `mul_impl` contains the
+                // sequence-repeat loop, so `look_inside_graph` declines
+                // it and BFS never reaches the leaf from
+                // `binary_value_from_tag`; seed the leaves the walker
+                // looks up by path.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_mul",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_truediv",
+                ]),
                 majit_translate::CallPath::from_segments([
                     "pyre_interpreter",
                     "objspace",

@@ -249,6 +249,7 @@ where
         table[jitcode::insns::BC_INT_ISCONSTANT as usize] = Self::opimpl_int_isconstant;
         table[jitcode::insns::BC_REF_ISCONSTANT as usize] = Self::opimpl_ref_isconstant;
         table[jitcode::insns::BC_INT_ISVIRTUAL as usize] = Self::opimpl_int_isvirtual;
+        table[jitcode::insns::BC_INT_ISVIRTUAL_R as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_REF_ISVIRTUAL as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_STRLEN as usize] = Self::opimpl_strlen;
         table[jitcode::insns::BC_STRGETITEM as usize] = Self::opimpl_strgetitem;

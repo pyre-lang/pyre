@@ -1888,8 +1888,8 @@ fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyResult {
 /// `nb_multiply`, so the binary operator reaches the repeat with whatever it
 /// was handed: an operand with no `__index__` at all is refused as a repeat,
 /// naming its own type, rather than by the conversion behind that check.
-fn array_repeat_count(w_count: PyObjectRef) -> Result<i64, PyError> {
-    if unsafe { pyre_interpreter::baseobjspace::lookup(w_count, "__index__") }.is_none() {
+fn array_repeat_count(mut w_count: PyObjectRef) -> Result<i64, PyError> {
+    if pyre_object::with_roots!(w_count => unsafe { pyre_interpreter::baseobjspace::lookup(w_count, "__index__") }).is_none() {
         return Err(PyError::type_error(format!(
             "can't multiply sequence by non-int of type '{}'",
             pyre_interpreter::type_methods::arg_type_name(w_count)

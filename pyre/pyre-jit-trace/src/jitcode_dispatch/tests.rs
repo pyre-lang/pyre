@@ -5603,7 +5603,6 @@ fn float_binop_leaves_are_the_pypy_leaf() {
             !ops.iter().any(|op| op.starts_with("residual_call_irf")),
             "{path} must not residualize the payload; ops={ops:?}"
         );
-        eprintln!("{path} {} ops: {ops:?}", ops.len());
     }
 }
 

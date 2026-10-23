@@ -195,12 +195,13 @@ fn type_error_names_the_installed_class() -> bool {
 /// be rejected before the read rather than by comparing what the read returned.
 fn simple_weak_set_contains_identity() -> (usize, usize, usize, usize) {
     const NONE: (usize, usize, usize, usize) = (0, 0, 0, 0);
-    let Some(method) = (unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            simple_weak_set_type(),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__contains__")),
-        )
-    }) else {
+    let mut w_type = simple_weak_set_type();
+    let w_contains_name = pyre_object::with_roots!(w_type => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__contains__"))
+    });
+    let Some(method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, w_contains_name) })
+    else {
         return NONE;
     };
     if !unsafe { pyre_interpreter::is_function(method) } {
@@ -279,7 +280,7 @@ fn simple_weak_set_contains(
     else {
         return Ok(None);
     };
-    if simple_weak_set_contains_identity() != installed {
+    if pyre_object::with_roots!(cache, item => simple_weak_set_contains_identity()) != installed {
         return Ok(None);
     }
     let roots = pyre_object::gc_roots::push_roots();

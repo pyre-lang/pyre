@@ -2433,14 +2433,14 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         code,
         first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
     );
-    let result_roots = pyre_object::gc_roots::push_roots();
-    let result_slot = result_roots.pin_roots(&[result]);
-    unsafe { set_filename_bytes(result_roots.get(result_slot), filename_bytes) };
-    let result = result_roots.get(result_slot);
-    unsafe { set_co_code_bytes(result, co_code_bytes) };
-    unsafe { w_code_fill_consts_from_tuple(result_roots.get(result_slot), arg(8)) };
-    unsafe { w_code_fill_names_from_tuple(result_roots.get(result_slot), arg(9)) };
-    Ok(result_roots.get(result_slot))
+    let mut result = result;
+    pyre_object::with_roots!(result => {
+        unsafe { set_filename_bytes(result, filename_bytes) };
+        unsafe { set_co_code_bytes(result, co_code_bytes) };
+        unsafe { w_code_fill_consts_from_tuple(result, arg(8)) };
+        unsafe { w_code_fill_names_from_tuple(result, arg(9)) };
+    });
+    Ok(result)
 }
 
 fn code_data_equal(a: &crate::CodeObject, b: &crate::CodeObject) -> bool {
@@ -3825,17 +3825,19 @@ pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
     unsafe { w_code_set_hidden_applevel(w_code, true) };
 }
 
-/// Extract the opaque code pointer from a known PyCode.
+/// Extract the leaked host `CodeObject` address from a known PyCode.
 ///
 /// `co_code` is immutable; a constant `PyCode` folds this to the body
-/// pointer so decode can fold `code_unit_at` as well.
+/// pointer so decode can fold `code_unit_at` as well. The return is
+/// `*const CodeObject` (`PyCode.code_ptr`): `history.getkind` of that
+/// raw `Ptr` is `"int"`, matching `code_instructions_len`'s `FUNC.ARGS`.
 ///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
 #[inline]
 #[majit_macros::elidable_cannot_raise]
-pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const () {
-    unsafe { (*(obj as *const PyCode)).code_ptr as *const () }
+pub unsafe fn w_code_get_ptr(obj: PyObjectRef) -> *const crate::CodeObject {
+    unsafe { (*(obj as *const PyCode)).code_ptr }
 }
 
 /// `Constants<ConstantData>` is a single-field tuple wrapping `Box<[ConstantData]>`.
@@ -4208,7 +4210,10 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
 /// Refresh [`register_live_code_wrapper`] for the code object `obj`.
 #[majit_macros::dont_look_inside]
 fn w_code_register_live_wrapper(obj: PyObjectRef) {
-    register_live_code_wrapper(unsafe { (*(obj as *const PyCode)).code_ptr }, obj);
+    register_live_code_wrapper(
+        unsafe { (*(obj as *const PyCode)).code_ptr as *const () },
+        obj,
+    );
 }
 
 /// The first `frame_stores_global` store into a code object's `w_globals`.

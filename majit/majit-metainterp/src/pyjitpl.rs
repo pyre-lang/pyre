@@ -2817,11 +2817,6 @@ pub struct MetaInterp<M: Clone> {
     /// from the tracing green_key when cross-loop cut retargets to the
     /// inner loop's key (compile.py:269).
     pub(crate) last_compiled_key: Option<u64>,
-    /// Whether the last root trace entered by a structured green key, whose
-    /// layout prepends the back-edge target (`TraceCtx::green_key_prepends_pc`).
-    /// A bridge has no key of its own and files its closing loop under the
-    /// same layout.
-    pub(crate) structured_entry_keys: bool,
     /// Owning JitCellToken of the most recently compiled loop or bridge.
     /// `compile.py:record_loop_or_bridge` registers this token itself on every
     /// quasi-immutable dependency, including when the dependency was found in
@@ -4696,7 +4691,6 @@ impl<M: Clone> MetaInterp<M> {
             cancel_count: 0,
             internal_compile_panics: 0,
             last_compiled_key: None,
-            structured_entry_keys: false,
             last_compiled_artifact_token: None,
             potential_retrace_position: None,
             last_quasi_immutable_deps: Vec::new(),
@@ -7218,7 +7212,6 @@ impl<M: Clone> MetaInterp<M> {
         let force_finish = self
             .warm_state_for_driver(jd_no)
             .should_force_finish_tracing_for_key(&green_key_values);
-        self.structured_entry_keys = true;
         let mut ctx = TraceCtx::with_green_key(
             recorder,
             green_key,

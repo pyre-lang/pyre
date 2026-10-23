@@ -3982,8 +3982,8 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// subclass priority). The caller traces the call.
 #[majit_macros::dont_look_inside]
 unsafe fn lookup_plain_compare_function(
-    a: PyObjectRef,
-    b: PyObjectRef,
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
     op: CompareOp,
 ) -> PyObjectRef {
     let dunder = match op {
@@ -3995,11 +3995,11 @@ unsafe fn lookup_plain_compare_function(
         CompareOp::Ne => "__ne__",
     };
     let rdunder = reverse_dunder(dunder).unwrap_or(dunder);
-    let a_method = plain_compare_function(a, dunder);
+    let a_method = pyre_object::with_roots!(a, b => plain_compare_function(a, dunder));
     if a_method.is_null() {
         return pyre_object::PY_NULL;
     }
-    let b_method = plain_compare_function(b, rdunder);
+    let b_method = pyre_object::with_roots!(a, b => plain_compare_function(b, rdunder));
     let b_first = !b_method.is_null()
         && match (crate::typedef::r#type(a), crate::typedef::r#type(b)) {
             (Some(at), Some(bt)) => at != bt && issubtype_cached(bt.as_ptr(), at.as_ptr()),
@@ -4013,15 +4013,16 @@ unsafe fn lookup_plain_compare_function(
 }
 
 #[majit_macros::dont_look_inside]
-unsafe fn plain_compare_function(obj: PyObjectRef, name: &str) -> PyObjectRef {
-    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+unsafe fn plain_compare_function(mut obj: PyObjectRef, name: &str) -> PyObjectRef {
+    let mut w_name = pyre_object::with_roots!(obj => pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)));
     let method = if is_instance(obj) {
         let Some(w_type) = crate::typedef::r#type(obj) else {
             return pyre_object::PY_NULL;
         };
-        lookup_in_type_where(w_type.as_ptr(), w_name)
+        let mut w_type = w_type.as_ptr();
+        pyre_object::with_roots!(obj, w_name, w_type => lookup_in_type_where(w_type, w_name))
     } else {
-        crate::baseobjspace::subclass_special_override(obj, name).map(|(method, _)| method)
+        pyre_object::with_roots!(obj, w_name => crate::baseobjspace::subclass_special_override(obj, name).map(|(method, _)| method))
     };
     let Some(method) = method else {
         return pyre_object::PY_NULL;
@@ -4078,8 +4079,10 @@ unsafe fn try_compare_override_inner(
     let _roots = pyre_object::gc_roots::push_roots();
     let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
     let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
-    let comparison_method = |obj: PyObjectRef, name: &str| {
-        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+    let comparison_method = |mut obj: PyObjectRef, name: &str| {
+        let w_name = pyre_object::with_roots!(obj => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name))
+        });
         if is_instance(obj) {
             let w_type = crate::typedef::r#type(obj)?;
             let method = lookup_in_type_where(w_type.as_ptr(), w_name)?;
@@ -4310,64 +4313,33 @@ pub fn init_interned_binop_names() {
 
 /// Interned immortal `w_name` pair for a binop special. Each arm names a
 /// literal so the fold emits one Ref constant per name.
+///
+/// `box_str_constant` can collect (intern-table resize). The first interned
+/// word is pinned across the second intern.
+fn interned_dunder_pair(fwd: &str, rev: &str) -> (PyObjectRef, PyObjectRef) {
+    let mut left = pyre_object::unicodeobject::box_str_constant(Wtf8::new(fwd));
+    let right = pyre_object::with_roots!(left => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(rev))
+    });
+    (left, right)
+}
+
 fn interned_binop_w_names(op: BinopDunder) -> (PyObjectRef, PyObjectRef) {
     match op {
-        BinopDunder::Add => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__radd__")),
-        ),
-        BinopDunder::Sub => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__sub__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rsub__")),
-        ),
-        BinopDunder::Mul => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmul__")),
-        ),
-        BinopDunder::FloorDiv => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__floordiv__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rfloordiv__")),
-        ),
-        BinopDunder::Mod => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mod__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmod__")),
-        ),
-        BinopDunder::TrueDiv => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__truediv__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rtruediv__")),
-        ),
-        BinopDunder::Pow => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rpow__")),
-        ),
-        BinopDunder::DivMod => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__divmod__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rdivmod__")),
-        ),
-        BinopDunder::LShift => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__lshift__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rlshift__")),
-        ),
-        BinopDunder::RShift => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rshift__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rrshift__")),
-        ),
-        BinopDunder::And => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__and__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rand__")),
-        ),
-        BinopDunder::Or => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__or__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__ror__")),
-        ),
-        BinopDunder::Xor => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__xor__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rxor__")),
-        ),
-        BinopDunder::MatMul => (
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__matmul__")),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmatmul__")),
-        ),
+        BinopDunder::Add => interned_dunder_pair("__add__", "__radd__"),
+        BinopDunder::Sub => interned_dunder_pair("__sub__", "__rsub__"),
+        BinopDunder::Mul => interned_dunder_pair("__mul__", "__rmul__"),
+        BinopDunder::FloorDiv => interned_dunder_pair("__floordiv__", "__rfloordiv__"),
+        BinopDunder::Mod => interned_dunder_pair("__mod__", "__rmod__"),
+        BinopDunder::TrueDiv => interned_dunder_pair("__truediv__", "__rtruediv__"),
+        BinopDunder::Pow => interned_dunder_pair("__pow__", "__rpow__"),
+        BinopDunder::DivMod => interned_dunder_pair("__divmod__", "__rdivmod__"),
+        BinopDunder::LShift => interned_dunder_pair("__lshift__", "__rlshift__"),
+        BinopDunder::RShift => interned_dunder_pair("__rshift__", "__rrshift__"),
+        BinopDunder::And => interned_dunder_pair("__and__", "__rand__"),
+        BinopDunder::Or => interned_dunder_pair("__or__", "__ror__"),
+        BinopDunder::Xor => interned_dunder_pair("__xor__", "__rxor__"),
+        BinopDunder::MatMul => interned_dunder_pair("__matmul__", "__rmatmul__"),
     }
 }
 
@@ -4425,25 +4397,27 @@ pub(crate) enum SeqBase {
 /// unresolvable `LoadStatic` into its JitCode.
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn needs_seq_binop_dispatch(
-    a: PyObjectRef,
-    b: PyObjectRef,
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
     base: SeqBase,
     op: BinopDunder,
 ) -> bool {
-    let (fwd, rev) = interned_binop_w_names(op);
-    let tp: *const pyre_object::PyType = match base {
-        SeqBase::Str => &pyre_object::STR_TYPE,
-        SeqBase::List => &pyre_object::LIST_TYPE,
-        SeqBase::Tuple => &pyre_object::TUPLE_TYPE,
-    };
-    let Some(t) = crate::typedef::gettypefor(tp) else {
-        return false;
-    };
-    let t = t.as_ptr();
-    dunder_overridden(a, fwd, t)
-        || dunder_overridden(a, rev, t)
-        || dunder_overridden(b, fwd, t)
-        || dunder_overridden(b, rev, t)
+    pyre_object::with_roots!(a, b => {
+        let (fwd, rev) = interned_binop_w_names(op);
+        let tp: *const pyre_object::PyType = match base {
+            SeqBase::Str => &pyre_object::STR_TYPE,
+            SeqBase::List => &pyre_object::LIST_TYPE,
+            SeqBase::Tuple => &pyre_object::TUPLE_TYPE,
+        };
+        let Some(t) = crate::typedef::gettypefor(tp) else {
+            return false;
+        };
+        let t = t.as_ptr();
+        dunder_overridden(a, fwd, t)
+            || dunder_overridden(a, rev, t)
+            || dunder_overridden(b, fwd, t)
+            || dunder_overridden(b, rev, t)
+    })
 }
 
 /// [`needs_seq_binop_dispatch`] behind the promoted exact-builtin test of
@@ -4465,12 +4439,14 @@ unsafe fn needs_seq_binop_dispatch_unless_exact(
 /// `add` graph.
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn needs_bytes_binop_dispatch(
-    a: PyObjectRef,
-    b: PyObjectRef,
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
     op: BinopDunder,
 ) -> bool {
-    let (fwd, rev) = interned_binop_w_names(op);
-    bytes_operand_overrides(a, fwd, rev) || bytes_operand_overrides(b, fwd, rev)
+    pyre_object::with_roots!(a, b => {
+        let (fwd, rev) = interned_binop_w_names(op);
+        bytes_operand_overrides(a, fwd, rev) || bytes_operand_overrides(b, fwd, rev)
+    })
 }
 
 /// [`needs_bytes_binop_dispatch`] behind the promoted exact-builtin test of
@@ -4517,7 +4493,7 @@ unsafe fn bytes_operand_overrides(obj: PyObjectRef, fwd: PyObjectRef, rev: PyObj
 /// base type statics are loaded here, and a traced caller would otherwise
 /// carry an unresolvable `LoadStatic`.
 #[majit_macros::dont_look_inside]
-pub(crate) unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, op: BinopDunder) -> bool {
+pub(crate) unsafe fn sequence_numeric_slot_is_null(mut obj: PyObjectRef, op: BinopDunder) -> bool {
     let tp: *const pyre_object::PyType = if is_str(obj) {
         &pyre_object::STR_TYPE
     } else if is_list(obj) {
@@ -4534,7 +4510,9 @@ pub(crate) unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, op: BinopDu
     let Some(t) = crate::typedef::gettypefor(tp) else {
         return false;
     };
-    !dunder_overridden(obj, interned_binop_w_names(op).0, t.as_ptr())
+    pyre_object::with_roots!(obj => {
+        !dunder_overridden(obj, interned_binop_w_names(op).0, t.as_ptr())
+    })
 }
 
 /// `needs_seq_binop_dispatch` for the `sq_repeat` branches of [`mul`], where
@@ -4552,11 +4530,11 @@ pub(crate) unsafe fn sequence_numeric_slot_is_null(obj: PyObjectRef, op: BinopDu
 /// traced caller emits a residual call rather than an unresolvable
 /// `LoadStatic`.
 #[majit_macros::dont_look_inside]
-pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: RepeatDunder) -> bool {
+pub(crate) unsafe fn seq_repeat_override(mut obj: PyObjectRef, dunders: RepeatDunder) -> bool {
     if pyre_object::is_exact_builtin_instance(obj) {
         return false;
     }
-    let t = if is_str(obj) {
+    let mut t = if is_str(obj) {
         let Some(t) = crate::typedef::gettypefor(&pyre_object::STR_TYPE) else {
             return false;
         };
@@ -4586,10 +4564,9 @@ pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: RepeatDunder
     } else {
         return false;
     };
-    match dunders {
+    pyre_object::with_roots!(obj, t => match dunders {
         RepeatDunder::MulPair => {
-            let mul = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__"));
-            let rmul = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmul__"));
+            let (mul, rmul) = interned_dunder_pair("__mul__", "__rmul__");
             dunder_overridden(obj, mul, t) || dunder_overridden(obj, rmul, t)
         }
         RepeatDunder::IMul => dunder_overridden(
@@ -4597,7 +4574,7 @@ pub(crate) unsafe fn seq_repeat_override(obj: PyObjectRef, dunders: RepeatDunder
             pyre_object::unicodeobject::box_str_constant(Wtf8::new("__imul__")),
             t,
         ),
-    }
+    })
 }
 
 /// True when `obj` is an exact builtin numeric instance
@@ -4672,12 +4649,14 @@ unsafe fn numeric_operand_overrides(
 /// `_call_binop_impl` looks inside. Exact builtins take the false arm in
 /// `needs_numeric_binop_dispatch_unless_exact` (`both_exact_builtin_instances_promoted`).
 pub(crate) unsafe fn needs_numeric_binop_dispatch(
-    a: PyObjectRef,
-    b: PyObjectRef,
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
     op: BinopDunder,
 ) -> bool {
-    let (fwd, rev) = interned_binop_w_names(op);
-    numeric_operand_overrides(a, fwd, rev) || numeric_operand_overrides(b, fwd, rev)
+    pyre_object::with_roots!(a, b => {
+        let (fwd, rev) = interned_binop_w_names(op);
+        numeric_operand_overrides(a, fwd, rev) || numeric_operand_overrides(b, fwd, rev)
+    })
 }
 
 /// [`needs_numeric_binop_dispatch`] behind the promoted exact-builtin test
@@ -4750,11 +4729,13 @@ pub(crate) unsafe fn both_exact_builtin_instances_promoted(a: PyObjectRef, b: Py
 /// Unary analog: true when numeric operand `a` overrides the unary
 /// special named by `op` relative to its builtin base.
 #[majit_macros::dont_look_inside]
-pub(crate) unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, op: UnaryDunder) -> bool {
-    let Some(t) = numeric_base_type_of_overriding_subclass(a) else {
-        return false;
-    };
-    dunder_overridden(a, op.interned_w_name(), t.as_ptr())
+pub(crate) unsafe fn needs_numeric_unaryop_dispatch(mut a: PyObjectRef, op: UnaryDunder) -> bool {
+    pyre_object::with_roots!(a => {
+        let Some(t) = numeric_base_type_of_overriding_subclass(a) else {
+            return false;
+        };
+        dunder_overridden(a, op.interned_w_name(), t.as_ptr())
+    })
 }
 
 /// Call the overriding unary special on a numeric subclass operand before
@@ -4769,22 +4750,27 @@ pub(crate) unsafe fn needs_numeric_unaryop_dispatch(a: PyObjectRef, op: UnaryDun
 /// already turns into `guard_class`.  With both pinned, the comparison is a
 /// constant and an exact builtin operand never records the probe at all.
 unsafe fn try_numeric_unaryop_override(
-    a: PyObjectRef,
+    mut a: PyObjectRef,
     op: UnaryDunder,
 ) -> Result<Option<PyObjectRef>, PyError> {
     if is_exact_builtin_instance_promoted(a) {
         return Ok(None);
     }
-    if !needs_numeric_unaryop_dispatch(a, op) {
+    if !pyre_object::with_roots!(a => needs_numeric_unaryop_dispatch(a, op)) {
         return Ok(None);
     }
     let Some(t) = crate::typedef::r#type(a) else {
         return Ok(None);
     };
-    let Some(method) = lookup_in_type_where(t.as_ptr(), op.interned_w_name()) else {
+    let mut t = t.as_ptr();
+    let Some(method) =
+        pyre_object::with_roots!(a, t => lookup_in_type_where(t, op.interned_w_name()))
+    else {
         return Ok(None);
     };
-    Ok(Some(crate::call::call_function_impl_result(method, &[a])?))
+    Ok(Some(
+        pyre_object::with_roots!(a => crate::call::call_function_impl_result(method, &[a]))?,
+    ))
 }
 
 /// Invoke only the right operand's reflected special method.
@@ -5032,13 +5018,22 @@ unsafe fn shortcut_binop(
 /// `_make_binop_impl` first arm: `type(w1) is type(w2)`, then
 /// `shortcut_binop` (`lookup` + `get_and_call_function`).
 pub(crate) fn try_binop_shortcut(
-    a: PyObjectRef,
-    b: PyObjectRef,
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
     op: BinopDunder,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         if !same_unoverridden_rpy_type(a, b) {
             return Ok(None);
+        }
+        // `call_shortcut`: `getattr(self, shortcut_name)`. The specialized
+        // class attribute on int/bool/float is the vtable slot stamped at
+        // `init_interned_binop_names`.
+        let vtable = get_shortcut_binop(&*(*a).ob_type) as *const BinopShortcutVtable;
+        if !vtable.is_null()
+            && let Some(f) = binop_shortcut_fn(&*vtable, op)
+        {
+            return Ok(Some(f(a, b)?));
         }
         let w_name = match op {
             BinopDunder::Add => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__")),
@@ -5069,7 +5064,7 @@ pub(crate) fn try_binop_shortcut(
             }
         };
         shortcut_binop(a, b, w_name)
-    }
+    })
 }
 
 /// `_make_binop_impl` first arm, then the shared `_impl` body.
@@ -5077,8 +5072,12 @@ pub(crate) fn try_binop_shortcut(
 /// Signature is `(w_obj1, w_obj2, op)` — three words.  Upstream's
 /// generated `binop_mod_impl(space, w_obj1, w_obj2)` closes over the
 /// TypeError symbol; a `&str` argument is two words and shifts `op`.
-pub(crate) fn binop_with_shortcut(a: PyObjectRef, b: PyObjectRef, op: BinopDunder) -> PyResult {
-    if let Some(w_res) = try_binop_shortcut(a, b, op)? {
+pub(crate) fn binop_with_shortcut(
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
+    op: BinopDunder,
+) -> PyResult {
+    if let Some(w_res) = pyre_object::with_roots!(a, b => try_binop_shortcut(a, b, op))? {
         return Ok(w_res);
     }
     let symbol = op.symbol();
@@ -5109,7 +5108,7 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 /// `+` and `+=` — one body, see [`binop_type_error`].
 pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Add);
         // A sequence left operand has no `nb_add` to offer, so the numeric
         // override runs the right operand's alone; the concat branches below
@@ -5139,7 +5138,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             // descroperation.py:664 "unicode + string subclass" — a str
             // subclass overriding `__add__`/`__radd__` must reach the
             // reflected dispatch; otherwise concat directly.
-            if needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::Str, BinopDunder::Add)
+            if pyre_object::with_roots!(a, b => needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::Str, BinopDunder::Add))
                 && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Add))?
             {
                 return Ok(result);
@@ -5148,7 +5147,9 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         }
         if is_str(a) {
             let str_type = crate::typedef::gettypefor(&pyre_object::STR_TYPE);
-            let w_add = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"));
+            let w_add = pyre_object::with_roots!(a, b => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"))
+            });
             let uses_builtin_add =
                 str_type.is_some_and(|str_type| !dunder_overridden(a, w_add, str_type.as_ptr()));
             if uses_builtin_add {
@@ -5164,7 +5165,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             }
         }
         if is_list(a) && is_list(b) {
-            if needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::List, BinopDunder::Add)
+            if pyre_object::with_roots!(a, b => needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::List, BinopDunder::Add))
                 && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Add))?
             {
                 return Ok(result);
@@ -5182,7 +5183,9 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             // wording either way: its `slot_nb_add` stands in for the base's
             // `sq_concat`, so nothing reaches this refusal.
             let list_type = crate::typedef::gettypefor(&pyre_object::LIST_TYPE);
-            let w_add = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"));
+            let w_add = pyre_object::with_roots!(a, b => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"))
+            });
             let uses_builtin_add =
                 list_type.is_some_and(|list_type| !dunder_overridden(a, w_add, list_type.as_ptr()));
             if uses_builtin_add {
@@ -5194,7 +5197,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             }
         }
         if is_tuple(a) && is_tuple(b) {
-            if needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::Tuple, BinopDunder::Add)
+            if pyre_object::with_roots!(a, b => needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::Tuple, BinopDunder::Add))
                 && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Add))?
             {
                 return Ok(result);
@@ -5204,7 +5207,9 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         if is_tuple(a) {
             // `tuple_concat`, the same shape as the list branch above.
             let tuple_type = crate::typedef::gettypefor(&pyre_object::TUPLE_TYPE);
-            let w_add = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"));
+            let w_add = pyre_object::with_roots!(a, b => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"))
+            });
             let uses_builtin_add = tuple_type
                 .is_some_and(|tuple_type| !dunder_overridden(a, w_add, tuple_type.as_ptr()));
             if uses_builtin_add {
@@ -5223,7 +5228,9 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
                 // Only a real bytes-like rhs can carry a subclass `__radd__`;
                 // a memoryview cannot, so dispatch only when both are bytes-like.
                 if pyre_object::bytesobject::is_bytes_like(b)
-                    && needs_bytes_binop_dispatch_unless_exact(a, b, BinopDunder::Add)
+                    && pyre_object::with_roots!(b_src, a, b => {
+                        needs_bytes_binop_dispatch_unless_exact(a, b, BinopDunder::Add)
+                    })
                     && let Some(result) = pyre_object::with_roots!(b_src, a, b => try_dispatch_binary_special(a, b, BinopDunder::Add))?
                 {
                     return Ok(result);
@@ -5250,7 +5257,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -5274,14 +5281,16 @@ pub fn sub(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 /// `-` and `-=` — one body, see [`binop_type_error`].
 pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         if set_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Sub))?
         {
             return Ok(result);
         }
-        let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Sub);
+        let numeric_override = pyre_object::with_roots!(a, b => {
+            needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Sub)
+        });
         if numeric_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Sub))?
         {
@@ -5316,7 +5325,7 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
@@ -5325,7 +5334,7 @@ pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 /// `*` and `*=` — one body, see [`binop_type_error`].
 pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Mul);
         // As in [`binop_add_impl`]: a sequence operand carries no
         // `nb_multiply`, so only the other operand's runs here.
@@ -5353,8 +5362,8 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // sequences.  A sequence subclass that overrides `__mul__`/`__rmul__`
         // must reach its override first — `LM([1]) * 2` is `LM.__mul__`, not a
         // list repetition — the same gate the concat branches of `add` apply.
-        if (seq_repeat_override(a, RepeatDunder::MulPair)
-            || seq_repeat_override(b, RepeatDunder::MulPair))
+        if (pyre_object::with_roots!(a, b => seq_repeat_override(a, RepeatDunder::MulPair))
+            || pyre_object::with_roots!(a, b => seq_repeat_override(b, RepeatDunder::MulPair)))
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Mul))?
         {
             return Ok(result);
@@ -5365,8 +5374,8 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // is the only operand offered and answers first.  The repeat runs at
         // the tail of this function when it declines.
         let count_answers_first = numeric_override
-            && (sequence_numeric_slot_is_null(a, BinopDunder::Mul)
-                || sequence_numeric_slot_is_null(b, BinopDunder::Mul));
+            && (pyre_object::with_roots!(a, b => sequence_numeric_slot_is_null(a, BinopDunder::Mul))
+                || pyre_object::with_roots!(a, b => sequence_numeric_slot_is_null(b, BinopDunder::Mul)));
         if !count_answers_first {
             if is_str(a) && is_int_or_long(b) {
                 return str_repeat(a, b);
@@ -5408,22 +5417,25 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // can address the sequence, at their post-collection addresses.
         let _roots = pyre_object::gc_roots::push_roots();
         let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
+        let mut a = pyre_object::gc_roots::shadow_stack_get(operands);
+        let mut b = pyre_object::gc_roots::shadow_stack_get(operands + 1);
         let dispatched = match (a_seq, b_seq) {
             (true, true) => None,
-            (true, false) => match lookup_type_special(
-                b,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmul__")),
-            ) {
-                Some(method) => try_call_special(method, &[b, a])?,
-                None => None,
-            },
-            (false, true) => match lookup_type_special(
-                a,
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__")),
-            ) {
-                Some(method) => try_call_special(method, &[a, b])?,
-                None => None,
-            },
+            (true, false) => {
+                let w_rmul_name =
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmul__"));
+                match lookup_type_special(b, w_rmul_name) {
+                    Some(method) => try_call_special(method, &[b, a])?,
+                    None => None,
+                }
+            }
+            (false, true) => {
+                let w_mul_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__"));
+                match lookup_type_special(a, w_mul_name) {
+                    Some(method) => try_call_special(method, &[a, b])?,
+                    None => None,
+                }
+            }
             (false, false) if !numeric_override => {
                 pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Mul))?
             }
@@ -5438,7 +5450,7 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // operand that has none is reported by its own type — the sequence is
         // never the one named.
         if a_seq || b_seq {
-            let (seq_slot, other) = if a_seq {
+            let (seq_slot, mut other) = if a_seq {
                 (operands, b)
             } else {
                 (operands + 1, a)
@@ -5446,7 +5458,10 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             // Named before the MRO walk below, so the report never reads a
             // word the lookup could have left behind.
             let other_name = crate::baseobjspace::object_functionstr_type_name(other);
-            if !(a_seq && b_seq) && crate::baseobjspace::lookup(other, "__index__").is_some() {
+            if !(a_seq && b_seq)
+                && pyre_object::with_roots!(other => crate::baseobjspace::lookup(other, "__index__"))
+                    .is_some()
+            {
                 // `__index__` is Python, so the sequence is addressed again
                 // only after the count is in hand.
                 let count = crate::baseobjspace::getindex_repeat(other)?;
@@ -5457,7 +5472,7 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             )));
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 pub fn floordiv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
@@ -5466,7 +5481,7 @@ pub fn floordiv(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 /// `//` and `//=` — one body, see [`binop_type_error`].
 pub(crate) fn floordiv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override =
             needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::FloorDiv);
         if numeric_override
@@ -5497,7 +5512,7 @@ pub(crate) fn floordiv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// Call `dunder` on `obj` with `other` when `obj`'s type overrides it relative
@@ -5510,11 +5525,13 @@ pub(crate) fn floordiv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str
 /// the builtin `str`/`bytes` `__mod__` re-enters [`mod_`], so dispatching it
 /// would recurse.
 unsafe fn try_subclass_binop_override(
-    obj: PyObjectRef,
-    other: PyObjectRef,
+    mut obj: PyObjectRef,
+    mut other: PyObjectRef,
     dunder: &str,
 ) -> Result<Option<PyObjectRef>, PyError> {
-    let Some((method, w_type)) = crate::baseobjspace::subclass_special_override(obj, dunder) else {
+    let Some((method, w_type)) = pyre_object::with_roots!(obj, other => {
+        crate::baseobjspace::subclass_special_override(obj, dunder)
+    }) else {
         return Ok(None);
     };
     let result = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[other])?;
@@ -5527,7 +5544,7 @@ pub fn mod_(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 /// `%` and `%=` — one body, see [`binop_type_error`].
 pub(crate) fn mod_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Mod);
         if numeric_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Mod))?
@@ -5594,7 +5611,7 @@ pub(crate) fn mod_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// True division (`/` operator) — always produces a float result.
@@ -5611,7 +5628,7 @@ pub fn truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// `/` and `/=` — one body, see [`binop_type_error`].
 pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override =
             needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::TrueDiv);
         if numeric_override
@@ -5643,13 +5660,13 @@ pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str)
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// `descroperation.py pow_binary` — return `None` when neither numeric
 /// fast paths nor `__pow__` / `__rpow__` produce a result.
-fn pow_binary(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
-    unsafe {
+fn pow_binary(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Pow);
         if numeric_override {
             if let Some(result) = try_dispatch_binary_special(a, b, BinopDunder::Pow)? {
@@ -5696,7 +5713,7 @@ fn pow_binary(a: PyObjectRef, b: PyObjectRef) -> Result<Option<PyObjectRef>, PyE
             };
         }
         try_dispatch_binary_special(a, b, BinopDunder::Pow)
-    }
+    })
 }
 
 /// Power operation dispatch (`**` operator).
@@ -6074,13 +6091,14 @@ fn pinned_shadow_operand(base: usize, index: usize) -> PyObjectRef {
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 pub(crate) fn try_dispatch_binary_special(
-    lhs: PyObjectRef,
-    rhs: PyObjectRef,
+    mut lhs: PyObjectRef,
+    mut rhs: PyObjectRef,
     op: BinopDunder,
 ) -> Result<Option<PyObjectRef>, PyError> {
     // descroperation.py `seq_bug_compat = (symbol == '+' or symbol == '*')`.
     let seq_bug_compat = matches!(op, BinopDunder::Add | BinopDunder::Mul);
-    let (w_left_name, w_right_name) = interned_binop_w_names(op);
+    let (w_left_name, w_right_name) =
+        pyre_object::with_roots!(lhs, rhs => interned_binop_w_names(op));
     unsafe {
         let Some(w_typ1) = crate::typedef::r#type(lhs) else {
             return Ok(None);
@@ -6208,23 +6226,35 @@ fn try_dispatch_ternary_pow_special(
         let _roots = pyre_object::gc_roots::push_roots();
         let operands = pyre_object::gc_roots::pin_roots(&[*base, *exp, *modulus]);
         let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
-        let (w_base_src, w_base_impl) = match lookup_where_with_method_cache(
-            w_base_type.as_ptr(),
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__")),
-        ) {
-            Some((src, imp)) => (Some(src), Some(imp)),
-            None => (None, None),
+        let (w_base_src, w_base_impl) = {
+            let w_pow_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__"));
+            match lookup_where_with_method_cache(w_base_type.as_ptr(), w_pow_name) {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            }
         };
+        let mut w_base_src = w_base_src.unwrap_or(pyre_object::PY_NULL);
+        let mut w_base_impl = w_base_impl.unwrap_or(pyre_object::PY_NULL);
         let (w_exp_src, w_exp_impl) = if w_base_type != w_exp_type {
-            match lookup_where_with_method_cache(
-                w_exp_type.as_ptr(),
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rpow__")),
-            ) {
+            let w_rpow_name = pyre_object::with_roots!(w_base_src, w_base_impl => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rpow__"))
+            });
+            match lookup_where_with_method_cache(w_exp_type.as_ptr(), w_rpow_name) {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             }
         } else {
             (None, None)
+        };
+        let w_base_src = if w_base_src.is_null() {
+            None
+        } else {
+            Some(w_base_src)
+        };
+        let w_base_impl = if w_base_impl.is_null() {
+            None
+        } else {
+            Some(w_base_impl)
         };
         // Each implementation also has to survive the invocations that precede
         // it.  A class attribute is an arbitrary object, so a `dict` subclass
@@ -6293,8 +6323,8 @@ fn try_dispatch_ternary_pow_special(
 /// such method or the call yields `NotImplemented`, so the caller falls
 /// back to the corresponding binary operation.
 pub(crate) fn try_inplace_special(
-    lhs: PyObjectRef,
-    rhs: PyObjectRef,
+    mut lhs: PyObjectRef,
+    mut rhs: PyObjectRef,
     idunder: &str,
     rdunder: Option<&str>,
     seq_bug_compat: bool,
@@ -6310,11 +6340,11 @@ pub(crate) fn try_inplace_special(
         return Ok(None);
     }
     // descroperation.py:826 — only when the lhs in-place method exists.
-    if let Some(method) = unsafe {
-        lookup_type_special(
+    if let Some(mut method) = unsafe {
+        pyre_object::with_roots!(lhs, rhs => lookup_type_special(
             lhs,
             pyre_object::unicodeobject::box_str_constant(Wtf8::new(idunder)),
-        )
+        ))
     } {
         // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
         // lhs is a builtin sequence and the rhs is not, try the rhs
@@ -6327,10 +6357,10 @@ pub(crate) fn try_inplace_special(
             && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type.as_ptr())
         {
             unsafe {
-                lookup_type_special(
+                pyre_object::with_roots!(lhs, rhs, method => lookup_type_special(
                     rhs,
                     pyre_object::unicodeobject::box_str_constant(Wtf8::new(rd)),
-                )
+                ))
             }
         } else {
             None
@@ -6702,38 +6732,40 @@ pub fn pow3(mut base: PyObjectRef, mut exp: PyObjectRef, mut modulus: PyObjectRe
 /// fast path then forward + reverse special-method dispatch with the
 /// standard NotImplemented fallback.
 pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
-    let numeric_override;
-    unsafe {
-        numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::DivMod);
-        if numeric_override
+    pyre_object::with_roots!(a, b => {
+        let numeric_override;
+        unsafe {
+            numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::DivMod);
+            if numeric_override
+                && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::DivMod))?
+            {
+                return Ok(result);
+            }
+            let lhs_num = is_int(a) || is_long(a) || is_float(a);
+            let rhs_num = is_int(b) || is_long(b) || is_float(b);
+            if !numeric_override && lhs_num && rhs_num {
+                // Python 3.14 target-version spelling; see `divmod_builtin` above
+                // for the PyPy 3.11 difference.
+                if !pyre_object::with_roots!(a, b => is_true(b))? {
+                    return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+                }
+                if is_float_pair(a, b) {
+                    let (x, y) = float_operands(a, b)?;
+                    let (q, r) = float_divmod_w(x, y)?;
+                    let mut w_q = w_float_new(q);
+                    let w_r = pyre_object::with_roots!(w_q => w_float_new(r));
+                    return Ok(pyre_object::wraptuple2(w_q, w_r));
+                }
+                return integer_divmod_pair(a, b);
+            }
+        }
+        if !numeric_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::DivMod))?
         {
             return Ok(result);
         }
-        let lhs_num = is_int(a) || is_long(a) || is_float(a);
-        let rhs_num = is_int(b) || is_long(b) || is_float(b);
-        if !numeric_override && lhs_num && rhs_num {
-            // Python 3.14 target-version spelling; see `divmod_builtin` above
-            // for the PyPy 3.11 difference.
-            if !pyre_object::with_roots!(a, b => is_true(b))? {
-                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-            }
-            if is_float_pair(a, b) {
-                let (x, y) = float_operands(a, b)?;
-                let (q, r) = float_divmod_w(x, y)?;
-                let mut w_q = w_float_new(q);
-                let w_r = pyre_object::with_roots!(w_q => w_float_new(r));
-                return Ok(pyre_object::wraptuple2(w_q, w_r));
-            }
-            return integer_divmod_pair(a, b);
-        }
-    }
-    if !numeric_override
-        && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::DivMod))?
-    {
-        return Ok(result);
-    }
-    Err(binary_builtin_type_error("divmod()", a, b))
+        Err(binary_builtin_type_error("divmod()", a, b))
+    })
 }
 
 /// floatobject.py `PowDomainError` — sentinel for a negative base raised to
@@ -6905,7 +6937,7 @@ pub fn lshift(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
 
 /// `<<` and `<<=` — one body, see [`binop_type_error`].
 pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::LShift);
         if numeric_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::LShift))?
@@ -6932,7 +6964,7 @@ pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// Right shift dispatch (`>>` operator).
@@ -6943,7 +6975,7 @@ pub fn rshift(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// `>>` and `>>=` — one body, see [`binop_type_error`].
 pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::RShift);
         if numeric_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::RShift))?
@@ -6970,7 +7002,7 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// Bitwise AND dispatch (`&` operator).
@@ -6981,14 +7013,16 @@ pub fn and_(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// `&` and `&=` — one body, see [`binop_type_error`].
 pub(crate) fn and_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         if set_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::And))?
         {
             return Ok(result);
         }
-        let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::And);
+        let numeric_override = pyre_object::with_roots!(a, b => {
+            needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::And)
+        });
         if numeric_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::And))?
         {
@@ -7023,7 +7057,7 @@ pub(crate) fn and_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// Check if an object can participate in `X | Y` union syntax.
@@ -7069,7 +7103,7 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
             b
         }
     };
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         let numeric = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Or);
         if set_override
@@ -7144,7 +7178,7 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
             return crate::_pypy_generic_alias::create_union(a, b);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// Bitwise XOR dispatch (`^` operator).
@@ -7155,14 +7189,16 @@ pub fn xor(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 
 /// `^` and `^=` — one body, see [`binop_type_error`].
 pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
-    unsafe {
+    pyre_object::with_roots!(a, b => unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         if set_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Xor))?
         {
             return Ok(result);
         }
-        let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Xor);
+        let numeric_override = pyre_object::with_roots!(a, b => {
+            needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Xor)
+        });
         if numeric_override
             && let Some(result) = pyre_object::with_roots!(a, b => try_dispatch_binary_special(a, b, BinopDunder::Xor))?
         {
@@ -7196,7 +7232,7 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
-    }
+    })
 }
 
 /// Comparison operation dispatch.
@@ -7800,8 +7836,8 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
                 _ => unreachable!(),
             }));
         }
-        let w_dunder = op.interned_w_name();
-        let w_rdunder = op.interned_rw_name();
+        let mut w_dunder = pyre_object::with_roots!(a, b => op.interned_w_name());
+        let mut w_rdunder = pyre_object::with_roots!(a, b, w_dunder => op.interned_rw_name());
         // `SetLikeDictView` operands expose comparison dunders through the
         // typedef. Instance-shaped operands were already handled by
         // `try_compare_override`, so only non-instance operands dispatch here.

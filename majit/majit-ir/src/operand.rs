@@ -193,11 +193,6 @@ pub(crate) fn wide_ref_index(id: u64) -> Option<u32> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn wide_high_water() -> u32 {
-    NEXT_WIDE_ID.load(Ordering::Relaxed)
-}
-
 /// An operand stored in `Op.args` / `Op.fail_args`.
 ///
 /// Mirror of `OpRef`'s four logical cases, but carrying the producer by

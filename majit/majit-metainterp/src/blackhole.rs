@@ -5720,8 +5720,14 @@ mod tests {
         #[test]
         fn production_bh_builder_wires_cast_ptr_int() {
             use majit_jitcode::insns;
-            let builder =
-                super::build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
+            // `BC_SETARRAYITEM_RAW_I` owns byte 34 (`#2322`). Sibling
+            // production-builder tests pass the reserved recursive-call
+            // void byte, which `build_inline_call_only_bh_builder` then
+            // re-inserts from `wellknown_bh_insns`.
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                insns::BC_RECURSIVE_CALL_VOID,
+            )]);
             let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
             for (opname, byte) in [
                 ("cast_ptr_to_int/r>i", insns::BC_CAST_PTR_TO_INT),
@@ -9337,6 +9343,7 @@ bhhandler_i_v!(handler_loop_header, bhimpl_loop_header);
 bhhandler_r_i!(handler_ref_isconstant, bhimpl_ref_isconstant);
 bhhandler_r_i!(handler_ref_isvirtual, bhimpl_ref_isvirtual);
 bhhandler_i_i!(handler_int_isvirtual, bhimpl_int_isvirtual);
+bhhandler_r_i!(handler_int_isvirtual_r, bhimpl_int_isvirtual);
 // Temporarily expanded from `bhhandler_goto_if_not_i!(handler_goto_if_not,
 // bhimpl_goto_if_not)` for MAJIT_BH_DEBUG cond inspection (#210).
 fn handler_goto_if_not(
@@ -11781,6 +11788,10 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         ),
         ("ref_isvirtual/r>i", majit_jitcode::insns::BC_REF_ISVIRTUAL),
         ("int_isvirtual/i>i", majit_jitcode::insns::BC_INT_ISVIRTUAL),
+        (
+            "int_isvirtual/r>i",
+            majit_jitcode::insns::BC_INT_ISVIRTUAL_R,
+        ),
         ("new/d>r", majit_jitcode::insns::BC_NEW),
         (
             "new_with_vtable/d>r",
@@ -12123,6 +12134,12 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // `opimpl_ref_isvirtual`. An int-kind leftover uses the same always-
     // false blackhole body (`bhimpl_ref_isvirtual`) with the `i>i` decoder.
     builder.wire_handler("int_isvirtual/i>i", handler_int_isvirtual);
+    // Task A: a raw-flavored `Ptr` is annotator `SomePtr` (r bank) while
+    // `getkind` still names the op `int_isvirtual`, so the assembler
+    // emits `/r>i`. Same always-false body; `bhhandler_r_i` matches the
+    // emit-side operand shape. This key was never registered — the mixed
+    // emit appeared after Task A, not from a rebase drop.
+    builder.wire_handler("int_isvirtual/r>i", handler_int_isvirtual_r);
     builder.wire_handler(
         "goto_if_not_int_is_zero/iL",
         handler_goto_if_not_int_is_zero,

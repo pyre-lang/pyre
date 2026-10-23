@@ -3993,7 +3993,7 @@ impl IterOpcodeHandler for PyFrame {
 
     /// GET_ITER: convert iterable to iterator.
     /// PyPy: space.iter(w_iterable) → calls __iter__ or wraps in seq_iter.
-    fn ensure_iter_value(&mut self, iter: Self::Value) -> Result<(), PyError> {
+    fn ensure_iter_value(&mut self, mut iter: Self::Value) -> Result<(), PyError> {
         unsafe {
             // mappingproxy iterates over its backing dict's keys.
             // dictproxyobject.py descr_iter → space.iter(self.w_mapping).
@@ -4006,16 +4006,14 @@ impl IterOpcodeHandler for PyFrame {
             // than the word that was live before the barrier.  The bracket ends
             // with the branch: past it the mapping is the frame's own stack
             // slot, which the collector updates.
-            let iter = if pyre_object::is_dict_proxy(iter) {
+            if pyre_object::is_dict_proxy(iter) {
                 let roots = pyre_object::gc_roots::push_roots();
                 let mapping_slot = roots.base();
                 let _ = roots.pin_root(pyre_object::w_dict_proxy_get_mapping(iter));
                 let tos = self.valuestackdepth - 1;
                 self.set_locals_w(tos, roots.get(mapping_slot));
-                roots.get(mapping_slot)
-            } else {
-                iter
-            };
+                iter = roots.get(mapping_slot);
+            }
             // `range` sequence → fresh `W_IntRangeIterator` cursor; replace
             // the stack operand so FOR_ITER advances the iterator, not the
             // reusable range object.  (Mirrors the dict-proxy rewrite
@@ -4183,11 +4181,11 @@ impl IterOpcodeHandler for PyFrame {
             // this only sees non-iterator containers.
             if pyre_object::is_instance(iter)
                 || crate::typedef::r#type(iter).is_some_and(|t| {
-                    crate::baseobjspace::lookup_in_type_where(
-                        t.as_ptr(),
-                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-                    )
-                    .is_some()
+                    let mut t = t.as_ptr();
+                    let w_iter_name = pyre_object::with_roots!(iter, t => {
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__"))
+                    });
+                    crate::baseobjspace::lookup_in_type_where(t, w_iter_name).is_some()
                 })
             {
                 let result = crate::baseobjspace::iter(iter)?;
@@ -4208,16 +4206,18 @@ impl IterOpcodeHandler for PyFrame {
                         None
                     }
                 };
-                if let Some(metaclass) = mc
-                    && let Some(method) = crate::baseobjspace::lookup_in_type(
-                        metaclass,
-                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
-                    )
-                {
-                    let result = crate::call_function(method, &[iter]);
-                    let tos = self.valuestackdepth - 1;
-                    self.set_locals_w(tos, result);
-                    return Ok(());
+                if let Some(mut metaclass) = mc {
+                    let w_iter_name = pyre_object::with_roots!(iter, metaclass => {
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__"))
+                    });
+                    if let Some(method) =
+                        crate::baseobjspace::lookup_in_type(metaclass, w_iter_name)
+                    {
+                        let result = crate::call_function(method, &[iter]);
+                        let tos = self.valuestackdepth - 1;
+                        self.set_locals_w(tos, result);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -4486,9 +4486,9 @@ unsafe fn method_descriptor_bound(
 ///  - everything else (staticmethod / non-method descriptors / shadowed
 ///    or arbitrary class attrs) → no binding (NULL)
 pub fn compute_load_method_bound(
-    obj: PyObjectRef,
-    attr: PyObjectRef,
-    w_name: PyObjectRef,
+    mut obj: PyObjectRef,
+    mut attr: PyObjectRef,
+    mut w_name: PyObjectRef,
 ) -> PyObjectRef {
     unsafe {
         if pyre_object::is_method(attr) {
@@ -4501,15 +4501,16 @@ pub fn compute_load_method_bound(
             // descriptors that win over the instance dict — property /
             // member — resolve to PY_NULL either way.)
             let _roots = pyre_object::gc_roots::push_roots();
-            let base = pyre_object::gc_roots::pin_roots(&[obj, attr]);
+            let base = pyre_object::gc_roots::pin_roots(&[obj, attr, w_name]);
             let shadowed = crate::objspace::std::mapdict::instance_node_getdictvalue(
                 pyre_object::gc_roots::shadow_stack_get(base),
-                pyre_object::w_str_get_wtf8(w_name),
+                pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 2)),
             )
             .is_some();
-            let obj = pyre_object::gc_roots::shadow_stack_get(base);
-            let attr = pyre_object::gc_roots::shadow_stack_get(base + 1);
-            let w_type = pyre_object::w_instance_get_type(obj);
+            let mut obj = pyre_object::gc_roots::shadow_stack_get(base);
+            let mut attr = pyre_object::gc_roots::shadow_stack_get(base + 1);
+            w_name = pyre_object::gc_roots::shadow_stack_get(base + 2);
+            let mut w_type = pyre_object::w_instance_get_type(obj);
             // callmethod.py:33 `w_type.has_object_getattribute()`: a non-default
             // `__getattribute__` produced `attr` through the override rather
             // than the default descriptor path, so the MRO-shape binding
@@ -4528,7 +4529,9 @@ pub fn compute_load_method_bound(
             // drops `self` — while `load_method_fast_path`, which resolves
             // the same question by lookup, pushed the unbound function that
             // needs it.
-            if !crate::baseobjspace::has_object_getattribute(w_type) {
+            if !pyre_object::with_roots!(obj, attr, w_name, w_type => {
+                crate::baseobjspace::has_object_getattribute(w_type)
+            }) {
                 return PY_NULL;
             }
             let raw = crate::baseobjspace::lookup_in_type(w_type, w_name);
@@ -4608,13 +4611,16 @@ pub fn compute_load_method_bound(
             // hands back the class's own function reaches this arm on its
             // storage rather than the instance one, and binding there
             // prepends a receiver the call site never wrote.
-            if !crate::baseobjspace::has_object_getattribute(w_type.as_ptr()) {
+            let mut w_type = w_type.as_ptr();
+            if !pyre_object::with_roots!(obj, attr, w_name, w_type => {
+                crate::baseobjspace::has_object_getattribute(w_type)
+            }) {
                 return PY_NULL;
             }
-            match crate::baseobjspace::lookup_in_type(w_type.as_ptr(), w_name) {
+            match crate::baseobjspace::lookup_in_type(w_type, w_name) {
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                 // Exact for the reason given on the instance arm above.
-                Some(d) if pyre_object::is_exact_classmethod(d) => w_type.as_ptr(),
+                Some(d) if pyre_object::is_exact_classmethod(d) => w_type,
                 Some(d) => method_descriptor_bound(d, attr, obj),
                 None => PY_NULL,
             }
@@ -6390,10 +6396,12 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn load_method_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
-        let obj = self.pop();
+        let mut obj = self.pop();
         // callmethod.py:42 `w_name = f.getname_w(nameindex)`.
         let w_name = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+            pyre_object::with_roots!(obj => {
+                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+            })
         };
         // callmethod.py:60-78 fast method path: a plain method descriptor in
         // the class, nothing shadowing it in the instance, on a type that uses
@@ -6762,9 +6770,11 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn delete_attr_cached(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
-        let obj = self.pop();
+        let mut obj = self.pop();
         let w_name = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+            pyre_object::with_roots!(obj => {
+                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+            })
         };
         crate::baseobjspace::delattr(obj, w_name)?;
         Ok(())

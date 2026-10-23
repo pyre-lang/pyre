@@ -6422,12 +6422,18 @@ fn dict_getitem_str_no_callback(dict: PyObjectRef, key: &str) -> Option<Option<P
 /// attribute miss. `Some(true)` is a present `__path__`, including Python
 /// `None`: `findattr` then returns `w_None`, which is not RPython `None`,
 /// so `_handle_fromlist` still runs.
-pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
-    let w_type = unsafe { (*w_module).w_class };
-    if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_some() {
+pub fn module_is_package_no_callback(mut w_module: PyObjectRef) -> Option<bool> {
+    let mut w_type = unsafe { (*w_module).w_class };
+    if pyre_object::with_roots!(w_module, w_type => unsafe {
+        crate::baseobjspace::module_getattribute_if_not_from_default(w_type)
+    })
+    .is_some()
+    {
         return None;
     }
-    if unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, "__path__") } {
+    if pyre_object::with_roots!(w_module, w_type => unsafe {
+        crate::baseobjspace::type_lookup_is_data_descr(w_type, "__path__")
+    }) {
         return None;
     }
     let dict = unsafe { pyre_object::w_module_get_w_dict(w_module) };
@@ -6436,12 +6442,12 @@ pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
     }
     match dict_getitem_str_no_callback(dict, "__path__")? {
         None => {
-            if unsafe {
+            if pyre_object::with_roots!(w_module, w_type => unsafe {
                 crate::baseobjspace::lookup_in_type(
                     w_type,
                     pyre_object::unicodeobject::box_str_constant(Wtf8::new("__path__")),
                 )
-            }
+            })
             .is_some()
             {
                 None
@@ -8511,9 +8517,18 @@ pub fn import_from(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, c
     // after-effect.  A custom `__getattribute__`, a data descriptor, or a
     // dict miss stays on import_from_slow (full getattr + sys.modules).
     if unsafe { pyre_object::is_module(module) } {
-        let w_type = unsafe { (*module).w_class };
-        if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_none()
-            && !unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, name) }
+        let mut w_type = unsafe { (*module).w_class };
+        if unsafe {
+            pyre_object::with_roots!(module, w_type => {
+                crate::baseobjspace::module_getattribute_if_not_from_default(w_type)
+            })
+        }
+        .is_none()
+            && !unsafe {
+                pyre_object::with_roots!(module, w_type => {
+                    crate::baseobjspace::type_lookup_is_data_descr(w_type, name)
+                })
+            }
         {
             let mut dict = unsafe { pyre_object::w_module_get_w_dict(module) };
             if !dict.is_null()

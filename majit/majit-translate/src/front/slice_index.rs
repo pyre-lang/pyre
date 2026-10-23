@@ -272,6 +272,17 @@ fn rewire_one_slice_index_site(
         })
         .ok_or_else(|| format!("{name}: no slice::index call consumes the RangeFrom value"))?;
 
+    // `rlist.py ll_listslice_*` takes a GC list (`Ref`). An Int-banked
+    // receiver is a Vec header or a scalar fat pointer, not that list;
+    // minting the helper would `arraylen_gc` the header. Keep the ordinary
+    // residual (`slice_index` module header: a graph that never meets the
+    // rtyper retains the original FunDecl).
+    if receiver_is_int_banked(graph, &slice) {
+        return Err(format!(
+            "{name}: slice receiver is int-banked — declining getslice rewrite"
+        ));
+    }
+
     // 2. Consumer gate: the `RangeFrom` value must feed EXACTLY its own
     //    construction (`FieldWrite`) and this one index call. A range read by
     //    a `.start` field read, a second index, or a stored range keeps the
@@ -376,9 +387,15 @@ fn rewire_one_slice_index_site(
                 .map(|oi| (bi, oi))
         })
         .ok_or_else(|| format!("{name}: slice::index op vanished before rewrite"))?;
+    let identity_fallback = identity_from_slice_result_ty(&index_result_ty);
     match bounds {
         SliceIndexBounds::Range { start, end } => {
-            let segments = getslice_marker_segments(graph, &slice, "__getslice_range");
+            let segments = getslice_marker_segments_with_fallback(
+                graph,
+                &slice,
+                "__getslice_range",
+                identity_fallback.clone(),
+            );
             graph.blocks[rb].operations[ri] = SpaceOperation {
                 result: Some(index_result),
                 kind: OpKind::Call {
@@ -395,11 +412,21 @@ fn rewire_one_slice_index_site(
         SliceIndexBounds::MinusOne { .. } | SliceIndexBounds::RangeTo { .. } => {
             let (segments, args) = match bounds {
                 SliceIndexBounds::MinusOne { .. } => (
-                    getslice_marker_segments(graph, &slice, "__getslice_minusone"),
+                    getslice_marker_segments_with_fallback(
+                        graph,
+                        &slice,
+                        "__getslice_minusone",
+                        identity_fallback.clone(),
+                    ),
                     vec![slice],
                 ),
                 SliceIndexBounds::RangeTo { end } => (
-                    getslice_marker_segments(graph, &slice, "__getslice_rangeto"),
+                    getslice_marker_segments_with_fallback(
+                        graph,
+                        &slice,
+                        "__getslice_rangeto",
+                        identity_fallback.clone(),
+                    ),
                     vec![slice, end.clone()],
                 ),
                 SliceIndexBounds::RangeFrom { .. } => unreachable!(),
@@ -415,7 +442,12 @@ fn rewire_one_slice_index_site(
             };
         }
         SliceIndexBounds::RangeFrom { start } => {
-            let segments = getslice_marker_segments(graph, &slice, "__getslice_rangefrom");
+            let segments = getslice_marker_segments_with_fallback(
+                graph,
+                &slice,
+                "__getslice_rangefrom",
+                identity_fallback,
+            );
             graph.blocks[rb].operations[ri] = SpaceOperation {
                 result: Some(index_result),
                 kind: OpKind::Call {
@@ -809,19 +841,45 @@ pub(crate) fn range_feeds_only_index(
 
 /// Marker path. The leaf stays `__getslice_*`. A second segment carries the
 /// item kind when the slice operand's list spelling or array identity names
-/// one and the sibling-array scan does not. A scan hit keeps today's
-/// one-segment marker: the codewriter still recovers that identity itself.
-fn getslice_marker_segments(graph: &FunctionGraph, slice: &Variable, leaf: &str) -> Vec<String> {
+/// one. A scan hit used to keep a one-segment marker and trust jtransform
+/// to recover the identity; a later rewrite can drop the sibling array op,
+/// so the suffix is the identity the codewriter reads first.
+#[cfg(test)]
+pub(crate) fn getslice_marker_segments(
+    graph: &FunctionGraph,
+    slice: &Variable,
+    leaf: &str,
+) -> Vec<String> {
+    getslice_marker_segments_with_fallback(graph, slice, leaf, None)
+}
+
+pub(crate) fn getslice_marker_segments_with_fallback(
+    graph: &FunctionGraph,
+    slice: &Variable,
+    leaf: &str,
+    fallback: Option<(ValueType, Option<String>)>,
+) -> Vec<String> {
     let mut segments = vec![leaf.to_string()];
-    if let Some(suffix) = slice_marker_suffix(graph, slice) {
+    if let Some(suffix) = slice_marker_suffix(graph, slice).or_else(|| {
+        fallback.and_then(|(item_ty, array_type_id)| {
+            crate::codewriter::getslice::listslice_marker_suffix(&item_ty, array_type_id.as_deref())
+                .or_else(|| crate::codewriter::getslice::listslice_marker_suffix(&item_ty, None))
+        })
+    }) {
         segments.push(suffix);
     }
     segments
 }
 
 fn slice_marker_suffix(graph: &FunctionGraph, slice: &Variable) -> Option<String> {
-    if crate::codewriter::getslice::array_identity_of_base(graph, slice).is_some() {
-        return None;
+    if let Some((item_ty, array_type_id)) =
+        crate::codewriter::getslice::array_identity_of_base(graph, slice)
+    {
+        return crate::codewriter::getslice::listslice_marker_suffix(
+            &item_ty,
+            array_type_id.as_deref(),
+        )
+        .or_else(|| crate::codewriter::getslice::listslice_marker_suffix(&item_ty, None));
     }
     let classes = crate::codewriter::getslice::LinkClasses::of(graph);
     let same = |v: &Variable| classes.same(v, slice);
@@ -837,7 +895,10 @@ fn slice_marker_suffix(graph: &FunctionGraph, slice: &Variable) -> Option<String
                     return crate::codewriter::getslice::listslice_marker_suffix(
                         &item_ty,
                         array_type_id.as_deref(),
-                    );
+                    )
+                    .or_else(|| {
+                        crate::codewriter::getslice::listslice_marker_suffix(&item_ty, None)
+                    });
                 }
             }
             OpKind::Input {
@@ -851,11 +912,17 @@ fn slice_marker_suffix(graph: &FunctionGraph, slice: &Variable) -> Option<String
     }
     let (item_ty, array_type_id) = from_input?;
     crate::codewriter::getslice::listslice_marker_suffix(&item_ty, array_type_id.as_deref())
+        .or_else(|| crate::codewriter::getslice::listslice_marker_suffix(&item_ty, None))
 }
 
 /// `[i64]` / `[f64]` and the same spellings inside `Vec<T>` / `VecDeque<T>` /
 /// `[T; N]`. Anything else stays unsuffixed.
 fn identity_from_list_spelling(spelling: &str) -> Option<(ValueType, Option<String>)> {
+    // Shared `&[u8]` / `*const [u8]` is rstr `STR`, not a list of unsigned
+    // (`is_shared_u8_slice_spelling` / `is_list_container_spelling`).
+    if majit_ir::descr::is_shared_u8_slice_spelling(spelling) {
+        return None;
+    }
     let stripped = spelling
         .trim()
         .trim_start_matches('&')
@@ -878,7 +945,19 @@ fn identity_from_list_spelling(spelling: &str) -> Option<(ValueType, Option<Stri
     identity_from_array_type_id(&format!("[{elem}]"))
 }
 
-fn identity_from_array_type_id(id: &str) -> Option<(ValueType, Option<String>)> {
+pub(crate) fn identity_from_array_type_id(id: &str) -> Option<(ValueType, Option<String>)> {
+    if id == crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID {
+        return Some((
+            ValueType::Ref(None),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+        ));
+    }
+    if id == "GcArray<i64>" || id == "[i64]" {
+        return Some((ValueType::Int, Some("[i64]".to_string())));
+    }
+    if id == "GcArray<f64>" || id == "[f64]" {
+        return Some((ValueType::Float, Some("[f64]".to_string())));
+    }
     let inner = id.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
     if inner.contains(';') || inner.contains('<') {
         return None;
@@ -888,9 +967,54 @@ fn identity_from_array_type_id(id: &str) -> Option<(ValueType, Option<String>)> 
             ValueType::Int
         }
         "f64" => ValueType::Float,
+        "*mut PyObject" | "*const PyObject" | "PyObjectRef" => {
+            return Some((
+                ValueType::Ref(None),
+                Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+            ));
+        }
         _ => return None,
     };
     Some((item_ty, Some(id.to_string())))
+}
+
+/// `true` when `slice` lives in the integer register bank — a Vec header
+/// address or a scalar fat pointer, not a GC list `ll_listslice_*` can
+/// `arraylen_gc`.
+pub(crate) fn receiver_is_int_banked(graph: &FunctionGraph, slice: &Variable) -> bool {
+    match FunctionGraph::concretetype_of(slice) {
+        crate::model::ConcreteType::Signed => return true,
+        crate::model::ConcreteType::GcRef => return false,
+        _ => {}
+    }
+    let classes = crate::codewriter::getslice::LinkClasses::of(graph);
+    let same = |v: &Variable| classes.same(v, slice);
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        if !op.result.as_ref().is_some_and(&same) {
+            continue;
+        }
+        match &op.kind {
+            OpKind::Input { ty, .. }
+            | OpKind::Call { result_ty: ty, .. }
+            | OpKind::FieldRead { ty, .. }
+            | OpKind::ArrayRead { item_ty: ty, .. }
+            | OpKind::BinOp { result_ty: ty, .. } => {
+                return matches!(ty, ValueType::Int | ValueType::Unsigned);
+            }
+            OpKind::ConstInt(_) | OpKind::ConstUInt(_) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn identity_from_slice_result_ty(ty: &ValueType) -> Option<(ValueType, Option<String>)> {
+    match ty {
+        ValueType::Int | ValueType::Unsigned => Some((ValueType::Int, None)),
+        ValueType::Float => Some((ValueType::Float, None)),
+        ValueType::Ref(Some(root)) => identity_from_list_spelling(root),
+        _ => None,
+    }
 }
 
 /// `true` when `var` is produced by some op or is a block inputarg — i.e. it
@@ -979,6 +1103,33 @@ mod tests {
             fun_decl_id: None,
             generic_rust_args: Vec::new(),
         }
+    }
+
+    /// A GC-list receiver the getslice rewrite can mint against. ConstInt
+    /// dummies sit in the integer bank and are declined (`receiver_is_int_banked`).
+    fn dummy_gc_slice(g: &mut FunctionGraph, block: crate::model::BlockId) -> Variable {
+        let slice = g.alloc_value_var();
+        g.push_inputarg_var(block, slice.clone());
+        g.push_op_with_result_var(
+            block,
+            OpKind::Input {
+                name: "slice".into(),
+                ty: ValueType::Ref(None),
+                class_root: Some("[*mut PyObject]".into()),
+            },
+            slice.clone(),
+        );
+        slice
+    }
+
+    fn marker_head_is(op: &SpaceOperation, name: &str) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.first().map(String::as_str) == Some(name)
+        )
     }
 
     fn build_rangeto_static_length_graph(
@@ -1090,7 +1241,7 @@ mod tests {
     fn build_rangeto_minusone_graph(field_name: &str) -> (FunctionGraph, SliceIndexRangeToSite) {
         let mut g = FunctionGraph::new("rangeto_minusone");
         let entry = g.startblock;
-        let slice = g.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, entry);
         let len = g
             .push_op_var(
                 entry,
@@ -1331,7 +1482,14 @@ mod tests {
         else {
             panic!("RangeTo must remain a synthetic call until flowspace adaptation");
         };
-        assert_eq!(segments, &["__getslice_rangeto"]);
+        assert_eq!(
+            segments.first().map(String::as_str),
+            Some("__getslice_rangeto")
+        );
+        assert!(
+            segments.len() <= 2,
+            "marker is the rangeto capstone, optionally suffixed"
+        );
         assert_eq!(args, &expected_args);
         assert_eq!(new_ty, result_ty);
         assert!(
@@ -2113,7 +2271,7 @@ mod tests {
     fn rewrite_lifts_rangefrom_index_to_getslice() {
         let mut g = FunctionGraph::new("test_slice_index");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         let k = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
         let range = g
             .push_op_var(
@@ -2182,15 +2340,7 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|blk| &blk.operations)
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments == &["__getslice_rangefrom".to_string()]
-                )
-            })
+            .filter(|op| marker_head_is(op, "__getslice_rangefrom"))
             .collect();
         assert_eq!(marker_ops.len(), 1, "exactly one RangeFrom marker");
         let OpKind::Call { args, .. } = &marker_ops[0].kind else {
@@ -2199,6 +2349,33 @@ mod tests {
         assert_eq!(args.len(), 2, "marker has [slice, start]");
         assert_eq!(args[0], slice, "arg0 = slice receiver");
         assert_eq!(args[1], k, "arg1 = const start k");
+    }
+
+    #[test]
+    fn object_slice_input_stamps_the_ref_suffix() {
+        let mut g = FunctionGraph::new("object_slice_input");
+        let a = g.startblock;
+        let slice = g.alloc_value_var();
+        g.push_inputarg_var(a, slice.clone());
+        g.push_op_with_result_var(
+            a,
+            OpKind::Input {
+                name: "args_w".into(),
+                ty: ValueType::Ref(None),
+                class_root: Some("[*mut PyObject]".into()),
+            },
+            slice.clone(),
+        );
+        let segments = getslice_marker_segments(&g, &slice, "__getslice_rangefrom");
+        assert_eq!(
+            segments.first().map(String::as_str),
+            Some("__getslice_rangefrom")
+        );
+        assert_eq!(segments.len(), 2, "object-slice identity is carried");
+        assert_eq!(
+            crate::codewriter::getslice::decode_listslice_marker_suffix(&segments[1]),
+            Some((ValueType::Ref(None), None))
+        );
     }
 
     #[test]
@@ -2271,7 +2448,7 @@ mod tests {
     fn rewrite_minusone_keeps_link_carried_range_defined() {
         let mut g = FunctionGraph::new("test_slice_index_minusone_link");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         let len = g
             .push_op_var(
                 a,
@@ -2344,7 +2521,8 @@ mod tests {
                     target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
-                } if segments == &["__getslice_minusone".to_string()] && args.len() == 1
+                } if segments.first().map(String::as_str) == Some("__getslice_minusone")
+                    && args.len() == 1
             )
         }));
         assert!(
@@ -2387,7 +2565,7 @@ mod tests {
     fn rewrite_minusone_sees_arraylen_through_instance_cast() {
         let mut g = FunctionGraph::new("test_slice_index_minusone_cast");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         let cast = g
             .push_op_var(
                 a,
@@ -2458,7 +2636,8 @@ mod tests {
                     target: CallTarget::FunctionPath { segments, .. },
                     args,
                     ..
-                } if segments == &["__getslice_minusone".to_string()] && args.len() == 1
+                } if segments.first().map(String::as_str) == Some("__getslice_minusone")
+                    && args.len() == 1
             )
         }));
     }
@@ -2469,7 +2648,7 @@ mod tests {
     fn rewrite_general_rangeto_keeps_link_carried_range_defined() {
         let mut g = FunctionGraph::new("test_slice_index_rangeto");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         let end_base = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
         let end_one = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
         let end = g
@@ -2537,7 +2716,7 @@ mod tests {
     fn rewrite_preserves_runtime_end() {
         let mut g = FunctionGraph::new("test_slice_index_rangeto_runtime");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         let end = g
             .push_op_var(
                 a,
@@ -2655,7 +2834,7 @@ mod tests {
     fn rangeto_rewrites_vec_inherent_index() {
         let mut g = FunctionGraph::new("test_vec_inherent_rangeto");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         let end = g
             .push_op_var(
                 a,
@@ -2709,6 +2888,86 @@ mod tests {
         assert_rangeto_rewrite(&mut g, site);
     }
 
+    /// An Int-banked `Vec` header is not a GC list. `vec_inherent_index_segments`
+    /// still matches; the rewrite declines so the original `Vec::index` FunDecl
+    /// and its range argument stay. Minting `ll_listslice_*` would `arraylen_gc`
+    /// the header.
+    #[test]
+    fn int_banked_vec_index_keeps_ordinary_residual() {
+        let mut g = FunctionGraph::new("test_int_banked_vec_rangeto");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let end = g
+            .push_op_var(
+                a,
+                OpKind::Input {
+                    name: "end".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        g.push_inputarg_var(a, end.clone());
+        let range = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: rangeto_ctor_target(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeTo".into())),
+                },
+                true,
+            )
+            .unwrap();
+        g.block_mut(a).operations.push(SpaceOperation {
+            result: None,
+            kind: end_field_write(&range, &end),
+        });
+        let sub = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["vec".into(), "Vec".into(), "index".into()],
+                        fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
+                    },
+                    args: crate::model::call_args(vec![slice, range.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![sub]);
+
+        let site = SliceIndexRangeToSite {
+            range_result: range,
+            end,
+        };
+        assert_eq!(
+            rewire_slice_index_rangeto_sites(&mut g, &[site]),
+            0,
+            "an int-banked Vec receiver keeps the ordinary residual"
+        );
+        assert!(
+            has_residual_slice_index(&g),
+            "Vec::index FunDecl stays in place"
+        );
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| marker_head_is(op, "__getslice_rangeto")
+                    || marker_head_is(op, "__getslice_rangefrom")
+                    || marker_head_is(op, "__getslice_minusone")
+                    || marker_head_is(op, "__getslice_range")),
+            "no getslice marker is planted on an int-banked receiver"
+        );
+    }
+
     /// A RangeFrom whose `usize` start is a runtime value is retained as a
     /// marker; its unsigned annotation proves the start nonnegative to
     /// `decompose_slice_args` when the adapter expands it.
@@ -2716,7 +2975,7 @@ mod tests {
     fn rewrite_lifts_runtime_unsigned_start() {
         let mut g = FunctionGraph::new("test_slice_index_runtime");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         // A runtime start: the result of a BinOp, not a ConstInt.
         let x = g.push_op_var(a, OpKind::ConstInt(5), true).unwrap();
         let start = g
@@ -2777,7 +3036,7 @@ mod tests {
                         target: CallTarget::FunctionPath { segments, .. },
                         args,
                         ..
-                    } if segments == &["__getslice_rangefrom".to_string()]
+                    } if segments.first().map(String::as_str) == Some("__getslice_rangefrom")
                         && args == &[slice.clone(), start.clone()]
                 )),
             "runtime RangeFrom becomes an adapter marker"
@@ -2791,7 +3050,7 @@ mod tests {
     fn rewrite_declines_multi_consumer_range() {
         let mut g = FunctionGraph::new("test_slice_index_multi");
         let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let slice = dummy_gc_slice(&mut g, a);
         let k = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
         let range = g
             .push_op_var(

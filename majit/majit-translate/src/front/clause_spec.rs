@@ -1118,6 +1118,21 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize, expand_aliase
     if let Some(fnptr) = obj.get("FnPtr") {
         return spec_fn_ptr(fnptr, llbc, depth, expand_aliases);
     }
+    // Associated-type projection. `charon_type_value_to_ast_string` resolves
+    // a unique impl to the bound type and otherwise keeps `??TraitType`.
+    // Dumping the Charon JSON here is not a Rust path: residual shims
+    // turbofish it into generated source.
+    if let Some(arr) = obj.get("TraitType").and_then(Value::as_array)
+        && arr.len() == 3
+    {
+        if let Some(rendered) =
+            crate::front::mir::resolve_trait_assoc_type(&arr[0], &arr[1], llbc, depth)
+            && !rendered.starts_with('?')
+        {
+            return rendered;
+        }
+        return "?TraitType".to_string();
+    }
     canonical_type_json(v, llbc, depth)
 }
 
@@ -2259,6 +2274,51 @@ mod tests {
         assert_eq!(
             names,
             vec!["fixture::Wrapper<*mut fixture::Inner>".to_string()]
+        );
+    }
+
+    /// An unresolved associated-type projection is not Charon JSON.
+    /// Residual shims turbofish `spec_type_name`; `{ "TraitType": … }`
+    /// is not a Rust type.
+    #[test]
+    fn spec_type_name_of_an_unresolved_trait_type_is_not_json() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [],
+                "type_decls": [],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let projection = json!({
+            "TraitType": [
+                {
+                    "kind": {"Clause": {"Bound": [0, 0]}},
+                    "trait_decl_ref": {
+                        "regions": [],
+                        "skip_binder": {
+                            "generics": {
+                                "const_generics": [],
+                                "regions": [],
+                                "trait_refs": [],
+                                "types": [{"TypeVar": {"Bound": [1, 0]}}]
+                            },
+                            "id": "pyre_object::setobject::AbstractUnwrappedSetStrategy"
+                        }
+                    }
+                },
+                0,
+                {"const_generics": [], "regions": [], "trait_refs": [], "types": []}
+            ]
+        });
+        let name = spec_type_name(&projection, &llbc, 0, false);
+        assert_eq!(name, "?TraitType");
+        assert!(
+            !name.contains('{'),
+            "Charon JSON is not a Rust path: {name}"
         );
     }
 

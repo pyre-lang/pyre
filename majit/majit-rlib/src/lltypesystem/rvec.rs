@@ -151,6 +151,7 @@ const ITEM_SIZE_R: usize = std::mem::size_of::<GCREF>();
 const ITEM_ALIGN_R: usize = std::mem::align_of::<GCREF>();
 const ITEM_SIZE_F: usize = std::mem::size_of::<f64>();
 const ITEM_ALIGN_F: usize = std::mem::align_of::<f64>();
+const ITEM_SIZE_C: usize = 1;
 
 // ── header words ────────────────────────────────────────────────────────
 
@@ -566,6 +567,27 @@ pub fn ll_slice_contains_i(items: usize, length: usize, item: usize) -> bool {
     let mut i = 0;
     while i < length {
         if ll_slice_getitem_fast_i(items, i) == item {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `ll_getitem_fast` on a byte slice: `index` is in bounds. Item stride is
+/// one byte (`rlist.py` `ll_getitem_fast` over `Array(Char)`).
+pub fn ll_slice_getitem_fast_c(items: usize, index: usize) -> usize {
+    unsafe { *(slice_item_addr(items, index, ITEM_SIZE_C) as *const u8) as usize }
+}
+
+/// `ll_listcontains` on a byte `(items, length)` slice.
+///
+/// `ll_listcontains` is "not inlined by the JIT -- contains a loop".
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_slice_contains_c(items: usize, length: usize, item: usize) -> bool {
+    let mut i = 0;
+    while i < length {
+        if ll_slice_getitem_fast_c(items, i) == item {
             return true;
         }
         i += 1;
@@ -1509,6 +1531,15 @@ mod tests {
     }
 
     #[test]
+    fn slice_contains_c_walks_byte_items() {
+        let v: Vec<u8> = vec![1, 0, 3];
+        let items = v.as_ptr() as usize;
+        assert!(ll_slice_contains_c(items, 3, 0));
+        assert!(!ll_slice_contains_c(items, 3, 2));
+        assert_eq!(ll_slice_getitem_fast_c(items, 2), 3);
+    }
+
+    #[test]
     fn helpers_grow_and_reverse_a_host_vec() {
         let mut v = ll_vec_newemptylist_i();
         for item in 0..40 {
@@ -1672,6 +1703,7 @@ mod tests {
             "ll_slice_rotate_right_r",
             "ll_slice_rotate_left_f",
             "ll_slice_bounds_panic",
+            "ll_slice_contains_c",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(

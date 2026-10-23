@@ -311,11 +311,6 @@ pub struct TraceCtx {
     /// [`Self::portal_trace_push_fn`] into `MetaInterp.portal_trace_positions`.
     /// Structured green key values (if provided by the interpreter).
     green_key_values: Option<GreenKey>,
-    /// Whether the driver's entry keys carry the back-edge target in front
-    /// of the declared greens (the structured `can_enter_jit` layout).  A
-    /// structured root sets it; a bridge inherits its driver's layout, since
-    /// the loop it may close into was filed under that layout.
-    pub(crate) green_key_prepends_pc: bool,
     /// Declarative driver layout metadata, if provided by the interpreter.
     pub(crate) driver_descriptor: Option<JitDriverStaticData>,
     /// Standard virtualizable boxes -- OpRefs for each static field + array element.
@@ -2374,7 +2369,6 @@ impl TraceCtx {
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
             green_key_values: None,
-            green_key_prepends_pc: false,
             driver_descriptor: None,
             virtualizable_boxes: None,
             virtualizable_live_null_slots: None,
@@ -2476,7 +2470,6 @@ impl TraceCtx {
             root_green_key_raw: (0, 0),
             inline_frames: Vec::new(),
             green_key_values: Some(green_key_values),
-            green_key_prepends_pc: true,
             driver_descriptor: None,
             virtualizable_boxes: None,
             virtualizable_live_null_slots: None,
@@ -8502,7 +8495,7 @@ mod tests {
             unimplemented!("LiveMemTestCpu::execute_token")
         }
         fn get_latest_descr<'a>(
-            &'a self,
+            &self,
             _frame: &'a majit_backend::DeadFrame,
         ) -> &'a dyn majit_ir::FailDescr {
             unimplemented!("LiveMemTestCpu::get_latest_descr")

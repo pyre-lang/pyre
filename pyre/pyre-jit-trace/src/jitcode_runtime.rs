@@ -2892,7 +2892,7 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // already binds each key; without the slot, `setup_insns` never
     // records the byte and a guard-failure resume panics here.
     // `build_inline_call_only_bh_builder` registers the four raw-array keys
-    // and `int_isvirtual/i>i` at their canonical `BC_*` bytes.
+    // and `int_isvirtual/{i,r}>i` at their canonical `BC_*` bytes.
 
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
