@@ -224,7 +224,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         });
         payload
     };
-    let payload_value = crate::front::option_unwrap_or::emit_narrow(graph, then_bb, &cast, payload);
+    let payload_value = crate::front::option_unwrap::emit_narrow(graph, then_bb, &cast, payload);
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &out_var,
