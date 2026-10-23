@@ -459,6 +459,7 @@ fn build_semantic_program_via_active_frontend(
             );
             program.harvested_hints = hints;
             program.immutable_fields = immutable_fields;
+            program.raw_alloc_flavor_structs = raw_alloc_flavor_structs;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             program.residual_fn_catalog = residual_fn_catalog;

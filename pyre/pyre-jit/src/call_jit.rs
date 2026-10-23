@@ -1019,19 +1019,22 @@ pub(crate) extern "C" fn record_inline_traceback_for_recording(
     // A recording MIFrame may pass a null / sentinel `w_code` (the portal
     // virtualizable is the caller's frame). Resolve this jitcode's own
     // pycode; a helper with no Python code contributes no node.
-    let (w_code_value, w_globals_value) =
-        if w_code_value == 0 || w_code_value as usize == usize::MAX {
-            match pyre_jit_trace::state::code_for_jitcode_index(jitcode_index) {
-                Some(w_code) if !w_code.is_null() && w_code as usize != usize::MAX => {
-                    let w_globals =
-                        unsafe { pyre_interpreter::w_code_get_w_globals(w_code as PyObjectRef) };
-                    (w_code as i64, w_globals as i64)
-                }
-                _ => return,
-            }
-        } else {
-            (w_code_value, w_globals_value)
-        };
+    //
+    // Keep the caller-supplied `w_globals`. `PyCode.w_globals` is only the
+    // first namespace (`pycode.py frame_stores_global`); another function
+    // using the same code can have different frame-owned globals
+    // (`pyframe.py get_w_globals`).
+    let w_code_value = if w_code_value == 0 || w_code_value as usize == usize::MAX {
+        match pyre_jit_trace::state::code_for_jitcode_index(jitcode_index) {
+            Some(w_code) if !w_code.is_null() && w_code as usize != usize::MAX => w_code as i64,
+            _ => return,
+        }
+    } else {
+        w_code_value
+    };
+    if w_globals_value == 0 || w_globals_value as usize == usize::MAX {
+        return;
+    }
     if w_code_value == 0 {
         return;
     }

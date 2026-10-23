@@ -673,8 +673,9 @@ pub mod rbuilder_runtime {
 
     /// Residual `ll_build` (`rbuilder.py AbstractStringBuilderRepr.rtype_method_build`).
     /// The front's `__majit_stringbuilder_build` marker retargets here; `item_size`
-    /// is the STR width RPython's `ll_build` closes over.
-    #[majit_macros::dont_look_inside]
+    /// is the STR width RPython's `ll_build` closes over. This wrapper is
+    /// the 1-arg ABI; looking inside reaches `ll_build`'s
+    /// `look_inside_iff(isvirtual)` so a virtual builder is traced.
     pub extern "C" fn jit_ll_build(builder: crate::PyObjectRef) -> crate::PyObjectRef {
         ll_build(builder as i64, STR_ITEM_SIZE) as crate::PyObjectRef
     }

@@ -28,8 +28,10 @@ use crate::parse::CallPath;
 use crate::policy::{DefaultJitPolicy, JitPolicy};
 use crate::rlib::rstring::effect_graph_from_search_helper;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+#[cfg(test)]
+use crate::translator::rtyper::lltypesystem::rstr::UNICODEPTR;
 use crate::translator::rtyper::lltypesystem::rstr::{
-    STRPTR, UNICODEPTR, build_ll_find_char_helper_graph, build_ll_find_helper_graph_on,
+    STRPTR, build_ll_find_char_helper_graph, build_ll_find_helper_graph_on,
     build_ll_search_helper_graph_on, direct_call_funcobjs, graph_ref_for_funcptr_id,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
@@ -79,6 +81,12 @@ pub fn ll_find_path(cc: &mut CallControl) -> CallPath {
             .into_inner();
         cc.register_opname_helper_graph(path.clone(), flow);
     }
+    // `free_function_alias_paths` may already have parked the rlib native
+    // (`*const u8`, getkind `'int'`) on the elidable callee leaves.
+    // Remap those leaves to the `Ptr(STR)` residual so `getcalldescr`
+    // sees `[Ref, …]` matching the portal call.
+    let _ = ll_find_char_path(cc, &*STRPTR);
+    let _ = search_elidable_path(cc);
     path
 }
 
@@ -102,6 +110,7 @@ pub fn ll_search_path(cc: &mut CallControl) -> CallPath {
         .expect("fresh ll_search helper is uniquely owned")
         .into_inner();
     cc.register_opname_helper_graph(path.clone(), flow);
+    let _ = search_elidable_path(cc);
     path
 }
 
@@ -112,13 +121,13 @@ pub fn ll_search_path(cc: &mut CallControl) -> CallPath {
 /// `lltypesystem::rstr::ll_find_char` (`Ptr(STR)` only).
 pub fn ll_find_char_path(cc: &mut CallControl, ptr_lltype: &LowLevelType) -> CallPath {
     let path = CallPath::from_segments([LL_FIND_CHAR]);
-    if cc.has_function_graph(&path) {
-        return path;
-    }
     let py = build_ll_find_char_helper_graph(LL_FIND_CHAR, ptr_lltype.clone())
         .expect("ll_find_char helper graph");
     debug_assert!(py.func._elidable_function_);
-    register_callee_graph(cc, path.clone(), &py.graph.borrow(), true);
+    if ptr_lltype == &*STRPTR {
+        bind_residual_native_fnaddr(cc, &path);
+    }
+    remap_str_helper_leaf(cc, path.clone(), &py.graph.borrow());
     path
 }
 
@@ -129,9 +138,7 @@ pub fn ll_find_char_path(cc: &mut CallControl, ptr_lltype: &LowLevelType) -> Cal
 /// `rstring::_search_elidable` (`Ptr(STR)` only).
 pub fn search_elidable_path(cc: &mut CallControl) -> CallPath {
     let path = CallPath::from_segments([SEARCH_ELIDABLE]);
-    if cc.has_function_graph(&path) {
-        return path;
-    }
+    bind_residual_native_fnaddr(cc, &path);
     let ann = RPythonAnnotator::new(None, None, None, false);
     let rtyper = RPythonTyper::new(&ann);
     let py = crate::rlib::rstring::build_search_elidable_helper_graph(
@@ -141,8 +148,28 @@ pub fn search_elidable_path(cc: &mut CallControl) -> CallPath {
     )
     .expect("_search_elidable helper graph");
     register_direct_call_callees(cc, &rtyper, &py.graph.borrow());
-    register_callee_graph(cc, path.clone(), &py.graph.borrow(), true);
+    remap_str_helper_leaf(cc, path.clone(), &py.graph.borrow());
     path
+}
+
+/// Occupy `path` with the rtyped `Ptr(STR)` helper. `GraphStore` keys by
+/// `(source_identity.or(owner_root), name)` and a same-key insert folds
+/// hints only, so a native `*const u8` leaf would keep `[Int, …]`. A
+/// distinct `#str` identity remaps the path onto this graph.
+fn remap_str_helper_leaf(
+    cc: &mut CallControl,
+    path: CallPath,
+    callee: &crate::flowspace::model::FunctionGraph,
+) {
+    let graph = effect_graph_from_search_helper(callee);
+    let identity = format!("{}#str", graph.name);
+    cc.register_function_graph(path.clone(), graph.with_source_identity(identity));
+    cc.add_candidate_graph_if_look_inside(path.clone());
+    if cc.is_candidate(&path) {
+        let _ = cc.get_jitcode(&path);
+    } else {
+        bind_residual_native_fnaddr(cc, &path);
+    }
 }
 
 fn callee_already_registered(cc: &CallControl, path: &CallPath) -> bool {
@@ -1150,5 +1177,113 @@ mod tests {
                 "raw direct_call in {path}: {dump}"
             );
         }
+    }
+
+    /// `free_function_alias_paths` parks the rlib native (`*const u8`) on
+    /// the helper leaf. The residual is `Ptr(STR)` and must replace it,
+    /// or `getcalldescr` sees `[Int, Int, …]` against `[Ref, Ref, …]`.
+    #[test]
+    fn search_elidable_residual_replaces_native_int_leaf() {
+        let mut cc = CallControl::new();
+        let mut native = crate::model::FunctionGraph::new(SEARCH_ELIDABLE);
+        let start = native.startblock;
+        for name in ["s1", "s2", "start", "end", "mode"] {
+            let v = native.alloc_value_var_with_type(ConcreteType::Signed);
+            native.push_inputarg_var(start, v.clone());
+            native.push_op_with_result_var(
+                start,
+                OpKind::Input {
+                    name: name.to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                v,
+            );
+        }
+        let result = native.alloc_value_var_with_type(ConcreteType::Signed);
+        native.push_op_with_result_var(start, OpKind::ConstInt(-1), result.clone());
+        native.set_return(start, Some(result));
+        cc.register_function_graph(CallPath::from_segments([SEARCH_ELIDABLE]), native);
+
+        let _ = search_elidable_path(&mut cc);
+        let target = CallTarget::function_path([SEARCH_ELIDABLE]);
+        let (_, graph) = cc
+            .target_to_path_and_graph(&target)
+            .expect("residual occupies the helper leaf");
+        let inputs: Vec<&ValueType> = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { ty, .. } => Some(ty),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                inputs.as_slice(),
+                [
+                    ValueType::Ref(_),
+                    ValueType::Ref(_),
+                    ValueType::Int,
+                    ValueType::Int,
+                    ValueType::Int
+                ]
+            ),
+            "helper leaf must be Ptr(STR), not native *const u8: {inputs:?}"
+        );
+    }
+
+    /// Same GraphStore-fold as `_search_elidable`: the rlib native
+    /// (`*const u8`) must not keep the `ll_find_char` leaf.
+    #[test]
+    fn ll_find_char_residual_replaces_native_int_leaf() {
+        let mut cc = CallControl::new();
+        let mut native = crate::model::FunctionGraph::new(LL_FIND_CHAR);
+        let start = native.startblock;
+        for name in ["s", "ch", "start", "end"] {
+            let v = native.alloc_value_var_with_type(ConcreteType::Signed);
+            native.push_inputarg_var(start, v.clone());
+            native.push_op_with_result_var(
+                start,
+                OpKind::Input {
+                    name: name.to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                v,
+            );
+        }
+        let result = native.alloc_value_var_with_type(ConcreteType::Signed);
+        native.push_op_with_result_var(start, OpKind::ConstInt(-1), result.clone());
+        native.set_return(start, Some(result));
+        cc.register_function_graph(CallPath::from_segments([LL_FIND_CHAR]), native);
+
+        let _ = ll_find_char_path(&mut cc, &*STRPTR);
+        let target = CallTarget::function_path([LL_FIND_CHAR]);
+        let (_, graph) = cc
+            .target_to_path_and_graph(&target)
+            .expect("residual occupies the helper leaf");
+        let inputs: Vec<&ValueType> = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { ty, .. } => Some(ty),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                inputs.as_slice(),
+                [
+                    ValueType::Ref(_),
+                    ValueType::Int,
+                    ValueType::Int,
+                    ValueType::Int
+                ]
+            ),
+            "helper leaf must be Ptr(STR), not native *const u8: {inputs:?}"
+        );
     }
 }

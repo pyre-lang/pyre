@@ -16656,6 +16656,8 @@ mod tests {
         crate::call_jit::ResumedFrame {
             code: std::ptr::null(),
             py_pc,
+            jitcode_index: 0,
+            jitcode_pc: 0,
             frame_ptr: std::ptr::null_mut(),
             vsd: 0,
             namespace: std::ptr::null(),

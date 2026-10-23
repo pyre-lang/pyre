@@ -640,29 +640,34 @@ impl Llbc {
     }
 
     /// Whether `path` names a struct harvested as `_alloc_flavor_ = raw`.
-    /// Matches the intern key's leaf (`bytecode::CodeObject` against
-    /// harvested `CodeObject` / `pycode::CodeObject`).
+    ///
+    /// The harvest stores the crate-stripped intern key
+    /// (`bytecode::CodeObject`). A TypeDecl `name_path` still carries the
+    /// crate (`rustpython_compiler_core::bytecode::CodeObject`); strip that
+    /// first segment the way `alloc_flavor_raw_contains` does. A stored
+    /// bare leaf still matches the query leaf.
     pub fn is_raw_alloc_flavor_path(&self, path: &str) -> bool {
         let paths = self.raw_alloc_flavor_paths.read();
         if paths.is_empty() {
             return false;
         }
-        if paths
-            .binary_search_by(|known| known.as_str().cmp(path))
-            .is_ok()
+        if Self::raw_alloc_flavor_contains(&paths, path) {
+            return true;
+        }
+        if let Some((_, stripped)) = path.split_once("::")
+            && Self::raw_alloc_flavor_contains(&paths, stripped)
         {
             return true;
         }
         let leaf = path.rsplit("::").next().unwrap_or(path);
         let leaf = leaf.split('<').next().unwrap_or(leaf);
-        if leaf != path
-            && paths
-                .binary_search_by(|known| known.as_str().cmp(leaf))
-                .is_ok()
-        {
-            return true;
-        }
-        false
+        leaf != path && Self::raw_alloc_flavor_contains(&paths, leaf)
+    }
+
+    fn raw_alloc_flavor_contains(paths: &[String], key: &str) -> bool {
+        paths
+            .binary_search_by(|known| known.as_str().cmp(key))
+            .is_ok()
     }
 
     /// Resolve a Charon `Deduplicated: <id>` type reference to the
@@ -1521,6 +1526,23 @@ mod tests {
         assert!(llbc.span_data(&missing).is_none());
         let present = ullbc::SpanRef::Deduplicated(4);
         assert_eq!(llbc.span_data(&present).unwrap().beg.line, 4);
+    }
+
+    #[test]
+    fn raw_alloc_flavor_path_matches_crate_stripped_intern_key() {
+        let doc = r#"{"charon_version":"t","has_errors":false,
+                      "translated":{"crate_name":"c","fun_decls":[]}}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("loads");
+        l.register_raw_alloc_flavor_paths(["bytecode::CodeObject".to_string()]);
+        assert!(l.is_raw_alloc_flavor_path("bytecode::CodeObject"));
+        assert!(
+            l.is_raw_alloc_flavor_path("rustpython_compiler_core::bytecode::CodeObject"),
+            "TypeDecl name_path keeps the crate; harvest stores the intern key"
+        );
+        assert!(
+            !l.is_raw_alloc_flavor_path("other::CodeObject"),
+            "a different module's CodeObject is not the harvested intern key"
+        );
     }
 
     #[test]
