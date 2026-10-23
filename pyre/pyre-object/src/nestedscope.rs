@@ -34,6 +34,11 @@ pub struct CellFamily {
     pub ever_mutated_watchers: QuasiImmutField,
 }
 
+/// Host `CellFamily` is a `Box::into_raw`'d host allocation, never a GC object.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_CellFamily: &str = "raw";
+
 impl CellFamily {
     /// nestedscope.py `CellFamily.__init__`.
     pub fn new(name: String) -> Self {

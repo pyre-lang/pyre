@@ -1830,6 +1830,7 @@ fn analyze_pipeline_from_module_paths(
                 &pair_fields,
                 &program.known_struct_names,
                 &immutable_fields,
+                &program.raw_alloc_flavor_structs,
             );
             &heuristic
         }

@@ -99,6 +99,9 @@ pub struct HeuristicLayoutProvider {
     /// when the source did not declare any immutable fields for that
     /// struct.
     immutable_fields_by_struct: HashMap<String, HashMap<String, ImmutableRank>>,
+    /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
+    /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
+    raw_alloc_flavor_structs: HashSet<String>,
 }
 
 impl HeuristicLayoutProvider {
@@ -115,6 +118,7 @@ impl HeuristicLayoutProvider {
         fields_by_struct: &HashMap<String, Vec<(String, String)>>,
         known_struct_names: &HashSet<String>,
         immutable_fields_by_struct: &HashMap<String, Vec<(String, ImmutableRank)>>,
+        raw_alloc_flavor_structs: &HashSet<String>,
     ) -> Self {
         let immutable: HashMap<String, HashMap<String, ImmutableRank>> = immutable_fields_by_struct
             .iter()
@@ -135,6 +139,7 @@ impl HeuristicLayoutProvider {
                     &known_sizes,
                     &known_aligns,
                     &imm_ranks,
+                    raw_alloc_flavor_structs,
                 );
                 if known_sizes.get(struct_name) != Some(&layout.size)
                     || known_aligns.get(struct_name) != Some(&layout.align)
@@ -154,6 +159,7 @@ impl HeuristicLayoutProvider {
             known_struct_aligns: known_aligns,
             fields_by_struct: fields_by_struct.clone(),
             immutable_fields_by_struct: immutable,
+            raw_alloc_flavor_structs: raw_alloc_flavor_structs.clone(),
         }
     }
 }
@@ -172,6 +178,7 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_sizes,
             &self.known_struct_aligns,
             &imm_ranks,
+            &self.raw_alloc_flavor_structs,
         ))
     }
 
@@ -195,6 +202,7 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_names,
             &self.known_struct_sizes,
             &imm_ranks,
+            &self.raw_alloc_flavor_structs,
         );
         Some(layout)
     }
@@ -214,8 +222,12 @@ mod tests {
                 ("y".to_string(), "i64".to_string()),
             ],
         );
-        let provider =
-            HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &HashMap::new());
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         let layout = provider.get_struct_layout("MyStruct").unwrap();
         assert_eq!(layout.size, 16);
         assert_eq!(layout.fields.len(), 2);
@@ -230,8 +242,12 @@ mod tests {
     #[test]
     fn test_heuristic_provider_unknown_struct() {
         let fields = HashMap::new();
-        let provider =
-            HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &HashMap::new());
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
         assert!(provider.get_struct_layout("NoSuchStruct").is_none());
     }
 
@@ -252,8 +268,12 @@ mod tests {
             "Storage".to_string(),
             vec![("pools".to_string(), ImmutableRank::Immutable)],
         );
-        let provider =
-            HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &immutable);
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &HashSet::new(),
+            &immutable,
+            &HashSet::new(),
+        );
         let layout = provider.get_struct_layout("Storage").unwrap();
         assert_eq!(layout.fields[0].name, "pools");
         assert!(layout.fields[0].is_immutable());
@@ -277,8 +297,12 @@ mod tests {
             "Cell".to_string(),
             vec![("value".to_string(), ImmutableRank::QuasiImmutable)],
         );
-        let provider =
-            HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &immutable);
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &HashSet::new(),
+            &immutable,
+            &HashSet::new(),
+        );
         let layout = provider.get_struct_layout("Cell").unwrap();
         assert_eq!(layout.fields[0].name, "value");
         assert_eq!(layout.fields[0].rank, Some(ImmutableRank::QuasiImmutable));
@@ -316,8 +340,12 @@ mod tests {
             "module::Enum".to_string(),
             vec![("__discriminant".to_string(), "i64".to_string())],
         );
-        let provider =
-            HeuristicLayoutProvider::from_struct_fields(&fields, &HashSet::new(), &HashMap::new());
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &fields,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
 
         // Heuristic alone would place the tag at offset 0.
         assert_eq!(

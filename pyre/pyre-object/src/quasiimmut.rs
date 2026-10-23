@@ -37,6 +37,11 @@ pub struct QuasiImmut {
     unlinked: AtomicBool,
 }
 
+/// Host `QuasiImmut` is a `Box::into_raw`'d host allocation, never a GC object.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_QuasiImmut: &str = "raw";
+
 /// The list `quasiimmut.py __init__` sets up, behind the lock that keeps
 /// a registration and a sweep from interleaving.
 struct LoopTokens {
@@ -148,6 +153,14 @@ impl QuasiImmut {
     }
 }
 
+/// Heap box behind [`QuasiImmutField::lock`].
+struct QuasiImmutLock(parking_lot::Mutex<()>);
+
+/// Host `QuasiImmutLock` is a `Box::into_raw`'d host allocation, never a GC object.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_QuasiImmutLock: &str = "raw";
+
 /// The hidden `mutate_<name>` field the rtyper synthesises for one `?`
 /// declaration (`quasiimmut.py get_mutate_field_name`), written out because
 /// pyre has no rtyper to synthesise it.
@@ -179,7 +192,7 @@ impl QuasiImmut {
 #[repr(C)]
 pub struct QuasiImmutField {
     ptr: AtomicPtr<QuasiImmut>,
-    lock: AtomicPtr<parking_lot::Mutex<()>>,
+    lock: AtomicPtr<QuasiImmutLock>,
 }
 
 /// Byte offsets of the two words of [`QuasiImmutField`]. A descr group that
@@ -218,7 +231,7 @@ impl QuasiImmutField {
     fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
         let existing = self.lock.load(Ordering::Acquire);
         let mutex = if existing.is_null() {
-            let fresh = Box::into_raw(Box::new(parking_lot::Mutex::new(())));
+            let fresh = Box::into_raw(Box::new(QuasiImmutLock(parking_lot::Mutex::new(()))));
             match self.lock.compare_exchange(
                 std::ptr::null_mut(),
                 fresh,
@@ -234,7 +247,7 @@ impl QuasiImmutField {
         } else {
             existing
         };
-        unsafe { (*mutex).lock() }
+        unsafe { (*mutex).0.lock() }
     }
 
     /// Whether any read has been recorded since the last invalidation — the

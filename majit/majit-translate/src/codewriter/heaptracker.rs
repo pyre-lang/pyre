@@ -224,7 +224,7 @@ pub fn all_interiorfielddescrs(
             if row.name == "typeptr" || row.name.starts_with("c__pad") {
                 continue;
             }
-            let (_, ir_type, _) = get_type_flag(&row.ty);
+            let (_, ir_type, _) = get_type_flag(&row.ty, &gccache.raw_alloc_flavor_structs);
             if ir_type == majit_ir::value::Type::Void {
                 continue;
             }
@@ -261,7 +261,7 @@ pub fn all_interiorfielddescrs(
         if row.name == "typeptr" || row.name.starts_with("c__pad") {
             continue;
         }
-        let (_, ir_type, _) = get_type_flag(&row.ty);
+        let (_, ir_type, _) = get_type_flag(&row.ty, &gccache.raw_alloc_flavor_structs);
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
@@ -299,13 +299,13 @@ pub fn get_fielddescr_index_in(
         if row.name != fieldname {
             return false;
         }
-        let (_, ir_type, _) = get_type_flag(&row.ty);
+        let (_, ir_type, _) = get_type_flag(&row.ty, &gccache.raw_alloc_flavor_structs);
         ir_type != majit_ir::value::Type::Void && !gccache.is_known_struct(&row.ty)
     });
     for row in fields {
         let name = &row.name;
         let field_type = &row.ty;
-        let (_, ir_type, _) = get_type_flag(field_type);
+        let (_, ir_type, _) = get_type_flag(field_type, &gccache.raw_alloc_flavor_structs);
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }
@@ -365,7 +365,7 @@ fn all_fielddescrs_into(
     for row in fields {
         let name = &row.name;
         let field_type = &row.ty;
-        let (flag, ir_type, _) = get_type_flag(field_type);
+        let (flag, ir_type, _) = get_type_flag(field_type, &gccache.raw_alloc_flavor_structs);
         if ir_type == majit_ir::value::Type::Void {
             continue;
         }

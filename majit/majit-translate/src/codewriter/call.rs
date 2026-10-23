@@ -3306,11 +3306,18 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Vec<")
         || type_name.starts_with("Option<")
         || type_name == "String"
-        || atomic_wrapper_leaf(type_name).is_some()
+        || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
     {
         return false;
     }
     known_structs.contains(type_name) || majit_ir::descr::positional_shape_id(type_name).is_some()
+}
+
+/// Pointee spelling of an `AtomicPtr<T>`.
+fn atomic_ptr_pointee(type_name: &str) -> Option<&str> {
+    let leaf = type_name.rsplit("::").next().unwrap_or(type_name);
+    let rest = leaf.strip_prefix("AtomicPtr<")?;
+    rest.strip_suffix('>')
 }
 
 /// Layout-transparent `core::sync::atomic` wrappers. `AtomicI64` occupies
@@ -3319,13 +3326,22 @@ fn is_known_by_value_struct(
 /// struct, so the field walk must not recurse into the wrapper.
 pub(crate) fn atomic_wrapper_leaf(
     type_name: &str,
+    raw_alloc_flavor_structs: &HashSet<String>,
 ) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
     let leaf = type_name.rsplit("::").next().unwrap_or(type_name);
     let leaf = leaf.split('<').next().unwrap_or(leaf);
     let word = crate::layout::target_word_size();
     use majit_ir::descr::ArrayFlag;
     match leaf {
-        "AtomicPtr" => Some((ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)),
+        // Layout-identical to `*mut T`, so the same `get_type_flag` path
+        // (`descr.py get_type_flag` / `_gckind == 'raw'`).
+        "AtomicPtr" => match atomic_ptr_pointee(type_name) {
+            Some(inner) => Some(get_type_flag(
+                &format!("*mut {inner}"),
+                raw_alloc_flavor_structs,
+            )),
+            None => Some((ArrayFlag::Pointer, majit_ir::value::Type::Ref, word)),
+        },
         "AtomicBool" => Some((ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1)),
         "AtomicI64" => Some((ArrayFlag::Signed, majit_ir::value::Type::Int, 8)),
         "AtomicI32" => Some((ArrayFlag::Signed, majit_ir::value::Type::Int, 4)),
@@ -3356,6 +3372,7 @@ impl StructLayout {
         known_struct_sizes: &std::collections::HashMap<String, usize>,
         known_struct_aligns: &std::collections::HashMap<String, usize>,
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
+        raw_alloc_flavor_structs: &HashSet<String>,
     ) -> Self {
         // RPython: symbolic.get_array_token() computes itemsize for ANY struct,
         // even those with nested structs. UnsupportedFieldExc only affects
@@ -3379,7 +3396,7 @@ impl StructLayout {
                         .copied()
                         .unwrap_or(crate::layout::target_word_size())
                 } else {
-                    get_type_flag(type_str).2
+                    get_type_flag(type_str, raw_alloc_flavor_structs).2
                 };
                 if sz > 0 {
                     let align = sz.min(crate::layout::target_word_size());
@@ -3388,8 +3405,12 @@ impl StructLayout {
                 }
                 continue;
             }
-            let (flag, field_type, field_size) =
-                field_metadata(type_str, known_structs, known_struct_sizes);
+            let (flag, field_type, field_size) = field_metadata(
+                type_str,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+            );
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
                 continue;
             }
@@ -3426,11 +3447,11 @@ impl StructLayout {
                             Some(size) => {
                                 panic!("type `{ty}` has size {size} but no field alignment")
                             }
-                            None => type_align(ty),
+                            None => type_align(ty, raw_alloc_flavor_structs),
                         }
                     }
                 } else {
-                    type_align(ty)
+                    type_align(ty, raw_alloc_flavor_structs)
                 }
             })
             .filter(|s| *s > 0)
@@ -3491,6 +3512,7 @@ impl StructLayout {
         known_structs: &std::collections::HashSet<String>,
         known_struct_sizes: &std::collections::HashMap<String, usize>,
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
+        raw_alloc_flavor_structs: &HashSet<String>,
     ) {
         for fl in &mut self.fields {
             if let Some(&offset) = exact_offsets.get(&fl.name) {
@@ -3511,8 +3533,12 @@ impl StructLayout {
             let Some(&offset) = exact_offsets.get(name) else {
                 continue;
             };
-            let (flag, field_type, field_size) =
-                field_metadata(type_str, known_structs, known_struct_sizes);
+            let (flag, field_type, field_size) = field_metadata(
+                type_str,
+                known_structs,
+                known_struct_sizes,
+                raw_alloc_flavor_structs,
+            );
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
                 continue;
             }
@@ -4004,6 +4030,7 @@ impl CallControl {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &self.raw_alloc_flavor_structs,
         ));
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
@@ -4198,7 +4225,7 @@ impl CallControl {
                 majit_ir::value::Type::Ref,
             )
         } else if let Some(elem) = elem_ref {
-            let (f, t, s) = get_type_flag(elem);
+            let (f, t, s) = get_type_flag(elem, &self.raw_alloc_flavor_structs);
             (f, s, t)
         } else {
             (
@@ -4560,7 +4587,7 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty);
+            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
             // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`
             // open with `if FIELD is lltype.Void: continue`, so a zero-sized
             // field is in neither the descr list nor the positional census.
@@ -4909,7 +4936,7 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty);
+            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
             if ir_type == majit_ir::value::Type::Void || fname == "typeptr" {
                 continue;
             }
@@ -5004,7 +5031,7 @@ impl CallControl {
         for row in fields {
             let fname = &row.name;
             let fty = &row.ty;
-            let (flag, ir_type, field_size) = get_type_flag(fty);
+            let (flag, ir_type, field_size) = get_type_flag(fty, &self.raw_alloc_flavor_structs);
             // Same skip, same reason as `fielddescrof_concrete`: this walk
             // hands its match to `field_pos_in`, and `heaptracker.py
             // all_interiorfielddescrs` / `get_fielddescr_index_in` both drop
@@ -11940,7 +11967,8 @@ fn all_interiorfielddescrs(
     for row in fields.iter() {
         let field_name = &row.name;
         let field_type_str = &row.ty;
-        let (flag, field_type, field_size) = get_type_flag(field_type_str);
+        let (flag, field_type, field_size) =
+            get_type_flag(field_type_str, &cc.raw_alloc_flavor_structs);
         if field_type == majit_ir::value::Type::Void {
             continue;
         }
@@ -11968,7 +11996,7 @@ fn all_interiorfielddescrs(
     }
     let max_align = fields
         .iter()
-        .map(|row| type_align(&row.ty))
+        .map(|row| type_align(&row.ty, &cc.raw_alloc_flavor_structs))
         .filter(|s| *s > 0)
         .max();
     let item_size = match max_align {
@@ -12132,7 +12160,7 @@ fn compute_struct_size_uncached(
                 .map(|l| l.size)
                 .unwrap_or(crate::layout::target_word_size())
         } else {
-            let (_, field_type, s) = get_type_flag(field_type_str);
+            let (_, field_type, s) = get_type_flag(field_type_str, &cc.raw_alloc_flavor_structs);
             if field_type == majit_ir::value::Type::Void || s == 0 {
                 continue;
             }
@@ -12149,9 +12177,9 @@ fn compute_struct_size_uncached(
             if cc.is_known_struct(ty) {
                 cc.struct_layout_for(ty)
                     .map(|l| l.align)
-                    .unwrap_or_else(|| type_align(ty))
+                    .unwrap_or_else(|| type_align(ty, &cc.raw_alloc_flavor_structs))
             } else {
-                type_align(ty)
+                type_align(ty, &cc.raw_alloc_flavor_structs)
             }
         })
         .filter(|s| *s > 0)
@@ -12200,6 +12228,7 @@ fn field_metadata(
     type_str: &str,
     known_structs: &std::collections::HashSet<String>,
     known_struct_sizes: &std::collections::HashMap<String, usize>,
+    raw_alloc_flavor_structs: &HashSet<String>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     if is_known_by_value_struct(known_structs, type_str) {
         let nested_size = known_struct_sizes
@@ -12212,16 +12241,8 @@ fn field_metadata(
             nested_size,
         )
     } else {
-        get_type_flag(type_str)
+        get_type_flag(type_str, raw_alloc_flavor_structs)
     }
-}
-
-/// Leaf of a `*const T` / `*mut T` spelling, generics stripped.
-fn pointer_type_leaf(type_str: &str) -> Option<&str> {
-    let rest = type_str
-        .strip_prefix("*const ")
-        .or_else(|| type_str.strip_prefix("*mut "))?;
-    Some(rest.split('<').next().unwrap_or(rest))
 }
 
 /// Leaf of a type spelling that occupies no storage.
@@ -12241,6 +12262,7 @@ pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
 
 pub(crate) fn get_type_flag(
     type_str: &str,
+    raw_alloc_flavor_structs: &HashSet<String>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     use majit_ir::descr::ArrayFlag;
     match type_str {
@@ -12254,17 +12276,19 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
         ),
-        // `Cell.family` / `PyCode.code_ptr` point at leaked host allocations
-        // (`nestedscope.rs` `CellFamily`, compiler-core `CodeObject`), not GC
-        // objects, so `history.getkind` gives "int" (`TO._gckind == 'raw'`).
-        // The pointees are named because `adt_def_is_raw_storage` refuses
-        // them (they hold `Box` / `String` fields): declaring the ADT raw would
-        // also turn every `CodeObject` field read into `getfield_raw`.
-        // Instantiations (`CodeObject<C>`) share the leaf.
-        s if matches!(
-            pointer_type_leaf(s),
-            Some("CellFamily") | Some("CodeObject")
-        ) =>
+        // descr.py get_type_flag: Ptr whose pointee has `_gckind == 'raw'` is
+        // FLAG_UNSIGNED; history.getkind of that Ptr is "int". The pointee
+        // is identified by the harvested `_alloc_flavor_<Struct> = "raw"`
+        // marker.
+        s if s
+            .strip_prefix("*const ")
+            .or_else(|| s.strip_prefix("*mut "))
+            .is_some_and(|pointee| {
+                crate::front::llbc_hints::alloc_flavor_raw_contains(
+                    raw_alloc_flavor_structs,
+                    pointee,
+                )
+            }) =>
         {
             (
                 ArrayFlag::Unsigned,
@@ -12364,13 +12388,13 @@ pub(crate) fn get_type_flag(
         // `[u8; 4]` would stride 8. A GC-pointer element keeps `FLAG_POINTER`;
         // a scalar keeps that scalar's flag and the multiplied size.
         s if let Some((elem, len)) = crate::front::mir::shaped_array_parts(s) => {
-            let (flag, item_type, elem_size) = get_type_flag(elem);
+            let (flag, item_type, elem_size) = get_type_flag(elem, raw_alloc_flavor_structs);
             (flag, item_type, elem_size.saturating_mul(len))
         }
         // Zero-sized types occupy no storage and contribute no field slot
         // (heaptracker.py:60-62; lltype.py `_names_without_voids()`).
         s if type_str_leaf_is_void_zst(s) => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
-        s if let Some(leaf) = atomic_wrapper_leaf(s) => leaf,
+        s if let Some(leaf) = atomic_wrapper_leaf(s, raw_alloc_flavor_structs) => leaf,
         // Unknown type — treat as GC pointer (conservative)
         _ => (
             ArrayFlag::Pointer,
@@ -12386,14 +12410,18 @@ pub(crate) fn get_type_flag(
 /// `Vec<T>` is three word fields (pointer, length, capacity), so it
 /// aligns to one word. Any other non-power-of-two size is an aggregate
 /// whose fields are not in hand: that fails instead of assuming a word.
-pub(crate) fn type_align(type_str: &str) -> usize {
+pub(crate) fn type_align(type_str: &str, raw_alloc_flavor_structs: &HashSet<String>) -> usize {
     if let Some((elem, len)) = crate::front::mir::shaped_array_parts(type_str) {
-        return if len == 0 { 0 } else { type_align(elem) };
+        return if len == 0 {
+            0
+        } else {
+            type_align(elem, raw_alloc_flavor_structs)
+        };
     }
     if crate::vec_layout::field_layout_is_inline_vec(type_str) {
         return crate::layout::target_word_size();
     }
-    let size = get_type_flag(type_str).2;
+    let size = get_type_flag(type_str, raw_alloc_flavor_structs).2;
     if size == 0 || size.is_power_of_two() {
         return size;
     }
@@ -13396,7 +13424,7 @@ mod tests {
     /// The unknown-name fallback would bank it as a word-sized Ref.
     #[test]
     fn get_type_flag_char_is_unsigned_int_of_four_bytes() {
-        let (flag, ty, size) = get_type_flag("char");
+        let (flag, ty, size) = get_type_flag("char", &HashSet::new());
         assert_eq!(flag, majit_ir::descr::ArrayFlag::Unsigned);
         assert_eq!(ty, majit_ir::value::Type::Int);
         assert_eq!(size, 4);
@@ -13413,7 +13441,7 @@ mod tests {
             "std::hash::BuildHasherDefault",
             "core::marker::PhantomData<u8>",
         ] {
-            let (flag, ty, size) = get_type_flag(spelling);
+            let (flag, ty, size) = get_type_flag(spelling, &HashSet::new());
             assert_eq!(flag, majit_ir::descr::ArrayFlag::Void, "{spelling}");
             assert_eq!(ty, majit_ir::value::Type::Void, "{spelling}");
             assert_eq!(size, 0, "{spelling}");
@@ -16126,6 +16154,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(layout.fields[0].size, 8);
 
@@ -16180,6 +16209,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         let value_offset = layout
             .fields
@@ -16216,11 +16246,11 @@ mod tests {
     fn singlefloat_classifies_as_int_bank() {
         use majit_ir::descr::ArrayFlag;
         use majit_ir::value::Type;
-        let (f32_flag, f32_ty, f32_size) = get_type_flag("f32");
+        let (f32_flag, f32_ty, f32_size) = get_type_flag("f32", &HashSet::new());
         assert!(matches!(f32_flag, ArrayFlag::Unsigned));
         assert_eq!(f32_ty, Type::Int);
         assert_eq!(f32_size, 4);
-        let (f64_flag, f64_ty, _) = get_type_flag("f64");
+        let (f64_flag, f64_ty, _) = get_type_flag("f64", &HashSet::new());
         assert!(matches!(f64_flag, ArrayFlag::Float));
         assert_eq!(f64_ty, Type::Float);
         assert_eq!(return_type_string_to_kind("f32"), 'i');
@@ -16253,11 +16283,11 @@ mod tests {
         use majit_ir::value::Type;
 
         let word = crate::layout::target_word_size();
-        let (flag, ty, size) = get_type_flag("Vec<Box<Dynamic>>");
+        let (flag, ty, size) = get_type_flag("Vec<Box<Dynamic>>", &HashSet::new());
         assert_eq!(flag, ArrayFlag::Struct);
         assert_eq!(ty, Type::Ref);
         assert_eq!(size, 3 * word);
-        let (box_flag, _, box_size) = get_type_flag("Box<Dynamic>");
+        let (box_flag, _, box_size) = get_type_flag("Box<Dynamic>", &HashSet::new());
         assert_eq!(box_flag, ArrayFlag::Pointer);
         assert_eq!(box_size, word);
 
@@ -16270,6 +16300,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(layout.fields[0].name, "stack");
         assert_eq!(layout.fields[0].offset, 0);
@@ -16287,6 +16318,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(vec_only.fields.len(), 1);
         assert_eq!(vec_only.fields[0].size, 3 * word);
@@ -16298,6 +16330,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(vec_then_flag.fields[1].offset, 3 * word);
         assert_eq!(vec_then_flag.size, 4 * word);
@@ -16312,6 +16345,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(triple.align, 4);
         assert_eq!(triple.size, 12);
@@ -16323,6 +16357,7 @@ mod tests {
             &std::collections::HashMap::from([("Triple".to_string(), 12)]),
             &std::collections::HashMap::from([("Triple".to_string(), 4)]),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(nested.align, 4, "three u32 align to 4, not a word");
         assert_eq!(nested.size, 12);
@@ -18981,6 +19016,7 @@ mod tests {
                     &known_sizes,
                     &known_aligns,
                     &HashMap::new(),
+                    &HashSet::new(),
                 );
                 if known_sizes.get(*name) != Some(&layout.size)
                     || known_aligns.get(*name) != Some(&layout.align)
@@ -19122,6 +19158,7 @@ mod tests {
             &known_sizes,
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(layout.size, crate::layout::target_word_size());
         assert_eq!(layout.fields.len(), 1);
@@ -19139,25 +19176,39 @@ mod tests {
         use majit_ir::descr::ArrayFlag;
         use majit_ir::value::Type;
 
-        let (flag, field_type, size) = get_type_flag("*const u8");
+        let (flag, field_type, size) = get_type_flag("*const u8", &HashSet::new());
         assert_eq!(flag, ArrayFlag::Unsigned);
         assert_eq!(field_type, Type::Int);
         assert_eq!(size, crate::layout::target_word_size());
     }
 
-    /// `Cell.family` / `PyCode.code_ptr` point at leaked host allocations;
-    /// `history.getkind` of a raw `Ptr` is "int".
+    /// `descr.py get_type_flag` / `_gckind == 'raw'`: a pointer to a
+    /// harvested `_alloc_flavor_ = raw` struct is an unsigned int word.
+    /// The same spelling with an empty set is the `*mut T` Ref fallback.
     #[test]
     fn raw_host_pointee_pointer_is_int_banked() {
         use majit_ir::descr::ArrayFlag;
         use majit_ir::value::Type;
 
-        for spelling in ["*const CellFamily", "*const CodeObject"] {
-            let (flag, field_type, size) = get_type_flag(spelling);
-            assert_eq!(flag, ArrayFlag::Unsigned, "{spelling}");
-            assert_eq!(field_type, Type::Int, "{spelling}");
-            assert_eq!(size, crate::layout::target_word_size(), "{spelling}");
+        let word = crate::layout::target_word_size();
+        let expected = (ArrayFlag::Unsigned, Type::Int, word);
+        let fallback = (ArrayFlag::Pointer, Type::Ref, word);
+        let empty = HashSet::new();
+        let raw: HashSet<String> = ["CellFamily", "CodeObject", "QuasiImmut"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for spelling in [
+            "*const CellFamily",
+            "*const CodeObject",
+            "*mut CodeObject",
+            "AtomicPtr<QuasiImmut>",
+        ] {
+            assert_eq!(get_type_flag(spelling, &raw), expected, "{spelling}");
+            assert_eq!(get_type_flag(spelling, &empty), fallback, "{spelling}");
         }
+        assert_eq!(get_type_flag("AtomicPtr<PyObject>", &raw), fallback);
+        assert_eq!(get_type_flag("AtomicPtr<PyObject>", &empty), fallback);
     }
 
     /// A one-word-item Vec field is `Ptr(Struct(raw) "RustVec")`
@@ -19173,9 +19224,9 @@ mod tests {
         let known = std::collections::HashSet::new();
         let sizes = std::collections::HashMap::new();
         for spelling in ["*mut Vec<usize>", "*mut Vec<*mut u8>", "*mut Vec<f64>"] {
-            assert_eq!(get_type_flag(spelling), expected, "{spelling}");
+            assert_eq!(get_type_flag(spelling, &known), expected, "{spelling}");
             assert_eq!(
-                super::field_metadata(spelling, &known, &sizes),
+                super::field_metadata(spelling, &known, &sizes, &known),
                 expected,
                 "{spelling}"
             );
@@ -19196,6 +19247,7 @@ mod tests {
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
+            &HashSet::new(),
         );
         assert_eq!(layout.fields.len(), 1);
         assert_eq!(layout.fields[0].flag, ArrayFlag::Unsigned);

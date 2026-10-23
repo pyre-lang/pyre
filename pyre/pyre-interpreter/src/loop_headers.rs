@@ -160,6 +160,11 @@ pub struct LoopHeaderInfo {
     pub header_pcs: Vec<usize>,
 }
 
+/// Host `LoopHeaderInfo` is a `Box::into_raw`'d host allocation, never a GC object.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_LoopHeaderInfo: &str = "raw";
+
 /// Publish `LoopHeaderInfo` on `w_code` at the first query.
 ///
 /// A null wrapper, or a null/unaligned `code_ptr` (the case in which

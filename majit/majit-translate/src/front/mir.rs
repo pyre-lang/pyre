@@ -1472,6 +1472,9 @@ pub(crate) struct CrateLoweringState {
     tombstoned_leaves: std::collections::HashSet<String>,
     /// Gc structs and enums visible to every body of this artefact.
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
+    /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
+    raw_alloc_flavor_structs: std::collections::HashSet<String>,
     dont_look_inside: std::collections::HashSet<String>,
     elidable_residual: std::collections::HashSet<String>,
     not_rpython: std::collections::HashSet<String>,
@@ -1502,7 +1505,6 @@ struct CrateExports {
     exact_layouts:
         std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
     struct_ids: std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
-    raw_alloc_flavor_structs: std::collections::HashSet<String>,
 }
 
 /// One artefact's lowering context: the artefact, the host addresses and
@@ -1679,6 +1681,10 @@ impl CrateLoweringState {
         } else {
             func_hints
         };
+        let raw_alloc_flavor_structs =
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                llbc,
+            ));
         Self {
             known_trait_names,
             struct_field_attrs,
@@ -1689,13 +1695,10 @@ impl CrateLoweringState {
                 struct_origins,
                 exact_layouts,
                 struct_ids,
-                raw_alloc_flavor_structs:
-                    crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
-                        std::slice::from_ref(llbc),
-                    ),
             }),
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
+            raw_alloc_flavor_structs,
             dont_look_inside,
             elidable_residual,
             not_rpython,
@@ -1726,6 +1729,21 @@ impl CrateLoweringState {
     #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn struct_fields(&self) -> &crate::front::semantic::StructFieldRegistry {
         &self.struct_fields
+    }
+
+    /// Union `other`'s harvested raw-flavor structs so a later crate's
+    /// `get_type_flag` sees earlier crates' `_alloc_flavor_ = raw` markers.
+    #[cfg(any(test, feature = "mir-frontend"))]
+    pub(crate) fn absorb_raw_alloc_flavor_structs(
+        &mut self,
+        other: &std::collections::HashSet<String>,
+    ) {
+        self.raw_alloc_flavor_structs.extend(other.iter().cloned());
+    }
+
+    #[cfg(any(test, feature = "mir-frontend"))]
+    pub(crate) fn raw_alloc_flavor_structs(&self) -> &std::collections::HashSet<String> {
+        &self.raw_alloc_flavor_structs
     }
 }
 
@@ -2007,6 +2025,7 @@ impl<'l> CrateLowering<'l> {
             struct_fields,
             tombstoned_leaves,
             gc_struct_ids,
+            raw_alloc_flavor_structs,
             dont_look_inside,
             spec,
             ..
@@ -2048,6 +2067,7 @@ impl<'l> CrateLowering<'l> {
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
+            raw_alloc_flavor_structs,
             builder_mode,
             &accum,
             root_stack,
@@ -2205,6 +2225,7 @@ impl<'l> CrateLowering<'l> {
             struct_fields,
             tombstoned_leaves,
             gc_struct_ids,
+            raw_alloc_flavor_structs,
             dont_look_inside,
             spec: spec_queue,
             skipped,
@@ -2234,6 +2255,7 @@ impl<'l> CrateLowering<'l> {
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
+            raw_alloc_flavor_structs,
             builder_mode,
             &accum,
             root_stack,
@@ -2328,7 +2350,6 @@ impl CrateLoweringState {
             struct_origins,
             exact_layouts,
             struct_ids,
-            raw_alloc_flavor_structs,
         } = self.exports.take();
         let atomic_load_decls = self.atomic_load_decls.take();
         crate::front::semantic::SemanticProgram {
@@ -2342,7 +2363,7 @@ impl CrateLoweringState {
             // (the `attributes` array carries DocComment / Outer but not our
             // proc-macro hints).
             immutable_fields: std::collections::HashMap::new(),
-            raw_alloc_flavor_structs,
+            raw_alloc_flavor_structs: self.raw_alloc_flavor_structs.clone(),
             enum_variant_by_discriminant,
             struct_origins,
             struct_field_attrs,
@@ -4934,6 +4955,9 @@ pub struct LowerContext<'a> {
     /// Structs and enums declared Gc across this one artefact.
     /// Absence is Raw (`DeclaredGcFacts::gc_struct_ids`).
     gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
+    /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
+    raw_alloc_flavor_structs: std::collections::HashSet<String>,
 }
 
 impl<'a> LowerContext<'a> {
@@ -4954,6 +4978,9 @@ impl<'a> LowerContext<'a> {
             dont_look_inside: dont_look_inside_set_of(llbc),
             tombstoned_leaves: tombstoned_leaves_of(llbc),
             gc_struct_ids,
+            raw_alloc_flavor_structs: crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                std::slice::from_ref(llbc),
+            ),
         }
     }
 }
@@ -4990,6 +5017,7 @@ pub fn lower_fun_decl_with_static_addrs(
             &context.dont_look_inside,
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
+            &context.raw_alloc_flavor_structs,
         )
     })
 }
@@ -5062,6 +5090,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let mut u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
@@ -5085,6 +5114,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         dont_look_inside,
         tombstoned_leaves,
         gc_struct_ids,
+        raw_alloc_flavor_structs,
         builder_mode,
         &accum,
         &RootStackAnalyzer::new(llbc, &RootStackState::new(llbc)),
@@ -5111,6 +5141,7 @@ fn lower_fat_dyn_callee(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<FunctionGraph> {
     if crate::front::dyn_fat::splice_in_progress(def_id) {
         return None;
@@ -5133,6 +5164,7 @@ fn lower_fat_dyn_callee(
         dont_look_inside,
         tombstoned_leaves,
         gc_struct_ids,
+        raw_alloc_flavor_structs,
     )
     .ok()
 }
@@ -5152,6 +5184,7 @@ fn splice_recorded_fat_dyn_returns(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) {
     let dyn_results = lo.dyn_return_calls.clone();
     let cache =
@@ -5173,6 +5206,7 @@ fn splice_recorded_fat_dyn_returns(
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
+            raw_alloc_flavor_structs,
         );
         cache.borrow_mut().insert(def_id, lowered.clone());
         lowered
@@ -5354,6 +5388,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     // When set, each strategy's `Lowering` is switched to builder form
     // ([`Lowering::enable_builder_mode`]) so a string accumulator
     // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
@@ -6177,6 +6212,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
+            raw_alloc_flavor_structs,
         );
         // Field reads emitted while blocks were still being closed name a
         // base defined only in a predecessor. Thread once every edge exists.
@@ -6215,6 +6251,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
         )?;
         lo.struct_fields = Some(struct_fields);
+        lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
         if builder_mode {
             lo.enable_builder_mode();
         }
@@ -6271,6 +6308,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
     )?;
     lo.struct_fields = Some(struct_fields);
+    lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
     if builder_mode {
         lo.enable_builder_mode();
     }
@@ -6313,6 +6351,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
             )?;
             lo.struct_fields = Some(struct_fields);
+            lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
             if builder_mode {
                 lo.enable_builder_mode();
             }
@@ -8784,6 +8823,9 @@ struct Lowering<'a> {
     /// is only the missing-row fallback. `None` in unit tests that do not
     /// lower Opaque scalar fields.
     struct_fields: Option<&'a crate::front::semantic::StructFieldRegistry>,
+    /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
+    /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
+    raw_alloc_flavor_structs: std::collections::HashSet<String>,
     /// Harvested `#[dont_look_inside]` marker set (keyed
     /// `strip_crate_prefix(name_path())`, the same spelling
     /// `stamp_return_token` uses at the whole-program registration loop).
@@ -9960,6 +10002,7 @@ impl<'a> Lowering<'a> {
             graph,
             llbc,
             struct_fields: None,
+            raw_alloc_flavor_structs: std::collections::HashSet::new(),
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
@@ -22051,8 +22094,11 @@ impl<'a> Lowering<'a> {
                     // `heaptracker.py:100-101`: a
                     // zero-sized field occupies no storage and gets no slot,
                     // so no write is generated for it.
-                    void: crate::codewriter::call::get_type_flag(&field_ty).1
-                        == majit_ir::value::Type::Void
+                    void: crate::codewriter::call::get_type_flag(
+                        &field_ty,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .1 == majit_ir::value::Type::Void
                         || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc)),
                     narrow_root: self.typed_ref_field_narrow_root(declared_ty),
                 }
@@ -26225,9 +26271,13 @@ impl<'a> Lowering<'a> {
                                 ) {
                                     return None;
                                 }
-                                first_arg_ty
-                                    .as_ref()
-                                    .and_then(|ty| narrow_item_array_type_id(ty, self.llbc))
+                                first_arg_ty.as_ref().and_then(|ty| {
+                                    narrow_item_array_type_id(
+                                        ty,
+                                        self.llbc,
+                                        &self.raw_alloc_flavor_structs,
+                                    )
+                                })
                             })
                     };
                     (item_ty, array_type_id)
@@ -68729,7 +68779,11 @@ pub(crate) fn fixed_array_index_identity(
 /// describes — a scalar spelling or a thin pointer.  An element
 /// neither answers for — a multi-word aggregate, `String`, a fat pointer —
 /// reaches no `ArrayRead` at all and stays a residual call.
-fn narrow_item_array_type_id(receiver: &TyRef, llbc: &Llbc) -> Option<String> {
+fn narrow_item_array_type_id(
+    receiver: &TyRef,
+    llbc: &Llbc,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
     let identity = tyref_to_ast_string(receiver, llbc);
     if identity.starts_with("??")
         || crate::front::typestr::nolength_from_array_type_id(Some(identity.as_str()))
@@ -68737,7 +68791,8 @@ fn narrow_item_array_type_id(receiver: &TyRef, llbc: &Llbc) -> Option<String> {
         return None;
     }
     let elem = crate::codewriter::call::extract_element_type_from_str(&identity)?;
-    let (_, item_type, item_size) = crate::codewriter::call::get_type_flag(&elem);
+    let (_, item_type, item_size) =
+        crate::codewriter::call::get_type_flag(&elem, raw_alloc_flavor_structs);
     (item_type == majit_ir::value::Type::Int && item_size < 8).then_some(identity)
 }
 
@@ -81066,6 +81121,7 @@ mod tests {
             &context.dont_look_inside,
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
+            &context.raw_alloc_flavor_structs,
             accum.has_builder,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
@@ -90042,7 +90098,7 @@ mod tests {
             Some("char")
         );
         assert_eq!(
-            crate::codewriter::call::get_type_flag("char"),
+            crate::codewriter::call::get_type_flag("char", &std::collections::HashSet::new()),
             (
                 majit_ir::descr::ArrayFlag::Unsigned,
                 majit_ir::value::Type::Int,
@@ -97066,7 +97122,7 @@ mod tests {
             "usize"
         );
         assert_eq!(
-            crate::codewriter::call::get_type_flag("usize").1,
+            crate::codewriter::call::get_type_flag("usize", &std::collections::HashSet::new()).1,
             majit_ir::value::Type::Int
         );
 
@@ -97081,7 +97137,7 @@ mod tests {
         let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc, &gc_struct_ids);
         assert_eq!(ptr_str, "*mut u8");
         assert_eq!(
-            crate::codewriter::call::get_type_flag(&ptr_str).1,
+            crate::codewriter::call::get_type_flag(&ptr_str, &std::collections::HashSet::new()).1,
             majit_ir::value::Type::Ref
         );
     }
@@ -97148,7 +97204,7 @@ mod tests {
             "u8"
         );
         assert_eq!(
-            crate::codewriter::call::get_type_flag("u8"),
+            crate::codewriter::call::get_type_flag("u8", &std::collections::HashSet::new()),
             (
                 majit_ir::descr::ArrayFlag::Unsigned,
                 majit_ir::value::Type::Int,

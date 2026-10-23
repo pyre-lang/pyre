@@ -172,6 +172,7 @@ impl GraphBodyProvider {
         );
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());
+            state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
@@ -208,6 +209,7 @@ impl GraphBodyProvider {
         );
         for prev in &self.crates {
             state.absorb_struct_fields(prev.state.struct_fields());
+            state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, None, Some(&function_filter));

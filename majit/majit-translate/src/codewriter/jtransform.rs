@@ -27385,7 +27385,7 @@ mod tests {
         fn item_size(id: &str) -> usize {
             let elem = crate::codewriter::call::extract_element_type_from_str(id)
                 .unwrap_or_else(|| id.to_string());
-            crate::codewriter::call::get_type_flag(&elem).2
+            crate::codewriter::call::get_type_flag(&elem, &std::collections::HashSet::new()).2
         }
 
         // Host-slice readers stay the origin/main identities. Narrow scalars
@@ -27540,7 +27540,10 @@ mod tests {
             let owner = "Array<[u8;4];2>";
             let field_ty = crate::front::mir::positional_field_type("[u8;4]");
             assert_eq!(field_ty, "[u8;4]");
-            let (flag, _, size) = crate::codewriter::call::get_type_flag(&field_ty);
+            let (flag, _, size) = crate::codewriter::call::get_type_flag(
+                &field_ty,
+                &std::collections::HashSet::new(),
+            );
             assert_eq!(size, 4, "__pos_1 strides 4");
             assert_ne!(flag, majit_ir::descr::ArrayFlag::Pointer);
             assert!(!fixed_list_clears("[u8;4]"));
