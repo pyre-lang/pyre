@@ -592,7 +592,11 @@ pub(in crate::front::mir) fn unichr_as_utf8_text(code: i64) -> Option<String> {
 /// constant lowering uses (see [`Lowering::emit_constant`]); the flowspace
 /// adapter pre-folds it to the upstream string `Constant` and types it as
 /// a String.
-pub(in crate::front::mir) fn emit_str_const(graph: &mut FunctionGraph, bb_id: BlockId, text: &str) -> Variable {
+pub(in crate::front::mir) fn emit_str_const(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    text: &str,
+) -> Variable {
     use crate::model::{CallTarget, OpKind, ValueType};
     let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
     stamp_as_rstr_str(&var);

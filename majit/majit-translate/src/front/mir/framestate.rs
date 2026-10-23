@@ -49,6 +49,16 @@ impl PackedLocalRow {
             self.bound.remove(at);
         }
     }
+
+    pub(in crate::front::mir) fn get(
+        &self,
+        slot: usize,
+    ) -> Option<crate::flowspace::model::Variable> {
+        self.bound
+            .binary_search_by_key(&(slot as u32), |(i, _)| *i)
+            .ok()
+            .map(|at| self.bound[at].1.clone())
+    }
 }
 
 /// One flowspace word, or the two words of a pair slice, held in the MIR

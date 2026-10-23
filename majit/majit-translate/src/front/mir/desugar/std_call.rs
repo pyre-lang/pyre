@@ -83,7 +83,7 @@ impl<'a> Lowering<'a> {
         });
         let result = self
             .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            .alloc_value_var_with_type(concretetype_for_field(&ValueType::Str));
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::FieldRead {
@@ -224,6 +224,15 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             crate::front::slice_get::is_slice_get_mut_name_path(&fd.item_meta.name_path())
+        })
+    }
+
+    pub(in crate::front::mir) fn is_slice_get_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            crate::front::slice_get::is_slice_get_name_path(&fd.item_meta.name_path())
         })
     }
 
@@ -717,8 +726,11 @@ impl<'a> Lowering<'a> {
     ///
     /// `index_words_ptr` returns that raw address; look-inside of the
     /// alias would feed `SomeInstance` to the caller's `direct_ptradd`
-    /// (`ann_direct_ptradd`, `rffi.py` `ptradd`). An already-int raw
-    /// scalar (`*const usize as *mut usize`, `HashStateStorage::as_mut_ptr`)
+    /// (`ann_direct_ptradd`, `rffi.py` `ptradd`). The source kind is the
+    /// SSA `getkind` of the operand (`rtyper.py` `setconcretetype` of the
+    /// items-base call, `Ref` of the GcArray header). The place spelling
+    /// `*mut u8` is CCHARP `int` and would skip the cast. An already-int
+    /// raw scalar (`*const usize as *mut usize`, `HashStateStorage::as_mut_ptr`)
     /// stays in the int bank. An items-base accessor (`IntArray::base`)
     /// and a function that stores through the same spelling
     /// (`set_sizehint_state_value`) keep the header so getarrayitem /
@@ -726,7 +738,7 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn should_emit_rffi_cast_identity_to_raw_scalar(
         &self,
         dest_ty: &TyRef,
-        src_ty: Option<&TyRef>,
+        src_kind: Option<&ValueType>,
     ) -> bool {
         if graph_is_items_block_base_accessor(&self.graph.name) {
             return false;
@@ -734,21 +746,10 @@ impl<'a> Lowering<'a> {
         if raw_scalar_address_value_type(dest_ty, self.llbc).is_none() {
             return false;
         }
-        if src_ty.is_some_and(|ty| raw_scalar_address_value_type(ty, self.llbc).is_some()) {
+        if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned)) {
             return false;
         }
-        if !src_ty.is_some_and(|ty| {
-            matches!(
-                tyref_to_value_type_with(
-                    ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs
-                ),
-                ValueType::Ref(_)
-            )
-        }) {
+        if !matches!(src_kind, Some(ValueType::Ref(_))) {
             return false;
         }
         self.body
@@ -1048,6 +1049,60 @@ impl<'a> Lowering<'a> {
             _ => return Ok(false),
         }
         let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `Option::take(&mut self) -> Option<T>`: read the slot, write `None`,
+    /// return the old value. `core::mem::take` is Default; this is the
+    /// inherent None store (`option.rs take`). FunDecl path is exact
+    /// (`is_reflexive_into_iter`).
+    pub(in crate::front::mir) fn try_lower_option_take(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        arg_locals: &[Option<usize>],
+        call_args: &[Operand],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Ok(false);
+        };
+        let is_take = self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            impl_method_owner_for_fundecl(self.llbc, fd)
+                .is_some_and(|(owner, leaf)| owner == "option::Option" && leaf == "take")
+        });
+        if !is_take {
+            return Ok(false);
+        }
+        // The slot is the borrowed Option place. `mem_slot` covers an
+        // `atomic_ref_place` / `index_elem_alias` local; a field borrow
+        // (`self.pending_loop_exit.take()`) is the referent
+        // `argument_borrow_place` already walks, or the operand Place
+        // when Charon passes the field projection directly.
+        let Some(place) =
+            self.resolved_option_receiver_place(arg_locals.first().copied().flatten(), call_args)
+        else {
+            return Ok(false);
+        };
+        let Some(option_ty) = self.tyref_peel_ref_to_pointee(&place.ty) else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_option(&option_ty, self.llbc) {
+            return Ok(false);
+        }
+        let old = self.read_mem_slot(mir_bb, &MemSlot::Place(clone_place(&place)))?;
+        let bb_id = self.emit_bb(mir_bb);
+        let none = if self.tyref_is_niche_option_ptr(&option_ty) {
+            self.push_niche_null_ptr(mir_bb, &option_ty)
+        } else {
+            self.graph.push_niche_null(bb_id, None)
+        };
+        self.write_mem_slot(mir_bb, MemSlot::Place(place), none)?;
+        self.local_var[dest_local] = Some(LocalValue::One(old));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -1707,15 +1762,15 @@ impl<'a> Lowering<'a> {
         span: &MoveSpan,
     ) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
-        let result = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         let SpanKind::Field {
             name,
             owner,
             owner_id,
             ty,
         } = &span.kind;
+        let result = self
+            .graph
+            .alloc_value_var_with_type(concretetype_for_field(ty));
         let kind = OpKind::FieldRead {
             base: base.clone(),
             field: crate::model::FieldDescriptor::new(name.clone(), Some(owner.clone()))
@@ -1793,7 +1848,9 @@ impl<'a> Lowering<'a> {
         );
         let bb_id = self.emit_bb(mir_bb);
         for leaf in leaves {
-            let read = self.graph.alloc_value_var();
+            let read = self
+                .graph
+                .alloc_value_var_with_type(concretetype_for_field(&leaf.ty));
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(read.clone()),
                 kind: OpKind::FieldRead {
@@ -3093,7 +3150,11 @@ impl<'a> Lowering<'a> {
 
     /// Items address of a resizable byte list
     /// (`rgc.nonmoving_raw_ptr_for_resizable_list`). Result is CCHARP.
-    pub(in crate::front::mir) fn emit_list_items_ccharp(&mut self, mir_bb: usize, list: Variable) -> Variable {
+    pub(in crate::front::mir) fn emit_list_items_ccharp(
+        &mut self,
+        mir_bb: usize,
+        list: Variable,
+    ) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
         let data = self
             .graph
@@ -3384,7 +3445,12 @@ impl<'a> Lowering<'a> {
     /// `registered_path_for_fun_decl` / `spec_segments` spelling). Attach the
     /// FunDecl id when this artefact loaded it. The result is the list, not
     /// `STR`.
-    pub(in crate::front::mir) fn emit_charpsize2str_list(&mut self, mir_bb: usize, ptr: Variable, len: Variable) -> Variable {
+    pub(in crate::front::mir) fn emit_charpsize2str_list(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+        len: Variable,
+    ) -> Variable {
         let dest = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
@@ -5282,6 +5348,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
             },
         });
+        let mut intern_fields: Vec<(String, ValueType)> = Vec::new();
         for (i, field) in ctor.fields.iter().enumerate() {
             if field.void {
                 continue;
@@ -5309,6 +5376,7 @@ impl<'a> Lowering<'a> {
                 &field.name,
                 ty,
             );
+            intern_fields.push((field.name.clone(), ty.clone()));
             let value = match &field.narrow_root {
                 Some(root) => {
                     let narrowed = self
@@ -5345,6 +5413,10 @@ impl<'a> Lowering<'a> {
                 },
             });
         }
+        intern_positional_ctor_field_kinds(
+            &ctor.result_owner,
+            intern_fields.iter().map(|(name, ty)| (name.as_str(), ty)),
+        );
         res
     }
 
@@ -5960,6 +6032,31 @@ impl<'a> Lowering<'a> {
         self.tyref_is_niche_option_ptr(&receiver_ty) && self.tyref_is_niche_option_ptr(dest_ty)
     }
 
+    /// Borrowed Option place behind residual `as_ref` / `take`.
+    /// `mem_slot` covers `atomic_ref_place`; a field projection on the
+    /// operand is used when Charon passes it directly.
+    pub(in crate::front::mir) fn resolved_option_receiver_place(
+        &self,
+        recv_local: Option<usize>,
+        call_args: &[Operand],
+    ) -> Option<Place> {
+        let place = if let Some(MemSlot::Place(p)) = self.mem_slot(recv_local) {
+            p
+        } else if let Some(p) = self.resolved_borrow_place(recv_local) {
+            p
+        } else {
+            match call_args.first() {
+                Some(Operand::Copy(p) | Operand::Move(p))
+                    if !matches!(p.kind, PlaceKind::Local(_)) =>
+                {
+                    clone_place(p)
+                }
+                _ => return None,
+            }
+        };
+        Some(self.concrete_borrow_place(place))
+    }
+
     /// `alloc::fmt::format(args)` (the `format!` macro's String producer)
     /// — the call whose `format_args!` argument the #277 recognizer
     /// back-traces.  `write!`/`writeln!` lower to `fmt::Write::write_fmt`
@@ -6426,13 +6523,6 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// `as_bytes()` aliases the dest to the `W_UnicodeObject` and marks
-    /// that local; a later `slice::len` / `slice::is_empty` often
-    /// receives `Copy(*local)` rather than the local itself, so the
-    /// mark must follow the projection the same way `Rvalue::Len` does.
-    /// Last-write-wins for a call dest aliased to `args[0]`.  Inherit the
-    /// mark when the receiver is already a string byte view (`x = x.as_slice()`
-    /// after `as_bytes`); drop it when the receiver is an ordinary `&[u8]`.
     pub(in crate::front::mir) fn alias_dest_to_arg0(
         &mut self,
         dest_local: usize,
@@ -6635,6 +6725,17 @@ impl<'a> Lowering<'a> {
             matches!(
                 path.as_str(),
                 "core::ptr::copy_nonoverlapping" | "std::ptr::copy_nonoverlapping"
+            )
+        })
+    }
+
+    /// `core::ptr::null_mut` / `null` (`rbuiltin.py` `rtype_const_result`
+    /// of `lltype.nullptr`). FunDecl identity, not a residual path leaf.
+    pub(in crate::front::mir) fn is_ptr_null_mut(&self, reg: &RegularCall) -> bool {
+        regular_call_name_path(reg, self.llbc).is_some_and(|path| {
+            matches!(
+                path.as_str(),
+                "core::ptr::null_mut" | "std::ptr::null_mut" | "core::ptr::null" | "std::ptr::null"
             )
         })
     }
@@ -6938,7 +7039,11 @@ impl<'a> Lowering<'a> {
         self.is_std_cell_word_method(reg, "set")
     }
 
-    pub(in crate::front::mir) fn is_std_cell_word_method(&self, reg: &RegularCall, leaf: &str) -> bool {
+    pub(in crate::front::mir) fn is_std_cell_word_method(
+        &self,
+        reg: &RegularCall,
+        leaf: &str,
+    ) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -7890,7 +7995,10 @@ impl<'a> Lowering<'a> {
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
     /// than `TraitImpl`) or any table lookup misses.
-    pub(in crate::front::mir) fn blanket_into_devirt(&self, reg: &RegularCall) -> Option<IntoDevirt> {
+    pub(in crate::front::mir) fn blanket_into_devirt(
+        &self,
+        reg: &RegularCall,
+    ) -> Option<IntoDevirt> {
         if !self.callee_is_blanket_into(reg) {
             return None;
         }
@@ -8274,7 +8382,10 @@ impl<'a> Lowering<'a> {
     /// the value. Used only when `is_identity_wrapper_target` already
     /// selected the call, so a one-parameter Opaque such as `Box<T>` does
     /// not grow a synthetic field.
-    pub(in crate::front::mir) fn opaque_one_type_param_payload_layout(&self, ty: &TyRef) -> Option<Vec<(String, ValueType)>> {
+    pub(in crate::front::mir) fn opaque_one_type_param_payload_layout(
+        &self,
+        ty: &TyRef,
+    ) -> Option<Vec<(String, ValueType)>> {
         let peeled = self
             .tyref_peel_ref_to_pointee(ty)
             .unwrap_or_else(|| ty.clone());

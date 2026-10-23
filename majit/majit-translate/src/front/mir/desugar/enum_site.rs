@@ -146,8 +146,28 @@ impl<'a> Lowering<'a> {
                 v = arr.first()?;
                 continue;
             }
-            return serde_json::from_value(v.clone()).ok();
+            return Some(crate::front::result_exc::tyref_from_json(v.clone()));
         }
+    }
+
+    /// FunDecl output still names a binder: a root `TypeVar`, a
+    /// `*mut T` / `&T` whose pointee is a `TypeVar`, or an `Option`
+    /// whose payload peels to one. `FUNC.RESULT` then comes from the
+    /// destination place (`rtyper.py` `setconcretetype`).
+    pub(in crate::front::mir) fn tyref_output_is_unsubstituted(&self, ty: &TyRef) -> bool {
+        if tyref_is_type_var(ty, self.llbc) {
+            return true;
+        }
+        if self
+            .tyref_peel_ref_to_pointee(ty)
+            .is_some_and(|p| tyref_is_type_var(&p, self.llbc))
+        {
+            return true;
+        }
+        crate::front::result_exc::tyref_option_payload(ty, self.llbc).is_some_and(|p| {
+            let p = self.tyref_peel_ref_to_pointee(&p).unwrap_or(p);
+            tyref_is_type_var(&p, self.llbc)
+        })
     }
 
     /// The `Option`'s payload type `T` (its first `generics.types` entry)
@@ -1790,21 +1810,13 @@ impl<'a> Lowering<'a> {
     /// an Address. [`tyref_to_value_type_with`] already puts `Option<fn>`,
     /// a raw-address niche ([`ty_is_raw_address`], e.g. `Option<&RawEnum>`),
     /// and a pointer-niche `Option<&RawStruct>` ([`tyref_niche_option_payload_paint`])
-    /// in `Int`; a GC pointer / `SomeString` niche stays `Ref`.
+    /// in `Int`; a GC pointer / `SomeString` niche stays `Ref`. The remaining
+    /// word is int-banked by the pointee declaration
+    /// ([`Self::option_payload_is_int_banked`]). A tagged `Option<usize>`
+    /// is not a pointer niche, so [`Self::tyref_is_niche_option_ptr`] keeps
+    /// it a discriminant test.
     pub(in crate::front::mir) fn option_niche_is_int_bank(&self, option_ty: &TyRef) -> bool {
-        if !self.tyref_is_niche_option_ptr(option_ty) {
-            return false;
-        }
-        matches!(
-            tyref_to_value_type_with(
-                option_ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            ),
-            ValueType::Int | ValueType::Unsigned
-        )
+        self.tyref_is_niche_option_ptr(option_ty) && self.option_payload_is_int_banked(option_ty)
     }
 
     /// Int-bank null of a niche `Option`: `null_fn` with the `fn(..)`
@@ -1848,6 +1860,29 @@ impl<'a> Lowering<'a> {
             return Some(crate::model::NicheIntNull::RawAddress(Some(root)));
         }
         None
+    }
+
+    /// Payload (or the Option word itself) lives in the int bank: a raw
+    /// `Ptr` / borrow of a raw struct / `Vec` header (`history.py` `getkind`
+    /// `'int'`). The niche `None` is Address `NULL`, not `null_mut()`.
+    /// Intern-as-classdef does not veto: `&OwnedFd` is Address even when
+    /// `OwnedFd` was interned (`rrustvec.rs` `rust_vec_lltype` pointee
+    /// declaration).
+    pub(in crate::front::mir) fn option_payload_is_int_banked(&self, option_ty: &TyRef) -> bool {
+        let ty = self
+            .tyref_peel_ref_to_pointee(option_ty)
+            .unwrap_or_else(|| clone_tyref(option_ty));
+        let payload = crate::front::result_exc::tyref_option_payload(&ty, self.llbc).unwrap_or(ty);
+        matches!(
+            tyref_to_value_type_with(
+                &payload,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
+            ValueType::Int | ValueType::Unsigned
+        )
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option` in

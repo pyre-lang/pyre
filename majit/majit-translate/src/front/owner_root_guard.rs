@@ -60,9 +60,11 @@ fn type_id_is_guard(id: u64, llbc: &Llbc) -> bool {
         .is_some_and(|td| is_guard_path(&td.item_meta.name_path()))
 }
 
-/// `node` is the guard ADT, after dedup and hash-cons wrappers.
+/// `node` is the guard ADT, after dedup, hash-cons, and borrow wrappers.
+/// A `&OwnerRootGuard` skip_binder / receiver is the same key FieldRead
+/// of `owner_root` uses (`tyref_is_erased_drop` peels that ref).
 pub(super) fn type_node_is_guard(node: &serde_json::Value, llbc: &Llbc) -> bool {
-    let Some(node) = super::strip_ty_indirections(node, llbc) else {
+    let Some(node) = super::strip_ty_wrappers(node, llbc) else {
         return false;
     };
     super::adt_node_def_id(node).is_some_and(|id| type_id_is_guard(id, llbc))
@@ -102,6 +104,35 @@ fn builtin_leaf(value: &serde_json::Value) -> Option<&str> {
     None
 }
 
+/// `Impl` `skip_binder` names the guard after peeling Deduplicated /
+/// Value wrappers (`type_node_is_guard`), even when the Deduplicated→ADT
+/// index has no row for that id.
+fn impl_skip_binder_is_guard(fd: &FunDecl, llbc: &Llbc) -> bool {
+    let segs = &fd.item_meta.name;
+    let Some(last_ident) = segs
+        .iter()
+        .rposition(|seg| matches!(seg, NameSeg::Ident { .. }))
+    else {
+        return false;
+    };
+    if last_ident == 0 {
+        return false;
+    }
+    let NameSeg::Other(value) = &segs[last_ident - 1] else {
+        return false;
+    };
+    let Some(payload) = value.as_object().and_then(|m| m.get("Impl")) else {
+        return false;
+    };
+    let Some(obj) = payload.as_object() else {
+        return false;
+    };
+    obj.get("Ty")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|ty| ty.get("skip_binder"))
+        .is_some_and(|sb| type_node_is_guard(sb, llbc))
+}
+
 /// Adt id of the inherent or trait impl this method belongs to.
 fn impl_self_id(fd: &FunDecl, llbc: &Llbc) -> Option<u64> {
     let segs = &fd.item_meta.name;
@@ -128,7 +159,9 @@ fn ref_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
         let arr = obj.get("RawPtr").and_then(serde_json::Value::as_array)?;
         arr.first()?
     };
-    serde_json::from_value(inner.clone()).ok()
+    // A raw `Adt` constructor does not deserialize as `TyRef`;
+    // `from_value(...).ok()` dropped it (`tyref_from_json`).
+    Some(crate::front::result_exc::tyref_from_json(inner.clone()))
 }
 
 /// Peel every pointer layer, then say whether the pointee contains a guard
@@ -254,14 +287,31 @@ pub(super) fn classify(call: &CallPayload, llbc: &Llbc) -> Option<Op> {
     };
     let fd = llbc.fn_by_id(*id)?;
     let leaf = fn_leaf(fd)?;
-    if impl_self_id(fd, llbc).is_some_and(|id| type_id_is_guard(id, llbc)) {
-        return match leaf {
-            "new" => Some(Op::New),
-            "get" => Some(Op::Get),
-            "set" => Some(Op::Set),
-            "drop" => Some(Op::Drop),
-            _ => None,
-        };
+    // The guard type is the key (`PATH` / `tyref_is_erased_drop`), the
+    // same one FieldRead of `owner_root` uses. `impl_self_id` goes through
+    // the Deduplicated→ADT index; `skip_binder` of a foreign inherent
+    // impl is often only in `dedup_body`. A `get`/`set` receiver is
+    // `&OwnerRootGuard` and answers the FieldRead key directly.
+    let self_id = impl_self_id(fd, llbc);
+    let self_is_guard = self_id.is_some_and(|id| type_id_is_guard(id, llbc));
+    let skip_is_guard = impl_skip_binder_is_guard(fd, llbc);
+    let arg_erased = call
+        .args
+        .iter()
+        .any(|arg| operand_tyref(arg).is_some_and(|ty| tyref_is_erased_drop(ty, llbc)));
+    let guard_owner = self_is_guard || skip_is_guard || arg_erased;
+    // `arg_erased` is also true for `Option<OwnerRootGuard>::take`'s
+    // `&mut Option<_>` receiver. Unknown leaves fall through so that
+    // `take` still matches `is_option_take_path` below; returning
+    // `None` here left the call residual and declined the graph.
+    if guard_owner {
+        match leaf {
+            "new" => return Some(Op::New),
+            "get" => return Some(Op::Get),
+            "set" => return Some(Op::Set),
+            "drop" => return Some(Op::Drop),
+            _ => {}
+        }
     }
     let arg_tys: Vec<Option<&TyRef>> = call.args.iter().map(operand_tyref).collect();
     if is_destructor_leaf(leaf)

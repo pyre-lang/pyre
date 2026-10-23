@@ -11500,10 +11500,14 @@ fn equal_size_int_to_float_transmute_stays_residual() {
 }
 
 #[test]
-fn equal_size_rawptr_to_fnptr_transmute_lowers_to_cast_ptr_to_int() {
-    // `history.getkind`: data pointer is `ref`, `Ptr(FuncType)` is
-    // `int`.  Equal-size transmute is `lltype.cast_ptr_to_int`
-    // (`rbuiltin.py` `rtype_cast_ptr_to_int`).
+fn equal_size_rawptr_to_fnptr_transmute_is_int_bank_identity() {
+    // `history.py` `getkind` of a raw `Ptr` is `'int'` (`TYPE.TO._gckind
+    // == 'raw'`). `FuncType._gckind` is `'raw'`, so `Ptr(FuncType)` is
+    // `'int'` too. Equal-size same-bank transmute is the bank's
+    // ordinary copy; `jtransform.py` `rewrite_op_cast_ptr_to_int`
+    // returns None for a non-GC arg. The previous assertion that a
+    // data pointer is `ref` (and that this pair is `cast_ptr_to_int`)
+    // was the deleted deviation.
     let llbc = transmute_lowering_fixture();
     let graph = crate::test_support::lower_function(&llbc, "transmute_rawptr_to_fnptr")
         .expect("lower rawptr-to-fnptr transmute");
@@ -11514,36 +11518,43 @@ fn equal_size_rawptr_to_fnptr_transmute_lowers_to_cast_ptr_to_int() {
         .collect();
 
     assert!(
-        !ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments == &["core", "intrinsics", "transmute"]
-            )
-        }),
-        "ptr↔int transmute must not stay a residual intrinsic: {ops:?}"
+        !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+        "same-bank rawptr↔fnptr transmute must not residualize: {ops:?}"
     );
     assert!(
-        ops.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments
-                    == &[
-                        "rpython",
-                        "rtyper",
-                        "lltypesystem",
-                        "lltype",
-                        "cast_ptr_to_int",
-                    ]
-            )
-        }),
-        "expected cast_ptr_to_int host call, ops={ops:?}"
+        ops.iter().all(|op| !matches!(
+            &op.kind,
+            OpKind::UnaryOp { op, .. }
+                if op == "same_as" || op == "cast_ptr_to_int" || op == "cast_int_to_ptr"
+        )),
+        "same-bank transmute binds the destination to the input; ops={ops:?}"
     );
+    let input = ops
+        .iter()
+        .find_map(|op| match (&op.result, &op.kind) {
+            (
+                Some(result),
+                OpKind::Input {
+                    name,
+                    ty: ValueType::Int,
+                    ..
+                },
+            ) if name == "value" => Some(result),
+            _ => None,
+        })
+        .expect("value input");
+    let returned = graph
+        .blocks
+        .iter()
+        .find_map(|block| {
+            block
+                .exits
+                .iter()
+                .find_map(|link| (link.target == graph.returnblock).then(|| link.args.first()))
+        })
+        .flatten()
+        .and_then(LinkArg::as_variable);
+    assert_eq!(returned, Some(input));
 }
 
 pub(in crate::front::mir) fn fixture_span() -> serde_json::Value {

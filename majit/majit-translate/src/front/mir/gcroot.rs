@@ -544,6 +544,8 @@ impl<'a> Lowering<'a> {
                         ))
                     })?
                     .one()?;
+                // `get().0 as *mut T` is this word (`owner_root_guard.rs`).
+                self.guard_word_vars.insert(value.clone());
                 self.local_var[dest_local] = Some(LocalValue::One(value));
             }
             owner_root_guard::Op::Set => {
@@ -2314,7 +2316,11 @@ impl OwnedRootScopes {
 /// Successors of a block, unwind edges included: a wider predecessor set can
 /// only shrink the dominator sets this feeds, so an unwind edge that is not
 /// really taken costs an erasure rather than licensing one.
-pub(in crate::front::mir) fn block_successors(llbc: &Llbc, body: &Unstructured, bb: usize) -> Vec<usize> {
+pub(in crate::front::mir) fn block_successors(
+    llbc: &Llbc,
+    body: &Unstructured,
+    bb: usize,
+) -> Vec<usize> {
     block_successors_kind(llbc, body, bb, true)
 }
 
@@ -2326,7 +2332,11 @@ pub(in crate::front::mir) fn block_successors(llbc: &Llbc, body: &Unstructured, 
 /// chains would charge destructor glue and `UnwindResume`
 /// (`root_bracket_stack_effects_are_known` `_ => return false`) and keep
 /// every bracket that contains a call.
-pub(in crate::front::mir) fn block_normal_successors(llbc: &Llbc, body: &Unstructured, bb: usize) -> Vec<usize> {
+pub(in crate::front::mir) fn block_normal_successors(
+    llbc: &Llbc,
+    body: &Unstructured,
+    bb: usize,
+) -> Vec<usize> {
     block_successors_kind(llbc, body, bb, false)
 }
 

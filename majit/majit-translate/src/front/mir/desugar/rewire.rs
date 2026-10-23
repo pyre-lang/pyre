@@ -341,10 +341,10 @@ pub(crate) struct AggregateCtor {
     /// One row per operand.
     pub(in crate::front::mir) fields: Vec<AggregateField>,
     /// The destination is a by-value raw struct
-    /// (`tyref_is_raw_struct_value`). `history.py` `getkind` of that
-    /// `Ptr` is `'int'`, so the constructor result is Int. A `Ref`
-    /// result is `malloc(GcStruct)` and disagrees with FUNC.RESULT `i`
-    /// (`func_result_kind`).
+    /// (`tyref_is_raw_struct_value`). The annotator result is `SomePtr`
+    /// (`lltype.malloc(T, flavor='raw')`); `history.py` `getkind` `'int'`
+    /// is the JIT kind (`get_type_flag`). `raw` selects that malloc
+    /// flavor so `rewrite_op_malloc` does not emit `new(GcStruct)`.
     pub(in crate::front::mir) raw: bool,
 }
 
@@ -365,11 +365,15 @@ pub(in crate::front::mir) struct AggregateField {
     /// rust-heap header; `jtransform` copies it when this write's type is
     /// `Str` and the operand is `{cap, ptr, len}`.
     pub(in crate::front::mir) str_value: bool,
-    /// Register kind of this operand (`tuple_field_value_type` of the
-    /// field spelling). `rewrite_op_setfield` and
+    /// Register kind of this operand (`history.py` `getkind` of the
+    /// item lltype). `rewrite_op_setfield` and
     /// `coerce_gcref_null_store` take the kind from the field
-    /// (`history.py` `CONST_NULL` vs `CONST_0`), not from a host `0`.
+    /// (`CONST_NULL` vs `CONST_0`), not from a host `0`.
     pub(in crate::front::mir) ty: ValueType,
+    /// Field lltype is a raw-flavored `Ptr` (`rclass.py getgcflavor`).
+    /// Dual-gate stamps that `Ptr`; painting `Signed` first makes the
+    /// annotator `SomeInteger`.
+    pub(in crate::front::mir) skip_signed_paint: bool,
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -380,8 +384,8 @@ pub(in crate::front::mir) fn aggregate_ctor_result_bank(
 ) -> (ValueType, crate::model::ConcreteType, Option<bool>) {
     if ctor.raw {
         (
-            ValueType::Int,
-            crate::model::ConcreteType::Signed,
+            ValueType::Ref(None),
+            crate::model::ConcreteType::Unknown,
             Some(false),
         )
     } else {
@@ -475,7 +479,11 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             continue;
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
-        let value = field_store_value(value, &ty);
+        let value = if field.skip_signed_paint {
+            value
+        } else {
+            field_store_value(value, &ty)
+        };
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -523,7 +531,11 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
             continue;
         }
         let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
-        let value = field_store_value(value, &ty);
+        let value = if field.skip_signed_paint {
+            value
+        } else {
+            field_store_value(value, &ty)
+        };
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -621,9 +633,10 @@ fn ctor_field_is_raw_u8(ctor: &AggregateCtor, field: &AggregateField) -> bool {
 
 /// `TupleRepr` field bank of a positional ctor write (`rtuple.py`).
 ///
-/// [`positional_shape_metadata`] intern's `__pos_N` from the shape
-/// spelling; a raw `*mut usize` item is `int` (`history.py` `getkind`).
-/// The write has to use that same bank so setattr and getattr agree.
+/// The write kind is the item lltype (`items_r[i].lowleveltype`,
+/// [`tyref_aggregate_field_value_type`]). A spelling table `_ => Ref`
+/// overlay would paint a raw `Ptr` (`*mut usize`) as `Ref` while the
+/// stored word is Signed.
 pub(in crate::front::mir) fn positional_ctor_field_value_type(
     result_owner: &str,
     field_name: &str,
@@ -632,15 +645,33 @@ pub(in crate::front::mir) fn positional_ctor_field_value_type(
     crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
         result_owner,
         field_name,
-        positional_shape_metadata(result_owner)
-            .and_then(|(_, attrs)| {
-                attrs
-                    .into_iter()
-                    .find(|(name, _)| name == field_name)
-                    .map(|(_, vt)| vt)
-            })
-            .unwrap_or(fallback),
+        fallback,
     )
+}
+
+/// Intern `__pos_N` FORCE from the constructor's item TyRef kinds
+/// (`rtuple.py` `TupleRepr` `items_r[i].lowleveltype`). Shaped tuples
+/// have no TypeDecl harvest; `_init_classdef` would otherwise seed
+/// `positional_shape_forced_attributes` from the spelling table.
+pub(in crate::front::mir) fn intern_positional_ctor_field_kinds<'a, I>(
+    result_owner: &str,
+    fields: I,
+) where
+    I: IntoIterator<Item = (&'a str, &'a ValueType)>,
+{
+    if !majit_ir::descr::is_shaped_tuple_name(result_owner)
+        && !majit_ir::descr::is_shaped_array_name(result_owner)
+    {
+        return;
+    }
+    let kinds: Vec<(String, ValueType)> = fields
+        .into_iter()
+        .map(|(name, ty)| (name.to_string(), ty.clone()))
+        .collect();
+    if kinds.is_empty() {
+        return;
+    }
+    crate::annotator::classdesc::register_struct_fields_with_layout(result_owner, &kinds, None);
 }
 
 /// Build `shape` in `block` from operand values already in hand — a call of

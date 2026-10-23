@@ -3,10 +3,11 @@ use crate::model::{CallTarget, LinkArg, OpKind};
 use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
-    fixture_item_meta, graph_ops, ident_path, llbc_with_trait_impls,
-    std_extern_call_fixture_with_types, window_call_leafs, window_empty_generics, window_graph_ops,
-    window_llbc, window_local, window_meta, window_opaque_fun, window_place, window_shared_slice,
-    window_span, window_unwind_and_return_blocks, window_usize,
+    call_leafs, fixture_item_meta, graph_ops, ident_path, llbc_with_trait_impls,
+    std_extern_call_fixture_with_types, std_extern_call_fixture_with_types_dest, window_call_leafs,
+    window_empty_generics, window_graph_ops, window_llbc, window_local, window_meta,
+    window_opaque_fun, window_place, window_shared_slice, window_span,
+    window_unwind_and_return_blocks, window_usize,
 };
 
 /// `k = w_bytes_data(key); entries.get(k)` keeps `k` as one `Ptr(STR)`
@@ -135,76 +136,76 @@ fn w_bytes_data_local_stays_str_view_for_rdict_get() {
     );
 }
 
-    #[test]
-    fn rust_vec_std_leaf_accepts_both_callee_spellings() {
-        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for p in [
-            path(&["alloc", "vec", "<Impl>", "new"]),
-            path(&["alloc", "vec", "Vec", "new"]),
-            path(&["vec", "Vec", "new"]),
-        ] {
-            assert_eq!(super::rust_vec_std_leaf(&p), Some("new"), "{p:?}");
-        }
-        assert_eq!(
-            super::rust_vec_std_leaf(&path(&["vec", "Vec", "try_reserve_exact"])),
-            Some("try_reserve_exact")
-        );
-        for p in [
-            path(&["alloc", "boxed", "<Impl>", "new"]),
-            path(&["vec", "VecDeque", "new"]),
-            path(&["new"]),
-        ] {
-            assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
-        }
-        for (p, leaf) in [
-            (path(&["alloc", "vec", "<Impl>", "deref_mut"]), "deref_mut"),
-            (path(&["alloc", "vec", "Vec", "deref_mut"]), "deref_mut"),
-            (path(&["vec", "Vec", "deref_mut"]), "deref_mut"),
-            (
-                path(&["alloc", "vec", "<Impl>", "as_mut_slice"]),
-                "as_mut_slice",
-            ),
-            (path(&["vec", "Vec", "as_slice"]), "as_slice"),
-        ] {
-            assert_eq!(super::rust_vec_slice_view_leaf(&p), Some(leaf), "{p:?}");
-        }
-        for p in [
-            path(&["alloc", "vec", "<Impl>", "extend_from_slice"]),
-            path(&["alloc", "vec", "Vec", "extend_from_slice"]),
-            path(&["vec", "Vec", "extend_from_slice"]),
-        ] {
-            assert_eq!(
-                super::rust_vec_std_leaf(&p),
-                Some("extend_from_slice"),
-                "{p:?}"
-            );
-            assert!(super::path_is_vec_extend_from_slice(&p.join("::")), "{p:?}");
-        }
-        assert!(super::path_is_vec_slice_view("vec::Vec::deref_mut"));
-        assert!(!super::path_is_vec_slice_view("vec::Vec::push"));
-        assert!(super::path_is_vec_extend_from_slice(
-            "alloc::vec::<Impl>::extend_from_slice"
-        ));
-        assert!(!super::path_is_vec_extend_from_slice("vec::Vec::extend"));
-        assert!(super::path_is_build_refs_pair_abi(
-            "pyre_interpreter::runtime_ops::build_list_from_refs"
-        ));
-        assert!(super::path_is_build_refs_pair_abi(
-            "pyre_interpreter::build_tuple_from_refs"
-        ));
-        assert!(!super::path_is_build_refs_pair_abi(
-            "pyre_interpreter::runtime_ops::build_map_from_refs"
-        ));
-        assert_eq!(
-            super::rust_vec_std_leaf(&path(&[
-                "vec",
-                "Vec",
-                "<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>",
-                "deref",
-            ])),
-            Some("deref")
-        );
+#[test]
+fn rust_vec_std_leaf_accepts_both_callee_spellings() {
+    let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for p in [
+        path(&["alloc", "vec", "<Impl>", "new"]),
+        path(&["alloc", "vec", "Vec", "new"]),
+        path(&["vec", "Vec", "new"]),
+    ] {
+        assert_eq!(super::rust_vec_std_leaf(&p), Some("new"), "{p:?}");
     }
+    assert_eq!(
+        super::rust_vec_std_leaf(&path(&["vec", "Vec", "try_reserve_exact"])),
+        Some("try_reserve_exact")
+    );
+    for p in [
+        path(&["alloc", "boxed", "<Impl>", "new"]),
+        path(&["vec", "VecDeque", "new"]),
+        path(&["new"]),
+    ] {
+        assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
+    }
+    for (p, leaf) in [
+        (path(&["alloc", "vec", "<Impl>", "deref_mut"]), "deref_mut"),
+        (path(&["alloc", "vec", "Vec", "deref_mut"]), "deref_mut"),
+        (path(&["vec", "Vec", "deref_mut"]), "deref_mut"),
+        (
+            path(&["alloc", "vec", "<Impl>", "as_mut_slice"]),
+            "as_mut_slice",
+        ),
+        (path(&["vec", "Vec", "as_slice"]), "as_slice"),
+    ] {
+        assert_eq!(super::rust_vec_slice_view_leaf(&p), Some(leaf), "{p:?}");
+    }
+    for p in [
+        path(&["alloc", "vec", "<Impl>", "extend_from_slice"]),
+        path(&["alloc", "vec", "Vec", "extend_from_slice"]),
+        path(&["vec", "Vec", "extend_from_slice"]),
+    ] {
+        assert_eq!(
+            super::rust_vec_std_leaf(&p),
+            Some("extend_from_slice"),
+            "{p:?}"
+        );
+        assert!(super::path_is_vec_extend_from_slice(&p.join("::")), "{p:?}");
+    }
+    assert!(super::path_is_vec_slice_view("vec::Vec::deref_mut"));
+    assert!(!super::path_is_vec_slice_view("vec::Vec::push"));
+    assert!(super::path_is_vec_extend_from_slice(
+        "alloc::vec::<Impl>::extend_from_slice"
+    ));
+    assert!(!super::path_is_vec_extend_from_slice("vec::Vec::extend"));
+    assert!(super::path_is_build_refs_pair_abi(
+        "pyre_interpreter::runtime_ops::build_list_from_refs"
+    ));
+    assert!(super::path_is_build_refs_pair_abi(
+        "pyre_interpreter::build_tuple_from_refs"
+    ));
+    assert!(!super::path_is_build_refs_pair_abi(
+        "pyre_interpreter::runtime_ops::build_map_from_refs"
+    ));
+    assert_eq!(
+        super::rust_vec_std_leaf(&path(&[
+            "vec",
+            "Vec",
+            "<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>",
+            "deref",
+        ])),
+        Some("deref")
+    );
+}
 
 #[test]
 fn rust_vec_slice_view_accepts_inherent_and_trait_impl_spellings() {
@@ -400,6 +401,146 @@ fn signed_byte_vec_as_ptr_converts_the_header_and_wraps_ccharp() {
     }
 }
 
+#[test]
+fn byte_item_vec_deref_splits_the_header_with_word_helpers() {
+    let generics = |types: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    };
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let vec_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics(vec![u8_ty.clone()])}
+    });
+    let u8_slice = serde_json::json!({
+        "Ref": ["'_", {"Slice": [u8_ty, null]}, "Shared"]
+    });
+    let vec_decl = {
+        let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": {
+                "name": name,
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }},
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [], "inline": null, "rename": null, "public": true
+                },
+                "is_local": false
+            },
+            "kind": {"Struct": []}
+        })
+    };
+    for (caller, callee) in [
+        ("vec_u8_deref", &["vec", "Vec", "deref"] as &[&str]),
+        ("vec_u8_as_slice", &["alloc", "vec", "<Impl>", "as_slice"]),
+    ] {
+        let llbc = std_extern_call_fixture_with_types_dest(
+            caller,
+            callee,
+            &[vec_ty.clone()],
+            u8_slice.clone(),
+            vec![vec_decl.clone()],
+            true,
+        );
+        let graph = super::lower_function(&llbc, caller).expect("lower Vec<u8> slice view");
+        let ops = graph_ops(&graph);
+        let leafs = call_leafs(&ops);
+        assert!(
+            leafs.iter().any(|leaf| leaf == "ll_vec_items_i"),
+            "{caller} must call ll_vec_items_i; leafs={leafs:?} ops={ops:?}"
+        );
+        assert!(
+            leafs.iter().any(|leaf| leaf == "ll_vec_length_i"),
+            "{caller} must call ll_vec_length_i; leafs={leafs:?} ops={ops:?}"
+        );
+        assert!(
+            !leafs
+                .iter()
+                .any(|leaf| leaf == "deref" || leaf == "as_slice"),
+            "{caller} must not stay residual; leafs={leafs:?}"
+        );
+    }
+}
+
+#[test]
+fn payload_enum_vec_deref_stays_residual() {
+    let generics = |types: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "regions": [], "types": types, "const_generics": [], "trait_refs": []
+        })
+    };
+    let slot_ty = serde_json::json!({
+        "Adt": {"id": 1, "generics": generics(vec![])}
+    });
+    let vec_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics(vec![slot_ty.clone()])}
+    });
+    let slot_slice = serde_json::json!({
+        "Ref": ["'_", {"Slice": [slot_ty, null]}, "Shared"]
+    });
+    let item_meta = |path: &[&str]| {
+        let name: Vec<serde_json::Value> = path
+            .iter()
+            .map(|s| serde_json::json!({"Ident": [s, 0]}))
+            .collect();
+        serde_json::json!({
+            "name": name,
+            "span": {"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }},
+            "source_text": null,
+            "attr_info": {
+                "attributes": [], "inline": null, "rename": null, "public": true
+            },
+            "is_local": false
+        })
+    };
+    let vec_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(&["alloc", "vec", "Vec"]),
+        "kind": {"Struct": []}
+    });
+    let slot_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta(&["fixture", "SlotValue"]),
+        "kind": {"Enum": [
+            {"name": "Int", "fields": [{
+                "name": "v",
+                "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+                "attr_info": null
+            }]}
+        ]}
+    });
+    let llbc = std_extern_call_fixture_with_types(
+        "vec_slot_deref",
+        &["vec", "Vec", "deref"],
+        &[vec_ty],
+        slot_slice,
+        vec![vec_decl, slot_decl],
+    );
+    let graph =
+        super::lower_function(&llbc, "vec_slot_deref").expect("payload-enum Vec deref must lower");
+    let leafs = call_leafs(&graph_ops(&graph));
+    assert!(
+        leafs.iter().any(|leaf| leaf == "deref"),
+        "Vec<SlotValue>::deref stays residual; leafs={leafs:?}"
+    );
+    assert!(
+        !leafs.iter().any(|leaf| leaf.starts_with("ll_vec_items")),
+        "payload-enum Vec deref is not a pair view; leafs={leafs:?}"
+    );
+}
+
 /// `code.varnames.len()` and `code.localspluskinds[i]` share one field
 /// read. Each use gets its own fat-pointer word; the shared read is
 /// not a `Vec` component and is not rewritten in place.
@@ -575,135 +716,151 @@ fn fat_box_len_and_index_keep_the_field_read() {
     );
 }
 
-    /// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled
-    /// `{"Ref":[_, {"Slice": elem}, "Shared"]}`) has no ADT def-id, so
-    /// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
-    /// while a shared ref to a nominal `{"Adt": {"id": N}}` pointee
-    /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
-    /// (`llbc_with_trait_impls` in this file), no real corpus.
-    /// A one-word-item `&[T]` / `&mut [T]` is a pair slice; a byte slice, a
-    /// borrowed array, a double borrow and a bare slice are not.
-    #[test]
-    fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
-        use majit_ir::rvec::VecItemKind;
-        let file = serde_json::json!({
-            "charon_version": "0.1.201",
-            "has_errors": false,
-            "translated": {
-                "crate_name": "fixture",
-                "type_decls": [{
-                    "def_id": 0,
-                    "item_meta": fixture_item_meta(ident_path(&["PyObject"])),
-                    "kind": {"Struct": []}
-                }],
-                "fun_decls": [], "global_decls": [],
-                "trait_decls": [], "trait_impls": [],
-            }
-        });
-        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
-        let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
-        let objptr = serde_json::json!({
-            "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
-        });
-        let kind =
-            |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
-        assert_eq!(
-            kind(
-                serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })
-            ),
-            Some(VecItemKind::Int)
-        );
-        assert_eq!(
-            kind(
-                serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Float": "F64" } }, null] }, "Mut"] })
-            ),
-            Some(VecItemKind::Float)
-        );
-        assert_eq!(
-            kind(
-                serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
-            ),
-            None
-        );
-        assert_eq!(
-            kind(
-                serde_json::json!({ "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"] })
-            ),
-            None
-        );
-        assert_eq!(
-            kind(
-                serde_json::json!({ "Ref": ["'_", { "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] }, "Shared"] })
-            ),
-            None
-        );
-        assert_eq!(kind(serde_json::json!({ "Slice": [usize_ty, null] })), None);
-        assert_eq!(super::spelling_pair_field_kind("[PyObjectRef]"), None);
-        assert_eq!(super::spelling_pair_field_kind("[*mut PyObject]"), None);
-        assert_eq!(
-            super::spelling_pair_field_kind("[*const pyre_object::PyObject]"),
-            None
-        );
-        assert_eq!(
-            super::spelling_pair_field_kind("[*mut u8]"),
-            Some(VecItemKind::Int),
-            "*mut u8 is rffi.CCHARP, a word"
-        );
-        assert_eq!(
-            super::spelling_pair_field_kind("[GCREF]"),
-            Some(VecItemKind::Ref)
-        );
-        assert!(super::gcref_item_spelling("GCREF"));
-        assert!(super::gcref_item_spelling("majit_gc::GCREF"));
-        assert!(!super::gcref_item_spelling("*mut u8"));
-        assert_eq!(
-            super::spelling_pair_field_kind("[usize]"),
-            Some(VecItemKind::Int)
-        );
-        assert_eq!(
-            kind(serde_json::json!({
-                "Ref": ["'_", { "Slice": [objptr.clone(), null] }, "Mut"]
-            })),
-            Some(VecItemKind::Ref),
-            "object-pointer &mut [T] is the {{ptr, len}} view"
-        );
-        assert_eq!(
-            kind(serde_json::json!({
-                "Ref": ["'_", { "Slice": [objptr, null] }, "Shared"]
-            })),
-            None,
-            "object-pointer &[T] stays the length-prefixed object array"
-        );
-        // A slice of a Copy associated type is the same `{ptr, len}` fat
-        // pointer. Unique-impl resolution spells a raw pointer; an
-        // unresolved projection is still one word.
-        let ptr = serde_json::json!({"RawPtr": [usize_ty.clone(), "Mut"]});
-        let binding = serde_json::json!({
-            "kind": {"TraitType": [0, 0]},
-            "skip_binder": {"value": ptr}
-        });
-        let row = serde_json::json!({
-            "impl_trait": {"id": 0, "generics": {"types": []}},
-            "types": [binding],
-            "implied_trait_refs": []
-        });
-        let unique = llbc_with_trait_impls(serde_json::json!([row.clone()]));
-        let projection = serde_json::json!({
-            "TraitType": [
-                {"kind": {"Clause": {"Bound": [0, 0]}}, "trait_decl_ref": {"skip_binder": {"id": 0}}},
-                0,
-                {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
-            ]
-        });
-        let slice_of = |item: serde_json::Value| serde_json::json!({ "Ref": ["'_", { "Slice": [item, null] }, "Shared"] });
-        assert_eq!(
-            super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection.clone())), &unique),
-            Some(VecItemKind::Int),
-            "unique-impl *mut usize is a word (`rffi.CCHARP` / Address)"
-        );
-        let ambiguous = llbc_with_trait_impls(serde_json::json!([row.clone(), row]));
-        assert_eq!(
-            super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection)), &ambiguous),
-            Some(VecItemKind::Ref)
-        );
-    }
+/// The Sized gate: a shared reference to a fat pointee (`&[T]`, spelled
+/// `{"Ref":[_, {"Slice": elem}, "Shared"]}`) has no ADT def-id, so
+/// `type_node_shared_ref_pointee` + `adt_node_def_id` must NOT accept it;
+/// while a shared ref to a nominal `{"Adt": {"id": N}}` pointee
+/// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
+/// (`llbc_with_trait_impls` in this file), no real corpus.
+/// A one-word-item `&[T]` / `&mut [T]` is a pair slice; a byte slice, a
+/// borrowed array, a double borrow and a bare slice are not.
+#[test]
+fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
+    use majit_ir::rvec::VecItemKind;
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": fixture_item_meta(ident_path(&["PyObject"])),
+                "kind": {"Struct": []}
+            }],
+            "fun_decls": [], "global_decls": [],
+            "trait_decls": [], "trait_impls": [],
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
+    let objptr = serde_json::json!({
+        "RawPtr": [{"Adt": {"id": 0, "generics": {"types": []}}}, "Mut"]
+    });
+    let kind =
+        |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
+    assert_eq!(
+        kind(serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        kind(
+            serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Float": "F64" } }, null] }, "Mut"] })
+        ),
+        Some(VecItemKind::Float)
+    );
+    assert_eq!(
+        kind(
+            serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
+        ),
+        None
+    );
+    assert!(super::tyref_is_fat_slice(
+        &TyRef::Other(serde_json::json!({
+            "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"]
+        })),
+        &llbc,
+    ));
+    assert!(super::tyref_is_fat_slice(
+        &TyRef::Other(serde_json::json!({
+            "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"]
+        })),
+        &llbc,
+    ));
+    assert!(!super::tyref_is_fat_slice(
+        &TyRef::Other(serde_json::json!({
+            "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"]
+        })),
+        &llbc,
+    ));
+    assert_eq!(
+        kind(
+            serde_json::json!({ "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"] })
+        ),
+        None
+    );
+    assert_eq!(
+        kind(
+            serde_json::json!({ "Ref": ["'_", { "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] }, "Shared"] })
+        ),
+        None
+    );
+    assert_eq!(kind(serde_json::json!({ "Slice": [usize_ty, null] })), None);
+    assert_eq!(super::spelling_pair_field_kind("[PyObjectRef]"), None);
+    assert_eq!(super::spelling_pair_field_kind("[*mut PyObject]"), None);
+    assert_eq!(
+        super::spelling_pair_field_kind("[*const pyre_object::PyObject]"),
+        None
+    );
+    assert_eq!(
+        super::spelling_pair_field_kind("[*mut u8]"),
+        Some(VecItemKind::Int),
+        "*mut u8 is rffi.CCHARP, a word"
+    );
+    assert_eq!(
+        super::spelling_pair_field_kind("[GCREF]"),
+        Some(VecItemKind::Ref)
+    );
+    assert!(super::gcref_item_spelling("GCREF"));
+    assert!(super::gcref_item_spelling("majit_gc::GCREF"));
+    assert!(!super::gcref_item_spelling("*mut u8"));
+    assert_eq!(
+        super::spelling_pair_field_kind("[usize]"),
+        Some(VecItemKind::Int)
+    );
+    assert_eq!(
+        kind(serde_json::json!({
+            "Ref": ["'_", { "Slice": [objptr.clone(), null] }, "Mut"]
+        })),
+        Some(VecItemKind::Ref),
+        "object-pointer &mut [T] is the {{ptr, len}} view"
+    );
+    assert_eq!(
+        kind(serde_json::json!({
+            "Ref": ["'_", { "Slice": [objptr, null] }, "Shared"]
+        })),
+        None,
+        "object-pointer &[T] stays the length-prefixed object array"
+    );
+    // A slice of a Copy associated type is the same `{ptr, len}` fat
+    // pointer. Unique-impl resolution spells a raw pointer; an
+    // unresolved projection is still one word.
+    let ptr = serde_json::json!({"RawPtr": [usize_ty.clone(), "Mut"]});
+    let binding = serde_json::json!({
+        "kind": {"TraitType": [0, 0]},
+        "skip_binder": {"value": ptr}
+    });
+    let row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": []}},
+        "types": [binding],
+        "implied_trait_refs": []
+    });
+    let unique = llbc_with_trait_impls(serde_json::json!([row.clone()]));
+    let projection = serde_json::json!({
+        "TraitType": [
+            {"kind": {"Clause": {"Bound": [0, 0]}}, "trait_decl_ref": {"skip_binder": {"id": 0}}},
+            0,
+            {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        ]
+    });
+    let slice_of = |item: serde_json::Value| serde_json::json!({ "Ref": ["'_", { "Slice": [item, null] }, "Shared"] });
+    assert_eq!(
+        super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection.clone())), &unique),
+        Some(VecItemKind::Int),
+        "unique-impl *mut usize is a word (`rffi.CCHARP` / Address)"
+    );
+    let ambiguous = llbc_with_trait_impls(serde_json::json!([row.clone(), row]));
+    assert_eq!(
+        super::tyref_pair_slice_item_kind(&TyRef::Other(slice_of(projection)), &ambiguous),
+        Some(VecItemKind::Ref)
+    );
+}

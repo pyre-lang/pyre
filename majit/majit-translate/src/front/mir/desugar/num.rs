@@ -1367,6 +1367,7 @@ impl<'a> Lowering<'a> {
                     raw_u8: false,
                     str_value: false,
                     ty: ValueType::Ref(Some("RBigInt".to_string())),
+                    skip_signed_paint: false,
                 })
                 .collect(),
             raw: false,

@@ -336,240 +336,238 @@ fn read_array_literal_then_decode_pieces_end_to_end() {
     assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
 }
 
-    /// Build the `alloc::fmt::format` block shape a fieldless-enum `{:?}`
-    /// chain reaches after the `Display` collapsers decline — the format op
-    /// as the block's last op, closed by a single goto to a continuation
-    /// that consumes the rendered String — and assert the rewrite splits it
-    /// into a discriminant switch: one arm per variant emitting the constant
-    /// `"pre{ident}post"` message forwarded through the format-result slot,
-    /// plus a default arm raising to the exceptblock.
-    #[test]
-    fn rewrite_debug_enum_fmt_site_splits_into_discriminant_switch() {
-        use super::{DebugEnumFmtCollapse, rewrite_debug_enum_fmt_site};
-        use crate::model::{
-            CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
-        };
+/// Build the `alloc::fmt::format` block shape a fieldless-enum `{:?}`
+/// chain reaches after the `Display` collapsers decline — the format op
+/// as the block's last op, closed by a single goto to a continuation
+/// that consumes the rendered String — and assert the rewrite splits it
+/// into a discriminant switch: one arm per variant emitting the constant
+/// `"pre{ident}post"` message forwarded through the format-result slot,
+/// plus a default arm raising to the exceptblock.
+#[test]
+fn rewrite_debug_enum_fmt_site_splits_into_discriminant_switch() {
+    use super::{DebugEnumFmtCollapse, rewrite_debug_enum_fmt_site};
+    use crate::model::{CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType};
 
-        let mut graph = FunctionGraph::new("debug_enum_fmt");
-        let bf = graph.startblock;
+    let mut graph = FunctionGraph::new("debug_enum_fmt");
+    let bf = graph.startblock;
 
-        // Bf: the enum value is live (an op result here), and the terminal
-        // `alloc::fmt::format` produces the rendered String.
-        let func = graph.push_op_var(bf, OpKind::ConstInt(0), true).unwrap();
-        let fmt_args = graph
-            .push_op_var(
-                bf,
-                OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor("Arguments"),
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Ref(None),
+    // Bf: the enum value is live (an op result here), and the terminal
+    // `alloc::fmt::format` produces the rendered String.
+    let func = graph.push_op_var(bf, OpKind::ConstInt(0), true).unwrap();
+    let fmt_args = graph
+        .push_op_var(
+            bf,
+            OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Arguments"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let formatted = graph
+        .push_op_var(
+            bf,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["alloc", "fmt", "format"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
-                true,
-            )
-            .unwrap();
-        let formatted = graph
-            .push_op_var(
-                bf,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: ["alloc", "fmt", "format"]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                        fun_decl_id: None,
-                        generic_rust_args: Vec::new(),
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
-                    args: crate::model::call_args(vec![fmt_args]),
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .unwrap();
+                args: crate::model::call_args(vec![fmt_args]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
 
-        // Continuation consumes the String plus an unrelated live carried
-        // value, so the rewrite must thread `carried` through each arm.
-        let carried = graph.push_op_var(bf, OpKind::ConstInt(7), true).unwrap();
-        let (bcont, cont_args) = graph.create_block_with_arg_vars(2);
-        graph.set_return(bcont, Some(cont_args[0].clone()));
-        graph.block_mut(bf).exits = vec![
-            Link::from_variables(&graph, vec![formatted.clone(), carried], bcont, None)
-                .with_prevblock(bf),
-        ];
+    // Continuation consumes the String plus an unrelated live carried
+    // value, so the rewrite must thread `carried` through each arm.
+    let carried = graph.push_op_var(bf, OpKind::ConstInt(7), true).unwrap();
+    let (bcont, cont_args) = graph.create_block_with_arg_vars(2);
+    graph.set_return(bcont, Some(cont_args[0].clone()));
+    graph.block_mut(bf).exits = vec![
+        Link::from_variables(&graph, vec![formatted.clone(), carried], bcont, None)
+            .with_prevblock(bf),
+    ];
 
-        let site = DebugEnumFmtCollapse {
-            format_result: formatted.clone(),
-            enum_value: func.clone(),
-            pieces: vec![
-                "intrinsic function ".to_string(),
-                " not implemented".to_string(),
-            ],
-            by_discr: vec![(0, "Invalid".to_string()), (1, "Print".to_string())],
-            // This test drives `rewrite_debug_enum_fmt_site` (the switch
-            // build) directly on a graph with no residual chain, so the
-            // delete / re-thread plan is empty.
-            link_rewrites: Vec::new(),
-            dead_results: Vec::new(),
-            dead_bases: Vec::new(),
-        };
-        assert!(rewrite_debug_enum_fmt_site(&mut graph, &site));
+    let site = DebugEnumFmtCollapse {
+        format_result: formatted.clone(),
+        enum_value: func.clone(),
+        pieces: vec![
+            "intrinsic function ".to_string(),
+            " not implemented".to_string(),
+        ],
+        by_discr: vec![(0, "Invalid".to_string()), (1, "Print".to_string())],
+        // This test drives `rewrite_debug_enum_fmt_site` (the switch
+        // build) directly on a graph with no residual chain, so the
+        // delete / re-thread plan is empty.
+        link_rewrites: Vec::new(),
+        dead_results: Vec::new(),
+        dead_bases: Vec::new(),
+    };
+    assert!(rewrite_debug_enum_fmt_site(&mut graph, &site));
 
-        // The residual `alloc::fmt::format` is gone; Bf now switches on the
-        // enum value directly (a fieldless enum is `Int`-valued, so its
-        // value IS the discriminant — no `__discriminant` field read).
-        let has_format = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if super::fmt_path_ends_with(segments, &["fmt", "format"])
-            )
-        });
-        assert!(!has_format, "residual alloc::fmt::format removed");
-        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
-        assert!(
-            matches!(&bf_block.exitswitch, Some(ExitSwitch::Value(v)) if v.id() == func.id()),
-            "switch selects the enum value directly"
-        );
-        let disc_read = bf_block.operations.iter().any(|op| {
-            matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
-        });
-        assert!(
-            !disc_read,
-            "no __discriminant field read (enum value is the tag)"
-        );
+    // The residual `alloc::fmt::format` is gone; Bf now switches on the
+    // enum value directly (a fieldless enum is `Int`-valued, so its
+    // value IS the discriminant — no `__discriminant` field read).
+    let has_format = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                if super::fmt_path_ends_with(segments, &["fmt", "format"])
+        )
+    });
+    assert!(!has_format, "residual alloc::fmt::format removed");
+    let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+    assert!(
+        matches!(&bf_block.exitswitch, Some(ExitSwitch::Value(v)) if v.id() == func.id()),
+        "switch selects the enum value directly"
+    );
+    let disc_read = bf_block.operations.iter().any(
+        |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant"),
+    );
+    assert!(
+        !disc_read,
+        "no __discriminant field read (enum value is the tag)"
+    );
 
-        // Two variant arms + a default arm.
-        assert_eq!(bf_block.exits.len(), 3, "two variant arms + default");
+    // Two variant arms + a default arm.
+    assert_eq!(bf_block.exits.len(), 3, "two variant arms + default");
 
-        // Each variant arm emits its `__str_const` message and forwards it
-        // as the format-result slot into the continuation.
-        let str_consts: Vec<String> = graph
-            .blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .filter_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.first().map(String::as_str) == Some("__str_const") => {
-                    segments.get(1).cloned()
-                }
-                _ => None,
-            })
-            .collect();
-        assert!(str_consts.contains(&"intrinsic function Invalid not implemented".to_string()));
-        assert!(str_consts.contains(&"intrinsic function Print not implemented".to_string()));
-
-        // Exactly one arm raises (the default `AssertionError`).
-        let raises = graph
-            .blocks
-            .iter()
-            .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
-            .count();
-        assert_eq!(raises, 1, "the default arm raises to exceptblock");
-
-        // The continuation still receives a String in its first slot from
-        // every variant arm (the message var), and the carried value in the
-        // second slot.
-        let arm_exits: Vec<&Link> = graph
-            .blocks
-            .iter()
-            .flat_map(|b| &b.exits)
-            .filter(|l| l.target == bcont)
-            .collect();
-        assert_eq!(
-            arm_exits.len(),
-            2,
-            "both variant arms reach the continuation"
-        );
-        for l in arm_exits {
-            assert_eq!(l.args.len(), 2, "continuation arity preserved");
-            assert!(matches!(l.args[0], LinkArg::Value(_)));
-        }
-    }
-
-    /// `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)`: when the
-    /// enum value is defined in a predecessor, the switch block's
-    /// exitswitch names that block's `Variable.copy()` local, not the
-    /// producer identity (`Block.renamevariables`).
-    #[test]
-    fn rewrite_debug_enum_fmt_site_renames_exitswitch_to_block_local() {
-        use super::{DebugEnumFmtCollapse, rewrite_debug_enum_fmt_site};
-        use crate::model::{CallTarget, ExitSwitch, FunctionGraph, Link, OpKind, ValueType};
-
-        let mut graph = FunctionGraph::new("debug_enum_fmt_exitswitch_local");
-        let root = graph.startblock;
-        let func = graph.push_op_var(root, OpKind::ConstInt(0), true).unwrap();
-        let bf = graph.create_block();
-        graph.set_goto(root, bf, vec![]);
-
-        let fmt_args = graph
-            .push_op_var(
-                bf,
-                OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor("Arguments"),
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .unwrap();
-        let formatted = graph
-            .push_op_var(
-                bf,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: ["alloc", "fmt", "format"]
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect(),
-                        fun_decl_id: None,
-                        generic_rust_args: Vec::new(),
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
-                    args: crate::model::call_args(vec![fmt_args]),
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .unwrap();
-        let carried = graph.push_op_var(bf, OpKind::ConstInt(7), true).unwrap();
-        let (bcont, cont_args) = graph.create_block_with_arg_vars(2);
-        graph.set_return(bcont, Some(cont_args[0].clone()));
-        graph.block_mut(bf).exits = vec![
-            Link::from_variables(&graph, vec![formatted.clone(), carried], bcont, None)
-                .with_prevblock(bf),
-        ];
-
-        let site = DebugEnumFmtCollapse {
-            format_result: formatted,
-            enum_value: func.clone(),
-            pieces: vec![
-                "intrinsic function ".to_string(),
-                " not implemented".to_string(),
-            ],
-            by_discr: vec![(0, "Invalid".to_string()), (1, "Print".to_string())],
-            link_rewrites: Vec::new(),
-            dead_results: Vec::new(),
-            dead_bases: Vec::new(),
-        };
-        assert!(rewrite_debug_enum_fmt_site(&mut graph, &site));
-
-        match &graph.block(bf).exitswitch {
-            Some(ExitSwitch::Value(sw)) => {
-                assert_ne!(
-                    sw.id(),
-                    func.id(),
-                    "exitswitch must not keep the producer identity"
-                );
-                assert!(
-                    graph.variable_defined_in_block(bf, sw),
-                    "exitswitch use must be defined in the switch block"
-                );
+    // Each variant arm emits its `__str_const` message and forwards it
+    // as the format-result slot into the continuation.
+    let str_consts: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.first().map(String::as_str) == Some("__str_const") => {
+                segments.get(1).cloned()
             }
-            other => panic!("expected Value exitswitch, got {other:?}"),
-        }
+            _ => None,
+        })
+        .collect();
+    assert!(str_consts.contains(&"intrinsic function Invalid not implemented".to_string()));
+    assert!(str_consts.contains(&"intrinsic function Print not implemented".to_string()));
+
+    // Exactly one arm raises (the default `AssertionError`).
+    let raises = graph
+        .blocks
+        .iter()
+        .filter(|b| b.exits.iter().any(|l| l.target == graph.exceptblock))
+        .count();
+    assert_eq!(raises, 1, "the default arm raises to exceptblock");
+
+    // The continuation still receives a String in its first slot from
+    // every variant arm (the message var), and the carried value in the
+    // second slot.
+    let arm_exits: Vec<&Link> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.exits)
+        .filter(|l| l.target == bcont)
+        .collect();
+    assert_eq!(
+        arm_exits.len(),
+        2,
+        "both variant arms reach the continuation"
+    );
+    for l in arm_exits {
+        assert_eq!(l.args.len(), 2, "continuation arity preserved");
+        assert!(matches!(l.args[0], LinkArg::Value(_)));
     }
+}
+
+/// `ssa.py` `SSA_to_SSI` `record_used_var(block.exitswitch)`: when the
+/// enum value is defined in a predecessor, the switch block's
+/// exitswitch names that block's `Variable.copy()` local, not the
+/// producer identity (`Block.renamevariables`).
+#[test]
+fn rewrite_debug_enum_fmt_site_renames_exitswitch_to_block_local() {
+    use super::{DebugEnumFmtCollapse, rewrite_debug_enum_fmt_site};
+    use crate::model::{CallTarget, ExitSwitch, FunctionGraph, Link, OpKind, ValueType};
+
+    let mut graph = FunctionGraph::new("debug_enum_fmt_exitswitch_local");
+    let root = graph.startblock;
+    let func = graph.push_op_var(root, OpKind::ConstInt(0), true).unwrap();
+    let bf = graph.create_block();
+    graph.set_goto(root, bf, vec![]);
+
+    let fmt_args = graph
+        .push_op_var(
+            bf,
+            OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Arguments"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let formatted = graph
+        .push_op_var(
+            bf,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["alloc", "fmt", "format"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![fmt_args]),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    let carried = graph.push_op_var(bf, OpKind::ConstInt(7), true).unwrap();
+    let (bcont, cont_args) = graph.create_block_with_arg_vars(2);
+    graph.set_return(bcont, Some(cont_args[0].clone()));
+    graph.block_mut(bf).exits = vec![
+        Link::from_variables(&graph, vec![formatted.clone(), carried], bcont, None)
+            .with_prevblock(bf),
+    ];
+
+    let site = DebugEnumFmtCollapse {
+        format_result: formatted,
+        enum_value: func.clone(),
+        pieces: vec![
+            "intrinsic function ".to_string(),
+            " not implemented".to_string(),
+        ],
+        by_discr: vec![(0, "Invalid".to_string()), (1, "Print".to_string())],
+        link_rewrites: Vec::new(),
+        dead_results: Vec::new(),
+        dead_bases: Vec::new(),
+    };
+    assert!(rewrite_debug_enum_fmt_site(&mut graph, &site));
+
+    match &graph.block(bf).exitswitch {
+        Some(ExitSwitch::Value(sw)) => {
+            assert_ne!(
+                sw.id(),
+                func.id(),
+                "exitswitch must not keep the producer identity"
+            );
+            assert!(
+                graph.variable_defined_in_block(bf, sw),
+                "exitswitch use must be defined in the switch block"
+            );
+        }
+        other => panic!("expected Value exitswitch, got {other:?}"),
+    }
+}
 
 #[test]
 fn emit_fmt_concat_builds_interleaved_str_add_fold() {

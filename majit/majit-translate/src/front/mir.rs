@@ -1828,6 +1828,7 @@ impl CrateLoweringState {
             crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
                 std::slice::from_ref(llbc),
             );
+        llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -3061,8 +3062,11 @@ impl SemanticFunctionHeader {
         // `dont_look_inside_return_token` spells a raw address word as
         // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
         // pointer, or a declared-Raw ADT pointer
-        // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`).
-        // `scalar_result_token` matches that spelling. Ordinary
+        // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`), and
+        // a pair-slice as `u64`. `scalar_result_token` matches those
+        // spellings. A looked-inside `IntArray::as_slice` /
+        // `fsencode_bytes_w` lowers to a GcArray (`rlist.py` `ll_items`,
+        // `rstr.py` `Array(Char)`); CFG kind is `ref`. Ordinary
         // looked-inside graphs keep FUNC.RESULT unstamped so
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
@@ -3077,6 +3081,14 @@ impl SemanticFunctionHeader {
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
             )
+            && !output_is_pair_slice(&signature.output, llbc, error_carrier)
+            && dont_look_inside_return_container_root(
+                &signature.output,
+                llbc,
+                error_carrier,
+                gc_struct_ids,
+            )
+            .is_none()
         {
             signature_token
         } else {
@@ -3580,12 +3592,11 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
 
 pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
     let type_name = type_name.trim();
-    // A one-word-item Vec is `Ptr(Struct(raw) "RustVec")`
-    // (`rrustvec.rs rust_vec_lltype`); `getkind` of a raw pointer is
-    // `'int'`. Same recognizer as `Bookkeeper::project_rust_vec`.
-    if majit_ir::rvec::rust_vec_item_kind_for_spelling(type_name, crate::layout::target_word_size())
-        .is_some()
-    {
+    // A `Vec<T>` is `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs
+    // rust_vec_lltype`); `getkind` of a raw pointer is `'int'`. Same
+    // header recognizer as `Bookkeeper::project_rust_vec`; item kind
+    // only selects `ll_vec_*`.
+    if majit_ir::rvec::vec_item_spelling(type_name).is_some() {
         return ValueType::Int;
     }
     // `history.py` `getkind` of a raw `Ptr` whose pointee is a non-byte
@@ -3732,27 +3743,31 @@ fn published_struct_field_layout(
 }
 
 /// Type string `Bookkeeper::project_struct_field_type` consumes for a
-/// declared field. A `Vec` of one-word items is a canonical header-pointer
-/// spelling `project_rust_vec` accepts. An integer item keeps its own
-/// spelling (`usize` / `u64` versus `isize` / `i64`) so that projector can
-/// set `SomeInteger.unsigned`. [`tyref_to_field_layout_string`] writes
-/// `isize`, which annotates as `SomeInteger` and then `len` of the field
-/// raises `'int' has no length`.
+/// declared field. A stored `*mut Vec<T>` / `&Vec<T>` of one-word items is a
+/// canonical header-pointer spelling `project_rust_vec` accepts. An integer
+/// item keeps its own spelling (`usize` / `u64` versus `isize` / `i64`) so
+/// that projector can set `SomeInteger.unsigned`. A by-value `Vec<T>` field
+/// is the inline three-word substruct (`lltype._note_inlined_into`).
+/// [`tyref_to_field_layout_string`] writes `isize`, which annotates as
+/// `SomeInteger` and then `len` of the field raises `'int' has no length`.
 fn annotation_struct_field_type(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
-    match tyref_rust_vec_item_kind(ty, llbc) {
-        Some(majit_ir::rvec::VecItemKind::Int) => {
-            let item =
-                tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
-            format!("*mut Vec<{item}>")
-        }
-        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<GCREF>".to_string(),
-        Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
-        None => {
+    match tyref_rust_vec_layout(ty, llbc) {
+        Some(RustVecLayout::HeaderPtr) => match tyref_rust_vec_item_kind(ty, llbc) {
+            Some(majit_ir::rvec::VecItemKind::Int) => {
+                let item =
+                    tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
+                format!("*mut Vec<{item}>")
+            }
+            Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<GCREF>".to_string(),
+            Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
+            None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
+        },
+        Some(RustVecLayout::ByValue) | None => {
             let layout =
                 tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
             field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout)
@@ -6007,6 +6022,7 @@ impl<'a> LowerContext<'a> {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
+        llbc.register_raw_alloc_flavor_paths(raw_alloc_flavor_structs.iter().cloned());
         let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
             llbc,
             &gc_struct_ids,
@@ -6389,9 +6405,9 @@ pub(crate) use self::lltype::{
     fnptr_indirect_enabled, host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
     is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
     is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
-    nonzero_option_zero, output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
-    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
-    unichr_call,
+    nonzero_option_zero, output_type_is_objectptr, push_unichr, resolve_trait_assoc_type,
+    same_nominal_adt, strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin,
+    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;
@@ -6773,12 +6789,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            let guard_words = lo.guard_word_vars.clone();
             simplify_lowered_graph_expanding(
                 &mut lo.graph,
                 struct_field_attrs,
                 false,
-                &guard_words,
                 &expand_inline_struct,
             )?;
         }
@@ -7295,12 +7309,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        let guard_words = lo.guard_word_vars.clone();
         simplify_lowered_graph_expanding(
             &mut lo.graph,
             struct_field_attrs,
             true,
-            &guard_words,
             &expand_inline_struct,
         )?;
         // `removeassert.py` melt of abort-bound `format!` / `assert_eq!`
@@ -7366,12 +7378,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if abort_messages_melted > 0 || collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            let guard_words = lo.guard_word_vars.clone();
             simplify_lowered_graph_expanding(
                 &mut lo.graph,
                 struct_field_attrs,
                 true,
-                &guard_words,
                 &expand_inline_struct,
             )?;
         }

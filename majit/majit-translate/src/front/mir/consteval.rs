@@ -447,7 +447,10 @@ impl<'a> Lowering<'a> {
     /// already won via [`Self::static_addr_op`]; this lane is the
     /// identity of the declaration itself, never a residual
     /// `FunctionPath` of the static's symbolic path.
-    pub(in crate::front::mir) fn immutable_static_prebuilt_op(&self, def_id: u64) -> Option<OpKind> {
+    pub(in crate::front::mir) fn immutable_static_prebuilt_op(
+        &self,
+        def_id: u64,
+    ) -> Option<OpKind> {
         let g = self.llbc.global_by_id(def_id)?;
         if !immutable_static_is_prebuilt_table(self.llbc, g) {
             return None;
@@ -468,7 +471,10 @@ impl<'a> Lowering<'a> {
     }
 
     /// Peel `Deref` projections to an immutable `static` Global.
-    pub(in crate::front::mir) fn place_peels_to_immutable_static_id(&self, place: &Place) -> Option<u64> {
+    pub(in crate::front::mir) fn place_peels_to_immutable_static_id(
+        &self,
+        place: &Place,
+    ) -> Option<u64> {
         self.place_peels_to_any_immutable_static(place)
             .filter(|&id| {
                 self.llbc
@@ -480,7 +486,10 @@ impl<'a> Lowering<'a> {
     /// Peel `Deref` projections to any immutable `static`, including
     /// interior-mut `Cell` / `UnsafeCell` / atomic bindings. The value
     /// is not a prebuilt constant; the address is still the place.
-    pub(in crate::front::mir) fn place_peels_to_any_immutable_static(&self, place: &Place) -> Option<u64> {
+    pub(in crate::front::mir) fn place_peels_to_any_immutable_static(
+        &self,
+        place: &Place,
+    ) -> Option<u64> {
         let mut current = place;
         for _ in 0..8 {
             match &current.kind {
@@ -876,7 +885,6 @@ impl<'a> Lowering<'a> {
         };
         let ty = substituted.as_ref().unwrap_or(ty);
         i64::try_from(size_align_of_tyexpr(self.llbc, want_align, ty)?).ok()
-
     }
 }
 
@@ -936,7 +944,10 @@ pub(in crate::front::mir) fn global_is_immutable_static(g: &GlobalDecl) -> bool 
 /// is this shape (`bookkeeper.py immutablevalue`). A `static AtomicBool`
 /// is still `Static { is_mut: false }` in Charon, so the binding is not
 /// the fact; the declared type is.
-pub(in crate::front::mir) fn immutable_static_is_prebuilt_table(llbc: &Llbc, g: &GlobalDecl) -> bool {
+pub(in crate::front::mir) fn immutable_static_is_prebuilt_table(
+    llbc: &Llbc,
+    g: &GlobalDecl,
+) -> bool {
     if !global_is_immutable_static(g) {
         return false;
     }
@@ -983,16 +994,27 @@ pub(in crate::front::mir) fn immutable_static_sentinel_addr(def_id: u64) -> i64 
 /// (`decoded_const_to_op`); `Option<fn>` `None` is the null function
 /// pointer (`ConstInt(0)`). Anything the initializer does not name as a
 /// translation-time constant stays a pure getfield of the prebuilt.
-pub(in crate::front::mir) fn fold_immutable_static_field(llbc: &Llbc, def_id: u64, field_idx: usize) -> Option<OpKind> {
+pub(in crate::front::mir) fn fold_immutable_static_field(
+    llbc: &Llbc,
+    def_id: u64,
+    field_idx: usize,
+) -> Option<OpKind> {
     let fields = immutable_static_struct_fields(llbc, def_id)?;
     fields.into_iter().nth(field_idx).flatten()
 }
 
-pub(in crate::front::mir) fn immutable_static_struct_fields(llbc: &Llbc, def_id: u64) -> Option<Vec<Option<OpKind>>> {
+pub(in crate::front::mir) fn immutable_static_struct_fields(
+    llbc: &Llbc,
+    def_id: u64,
+) -> Option<Vec<Option<OpKind>>> {
     immutable_static_init_tables(llbc, def_id).map(|(fields, _)| fields)
 }
 
-pub(in crate::front::mir) fn immutable_static_field_fun_id(llbc: &Llbc, def_id: u64, field_idx: usize) -> Option<u64> {
+pub(in crate::front::mir) fn immutable_static_field_fun_id(
+    llbc: &Llbc,
+    def_id: u64,
+    field_idx: usize,
+) -> Option<u64> {
     let (_, funs) = immutable_static_init_tables(llbc, def_id)?;
     funs.into_iter().nth(field_idx).flatten()
 }
@@ -1046,7 +1068,9 @@ pub(in crate::front::mir) fn immutable_static_init_tables(
     Some((struct_fields?, struct_funs.unwrap_or_default()))
 }
 
-pub(in crate::front::mir) fn aggregate_adt_parts(kind: &serde_json::Value) -> Option<(u64, Option<u64>)> {
+pub(in crate::front::mir) fn aggregate_adt_parts(
+    kind: &serde_json::Value,
+) -> Option<(u64, Option<u64>)> {
     let adt = kind.get("Adt")?.as_array()?;
     let head = adt.first()?;
     let type_id = head
@@ -1348,7 +1372,10 @@ pub(in crate::front::mir) fn immutable_static_exists_for_adt(llbc: &Llbc, type_i
         })
 }
 
-pub(in crate::front::mir) fn local_assigned_operand(body: &Unstructured, local: u64) -> Option<Operand> {
+pub(in crate::front::mir) fn local_assigned_operand(
+    body: &Unstructured,
+    local: u64,
+) -> Option<Operand> {
     for block in &body.body {
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
@@ -1502,7 +1529,11 @@ pub(in crate::front::mir) fn type_node_has_interior_mutability(
     false
 }
 
-pub(in crate::front::mir) fn type_id_has_interior_mutability(llbc: &Llbc, type_id: u64, seen: &mut Vec<u64>) -> bool {
+pub(in crate::front::mir) fn type_id_has_interior_mutability(
+    llbc: &Llbc,
+    type_id: u64,
+    seen: &mut Vec<u64>,
+) -> bool {
     if seen.contains(&type_id) {
         return false;
     }
@@ -1528,14 +1559,21 @@ pub(in crate::front::mir) fn type_id_has_interior_mutability(llbc: &Llbc, type_i
     }
 }
 
-pub(in crate::front::mir) fn tyref_node_interior_mut(ty: &TyRef, llbc: &Llbc, seen: &mut Vec<u64>) -> bool {
+pub(in crate::front::mir) fn tyref_node_interior_mut(
+    ty: &TyRef,
+    llbc: &Llbc,
+    seen: &mut Vec<u64>,
+) -> bool {
     tyref_node(ty, llbc).is_some_and(|node| type_node_has_interior_mutability(node, llbc, seen))
 }
 
 /// Type constructors that *are* interior mutability, identified by the
 /// declaration path. `AtomicBool` is a struct in `sync::atomic`;
 /// `Ordering` in the same module is a fieldless enum and is not.
-pub(in crate::front::mir) fn adt_path_is_interior_mut_constructor(path: &str, kind: &TypeDeclKind) -> bool {
+pub(in crate::front::mir) fn adt_path_is_interior_mut_constructor(
+    path: &str,
+    kind: &TypeDeclKind,
+) -> bool {
     if path == "core::cell::UnsafeCell" || path.ends_with("::UnsafeCell") {
         return true;
     }
@@ -1795,7 +1833,13 @@ pub(crate) fn discover_raw_struct_paths(
             continue;
         }
         let mut stack = Vec::new();
-        if adt_def_is_raw_storage(decl.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
+        if adt_def_is_raw_storage(
+            decl.def_id,
+            llbc,
+            gc_struct_ids,
+            immutable_fields,
+            &mut stack,
+        ) {
             paths.push(decl.item_meta.name_path());
         }
     }
@@ -1824,6 +1868,7 @@ pub fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) 
     let gc_struct_ids = declared_gc.gc_struct_ids();
     let mut discovered = Vec::new();
     let mut raw_structs = Vec::new();
+    let mut raw_alloc = Vec::new();
     let mut foldable_cross = Vec::new();
     let mut foldable_impl: Vec<Vec<(String, OpKind)>> = Vec::new();
     for llbc in llbcs {
@@ -1832,6 +1877,11 @@ pub fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) 
             std::slice::from_ref(*llbc),
         );
         raw_structs.extend(discover_raw_struct_paths(llbc, &gc_struct_ids, &ranks));
+        raw_alloc.extend(
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                *llbc,
+            )),
+        );
         let mut impl_folds = Vec::new();
         for (path, op) in discover_foldable_const_lits(llbc) {
             if path.contains('<') {
@@ -1846,10 +1896,13 @@ pub fn link_transparent_scalar_types<L: std::borrow::Borrow<Llbc>>(llbcs: &[L]) 
     discovered.dedup();
     raw_structs.sort();
     raw_structs.dedup();
+    raw_alloc.sort();
+    raw_alloc.dedup();
     let foldable_cross = register_foldable_const_lits(foldable_cross);
     for (llbc, impl_folds) in llbcs.iter().zip(foldable_impl) {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
         llbc.register_raw_struct_paths(raw_structs.iter().cloned());
+        llbc.register_raw_alloc_flavor_paths(raw_alloc.iter().cloned());
         attach_foldable_const_lits(llbc, &foldable_cross);
         attach_foldable_const_lits(llbc, &impl_folds);
     }
@@ -2608,7 +2661,9 @@ pub(in crate::front::mir) fn decoded_named_const_on_llbc(
 }
 
 pub(in crate::front::mir) fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
-    Some(decoded_const_to_op(decoded_named_const_on_llbc(llbc, def_id)?))
+    Some(decoded_const_to_op(decoded_named_const_on_llbc(
+        llbc, def_id,
+    )?))
 }
 
 /// Discriminant of a fieldless enum variant aggregate.
@@ -3728,7 +3783,10 @@ pub(in crate::front::mir) fn const_transparent_aggregate_field(
 /// `core::mem::size_of` / `align_of`. Any other callee stays unharvested:
 /// that refusal is the fail-closed default
 /// [`const_eval_init_body_lit`] used before this exemption.
-pub(in crate::front::mir) fn const_eval_size_align_call(llbc: &Llbc, call: &CallPayload) -> Option<ConstLit> {
+pub(in crate::front::mir) fn const_eval_size_align_call(
+    llbc: &Llbc,
+    call: &CallPayload,
+) -> Option<ConstLit> {
     if !call.args.is_empty() {
         return None;
     }
@@ -3771,7 +3829,11 @@ pub(in crate::front::mir) fn const_eval_size_align_call(llbc: &Llbc, call: &Call
 /// two. A tuple or a struct whose Charon field offsets did not resolve
 /// still folds from its field types — alignment is the max of the
 /// fields (`ItemOffset` of a `lltype.Struct`).
-pub(in crate::front::mir) fn size_align_of_tyexpr(llbc: &Llbc, want_align: bool, ty: &serde_json::Value) -> Option<u64> {
+pub(in crate::front::mir) fn size_align_of_tyexpr(
+    llbc: &Llbc,
+    want_align: bool,
+    ty: &serde_json::Value,
+) -> Option<u64> {
     size_align_of_tyexpr_depth(llbc, want_align, ty, 0)
 }
 
@@ -3927,7 +3989,9 @@ pub(in crate::front::mir) fn size_align_of_tyexpr_depth(
     adt_size_align_from_fields(llbc, decl, body, want_align, depth + 1)
 }
 
-pub(in crate::front::mir) fn raw_ptr_or_ref_pointee(body: &serde_json::Value) -> Option<&serde_json::Value> {
+pub(in crate::front::mir) fn raw_ptr_or_ref_pointee(
+    body: &serde_json::Value,
+) -> Option<&serde_json::Value> {
     let obj = body.as_object()?;
     if let Some(raw) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
         return raw.first();
@@ -4100,7 +4164,10 @@ pub(in crate::front::mir) fn size_align_trait_type_from_owner<'a>(
     resolve_trait_assoc_type_value(&projection[0], &projection[1], llbc)
 }
 
-pub(in crate::front::mir) fn traitref_clause_bound0_index(v: &serde_json::Value, llbc: &Llbc) -> Option<usize> {
+pub(in crate::front::mir) fn traitref_clause_bound0_index(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<usize> {
     let obj = traitref_unwrap(v, llbc, 0)?;
     let bound = obj.get("kind")?.get("Clause")?.get("Bound")?.as_array()?;
     if bound.first()?.as_u64()? != 0 {
@@ -5186,7 +5253,9 @@ pub(in crate::front::mir) fn subst_bind_projected_field(
     }
     let slot_is_open = match subst.get(slot) {
         None => true,
-        Some(ty) => strip_ty_indirections(ty, llbc).is_some_and(|body| typevar_slot(body).is_some()),
+        Some(ty) => {
+            strip_ty_indirections(ty, llbc).is_some_and(|body| typevar_slot(body).is_some())
+        }
     };
     if slot_is_open {
         if subst.len() <= slot {

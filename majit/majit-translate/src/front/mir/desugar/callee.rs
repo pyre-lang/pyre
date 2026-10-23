@@ -2255,6 +2255,34 @@ pub(in crate::front::mir) fn is_vec_rangefull_index_regular(
     reg: &RegularCall,
     llbc: &Llbc,
 ) -> bool {
+    is_vec_range_index_regular(reg, llbc, "RangeFull")
+}
+
+/// `Vec<T>::index(_mut)(RangeFrom)` — `&vec[k..]`.
+pub(in crate::front::mir) fn is_vec_rangefrom_index_regular(
+    reg: &RegularCall,
+    llbc: &Llbc,
+) -> bool {
+    is_vec_range_index_regular(reg, llbc, "RangeFrom")
+}
+
+/// `__getslice_rangefrom` plus the object-array suffix jtransform reads.
+pub(in crate::front::mir) fn object_vec_rangefrom_marker_segments() -> Vec<String> {
+    let mut segments = vec!["__getslice_rangefrom".to_string()];
+    if let Some(suffix) = crate::codewriter::getslice::listslice_marker_suffix(
+        &ValueType::Ref(None),
+        Some(OBJECT_REF_GCARRAY_TYPE_ID),
+    ) {
+        segments.push(suffix);
+    }
+    segments
+}
+
+pub(in crate::front::mir) fn is_vec_range_index_regular(
+    reg: &RegularCall,
+    llbc: &Llbc,
+    range_leaf: &str,
+) -> bool {
     if vec_index_regular_unchecked_leaf(reg, llbc).is_none() {
         return false;
     }
@@ -2263,7 +2291,11 @@ pub(in crate::front::mir) fn is_vec_rangefull_index_regular(
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-        .is_some_and(|t| tyref_to_ast_string(&t, llbc) == "RangeFull")
+        .is_some_and(|t| {
+            let spelling = tyref_to_ast_string(&t, llbc);
+            let leaf = spelling.rsplit("::").next().unwrap_or(spelling.as_str());
+            leaf == range_leaf || leaf.starts_with(&format!("{range_leaf}<"))
+        })
 }
 
 /// Shared vs mutable whole-list view of a `Vec<PyObjectRef>`.

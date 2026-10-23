@@ -143,13 +143,14 @@ fn op_concat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    if unsafe {
-        crate::baseobjspace::lookup(args[0], "__getitem__").is_none()
-            || crate::baseobjspace::lookup(args[1], "__getitem__").is_none()
-    } {
-        return Err(concat_type_error(args[0]));
+    let mut a = args[0];
+    let mut b = args[1];
+    if pyre_object::with_roots!(a, b => unsafe { crate::baseobjspace::lookup(a, "__getitem__") }).is_none()
+        || pyre_object::with_roots!(a, b => unsafe { crate::baseobjspace::lookup(b, "__getitem__") }).is_none()
+    {
+        return Err(concat_type_error(a));
     }
-    add(args[0], args[1])
+    add(a, b)
 }
 
 /// `interp_operator.py iconcat` — `a += b` for two subscriptable
@@ -162,17 +163,14 @@ fn op_iconcat(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             args.len()
         )));
     }
-    if unsafe {
-        crate::baseobjspace::lookup(args[0], "__getitem__").is_none()
-            || crate::baseobjspace::lookup(args[1], "__getitem__").is_none()
-    } {
-        return Err(concat_type_error(args[0]));
+    let mut a = args[0];
+    let mut b = args[1];
+    if pyre_object::with_roots!(a, b => unsafe { crate::baseobjspace::lookup(a, "__getitem__") }).is_none()
+        || pyre_object::with_roots!(a, b => unsafe { crate::baseobjspace::lookup(b, "__getitem__") }).is_none()
+    {
+        return Err(concat_type_error(a));
     }
-    crate::opcode_ops::binary_value(
-        args[0],
-        args[1],
-        crate::bytecode::BinaryOperator::InplaceAdd,
-    )
+    crate::opcode_ops::binary_value(a, b, crate::bytecode::BinaryOperator::InplaceAdd)
 }
 
 /// `interp_operator.py call`: `call(obj, /, *args, **kwargs)` forwards

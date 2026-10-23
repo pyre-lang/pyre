@@ -232,13 +232,18 @@ pub const BC_RECORD_EXACT_VALUE_R: u8 = 40;
 // rides on `EffectInfo.call_release_gil_target` (`effectinfo.py
 // is_call_release_gil`). Reused below as
 // [`BC_JIT_FORCE_QUASI_IMMUTABLE_I`].
-// BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
-// resoperation.py (`# no such thing`) excludes
-// CALL_RELEASE_GIL_R from the upstream opcode table.
-// slot 44 (formerly BC_CALL_RELEASE_GIL_FLOAT) freed — see slot 42
-// above.
-// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed — see slot 42
-// above.
+/// `int_isvirtual` whose operand lives in the ref bank (`r>i`).
+///
+/// Task A types a raw-flavored `Ptr` as annotator `SomePtr` (r bank) while
+/// `history.py` `getkind` still names the op `int_isvirtual`. Distinct from
+/// [`BC_INT_ISVIRTUAL`] (254, `i>i`): `setup_insns` and
+/// `opcode_bytes_are_one_to_one` require one byte per `(opname, argcodes)`.
+/// Slot 43 was formerly reserved as the absent `CALL_RELEASE_GIL_REF`
+/// (`resoperation.py` `# no such thing`).
+pub const BC_INT_ISVIRTUAL_R: u8 = 43;
+// slot 44 (formerly BC_CALL_RELEASE_GIL_FLOAT) freed — release-GIL
+// policy rides on `EffectInfo.call_release_gil_target`.
+// slot 45 (formerly BC_CALL_RELEASE_GIL_VOID) freed — same.
 // slots 46..=48 (formerly BC_CALL_LOOPINVARIANT_{INT,REF,FLOAT}) freed
 // — loop-invariant policy rides on
 // `EffectInfo.extraeffect = EF_LOOPINVARIANT` (`effectinfo.py`).
@@ -1246,6 +1251,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("ref_isconstant/r>i", BC_REF_ISCONSTANT);
     m.insert("ref_isvirtual/r>i", BC_REF_ISVIRTUAL);
     m.insert("int_isvirtual/i>i", BC_INT_ISVIRTUAL);
+    m.insert("int_isvirtual/r>i", BC_INT_ISVIRTUAL_R);
     m.insert("record_exact_class/ri", BC_RECORD_EXACT_CLASS);
     // `record_exact_value_{i,r}` — `jtransform.py rewrite_op_jit_record_exact_value`.
     // Void at blackhole resume (`bhimpl_record_exact_value_{i,r}`).

@@ -4094,7 +4094,9 @@ fn positional_tuple_field_rows_take_kind_from_dest_ty() {
 #[test]
 fn positional_tuple_raw_ptr_fields_take_int_kind_from_getkind() {
     // `mapdict::<Impl>::slots` returns `(*mut usize, *mut *mut ItemsBlock)`.
-    // `history.py` `getkind` of a raw `Ptr` is `'int'`.
+    // `*mut usize` is a raw `Ptr` (`history.py` `getkind` `'int'`).
+    // `*mut *mut ItemsBlock` is a pointer to a GCREF slot
+    // (`Ptr(GcArray)` interior), getkind `'ref'`.
     let llbc = llbc_with_trait_impls(serde_json::json!([]));
     let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
     let raw_usize = serde_json::json!({"RawPtr": [usize_ty, "Mut"]});
@@ -4120,7 +4122,7 @@ fn positional_tuple_raw_ptr_fields_take_int_kind_from_getkind() {
             .collect::<Vec<_>>(),
         vec![
             ("__pos_0", Some(ValueType::Int)),
-            ("__pos_1", Some(ValueType::Int)),
+            ("__pos_1", Some(ValueType::Ref(None))),
         ]
     );
     let byte = TyRef::Other(serde_json::json!({

@@ -9284,7 +9284,7 @@ fn drive_unpack_iterable_trace(
     let w_iterator = roots.get(base + 1);
     let items = roots.get(base + 2);
 
-    // Extracted merge-point reds: root_base, items_slot, RootScope cell.
+    // Extracted merge-point reds: root_base, items_slot, RootScope save_point.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
@@ -9485,7 +9485,8 @@ fn drive_unpack_iterable_trace(
     }
 
     // Seed every bank the extracted `jit_merge_point` names.  Green is
-    // the type object; reds are root_base / items_slot / RootScope cell.
+    // the type object; reds are root_base / items_slot / RootScope
+    // save_point (`history.py` `getkind` of a raw Ptr is `'int'`).
     let green_args = [(
         majit_metainterp::JitArgKind::Ref,
         greenkey_raw as usize as i64,
@@ -9503,9 +9504,9 @@ fn drive_unpack_iterable_trace(
             root_base + 1,
         ),
         (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
-            pyre_object::gc_roots::shadow_stack_cell() as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+            root_base,
         ),
     ];
 
@@ -9513,7 +9514,7 @@ fn drive_unpack_iterable_trace(
         greenkey: pyre_object::PY_NULL,
         root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
         items_slot: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -15727,20 +15728,25 @@ pub(crate) fn decode_and_restore_guard_failure(
         // _copy_resume_data_from`) must restart at the storage's pc
         // (`pyjitpl.py handle_guard_failure` -> `resume.py
         // rebuild_from_resumedata` -> `MIFrame.setup_resume_at_op`).
+        //
+        // Helper jitcodes have no Python `CodeObject`
+        // (`raw_code_for_jitcode_index`); `resume_py_pc_for_jitcode_word`
+        // then falls back to the containing/trivia lookup and reports 0.
+        // Using that mapped word as the portal merge-point green CloseLoops
+        // at the function entry and the bridge re-runs `q = [0]*n`. The
+        // innermost *Python* section is the innermost `resumed_frames` entry
+        // whose jitcode maps to a Python code object — a property of the
+        // section's jitcode/code, never `py_pc == 0` as a sentinel. If no
+        // section has a Python twin, keep the vable `last_instr` (`ni`).
         let ni = jit_state.next_instr();
-        let innermost = resumed_frames.last();
-        let resume_pc = if innermost.is_some_and(|f| f.py_pc == usize::MAX) {
-            // Helper innermost: the live frame's vable next-instr, not
-            // a fake Python pc. Continuations keep their twin / trivia pc.
-            ni
-        } else {
-            innermost.map(|f| f.py_pc).unwrap_or(ni)
-        };
-        // `write_from_resume_data_partial` / `consume_vable_info` write the
-        // virtualizable (outermost) frame. An inlined callee is a separate
-        // object this rebuild materializes; its depth does not index the
-        // portal `locals_cells_stack_w`. Correct vsd only when the innermost
-        // section IS that physical frame.
+        let innermost = innermost_python_twin_section(&resumed_frames);
+        let resume_pc = resume_pc_for_guard_failure(ni, &resumed_frames);
+        // virtualizable.py `write_from_resume_data_partial` /
+        // `consume_vable_info` write the virtualizable (outermost) frame.
+        // An inlined callee is a separate object this rebuild materializes;
+        // its depth does not index the portal `locals_cells_stack_w`.
+        // Correct vsd only when the innermost Python section IS that
+        // physical frame.
         let outermost_ptr = resumed_frames.first().map(|f| f.frame_ptr);
         if resume_pc != ni || resumed_frames.len() > 1 {
             if let Some(inner) = innermost {
@@ -15761,13 +15767,16 @@ pub(crate) fn decode_and_restore_guard_failure(
         // `locals_cells_stack_w` from the vable boxes, including slots
         // above `valuestackdepth`. A popped box can still hold a young
         // pointer; the type-9 walker traces every allocated slot, so
-        // leave those words NULL.
+        // leave those words NULL. The vsd-correction arm above already
+        // trimmed when it rewrote the depth; this covers the single-frame
+        // resume that keeps the restored vsd (`test_complex_newobj_ex`
+        // after a hot `Unpickler.load`).
         jit_state.clear_stack_above(jit_state.valuestackdepth());
         // Outermost-first `(w_code, py_pc, jitcode_index, jitcode_pc)` per
         // resumed section. The caller needs them to ask each frame's own
         // exception table — or a helper section's `catch_exception` — whether
         // it catches at its own resume pc. `resume_pc` alone only addresses
-        // the innermost section.
+        // the innermost Python section.
         let coords: Vec<(usize, usize, i32, i32)> = resumed_frames
             .iter()
             .map(|f| (f.code as usize, f.py_pc, f.jitcode_index, f.jitcode_pc))
@@ -15781,6 +15790,24 @@ pub(crate) fn decode_and_restore_guard_failure(
     } else {
         None
     }
+}
+
+/// Innermost rd_numb section whose jitcode maps to a Python `CodeObject`.
+///
+/// `resume.py` `rebuild_from_resumedata` / `setup_resume_at_op` resume each
+/// section at its jitcode pc; helper jitcodes have no Python twin.
+fn innermost_python_twin_section(
+    frames: &[crate::call_jit::ResumedFrame],
+) -> Option<&crate::call_jit::ResumedFrame> {
+    frames.iter().rev().find(|f| f.has_python_twin)
+}
+
+/// Guard-failure resume pc: every section count resumes at the innermost
+/// Python-twin section's pc; `ni` only when no section has a Python twin.
+fn resume_pc_for_guard_failure(ni: usize, frames: &[crate::call_jit::ResumedFrame]) -> usize {
+    innermost_python_twin_section(frames)
+        .map(|f| f.py_pc)
+        .unwrap_or(ni)
 }
 
 /// Decode rd_numb to produce typed values via
@@ -16513,6 +16540,12 @@ fn build_resumed_frames(
             vsd,
             namespace,
             values,
+            // `raw_code_for_jitcode_index`: non-null `code_ptr` on the
+            // section's jitcode. The same identity `resume_py_pc_for_jitcode_word`
+            // needs a Python code object; helpers have none and their mapped
+            // py_pc is the trivia fallback (often 0).
+            has_python_twin: pyre_jit_trace::state::raw_code_for_jitcode_index(frame.jitcode_index)
+                .is_some(),
         });
     }
 
@@ -17281,6 +17314,53 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resumed_section(py_pc: usize, has_python_twin: bool) -> crate::call_jit::ResumedFrame {
+        crate::call_jit::ResumedFrame {
+            code: std::ptr::null(),
+            py_pc,
+            jitcode_index: 0,
+            jitcode_pc: 0,
+            frame_ptr: std::ptr::null_mut(),
+            vsd: 0,
+            namespace: std::ptr::null(),
+            values: Vec::new(),
+            has_python_twin,
+        }
+    }
+
+    #[test]
+    fn single_frame_guard_failure_resumes_at_section_pc() {
+        // #2444 + #158: one twin section resumes at its py_pc; a helper
+        // section has no Python twin and falls back to vable `last_instr`.
+        let twin = [resumed_section(12, true)];
+        assert_eq!(resume_pc_for_guard_failure(24, &twin), 12);
+        let helper = [resumed_section(0, false)];
+        assert_eq!(resume_pc_for_guard_failure(24, &helper), 24);
+    }
+
+    #[test]
+    fn inlined_python_callee_resumes_at_innermost_py_pc() {
+        // #2444: multi-frame whose innermost section IS an inlined Python
+        // callee resumes at that section's py_pc, not the portal `ni`.
+        let frames = [resumed_section(24, true), resumed_section(12, true)];
+        assert_eq!(resume_pc_for_guard_failure(24, &frames), 12);
+    }
+
+    #[test]
+    fn helper_innermost_section_resumes_at_portal_pc_not_zero() {
+        // Guard failure inside an inlined helper (no Python twin; mapped
+        // py_pc 0) resumes at the portal section's py_pc, not 0.
+        let frames = [resumed_section(24, true), resumed_section(0, false)];
+        assert_eq!(resume_pc_for_guard_failure(24, &frames), 24);
+        assert_ne!(resume_pc_for_guard_failure(24, &frames), 0);
+    }
+
+    #[test]
+    fn helper_only_chain_falls_back_to_vable_last_instr() {
+        let frames = [resumed_section(0, false), resumed_section(0, false)];
+        assert_eq!(resume_pc_for_guard_failure(18, &frames), 18);
+    }
 
     #[test]
     fn opcode_method_name_underscores_numeric_suffixes() {

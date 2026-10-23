@@ -146,6 +146,9 @@ impl<'a> Lowering<'a> {
         if !add_dest_used_only_as_single_read_deref(self.llbc, self.body, dest_local) {
             return Ok(false);
         }
+        let Some(base) = self.take_string_repr_gcref(&args[0]) else {
+            return Ok(false);
+        };
         let bb_id = self.block_id[mir_bb];
         let res = self
             .graph
@@ -159,7 +162,7 @@ impl<'a> Lowering<'a> {
                     generic_rust_args: Vec::new(),
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
-                args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
+                args: crate::model::call_args(vec![base.clone(), args[1].clone()]),
                 result_ty: ValueType::Int,
             },
         });
@@ -170,7 +173,7 @@ impl<'a> Lowering<'a> {
             dest_local,
             IndexElemAlias {
                 base_local: Some(base_local),
-                base_var: args[0].clone(),
+                base_var: base,
                 index_local: arg_locals.get(1).copied().flatten(),
                 index_var: args[1].clone(),
                 item_ty: ValueType::Int,
@@ -237,7 +240,7 @@ impl<'a> Lowering<'a> {
                 let recv = self.realias_operand(Some(*recv_local), recv_var.clone());
                 let res = self
                     .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    .alloc_value_var_with_type(concretetype_for_field(ty));
                 self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                     result: Some(res.clone()),
                     kind: OpKind::FieldRead {
@@ -529,64 +532,154 @@ impl<'a> Lowering<'a> {
     /// The GC pointer a `p as usize` chain produced, if `var` is that
     /// address integer or an `r_uint` retype of it.
     pub(in crate::front::mir) fn address_cast_pointer(&self, var: &Variable) -> Option<Variable> {
-        if let Some(orig) = self.cast_ptr_to_int_src.get(var) {
-            return Some(orig.clone());
+        // Provenance is recorded at emit (`cast_ptr_to_int` /
+        // `r_uint` / `Hint`) and follows `FrameState.copy` through
+        // [`Self::inherit_copied_var`]. A miss after walking those
+        // copies is "not an address word". Walking every op
+        // (`resolve_to_producer_op`) here is O(graph) per SSA and is
+        // what made production-LLBC lowering take minutes — the same
+        // class as walking before `is_any_getslice_marker`.
+        self.address_cast_origin_by_id(var.id())
+    }
+
+    /// `cast_ptr_to_int_src` keyed by the address word, walking
+    /// `FrameState.copy` renames (`input_copied_from`). The loop body's
+    /// inputarg is a fresh Variable; HashMap lookup of that copy misses
+    /// without this walk.
+    pub(in crate::front::mir) fn address_cast_origin_by_id(&self, start: u64) -> Option<Variable> {
+        let mut id = start;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if let Some(orig) = self
+                .cast_ptr_to_int_src
+                .iter()
+                .find(|(k, _)| k.id() == id)
+                .map(|(_, v)| v.clone())
+            {
+                return Some(orig);
+            }
+            if let Some(orig) = self
+                .raw_address_uint_src
+                .iter()
+                .find(|(k, _)| k.id() == id)
+                .map(|(_, v)| v.clone())
+            {
+                return Some(orig);
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return None;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return None,
+            }
         }
-        if let Some(orig) = self.raw_address_uint_src.get(var) {
-            return Some(orig.clone());
+    }
+
+    /// The `rstr.py` `STR` a byte-view data pointer came from.
+    ///
+    /// `<[u8]>::as_ptr` is `cast_ptr_to_int` of the string
+    /// (`slice_as_ptr_word`), so `p.add(i)` sees an Int. `ll_stritem_nonneg`
+    /// takes the STR; recover it from `cast_ptr_to_int_src`. Walk until the
+    /// GcRef header: one hop can stop on an intermediate address word, and
+    /// `strgetitem` of that word assembles as `/ii>i`.
+    pub(in crate::front::mir) fn string_repr_of_byte_view_ptr(&self, ptr: &Variable) -> Variable {
+        let mut cur = ptr.clone();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if self.var_is_gc_string_repr(&cur) {
+                return cur;
+            }
+            if !seen.insert(cur.id()) || seen.len() > 16 {
+                return cur;
+            }
+            match self.address_cast_pointer(&cur) {
+                Some(orig) if orig.id() != cur.id() => cur = orig,
+                _ => return cur,
+            }
         }
-        let (block_id, idx) = resolve_to_producer_op(&self.graph, var)?;
-        let op = self
-            .graph
-            .blocks
-            .iter()
-            .find(|block| block.id == block_id)?
-            .operations
-            .get(idx)?;
-        if op
-            .result
-            .as_ref()
-            .is_some_and(|result| self.cast_ptr_to_int_src.contains_key(result))
-        {
-            return self.cast_ptr_to_int_src.get(op.result.as_ref()?).cloned();
-        }
-        if op
-            .result
-            .as_ref()
-            .is_some_and(|result| self.raw_address_uint_src.contains_key(result))
-        {
-            return self.raw_address_uint_src.get(op.result.as_ref()?).cloned();
-        }
-        // `hint` is `same_as` of its value (`flowspace_adapter`,
-        // `jtransform.py` `rewrite_op_hint`). `Function.getcode` is
-        // `promote(self.code as usize) as PyObject` (`jit.py` `promote`):
-        // the promote result is a fresh variable, so the map above misses
-        // unless the walk steps through the hint.
-        let hint_value = match &op.kind {
-            OpKind::Hint { value, .. } => Some(value.clone()),
-            _ => None,
-        };
-        if let Some(value) = hint_value {
-            return self.address_cast_pointer(&value);
-        }
-        let OpKind::Call { target, args, .. } = &op.kind else {
-            return None;
-        };
-        let is_address_retype = match target {
-            CallTarget::FunctionPath { segments, .. } => segments.last().is_some_and(|leaf| {
-                // `hint_promote` is `same_as` of its argument
-                // (`jtransform.py` `rewrite_op_hint`). `Function.getcode`
-                // promotes the address word, so the int→ptr half has to
-                // see the pointer the word came from.
-                matches!(leaf.as_str(), "r_uint" | "cast_ptr_to_int" | "hint_promote")
-            }),
+    }
+
+    /// `strgetitem` first operand is the STR (`history.py` `getkind` `'ref'`).
+    /// A `Signed` recovery is the chars pointer (`CCHARP`); that assembles
+    /// as `/ii>i`. Parameters are minted `Unknown` until
+    /// [`paint_str_param_gcref`]; `Input { ty: Str }` is already the STR.
+    pub(in crate::front::mir) fn var_is_gc_string_repr(&self, var: &Variable) -> bool {
+        match crate::model::FunctionGraph::concretetype_of(var) {
+            crate::model::ConcreteType::GcRef => true,
+            crate::model::ConcreteType::Unknown => self.var_is_str_input(var),
             _ => false,
-        };
-        if !is_address_retype {
+        }
+    }
+
+    pub(in crate::front::mir) fn var_is_str_input(&self, var: &Variable) -> bool {
+        let mut id = var.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if self
+                .graph
+                .block(self.graph.startblock)
+                .operations
+                .iter()
+                .any(|op| {
+                    op.result.as_ref().is_some_and(|result| result.id() == id)
+                        && matches!(
+                            &op.kind,
+                            OpKind::Input {
+                                ty: ValueType::Str,
+                                ..
+                            }
+                        )
+                })
+            {
+                return true;
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return false;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return false,
+            }
+        }
+    }
+
+    /// Recover the STR for a byte-view data pointer and stamp it `GcRef`
+    /// so the assembler banks `strgetitem` as `/ri>i`.
+    pub(in crate::front::mir) fn take_string_repr_gcref(&self, ptr: &Variable) -> Option<Variable> {
+        let base = self.string_repr_of_byte_view_ptr(ptr);
+        if !self.var_is_gc_string_repr(&base) {
             return None;
         }
-        let arg = args.first()?.as_variable()?;
-        self.address_cast_pointer(arg)
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &base,
+            crate::model::ConcreteType::GcRef,
+        );
+        Some(base)
+    }
+
+    /// `var` is the reference `OwnerRootGuard::new` stored. A later
+    /// Cast / `ptr::cast` of that word is identity, so the FieldRead
+    /// stays the live value (`OwnerRootGuard::get`).
+    ///
+    /// `FrameState.copy` gives the successor a fresh Variable
+    /// (`input_copied_from`); walk that rename the way a `FieldRead`
+    /// of quasi-immutable `w_globals` does.
+    pub(in crate::front::mir) fn guard_root_word(&self, var: &Variable) -> Option<Variable> {
+        let mut id = var.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if self.guard_word_vars.iter().any(|known| known.id() == id) {
+                return Some(var.clone());
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return None;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return None,
+            }
+        }
     }
 
     /// `var` or the op that produced it (across one inputarg link) is a
@@ -1185,7 +1278,6 @@ impl<'a> Lowering<'a> {
                                             &self.raw_alloc_flavor_structs,
                                         )
                                     }),
-
                                 );
                             let ty = if store_rstr_attr {
                                 ValueType::Str
@@ -1412,12 +1504,12 @@ impl<'a> Lowering<'a> {
     /// RPython represents an instance attribute as `SomeInstance(classdef)`;
     /// when nullable, the same annotation simply carries `can_be_None=True`.
     /// Rust spells those slots as `&NamedAdt` or `*mut/*const NamedAdt`, whose
-    /// producer initially has pointer annotation.  A pointer to an RPython
-    /// array is the same boundary: `rutf8.UTF8_INDEX_STORAGE` is a `GcArray`,
-    /// while Rust carries the exact owner as `*mut Vec<Utf8LocElem>`.  The
+    /// producer initially has pointer annotation.  The
     /// `_setup_repr_llfields` types the virtualizable token as GCREF, and a
     /// `Ref` / `Str` field is the same kind. A host `0` is `ConstPtr(NULL)`
-    /// (`history.py` `CONST_NULL`), not `CONST_0`.
+    /// (`history.py` `CONST_NULL`), not `CONST_0`. A `*mut Vec<T>` field is
+    /// the raw header address (`rrustvec.rs rust_vec_lltype`), kind `int`,
+    /// so this coercion does not apply.
     pub(in crate::front::mir) fn coerce_gcref_null_store(
         &mut self,
         bb_id: BlockId,
@@ -1562,6 +1654,12 @@ impl<'a> Lowering<'a> {
         // (`rclass.py` `pairtype(InstanceRepr, InstanceRepr).convert_from_to`).
         // Same decision as [`Self::instance_narrow_for_type`].
         if tyref_fieldless_enum_pointee(ty, self.llbc).is_some() {
+            return None;
+        }
+        // A `Vec<T>` header is `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs
+        // rust_vec_lltype`), kind `int`. The pointee TypeDecl is not a GC
+        // type, so the store is the header address, not a `SomeList`.
+        if tyref_is_rust_vec_header(ty, self.llbc) {
             return None;
         }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
@@ -2201,6 +2299,16 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((Some(op), res));
                     }
+                    // `get().0 as *mut T` of an erased `OwnerRootGuard` is the
+                    // loaded word (`owner_root_guard.rs`). A dest-class
+                    // narrow here would hide that FieldRead from the return;
+                    // `deref_mut` retargets the word to the pointee class.
+                    if matches!(dst_kind, ValueType::Ref(_))
+                        && let Some(word) = self.guard_root_word(&arg)
+                    {
+                        return Ok((None, word));
+                    }
+
                     // An integer cast to a narrower unsigned type keeps only
                     // the low bytes. The JIT carries every integer in one
                     // machine word, so the truncation has to be an explicit
@@ -2436,7 +2544,18 @@ impl<'a> Lowering<'a> {
                                 return Ok((Some(op), res));
                             }
                         }
-                        let (kind, res) = signedness_retype_op(&mut self.graph, arg, false);
+                        let (kind, res) = signedness_retype_op(&mut self.graph, arg.clone(), false);
+                        if let Some(orig) = self
+                            .cast_ptr_to_int_src
+                            .get(&arg)
+                            .cloned()
+                            .or_else(|| self.address_cast_origin_by_id(arg.id()))
+                        {
+                            self.cast_ptr_to_int_src.insert(res.clone(), orig);
+                        }
+                        if let Some(orig) = self.raw_address_uint_src.get(&arg).cloned() {
+                            self.raw_address_uint_src.insert(res.clone(), orig);
+                        }
                         return Ok((Some(kind), res));
                     }
                     // Pointer -> unsigned-word cast is two operations in
@@ -2505,6 +2624,14 @@ impl<'a> Lowering<'a> {
                     // not keep `SomePtr(GCREF)`. A flavor-raw dest is
                     // int-banked (`rclass.py getgcflavor`); folding would
                     // leave a GC `*const ()` actual against FUNC.ARGS Int.
+                    // `promote(p as usize) as *mut T` (`jit.py` `promote`,
+                    // `Function.getcode`) is the same fold: the promote
+                    // result is a new variable, recovered through
+                    // [`Self::address_cast_pointer`]. Narrow to the
+                    // destination class — a naked alias of a forwarded
+                    // block inputarg has no defining op, so the offset
+                    // arm of `items_block_items_base` would drop out of
+                    // the return merge.
                     if matches!(dst_kind, ValueType::Ref(_))
                         && flavor_raw_pointer_class_root(
                             dest_ty,
@@ -2554,13 +2681,17 @@ impl<'a> Lowering<'a> {
                     // A function that *returns* `*mut i64` (`index_words_ptr`)
                     // is `rffi.cast` onto `CArrayPtr`; aliasing would keep
                     // `__cast_address_intrinsic`'s Instance for the caller's
-                    // `direct_ptradd`. An items-base accessor or a store
-                    // through the same spelling keeps the GcArray header.
-                    if matches!(src_kind, Some(ValueType::Ref(_)))
-                        && self.should_emit_rffi_cast_identity_to_raw_scalar(
-                            dest_ty,
-                            operand_tyref(&operand),
-                        )
+                    // `direct_ptradd`. The items-base call is `Ref` on the
+                    // SSA result (`callee_returns_gc_block`); the place
+                    // spelling `*mut u8` is CCHARP `int`. An items-base
+                    // accessor or a store through the same spelling keeps
+                    // the GcArray header.
+                    let rffi_src = match self.ssa_value_kind(&arg) {
+                        Some(kind) => Some(kind),
+                        None if pointer_word => Some(ValueType::Ref(None)),
+                        None => None,
+                    };
+                    if self.should_emit_rffi_cast_identity_to_raw_scalar(dest_ty, rffi_src.as_ref())
                     {
                         let bb_id = self.block_id[mir_bb];
                         let raw = self.emit_rffi_cast_to_raw_scalar_ptr(bb_id, arg, dest_ty);
@@ -2898,6 +3029,23 @@ impl<'a> Lowering<'a> {
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
                     return Ok((Some(op), res));
+                }
+                // `get().0 as *mut T` of an erased `OwnerRootGuard` is the
+                // loaded word (`owner_root_guard.rs`). Charon emits this
+                // as `Rvalue::Cast`, not `UnaryOp::Cast`; a dest-class
+                // narrow would hide that FieldRead from the return.
+                let dest_is_ref = matches!(
+                    tyref_to_value_type_with(
+                        &ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    ),
+                    ValueType::Ref(_)
+                );
+                if dest_is_ref && let Some(word) = self.guard_root_word(&v) {
+                    return Ok((None, word));
                 }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -3274,6 +3422,16 @@ impl<'a> Lowering<'a> {
                                 pair_lens.push(Some(len));
                                 continue;
                             }
+                            // Origin dest of a `Vec<u8>` slice view has a
+                            // length slot whose stored ty misses
+                            // `tyref_pair_field_kind` (`u8` has no helper
+                            // kind). `pair_operand` still names both words;
+                            // `resolve_operand` would read the pair as one.
+                            if let Some((ptr, len, _)) = self.pair_operand(mir_bb, &op)? {
+                                arg_vars.push(ptr);
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
                             arg_vars.push(self.resolve_operand(mir_bb, op)?);
                             pair_lens.push(None);
                         }
@@ -3353,25 +3511,18 @@ impl<'a> Lowering<'a> {
                         // int/uint element ranges are recorded; the divert itself is
                         // consumer-gated in the post-pass, so a range read by a
                         // slice-index / field read keeps this ctor + FieldWrite path.
-                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor
-                                .ctor_name
-                                .split('<')
-                                .next()
-                                .unwrap_or(ctor.ctor_name.as_str())
-                                == "Range"
-                            && arg_vars.len() == 2
-                            && self.aggregate_head_is_int_range(&kind)
-                        {
+                        // The TypeDecl is the `start`/`end` struct (alias-peeled);
+                        // a Charon head that is a bare type_id still resolves.
+                        if arg_vars.len() == 2 && self.aggregate_head_is_int_range(&kind, dest_ty) {
                             // `0..n` is `Range<usize>` after the per-instantiation
                             // suffix. The for-loop divert matches the ctor result,
                             // not the leaf spelling, and replaces that value with
                             // `range()` before any consumer reads the struct.
                             self.range_iter_new_sites.push(
-                                crate::front::range_iter::RangeNewSite {
-                                    result_var: res.clone(),
-                                    kind: crate::front::range_iter::RangeSiteKind::Exclusive,
-                                },
+                                crate::front::range_iter::RangeNewSite::new(
+                                    res.clone(),
+                                    crate::front::range_iter::RangeSiteKind::Exclusive,
+                                ),
                             );
                             self.slice_index_range_sites.push(
                                 crate::front::slice_index::SliceIndexRangeSite {
@@ -4145,7 +4296,11 @@ impl<'a> Lowering<'a> {
     /// `move c` of a builder-mode accumulator, returning the built
     /// `SomeString` Variable.  The builder Ref was minted at the ctor and
     /// mutated in place by the appends, so it is read (not rebound) here.
-    pub(in crate::front::mir) fn resolve_builder_build(&mut self, mir_bb: usize, c: usize) -> Result<Variable, LowerError> {
+    pub(in crate::front::mir) fn resolve_builder_build(
+        &mut self,
+        mir_bb: usize,
+        c: usize,
+    ) -> Result<Variable, LowerError> {
         let bb_id = self.emit_bb(mir_bb);
         let builder = self.local_var[c]
             .as_ref()
@@ -4245,6 +4400,20 @@ impl<'a> Lowering<'a> {
         Ok(None)
     }
 
+    /// SSA `getkind` of a lowered value (`rtyper.py` `setconcretetype`
+    /// / `v.concretetype`). The place `TyRef` can disagree (CCHARP
+    /// `*mut u8` is `int` while the items-base call result is `ref`).
+    /// `Unknown` is missing, not a bank.
+    pub(in crate::front::mir) fn ssa_value_kind(&self, var: &Variable) -> Option<ValueType> {
+        match FunctionGraph::concretetype_of(var) {
+            crate::model::ConcreteType::GcRef => Some(ValueType::Ref(None)),
+            crate::model::ConcreteType::Signed => Some(ValueType::Int),
+            crate::model::ConcreteType::Float => Some(ValueType::Float),
+            crate::model::ConcreteType::Void => Some(ValueType::Void),
+            crate::model::ConcreteType::Unknown => None,
+        }
+    }
+
     /// The [`ValueType`] of a `Copy` / `Move` operand, read from the
     /// operand place's post-projection type.  Used by the `Cast`
     /// lowering to decide whether the cast crosses a register bank.
@@ -4322,6 +4491,12 @@ impl<'a> Lowering<'a> {
         // `pair(rtype_eq) (InstanceRepr, IntegerRepr)` wall: the tag
         // compare becomes `eq` of a minted empty instance with `ConstInt`.
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
+            return None;
+        }
+        // A by-value `Vec<T>` dest is the three-word header, not an
+        // instance classdef. Narrowing it would paint `SomeInstance`
+        // onto a later `getitem` that must stay a list.
+        if tyref_is_rust_vec_header(dest_ty, self.llbc) {
             return None;
         }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
@@ -4707,6 +4882,13 @@ impl<'a> Lowering<'a> {
         arg: &Variable,
         src_is_pointer: bool,
     ) -> Option<(OpKind, Variable)> {
+        // `get().0 as *mut T` of an erased guard is the loaded word.
+        // A dest-class narrow would hide that FieldRead; `deref_mut`
+        // retargets the word to the pointee class.
+        if self.guard_root_word(arg).is_some() {
+            return None;
+        }
+
         let dest_kind = tyref_to_value_type_with(
             dest_ty,
             self.llbc,
@@ -5597,6 +5779,12 @@ impl<'a> Lowering<'a> {
         &self,
         field_ty: &TyRef,
     ) -> bool {
+        if matches!(
+            tyref_rust_vec_layout(field_ty, self.llbc),
+            Some(RustVecLayout::ByValue)
+        ) {
+            return true;
+        }
         let Some(node) = tyref_node(field_ty, self.llbc) else {
             return false;
         };
@@ -6171,6 +6359,12 @@ impl<'a> Lowering<'a> {
                         if field_name == name {
                             let wrapper_ty = clone_tyref(&inner.ty);
                             let base = self.resolve_place(mir_bb, *inner)?;
+                            // `GcRef.0` of an erased guard is the stored
+                            // reference (`owner_root_guard.rs`), same as the
+                            // opaque-wrapper arm below.
+                            if let Some(word) = self.guard_root_word(&base) {
+                                return Ok(word);
+                            }
                             // The carrier word stays one pointer. Projecting
                             // its inner `PyObjectRef` has to name that class,
                             // or the handle and the object merge.
@@ -6180,8 +6374,10 @@ impl<'a> Lowering<'a> {
                     }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
-                    // word. The only projection that view emits is `__pos_0`.
-                    if field_name == "__pos_0"
+                    // word. Charon names a positional field `_0` or `0`; a
+                    // missing name becomes `__pos_0` (`GcRef.0` is that
+                    // word: `owner_root_guard.rs`).
+                    if field_name == majit_charon_reader::ullbc::positional_field_name(0)
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
                             self.llbc,
@@ -6193,6 +6389,12 @@ impl<'a> Lowering<'a> {
                     {
                         let wrapper_ty = clone_tyref(&inner.ty);
                         let base = self.resolve_place(mir_bb, *inner)?;
+                        // `GcRef.0` of an erased guard is the stored
+                        // reference, not the usize field
+                        // (`owner_root_guard.rs`).
+                        if let Some(word) = self.guard_root_word(&base) {
+                            return Ok(word);
+                        }
                         return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                     }
                     // A one-word niche `Option` is represented by its payload
@@ -6219,7 +6421,9 @@ impl<'a> Lowering<'a> {
                     // storage-raw struct overlay stay identity.
                     // Promoting the Address to Instance is the
                     // `Ptr ∪ Instance` union `project_struct_rows` refuses.
-                    if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
+                    if field_name == majit_charon_reader::ullbc::positional_field_name(0)
+                        && self.tyref_is_niche_option_ptr(&inner.ty)
+                    {
                         let option_ty = clone_tyref(&inner.ty);
                         let base = self.resolve_place(mir_bb, *inner)?;
                         // Storage-raw ADT pointer first (`lltype.py`
@@ -6266,16 +6470,14 @@ impl<'a> Lowering<'a> {
                     // niche scalar itself.  A `Some.__pos_0` projection must
                     // therefore alias the Option value instead of treating
                     // that byte as an aggregate pointer and dereferencing it.
-                    if field_name == "__pos_0"
+                    if field_name == majit_charon_reader::ullbc::positional_field_name(0)
                         && tyref_option_fieldless_niche(&inner.ty, self.llbc).is_some()
                     {
                         return self.resolve_place(mir_bb, *inner);
                     }
                     // `Option<NonZero*>` is that same integer word. `Some.0`
-                    // is the word, not a field of an aggregate. Charon names
-                    // the positional field `_0`; a missing name becomes
-                    // `__pos_0`.
-                    if (field_name == "_0" || field_name == "__pos_0")
+                    // is the word, not a field of an aggregate.
+                    if field_name == majit_charon_reader::ullbc::positional_field_name(0)
                         && tyref_option_nonzero_scalar(&inner.ty, self.llbc)
                     {
                         return self.resolve_place(mir_bb, *inner);
@@ -6432,7 +6634,7 @@ impl<'a> Lowering<'a> {
                         );
                         let res = self
                             .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            .alloc_value_var_with_type(concretetype_for_field(&ty));
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(res.clone()),
                             kind: OpKind::FieldRead {
@@ -6541,14 +6743,15 @@ impl<'a> Lowering<'a> {
                     }
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     let narrow_instance_class = container_is_enum
-                        && field_name == "__pos_0"
+                        && field_name == majit_charon_reader::ullbc::positional_field_name(0)
                         && self.enum_payload_is_nullable_instance_ptr(&place_ty);
                     // `Constants<C>(Box<[C]>)` is opaque in the interpreter
                     // snapshot, so the field ty is not a visible `Box<[T]>`.
                     // The length is still the fat metadata word.
-                    let constants_box = (field_name == "__pos_0" || field_name == "0")
+                    let constants_box = field_name
+                        == majit_charon_reader::ullbc::positional_field_name(0)
                         && (owner_root == "Constants" || owner_root.ends_with("::Constants"));
                     // `SetStrategyRef::deref` / `DictStrategyRef::deref` is
                     // `self.imp` (`&dyn SetStrategy` / `&dyn DictStrategy`).
@@ -6603,8 +6806,11 @@ impl<'a> Lowering<'a> {
                     // The option (or the guard itself) is the reference
                     // `OwnerRootGuard::new` stored. A later `.0 as *mut T`
                     // has to return this read, not an integer cast of it.
-                    if owner_root_guard::tyref_is_guard(&place_ty, self.llbc)
-                        || owner_root_guard::tyref_is_option_of_guard(&place_ty, self.llbc)
+                    // `(*self).owner_root` types the place as a borrow of
+                    // the option; `tyref_is_erased_drop` peels that ref
+                    // (`owner_root_guard.rs`).
+                    if owner_root_guard::tyref_is_erased_drop(&place_ty, self.llbc)
+                        || owner_root_guard::tyref_is_erased_drop(&field_ty, self.llbc)
                     {
                         self.guard_word_vars.insert(res.clone());
                     }
@@ -6767,6 +6973,14 @@ impl<'a> Lowering<'a> {
                     } else {
                         base
                     };
+                    let (base, string_byte_view) = if string_byte_view {
+                        match self.take_string_repr_gcref(&base) {
+                            Some(recovered) => (recovered, true),
+                            None => (base, false),
+                        }
+                    } else {
+                        (base, false)
+                    };
                     let kind = if string_byte_view {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -6855,7 +7069,7 @@ impl<'a> Lowering<'a> {
                     );
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     let elem_ty = tyref_tuple_element(&inner.ty, idx, self.llbc);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
@@ -6977,7 +7191,7 @@ impl<'a> Lowering<'a> {
                         );
                         let res = self
                             .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            .alloc_value_var_with_type(concretetype_for_field(&ty));
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(res.clone()),
                             kind: OpKind::FieldRead {
@@ -7136,6 +7350,15 @@ impl<'a> Lowering<'a> {
                 {
                     let ptr = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
+                    // Twin of the typed-items Deref arm and of brick 3's
+                    // `*base.add(idx)` Index: `*items_block_items_base(block)`
+                    // is `l.items[0]`. Annotate the base as `[PyObject]`
+                    // before the ArrayRead so `getitem` uses ListRepr.
+                    let base = self
+                        .narrow_value_to_instance_root(bb_id, ptr.into(), "[PyObject]")
+                        .as_variable()
+                        .expect("a materialized object-items base stays a Variable")
+                        .clone();
                     let index = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7149,7 +7372,7 @@ impl<'a> Lowering<'a> {
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(loaded.clone()),
                         kind: OpKind::ArrayRead {
-                            base: ptr,
+                            base,
                             index,
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
@@ -7234,7 +7457,7 @@ impl<'a> Lowering<'a> {
                     let bb_id = self.emit_bb(mir_bb);
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(concretetype_for_field(&ty));
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
@@ -7823,8 +8046,10 @@ impl<'a> Lowering<'a> {
                 ),
                 None => {
                     // Synthetic placeholders for non-Adt aggregates
-                    // (`Tuple`, `Array`, `Closure`) — they have no
-                    // user-defined class to resolve into.  A non-empty
+                    // (`Tuple`, `Array`) — they have no user-defined
+                    // class to resolve into.  A closure env is a
+                    // `TypeDeclKind::Struct` with `src: Closure` and
+                    // resolves in the Struct arm above.  A non-empty
                     // tuple or array carries its per-shape `<…>` suffix
                     // so its `__pos_N` attrs do not collide with other
                     // shapes on one global class; the suffix matches
@@ -7903,12 +8128,32 @@ impl<'a> Lowering<'a> {
         // carrier. `typed_ref_field_narrow_root` of the declared
         // payload would recast onto that payload class.
         let handle_store_root = self.transparent_handle_field_store_root(dest_ty);
+        // A closure-env capture declared as `&P` / `&mut P` for a
+        // primitive `P` is `P`: `lltype.py` `Ptr.__new__` refuses
+        // `Ptr(Signed)`, so `Rvalue::Ref` aliases the referent and
+        // `history.py` `getkind` of the field lltype is `'int'`. Harvest
+        // FORCE and FieldRead already peel
+        // (`tyref_to_attr_value_type_for_struct_field`,
+        // `adt_field_read_value_type`); the constructor store is the
+        // same field lltype.
+        let owner_is_closure_env = tyref_is_closure_env(dest_ty, self.llbc);
+        let owner_declared_gc = container_declared_gc(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        );
         let fields: Vec<AggregateField> = (0..n_operands)
             .map(|i| {
                 let (name, field_ty) = field_rows
                     .get(i)
                     .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
-                    .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
+                    .unwrap_or_else(|| {
+                        (
+                            majit_charon_reader::ullbc::positional_field_name(i),
+                            String::new(),
+                        )
+                    });
                 let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
                 // `_names_without_voids()` (`lltype.py`) /
                 // `heaptracker.py get_fielddescr_index_in`: a
@@ -7937,12 +8182,29 @@ impl<'a> Lowering<'a> {
                     Some(declared) => {
                         if let Some(item_ty) = scalar_fixed_array_item(declared, self.llbc) {
                             item_ty
+                        } else if owner_is_closure_env {
+                            adt_field_read_value_type(
+                                declared,
+                                declared,
+                                false,
+                                true,
+                                owner_declared_gc,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
                         } else {
                             tyref_aggregate_field_value_type(declared, self.llbc, &field_ty)
                         }
                     }
                     None => tuple_field_value_type(&field_ty),
                 };
+                let skip_signed_paint = declared_ty.is_some_and(|declared| {
+                    tyref_is_raw_alloc_flavor_pointer(declared, self.llbc)
+                        || (owner_is_closure_env
+                            && tyref_is_raw_alloc_flavor_adt(declared, self.llbc))
+                });
                 AggregateField {
                     name,
                     void,
@@ -7960,6 +8222,7 @@ impl<'a> Lowering<'a> {
                             && self.exception_disc_info_for_ty(dest_ty).is_some()
                     }),
                     ty,
+                    skip_signed_paint,
                 }
             })
             .collect();
@@ -7972,6 +8235,13 @@ impl<'a> Lowering<'a> {
         {
             target = target.with_payload_void();
         }
+        intern_positional_ctor_field_kinds(
+            &result_owner,
+            fields
+                .iter()
+                .filter(|field| !field.void)
+                .map(|field| (field.name.as_str(), &field.ty)),
+        );
         Ok(AggregateShape::Ctor(AggregateCtor {
             target,
             result_owner,
@@ -8323,25 +8593,52 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// True when the `AggregateKind::Adt` head constructs a
-    /// `core::ops::range::Range` whose element type is an integer that
-    /// fits a machine word (anything but `i128` / `u128`) — the int-range
-    /// shape `front::range_iter` diverts to the orthodox `range()` builtin.
-    /// The element is read from the head's `generics.types[0]` (present even
-    /// when the bounds are literal consts); a non-int element, a non-object
-    /// head (bare `type_id`, no generics), or a non-`Range` owner declines,
-    /// leaving the ordinary ADT ctor path.
+    /// `true` when the `AggregateKind::Adt` head constructs an exclusive
+    /// int `Range { start, end }` whose element type is an integer that
+    /// fits a machine word (anything but `i128` / `u128`) — the
+    /// `for _ in a..b` shape `front::range_iter` diverts to the orthodox
+    /// `range()` builtin. The TypeDecl is the two-field struct (alias
+    /// peeled). A Charon head that is a bare type_id still resolves; the
+    /// element then comes from the dest `TyRef` or the decl instantiation.
     pub(in crate::front::mir) fn aggregate_head_is_int_range(
         &self,
         kind: &serde_json::Value,
+        dest_ty: &TyRef,
     ) -> bool {
-        kind.as_object()
+        let Some(head) = kind
+            .as_object()
             .and_then(|m| m.get("Adt"))
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
-            .and_then(|v| v.as_object())
-            .and_then(|head| self.int_range_head_narrow(head, "core::ops::range::Range"))
-            .is_some()
+        else {
+            return false;
+        };
+        let type_id = head
+            .as_u64()
+            .or_else(|| head.as_object().and_then(type_decl_ref_adt_id));
+        let Some(td) = type_id.and_then(|id| self.llbc.type_by_id(id)) else {
+            return false;
+        };
+        if !type_decl_is_exclusive_range(td, self.llbc) {
+            return false;
+        }
+        if let Some(int) = head
+            .as_object()
+            .and_then(|head| type_decl_ref_generics(head, self.llbc))
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+            .and_then(|n| strip_ty_wrappers(n, self.llbc))
+            .and_then(|e| e.as_object())
+            .and_then(|m| m.get("Scalar"))
+            .and_then(|l| l.get("Integer"))
+            .and_then(|l| l.as_object())
+        {
+            return integer_scalar_is_word_int(Some(int));
+        }
+        tyref_adt_element_is_word_int(dest_ty, self.llbc)
+            || type_decl_instantiation_element_is_word_int(td, self.llbc)
     }
 
     /// The `TypeDeclRef` (`{"id", "generics", "builtin"}`) of a field
@@ -10375,7 +10672,10 @@ pub(in crate::front::mir) fn call_target_leaf_is(target: &CallTarget, leaf: &str
 /// The FunctionPath still names this FunDecl: the path's resolved
 /// `fun_decl_id` is that declaration. A rewritten helper (`ll_vec_*`,
 /// a blanket-`Into` `from`) has a different id, or none.
-pub(in crate::front::mir) fn function_path_names_fun_decl(path_fun_decl_id: Option<u64>, fd_id: u64) -> bool {
+pub(in crate::front::mir) fn function_path_names_fun_decl(
+    path_fun_decl_id: Option<u64>,
+    fd_id: u64,
+) -> bool {
     path_fun_decl_id == Some(fd_id)
 }
 
@@ -10430,7 +10730,10 @@ pub(in crate::front::mir) fn attach_call_generic_instance(
 }
 
 /// By-value multi-word ADT: `'i'` raw address, `'r'` if the type is `Gc`.
-pub(in crate::front::mir) fn pass_by_value_multiword_kind(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+pub(in crate::front::mir) fn pass_by_value_multiword_kind(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<ValueType> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let obj = node.as_object()?;
     if obj.contains_key("Ref") || obj.contains_key("RawPtr") || obj.contains_key("Slice") {
@@ -10487,7 +10790,11 @@ pub(in crate::front::mir) fn type_decl_is_declared_gc(td: &TypeDecl, llbc: &Llbc
     false
 }
 
-pub(in crate::front::mir) fn push_cast_ptr_to_int(graph: &mut FunctionGraph, bb_id: BlockId, arg: Variable) -> Variable {
+pub(in crate::front::mir) fn push_cast_ptr_to_int(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    arg: Variable,
+) -> Variable {
     let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: Some(result.clone()),
@@ -10527,7 +10834,11 @@ pub(in crate::front::mir) fn push_r_uint(
     result
 }
 
-pub(in crate::front::mir) fn rarithmetic_mask(name: &str, arg: Variable, result_ty: ValueType) -> OpKind {
+pub(in crate::front::mir) fn rarithmetic_mask(
+    name: &str,
+    arg: Variable,
+    result_ty: ValueType,
+) -> OpKind {
     OpKind::Call {
         target: CallTarget::FunctionPath {
             segments: ["rpython", "rlib", "rarithmetic", name]

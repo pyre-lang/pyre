@@ -147,7 +147,7 @@ impl<'a> Lowering<'a> {
         let bb_id = self.emit_bb(mir_bb);
         let loaded = self
             .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(loaded.clone()),
             kind: OpKind::FieldRead {
@@ -1879,7 +1879,11 @@ pub(in crate::front::mir) fn spill_substituted_fields(
 /// or a nested binder is [`None`]: the payload is still unknown.
 /// A `TypeVar` inside the looked-up argument is the caller's variable
 /// and is not replaced again.
-pub(in crate::front::mir) fn substitute_spill_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
+pub(in crate::front::mir) fn substitute_spill_typevars(
+    ty: &TyRef,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
     substitute_typevars(ty, owner, llbc, true)
 }
 
@@ -1888,8 +1892,24 @@ pub(in crate::front::mir) fn substitute_spill_typevars(ty: &TyRef, owner: &serde
 /// A root TypeVar is still unknown. `RustVecRepr.lowleveltype` is a raw
 /// `Ptr`, so `Result<Vec<T>, E>::Ok.__pos_0` is `'int'` (`history.py`
 /// `getkind`) for every item type T.
-pub(in crate::front::mir) fn substitute_field_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
+pub(in crate::front::mir) fn substitute_field_typevars(
+    ty: &TyRef,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
     substitute_typevars(ty, owner, llbc, false)
+}
+
+/// Call-site generics as the `Adt` owner `substitute_field_typevars`
+/// reads (`instantiate_adt_field_ty`). `reg.generics` is the
+/// `types`/`const_generics` object, not an `Adt` node.
+pub(in crate::front::mir) fn substitute_fun_output_typevars(
+    output: &TyRef,
+    generics: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    let owner = serde_json::json!({ "Adt": { "generics": generics } });
+    substitute_field_typevars(output, &owner, llbc)
 }
 
 pub(in crate::front::mir) fn substitute_typevars(
@@ -1912,7 +1932,10 @@ pub(in crate::front::mir) fn substitute_typevars(
 
 /// Whether `node` is a TypeVar after peeling `Deduplicated` / `Value`.
 /// Nested TypeVars (a Vec allocator, a trait ref) are not this.
-pub(in crate::front::mir) fn argument_root_is_typevar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+pub(in crate::front::mir) fn argument_root_is_typevar(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
     strip_ty_indirections(node, llbc).is_none_or(|stripped| stripped.get("TypeVar").is_some())
 }
 
@@ -5188,6 +5211,25 @@ pub(in crate::front::mir) fn output_is_raw_address_word(
     let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let kind_src = payload.as_ref().unwrap_or(output);
     ty_is_raw_address(kind_src, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+}
+
+/// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a
+/// `(ptr, len)` pair slice (`&[i64]`, `&mut [PyObjectRef]`, …). The
+/// residual token is the pointer word (`u64`); a looked-inside body
+/// that folds to a GcArray (`IntArray::as_slice` / `ll_items`) answers
+/// `ref` on the CFG instead.
+pub(in crate::front::mir) fn output_is_pair_slice(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    let ty = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    let ty = ty.as_ref().unwrap_or(output);
+    tyref_pair_slice_item_kind(ty, llbc).is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
 }
 
 /// `ty` itself is a Charon primitive scalar, not a pointer to one.
