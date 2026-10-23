@@ -1644,13 +1644,9 @@ unsafe fn box_code_constant_inheriting_unit(
     // Boxing can collect and move `parent`. Snapshot every value needed from
     // it first, just as RPython's GC transform spills live fields before the
     // allocation rather than retaining a native reference into the object.
-    let obj = unsafe { box_code_constant_in_place(code, hidden_applevel, owner) };
+    let mut obj = unsafe { box_code_constant_in_place(code, hidden_applevel, owner) };
     if let Some(bytes) = inherited_filename {
-        let roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = roots.base();
-        let obj = roots.pin_root(obj);
-        unsafe { set_filename_bytes(obj, Some(bytes)) };
-        let obj = roots.get(obj_slot);
+        pyre_object::with_roots!(obj => unsafe { set_filename_bytes(obj, Some(bytes)) });
         unsafe { (*(obj as *mut PyCode)).filename_inherits_to_nested = true };
         obj
     } else {
@@ -1673,15 +1669,14 @@ pub unsafe fn set_compilation_unit_filename_bytes(w_code: PyObjectRef, bytes: Op
 /// This code's own filename is rewritten first, so nested constants are
 /// selected by the captured original spelling.
 unsafe fn set_compilation_unit_filename_bytes_oldname(
-    w_code: PyObjectRef,
+    mut w_code: PyObjectRef,
     bytes: Option<Vec<u8>>,
     oldname: Option<&[u8]>,
 ) {
     let roots = pyre_object::gc_roots::push_roots();
-    let code_slot = roots.base();
-    let _ = roots.pin_root(w_code);
+    let code_slot = roots.pin_roots(&[w_code]);
+    w_code = roots.get(code_slot);
     {
-        let w_code = roots.get(code_slot);
         let pycode = unsafe { &*(w_code as *const PyCode) };
         if let Some(bytes) = bytes.as_ref()
             && !pycode.code_ptr.is_null()
@@ -1703,6 +1698,7 @@ unsafe fn set_compilation_unit_filename_bytes_oldname(
     }
     let old_filename = {
         let current = unsafe { code_filename_bytes(roots.get(code_slot)) };
+        w_code = roots.get(code_slot);
         if let Some(old) = oldname
             && current.as_slice() != old
         {
@@ -1711,16 +1707,17 @@ unsafe fn set_compilation_unit_filename_bytes_oldname(
         current
     };
     let child_bytes = bytes.clone();
+    w_code = roots.get(code_slot);
     let inherits = bytes.is_some();
     unsafe { set_filename_bytes(roots.get(code_slot), bytes) };
+    w_code = roots.get(code_slot);
     unsafe {
         (*(roots.get(code_slot) as *mut PyCode)).filename_inherits_to_nested = inherits;
     }
     let mut i = 0usize;
     loop {
-        let nested = {
-            let w_code = roots.get(code_slot);
-            let pycode = unsafe { &*(w_code as *const PyCode) };
+        let mut nested = {
+            let pycode = unsafe { &*(roots.get(code_slot) as *const PyCode) };
             if pycode.co_consts_w.is_null() {
                 break;
             }
@@ -1731,18 +1728,25 @@ unsafe fn set_compilation_unit_filename_bytes_oldname(
             table[i]
         };
         i += 1;
-        if !nested.is_null()
-            && unsafe { is_code(nested) }
-            && unsafe { code_filename_bytes(nested) } == old_filename
-        {
+        if nested.is_null() || !unsafe { is_code(nested) } {
+            continue;
+        }
+        let nested_scope = pyre_object::gc_roots::push_roots();
+        let nested_slot = nested_scope.pin_roots(&[nested]);
+        nested = nested_scope.get(nested_slot);
+        if unsafe { code_filename_bytes(nested_scope.get(nested_slot)) } == old_filename {
+            let child = child_bytes.clone();
             unsafe {
                 set_compilation_unit_filename_bytes_oldname(
-                    nested,
-                    child_bytes.clone(),
+                    nested_scope.get(nested_slot),
+                    child,
                     Some(old_filename.as_slice()),
                 )
             };
         }
+        nested = nested_scope.get(nested_slot);
+        let _ = nested;
+        w_code = roots.get(code_slot);
     }
 }
 
@@ -1750,10 +1754,10 @@ unsafe fn set_compilation_unit_filename_bytes_oldname(
 /// `importing.py update_code_filenames` stores `code_w.co_filename = pathname`
 /// then `code_w.w_filename = space.newfilename(pathname)`; this is that pair.
 /// Realization allocates, so `obj` is rooted across it and reloaded.
-unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
+unsafe fn set_filename_bytes(mut obj: PyObjectRef, bytes: Option<Vec<u8>>) {
     let roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = roots.base();
-    let obj = roots.pin_root(obj);
+    let obj_slot = roots.pin_roots(&[obj]);
+    obj = roots.get(obj_slot);
     {
         let slot = unsafe { &mut (*(obj as *mut PyCode)).filename_bytes };
         if let Some(bytes) = bytes {
@@ -1767,7 +1771,7 @@ unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
             *slot = std::ptr::null_mut();
         }
     }
-    let obj = roots.get(obj_slot);
+    obj = roots.get(obj_slot);
     let (filename_bytes, code_ptr) = unsafe {
         let pycode = &*(obj as *const PyCode);
         (pycode.filename_bytes, pycode.code_ptr)
@@ -1777,6 +1781,8 @@ unsafe fn set_filename_bytes(obj: PyObjectRef, bytes: Option<Vec<u8>>) {
     unsafe {
         (*(published.owner() as *mut PyCode)).w_filename = published.get(0);
     }
+    obj = roots.get(obj_slot);
+    let _ = obj;
 }
 
 /// Replace the byte-exact `PyCode.co_code` fallback owned by `obj`.
@@ -2326,12 +2332,11 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
     );
     let result_roots = pyre_object::gc_roots::push_roots();
-    let result_slot = result_roots.base();
-    let result = result_roots.pin_root(result);
-    unsafe { set_filename_bytes(result, filename_bytes) };
+    let result_slot = result_roots.pin_roots(&[result]);
+    unsafe { set_filename_bytes(result_roots.get(result_slot), filename_bytes) };
     let result = result_roots.get(result_slot);
     unsafe { set_co_code_bytes(result, co_code_bytes) };
-    unsafe { w_code_fill_consts_from_tuple(result, arg(8)) };
+    unsafe { w_code_fill_consts_from_tuple(result_roots.get(result_slot), arg(8)) };
     Ok(result_roots.get(result_slot))
 }
 
@@ -3229,9 +3234,8 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     let w_qualname = qual_slot.map(pyre_object::gc_roots::shadow_stack_get);
     result = install_code_name_objects(result, w_name, w_qualname);
     let result_roots = pyre_object::gc_roots::push_roots();
-    let result_slot = result_roots.base();
-    let result = result_roots.pin_root(result);
-    unsafe { set_filename_bytes(result, filename_bytes) };
+    let result_slot = result_roots.pin_roots(&[result]);
+    unsafe { set_filename_bytes(result_roots.get(result_slot), filename_bytes) };
     let result = result_roots.get(result_slot);
     unsafe { set_co_code_bytes(result, co_code_bytes) };
     unsafe {
@@ -3913,11 +3917,11 @@ pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &[u8]) {
 /// `importing.py update_code_filenames` / `fix_co_filename`: rewrite this
 /// code's filename first, then walk nested constants by index, reloading the
 /// wrapper and `co_consts_w` after each nested call.
-unsafe fn fix_co_filename_oldname(w_code: PyObjectRef, newname: &[u8], oldname: Option<&[u8]>) {
+unsafe fn fix_co_filename_oldname(mut w_code: PyObjectRef, newname: &[u8], oldname: Option<&[u8]>) {
     let roots = pyre_object::gc_roots::push_roots();
-    let code_slot = roots.base();
-    let _ = roots.pin_root(w_code);
-    let code_ptr = unsafe { w_code_get_ptr(roots.get(code_slot)) } as *mut crate::CodeObject;
+    let code_slot = roots.pin_roots(&[w_code]);
+    w_code = roots.get(code_slot);
+    let code_ptr = unsafe { w_code_get_ptr(w_code) } as *mut crate::CodeObject;
     if code_ptr.is_null() {
         return;
     }
@@ -3925,7 +3929,6 @@ unsafe fn fix_co_filename_oldname(w_code: PyObjectRef, newname: &[u8], oldname: 
     // code whose filename still equals the root's. When the root already
     // spells that path, the walk would write the same bytes back.
     {
-        let w_code = roots.get(code_slot);
         let pycode = unsafe { &*(w_code as *const PyCode) };
         let already = if pycode.filename_bytes.is_null() {
             unsafe { &*(pycode.code_ptr as *const crate::CodeObject) }
@@ -3941,6 +3944,7 @@ unsafe fn fix_co_filename_oldname(w_code: PyObjectRef, newname: &[u8], oldname: 
     }
     let old_filename = {
         let current = unsafe { code_filename_bytes(roots.get(code_slot)) };
+        w_code = roots.get(code_slot);
         if let Some(old) = oldname
             && current.as_slice() != old
         {
@@ -3949,6 +3953,7 @@ unsafe fn fix_co_filename_oldname(w_code: PyObjectRef, newname: &[u8], oldname: 
         current
     };
     let old_source_path = unsafe { (*code_ptr).source_path.clone() };
+    w_code = roots.get(code_slot);
     let filename = match std::str::from_utf8(newname) {
         Ok(newname_str) => {
             unsafe { (*code_ptr).source_path = newname_str.to_owned() };
@@ -3957,15 +3962,15 @@ unsafe fn fix_co_filename_oldname(w_code: PyObjectRef, newname: &[u8], oldname: 
         Err(_) => Some(newname.to_vec()),
     };
     unsafe { set_filename_bytes(roots.get(code_slot), filename) };
+    w_code = roots.get(code_slot);
     unsafe {
         (*(roots.get(code_slot) as *mut PyCode)).filename_inherits_to_nested =
             std::str::from_utf8(newname).is_err();
     }
     let mut i = 0usize;
     loop {
-        let nested = {
-            let w_code = roots.get(code_slot);
-            let pycode = unsafe { &*(w_code as *const PyCode) };
+        let mut nested = {
+            let pycode = unsafe { &*(roots.get(code_slot) as *const PyCode) };
             if pycode.co_consts_w.is_null() {
                 break;
             }
@@ -3976,12 +3981,24 @@ unsafe fn fix_co_filename_oldname(w_code: PyObjectRef, newname: &[u8], oldname: 
             table[i]
         };
         i += 1;
-        if !nested.is_null()
-            && unsafe { is_code(nested) }
-            && unsafe { code_filename_bytes(nested) } == old_filename
-        {
-            unsafe { fix_co_filename_oldname(nested, newname, Some(old_filename.as_slice())) };
+        if nested.is_null() || !unsafe { is_code(nested) } {
+            continue;
         }
+        let nested_scope = pyre_object::gc_roots::push_roots();
+        let nested_slot = nested_scope.pin_roots(&[nested]);
+        nested = nested_scope.get(nested_slot);
+        if unsafe { code_filename_bytes(nested_scope.get(nested_slot)) } == old_filename {
+            unsafe {
+                fix_co_filename_oldname(
+                    nested_scope.get(nested_slot),
+                    newname,
+                    Some(old_filename.as_slice()),
+                )
+            };
+        }
+        nested = nested_scope.get(nested_slot);
+        let _ = nested;
+        w_code = roots.get(code_slot);
     }
     if let Ok(newname_str) = std::str::from_utf8(newname) {
         let code_ptr = unsafe { w_code_get_ptr(roots.get(code_slot)) } as *mut crate::CodeObject;
@@ -3989,6 +4006,8 @@ unsafe fn fix_co_filename_oldname(w_code: PyObjectRef, newname: &[u8], oldname: 
             unsafe { fix_code_filenames(&mut *code_ptr, &old_source_path, newname_str) };
         }
     }
+    w_code = roots.get(code_slot);
+    let _ = w_code;
 }
 
 /// Cached [`crate::pyframe::npure_cellvars`] for the code wrapper `obj`,

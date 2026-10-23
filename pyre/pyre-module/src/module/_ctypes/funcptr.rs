@@ -1676,6 +1676,7 @@ fn handle_python_callback_system_exit(
     }
     let roots = pyre_object::gc_roots::push_roots();
     let error_slot = error.pin(&roots);
+    error.reload(&roots, error_slot);
     let code = pyre_interpreter::error::system_exit_code(&error);
     error.reload(&roots, error_slot);
     #[cfg(unix)]
