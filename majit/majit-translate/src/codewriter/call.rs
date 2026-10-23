@@ -23781,6 +23781,18 @@ mod tests {
         (inner, inherent, trait_impl)
     }
 
+    fn bits_collision_spec_identity_path() -> CallPath {
+        CallPath::from_segments(crate::front::mir::trait_impl_identity_path(
+            "OwnerFlags",
+            "Flags",
+            "bits",
+        ))
+    }
+
+    fn register_bits_collision_identity(cc: &mut CallControl, trait_impl: FunctionGraph) {
+        cc.register_function_graph(bits_collision_spec_identity_path(), trait_impl);
+    }
+
     fn assert_bits_collision_bindings(cc: &mut CallControl) {
         // The production post-pass must not steal a collision family
         // onto the inherent owner-leaf.
@@ -23788,10 +23800,21 @@ mod tests {
         let inner_path = CallPath::for_impl_method("InnerFlags", "bits");
         let inherent_path = CallPath::for_impl_method("OwnerFlags", "bits");
         let trait_path = CallPath::for_trait_impl_method("OwnerFlags", 18817, "bits");
+        let spec_path = bits_collision_spec_identity_path();
         assert_ne!(
             cc.function_graphs.key_for(&inherent_path),
             cc.function_graphs.key_for(&trait_path),
             "owner-leaf and trait-impl identity name distinct graphs"
+        );
+        assert_eq!(
+            cc.function_graphs.key_for(&spec_path),
+            cc.function_graphs.key_for(&trait_path),
+            "spec_segments identity path names the trait-impl graph"
+        );
+        assert_ne!(
+            cc.function_graphs.key_for(&inherent_path),
+            cc.function_graphs.key_for(&spec_path),
+            "spec_segments identity path must not steal owner-leaf"
         );
         assert_eq!(
             cc.function_graphs.key_for(&inherent_path),
@@ -23846,13 +23869,24 @@ mod tests {
                 && !std::sync::Arc::ptr_eq(&jc_inner, &jc_trait),
             "each of the three graphs gets its own jitcode"
         );
+        // `get_jitcode` keys shells on CallPath (`call.py` keys on the
+        // graph object). Alias spellings of one funcobj share GraphKey
+        // (`key_for` above); they do not share a shell Arc.
     }
 
     #[test]
     fn inherent_bits_wins_owner_leaf_when_trait_impl_registers_first() {
         let mut cc = CallControl::new();
         let (inner, inherent, trait_impl) = bits_collision_graphs();
-        cc.register_trait_impl_method("OwnerFlags", 18817, "bits", Some("Flags"), true, trait_impl);
+        cc.register_trait_impl_method(
+            "OwnerFlags",
+            18817,
+            "bits",
+            Some("Flags"),
+            true,
+            trait_impl.clone(),
+        );
+        register_bits_collision_identity(&mut cc, trait_impl);
         cc.register_inherent_method("OwnerFlags", "bits", inherent);
         cc.register_inherent_method("InnerFlags", "bits", inner);
         assert_bits_collision_bindings(&mut cc);
@@ -23864,7 +23898,15 @@ mod tests {
         let (inner, inherent, trait_impl) = bits_collision_graphs();
         cc.register_inherent_method("InnerFlags", "bits", inner);
         cc.register_inherent_method("OwnerFlags", "bits", inherent);
-        cc.register_trait_impl_method("OwnerFlags", 18817, "bits", Some("Flags"), true, trait_impl);
+        cc.register_trait_impl_method(
+            "OwnerFlags",
+            18817,
+            "bits",
+            Some("Flags"),
+            true,
+            trait_impl.clone(),
+        );
+        register_bits_collision_identity(&mut cc, trait_impl);
         assert_bits_collision_bindings(&mut cc);
     }
 

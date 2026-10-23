@@ -2736,18 +2736,26 @@ impl SemanticFunctionHeader {
         } else {
             format!("{module_path}::{name}")
         };
-        let source_identity = match (&self_ty_root, &trait_impl_identity) {
-            (Some(owner), Some(identity)) => {
+        // `GraphKey` is `(source_identity, name)`. A trait-impl whose
+        // identity string failed to render must not share the inherent's
+        // key or `GraphStore::insert` keeps the first body and owner-leaf
+        // last-win cannot replace it (`CallControl.graphs_from` /
+        // `Bookkeeper.getdesc` key on the function object).
+        let source_identity = match (&self_ty_root, &trait_impl_identity, trait_impl_id) {
+            (Some(owner), Some(identity), _) => {
                 format!("{module_path}::{owner}::<impl {identity}>::{name}")
             }
-            (Some(owner), None) => format!("{module_path}::{owner}::{name}"),
-            // `CallControl.graphs_from` / `Bookkeeper.getdesc` keys on the
-            // function object. A non-ADT `Self` still has a trait-impl
-            // identity (trait ref + Self type); keep it in the graph key
-            // so two `cmp::impls::<Impl>::le` bodies do not share one
+            (Some(owner), None, Some(impl_id)) => {
+                format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}")
+            }
+            (Some(owner), None, None) => format!("{module_path}::{owner}::{name}"),
+            // A non-ADT `Self` still has a trait-impl identity (trait ref
+            // + Self type); keep it in the graph key so two
+            // `cmp::impls::<Impl>::le` bodies do not share one
             // `FunctionDesc`.
-            (None, Some(identity)) => format!("{fn_path}::<impl {identity}>"),
-            (None, None) => fn_path.clone(),
+            (None, Some(identity), _) => format!("{fn_path}::<impl {identity}>"),
+            (None, None, Some(impl_id)) => format!("{fn_path}::<Impl#{impl_id}>"),
+            (None, None, None) => fn_path.clone(),
         };
         // Trait-impl methods carry the trait leaf so registration calls
         // `register_trait_method`. Inherent impls leave `trait_root` empty.
@@ -15370,6 +15378,19 @@ impl<'a> Lowering<'a> {
                         self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
                     }
+                    // GC ref → Signed (`p as i64`): `support.py ptr2int` /
+                    // `rbuiltin.py gen_cast` Ptr→Address then Address→Signed.
+                    // `lltype.cast_ptr_to_int` is Ptr→Primitive (integer
+                    // binops), not a GC object's address as a word.
+                    // `ValueType::Str` / `StringBuilder` share the `'ref'`
+                    // bank with `Ref` (`UnicodeValueStorage`, rstr `STR`).
+                    if gc_ptr_to_signed(src_kind.as_ref(), &dst_kind) {
+                        let bb_id = self.emit_bb(mir_bb);
+                        let orig = arg.clone();
+                        let signed = push_gc_ptr_as_signed_address(&mut self.graph, bb_id, arg);
+                        self.cast_ptr_to_int_src.insert(signed.clone(), orig);
+                        return Ok((None, signed));
+                    }
                     // `p as usize as *mut T` is `lltype.cast_opaque_ptr`.
                     // Fold the int→ptr half back to the original GC pointer
                     // so OptEarlyForce does not force_box a virtual
@@ -15712,15 +15733,29 @@ impl<'a> Lowering<'a> {
                 if let Some((op, res)) = self.raw_ptr_to_unsigned(mir_bb, src_raw_addr, &ty, &v) {
                     return Ok((Some(op), res));
                 }
-                // `*mut Raw as *mut u8` / a GC pointer, and the reverse, cross
-                // the int and ref banks. Aliasing would reuse one variable in
-                // both argument lists.
                 let dst_kind = tyref_to_value_type_with(
                     &ty,
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
                 );
+                // GC ref → Signed (`p as i64`) before the bank-crossing
+                // `cast_call_segments` arm: that arm is `lltype.cast_ptr_to_int`
+                // (`gen_cast` Ptr→Primitive), which blackhole panics on a GC
+                // heap address (`bhimpl_cast_ptr_to_int`). `Str` /
+                // `StringBuilder` are the same `'ref'` bank.
+                if gc_ptr_to_signed(src_kind.as_ref(), &dst_kind)
+                    && self.dest_is_plain_signed_int(&ty)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let orig = v.clone();
+                    let signed = push_gc_ptr_as_signed_address(&mut self.graph, bb_id, v);
+                    self.cast_ptr_to_int_src.insert(signed.clone(), orig);
+                    return Ok((None, signed));
+                }
+                // `*mut Raw as *mut u8` / a GC pointer, and the reverse, cross
+                // the int and ref banks. Aliasing would reuse one variable in
+                // both argument lists.
                 let dest_raw_addr = ty_is_raw_address(&ty, self.llbc, self.gc_struct_ids);
                 let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
                     || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
@@ -48971,7 +49006,35 @@ fn rdict_insert_get_cast_root(
 }
 
 /// Call-path segments for a specialized leaf of this declaration.
+///
+/// A FunDecl with `trait_impl_id` keeps the impl's trait-ref + Self
+/// identity (`CallControl.graphs_from` / `Bookkeeper.getdesc`) even when
+/// the `Self` type is an ADT. rustc's method-call rule binds owner-leaf
+/// to the inherent method; `impl Flags for BuiltinCodeFlags` must not
+/// share that slot. Inherent methods (no `trait_impl_id`) stay
+/// `CallPath::for_impl_method`.
 fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
+    if let Some(impl_id) = trait_impl_id_for_fundecl(fd) {
+        if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
+            if let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id) {
+                return trait_impl_identity_path(&owner, &identity, leaf);
+            }
+            return crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, leaf).segments;
+        }
+        let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+        let module = stripped
+            .rsplit_once("::")
+            .map(|(module, _)| module)
+            .unwrap_or("");
+        // Primitive `Self` (`impl PartialOrd<char> for char`): no ADT
+        // owner, so `name_path` is `cmp::impls::<Impl>::le` for every
+        // width. The impl's trait ref and Self type is that identity.
+        if let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id)
+            && !module.is_empty()
+        {
+            return trait_impl_identity_path(module, &identity, leaf);
+        }
+    }
     if let Some((owner, _)) = impl_method_owner_for_fundecl(llbc, fd) {
         // `method-call-expr`: inherent methods are looked up before trait
         // methods for the same receiver. `CallControl.graphs_from` /
@@ -48992,16 +49055,6 @@ fn spec_segments(llbc: &Llbc, fd: &FunDecl, leaf: &str) -> Vec<String> {
         .rsplit_once("::")
         .map(|(module, _)| module)
         .unwrap_or("");
-    // Primitive `Self` (`impl PartialOrd<char> for char`): no ADT owner,
-    // so `name_path` is `cmp::impls::<Impl>::le` for every width.
-    // `CallControl.graphs_from` keeps one graph per function object;
-    // the impl's trait ref and Self type is that identity.
-    if let Some(impl_id) = trait_impl_id_for_fundecl(fd)
-        && let Some(identity) = crate::front::clause_spec::render_trait_impl(llbc, impl_id)
-        && !module.is_empty()
-    {
-        return trait_impl_identity_path(module, &identity, leaf);
-    }
     // Same key `free_function_alias_paths` registers: the module portion
     // of `name_path` is one segment when it contains `<Impl>`, not a
     // split of that token.
@@ -62935,6 +62988,24 @@ pub(crate) fn value_type_bank(ty: &ValueType) -> u8 {
     }
 }
 
+/// GC pointer kinds that occupy the `'ref'` bank (`flatten.py getkind` of
+/// a `Ptr` whose `TO` is a GC struct). `Ref` is an `rclass` instance;
+/// `Str` is rstr `STR` (`UnicodeValueStorage` / `Utf8Str` / `Wtf8`);
+/// `StringBuilder` is `rstring.StringBuilder`. `lltype_is_gc` is true
+/// for all three, so `rewrite_op_cast_ptr_to_adr` raises.
+pub(crate) fn value_type_is_gc_ptr(ty: &ValueType) -> bool {
+    matches!(
+        ty,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+    )
+}
+
+/// `p as i64` of a GC pointer (`support.py ptr2int`): operand bank `'ref'`,
+/// result `Signed`. Keyed on [`ValueType`], never a callee or variable name.
+fn gc_ptr_to_signed(src: Option<&ValueType>, dst: &ValueType) -> bool {
+    src.is_some_and(value_type_is_gc_ptr) && matches!(dst, ValueType::Int)
+}
+
 /// Whether `transmute::<A, B>` is an ordinary copy in the lowered graph.
 ///
 /// The predicate is deliberately the conjunction of two independent facts:
@@ -63440,6 +63511,68 @@ fn push_cast_ptr_to_int(graph: &mut FunctionGraph, bb_id: BlockId, arg: Variable
         },
     });
     result
+}
+
+/// `support.py ptr2int` / `rbuiltin.py gen_cast` of Ptr→Address then
+/// Address→Signed: `llmemory.cast_ptr_to_adr` then `cast_adr_to_int`.
+/// The 1-arg `cast_adr_to_int` form is mode `"emulated"`
+/// (`rtype_cast_adr_to_int`). Keyed on operand/result types
+/// (GC `'ref'` bank → `ValueType::Int`), never on a callee name.
+///
+/// Typed casts stay `simple_call` (`normalize_unary_op_name` has no
+/// `cast_ptr_to_adr` arm). The live GC pointer is `same_as`'d into a
+/// fresh Variable first: dual-gate `pairtype(Repr, GCRefRepr)` writes
+/// OBJECTPTR onto the Call argument's cell, and that cell must not be
+/// the STR / UNICODE the later `stroruni.*` oopspec still reads
+/// (`jtransform.py` `args[0].concretetype.TO`).
+fn push_gc_ptr_as_signed_address(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    arg: Variable,
+) -> Variable {
+    let operand = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    if let Some(ct) = arg.concretetype() {
+        operand.set_concretetype(Some(ct));
+    }
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(operand.clone()),
+        kind: OpKind::UnaryOp {
+            op: "same_as".to_string(),
+            operand: arg,
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let adr = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(adr.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "llmemory",
+                "cast_ptr_to_adr",
+            ]),
+            args: crate::model::call_args(vec![operand]),
+            result_ty: ValueType::Int,
+        },
+    });
+    let signed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(signed.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "llmemory",
+                "cast_adr_to_int",
+            ]),
+            args: crate::model::call_args(vec![adr]),
+            result_ty: ValueType::Int,
+        },
+    });
+    signed
 }
 
 fn push_r_uint(graph: &mut FunctionGraph, bb_id: BlockId, arg: Variable) -> Variable {
@@ -71047,6 +71180,12 @@ fn scalar_inherent_method_path(
         return None;
     };
     let declaration = llbc.fn_by_id(*id)?;
+    // A trait-impl FunDecl on a transparent / payload-free owner is still
+    // the trait-impl graph. Owner-leaf belongs to the inherent method
+    // (`spec_segments`); fall through to `registered_path_for_fun_decl`.
+    if trait_impl_id_for_fundecl(declaration).is_some() {
+        return None;
+    }
     let (owner, method) = impl_method_owner_for_fundecl(llbc, declaration)?;
     let receiver = declaration.signature.inputs.first()?;
     let node = strip_ty_wrappers(tyref_node(receiver, llbc)?, llbc)?;
@@ -82182,16 +82321,19 @@ mod tests {
         DecodedConst, FnPtrFamily, adt_field_read_value_type, bitflags_trait_empty_const,
         cast_call_segments, cast_kind_is_raw_ptr, cast_pointer_marker_op,
         charon_type_value_to_ast_string, decode_literal, dont_look_inside_return_token,
-        fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
-        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        fn_ptr_family_for, gc_ptr_to_signed, int_binop_needs_ptr_to_int,
+        is_class_pytype_assoc_const, is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, no_tombstoned_leaves, primitive_float_const,
-        push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
+        push_cast_ptr_to_int, push_direct_ptradd, push_gc_ptr_as_signed_address,
+        push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
-        simplify_lowered_graph, static_key_segments, type_decl_is_closure_env, tyref_array_suffix,
-        tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-        tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type,
+        simplify_lowered_graph, static_key_segments, tuple_field_value_type,
+        type_decl_is_closure_env, tyref_array_suffix, tyref_fn_ptr_input_class_root,
+        tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+        tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec, tyref_ref_param_class_root,
+        tyref_shaped_tuple_root, tyref_to_attr_value_type,
         tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
+        value_type_is_gc_ptr,
     };
     use crate::flowspace::model::{ConstValue, Variable};
     use crate::model::{
@@ -93758,6 +93900,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn spec_segments_adt_owned_trait_impl_keeps_identity_not_owner_leaf() {
+        // rustc method-call: inherent `OwnerFlags::bits` owns owner-leaf;
+        // `impl Flags for OwnerFlags` is the identity path even though
+        // `Self` is an ADT (`CallControl.graphs_from`).
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+        let meta = |name: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "name": name,
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            })
+        };
+        let owner_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": {"types": [], "const_generics": []}}
+        });
+        let owner_value = serde_json::json!({"Value": [0, owner_adt.clone()]});
+        let inherent_impl = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": owner_value.clone(),
+            "kind": "InherentImplBlock"
+        }}});
+        // `Ty` so `impl_method_owner_for_fundecl` resolves the ADT; `Trait`
+        // so `trait_impl_id_for_fundecl` still sees the impl id.
+        let trait_impl_seg = serde_json::json!({"Impl": {
+            "Ty": {"skip_binder": owner_value.clone(), "kind": "TraitImpl"},
+            "Trait": 0
+        }});
+        let bits_fd = |def_id: u64, impl_seg: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(vec![
+                    ident("gateway"),
+                    impl_seg,
+                    ident("bits"),
+                ]),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [{"Ref": [null, owner_adt.clone(), "Shared"]}],
+                    "output": {"Scalar": {"Integer": {"Unsigned": "U32"}}}
+                },
+                "body": {"Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 1, "locals": []},
+                    "body": []
+                }}
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("gateway"), ident("OwnerFlags")]),
+                    "kind": {"Struct": []}
+                }],
+                "fun_decls": [null, bits_fd(1, inherent_impl), bits_fd(2, trait_impl_seg)],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(vec![ident("bitflags"), ident("Flags")]),
+                    "methods": [{"skip_binder": {"name": "bits"}}]
+                }],
+                "trait_impls": [{
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {"types": [owner_adt.clone()], "const_generics": []}
+                    },
+                    "methods": []
+                }]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let inherent = llbc.fn_by_id(1).expect("inherent bits");
+        let trait_impl = llbc.fn_by_id(2).expect("trait-impl bits");
+        assert!(super::trait_impl_id_for_fundecl(inherent).is_none());
+        assert_eq!(super::trait_impl_id_for_fundecl(trait_impl), Some(0));
+        let inherent_owner = super::impl_method_owner_for_fundecl(&llbc, inherent)
+            .expect("inherent has an ADT owner");
+        let trait_owner = super::impl_method_owner_for_fundecl(&llbc, trait_impl)
+            .expect("trait impl has an ADT owner");
+        assert_eq!(inherent_owner.0, trait_owner.0);
+        let owner_leaf =
+            crate::parse::CallPath::for_impl_method(&inherent_owner.0, "bits").segments;
+        let inherent_path = super::spec_segments(&llbc, inherent, "bits");
+        let trait_path = super::spec_segments(&llbc, trait_impl, "bits");
+        let identity =
+            crate::front::clause_spec::render_trait_impl(&llbc, 0).expect("Flags identity");
+        assert_eq!(inherent_path, owner_leaf);
+        assert_eq!(
+            trait_path,
+            super::trait_impl_identity_path(&trait_owner.0, &identity, "bits")
+        );
+        assert_ne!(inherent_path, trait_path);
+        assert_eq!(
+            super::registered_path_for_fun_decl(&llbc, inherent).segments,
+            inherent_path
+        );
+        assert_eq!(
+            super::registered_path_for_fun_decl(&llbc, trait_impl).segments,
+            trait_path
+        );
+        assert_eq!(
+            super::fundecl_fn_item_segments(&llbc, inherent),
+            inherent_path
+        );
+        assert_eq!(
+            super::fundecl_fn_item_segments(&llbc, trait_impl),
+            trait_path
+        );
+    }
+
     /// Two one-call graphs sharing a synthetic `core::intrinsics::transmute`
     /// declaration.  The first has the portal's scalar-to-fieldless-enum
     /// shape; the second is an equal-size register-bank crossing.
@@ -103133,6 +103393,136 @@ mod tests {
                 .result
                 .as_ref(),
             Some(&signed)
+        );
+    }
+
+    #[test]
+    fn push_gc_ptr_as_signed_address_emits_llmemory_adr_then_int() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+        let signed = push_gc_ptr_as_signed_address(&mut graph, entry, ptr.clone());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&signed),
+            crate::model::ConcreteType::Signed,
+            "rbuiltin.py rtype_cast_adr_to_int resulttype is Signed"
+        );
+        let ops = &graph.block(entry).operations;
+        assert!(ops.len() >= 3);
+        let same_as = &ops[ops.len() - 3];
+        let operand = match &same_as.kind {
+            OpKind::UnaryOp {
+                op,
+                operand,
+                result_ty: ValueType::Ref(_),
+            } if op == "same_as" => {
+                assert_eq!(operand, &ptr);
+                same_as
+                    .result
+                    .clone()
+                    .expect("same_as isolates the Call operand")
+            }
+            other => panic!("ptr2int must same_as the live pointer first, got {other:?}"),
+        };
+        assert_ne!(operand, ptr, "Call operand is a fresh Variable");
+        let adr_op = &ops[ops.len() - 2];
+        let int_op = ops.last().unwrap();
+        let adr = match &adr_op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty: ValueType::Int,
+            } if segments.last().map(String::as_str) == Some("cast_ptr_to_adr") => {
+                assert_eq!(args, &vec![operand]);
+                assert_eq!(segments[segments.len() - 2], "llmemory");
+                adr_op.result.clone().expect("cast_ptr_to_adr result")
+            }
+            other => panic!("first call must be llmemory.cast_ptr_to_adr, got {other:?}"),
+        };
+        match &int_op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                result_ty: ValueType::Int,
+            } if segments.last().map(String::as_str) == Some("cast_adr_to_int") => {
+                assert_eq!(args, &vec![adr]);
+                assert_eq!(segments[segments.len() - 2], "llmemory");
+                assert_ne!(segments.last().map(String::as_str), Some("cast_ptr_to_int"));
+            }
+            other => panic!("second call must be llmemory.cast_adr_to_int, got {other:?}"),
+        }
+        assert_eq!(int_op.result.as_ref(), Some(&signed));
+    }
+
+    /// `*mut UnicodeValueStorage as i64` (`w_str_from_storage`) is Str→Int,
+    /// not Ref→Int. Matching only `ValueType::Ref(_)` left
+    /// `cast_call_segments` emitting `lltype.cast_ptr_to_int`.
+    #[test]
+    fn gc_ptr_to_signed_covers_str_and_stringbuilder() {
+        assert_eq!(
+            tuple_field_value_type("UnicodeValueStorage"),
+            ValueType::Str
+        );
+        assert_eq!(tuple_field_value_type("Utf8Str"), ValueType::Str);
+        for src in [
+            ValueType::Ref(None),
+            ValueType::Ref(Some("PyObject".into())),
+            ValueType::Str,
+            ValueType::StringBuilder,
+        ] {
+            assert!(value_type_is_gc_ptr(&src), "{src:?}");
+            assert!(
+                gc_ptr_to_signed(Some(&src), &ValueType::Int),
+                "{src:?} → Int"
+            );
+            assert!(
+                !gc_ptr_to_signed(Some(&src), &ValueType::Unsigned),
+                "{src:?} → Unsigned is ptr→Unsigned, not ptr2int"
+            );
+        }
+        for src in [
+            ValueType::Int,
+            ValueType::Unsigned,
+            ValueType::Float,
+            ValueType::Bool,
+        ] {
+            assert!(!value_type_is_gc_ptr(&src), "{src:?}");
+            assert!(!gc_ptr_to_signed(Some(&src), &ValueType::Int), "{src:?}");
+        }
+        assert!(!gc_ptr_to_signed(None, &ValueType::Int));
+        let mut graph = FunctionGraph::new("str_as_i64");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x2000), true)
+            .expect("string pointer");
+        assert!(gc_ptr_to_signed(Some(&ValueType::Str), &ValueType::Int));
+        let signed = push_gc_ptr_as_signed_address(&mut graph, entry, ptr);
+        let ops = &graph.block(entry).operations;
+        match &ops[ops.len() - 2].kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                assert_eq!(segments.last().map(String::as_str), Some("cast_ptr_to_adr"));
+                assert_eq!(segments[segments.len() - 2], "llmemory");
+            }
+            other => panic!("Str→Int must emit llmemory.cast_ptr_to_adr, got {other:?}"),
+        }
+        match &ops.last().unwrap().kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                assert_eq!(segments.last().map(String::as_str), Some("cast_adr_to_int"));
+                assert_ne!(segments.last().map(String::as_str), Some("cast_ptr_to_int"));
+            }
+            other => panic!("Str→Int must emit llmemory.cast_adr_to_int, got {other:?}"),
+        }
+        assert_eq!(
+            FunctionGraph::concretetype_of(&signed),
+            crate::model::ConcreteType::Signed
         );
     }
 
