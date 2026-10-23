@@ -8,6 +8,7 @@
 //! `malloc_cond_varsize_frame`, `malloc_cond_varsize`,
 //! `_binaryop_or_lea`, `flush_cc`, `addr_add_const`, `genop_finish`,
 //! `closing_jump`, `genop_discard_gc_store_indexed` / `save_into_mem`,
+//! `consider_gc_store`,
 //! `test_location`, `AddressLoc`, `genop_cast_float_to_singlefloat`,
 //! `genop_cast_singlefloat_to_float`.
 
@@ -5149,6 +5150,161 @@ fn gc_store_indexed_immediate_values_round_trip_memory() {
             unsafe { *at.add(size) },
             0xA5,
             "byte after value {value:#x} size {size} factor {factor}"
+        );
+    }
+}
+
+/// GC_STORE_INDEXED with a `ConstInt` index, end to end: `cpu_simplify_scale`
+/// folds `index * factor + offset` into a GC_STORE offset. Every value lives
+/// in a register, so the size-1 stores read `lowest8bits` of `rsi`/`rdi`/
+/// `r8`.. as well as `rax`..`rbx`. The backend's own handling of an
+/// `ImmedLoc` index is covered by the `x86::assembler` unit tests.
+#[test]
+fn gc_store_indexed_constant_index_stores_registers() {
+    const N: usize = 12;
+    let mut storage = vec![0xA5u8; 512];
+    let base_ptr = storage.as_mut_ptr();
+
+    let mut backend = fresh_backend();
+    let base = OpRef::input_arg_ref(0);
+    let mut inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+    let mut ops = Vec::new();
+    let mut slots = Vec::new();
+    for k in 0..N {
+        inputargs.push(InputArg::from_type_rc(Type::Int, k as u32 + 1));
+        let value = OpRef::input_arg_int(k as u32 + 1);
+        // index * factor + offset: (3 * 8 + 8) for the word, then one byte
+        // slot per value past it.
+        let (index, factor, offset, size) = if k == 0 {
+            (3i64, 8i64, 8i64, 8i64)
+        } else {
+            (k as i64, 2, 40 + k as i64, 1)
+        };
+        slots.push((index * factor + offset, size));
+        ops.push(op_at(
+            OpCode::GcStoreIndexed,
+            &[
+                base,
+                OpRef::const_int(index),
+                value,
+                OpRef::const_int(factor),
+                OpRef::const_int(offset),
+                OpRef::const_int(size),
+            ],
+            OpRef::void_op(k as u32 + N as u32 + 1),
+        ));
+    }
+    // Keep every value live across the stores.
+    let mut sum = OpRef::input_arg_int(1);
+    let mut pos = 2 * N as u32 + 1;
+    for k in 1..N {
+        let next = OpRef::int_op(pos);
+        ops.push(op_at(
+            OpCode::IntAdd,
+            &[sum, OpRef::input_arg_int(k as u32 + 1)],
+            next,
+        ));
+        sum = next;
+        pos += 1;
+    }
+    ops.push(finish_int(sum, pos));
+    let token = compile_ops(&mut backend, &inputargs, ops);
+
+    let values: Vec<i64> = (0..N as i64)
+        .map(|k| {
+            if k == 0 {
+                0x0123_4567_89ab_cdef
+            } else {
+                0x1100 + k
+            }
+        })
+        .collect();
+    let mut args = vec![Value::Ref(GcRef(base_ptr as usize))];
+    args.extend(values.iter().map(|&v| Value::Int(v)));
+    let frame = backend.execute_token(&token, &args);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    assert_eq!(
+        backend.get_int_value(&frame, 0),
+        values.iter().copied().fold(0i64, i64::wrapping_add)
+    );
+
+    for (k, &(at, size)) in slots.iter().enumerate() {
+        let at = at as usize;
+        let size = size as usize;
+        assert_eq!(
+            read_bytes(unsafe { base_ptr.add(at) }, size),
+            &values[k].to_le_bytes()[..size],
+            "value {k} at {at} size {size}"
+        );
+    }
+    // Nothing else was written: the word at 32..40, then bytes 43, 46, ...
+    let written: Vec<usize> = slots
+        .iter()
+        .flat_map(|&(at, size)| (at as usize)..(at as usize + size as usize))
+        .collect();
+    for (i, &byte) in storage.iter().enumerate() {
+        if !written.contains(&i) {
+            assert_eq!(byte, 0xA5, "stray write at {i}");
+        }
+    }
+}
+
+/// GC_LOAD_INDEXED_I with a `ConstInt` index, end to end, for each width and
+/// sign: `emit_gc_load_or_indexed` folds the index into a GC_LOAD offset.
+#[test]
+fn gc_load_indexed_constant_index_reads_memory() {
+    let mut storage = [0u8; 64];
+    for (i, byte) in storage.iter_mut().enumerate() {
+        *byte = 0x80 | i as u8;
+    }
+    let base_ptr = storage.as_mut_ptr();
+    // (index, factor, offset, nsize)
+    let cases = [
+        (2i64, 8i64, 0i64, 8i64),
+        (5, 4, 4, -4),
+        (5, 4, 4, 4),
+        (3, 2, 1, -2),
+        (3, 2, 1, 2),
+        (7, 1, 9, -1),
+        (7, 1, 9, 1),
+    ];
+    for (n, &(index, factor, offset, nsize)) in cases.iter().enumerate() {
+        let mut backend = fresh_backend();
+        let base = OpRef::input_arg_ref(0);
+        let loaded = OpRef::int_op(1);
+        let ops = vec![
+            op_at(
+                OpCode::GcLoadIndexedI,
+                &[
+                    base,
+                    OpRef::const_int(index),
+                    OpRef::const_int(factor),
+                    OpRef::const_int(offset),
+                    OpRef::const_int(nsize),
+                ],
+                loaded,
+            ),
+            finish_int(loaded, 2),
+        ];
+        let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
+        let token = compile_ops(&mut backend, &inputargs, ops);
+        let frame = backend.execute_token(&token, &[Value::Ref(GcRef(base_ptr as usize))]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        let at = (index * factor + offset) as usize;
+        let size = nsize.unsigned_abs() as usize;
+        let mut raw = [0u8; 8];
+        raw[..size].copy_from_slice(&storage[at..at + size]);
+        let unsigned = i64::from_le_bytes(raw);
+        let expected = if nsize < 0 {
+            let shift = 64 - 8 * size as u32;
+            (unsigned << shift) >> shift
+        } else {
+            unsigned
+        };
+        assert_eq!(
+            backend.get_int_value(&frame, 0),
+            expected,
+            "case {n}: index {index} factor {factor} offset {offset} nsize {nsize}"
         );
     }
 }

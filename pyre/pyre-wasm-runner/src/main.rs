@@ -585,11 +585,16 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     if let Ok(set_path) =
         instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_script_path")
     {
-        let name = script.to_string_lossy();
+        let name = host_path_to_guest(script).ok_or_else(|| {
+            Error::msg(format!(
+                "script path cannot be represented in guest: {}",
+                script.display()
+            ))
+        })?;
         let nlen = name.len() as u32;
         if nlen != 0 {
             let p = alloc.call(&mut store, nlen)?;
-            memory.write(&mut store, p as usize, name.as_bytes())?;
+            memory.write(&mut store, p as usize, &name)?;
             set_path.call(&mut store, (p, nlen))?;
             dealloc.call(&mut store, (p, nlen))?;
         }

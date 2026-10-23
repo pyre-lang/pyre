@@ -89,12 +89,18 @@ show("handler", lambda: "\xff".encode("ascii", "lone_surrogate_probe"))
 # encoding, so a lone surrogate has to fail the encode or be escaped. Windows
 # hands the name to the wide-char API, where the lookup itself fails and the
 # message is the host's; that is not what this fixture checks.
-show("path", lambda: os.path.join(S, "a"))
+show("path", lambda: os.path.split(os.path.join(S, "a")))
 if os.name == "posix":
-    show("listdir", lambda: os.listdir(S))
-    show("open", lambda: open(S))
-else:
-    print("listdir posix-only")
-    print("open posix-only")
+    for fn in (os.listdir, open):
+        try:
+            fn(S)
+        except UnicodeEncodeError as exc:
+            assert exc.object == S
+            assert (exc.start, exc.end, exc.reason) == (0, 1, "surrogates not allowed")
+        else:
+            raise AssertionError("a lone high surrogate reached the filesystem")
+# wasm uses POSIX paths even on a Windows host. Keep the output portable
+# while asserting the POSIX encoding failure above on every POSIX runtime.
+print("filesystem path checks done")
 
 print("done")

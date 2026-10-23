@@ -1552,36 +1552,56 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         pyre_interpreter::__pyre_store!(
             ns,
             "getservbyname",
-            pyre_interpreter::make_builtin_function("getservbyname", |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getservbyname() missing argument",
-                    ));
-                }
+            pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature("getservbyname", |args| {
+                // Bound scope: `name`, optional `proto` (`PY_NULL` omitted).
+                // `@unwrap_spec(name='text', w_proto=WrappedDefault(None))`.
                 let w_name = args[0];
                 let mut w_proto = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                let name = unsafe {
-                    if !pyre_object::is_str(w_name) {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "getservbyname: name must be a string",
-                        ));
-                    }
-                    pyre_object::with_roots!(w_proto => pyre_interpreter::baseobjspace::str_utf8_w(w_name))?
-                        .to_string()
+                let name = pyre_object::with_roots!(w_proto =>
+                    pyre_interpreter::baseobjspace::text_w(w_name)
+                )?
+                .to_string();
+                // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
+                // string stops at an embedded NUL, so PyPy looks up the prefix;
+                // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
+                // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
+                // `s` converter raises ValueError "embedded null character"
+                // before the body's range check and audit; a 3.15.0 run reports
+                // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
+                // these wrappers.
+                let c_name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+                    pyre_interpreter::PyError::value_error("embedded null character")
+                })?;
+                // `w_proto` is read again by the audit below, after `text_w`
+                // can collect, so it is rooted first.
+                let w_proto_or_none = if w_proto.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    w_proto
                 };
-                let c_name = std::ffi::CString::new(name.as_bytes())
-                    .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?;
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(w_proto) }
+                let roots = pyre_object::gc_roots::push_roots();
+                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
+                // `interp_func.py`: only `None` (or an omitted argument) means
+                // "any protocol"; anything else goes through `space.text_w`.
+                let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
+                    && !unsafe { pyre_object::is_none(w_proto) }
                 {
-                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                    )
+                    let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?
+                        .to_string();
+                    Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
+                        pyre_interpreter::PyError::value_error("embedded null character")
+                    })?)
                 } else {
                     None
                 };
+                // `space.audit('socket.getservbyname', [space.newtext(name), w_proto])`.
+                let w_name_text = pyre_object::w_str_new_managed(&name);
+                pyre_interpreter::module::sys::vm::audit(
+                    "socket.getservbyname",
+                    &[w_name_text, roots.get(proto_slot)],
+                )?;
+                drop(roots);
                 #[cfg(unix)]
                 {
                     let port = majit_rlib::rsocket::getservbyname(&c_name, proto_c.as_deref())
@@ -1609,19 +1629,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let port = unsafe { u16::from_be(rffi::servent_port(p)) };
                     Ok(pyre_object::w_int_new(port as i64))
                 }
-            })
+            }, pyre_interpreter::Signature::new(vec!["name", "proto"], None, None, 0, 0)),
+            1,
+            )
         );
 
         // getservbyport(port[, proto]) → name
         pyre_interpreter::__pyre_store!(
             ns,
             "getservbyport",
-            pyre_interpreter::make_builtin_function("getservbyport", |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "getservbyport() missing argument",
-                    ));
-                }
+            pyre_interpreter::function_set_null_positional_defaults(
+            pyre_interpreter::make_builtin_function_with_signature("getservbyport", |args| {
+                // Bound scope: `port`, optional `proto` (`PY_NULL` omitted).
                 // `getservbyport` rejects a port outside the range before it
                 // narrows: taking the low sixteen bits of 70000 would look up
                 // 4464 and answer for it.  The clinic spells the parameter
@@ -1632,23 +1651,49 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 let port = pyre_object::with_roots!(w_proto =>
                     pyre_interpreter::baseobjspace::gateway_int_w(w_port)
                 )?;
+                // `w_proto` is read again by the audit below, after `text_w`
+                // can collect, so it is rooted first.
+                let w_proto_or_none = if w_proto.is_null() {
+                    pyre_object::w_none()
+                } else {
+                    w_proto
+                };
+                let roots = pyre_object::gc_roots::push_roots();
+                let proto_slot = roots.pin_roots(&[w_proto_or_none]);
+                // `interp_func.py`: only `None` (or an omitted argument) means
+                // "any protocol"; anything else goes through `space.text_w`,
+                // which accepts an embedded NUL.
+                let proto_c: Option<std::ffi::CString> = if !w_proto.is_null()
+                    && !unsafe { pyre_object::is_none(w_proto) }
+                {
+                    let p = pyre_interpreter::baseobjspace::text_w(roots.get(proto_slot))?;
+                // [3.15-spec] `interp_func.py` hands the text to `rsocket`, whose C
+                // string stops at an embedded NUL, so PyPy looks up the prefix;
+                // `socket_getservbyname` / `socket_getservbyport` at the v3.15.0
+                // tag parse `"s|s:getservbyname"` / `"i|s:getservbyport"`, whose
+                // `s` converter raises ValueError "embedded null character"
+                // before the body's range check and audit; a 3.15.0 run reports
+                // it for `getservbyport(-1, "tcp x")`.  No JIT hint covers
+                // these wrappers.
+                    Some(std::ffi::CString::new(p.as_bytes()).map_err(|_| {
+                        pyre_interpreter::PyError::value_error("embedded null character")
+                    })?)
+                } else {
+                    None
+                };
                 if !(0..=0xffff).contains(&port) {
                     return Err(pyre_interpreter::PyError::overflow_error(
                         "getservbyport: port must be 0-65535.",
                     ));
                 }
                 let port = port as u16;
-                let proto_c: Option<std::ffi::CString> = if args.len() >= 2
-                    && unsafe { pyre_object::is_str(w_proto) }
-                {
-                    let p = pyre_interpreter::baseobjspace::str_utf8_w(w_proto)?.to_string();
-                    Some(
-                        std::ffi::CString::new(p.as_bytes())
-                            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null"))?,
-                    )
-                } else {
-                    None
-                };
+                // `space.audit('socket.getservbyport', [space.newint(port), w_proto])`.
+                let w_port_int = pyre_object::w_int_new(i64::from(port));
+                pyre_interpreter::module::sys::vm::audit(
+                    "socket.getservbyport",
+                    &[w_port_int, roots.get(proto_slot)],
+                )?;
+                drop(roots);
                 #[cfg(unix)]
                 {
                     let name =
@@ -1683,7 +1728,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     };
                     Ok(pyre_object::w_str_new_managed(&name))
                 }
-            })
+            }, pyre_interpreter::Signature::new(vec!["port", "proto"], None, None, 0, 0)),
+            1,
+            )
         );
     }
 
@@ -1766,28 +1813,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         "setdefaulttimeout() missing argument",
                     ));
                 }
-                let v = args[0];
-                if unsafe { pyre_object::is_none(v) } {
-                    set_default_socket_timeout(None);
-                    return Ok(pyre_object::w_none());
-                }
-                let secs = unsafe {
-                    if pyre_object::is_int(v) {
-                        pyre_object::w_int_get_value(v) as f64
-                    } else if pyre_object::is_float(v) {
-                        pyre_object::floatobject::w_float_get_value(v)
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "setdefaulttimeout: value must be a float or None",
-                        ));
-                    }
-                };
-                if secs < 0.0 || !secs.is_finite() {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "Timeout value out of range",
-                    ));
-                }
-                set_default_socket_timeout(Some(secs));
+                let secs = socket_timeout_w(args[0])?;
+                set_default_socket_timeout((secs >= 0.0).then_some(secs));
                 Ok(pyre_object::w_none())
             },
             1,
@@ -3217,6 +3244,103 @@ fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, mut v: pyre_object:
     }
 }
 
+/// `interp_socket.py settimeout_w` / `interp_func.py setdefaulttimeout`:
+/// `None` is `-1.0`; otherwise `timeout = space.float_w(w_timeout)` and
+/// `timeout < 0.0` raises ValueError "Timeout value out of range".
+///
+/// [3.15-spec] PyPy stores the converted float as is, so `inf`, `nan` and
+/// `1e300` are accepted and `gettimeout()` returns them unchanged.  At the
+/// v3.15.0 tag, `Modules/socketmodule.c` `socket_parse_timeout` converts
+/// through `_PyTime_FromSecondsObject` (`Python/pytime.c`
+/// `pytime_from_object`, `pytime_from_double`) to an int64 nanosecond count:
+/// - `PyIndex_Check(obj)` is tested first, so an object with `__index__` --
+///   a `float` subclass defining it included -- goes through
+///   `PyLong_AsLongLong`, and an `int` subclass's `__float__` is not
+///   consulted;
+/// - NaN raises ValueError "Invalid value NaN (not a number)";
+/// - a count outside int64 raises OverflowError "timestamp out of range for
+///   C PyTime_t";
+/// - on Windows (no `HAVE_POLL`), more than `INT_MAX` milliseconds raises
+///   OverflowError "timeout doesn't fit into C timeval";
+/// - `gettimeout()` reads the count back (`_PyTime_AsSecondsDouble`).
+/// A 3.15.0 run reports each of these, `settimeout(1e-10)` reading back
+/// `1e-09` and `-1e300` raising OverflowError.  No JIT hint covers either
+/// wrapper.
+fn socket_timeout_w(w_timeout: pyre_object::PyObjectRef) -> Result<f64, pyre_interpreter::PyError> {
+    const SEC_TO_NS: i64 = 1_000_000_000;
+    let pytime_overflow =
+        || pyre_interpreter::PyError::overflow_error("timestamp out of range for C PyTime_t");
+    if unsafe { pyre_object::is_none(w_timeout) } {
+        return Ok(-1.0);
+    }
+    // `pytime_from_object`: `PyIndex_Check(obj)` → `PyLong_AsLongLong`.
+    let index_sec = |w_int: pyre_object::PyObjectRef| -> Option<Option<i64>> {
+        unsafe {
+            if pyre_object::pyobject::is_bool(w_int) {
+                Some(Some(pyre_object::boolobject::w_bool_get_value(w_int) as i64))
+            } else if pyre_object::pyobject::is_int(w_int) {
+                Some(Some(pyre_object::intobject::w_int_get_value(w_int)))
+            } else if pyre_object::pyobject::is_long(w_int) {
+                Some(num_traits::ToPrimitive::to_i64(
+                    pyre_object::longobject::w_long_get_value(w_int),
+                ))
+            } else {
+                None
+            }
+        }
+    };
+    let ns_from_sec = |sec: Option<i64>| {
+        sec.and_then(|sec| sec.checked_mul(SEC_TO_NS))
+            .ok_or_else(pytime_overflow)
+    };
+    let ns: i64 = if let Some(sec) = index_sec(w_timeout) {
+        ns_from_sec(sec)?
+    } else if unsafe { pyre_interpreter::baseobjspace::lookup(w_timeout, "__index__") }
+        .is_some()
+    {
+        // `space.index` returns an `int`; `w_timeout` is not read again.
+        let w_index = pyre_interpreter::baseobjspace::space_index(w_timeout)?;
+        ns_from_sec(index_sec(w_index).unwrap_or(None))?
+    } else {
+        let d = pyre_interpreter::baseobjspace::float_w(w_timeout)?;
+        if d.is_nan() {
+            return Err(pyre_interpreter::PyError::value_error(
+                "Invalid value NaN (not a number)",
+            ));
+        }
+        // `pytime_from_double` with `_PyTime_ROUND_TIMEOUT` (round away
+        // from zero), then the `[PyTime_MIN, -PyTime_MIN)` range check.
+        let d = d * SEC_TO_NS as f64;
+        let d = if d >= 0.0 { d.ceil() } else { d.floor() };
+        if !((i64::MIN as f64) <= d && d < -(i64::MIN as f64)) {
+            return Err(pytime_overflow());
+        }
+        d as i64
+    };
+    if ns < 0 {
+        return Err(pyre_interpreter::PyError::value_error(
+            "Timeout value out of range",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        // `_PyTime_AsMilliseconds(timeout, _PyTime_ROUND_TIMEOUT) > INT_MAX`;
+        // the `_PyTime_AsTimeval` bound is wider than this one.
+        let ms = ns / 1_000_000 + i64::from(ns % 1_000_000 != 0);
+        if ms > i64::from(i32::MAX) {
+            return Err(pyre_interpreter::PyError::overflow_error(
+                "timeout doesn't fit into C timeval",
+            ));
+        }
+    }
+    // `_PyTime_AsSecondsDouble`.
+    Ok(if ns % SEC_TO_NS == 0 {
+        (ns / SEC_TO_NS) as f64
+    } else {
+        ns as f64 / 1e9
+    })
+}
+
 /// `rsocket.py:RSocket.settimeout` — apply a timeout value to a live fd.
 ///
 /// `timeout < 0` (the "None" sentinel) clears `O_NONBLOCK` so the socket
@@ -3977,17 +4101,18 @@ fn c_uint_converter(
 /// The failure `getaddrinfo` / `getnameinfo` report through their return code
 /// rather than through `errno`.
 ///
-/// [3.14-spec] `rsocket.GAIError.get_msg` answers
+/// [3.15-spec] `rsocket.GAIError.get_msg` answers
 /// `_rsocket_rffi.gai_strerror_str`, which on Windows is
 /// `rwin32.FormatError(errno)`, the system message table's text in the
-/// host's UI language.  `socketmodule.c set_gaierror` at v3.14.6 spells the
-/// message `gai_strerror(error)` only under `HAVE_GAI_STRERROR`, which
-/// `PC/pyconfig.h` does not define (`socketmodule.h` defines only
-/// `HAVE_GETADDRINFO` for Windows), so the message there is the fixed
-/// `"getaddrinfo failed"`.  MEASURED 2026-08-27 (corroboration, 3.14.2) on a
-/// ko-KR host: `socket.getaddrinfo` on an unresolvable name answers
-/// `gaierror(11001, 'getaddrinfo failed')` there and
-/// `gaierror(11001, '<localized>')` under PyPy 7.3.22.
+/// host's UI language.  `socketmodule.c set_gaierror` at the v3.15.0 tag
+/// spells the message `gai_strerror(error)` only under `HAVE_GAI_STRERROR`
+/// and otherwise builds `("(is)", error, "getaddrinfo failed")`; at that tag
+/// neither `PC/pyconfig.h` nor `Modules/socketmodule.h` defines
+/// `HAVE_GAI_STRERROR` (`socketmodule.h` defines only `HAVE_GETADDRINFO` for
+/// Windows), so the message there is the fixed `"getaddrinfo failed"`.  MEASURED 2026-10-22 on a ko-KR host:
+/// `socket.getaddrinfo('nonexistent.invalid', 80)` answers
+/// `gaierror(11001, 'getaddrinfo failed')` under CPython 3.15.0 and
+/// `gaierror(11001, '<localized>')` under PyPy 8.0.0.
 #[cfg(any(unix, windows))]
 fn set_gaierror(error: libc::c_int) -> pyre_interpreter::PyError {
     #[cfg(unix)]
@@ -4536,11 +4661,15 @@ pub fn __majit_wrap_socket_listen(
     let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     let mut w_backlog = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let fd = pyre_object::with_roots!(w_backlog => socket_fd(obj))?;
-    let backlog = if args.len() >= 2 {
+    let mut backlog = if args.len() >= 2 {
         pyre_interpreter::baseobjspace::c_int_w(w_backlog)?
     } else {
         128
     };
+    // `interp_socket.py listen_w`: "if it is lower, it is set to 0".
+    if backlog < 0 {
+        backlog = 0;
+    }
     #[cfg(unix)]
     {
         majit_rlib::rsocket::listen(fd, backlog).map_err(rsocket_os_error)?;
@@ -4548,6 +4677,8 @@ pub fn __majit_wrap_socket_listen(
     }
     #[cfg(windows)]
     {
+        // `rsocket.py RSocket.listen`: the backlog is at least 1.
+        let backlog = backlog.max(1);
         let r = unsafe { rffi::listen(fd, backlog) };
         if r != 0 {
             return Err(socket_last_error());
@@ -4672,90 +4803,160 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 pub fn __majit_wrap_socket_setsockopt(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    if args.len() < 4 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "setsockopt() requires self + level + name + value",
-        ));
+    // `interp_socket.py setsockopt_w`: `level` and `optname` through
+    // `c_int_w`, then a dispatch on `len(args_w)` — three arguments try
+    // `c_int_w` on the value and fall back to `bufferstr_w`, four take
+    // `None, optlen`.
+    //
+    // [3.15-spec] `lib-python/3/test/test_socket.py` `test_setsockopt_errors`
+    // asserts `socketmodule.c sock_setsockopt`'s observables, which
+    // `setsockopt_w` does not give: the "takes at least 3 arguments" count
+    // check, OverflowError for an `int` value outside the C `int` range
+    // (`setsockopt_w` retries that through `bufferstr_w`), "requires 4
+    // arguments when the third argument is None", "only takes 4 arguments
+    // when the third argument is None (got T)" and, for a value with no
+    // buffer interface, "socket option should be int, bytes-like object or
+    // None (got T)" (`bufferstr_w` says "a bytes-like object is required").
+    // Only those diagnostics differ; the control flow, including the buffer
+    // retry for a non-`int` value whose conversion fails, is `setsockopt_w`'s.
+    let n_args = args.len().saturating_sub(1);
+    if n_args < 3 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "setsockopt() takes at least 3 arguments ({n_args} given)"
+        )));
     }
-    let mut w_self = args[0];
-    let mut w_level = args[1];
-    let mut w_name = args[2];
-    let mut val = args[3];
-    let fd = pyre_object::with_roots!(w_self, w_level, w_name, val => socket_fd(w_self))?;
-    let level = pyre_object::with_roots!(w_self, w_name, val =>
-        pyre_interpreter::baseobjspace::c_int_w(w_level)
-    )?;
-    let name = pyre_object::with_roots!(w_self, val =>
-        pyre_interpreter::baseobjspace::c_int_w(w_name)
-    )?;
-    // `sock_setsockopt` sends an int for this option through
-    // `WSAIoctl` and keeps the value, because the option number is an
-    // ioctl code that `setsockopt` itself rejects.  A bytes value is
-    // not covered there either and still goes the ordinary way.
-    #[cfg(windows)]
-    if name == SIO_TCP_SET_ACK_FREQUENCY && unsafe { pyre_object::is_int(val) } {
-        let flag = (unsafe { pyre_object::w_int_get_value(val) }) as libc::c_int;
-        if unsafe { rffi::set_ack_frequency(fd, flag) } != 0 {
-            return Err(socket_last_error());
+    if n_args > 4 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "setsockopt() takes at most 4 arguments ({n_args} given)"
+        )));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(args);
+    let level = pyre_interpreter::baseobjspace::c_int_w(roots.get(base + 1))?;
+    let optname = pyre_interpreter::baseobjspace::c_int_w(roots.get(base + 2))?;
+    if n_args == 3 {
+        if unsafe { pyre_object::is_none(roots.get(base + 3)) } {
+            return Err(pyre_interpreter::PyError::type_error(
+                "setsockopt() requires 4 arguments when the third argument is None",
+            ));
         }
-        socket_set_attr(w_self, "_quickack", pyre_object::w_int_new(flag as i64));
-        return Ok(pyre_object::w_none());
-    }
-    #[cfg(unix)]
-    {
-        unsafe {
-            if pyre_object::is_int(val) {
-                let v = pyre_object::w_int_get_value(val) as libc::c_int;
-                majit_rlib::rsocket::setsockopt(fd, level, name, &v.to_ne_bytes())
+        let optval = match pyre_interpreter::baseobjspace::c_int_w(roots.get(base + 3)) {
+            Ok(optval) => optval,
+            Err(mut e) => {
+                // `if e.async(space): raise`.  An `int` value that does not
+                // fit a C int re-raises its OverflowError: `bufferstr_w` of an
+                // `int` can only fail, so the retry changes nothing but the
+                // message.
+                if e.r#async(pyre_object::PY_NULL)
+                    || (e.kind == pyre_interpreter::PyErrorKind::OverflowError
+                        && unsafe {
+                            pyre_object::is_int(roots.get(base + 3))
+                                || pyre_object::is_long(roots.get(base + 3))
+                        })
+                {
+                    return Err(e);
+                }
+                // `space.bufferstr_w(args_w[2])`.  Only the
+                // `BufferInterfaceNotFound` diagnostic is respelled; an
+                // exporter's own error propagates.
+                let optval = match pyre_interpreter::baseobjspace::simple_buffer_bytes(
+                    roots.get(base + 3),
+                )? {
+                    Some(buf) => buf.into_bytes(),
+                    None => {
+                        return Err(pyre_interpreter::PyError::type_error(format!(
+                            "socket option should be int, bytes-like object or None (got {})",
+                            pyre_interpreter::type_methods::arg_type_name(roots.get(base + 3))
+                        )));
+                    }
+                };
+                // `RSocket.setsockopt`.  `optval` is a copy: `setsockopt`
+                // releases the interpreter, and the buffer's owner can move.
+                // The descriptor is read after the conversions, which can run
+                // Python that closes the socket (`self.sock.setsockopt` reads
+                // `self.fd` there).
+                let fd = socket_fd(roots.get(base))?;
+                #[cfg(unix)]
+                majit_rlib::rsocket::setsockopt(fd, level, optname, &optval)
                     .map_err(rsocket_os_error)?;
-            } else if pyre_object::bytesobject::is_bytes_like(val) {
-                // Copied before the call: `setsockopt` releases the
-                // interpreter, and the bytes object can move.
-                let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
-                majit_rlib::rsocket::setsockopt(fd, level, name, &data)
-                    .map_err(rsocket_os_error)?;
-            } else {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "setsockopt: value must be int or bytes-like",
-                ));
-            }
-        }
-        Ok(pyre_object::w_none())
-    }
-    #[cfg(windows)]
-    {
-        let r = unsafe {
-            if pyre_object::is_int(val) {
-                let v = pyre_object::w_int_get_value(val) as libc::c_int;
-                rffi::setsockopt(
-                    fd,
-                    level,
-                    name,
-                    &v as *const _ as *const libc::c_void,
-                    core::mem::size_of::<libc::c_int>() as rffi::SockLen,
-                )
-            } else if pyre_object::bytesobject::is_bytes_like(val) {
-                // Copied before the call: `setsockopt` releases the
-                // interpreter, and the bytes object can move.
-                let data = pyre_object::bytesobject::bytes_like_data(val).to_vec();
-                rffi::setsockopt(
-                    fd,
-                    level,
-                    name,
-                    data.as_ptr() as *const libc::c_void,
-                    data.len() as rffi::SockLen,
-                )
-            } else {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "setsockopt: value must be int or bytes-like",
-                ));
+                #[cfg(windows)]
+                if unsafe {
+                    rffi::setsockopt(
+                        fd,
+                        level,
+                        optname,
+                        optval.as_ptr() as *const libc::c_void,
+                        optval.len() as rffi::SockLen,
+                    )
+                } != 0
+                {
+                    return Err(socket_last_error());
+                }
+                return Ok(pyre_object::w_none());
             }
         };
-        if r != 0 {
+        let fd = socket_fd(roots.get(base))?;
+        // `sock_setsockopt` sends an int for this option through `WSAIoctl`
+        // and keeps the value, because the option number is an ioctl code
+        // that `setsockopt` itself rejects.  A bytes value is not covered
+        // there either and still goes the ordinary way.
+        #[cfg(windows)]
+        if optname == SIO_TCP_SET_ACK_FREQUENCY {
+            if unsafe { rffi::set_ack_frequency(fd, optval) } != 0 {
+                return Err(socket_last_error());
+            }
+            socket_set_attr(
+                roots.get(base),
+                "_quickack",
+                pyre_object::w_int_new(optval as i64),
+            );
+            return Ok(pyre_object::w_none());
+        }
+        // `RSocket.setsockopt_int`.
+        #[cfg(unix)]
+        majit_rlib::rsocket::setsockopt(fd, level, optname, &optval.to_ne_bytes())
+            .map_err(rsocket_os_error)?;
+        #[cfg(windows)]
+        if unsafe {
+            rffi::setsockopt(
+                fd,
+                level,
+                optname,
+                &optval as *const _ as *const libc::c_void,
+                core::mem::size_of::<libc::c_int>() as rffi::SockLen,
+            )
+        } != 0
+        {
             return Err(socket_last_error());
         }
-        Ok(pyre_object::w_none())
+        return Ok(pyre_object::w_none());
     }
+    if !unsafe { pyre_object::is_none(roots.get(base + 3)) } {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "setsockopt() only takes 4 arguments when the third argument is None (got {})",
+            pyre_interpreter::type_methods::arg_type_name(roots.get(base + 3))
+        )));
+    }
+    let optlen = pyre_interpreter::baseobjspace::int_w(roots.get(base + 4))?;
+    // `RSocket.setsockopt_None`.
+    let fd = socket_fd(roots.get(base))?;
+    #[cfg(unix)]
+    majit_rlib::rsocket::setsockopt_none(fd, level, optname, optlen as u32)
+        .map_err(rsocket_os_error)?;
+    #[cfg(windows)]
+    if unsafe {
+        rffi::setsockopt(
+            fd,
+            level,
+            optname,
+            std::ptr::null(),
+            optlen as rffi::SockLen,
+        )
+    } != 0
+    {
+        return Err(socket_last_error());
+    }
+    Ok(pyre_object::w_none())
 }
 
 #[cfg(any(unix, windows))]
@@ -6951,27 +7152,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     let mut obj = args[0];
                     let mut w_t = args[1];
-                    let timeout: f64 = if pyre_object::is_none(w_t) {
-                        -1.0
-                    } else {
-                        let v = {
-                            if pyre_object::is_float(w_t) {
-                                pyre_object::floatobject::w_float_get_value(w_t)
-                            } else if pyre_object::is_int(w_t) {
-                                pyre_object::w_int_get_value(w_t) as f64
-                            } else {
-                                return Err(pyre_interpreter::PyError::type_error(
-                                    "settimeout: timeout must be a float or None",
-                                ));
-                            }
-                        };
-                        if v < 0.0 {
-                            return Err(pyre_interpreter::PyError::value_error(
-                                "Timeout value out of range",
-                            ));
-                        }
-                        v
-                    };
+                    let timeout =
+                        pyre_object::with_roots!(obj, w_t => socket_timeout_w(w_t))?;
                     let fd = pyre_object::with_roots!(obj, w_t => socket_fd(obj))?;
                     socket_apply_timeout(fd, timeout)?;
                     // `gettimeout()` reports a float, and the timeout readers below
@@ -6980,7 +7162,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     let stored = if pyre_object::is_none(w_t) {
                         w_t
                     } else {
-                        pyre_object::floatobject::w_float_new(timeout)
+                        pyre_object::with_roots!(obj => pyre_object::floatobject::w_float_new(timeout))
                     };
                     socket_set_attr(obj, "_timeout", stored);
                     Ok(pyre_object::w_none())

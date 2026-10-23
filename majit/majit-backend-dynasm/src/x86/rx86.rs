@@ -14,6 +14,12 @@ pub type Assembler = super::assembler::Assembler;
 pub(crate) const BYTE_REG_FLAG: u8 = 0x20;
 pub(crate) const NO_BASE_REGISTER: i16 = -1;
 
+/// `rx86.py` `low_byte`. On x86-64 every register has a low byte, addressed
+/// through a REX prefix.
+pub(crate) fn low_byte(reg: u8) -> u8 {
+    reg | BYTE_REG_FLAG
+}
+
 pub(crate) const EAX: u8 = 0;
 pub(crate) const ECX: u8 = 1;
 pub(crate) const EDX: u8 = 2;

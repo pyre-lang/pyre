@@ -594,6 +594,11 @@ pyre_interpreter::py_module! {
         }
     },
     functions: {
+        // [3.15-spec] An empty line raises `binascii.Error("Missing length
+        // byte")` (`binascii_a2b_uu_impl`, the `ascii_len == 0` check; a
+        // measured CPython 3.15.0 `binascii.a2b_uu(b"")` raises it).
+        // `interp_uu.py a2b_uu` reads the length of an empty line as
+        // `(-0x20) & 0x3f` and returns 32 NUL bytes.
         "a2b_uu" / 1 = |args| {
             let data = as_bytes(args.first().copied().unwrap_or(w_none()))?;
             let out = common_binascii::a2b_uu(&data).map_err(transform_error)?;

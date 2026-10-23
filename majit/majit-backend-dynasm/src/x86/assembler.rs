@@ -21,7 +21,9 @@ use std::sync::Arc;
 pub(crate) type Assembler = dynasmrt::VecAssembler<dynasmrt::x64::X64Relocation>;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
-use super::regloc::{LocationCodeBuilder, Operand, addr_add, addr_add_const, heap, imm};
+use super::regloc::{
+    LocationCodeBuilder, Operand, addr_add, addr_add_const, heap, imm, lowest8bits,
+};
 use super::rx86;
 
 /// `rx86.py X86_64_CodeBuilder.MULTIBYTE_NOPs`, index == length, 1..=15.
@@ -149,7 +151,7 @@ mod tests {
         GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_array_descr_signed,
     };
 
-    use crate::regloc::{EDI, Loc, R10};
+    use crate::regloc::{EAX, EDI, ESI, Loc, R8, R10};
     use crate::runner::DynasmBackend;
     use dynasmrt::dynasm;
 
@@ -671,16 +673,11 @@ mod tests {
         );
     }
 
-    /// `push_gcmap(store=True)` is `MOV(raw_stack(ofs), imm(gcmap))`: a
-    /// 64-bit gcmap goes through `_load_scratch`, so a repeated gcmap reuses
-    /// r11 and a nearby one is `LEA r11, [r11+d]`.
-    #[test]
-    fn push_gcmap_loads_the_gcmap_through_the_scratch_cache() {
+    /// An `Assembler386` over no trace, for emitting single genops.
+    fn bare_assembler() -> super::Assembler386<'static> {
         let stats = Arc::new(majit_backend::AsmMemoryManagerStats::default());
         let arena = majit_backend::AsmMemoryManager::new_isolated(stats);
-        let inputargs: Vec<super::InputArgRc> = Vec::new();
-        let operations: Vec<OpRc> = Vec::new();
-        let mut asm = super::Assembler386::new(
+        super::Assembler386::new(
             arena,
             0,
             0,
@@ -703,9 +700,26 @@ mod tests {
             0,
             [0; 4],
             [0; 4],
-            &inputargs,
-            &operations,
-        );
+            &[],
+            &[],
+        )
+    }
+
+    /// The bytes `asm` emitted.
+    fn emitted(mut asm: super::Assembler386<'static>) -> Vec<u8> {
+        let code = asm.mc.take().finalize().expect("finalize emitted bytes");
+        let entry = asm.self_entry_addr_ptr;
+        drop(asm);
+        drop(unsafe { Box::from_raw(entry) });
+        code.to_vec()
+    }
+
+    /// `push_gcmap(store=True)` is `MOV(raw_stack(ofs), imm(gcmap))`: a
+    /// 64-bit gcmap goes through `_load_scratch`, so a repeated gcmap reuses
+    /// r11 and a nearby one is `LEA r11, [r11+d]`.
+    #[test]
+    fn push_gcmap_loads_the_gcmap_through_the_scratch_cache() {
+        let mut asm = bare_assembler();
         let gcmap = 0x1234_5678_9abc_usize;
         let store = {
             let ofs = super::JF_GCMAP_OFS;
@@ -723,11 +737,100 @@ mod tests {
         asm.push_gcmap(gcmap as *mut usize);
         asm.push_gcmap((gcmap + 16) as *mut usize);
         asm.push_gcmap(0x1000 as *mut usize);
-        let code = asm.mc.take().finalize().expect("finalize push_gcmap bytes");
-        let entry = asm.self_entry_addr_ptr;
-        drop(asm);
-        drop(unsafe { Box::from_raw(entry) });
-        assert_eq!(code, expected);
+        assert_eq!(emitted(asm), expected);
+    }
+
+    /// `genop_discard_gc_store_indexed` with the `ImmedLoc` index that
+    /// `make_sure_var_in_reg` returns for a `ConstInt`: `AddressLoc` folds
+    /// `index << scale` into the displacement. A size-1 store from a register
+    /// is `MOV8` of its `lowest8bits`, which carries a REX prefix so `rsi`
+    /// is `sil`, not `dh`.
+    #[test]
+    fn gc_store_indexed_immediate_index_folds_into_the_displacement() {
+        let mut asm = bare_assembler();
+        // mov byte [rdi + 3*8 + 8], sil
+        asm.genop_discard_gc_store_indexed(&[
+            Loc::Reg(EDI),
+            Loc::immed(3),
+            Loc::Reg(ESI),
+            Loc::immed(8),
+            Loc::immed(8),
+            Loc::immed(1),
+        ]);
+        // mov byte [rdi + 3*8 + 8], r8b
+        asm.genop_discard_gc_store_indexed(&[
+            Loc::Reg(EDI),
+            Loc::immed(3),
+            Loc::Reg(R8),
+            Loc::immed(8),
+            Loc::immed(8),
+            Loc::immed(1),
+        ]);
+        // mov qword [rdi + 3*8 - 8], rax
+        asm.genop_discard_gc_store_indexed(&[
+            Loc::Reg(EDI),
+            Loc::immed(3),
+            Loc::Reg(EAX),
+            Loc::immed(8),
+            Loc::immed(-8),
+            Loc::immed(8),
+        ]);
+        // mov dword [rdi + 2*4 + 4], 7
+        asm.genop_discard_gc_store_indexed(&[
+            Loc::Reg(EDI),
+            Loc::immed(2),
+            Loc::immed(7),
+            Loc::immed(4),
+            Loc::immed(4),
+            Loc::immed(4),
+        ]);
+        assert_eq!(
+            emitted(asm),
+            [
+                0x40, 0x88, 0x77, 0x20, // mov [rdi+0x20], sil
+                0x44, 0x88, 0x47, 0x20, // mov [rdi+0x20], r8b
+                0x48, 0x89, 0x47, 0x10, // mov [rdi+0x10], rax
+                0xC7, 0x47, 0x0C, 0x07, 0x00, 0x00, 0x00, // mov dword [rdi+0xc], 7
+            ]
+        );
+    }
+
+    /// `_genop_gc_load_indexed` with an `ImmedLoc` index: `addr_add` of a
+    /// register base and an immediate scaled part.
+    #[test]
+    fn gc_load_indexed_immediate_index_folds_into_the_displacement() {
+        let mut asm = bare_assembler();
+        // movsxd rax, dword [rdi + 5*4 + 4]
+        asm._genop_gc_load_indexed(
+            &[
+                Loc::Reg(EDI),
+                Loc::immed(5),
+                Loc::immed(4),
+                Loc::immed(4),
+                Loc::immed(4),
+                Loc::immed(1),
+            ],
+            Some(&Loc::Reg(EAX)),
+        );
+        // mov r10, qword [rdi + 2*8]
+        asm._genop_gc_load_indexed(
+            &[
+                Loc::Reg(EDI),
+                Loc::immed(2),
+                Loc::immed(8),
+                Loc::immed(0),
+                Loc::immed(8),
+                Loc::immed(0),
+            ],
+            Some(&Loc::Reg(R10)),
+        );
+        assert_eq!(
+            emitted(asm),
+            [
+                0x48, 0x63, 0x47, 0x18, // movsxd rax, [rdi+0x18]
+                0x4C, 0x8B, 0x57, 0x10, // mov r10, [rdi+0x10]
+            ]
+        );
     }
 }
 
@@ -3570,7 +3673,7 @@ impl<'a> Assembler386<'a> {
 
         // Sync regalloc frame positions to opref_to_slot, the map `resolve_opref`
         // reads, once the walk is over. No live emitter reaches it any more: every remaining consumer
-        // (`load_arg_to_rax` / `load_arg_to_rcx` / `resolve_const_or` and the
+        // (`load_arg_to_rax` / `load_arg_to_rcx` and the
         // genops that call them) is `#[allow(dead_code)]`, kept for the upstream
         // method boundary. The map cannot express what the regalloc actually
         // decides — `before_call` leaves a value bound to a callee-saved member
@@ -4280,162 +4383,10 @@ impl<'a> Assembler386<'a> {
             // must materialize it before the store — silently dropping
             // such writes left newly-allocated objects without vtables
             // and triggered downstream GuardClass failures.
-            OpCode::GcStore | OpCode::RawStore => {
-                let (value_loc, base_loc, ofs_loc, size_loc) = match arglocs {
-                    [v, b, o, s] => (v, b, o, s),
-                    _ => panic!(
-                        "GcStore arglocs must be [value, base, ofs, size] (got {} locs)",
-                        arglocs.len(),
-                    ),
-                };
-                let base = match base_loc {
-                    Loc::Reg(r) => r,
-                    other => panic!(
-                        "GcStore base_loc must be Loc::Reg (regalloc contract), got {other:?}",
-                    ),
-                };
-                let size = match size_loc {
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value.unsigned_abs() as usize,
-                    other => panic!(
-                        "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
-                    ),
-                };
-                // `save_into_mem` stores an immediate as an integer move. A
-                // singlefloat bit pattern is int-kind (`get_type_flag` →
-                // FLAG_UNSIGNED), not an xmm `MOVSS`.
-                let dest_addr = addr_add(&Loc::Reg(*base), ofs_loc, 0, 0);
-                self.save_into_mem(dest_addr, value_loc, size);
-            }
-            // ── x86/assembler.py genop_discard_gc_store_indexed ──
-            // `base_loc, ofs_loc, value_loc, factor_loc, offset_loc, size_loc = arglocs`.
-            // `dest_addr = AddressLoc(base_loc, ofs_loc, scale=get_scale(factor_loc.value), disp=offset_loc.value)`
-            // emits `[base + ofs * 2**scale + disp]`. `load_supported_factors =
-            // (1, 2, 4, 8)` (x86/runner.py:31), so the rewriter passes raw
-            // byte strides in that set straight through here and the native
-            // SIB scaled-index addressing does the multiply. Any other factor
-            // must have been pre-scaled away in `cpu_simplify_scale`.
-            OpCode::GcStoreIndexed => {
-                if let (Some(Loc::Reg(base)), Some(Loc::Reg(ofs_reg)), Some(value_loc)) =
-                    (arglocs.first(), arglocs.get(1), arglocs.get(2))
-                {
-                    let factor = match arglocs.get(3) {
-                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
-                        _ => 1,
-                    };
-                    let offset = match arglocs.get(4) {
-                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value as i32,
-                        _ => 0,
-                    };
-                    let size = match arglocs.get(5) {
-                        Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value.unsigned_abs() as usize,
-                        _ => 8,
-                    };
-
-                    let scale = match factor {
-                        1 => 0,
-                        2 => 1,
-                        4 => 2,
-                        8 => 3,
-                        other => panic!(
-                            "x86 GcStoreIndexed: unsupported factor {other}; \
-                             load_supported_factors = (1, 2, 4, 8)"
-                        ),
-                    };
-                    let dest_addr = addr_add(
-                        &Loc::Reg(*base),
-                        &Loc::Reg(*ofs_reg),
-                        i64::from(offset),
-                        scale,
-                    );
-                    self.save_into_mem(dest_addr, value_loc, size);
-                }
-            }
-            // ── x86/assembler.py _genop_gc_load_indexed ──
-            // Line-by-line port:
-            //   base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc = arglocs
-            //   scale = get_scale(scale_loc.value)
-            //   src_addr = addr_add(base_loc, ofs_loc, offset_loc.value, scale)
-            //   self.load_from_mem(resloc, src_addr, size_loc, sign_loc)
-            //
-            // The regalloc passes the raw byte stride in `scale_loc`
-            // (x86/regalloc.py:1184); `get_scale` converts 1/2/4/8 →
-            // 0/1/2/3 SIB exponents. PyPy keeps the (1,2,4,8) check
-            // implicit through `valid_addressing_size`; we surface the
-            // unsupported factors as a panic to keep miscompiles loud.
-            //
-            // KNOWN ISSUE: this emission triggers a timing-dependent
-            // segfault on `spectral_norm`-style traces (function call +
-            // many iterations + later loop). Adding any eprintln in the
-            // dispatch hides the bug, so it is likely a stale
-            // base-array pointer surviving a minor GC during the inline
-            // jitframe-alloc fast path.
+            OpCode::GcStore | OpCode::RawStore => self.genop_discard_gc_store(arglocs),
+            OpCode::GcStoreIndexed => self.genop_discard_gc_store_indexed(arglocs),
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
-                let (base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc) = match arglocs {
-                    [b, o, sc, of, sz, sg] => (b, o, sc, of, sz, sg),
-                    _ => panic!(
-                        "GcLoadIndexed arglocs must be [base, ofs, scale, offset, size, sign] (got {} locs)",
-                        arglocs.len(),
-                    ),
-                };
-                let base = match base_loc {
-                    Loc::Reg(r) => r,
-                    other => panic!(
-                        "GcLoadIndexed base_loc must be Loc::Reg (regalloc contract), got {other:?}",
-                    ),
-                };
-                let ofs_reg = match ofs_loc {
-                    Loc::Reg(r) => r,
-                    other => panic!(
-                        "GcLoadIndexed ofs_loc must be Loc::Reg (regalloc contract), got {other:?}",
-                    ),
-                };
-                let factor = match scale_loc {
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value,
-                    other => panic!(
-                        "GcLoadIndexed scale_loc must be Loc::Immed (regalloc contract), got {other:?}",
-                    ),
-                };
-                let offset = match offset_loc {
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value as i32,
-                    other => panic!(
-                        "GcLoadIndexed offset_loc must be Loc::Immed (regalloc contract), got {other:?}",
-                    ),
-                };
-                let size = match size_loc {
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value as usize,
-                    other => panic!(
-                        "GcLoadIndexed size_loc must be Loc::Immed (regalloc contract), got {other:?}",
-                    ),
-                };
-                let sign = match sign_loc {
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => i.value != 0,
-                    other => panic!(
-                        "GcLoadIndexed sign_loc must be Loc::Immed (regalloc contract), got {other:?}",
-                    ),
-                };
-                let dst = match result_loc {
-                    Some(Loc::Reg(r)) => r,
-                    other => panic!("GcLoadIndexed result_loc must be Loc::Reg, got {other:?}",),
-                };
-
-                let shift = match factor {
-                    1 => 0,
-                    2 => 1,
-                    4 => 2,
-                    8 => 3,
-                    other => panic!(
-                        "x86 GcLoadIndexed: unsupported factor {other}; \
-                         load_supported_factors = (1, 2, 4, 8)"
-                    ),
-                };
-                // `addr_add(base_loc, ofs_loc, offset, scale)`.
-                let src_addr = addr_add(
-                    &Loc::Reg(*base),
-                    &Loc::Reg(*ofs_reg),
-                    i64::from(offset),
-                    shift,
-                );
-                self.load_from_mem(*dst, src_addr, size, sign);
+                self._genop_gc_load_indexed(arglocs, result_loc);
             }
             // `rewrite.py transform_to_gc_load` lowers SETARRAYITEM_GC to
             // GC_STORE_INDEXED (after `handle_write_barrier_setarrayitem`)
@@ -7386,11 +7337,6 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// `ImmedLoc.lowest8bits`: the low byte, sign-extended.
-    fn lowest8bits(val: i64) -> i32 {
-        i32::from(val as u8 as i8)
-    }
-
     /// Sized store: `[base + ofs]` or `[base + ofs_reg]` — assembler.py save_into_mem.
     fn save_into_mem(&mut self, dest_addr: Operand, value_loc: &Loc, size: usize) {
         if let Loc::Reg(v) = value_loc
@@ -7403,13 +7349,7 @@ impl<'a> Assembler386<'a> {
             return;
         }
         match size {
-            // `value_loc.lowest8bits()`
-            1 => match value_loc.as_immed() {
-                Some((v, _)) => self
-                    .mc
-                    .MOV8(dest_addr, imm(i64::from(Self::lowest8bits(v)))),
-                None => self.mc.MOV8(dest_addr, value_loc),
-            },
+            1 => self.mc.MOV8(dest_addr, lowest8bits(value_loc)),
             2 => self.mc.MOV16(dest_addr, value_loc),
             4 => self.mc.MOV32(dest_addr, value_loc),
             8 => self.mc.MOV(dest_addr, value_loc),
@@ -8638,71 +8578,84 @@ impl<'a> Assembler386<'a> {
         self.store_d0_to_result(op.pos().get());
     }
 
-    // genop_* — GC memory operations
-
-    /// Emit a sized store of rcx/x1 to [rax]/[x0].
-    #[allow(dead_code)]
-    fn emit_store_to_rax_sized(&mut self, size: usize) {
-        match size {
-            1 => dynasm!(self.mc ; .arch x64 ; mov [rax], cl),
-            2 => dynasm!(self.mc ; .arch x64 ; mov [rax], cx),
-            4 => dynasm!(self.mc ; .arch x64 ; mov [rax], ecx),
-            _ => dynasm!(self.mc ; .arch x64 ; mov [rax], rcx),
-        }
+    /// `genop_discard_gc_store`:
+    /// `dest_addr = AddressLoc(base_loc, ofs_loc, 0, 0)`, then `save_into_mem`.
+    fn genop_discard_gc_store(&mut self, arglocs: &[Loc]) {
+        let (value_loc, base_loc, ofs_loc, size_loc) = match arglocs {
+            [v, b, o, s] => (v, b, o, s),
+            _ => panic!(
+                "GcStore arglocs must be [value, base, ofs, size] (got {} locs)",
+                arglocs.len(),
+            ),
+        };
+        let base = match base_loc {
+            Loc::Reg(r) => r,
+            other => {
+                panic!("GcStore base_loc must be Loc::Reg (regalloc contract), got {other:?}",)
+            }
+        };
+        let size = match size_loc {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => i.value.unsigned_abs() as usize,
+            other => {
+                panic!("GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",)
+            }
+        };
+        // `save_into_mem` stores an immediate as an integer move. A
+        // singlefloat bit pattern is int-kind (`get_type_flag` →
+        // FLAG_UNSIGNED), not an xmm `MOVSS`.
+        let dest_addr = addr_add(&Loc::Reg(*base), ofs_loc, 0, 0);
+        self.save_into_mem(dest_addr, value_loc, size);
     }
 
-    /// Resolve an OpRef that is expected to be a compile-time constant.
-    fn resolve_const_or(&self, opref: OpRef, default: i64) -> i64 {
-        match self.resolve_opref(opref) {
-            ResolvedArg::Const(v) => v,
-            _ => default,
-        }
+    /// `genop_discard_gc_store_indexed`:
+    /// `dest_addr = AddressLoc(base_loc, ofs_loc, get_scale(factor_loc.value), offset_loc.value)`.
+    /// `ofs_loc` is a register, or the `ImmedLoc` that `make_sure_var_in_reg`
+    /// returns for a `ConstInt` index. `load_supported_factors = (1, 2, 4, 8)`
+    /// (x86/runner.py), so `cpu_simplify_scale` has pre-scaled every other
+    /// factor away.
+    fn genop_discard_gc_store_indexed(&mut self, arglocs: &[Loc]) {
+        let (base_loc, ofs_loc, value_loc, factor_loc, offset_loc, size_loc) = match arglocs {
+            [b, o, v, f, of, sz] => (b, o, v, f, of, sz),
+            _ => panic!(
+                "GcStoreIndexed arglocs must be [base, ofs, value, factor, offset, size] (got {arglocs:?})",
+            ),
+        };
+        let (factor, offset, size) = match (factor_loc, offset_loc, size_loc) {
+            (Loc::Immed(f), Loc::Immed(of), Loc::Immed(sz)) => (f.value, of.value, sz.value),
+            other => panic!(
+                "GcStoreIndexed factor/offset/size must be Loc::Immed (regalloc contract), got {other:?}",
+            ),
+        };
+        let scale = crate::regalloc::get_scale(factor as usize);
+        let dest_addr = addr_add(base_loc, ofs_loc, offset, scale);
+        self.save_into_mem(dest_addr, value_loc, size as usize);
     }
 
-    /// GC_STORE: store value to base + offset.
-    /// 4-arg form: arg(0)=base, arg(1)=offset, arg(2)=value, arg(3)=itemsize.
-    #[allow(dead_code)]
-    fn genop_discard_gc_store(&mut self, op: &Op) {
-        if op.num_args() < 4 {
-            return; // 3-arg GC rewrite form — skip for now
-        }
-        let itemsize = self
-            .resolve_const_or(op.arg(3).to_opref(), 8)
-            .unsigned_abs() as usize;
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        dynasm!(self.mc ; .arch x64 ; add rax, rcx);
-        dynasm!(self.mc ; .arch x64 ; push rax);
-        self.load_arg_to_rcx(op.arg(2).to_opref());
-        dynasm!(self.mc ; .arch x64 ; pop rax);
-        self.emit_store_to_rax_sized(itemsize);
-    }
-
-    /// GC_STORE_INDEXED: store to base + base_offset + index * scale.
-    /// arg(0)=base, arg(1)=index, arg(2)=value, arg(3)=scale,
-    /// arg(4)=base_offset, arg(5)=itemsize.
-    #[allow(dead_code)]
-    fn genop_discard_gc_store_indexed(&mut self, op: &Op) {
-        let scale = self.resolve_const_or(op.arg(3).to_opref(), 1) as i32;
-        let base_offset = self.resolve_const_or(op.arg(4).to_opref(), 0) as i32;
-        let itemsize = self
-            .resolve_const_or(op.arg(5).to_opref(), 8)
-            .unsigned_abs() as usize;
-
-        self.load_arg_to_rax(op.arg(0).to_opref());
-        self.load_arg_to_rcx(op.arg(1).to_opref());
-        if scale != 1 {
-            rx86::imul_ri(&mut self.mc, rx86::ECX, scale);
-        }
-        dynasm!(self.mc ; .arch x64 ; add rax, rcx);
-        if base_offset != 0 {
-            rx86::add_ri(&mut self.mc, rx86::EAX, base_offset);
-        }
-        dynasm!(self.mc ; .arch x64 ; push rax);
-        self.load_arg_to_rcx(op.arg(2).to_opref());
-        dynasm!(self.mc ; .arch x64 ; pop rax);
-        self.emit_store_to_rax_sized(itemsize);
+    /// `_genop_gc_load_indexed`:
+    /// `src_addr = addr_add(base_loc, ofs_loc, offset_loc.value, get_scale(scale_loc.value))`,
+    /// then `load_from_mem`. As above, `ofs_loc` may be an `ImmedLoc`.
+    fn _genop_gc_load_indexed(&mut self, arglocs: &[Loc], result_loc: Option<&Loc>) {
+        let (base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc) = match arglocs {
+            [b, o, sc, of, sz, sg] => (b, o, sc, of, sz, sg),
+            _ => panic!(
+                "GcLoadIndexed arglocs must be [base, ofs, scale, offset, size, sign] (got {arglocs:?})",
+            ),
+        };
+        let (factor, offset, size, sign) = match (scale_loc, offset_loc, size_loc, sign_loc) {
+            (Loc::Immed(sc), Loc::Immed(of), Loc::Immed(sz), Loc::Immed(sg)) => {
+                (sc.value, of.value, sz.value as usize, sg.value != 0)
+            }
+            other => panic!(
+                "GcLoadIndexed scale/offset/size/sign must be Loc::Immed (regalloc contract), got {other:?}",
+            ),
+        };
+        let resloc = match result_loc {
+            Some(Loc::Reg(r)) => *r,
+            other => panic!("GcLoadIndexed result_loc must be Loc::Reg, got {other:?}"),
+        };
+        let scale = crate::regalloc::get_scale(factor as usize);
+        let src_addr = addr_add(base_loc, ofs_loc, offset, scale);
+        self.load_from_mem(resloc, src_addr, size, sign);
     }
 
     // genop_* — interior field operations

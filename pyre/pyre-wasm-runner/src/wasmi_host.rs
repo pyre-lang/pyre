@@ -186,13 +186,16 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
     // on a module predating the export, leaving the guest on `<string>`.
     if let Ok(set_path) = instance.get_typed_func::<(u32, u32), ()>(&store, "pyre_set_script_path")
     {
-        let name = script.to_string_lossy();
+        let name = host_path_to_guest(script).ok_or_else(|| {
+            format!(
+                "script path cannot be represented in guest: {}",
+                script.display()
+            )
+        })?;
         let nlen = name.len() as u32;
         if nlen != 0 {
             let p = alloc.call(&mut store, nlen).map_err(estr)?;
-            memory
-                .write(&mut store, p as usize, name.as_bytes())
-                .map_err(estr)?;
+            memory.write(&mut store, p as usize, &name).map_err(estr)?;
             set_path.call(&mut store, (p, nlen)).map_err(estr)?;
             dealloc.call(&mut store, (p, nlen)).map_err(estr)?;
         }

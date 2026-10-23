@@ -2744,7 +2744,7 @@ pub fn valid_addressing_size(size: usize) -> bool {
 
 /// regalloc.py:1239
 pub fn get_scale(size: usize) -> u8 {
-    debug_assert!(valid_addressing_size(size));
+    assert!(valid_addressing_size(size), "get_scale({size})");
     if size < 4 {
         (size - 1) as u8 // 1, 2 => 0, 1
     } else {

@@ -1,5 +1,5 @@
 # pyre-check: spec-folds=builtin_range
-# pyre-check: trace-shape=entry-bridge:main:absent=CallMayForceR
+# pyre-check: trace-shape=main:absent=CallMayForceR
 # Pins virtual range construction for one-, two-, and three-bound calls while
 # retaining correct residual behavior for exceptional, subclass, index, and
 # escaping-object shapes.
@@ -11,6 +11,8 @@
 # to end. With the region built from the exception table instead, the while
 # loop and the three `for` loops compile.  The fold census verifies the range
 # construction itself without sizing the arithmetic loop to a timer floor.
+# Inspect the `FOR_ITER` loop traces that cover the range constructors.
+# This fixture does not guarantee an entry bridge for `main`.
 try:
     import pypyjit
 

@@ -144,16 +144,27 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     pyre_interpreter::baseobjspace::charbuf_w(obj)
 }
 
-/// Coerce an argument slot to an integer, `None`/absent (`PY_NULL`) → default.
+/// Coerce an argument slot to an integer, absent (`PY_NULL`) → default.
 ///
 /// The Signature-bound call path fills every declared slot: a supplied
 /// keyword / positional carries the value, an omitted optional carries
-/// `PY_NULL`.
+/// `PY_NULL`.  An explicit `None` goes through `int_w` and raises
+/// `TypeError`, as `@unwrap_spec(...=int)` does.
 fn int_or_default(o: PyObjectRef, default: i64) -> Result<i64, pyre_interpreter::PyError> {
-    if o.is_null() || unsafe { is_none(o) } {
+    if o.is_null() {
         Ok(default)
     } else {
         pyre_interpreter::baseobjspace::int_w(o)
+    }
+}
+
+/// `int_or_default` for a `"c_int"` unwrap_spec: the C `int` range is
+/// checked instead of wrapped.
+fn c_int_or_default(o: PyObjectRef, default: i32) -> Result<i32, pyre_interpreter::PyError> {
+    if o.is_null() {
+        Ok(default)
+    } else {
+        pyre_interpreter::baseobjspace::c_int_w(o)
     }
 }
 
@@ -284,9 +295,12 @@ fn init_compress_type(ns: PyObjectRef) {
                     let data = pyre_object::with_roots!(w_self => as_bytes(w_data))?;
                     let this = compressor_this(w_self)?;
                     if this.backend.is_null() {
-                        return Err(zlib_error("Error -2: inconsistent stream state"));
+                        return Err(zlib_error("compressor object already flushed"));
                     }
                     let mut c = { &*this.backend }.lock();
+                    if c.is_finished() {
+                        return Err(zlib_error("compressor object already flushed"));
+                    }
                     let out = c.compress(&data).map_err(zlib_error)?;
                     Ok(bytesobject::w_bytes_from_bytes(&out))
                 },
@@ -321,16 +335,19 @@ fn init_compress_type(ns: PyObjectRef) {
                 // than truncating it into a different flush mode.
                 let mut w_self = args[0];
                 let mode = match args.get(1).copied() {
-                    Some(o) if !{ is_none(o) } => {
+                    Some(o) if !o.is_null() => {
                         pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::c_int_w(o))?
                     }
                     _ => backend::Z_FINISH,
                 };
                 let this = compressor_this(w_self)?;
                 if this.backend.is_null() {
-                    return Err(zlib_error("Error -2: inconsistent stream state"));
+                    return Err(zlib_error("compressor object already flushed"));
                 }
                 let mut c = { &*this.backend }.lock();
+                if c.is_finished() {
+                    return Err(zlib_error("compressor object already flushed"));
+                }
                 let out = c.flush(mode).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             })
@@ -521,7 +538,7 @@ fn decompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_inter
         let v = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::int_w(w_max_length))?;
         if v < 0 {
             return Err(pyre_interpreter::PyError::value_error(
-                "max_length must be non-negative",
+                "max_length must be greater than zero",
             ));
         }
         (v != 0).then_some(v as usize)
@@ -599,8 +616,10 @@ fn init_decompress_type(ns: PyObjectRef) {
                     ));
                 }
                 let mut w_self = args[0];
+                // `Decompress.flush(w_length=None)`: a supplied length,
+                // None included, goes through `space.int_w`.
                 let length = match args.get(1).copied() {
-                    Some(o) if !{ is_none(o) } => {
+                    Some(o) if !o.is_null() => {
                         let v = pyre_object::with_roots!(w_self => pyre_interpreter::baseobjspace::int_w(o))?;
                         if v <= 0 {
                             return Err(pyre_interpreter::PyError::value_error(
@@ -611,12 +630,17 @@ fn init_decompress_type(ns: PyObjectRef) {
                     }
                     _ => backend::DEF_BUF_SIZE,
                 };
+                // `Decompress.flush`: a released stream gives `b''`, and so
+                // does an `RZlibError` raised by the final inflate.
                 let this = decompressor_this(w_self)?;
                 if this.backend.is_null() {
-                    return Err(zlib_error("Error -2: inconsistent stream state"));
+                    return Ok(bytesobject::w_bytes_from_bytes(b""));
                 }
                 let mut d = { &*this.backend }.lock();
-                let out = d.flush(length).map_err(zlib_error)?;
+                if d.is_finished() {
+                    return Ok(bytesobject::w_bytes_from_bytes(b""));
+                }
+                let out = d.flush(length).unwrap_or_default();
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             })
         )
@@ -993,9 +1017,9 @@ pyre_interpreter::py_module! {
         fn compress(
             data: PyBufferStr,
             #[posonly]
-            #[default(w_none())]
+            #[default(PY_NULL)]
             level: PyObjectRef,
-            #[default(w_none())]
+            #[default(PY_NULL)]
             mut wbits: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let level = pyre_object::with_roots!(wbits => int_or_default(level, -1))? as i32;
@@ -1008,16 +1032,25 @@ pyre_interpreter::py_module! {
         fn decompress(
             data: PyBufferStr,
             #[posonly]
-            #[default(w_none())]
+            #[default(PY_NULL)]
             wbits: PyObjectRef,
-            #[default(w_none())]
+            #[default(PY_NULL)]
             mut bufsize: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-            let wbits = to_wbits(pyre_object::with_roots!(bufsize => int_or_default(wbits, backend::MAX_WBITS as i64))?);
+            // `@unwrap_spec(string='bufferstr', wbits="c_int", bufsize=int)`.
+            let wbits = pyre_object::with_roots!(bufsize => c_int_or_default(wbits, backend::MAX_WBITS))?;
             let bufsize = int_or_default(bufsize, backend::DEF_BUF_SIZE as i64)?;
+            // [3.15-spec] `interp_zlib.py decompress` unwraps `bufsize` and
+            // never reads it, so pypy3 accepts -1.  At the v3.15.0 tag,
+            // `zlibmodule.c` declares `bufsize: Py_ssize_t(allow_negative=False)`
+            // and `Modules/clinic/zlibmodule.c.h` `zlib_decompress` raises
+            // ValueError "bufsize cannot be negative"; a 3.15.0 run reports it.
+            // No JIT hint covers `decompress`.
             if bufsize < 0 {
-                return Err(pyre_interpreter::PyError::value_error("bufsize must be non-negative"));
+                return Err(pyre_interpreter::PyError::value_error("bufsize cannot be negative"));
             }
+            // `zlib_decompress_impl`: `if (bufsize == 0) bufsize = 1;`.
+            let bufsize = bufsize.max(1);
             let out = backend::decompress(&data, wbits, bufsize as usize)
                 .map_err(|e| oneshot_init_error(e, "Bad window buffer size"))?;
             Ok(bytesobject::w_bytes_from_bytes(&out))
@@ -1026,11 +1059,11 @@ pyre_interpreter::py_module! {
         // strategy, w_zdict)` — all six positional-or-keyword and all native
         // initialization options are passed through to deflateInit2.
         fn compressobj(
-            #[default(w_none())] level: PyObjectRef,
-            #[default(w_none())] mut method: PyObjectRef,
-            #[default(w_none())] mut wbits: PyObjectRef,
-            #[default(w_none())] mut memLevel: PyObjectRef,
-            #[default(w_none())] mut strategy: PyObjectRef,
+            #[default(PY_NULL)] level: PyObjectRef,
+            #[default(PY_NULL)] mut method: PyObjectRef,
+            #[default(PY_NULL)] mut wbits: PyObjectRef,
+            #[default(PY_NULL)] mut memLevel: PyObjectRef,
+            #[default(PY_NULL)] mut strategy: PyObjectRef,
             #[default(w_none())] mut zdict: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let level = pyre_object::with_roots!(memLevel, method, strategy, wbits, zdict => int_or_default(level, -1))? as i32;
@@ -1049,7 +1082,7 @@ pyre_interpreter::py_module! {
         }
         // interp_zlib.py `Decompress___new__(wbits, w_zdict)`.
         fn decompressobj(
-            #[default(w_none())] wbits: PyObjectRef,
+            #[default(PY_NULL)] wbits: PyObjectRef,
             #[default(w_none())] mut zdict: PyObjectRef,
         ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let wbits = to_wbits(pyre_object::with_roots!(zdict => int_or_default(wbits, backend::MAX_WBITS as i64))?);

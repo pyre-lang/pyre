@@ -435,7 +435,7 @@ fn vtable_method_slot_offsets() -> Vec<(String, String, usize)> {
             owner,
             offset,
             ..
-        } = load_descr_uncached(i)
+        } = load_wire_descr(i)
         else {
             continue;
         };
@@ -1287,6 +1287,19 @@ fn load_descr_uncached(index: usize) -> BhDescr {
     load_descr_with_parent(index, descr_layout_at)
 }
 
+/// Read the serialized descriptor without resolving runtime addresses or
+/// parent layouts. `pyjitpl.py MetaInterpStaticData.bytecode_for_address`
+/// builds a function-address dictionary; scanning method
+/// offsets for that dictionary must not materialize unrelated allocation
+/// descriptors, including host-only types absent from a wasm guest.
+fn load_wire_descr(index: usize) -> BhDescr {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
+    let offsets = &descrs_index().offsets;
+    let start = offsets[index] as usize;
+    let end = offsets[index + 1] as usize;
+    descr_from_indexed_bytes(&BYTES[start..end], descrs_index().size_type_ids[index])
+}
+
 /// Decode one `descrs.bin` slot.
 ///
 /// A parentless `BhDescr::Size` whose `type_id` is nonzero is the STRUCT row
@@ -1330,12 +1343,7 @@ fn load_descr_with_parent(
     index: usize,
     parent_layout_at: impl FnOnce(usize) -> std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>,
 ) -> BhDescr {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
-    let offsets = &descrs_index().offsets;
-    let start = offsets[index] as usize;
-    let end = offsets[index + 1] as usize;
-    let mut descr =
-        descr_from_indexed_bytes(&BYTES[start..end], descrs_index().size_type_ids[index]);
+    let mut descr = load_wire_descr(index);
     let parent_layout = descrs_index().parent_layouts[index];
     if parent_layout != u32::MAX {
         let BhDescr::Field { parent, .. } = &mut descr else {

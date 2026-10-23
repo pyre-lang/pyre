@@ -603,6 +603,8 @@ pub fn bind(fd: INT, addr: &[u8]) -> Result<(), CSocketError> {
 /// `listen`.
 #[cfg(unix)]
 pub fn listen(fd: INT, backlog: INT) -> Result<(), CSocketError> {
+    // `RSocket.listen`: "The backlog argument must be at least 1".
+    let backlog = backlog.max(1);
     let res = unsafe { crate::_rsocket_rffi::socketlisten(fd, backlog) };
     if res < 0 {
         return Err(last_error());
@@ -776,6 +778,24 @@ pub fn setsockopt(fd: INT, level: INT, option: INT, value: &[u8]) -> Result<(), 
             option,
             value.as_ptr().cast(),
             value.len() as libc::socklen_t,
+        )
+    };
+    if res < 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
+/// `setsockopt_None` — a NULL option value of `optlen` bytes.
+#[cfg(unix)]
+pub fn setsockopt_none(fd: INT, level: INT, option: INT, optlen: u32) -> Result<(), CSocketError> {
+    let res = unsafe {
+        crate::_rsocket_rffi::socketsetsockopt(
+            fd,
+            level,
+            option,
+            core::ptr::null(),
+            optlen as libc::socklen_t,
         )
     };
     if res < 0 {

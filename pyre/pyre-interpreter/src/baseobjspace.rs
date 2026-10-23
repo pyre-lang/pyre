@@ -11132,7 +11132,7 @@ pub fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>
 /// refused.  `_convert_from_buffer_or_iterable` (bytesobject.py) reads the
 /// `bytes()` / `bytearray()` source this way, which is why
 /// `bytes(memoryview(b'abcd')[::2])` is a copy and not a `BufferError`.
-pub(crate) fn full_ro_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
+pub fn full_ro_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
     buffer_bytes(obj, BufferRequest::FullRo)
 }
 

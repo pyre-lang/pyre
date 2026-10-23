@@ -80,6 +80,21 @@ pub(crate) fn addr_add_const(base_loc: &Loc, offset: i64) -> Operand {
     addr_add(base_loc, &Loc::immed(0), offset, 0)
 }
 
+/// regloc.py `RegLoc.lowest8bits` / `ImmedLoc.lowest8bits`: a register's
+/// `low_byte`, which every byte instruction encodes with a forced REX prefix
+/// (`sil`, `dil`, `r8b`, ... rather than `dh`, `bh`), or an immediate's low
+/// byte sign-extended.
+pub(crate) fn lowest8bits(loc: &Loc) -> Operand {
+    match *loc {
+        Loc::Reg(r) => {
+            assert!(!r.is_xmm, "lowest8bits of {r:?}");
+            Operand::R(rx86::low_byte(r.value))
+        }
+        Loc::Immed(i) | Loc::ImmedFloat(i) => Operand::I(i64::from(i.value as u8 as i8)),
+        _ => panic!("lowest8bits of {loc:?}"),
+    }
+}
+
 impl From<RegLoc> for Operand {
     fn from(reg: RegLoc) -> Self {
         if reg.is_xmm {

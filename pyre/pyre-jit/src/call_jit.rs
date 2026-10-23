@@ -3263,7 +3263,36 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 None => {
                     // blackhole.py:1629 bottommost frame, unhandled →
                     // raise ExitFrameWithExceptionRef(exc).
-                    let mut err = exit_frame_exception_ref(
+                    //
+                    // The record allocates its traceback node, so it runs
+                    // before the `OperationError` carrier exists: that carrier
+                    // is a nursery object of its own, and a bare local held
+                    // across the record is left naming the pre-collection
+                    // copy.  The parked exception is read back past the
+                    // record, as the sibling propagation loop reads its pin.
+                    if !frame_ptr.is_null() {
+                        let guard_exc = guard_exc_root.get();
+                        match jitcode_index {
+                            // Every indexed frame recorded during blackhole
+                            // propagation goes through the guarded recorder;
+                            // `pyopcode.py handle_operation_error` is
+                            // upstream's single traceback attach point.
+                            Some(jitcode_index) => record_caught_blackhole_traceback(
+                                guard_exc,
+                                frame_ptr as i64,
+                                i64::from(jitcode_index),
+                                last_opcode_position as i64,
+                            ),
+                            None => unsafe {
+                                pyre_interpreter::pytraceback::record_application_traceback(
+                                    guard_exc as PyObjectRef,
+                                    frame_ptr,
+                                    (*frame_ptr).last_instr as i64,
+                                );
+                            },
+                        }
+                    }
+                    let err = exit_frame_exception_ref(
                         guard_exc_root.get(),
                         "guard_exc propagation",
                         || {
@@ -3273,30 +3302,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                             )
                         },
                     );
-                    if !frame_ptr.is_null() {
-                        match jitcode_index {
-                            // Every indexed frame recorded during blackhole
-                            // propagation goes through the guarded recorder;
-                            // `pyopcode.py handle_operation_error` is
-                            // upstream's single traceback attach point.
-                            Some(jitcode_index) => record_caught_blackhole_traceback(
-                                err.exc_object as i64,
-                                frame_ptr as i64,
-                                i64::from(jitcode_index),
-                                last_opcode_position as i64,
-                            ),
-                            None => unsafe {
-                                pyre_interpreter::pytraceback::record_application_traceback(
-                                    err.exc_object,
-                                    frame_ptr,
-                                    (*frame_ptr).last_instr as i64,
-                                );
-                            },
-                        }
-                        // `err` was built from the parked exception, which
-                        // the record above can move.
-                        err.set_exc_object(guard_exc_root.get() as PyObjectRef);
-                    }
                     // `guard_exc` is now owned by the typed
                     // `ExitFrameWithExceptionRef` result. A can-raise
                     // residual helper published the same value to both the

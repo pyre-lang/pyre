@@ -14116,7 +14116,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         if unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some() {
             // intobject.py: w_intvalue = space.int(w_value)
             let w_intvalue = pyre_object::with_roots!(obj => crate::baseobjspace::space_int(obj))?;
-            return ensure_baseint_result(w_intvalue, obj);
+            return ensure_baseint_result(w_intvalue);
         }
         // Python 3.14 difference: the deprecated `__trunc__` delegation in
         // this PyPy source was removed from `int()` after Python 3.11.  Our
@@ -14125,7 +14125,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         if unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_some() {
             // intobject.py:1016: w_obj = space.index(w_value)
             let w_obj = pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj))?;
-            return ensure_baseint_result(w_obj, obj);
+            return ensure_baseint_result(w_obj);
         }
         // intobject.py:1047 — unicode is normalized through
         // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
@@ -14169,10 +14169,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 /// intobject.py _ensure_baseint
-fn ensure_baseint_result(
-    obj: PyObjectRef,
-    _original: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+fn ensure_baseint_result(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // intobject.py `_ensure_baseint`: an object whose interp-level class is
     // `W_IntObject` / `W_LongObject` is returned as is; a `W_BoolObject` or a
     // user-subclass instance is rewrapped.
@@ -30115,10 +30112,10 @@ mod tests {
     #[test]
     fn ensure_baseint_returns_exact_int_and_rewraps_bool() {
         let input = w_long_new(BigInt::one().lshift(80).unwrap());
-        assert_eq!(ensure_baseint_result(input, input).unwrap(), input);
+        assert_eq!(ensure_baseint_result(input).unwrap(), input);
 
         let w_true = pyre_object::w_bool_from(true);
-        let result = ensure_baseint_result(w_true, w_true).unwrap();
+        let result = ensure_baseint_result(w_true).unwrap();
         assert_ne!(result, w_true);
         unsafe {
             assert!(!pyre_object::is_bool(result));
