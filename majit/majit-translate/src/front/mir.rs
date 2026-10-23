@@ -6133,23 +6133,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.saturating_sub_sites,
             )
         };
-        // The `Option::unwrap_or` value-select rewrite
-        // (`front::option_unwrap_or`) splits the residual `unwrap_or` call
-        // block into a `__discriminant` diamond, same post-lowering shape and
-        // fail-safe contract as `bool::then`; gate the reachability sweep on
-        // an actual rewrite.
-        let unwrap_or_rewritten = if lo.unwrap_or_sites.is_empty() {
-            0
-        } else {
-            crate::front::option_unwrap_or::rewire_unwrap_or_call_sites(
-                &mut lo.graph,
-                &lo.unwrap_or_sites,
-            )
-        };
         // The `Option::unwrap` guard rewrite (`front::option_unwrap`) splits the
         // residual `unwrap` call block into a `__discriminant` guard whose
         // `Some` arm extracts `__pos_0` and whose `None` arm raises the implicit
-        // `AssertionError`; same fail-safe contract as `unwrap_or`, gate the
+        // `AssertionError`; same fail-safe contract as `bool::then`, gate the
         // reachability sweep on an actual rewrite.
         let unwrap_rewritten = if lo.unwrap_sites.is_empty() {
             0
@@ -6294,7 +6281,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || slice_is_ascii_rewritten > 0
             || saturating_add_rewritten > 0
             || saturating_sub_rewritten > 0
-            || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
             || expect_rewritten > 0
             || result_expect_rewritten > 0
@@ -9471,13 +9457,6 @@ struct Lowering<'a> {
     /// `getslice(start, stop)` rewrite.  The same aggregate may also be a
     /// `range_iter` candidate; both passes are consumer-gated.
     slice_index_range_sites: Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `Option::unwrap_or(opt, default)` call sites
-    /// recorded for the discriminant value-select the
-    /// `front::option_unwrap_or` post-pass synthesizes after the body
-    /// lowering completes.  Each carries the resolved `Option` owners the
-    /// arms' field reads need (see
-    /// [`crate::front::option_unwrap_or::UnwrapOrSite`]).
-    unwrap_or_sites: Vec<crate::front::option_unwrap_or::UnwrapOrSite>,
     /// `Option::unwrap(opt)` call sites recorded for the discriminant guard the
     /// `front::option_unwrap` post-pass synthesizes (see
     /// [`crate::front::option_unwrap::UnwrapSite`]).
@@ -10442,7 +10421,6 @@ impl<'a> Lowering<'a> {
             slice_index_rangefrom_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
-            unwrap_or_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             expect_sites: Vec::new(),
             map_or_sites: Vec::new(),
@@ -16278,20 +16256,52 @@ impl<'a> Lowering<'a> {
                 }
                 // `Option<&[u8]>` is a nullable window: `None` is a null
                 // data word. The discriminant is that null test, not a
-                // `__discriminant` field of a tagged aggregate.
+                // `__discriminant` field of a tagged aggregate. The data
+                // word is CCHARP (`Ptr(Array Char)`); `p is None` is
+                // `rnone.py` `rtype_is_None` → `ptr_iszero`, the same
+                // `is_(opt, null)` then `eq(_, False)` sequence the
+                // niche-pointer Discriminant arm emits (`push_niche_is_some`).
+                // `Constant(None)` is Void (`pairtype(Repr, VoidRepr)`);
+                // integer 0 is not a pointer null (`lltype.nullptr`).
                 if tyref_is_u8_window(&place.ty, self.llbc)
                     && let Some((data, _)) = self.pair_place_parts(mir_bb, &place)?
                 {
-                    let zero = self.emit_const_uint(mir_bb, 0);
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let none = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    let is_none = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let false_var = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.emit_bb(mir_bb);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(none.clone()),
+                        kind: OpKind::ConstNone,
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(is_none.clone()),
+                        kind: OpKind::BinOp {
+                            op: "is_".to_string(),
+                            lhs: data,
+                            rhs: none,
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(false_var.clone()),
+                        kind: OpKind::ConstBool(false),
+                    });
                     self.niche_disc_vars.insert(res.id());
                     return Ok((
                         Some(OpKind::BinOp {
-                            op: "ne".to_string(),
-                            lhs: data,
-                            rhs: zero,
+                            op: "eq".to_string(),
+                            lhs: is_none,
+                            rhs: false_var,
                             result_ty: ValueType::Int,
                         }),
                         res,
@@ -17258,6 +17268,16 @@ impl<'a> Lowering<'a> {
                 if atom == "Deref"
                     && tyref_pair_slice_item_kind(&inner.ty, self.llbc).is_none()
                     && tyref_pair_field_kind(&inner.ty, self.llbc).is_some() =>
+            {
+                self.pair_place_parts(mir_bb, inner)
+            }
+            // `Some(w)` of a niche u8-window Option is `w`: the payload
+            // `Field` (and a `Downcast` onto `Some`) is the Option's
+            // `{data, len}`, the same pair `Discriminant` reads. A
+            // tagged-instance `__pos_0` would rebuild a list.
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                if (v.get("Field").is_some() || v.get("Downcast").is_some())
+                    && tyref_is_u8_window(&inner.ty, self.llbc) =>
             {
                 self.pair_place_parts(mir_bb, inner)
             }
@@ -22038,6 +22058,21 @@ impl<'a> Lowering<'a> {
                     // mirroring the fieldless-enum discriminant collapse and the
                     // `Discriminant` niche fold above.
                     if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
+                        return self.resolve_place(mir_bb, *inner);
+                    }
+                    // A niche u8-window `Option` (`Option<&[u8]>` / Charon
+                    // `Option<[u8]>`) is the window itself: `None` is a null
+                    // data word, `Some(w)` is `w` (`rnone.py` / `rclass.py`:
+                    // a nullable value's non-None payload is the same word).
+                    // `Some.__pos_0` is therefore the Option's data word, not
+                    // a tagged-instance field. The `Discriminant` arm uses
+                    // the same `tyref_is_u8_window` gate. The Option is a
+                    // `{data, len}` pair, so the one-word projection is
+                    // `data` via `pair_place_parts`, not `LocalValue::one`.
+                    if field_name == "__pos_0" && tyref_is_u8_window(&inner.ty, self.llbc) {
+                        if let Some((data, _)) = self.pair_place_parts(mir_bb, inner.as_ref())? {
+                            return Ok(data);
+                        }
                         return self.resolve_place(mir_bb, *inner);
                     }
                     // The payload of `Option<fieldless-enum>` is likewise the
@@ -33894,21 +33929,10 @@ impl<'a> Lowering<'a> {
             site.object_array_type_id = slice_object_array_type_id.clone();
             self.slice_first_sites.push(site);
         }
-        // Capture `Option::unwrap_or(opt, default)` /
-        // `Result::unwrap_or(res, default)` sites for the discriminant
-        // value-select `front::option_unwrap_or` synthesizes.  `unwrap_or`'s
-        // body is Opaque (foreign `core`), but its receiver is the enum ADT, so
-        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
-        // `args[0]`, default in `args[1]`), NOT a raw FunctionPath.  Resolving
-        // the enum field owners needs the receiver's type (`first_arg_ty`), in
-        // hand here; `recognize_unwrap_or_site` classifies `Option` vs `Result`
-        // (their `Some`=1 / `Ok`=0 payload tags differ) and records the
-        // polarity.  The exception-carrier Result is recorded as a
-        // `CarrierCombinatorSite` instead — `front::result_exc` fuses that
-        // combinator onto `LastException` (`except OperationError`) rather
-        // than a value-select.  A resolution miss leaves the residual call —
-        // an unregistered callee the rtyper census Skips, so no graph
-        // regresses.
+        // Capture carrier `Result<T, PyError>::unwrap_or(res, default)` for
+        // `front::result_exc` LastException fusion (`except OperationError`).
+        // Plain Option / Result stay residual Method calls whose core bodies
+        // CHARON_CORE_INCLUDE translates. A non-carrier miss leaves that call.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -33923,10 +33947,6 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::JoinDefault,
             ) {
                 self.carrier_combinator_sites.push(site);
-            } else if let Some(site) =
-                self.recognize_unwrap_or_site(first_arg_ty.as_ref(), &result_var)
-            {
-                self.unwrap_or_sites.push(site);
             }
         }
         // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
@@ -38161,6 +38181,12 @@ impl<'a> Lowering<'a> {
                 &place.kind,
                 PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
                     if atom == "Deref" && tyref_is_u8_window(&inner.ty, self.llbc)
+            )
+            || matches!(
+                &place.kind,
+                PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                    if (v.get("Field").is_some() || v.get("Downcast").is_some())
+                        && tyref_is_u8_window(&inner.ty, self.llbc)
             );
         if window_place {
             if let Some((ptr, len)) = self.pair_place_parts(mir_bb, place)? {
@@ -42875,6 +42901,15 @@ impl<'a> Lowering<'a> {
         if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
             return Some((rendered.clone(), ValueType::Ref(Some(rendered))));
         }
+        // Shared `&[PyObjectRef]` is one GcArray word; `None` is
+        // `convert_const(None)` on that `ListRepr` (`rlist.py`
+        // `FixedSizeListRepr`). A mut slice of the same items is the
+        // `{ptr, len}` pair and is not this niche.
+        if let Some(root) =
+            object_pointer_gcarray_list_root(&TyRef::Other(payload.clone()), self.llbc)
+        {
+            return Some((root.clone(), ValueType::Ref(Some(root))));
+        }
         // `None` of a maybe-null `W_Root` is RPython's `None`, which unions
         // into `SomeInstance(W_Root, can_be_none=True)` and keeps the class
         // (`model.py` `unionof`).  The bare `null_mut()` is classdef-less, so
@@ -43193,9 +43228,10 @@ impl<'a> Lowering<'a> {
     /// Resolve a recognized carrier `Result<T, PyError>` combinator
     /// (`unwrap_or` / `expect` / `unwrap`) into a
     /// [`crate::front::result_exc::CarrierCombinatorSite`].  `None` when the
-    /// receiver is not the exception-carrier Result — those sites go to
-    /// [`Self::recognize_unwrap_or_site`] / [`Self::recognize_unwrap_site`] /
-    /// [`Self::recognize_expect_site`] for the value-select.
+    /// receiver is not the exception-carrier Result — `expect` / `unwrap`
+    /// then go to [`Self::recognize_unwrap_site`] /
+    /// [`Self::recognize_expect_site`], and `unwrap_or` stays a residual
+    /// call whose core body is translated.
     fn recognize_carrier_combinator_site(
         &self,
         recv_ty: Option<&TyRef>,
@@ -43221,82 +43257,6 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             payload_ty,
             catch,
-        })
-    }
-
-    /// Resolve a recognized `Option::unwrap_or(opt, default)` /
-    /// `Result::unwrap_or(res, default)` call into an
-    /// [`crate::front::option_unwrap_or::UnwrapOrSite`] — the enum root +
-    /// payload-variant owners and the payload type the value-select post-pass
-    /// needs.  `None` (leaving the residual call) when the receiver type is not
-    /// a resolvable `Option` or `Result`.  The payload variant differs by enum:
-    /// `Option::Some = 1` (`None = 0`), `Result::Ok = 0` (`Err = 1`) — recorded
-    /// in `payload_on_disc_true` so the post-pass branches to the right arm.
-    fn recognize_unwrap_or_site(
-        &self,
-        recv_ty: Option<&TyRef>,
-        result_var: &Variable,
-    ) -> Option<crate::front::option_unwrap_or::UnwrapOrSite> {
-        let recv_ty = recv_ty?;
-        // The payload variant discriminant (`Some`=1 / `Ok`=0) both classifies
-        // the receiver enum and picks the value-select polarity.  `Result<_,
-        // PyError>` is excluded — that instantiation is the exception-transform's
-        // domain (`front::result_exc` `rewire_carrier_combinator_sites` fuses
-        // its `unwrap_or` onto `LastException` edges, not a switchable
-        // discriminant value).  The capture site records a `CarrierCombinatorSite`
-        // for that receiver instead.  Only `Option` and plain-error `Result`
-        // (e.g. `io::Result`) select here.
-        let is_option = crate::front::result_exc::tyref_is_option(recv_ty, self.llbc);
-        let (payload_disc, payload_on_disc_true) = if is_option {
-            (1, true)
-        } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
-            && !crate::front::result_exc::tyref_is_result_of_carrier(
-                recv_ty,
-                self.llbc,
-                self.static_addrs.error_carrier,
-            )
-        {
-            (0, false)
-        } else {
-            return None;
-        };
-        // The payload `T` is the first type arg for both `Option<T>` and
-        // `Result<T, E>`.
-        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        let niche = self.tyref_is_niche_option_ptr(recv_ty);
-        let mut fieldless_none_tag =
-            tyref_option_fieldless_niche(recv_ty, self.llbc).map(|niche| niche.none_tag);
-        // An `Option` payload read keys the per-instantiation classdef its
-        // producer wrote (bare for the `Int`/`Unsigned`/niche carve-out); a
-        // plain-error `Result` has no suffixed producers here, so its `Ok`/`Err`
-        // owners stay bare.
-        let (enum_owner, payload_owner) = if is_option {
-            let (option_owner, some_owner, _) = self.resolve_option_consumer_owners(recv_ty)?;
-            (option_owner, some_owner)
-        } else {
-            let def_id = self.tyref_adt_def_id(recv_ty)?;
-            let td = self.llbc.type_by_id(def_id)?;
-            let enum_owner = td.item_meta.name_path();
-            let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, payload_disc)?;
-            (enum_owner, payload_owner)
-        };
-        if is_option
-            && !niche
-            && fieldless_none_tag.is_none()
-            && tyref_option_nonzero_scalar(recv_ty, self.llbc)
-        {
-            fieldless_none_tag = Some(0);
-        }
-        Some(crate::front::option_unwrap_or::UnwrapOrSite {
-            result_var: result_var.clone(),
-            enum_owner,
-            payload_owner,
-            payload_ty,
-            payload_on_disc_true,
-            niche,
-            int_null: self.option_niche_int_null(recv_ty),
-            niche_null_cast: self.option_niche_null_cast(recv_ty),
-            fieldless_none_tag,
         })
     }
 
@@ -45131,10 +45091,13 @@ impl<'a> Lowering<'a> {
     /// `Option<NonNull<T>>`, `Option<Box<T>>`, `Option<fn(..)>`, `Option<&mut T>`,
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
     /// thin nominal ADT. It also includes the exact Rust container spellings
-    /// that translate to one RPython GC pointer: `Option<Vec<T>>` becomes a
-    /// nullable `SomeList`, and `Option<&str>` / `Option<String>` (and the
-    /// other string-family payloads [`node_is_string_value`] already
-    /// projects) become a nullable `SomeString`.
+    /// that translate to one RPython GC pointer: `Option<Vec<T>>` of a
+    /// multi-word item becomes a nullable `SomeList`, a shared
+    /// `Option<&[PyObjectRef]>` is the same nullable GcArray list
+    /// (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`), and
+    /// `Option<&str>` / `Option<String>` (and the other string-family
+    /// payloads [`node_is_string_value`] already projects) become a
+    /// nullable `SomeString`.
     /// The JIT models each in ONE pointer word (`None` = null, `Some(p)` =
     /// the non-null payload pointer), so
     /// `Discriminant` on it is a pointer-null test (`base != null`) and the
@@ -45255,44 +45218,20 @@ impl<'a> Lowering<'a> {
             .is_some_and(|td| td.item_meta.name_path() == "core::ptr::non_null::NonNull")
     }
 
-    /// `true` when `option_ty` is a niche nullable `Option<P>` and `P` is
-    /// string-family ([`tyref_is_string_family`]): builtin `str`, `String`,
-    /// `Wtf8` / `Wtf8Buf` / `BytesBlock` / `Utf8Str`, including a shared
-    /// reference to those (`Option<&str>`). Under the niche model `None`
-    /// is the null string and `Some(c)` is the string `c` itself, so
-    /// derived equality is string contents — `rstr.py`
-    /// `AbstractStringRepr.rtype_eq` / `rtype_ne` → `ll_streq`.
+    /// `true` when `option_ty` is a niche nullable `Option<P>` whose
+    /// paint is `ValueType::Str` ([`tyref_is_option_of_string_value`]):
+    /// builtin `str`, `Utf8Str` / `BytesBlock`, shared `&str` /
+    /// `&Wtf8` / `&Wtf8Buf`, or by-value `Wtf8Buf` / `Utf8Str`.
+    /// `Option<&[u8]>` is the two-word `tyref_is_u8_window`, not a niche,
+    /// so it stays out. Under the niche model `None` is the null string
+    /// and `Some(c)` is the string `c` itself, so derived equality is
+    /// string contents — `rstr.py` `AbstractStringRepr.rtype_eq` /
+    /// `rtype_ne` → `ll_streq`. A rust-heap `String` / `&String` paints
+    /// `Ref` and stays out: `BinOp eq` on two `Ref`s is instance identity
+    /// (`rclass.py` `rtype_eq` → `ptr_eq`).
     fn option_niche_payload_compares_as_string(&self, option_ty: &TyRef) -> bool {
-        if !self.tyref_is_niche_option_ptr(option_ty) {
-            return false;
-        }
-        let Some(payload) = tyref_node(option_ty, self.llbc)
-            .and_then(|node| node.as_object())
-            .and_then(|m| m.get("Adt"))
-            .and_then(|a| a.as_object())
-            .and_then(|a| type_decl_ref_generics(a, self.llbc))
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-            .and_then(|t| t.first())
-        else {
-            return false;
-        };
-        // Same unique trait-projection peel as
-        // [`Self::option_niche_payload_compares_by_address`].
-        let resolved_assoc = trait_payload_node(payload, self.llbc)
-            .and_then(|node| trait_assoc_projection_target(node, self.llbc));
-        let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
-        let payload = resolved_body.unwrap_or(payload);
-        let payload_ty = TyRef::Other(payload.clone());
-        if tyref_is_shared_u8_slice(&payload_ty, self.llbc)
-            || tyref_is_bare_u8_slice(&payload_ty, self.llbc)
-        {
-            return false;
-        }
-        let Some(node) = strip_ty_wrappers(payload, self.llbc) else {
-            return false;
-        };
-        tyref_is_string_family(&TyRef::Other(node.clone()), self.llbc)
+        self.tyref_is_niche_option_ptr(option_ty)
+            && tyref_is_option_of_string_value(option_ty, self.llbc)
     }
 
     /// Operand of `<Option<P> as PartialEq>::eq` / `ne`: `&Option<P>`
@@ -45316,14 +45255,16 @@ impl<'a> Lowering<'a> {
     /// * Address identity (`*mut T` / `*const T`, `NonNull<T>`,
     ///   function pointer) — `rclass.py` `rtype_eq` / `rtype_ne`
     ///   → `ptr_eq` / `ptr_ne`; `rptr.py` `PtrRepr.rtype_eq`.
-    /// * String-family (`tyref_is_option_of_string_value` and
-    ///   `Option<&str>` / `Option<String>`) — `rstr.py`
+    /// * String-value paint (`tyref_is_option_of_string_value`:
+    ///   `Option<&str>` / `Option<&[u8]>` / `Option<Wtf8Buf>` and
+    ///   the other `Str` Options) — `rstr.py`
     ///   `AbstractStringRepr.rtype_eq` / `rtype_ne` →
     ///   `ll_streq`, which already treats a null operand
     ///   (`if not s1 or not s2: return s1 == s2`).
     ///
-    /// `&T` (pointee by value), `Box<T>` (by value), and a
-    /// non-niche aggregate Option stay residual.
+    /// A rust-heap `String` / `&String` paints `Ref`; `&T` (pointee
+    /// by value), `Box<T>` (by value), and a non-niche aggregate
+    /// Option stay residual.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -68042,10 +67983,7 @@ fn tyref_option_fieldless_niche(ty: &TyRef, llbc: &Llbc) -> Option<FieldlessOpti
 /// with `monomorphize: false`, so there is no `Option<E>` layout to read one
 /// off either. Rust does not specify the placement, so it is not derivable
 /// by rule. Declining here leaves every `Option<fieldless enum>` on the
-/// ordinary aggregate lowering; the tag threading the combinators carry
-/// ([`crate::front::option_unwrap_or::UnwrapOrSite::fieldless_none_tag`])
-/// stays exercised by its own tests and is ready for a niche encoding that
-/// reaches the artefact.
+/// ordinary aggregate lowering.
 fn fieldless_option_none_tag(_variants: usize, _storage_ty: &str) -> Option<i64> {
     None
 }
@@ -71051,10 +70989,40 @@ fn tyref_is_bare_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8")
 }
 
+/// Charon's `Option<[PyObject]>` spelling of `Option<&[PyObjectRef]>`:
+/// a bare slice of object pointers, one GcArray word.
+fn tyref_is_bare_object_pointer_slice(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    if node.get("Ref").is_some() || node.get("RawPtr").is_some() {
+        return false;
+    }
+    let Some(item) = node
+        .get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|item| strip_ty_indirections(item, llbc))
+    else {
+        return false;
+    };
+    json_ty_is_objectptr(item, llbc)
+        || object_pointer_item_spelling(&charon_type_value_to_ast_string(item, llbc, 0))
+}
+
 /// `Option<&[u8]>` / Charon `Option<[u8]>`: a nullable fat window.
 fn tyref_is_option_of_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     crate::front::result_exc::tyref_option_payload(ty, llbc).is_some_and(|payload| {
         tyref_is_shared_u8_slice(&payload, llbc) || tyref_is_bare_u8_slice(&payload, llbc)
+    })
+}
+
+/// `Option<&[PyObjectRef]>` / Charon `Option<[PyObject]>`: one nullable
+/// object GcArray (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`).
+fn tyref_is_option_of_object_pointer_slice(ty: &TyRef, llbc: &Llbc) -> bool {
+    crate::front::result_exc::tyref_option_payload(ty, llbc).is_some_and(|payload| {
+        tyref_is_object_pointer_gcarray_slice(&payload, llbc)
+            || tyref_is_bare_object_pointer_slice(&payload, llbc)
     })
 }
 
@@ -71092,12 +71060,16 @@ fn tyref_niche_option_payload_paint(
         return None;
     }
     let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
-    if !tyref_is_rust_heap_string(&payload, llbc) {
-        return None;
+    if tyref_is_rust_heap_string(&payload, llbc) {
+        return Some(ValueType::Ref(tyref_class_root_with(
+            &payload, llbc, tombstoned,
+        )));
     }
-    Some(ValueType::Ref(tyref_class_root_with(
-        &payload, llbc, tombstoned,
-    )))
+    // Shared object-pointer slice: the Option *is* the nullable list.
+    if let Some(root) = object_pointer_gcarray_list_root(&payload, llbc) {
+        return Some(ValueType::Ref(Some(root)));
+    }
+    None
 }
 
 /// `true` when Charon's resolved layout for `ty` is a two-variant
@@ -71145,6 +71117,13 @@ fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> bool {
     // set. A rust-heap `String` is not this set; it is niched by the
     // [`tyref_is_string_family`] arm below.
     if tyref_is_option_of_string_value(ty, llbc) {
+        return true;
+    }
+    // Shared `&[PyObjectRef]` / Charon's `Option<[PyObject]>` spelling
+    // is the length-prefixed object array: one GcArray word, `None` the
+    // null list (`rlist.py` `FixedSizeListRepr`). Mut object-pointer
+    // slices stay the `{ptr, len}` pair.
+    if tyref_is_option_of_object_pointer_slice(ty, llbc) {
         return true;
     }
     // A `Vec` of one-word items is the header address, never null
@@ -71532,6 +71511,24 @@ fn object_pointer_slice_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     };
     let pointee = strip_ty_indirections(pointee, llbc)?;
     let item = pointee.get("Slice")?.as_array()?.first()?;
+    let item = strip_ty_indirections(item, llbc)?;
+    let root = raw_ptr_pointee_class_root(item, llbc)
+        .or_else(|| adt_node_class_root_leaf(item, llbc, no_tombstoned_leaves()))?;
+    Some(format!("[{root}]"))
+}
+
+/// List spelling of a shared / const object-pointer slice, including
+/// Charon's bare `[PyObject]` Option payload. Mut slices are the
+/// `{ptr, len}` pair and stay out.
+fn object_pointer_gcarray_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    if tyref_is_object_pointer_gcarray_slice(ty, llbc) {
+        return object_pointer_slice_list_root(ty, llbc);
+    }
+    if !tyref_is_bare_object_pointer_slice(ty, llbc) {
+        return None;
+    }
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    let item = node.get("Slice")?.as_array()?.first()?;
     let item = strip_ty_indirections(item, llbc)?;
     let root = raw_ptr_pointee_class_root(item, llbc)
         .or_else(|| adt_node_class_root_leaf(item, llbc, no_tombstoned_leaves()))?;
@@ -82151,6 +82148,15 @@ fn tyref_option_pair_slice_item_kind(
 /// spellings): the length-prefixed object array, one GcArray word.
 fn tyref_is_object_pointer_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_object_pointer_slice_mutability(ty, llbc).is_some()
+}
+
+/// Shared / const object-pointer slice: one GcArray word. Mut slices of
+/// the same items are the `{ptr, len}` pair and stay out.
+fn tyref_is_object_pointer_gcarray_slice(ty: &TyRef, llbc: &Llbc) -> bool {
+    matches!(
+        tyref_object_pointer_slice_mutability(ty, llbc),
+        Some("Shared" | "Const")
+    )
 }
 
 /// `&T` whose pointee is a `PyObject` pointer — the argument of
@@ -119874,6 +119880,314 @@ mod tests {
         }
     }
 
+    /// `Rvalue::Discriminant` of `Option<&[u8]>` (and Charon's
+    /// `Option<[u8]>` spelling) is the nullable-window null test:
+    /// `is_(data, None)` then `eq(_, false)`. The data word is CCHARP;
+    /// `UInt(0)` is not a pointer null.
+    #[test]
+    fn option_u8_window_discriminant_is_pointer_null_test() {
+        use crate::model::OpKind;
+
+        let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let payloads = [
+            ("Option<&[u8]>", window_shared_slice()),
+            ("Option<[u8]>", window_slice()),
+        ];
+        for (name, payload) in payloads {
+            let option_ty = option_adt_node(0, payload);
+            let caller = serde_json::json!({
+                "def_id": 0,
+                "item_meta": window_meta(&["fixture", "window_disc"], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [option_ty.clone()],
+                    "output": disc_ty.clone()
+                },
+                "body": {"Unstructured": {
+                    "span": window_span(),
+                    "locals": {"arg_count": 1, "locals": [
+                        window_local(0, &disc_ty),
+                        window_local(1, &option_ty)
+                    ]},
+                    "body": [{
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &disc_ty),
+                                {"Discriminant": window_place(
+                                    serde_json::json!({"Local": 1}),
+                                    &option_ty
+                                )}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {"span": window_span(), "kind": "Return"}
+                    }]
+                }}
+            });
+            let llbc = window_llbc(vec![option_enum(0)], vec![caller]);
+            let graph = super::lower_function(&llbc, "window_disc")
+                .unwrap_or_else(|err| panic!("{name}: lower Discriminant: {err}"));
+            let ops: Vec<&crate::model::SpaceOperation> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .collect();
+            let const_uint_zeros = ops
+                .iter()
+                .filter(|op| matches!(&op.kind, OpKind::ConstUInt(0)))
+                .count();
+            assert_eq!(
+                const_uint_zeros,
+                0,
+                "{name}: window Discriminant must not emit ConstUInt(0); graph={}",
+                graph.dump()
+            );
+            let ne_ops = ops
+                .iter()
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
+                .count();
+            assert_eq!(
+                ne_ops,
+                0,
+                "{name}: window Discriminant must not emit BinOp ne; graph={}",
+                graph.dump()
+            );
+            let none_ids: std::collections::HashSet<u64> = ops
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::ConstNone => op.result.as_ref().map(|v| v.id()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !none_ids.is_empty(),
+                "{name}: window Discriminant must emit ConstNone; graph={}",
+                graph.dump()
+            );
+            let is_none_ids: std::collections::HashSet<u64> = ops
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::BinOp { op: name, rhs, .. }
+                        if name == "is_" && none_ids.contains(&rhs.id()) =>
+                    {
+                        op.result.as_ref().map(|v| v.id())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !is_none_ids.is_empty(),
+                "{name}: window Discriminant must emit is_(data, None); graph={}",
+                graph.dump()
+            );
+            let false_ids: std::collections::HashSet<u64> = ops
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::ConstBool(false) => op.result.as_ref().map(|v| v.id()),
+                    _ => None,
+                })
+                .collect();
+            let some_eq = ops.iter().any(|op| match &op.kind {
+                OpKind::BinOp {
+                    op: name, lhs, rhs, ..
+                } => {
+                    name == "eq" && is_none_ids.contains(&lhs.id()) && false_ids.contains(&rhs.id())
+                }
+                _ => false,
+            });
+            assert!(
+                some_eq,
+                "{name}: window Discriminant must emit eq(is_none, false); graph={}",
+                graph.dump()
+            );
+            let disc_reads = ops
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                    )
+                })
+                .count();
+            assert_eq!(
+                disc_reads,
+                0,
+                "{name}: window Discriminant must not read __discriminant; graph={}",
+                graph.dump()
+            );
+        }
+    }
+
+    /// `match opt { Some(w) => w, None => default }` over `Option<&[u8]>`
+    /// (and Charon's `Option<[u8]>` spelling): the `Some` payload is the
+    /// Option's window, not a tagged `Option<[u8]>::Some` instance.
+    #[test]
+    fn option_u8_window_some_payload_is_the_window() {
+        use crate::model::{CallTarget, ExitCase, LinkArg, OpKind};
+
+        let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+        let payloads = [
+            ("Option<&[u8]>", window_shared_slice()),
+            ("Option<[u8]>", window_slice()),
+        ];
+        for (name, payload) in payloads {
+            let option_ty = option_adt_node(0, payload.clone());
+            // `unwrap_or` returns `&[u8]`: a window dest. Charon's
+            // `Option<[u8]>` spelling still projects `Some.0` as `[u8]`.
+            let dest_ty = window_shared_slice();
+            let opt_place = window_place(serde_json::json!({"Local": 1}), &option_ty);
+            let default_place = window_place(serde_json::json!({"Local": 2}), &dest_ty);
+            let ret_place = window_place(serde_json::json!({"Local": 0}), &dest_ty);
+            let disc_place = window_place(serde_json::json!({"Local": 3}), &disc_ty);
+            let some_payload = window_place(
+                serde_json::json!({"Projection": [
+                    window_place(
+                        serde_json::json!({"Projection": [opt_place.clone(), {"Downcast": 1}]}),
+                        &option_ty
+                    ),
+                    {"Field": [1, 0]}
+                ]}),
+                &payload,
+            );
+            let caller = serde_json::json!({
+                "def_id": 0,
+                "item_meta": window_meta(&["fixture", "window_some_payload"], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [option_ty.clone(), dest_ty.clone()],
+                    "output": dest_ty.clone()
+                },
+                "body": {"Unstructured": {
+                    "span": window_span(),
+                    "locals": {"arg_count": 2, "locals": [
+                        window_local(0, &dest_ty),
+                        window_local(1, &option_ty),
+                        window_local(2, &dest_ty),
+                        window_local(3, &disc_ty)
+                    ]},
+                    "body": [
+                        {
+                            "statements": [{
+                                "span": window_span(),
+                                "kind": {"Assign": [
+                                    disc_place.clone(),
+                                    {"Discriminant": opt_place.clone()}
+                                ]}
+                            }],
+                            "kind": "Regular",
+                            "terminator": {"span": window_span(), "kind": {"Switch": {
+                                "discr": {"Copy": disc_place.clone()},
+                                "targets": {"SwitchInt": [
+                                    null,
+                                    [
+                                        [{"Scalar": {"Signed": ["Isize", "1"]}}, 1],
+                                        [{"Scalar": {"Signed": ["Isize", "0"]}}, 2]
+                                    ],
+                                    2
+                                ]}
+                            }}}
+                        },
+                        {
+                            "statements": [{
+                                "span": window_span(),
+                                "kind": {"Assign": [
+                                    ret_place.clone(),
+                                    {"Use": [{"Copy": some_payload}, "No"]}
+                                ]}
+                            }],
+                            "kind": "Regular",
+                            "terminator": {"span": window_span(), "kind": "Return"}
+                        },
+                        {
+                            "statements": [{
+                                "span": window_span(),
+                                "kind": {"Assign": [
+                                    ret_place.clone(),
+                                    {"Use": [{"Copy": default_place}, "No"]}
+                                ]}
+                            }],
+                            "kind": "Regular",
+                            "terminator": {"span": window_span(), "kind": "Return"}
+                        }
+                    ]
+                }}
+            });
+            let llbc = window_llbc(vec![option_enum(0)], vec![caller]);
+            let graph = super::lower_function(&llbc, "window_some_payload")
+                .unwrap_or_else(|err| panic!("{name}: lower Some payload: {err}"));
+            let ops: Vec<&crate::model::SpaceOperation> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .collect();
+            let cast_instance = ops
+                .iter()
+                .any(|op| crate::model::cast_instance_root(&op.kind).is_some());
+            assert!(
+                !cast_instance,
+                "{name}: Some arm must not emit __cast_instance_intrinsic; graph={}",
+                graph.dump()
+            );
+            let pos0 = ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+                )
+            });
+            assert!(
+                !pos0,
+                "{name}: Some arm must not getattr \"__pos_0\"; graph={}",
+                graph.dump()
+            );
+            let cast_int_to_ptr = ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                )
+            });
+            assert!(
+                !cast_int_to_ptr,
+                "{name}: Some arm must not emit cast_int_to_ptr; graph={}",
+                graph.dump()
+            );
+            // The niche `is_some` switch's true arm is `Some`. After the
+            // branch the data word is the successor's first inputarg
+            // (SSA-renamed `arg1`), not the startblock's `arg1_0`.
+            let start = graph.block(graph.startblock);
+            let some_link = start
+                .exits
+                .iter()
+                .find(|link| link.exitcase == Some(ExitCase::Bool(true)))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name}: Some is the true arm of the niche is_some switch; graph={}",
+                        graph.dump()
+                    )
+                });
+            let some_block = graph.block(some_link.target);
+            let some_data = some_block.inputargs.first().unwrap_or_else(|| {
+                panic!("{name}: Some arm carries opt data; graph={}", graph.dump())
+            });
+            let some_returns_opt = if some_link.target == graph.returnblock {
+                matches!(some_link.args.first(), Some(LinkArg::Value(v)) if v == some_data)
+            } else {
+                some_block.exits.iter().any(|link| {
+                    link.target == graph.returnblock
+                        && matches!(link.args.first(), Some(LinkArg::Value(v)) if v == some_data)
+                })
+            };
+            assert!(
+                some_returns_opt,
+                "{name}: Some arm must return opt's data word; graph={}",
+                graph.dump()
+            );
+        }
+    }
+
     /// Real-LLBC anchor for the `FixedObjectArray` Index intercept.  The
     /// intercept returns before `lower_call`'s ordinary result-narrowing tail,
     /// so an object element must carry its own `PyObject` narrow immediately
@@ -120823,6 +121137,148 @@ mod tests {
                 "Option<&String> param class root is the payload String's class root"
             );
         });
+    }
+
+    /// `<Option<String> as PartialEq>::eq` operands are `&Option<String>`.
+    /// The Option paints as the payload String's `Ref`, so a `BinOp eq`
+    /// would be instance identity (`rclass.py` `rtype_eq` → `ptr_eq`).
+    /// The operand is not admitted; the call stays on the ordinary path.
+    #[test]
+    fn option_of_string_eq_operand_is_not_string_binop() {
+        use crate::model::ValueType;
+        let llbc = option_of_string_value_llbc();
+        let option_string = TyRef::Other(option_adt_node(0, adt_node(2)));
+        let operand = TyRef::Other(option_shared_ref(option_adt_node(0, adt_node(2))));
+        assert!(
+            matches!(
+                super::tyref_to_value_type(&option_string, &llbc),
+                ValueType::Ref(_)
+            ),
+            "Option<String> paint is a Ref"
+        );
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                !lowering.option_niche_eq_ne_operand(&operand),
+                "Option<String> eq operand is not the string BinOp shortcut"
+            );
+        });
+    }
+
+    /// `<Option<&str> as PartialEq>::eq` operands are `&Option<&str>`.
+    /// The Option paints `Str`, so derived equality is string contents
+    /// (`rstr.py` `AbstractStringRepr.rtype_eq` → `ll_streq`).
+    #[test]
+    fn option_of_shared_str_eq_operand_is_string_binop() {
+        use crate::model::ValueType;
+        let llbc = option_of_string_value_llbc();
+        let option_str = option_adt_node(
+            0,
+            option_shared_ref(serde_json::json!({"Adt": {"builtin": "Str"}})),
+        );
+        let option_ty = TyRef::Other(option_str.clone());
+        let operand = TyRef::Other(option_shared_ref(option_str));
+        assert!(
+            matches!(
+                super::tyref_to_value_type(&option_ty, &llbc),
+                ValueType::Str
+            ),
+            "Option<&str> paint is Str"
+        );
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                lowering.option_niche_eq_ne_operand(&operand),
+                "Option<&str> eq operand is the string BinOp shortcut"
+            );
+        });
+    }
+
+    fn option_of_object_pointer_slice_llbc() -> Llbc {
+        llbc_with_types(
+            "fixture",
+            vec![
+                option_enum(0),
+                code_struct(1, &["pyre_object", "pyobject", "PyObject"]),
+            ],
+            vec![],
+        )
+    }
+
+    fn object_pointer_slice_node(kind: &str) -> serde_json::Value {
+        let item = serde_json::json!({"RawPtr": [adt_node(1), "Mut"]});
+        let slice = serde_json::json!({"Slice": [item, null]});
+        serde_json::json!({"Ref": ["Erased", slice, kind]})
+    }
+
+    /// `Option<&[PyObjectRef]>` is the nullable object GcArray list.
+    /// `Discriminant` is a null test; the param seeds `SomeList` of
+    /// `PyObject` (`rlist.py` `FixedSizeListRepr`).
+    #[test]
+    fn option_of_object_pointer_slice_is_nullable_list() {
+        use crate::model::ValueType;
+        let llbc = option_of_object_pointer_slice_llbc();
+        let option_ty = TyRef::Other(option_adt_node(0, object_pointer_slice_node("Shared")));
+        let list_root = Some("[PyObject]".to_string());
+        assert_eq!(
+            super::tyref_to_value_type(&option_ty, &llbc),
+            ValueType::Ref(list_root.clone()),
+            "Option<&[*mut PyObject]> paints as the nullable object list"
+        );
+        let tomb = super::no_tombstoned_leaves();
+        assert_eq!(
+            super::tyref_ref_param_class_root(&option_ty, &llbc, &tomb, None),
+            list_root,
+            "Option<&[*mut PyObject]> param seeds SomeList of PyObject"
+        );
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                lowering.tyref_is_niche_option_ptr(&option_ty),
+                "Option<&[*mut PyObject]> is the nullable-list niche"
+            );
+            assert_eq!(
+                lowering.option_niche_null_cast(&option_ty),
+                Some((
+                    "[PyObject]".to_string(),
+                    ValueType::Ref(Some("[PyObject]".into()))
+                )),
+                "None is convert_const(None) on that ListRepr"
+            );
+        });
+    }
+
+    /// Charon's `Option<[PyObject]>` spelling of the same slice.
+    #[test]
+    fn option_of_bare_object_pointer_slice_is_nullable_list() {
+        use crate::model::ValueType;
+        let llbc = option_of_object_pointer_slice_llbc();
+        let item = serde_json::json!({"RawPtr": [adt_node(1), "Mut"]});
+        let option_ty = TyRef::Other(option_adt_node(
+            0,
+            serde_json::json!({"Slice": [item, null]}),
+        ));
+        assert_eq!(
+            super::tyref_to_value_type(&option_ty, &llbc),
+            ValueType::Ref(Some("[PyObject]".into())),
+            "Charon Option<[PyObject]> paints as the nullable object list"
+        );
+        with_fixture_lowering(&llbc, |lowering| {
+            assert!(
+                lowering.tyref_is_niche_option_ptr(&option_ty),
+                "Charon Option<[PyObject]> is the nullable-list niche"
+            );
+        });
+    }
+
+    /// Mut object-pointer slices are the `{ptr, len}` pair at call sites
+    /// (`try_lower_pair_unwrap_or`). They are not the shared GcArray list
+    /// niche this conversion added.
+    #[test]
+    fn option_of_mut_object_pointer_slice_is_not_gcarray_list() {
+        let llbc = option_of_object_pointer_slice_llbc();
+        let option_ty = TyRef::Other(option_adt_node(0, object_pointer_slice_node("Mut")));
+        assert!(
+            !super::tyref_is_option_of_object_pointer_slice(&option_ty, &llbc),
+            "mut object-pointer slice is not the shared GcArray Option niche"
+        );
     }
 
     /// `Option<&[u8]>` None is a null window data word, not

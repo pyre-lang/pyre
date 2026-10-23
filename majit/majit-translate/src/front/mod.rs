@@ -92,7 +92,6 @@ pub(crate) mod option_is_none;
 pub(crate) mod option_map_or;
 pub(crate) mod option_try;
 pub(crate) mod option_unwrap;
-pub(crate) mod option_unwrap_or;
 pub(crate) mod range_iter;
 pub(crate) mod rbigint_call;
 pub(crate) mod result_as_ref;

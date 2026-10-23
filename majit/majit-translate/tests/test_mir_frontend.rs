@@ -1753,26 +1753,105 @@ fn a_char_element_indexes_to_an_int_banked_array_read() {
     );
 }
 
-/// `align.unwrap_or('>')` over an `Option<char>` joins the `Some` payload with
-/// the literal default. A Rust `char` is a Unicode scalar
-/// (`bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`): the literal
-/// is the integer code point plus `unichr`. Both links into the join are
-/// int-kind (`UniChar` rtypes in the int bank). A `__str_const` string
-/// would put a Ref on one link, which `flatten` cannot rename.
+/// `align.unwrap_or('>')` over an `Option<char>`. A `char` is an int-kind
+/// scalar, so the `'>'` default is the integer code point plus `unichr`
+/// (`bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`), int-kind, and the
+/// call result stays in the Int bank. The join of that default with the `Some`
+/// payload lives in the core `unwrap_or` body; the caller keeps one residual
+/// call to that body. A literal lowered as a `__str_const` string would put
+/// a Ref on the default argument and an Int on the payload, which `flatten`
+/// cannot rename into one register.
 #[test]
 fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
     use majit_translate::flowspace::model::Variable;
-    use majit_translate::model::{CallTarget, LinkArg, OpKind, ValueType};
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{Block, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
-    let graph = lower_function(load_corpus(), "char_unwrap_or_join").expect("lowering");
-    let producer = |var: &Variable| -> Option<&OpKind> {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .find(|op| op.result.as_ref() == Some(var))
-            .map(|op| &op.kind)
-    };
+    fn unwrap_or_leaf(leaf: &str) -> bool {
+        leaf == "unwrap_or" || leaf.starts_with("unwrap_or__spec")
+    }
+
+    fn names_core_unwrap_or(target: &CallTarget) -> bool {
+        match target {
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().is_some_and(|leaf| unwrap_or_leaf(leaf))
+            }
+            CallTarget::Method {
+                name,
+                resolved_path: Some(path),
+                ..
+            } => {
+                unwrap_or_leaf(name)
+                    && path
+                        .segments
+                        .last()
+                        .is_some_and(|leaf| unwrap_or_leaf(leaf))
+            }
+            CallTarget::Method { name, .. } => unwrap_or_leaf(name),
+            _ => false,
+        }
+    }
+
+    fn is_same_block_copy(kind: &OpKind) -> Option<&Variable> {
+        match kind {
+            OpKind::UnaryOp { op, operand, .. }
+                if matches!(op.as_str(), "same_as" | "int_copy" | "int_same_as") =>
+            {
+                Some(operand)
+            }
+            _ => None,
+        }
+    }
+
+    fn producer_in<'a>(
+        graph: &'a FunctionGraph,
+        var: &Variable,
+    ) -> Option<(&'a Block, &'a OpKind)> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(var))
+                .map(|op| (block, &op.kind))
+        })
+    }
+
+    fn arg_from_const_int(
+        graph: &FunctionGraph,
+        call_block: &Block,
+        var: &Variable,
+        lit: i64,
+    ) -> bool {
+        let mut cur = var.clone();
+        loop {
+            let Some((block, kind)) = producer_in(graph, &cur) else {
+                return false;
+            };
+            match kind {
+                OpKind::ConstInt(x) if *x == lit => return true,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.first().map(String::as_str) == Some("__majit_unichr") => {
+                    let Some(src) = args.first().and_then(|arg| arg.as_variable()) else {
+                        return false;
+                    };
+                    cur = src.clone();
+                }
+                _ if block.id == call_block.id => {
+                    let Some(src) = is_same_block_copy(kind) else {
+                        return false;
+                    };
+                    cur = src.clone();
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "char_unwrap_or_join").expect("lowering");
     assert!(
         !graph
             .blocks
@@ -1804,53 +1883,113 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
                 is_unichr(segments)
                     && args.iter().any(|arg| match arg {
                         LinkArg::Value(v) => {
-                            matches!(producer(v), Some(OpKind::ConstInt(0x3e)))
+                            matches!(
+                                producer_in(&graph, v).map(|(_, kind)| kind),
+                                Some(OpKind::ConstInt(0x3e))
+                            )
                         }
                         LinkArg::Const(_) => false,
                     })
             }),
         "the '>' default is the Int code point 0x3e passed to __majit_unichr",
     );
-    // Every link argument into a block input produced by the unichr
-    // literal or by the `Some.__pos_0` payload read is int-kind, and at
-    // least one input receives both — the `unwrap_or` join.
-    let mut joins = 0;
-    for target in &graph.blocks {
-        for (slot, _) in target.inputargs.iter().enumerate() {
-            let mut kinds = Vec::new();
-            for block in &graph.blocks {
-                for link in block.exits.iter().filter(|l| l.target == target.id) {
-                    let Some(LinkArg::Value(v)) = link.args.get(slot) else {
-                        continue;
-                    };
-                    match producer(v) {
-                        Some(OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            result_ty,
-                            ..
-                        }) if is_unichr(segments) => kinds.push(("literal", result_ty.clone())),
-                        Some(OpKind::FieldRead { field, ty, .. }) if field.name == "__pos_0" => {
-                            kinds.push(("payload", ty.clone()))
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if kinds.iter().any(|(k, _)| *k == "literal")
-                && kinds.iter().any(|(k, _)| *k == "payload")
+
+    let mut unwrap_or_calls = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } = &op.kind
+                && names_core_unwrap_or(target)
             {
-                joins += 1;
-                assert!(
-                    kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
-                    "both links into the unwrap_or join are int-kind, got {kinds:?}",
-                );
+                unwrap_or_calls.push((block, args, result_ty));
             }
         }
     }
     assert_eq!(
-        joins, 1,
-        "one block input joins the payload and the literal default"
+        unwrap_or_calls.len(),
+        1,
+        "the caller graph has one core unwrap_or call, got {}",
+        unwrap_or_calls.len()
     );
+    let (call_block, args, result_ty) = unwrap_or_calls[0];
+    assert_eq!(
+        *result_ty,
+        ValueType::Int,
+        "unwrap_or of Option<char> returns Int"
+    );
+    assert!(
+        args.iter().any(|arg| arg
+            .as_variable()
+            .is_some_and(|v| arg_from_const_int(&graph, call_block, v, 0x3e))),
+        "one unwrap_or argument is the unichr(0x3e) default"
+    );
+
+    if let Some(fd) = llbc.iter_fun_decls().find(|fd| {
+        if !fd.has_unstructured_body() {
+            return false;
+        }
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        if !unwrap_or_leaf(leaf) || !path.contains("option") {
+            return false;
+        }
+        let inst = fd
+            .item_meta
+            .instantiation()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let blob = format!("{path}{inst}");
+        blob.contains("char") || blob.contains("Char")
+    }) {
+        let context = LowerContext::new(llbc);
+        let body =
+            lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower core unwrap_or: {e}"));
+        let producer = |var: &Variable| -> Option<&OpKind> {
+            body.blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .find(|op| op.result.as_ref() == Some(var))
+                .map(|op| &op.kind)
+        };
+        let mut joins = 0;
+        for target in &body.blocks {
+            for (slot, _) in target.inputargs.iter().enumerate() {
+                let mut kinds = Vec::new();
+                for block in &body.blocks {
+                    for link in block.exits.iter().filter(|l| l.target == target.id) {
+                        let Some(LinkArg::Value(v)) = link.args.get(slot) else {
+                            continue;
+                        };
+                        match producer(v) {
+                            Some(OpKind::Input { ty, .. }) => kinds.push(("default", ty.clone())),
+                            Some(OpKind::FieldRead { field, ty, .. })
+                                if field.name == "__pos_0" =>
+                            {
+                                kinds.push(("payload", ty.clone()))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if kinds.iter().any(|(k, _)| *k == "default")
+                    && kinds.iter().any(|(k, _)| *k == "payload")
+                {
+                    joins += 1;
+                    assert!(
+                        kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
+                        "both links into the unwrap_or join are int-kind, got {kinds:?}",
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            joins, 1,
+            "one block input joins the payload and the default parameter"
+        );
+    }
 }
 
 /// The same pair over `Vec<i64>`, whose one-word items make the receiver the

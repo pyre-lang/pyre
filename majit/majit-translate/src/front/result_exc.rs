@@ -4686,7 +4686,7 @@ fn resolve_incoming(incoming: &[PlannedIncoming], payload: &Variable) -> Vec<Lin
 }
 
 /// Fresh arm that narrows `replacement` then reconstructs the join
-/// (`option_unwrap_or::emit_narrow`; `Link.__init__` one arg per inputarg).
+/// (`option_unwrap::emit_narrow`; `Link.__init__` one arg per inputarg).
 fn emit_join_cast_arm(
     graph: &mut FunctionGraph,
     inspect: &UnwrapOrInspect,
@@ -4701,7 +4701,7 @@ fn emit_join_cast_arm(
             .expect("cast arm narrows an input the plan recorded"),
         NarrowFrom::Const(c) => materialize_call_arg_constant(graph, bb, c),
     };
-    let narrowed = crate::front::option_unwrap_or::emit_narrow(graph, bb, &inspect.cast, raw);
+    let narrowed = crate::front::option_unwrap::emit_narrow(graph, bb, &inspect.cast, raw);
     let outgoing: Vec<LinkArg> = cast
         .outgoing
         .iter()
