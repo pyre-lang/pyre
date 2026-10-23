@@ -1731,14 +1731,12 @@ fn list_method_extend(
     None
 }
 
-#[allow(dead_code)]
 fn method_reverse(_ann: &RPythonAnnotator, s_self: &super::model::SomeList) -> Option<SomeValue> {
     // unaryop.py:369-370 — falls off the end (void op).
     s_self.listdef.mutate().expect("listdef.mutate");
     None
 }
 
-#[allow(dead_code)]
 fn method_insert(
     ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
@@ -1749,7 +1747,6 @@ fn method_insert(
     list_method_append(ann, s_self, s_value)
 }
 
-#[allow(dead_code)]
 fn method_remove(
     _ann: &RPythonAnnotator,
     s_self: &super::model::SomeList,
@@ -2748,7 +2745,6 @@ fn str_method_isalpha(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue
     SomeValue::Bool(SomeBool::new())
 }
 
-#[allow(dead_code)]
 fn method_isalnum(_ann: &RPythonAnnotator, _s_self: &SomeValue) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
@@ -2788,7 +2784,6 @@ fn str_method_splitlines(ann: &RPythonAnnotator, s_self: &SomeValue) -> SomeValu
     SomeValue::List(s_list)
 }
 
-#[allow(dead_code)]
 fn method_format(_ann: &RPythonAnnotator, _s_self: &SomeValue, _args: &[SomeValue]) -> SomeValue {
     // unaryop.py method_format — always raises.
     panic!("AnnotatorError: Method format() is not RPython")
