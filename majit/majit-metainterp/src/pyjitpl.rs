@@ -6676,7 +6676,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let hot = self
             .warm_state_for_driver(jd_no)
-            .force_start_tracing_for_key(&typed_values);
+            .force_start_tracing_for_key(&typed_values, live_values);
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6875,7 +6875,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         let hot = self
             .warm_state_for_driver(jd_no)
-            .force_start_tracing_for_key(&typed_values);
+            .force_start_tracing_for_key(&typed_values, live_values);
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6920,8 +6920,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> HotResult {
-        self.on_back_edge_typed_decision_on_driver(0, green_key, green_key_raw)
+        self.on_back_edge_typed_decision_on_driver(0, green_key, green_key_raw, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` occupied-cell decision on that
@@ -6931,6 +6932,7 @@ impl<M: Clone> MetaInterp<M> {
         jd_no: usize,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> HotResult {
         if self.tracing.is_some() {
             return HotResult::AlreadyTracing;
@@ -6948,16 +6950,33 @@ impl<M: Clone> MetaInterp<M> {
         // driver's cell still has a procedure token and the frontend row is
         // present. ` |_| true` adopted a sibling-driver token.
         let compiled_loops = &self.compiled_loops;
-        let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-        match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            warm_state.maybe_compile_decision_with_key(key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
+        let typed = {
+            let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+            Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                warm_state.maybe_compile_decision_with_key(
+                    key,
+                    |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                    reds,
+                )
             })
-        }) {
+        };
+        match typed {
             Some(hot) => hot,
-            None => warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            }),
+            None => {
+                let types = self
+                    .staticdata
+                    .jitdrivers_sd
+                    .get(jd_no)
+                    .map(|d| d.green_args_spec())
+                    .unwrap_or_default();
+                let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+                warm_state.maybe_compile_decision_with_meta(
+                    green_key,
+                    |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                    &types,
+                    reds,
+                )
+            }
         }
     }
 
@@ -6996,7 +7015,12 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> BackEdgeAction {
         let jd_no = self.entry_warm_jd(driver_descriptor);
-        match self.on_back_edge_typed_decision_on_driver(jd_no, green_key, green_key_raw) {
+        match self.on_back_edge_typed_decision_on_driver(
+            jd_no,
+            green_key,
+            green_key_raw,
+            live_values,
+        ) {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => self.start_back_edge_trace(
                 green_key,
@@ -13595,11 +13619,12 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         // Production extra-driver entry uses `JitDriver::maybe_compile_and_run_step`
         // with `JitDriver::index()`. The portal driver's index is 0; leftover
         // `active_jitdriver_sd` is not this door.
-        self.maybe_compile_and_run_step_on_driver(0, green_key, green_key_raw)
+        self.maybe_compile_and_run_step_on_driver(0, green_key, green_key_raw, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` on that driver's WarmEnterState.
@@ -13613,6 +13638,7 @@ impl<M: Clone> MetaInterp<M> {
         jd_no: usize,
         green_key: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         self.make_enter_function(jd_no);
         // `compiled_loops` is keyed `(jitdriver_sd.index, cell green_key)`.
@@ -13625,15 +13651,20 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_loops = &self.compiled_loops;
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
-            let step = warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            });
+            let step = warm_state.maybe_compile_decision_with_meta(
+                green_key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                &[],
+                reds,
+            );
             return (step, green_key);
         }
         match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            let step = warm_state.maybe_compile_decision_with_key(key, |cell_key| {
-                compiled_loops.contains_key(&(jd_no, cell_key))
-            });
+            let step = warm_state.maybe_compile_decision_with_key(
+                key,
+                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                reds,
+            );
             let resolved_key = if matches!(step, crate::warmstate::HotResult::RunCompiled) {
                 warm_state.cell_key_for(key).unwrap_or(green_key)
             } else {
@@ -13642,12 +13673,25 @@ impl<M: Clone> MetaInterp<M> {
             (step, resolved_key)
         }) {
             Some(step) => step,
-            None => (
-                warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
-                    compiled_loops.contains_key(&(jd_no, cell_key))
-                }),
-                green_key,
-            ),
+            None => {
+                drop(warm_state);
+                let types = self
+                    .staticdata
+                    .jitdrivers_sd
+                    .get(jd_no)
+                    .map(|d| d.green_args_spec())
+                    .unwrap_or_default();
+                let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+                (
+                    warm_state.maybe_compile_decision_with_meta(
+                        green_key,
+                        |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                        &types,
+                        reds,
+                    ),
+                    green_key,
+                )
+            }
         }
     }
 
@@ -13708,8 +13752,9 @@ impl<M: Clone> MetaInterp<M> {
         cell_key: u64,
         green_key_hash: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
-        self.function_entry_step_on_driver(0, cell_key, green_key_hash, green_key_raw)
+        self.function_entry_step_on_driver(0, cell_key, green_key_hash, green_key_raw, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` with
@@ -13720,6 +13765,7 @@ impl<M: Clone> MetaInterp<M> {
         cell_key: u64,
         green_key_hash: u64,
         green_key_raw: (usize, usize),
+        reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
         let engine_is_tracing = self.is_tracing();
@@ -13731,6 +13777,7 @@ impl<M: Clone> MetaInterp<M> {
                 None,
                 || compiled_loops.contains_key(&(jd_no, cell_key)),
                 engine_is_tracing,
+                reds,
             );
         }
         match Self::with_typed_decision_key(green_key_hash, green_key_raw, |key| {
@@ -13739,6 +13786,7 @@ impl<M: Clone> MetaInterp<M> {
                 Some(key),
                 || compiled_loops.contains_key(&(jd_no, cell_key)),
                 engine_is_tracing,
+                reds,
             )
         }) {
             Some(step) => step,
@@ -13747,6 +13795,7 @@ impl<M: Clone> MetaInterp<M> {
                 None,
                 || compiled_loops.contains_key(&(jd_no, cell_key)),
                 engine_is_tracing,
+                reds,
             ),
         }
     }
@@ -25588,12 +25637,13 @@ mod metainterp_static_data_tests {
         );
 
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run on jd1 reads that driver's compiled cell"
         );
-        let (on_portal, _) = meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0));
+        let (on_portal, _) =
+            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "portal slot 0 does not return RunCompiled just because compiled_loops contains the key"
@@ -27975,12 +28025,13 @@ mod metainterp_static_data_tests {
         );
 
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run on jd1 reads that driver's compiled cell"
         );
-        let (on_portal, _) = meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0));
+        let (on_portal, _) =
+            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "portal slot 0 does not see jd1's compiled cell"
@@ -28036,7 +28087,8 @@ mod metainterp_static_data_tests {
             },
         );
 
-        let (on_portal, _) = meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0));
+        let (on_portal, _) =
+            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "shipped insert_compiled_loop must land on the portal while leftover active_jitdriver_sd is a sibling"
@@ -28100,13 +28152,13 @@ mod metainterp_static_data_tests {
             "compile_loop internals look up leftover compiling jitdriver_sd"
         );
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "extra-driver compile files on that driver's index"
         );
         let (on_portal, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx0, key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx0, key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "extra-driver compile must not land on portal 0"
@@ -28158,7 +28210,7 @@ mod metainterp_static_data_tests {
         );
 
         let on_entry =
-            meta.function_entry_step_on_driver(idx1, key.get_uhash(), key.get_uhash(), (0, 0));
+            meta.function_entry_step_on_driver(idx1, key.get_uhash(), key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(
                 on_entry,
@@ -28167,7 +28219,7 @@ mod metainterp_static_data_tests {
             "function-entry on jd1 reads that driver's compiled cell"
         );
         let on_portal =
-            meta.function_entry_step_on_driver(0, key.get_uhash(), key.get_uhash(), (0, 0));
+            meta.function_entry_step_on_driver(0, key.get_uhash(), key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(
                 on_portal,
@@ -28276,14 +28328,14 @@ mod metainterp_static_data_tests {
         );
         assert!(
             matches!(
-                meta.on_back_edge_typed_decision_on_driver(idx1, key.get_uhash(), (0, 0)),
+                meta.on_back_edge_typed_decision_on_driver(idx1, key.get_uhash(), (0, 0), &[]),
                 crate::warmstate::HotResult::RunCompiled
             ),
             "occupied-cell decision on jd1 reads that driver's compiled cell"
         );
         assert!(
             !matches!(
-                meta.on_back_edge_typed_decision(key.get_uhash(), (0, 0)),
+                meta.on_back_edge_typed_decision(key.get_uhash(), (0, 0), &[]),
                 crate::warmstate::HotResult::RunCompiled
             ),
             "portal slot 0 does not take jd1's compiled cell as RunCompiled"
@@ -30636,8 +30688,12 @@ mod metainterp_static_data_tests {
                 front_target: None,
             },
         );
-        let (step, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx, portal_hash, (portal_code, portal_pc));
+        let (step, _) = meta.maybe_compile_and_run_step_on_driver(
+            idx,
+            portal_hash,
+            (portal_code, portal_pc),
+            &[],
+        );
         assert!(
             matches!(step, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -30740,7 +30796,7 @@ mod metainterp_static_data_tests {
         meta.tracing = meta.compile_tracing.take();
         meta.abort_trace_live(false);
 
-        let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (portal_code, portal_pc));
+        let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (portal_code, portal_pc), &[]);
         assert!(
             matches!(step, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -35236,13 +35292,13 @@ mod tests {
             "has_compiled_loop_entry follows leftover compiling jitdriver_sd"
         );
         let (on_entry, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx1, green_key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx1, green_key.get_uhash(), (0, 0), &[]);
         assert!(
             matches!(on_entry, crate::warmstate::HotResult::RunCompiled),
             "maybe_compile_and_run on the compiling driver sees the loop"
         );
         let (on_portal, _) =
-            meta.maybe_compile_and_run_step_on_driver(idx0, green_key.get_uhash(), (0, 0));
+            meta.maybe_compile_and_run_step_on_driver(idx0, green_key.get_uhash(), (0, 0), &[]);
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "portal slot 0 must not see an extra-driver compiled cell"
@@ -35294,7 +35350,7 @@ mod tests {
         assert!(meta.has_compiled_loop(green_key));
         assert!(
             matches!(
-                meta.function_entry_step(green_key, green_key, (0, 0)),
+                meta.function_entry_step(green_key, green_key, (0, 0), &[]),
                 crate::warmstate::FunctionEntryStep::NotHot
             ),
             "warmstate.py checks JC_TEMPORARY before the procedure token, so retained loop \
@@ -37084,7 +37140,7 @@ mod loop_side_table_tests {
         }
     }
 
-    fn rejecting_confirm_enter_jit(_greenargs: &[i64]) -> bool {
+    fn rejecting_confirm_enter_jit(_args: &[Value]) -> bool {
         false
     }
 
@@ -37119,7 +37175,7 @@ mod loop_side_table_tests {
             .set_confirm_enter_jit(Some(rejecting_confirm_enter_jit));
 
         assert!(matches!(
-            meta.maybe_compile_and_run_step(hash, raw),
+            meta.maybe_compile_and_run_step(hash, raw, &[]),
             (crate::warmstate::HotResult::NotHot, _),
         ));
     }
@@ -37131,7 +37187,7 @@ mod loop_side_table_tests {
             .set_confirm_enter_jit(Some(rejecting_confirm_enter_jit));
 
         assert!(matches!(
-            meta.function_entry_step(cell_key, hash, raw),
+            meta.function_entry_step(cell_key, hash, raw, &[]),
             crate::warmstate::FunctionEntryStep::NotHot,
         ));
     }

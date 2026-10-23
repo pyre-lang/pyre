@@ -6848,9 +6848,9 @@ pub struct PyPyJitDriver {
     pub get_unique_id: Option<fn(usize, bool, pyre_object::PyObjectRef) -> usize>,
     /// rlib/jit.py:690 — `should_unroll_one_iteration` hook callable.
     pub should_unroll_one_iteration: Option<fn(usize, bool, pyre_object::PyObjectRef) -> bool>,
-    /// rlib/jit.py:688 — `confirm_enter_jit` hook (concrete pyre signature
-    /// is wired alongside specialize_call; until then, `None`).
-    pub confirm_enter_jit: Option<fn() -> bool>,
+    /// rlib/jit.py `confirm_enter_jit` hook
+    /// (`warmspot.py` `_make_hook_graph(..., onlygreens=False)`).
+    pub confirm_enter_jit: Option<fn(&[Value]) -> bool>,
     /// rlib/jit.py:689 — `can_never_inline` hook (signature ported).
     pub can_never_inline: Option<fn() -> bool>,
 }
@@ -8154,6 +8154,7 @@ fn unpack_merge_point_jit(
                 pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX,
                 green_key,
                 (0, 0),
+                &[],
             )
             .0
     };
@@ -8233,6 +8234,7 @@ fn genentry_merge_point_jit(
                 pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX,
                 green_key,
                 (0, 0),
+                &[],
             )
             .0
     };
@@ -11583,6 +11585,17 @@ fn backedge_vsd_matches(frame: &PyFrame, loop_header_pc: usize) -> bool {
     true
 }
 
+/// Portal reds `interp_jit.py` declares as `['frame', 'ec']`.
+/// Same pair `pypyjit_live_values_with_ec` builds.
+fn pypyjit_portal_reds(frame: &mut PyFrame) -> [Value; 2] {
+    [
+        Value::Ref(majit_ir::GcRef(frame as *mut PyFrame as usize)),
+        Value::Ref(majit_ir::GcRef(
+            pyre_interpreter::call::getexecutioncontext() as usize,
+        )),
+    ]
+}
+
 /// RPython warmstate.py maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
@@ -11680,7 +11693,12 @@ fn maybe_compile_and_run(
     // The frame-shape walk and `liveness_for` are not on that path: they
     // run only once the counter has reached `bound_reached`, or when a
     // compiled token is about to be entered.
-    match driver.maybe_compile_and_run_step(green_key, (frame.pycode as usize, loop_header_pc)) {
+    let reds = pypyjit_portal_reds(frame);
+    match driver.maybe_compile_and_run_step(
+        green_key,
+        (frame.pycode as usize, loop_header_pc),
+        &reds,
+    ) {
         (majit_metainterp::warmstate::HotResult::StartTracing, _) => {
             if !backedge_frame_may_trace(frame, loop_header_pc) {
                 return None;
@@ -13235,9 +13253,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `has_runnable_compiled_loop`, the counter gate, then
     // `has_runnable_compiled_loop` again to decide the run -- walked it three
     // times to learn one thing, on every call that refused.
-    let step = pair
-        .0
-        .function_entry_step(green_key, green_key_hash, (code_ptr as usize, entry_pc));
+    let reds = pypyjit_portal_reds(frame_root.frame());
+    let step = pair.0.function_entry_step(
+        green_key,
+        green_key_hash,
+        (code_ptr as usize, entry_pc),
+        &reds,
+    );
     if matches!(step, FunctionEntryStep::NotHot) {
         return None;
     }
