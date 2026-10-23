@@ -1451,12 +1451,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         crate::type_methods::clinic_arg_type_name(args[0])
                     )));
                 }
-                if !unsafe { pyre_object::is_str(args[1]) } {
-                    return Err(crate::PyError::type_error(format!(
-                        "_fix_co_filename() argument 2 must be str, not {}",
-                        crate::type_methods::clinic_arg_type_name(args[1])
-                    )));
-                }
                 // `interp_imp.py pathname='fsencode'`: preserve the raw
                 // filesystem spelling before storing it on the code object.
                 // `args` is the gateway's native copy; `fsencode` can collect.

@@ -2154,7 +2154,12 @@ impl W_TextIOWrapper {
 
     fn reconfigure(
         &mut self,
-        #[default(pyre_object::w_none())] encoding: PyObjectRef,
+        // `interp_textio.py reconfigure`: `__args__.unpack()` then
+        // `if args_w: raise TypeError("reconfigure() takes no positional arguments")`.
+        // `_pyio.TextIOWrapper.reconfigure(self, *, encoding=None, ...)`.
+        #[kwonly]
+        #[default(pyre_object::w_none())]
+        encoding: PyObjectRef,
         #[default(pyre_object::w_none())] mut errors: PyObjectRef,
         #[default(pyre_object::PY_NULL)] mut newline: PyObjectRef,
         #[default(pyre_object::w_none())] mut line_buffering: PyObjectRef,
