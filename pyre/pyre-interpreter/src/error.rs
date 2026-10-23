@@ -774,7 +774,7 @@ fn make_pyerror_noargs(
         reraise_lasti: -1,
         w_name_context: std::ptr::null_mut(),
         w_obj_context: std::ptr::null_mut(),
-        w_fmt_x0: std::ptr::null_mut(),
+        fmt_x0: std::ptr::null_mut(),
         fmt_valuefmt_ptr: std::ptr::null(),
         fmt_valuefmt_len: 0,
     });
