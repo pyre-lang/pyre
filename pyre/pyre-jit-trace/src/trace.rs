@@ -2009,8 +2009,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
                 return p2_drain_abort();
             };
-            let Some(callee_pjc) =
-                crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)
+            let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)
             else {
                 discard_bridge_carrier_walk(
                     ctx,
@@ -2135,7 +2134,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 handler_entry,
             );
             (walk, entry, callee_pjc)
-        };    let deepest_got_exception = matches!(
+        };
+    let deepest_got_exception = matches!(
         &walk,
         Some(Ok((
             crate::jitcode_dispatch::DispatchOutcome::SubRaise { .. },
