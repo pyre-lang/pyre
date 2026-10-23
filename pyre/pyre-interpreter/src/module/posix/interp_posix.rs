@@ -1120,7 +1120,11 @@ mod win_nt {
         error: majit_rlib::rwin32::WindowsError,
         filename: PyObjectRef,
     ) -> crate::PyError {
-        crate::PyError::os_error_win32_syscall2(error.winerror as i32, filename, pyre_object::PY_NULL)
+        crate::PyError::os_error_win32_syscall2(
+            error.winerror as i32,
+            filename,
+            pyre_object::PY_NULL,
+        )
     }
 
     fn io_err_with_filename(error: &std::io::Error, filename: PyObjectRef) -> crate::PyError {
@@ -1644,26 +1648,14 @@ fn create_environ() -> pyre_object::PyObjectRef {
             );
         }
     }
-    #[cfg(feature = "sandbox")]
-    {
-        // The controller delivers the virtual environment as (bytes, bytes).
-        if let Ok(items) = crate::host_seam::ops::envitems() {
-            for (k_bytes, v_bytes) in items {
-                store(
-                    dict_slot,
-                    || pyre_object::w_bytes_from_bytes(&k_bytes),
-                    || pyre_object::w_bytes_from_bytes(&v_bytes),
-                );
-            }
-        }
-    }
-    #[cfg(all(feature = "host_env", not(feature = "sandbox"), unix))]
+    #[cfg(all(unix, feature = "host_env"))]
     {
         // On POSIX, posix.environ stores bytes → bytes. os.py's
         // _create_environ_mapping wraps this dict in an _Environ object that
         // encodes/decodes via surrogateescape when accessed.
         // `_convertenviron` walks `os.environ.items()`, routed to
-        // `rposix_environ.envitems_llimpl`.
+        // `rposix_environ.envitems_llimpl`. Under sandbox that wrapper is
+        // the `ll_os.ll_os_envitems` trampoline.
         for (key, value) in majit_rlib::rposix_environ::envitems_llimpl() {
             store(
                 dict_slot,
@@ -1800,11 +1792,12 @@ pub fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         })?;
         buf
     };
-    // Route host entropy through the trusted controller instead of
-    // reaching host getrandom directly.
+    // Count-only `ll_os.ll_os_urandom` trampoline. The host arm keeps
+    // `rurandom.urandom` with a signal checker, which the wire cannot
+    // marshal.
     #[cfg(feature = "sandbox")]
-    let buf = crate::host_seam::ops::urandom(n as i64)
-        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+    let buf = majit_rlib::rurandom::urandom_os(n as i64)
+        .map_err(|errno| crate::PyError::os_error_syscall(errno, pyre_object::PY_NULL))?;
     let block = pyre_object::bytesobject::try_alloc_bytes_block(&buf)
         .ok_or_else(crate::builtins::reservation_failed)?;
     Ok(pyre_object::bytesobject::w_bytes_from_block(block))
@@ -3536,8 +3529,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 if let Some(dir_fd) = _dir_fd {
                                     let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                                         .map_err(|_| {
-                                            crate::PyError::value_error("embedded null in path")
-                                        })?;
+                                        crate::PyError::value_error("embedded null in path")
+                                    })?;
                                     let fd = unsafe {
                                         majit_rlib::rposix::c_openat(
                                             dir_fd,
@@ -3709,6 +3702,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     )));
                 }
                 let code = crate::baseobjspace::c_int_w(args[0])?;
+                #[cfg(unix)]
+                {
+                    let msg = majit_rlib::rposix::strerror(code).map_err(|()| {
+                        crate::PyError::value_error("strerror() argument out of range")
+                    })?;
+                    Ok(crate::typedef::charp2uni(&msg))
+                }
+                #[cfg(not(unix))]
                 Ok(pyre_object::w_str_new_managed(
                     &crate::PyError::clean_strerror(code),
                 ))
@@ -3746,41 +3747,35 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // Windows `n > INT_MAX` reaches the C runtime as EINVAL
                 // instead of data.
                 let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
-                #[cfg(not(feature = "sandbox"))]
+                // `PyBytes_FromStringAndSize(NULL, length)` reserves the
+                // whole request up front and reports a failure it cannot
+                // satisfy as MemoryError; an infallible `vec![0u8; n]`
+                // aborts the process there instead.
+                Vec::<u8>::new()
+                    .try_reserve_exact(n)
+                    .map_err(|_| crate::PyError::memory_error(""))?;
+                #[cfg(unix)]
                 let buf = {
-                    // `PyBytes_FromStringAndSize(NULL, length)` reserves the
-                    // whole request up front and reports a failure it cannot
-                    // satisfy as MemoryError; an infallible `vec![0u8; n]`
-                    // aborts the process there instead.  The block stays
-                    // uninitialised until the read reports how much of it was
-                    // filled, so nothing writes the tail either.
+                    // interp_posix.py `read`: `rposix.read` sits inside
+                    // the `eintr_retry=True` loop, so an interrupted read runs
+                    // the pending signal handlers and is re-issued rather than
+                    // surfacing as `InterruptedError`.
+                    loop {
+                        match majit_rlib::rposix::read(fd, n as i64) {
+                            Ok(buf) => break buf,
+                            Err(errno) => crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(errno),
+                                |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
+                            )?,
+                        }
+                    }
+                };
+                #[cfg(not(unix))]
+                let buf = {
                     let mut buf: Vec<u8> = Vec::new();
                     buf.try_reserve_exact(n)
                         .map_err(|_| crate::PyError::memory_error(""))?;
-                    // interp_posix.py `read`: the syscall sits inside
-                    // the `eintr_retry=True` loop, so an interrupted read runs
-                    // the pending signal handlers and is re-issued rather than
-                    // surfacing as `InterruptedError`.  The blocking guard is
-                    // scoped to the syscall alone: `checksignals` runs Python.
                     loop {
-                        // `rposix.c_read` releases the GIL and saves errno.
-                        #[cfg(unix)]
-                        let (ret, errno) = {
-                            let ret = unsafe {
-                                majit_rlib::rposix::c_read(
-                                    fd,
-                                    buf.as_mut_ptr() as majit_rlib::rffi::VOIDP,
-                                    n,
-                                )
-                            };
-                            let errno = if ret < 0 {
-                                majit_rlib::rposix::get_saved_errno()
-                            } else {
-                                0
-                            };
-                            (ret, errno)
-                        };
-                        #[cfg(not(unix))]
                         let (ret, errno) =
                             crate::module::thread::call_external_function(|| unsafe {
                                 libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _)
@@ -3796,9 +3791,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )?;
                     }
                 };
-                #[cfg(feature = "sandbox")]
-                let buf = crate::host_seam::ops::read(fd, n as i64)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_bytes_from_bytes(&buf))
             },
             2,
@@ -3871,8 +3863,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 #[cfg(feature = "sandbox")]
                 let result = {
-                    let data = crate::host_seam::ops::read(fd, target.len() as i64)
-                        .map_err(|error| crate::host_seam::seam_os_err(error, ""))?;
+                    let data = majit_rlib::rposix::read(fd, target.len() as i64)
+                        .map_err(|errno| errno_err(errno, ""))?;
                     let length = data.len().min(target.len());
                     target[..length].copy_from_slice(&data[..length]);
                     length as i64
@@ -3901,33 +3893,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // accepted, while every contiguous readable exporter is.
                 let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }
                     .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
-                #[cfg(not(feature = "sandbox"))]
+                #[cfg(unix)]
                 let ret = {
-                    // interp_posix.py `write`: the syscall sits inside
+                    // interp_posix.py `write`: `rposix.write` sits inside
                     // the `eintr_retry=True` loop, so an interrupted write runs
                     // the pending signal handlers and is re-issued rather than
-                    // surfacing as `InterruptedError`.  The blocking guard is
-                    // scoped to the syscall alone: `checksignals` runs Python.
+                    // surfacing as `InterruptedError`.
+                    let count = data.len().min(i32::MAX as usize);
                     loop {
-                        // `rposix.c_write` releases the GIL and saves errno.
-                        #[cfg(unix)]
-                        let (ret, errno) = {
-                            let count = data.len().min(i32::MAX as usize);
-                            let ret = unsafe {
-                                majit_rlib::rposix::c_write(
-                                    fd,
-                                    data.as_ptr() as majit_rlib::rffi::VOIDP,
-                                    count,
-                                )
-                            };
-                            let errno = if ret < 0 {
-                                majit_rlib::rposix::get_saved_errno()
-                            } else {
-                                0
-                            };
-                            (ret as i64, errno)
-                        };
-                        #[cfg(not(unix))]
+                        match majit_rlib::rposix::write(fd, &data[..count]) {
+                            Ok(ret) => break ret,
+                            Err(errno) => crate::builtins::eintr_retry_with(
+                                std::io::Error::from_raw_os_error(errno),
+                                |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
+                            )?,
+                        }
+                    }
+                };
+                #[cfg(not(unix))]
+                let ret = {
+                    loop {
                         let (ret, errno) = crate::builtins::crt_write_once(fd, &data);
                         if ret >= 0 {
                             break ret as i64;
@@ -3938,9 +3923,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         )?;
                     }
                 };
-                #[cfg(feature = "sandbox")]
-                let ret = crate::host_seam::ops::write(fd, &data)
-                    .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                 Ok(pyre_object::w_int_new(ret))
             },
             2,
@@ -4014,9 +3996,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 #[cfg(not(feature = "sandbox"))]
                 {
                     if let Some(dir_fd) = _dir_fd {
-                        let c_path = std::ffi::CString::new(path.as_bytes.as_slice()).map_err(
-                            |_| crate::PyError::value_error("embedded null in path"),
-                        )?;
+                        let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                            .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                         let ret =
                             unsafe { majit_rlib::rposix::c_unlinkat(dir_fd, c_path.as_ptr(), 0) };
                         if ret < 0 {
@@ -4048,7 +4029,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
             let ret = unsafe { libc::unlink(c_path.as_ptr()) };
             if ret < 0 {
-                return Err(fs_err_with_filename(std::io::Error::last_os_error(), path.w_path()));
+                return Err(fs_err_with_filename(
+                    std::io::Error::last_os_error(),
+                    path.w_path(),
+                ));
             }
         }
         Ok(pyre_object::w_none())
@@ -5255,7 +5239,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     }
 
     /// `rposix.listdir`.
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(unix)]
     fn path_listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
         majit_rlib::rposix::listdir(path)
     }
@@ -5304,17 +5288,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let bytes_mode = unsafe { resolved.is_bytes() };
                 let path = resolved.as_bytes.as_slice();
                 let w_path = || resolved.w_path();
-                #[cfg(feature = "sandbox")]
-                {
-                    let names = crate::host_seam::ops::listdir(path)
-                        .map_err(|e| crate::host_seam::seam_os_err_with_filename(e, w_path()))?;
-                    let mut items = pyre_object::gc_roots::RootedItems::new();
-                    for n in names {
-                        items.push(fs_name_obj(bytes_mode, &n));
-                    }
-                    return Ok(pyre_object::w_list_new(items.take()));
-                }
-                #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+                #[cfg(unix)]
                 {
                     let mut w_path = w_path();
                     let names = pyre_object::with_roots!(w_path, w_arg => path_listdir(path))
@@ -5325,7 +5299,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     Ok(pyre_object::w_list_new(items.take()))
                 }
-                #[cfg(all(not(feature = "sandbox"), not(all(unix, feature = "host_env"))))]
+                #[cfg(not(unix))]
                 {
                     let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
                         .map_err(|e| fs_err_with_filename(e, w_path()))?;
@@ -7487,12 +7461,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::__pyre_put_new!(ns_slot, "stat_result", super::stat_result_seq_type());
     // `interp_posix.getcwdb` is `os.getcwd()` bytes; Unix `getcwd` is
     // `space.fsdecode(getcwdb(space))`. `rposix.getcwd` returns those bytes.
-    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[cfg(unix)]
     fn getcwdb_bytes() -> Result<Vec<u8>, crate::PyError> {
-        match majit_rlib::rposix::getcwd() {
-            Ok(cwd) => Ok(cwd),
-            Err(_) => Err(errno_err(majit_rlib::rposix::get_saved_errno(), "")),
-        }
+        majit_rlib::rposix::getcwd().map_err(|errno| errno_err(errno, ""))
     }
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::__pyre_put_new!(
@@ -7507,18 +7478,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // surrogate escape. A lossy decode would fold it to U+FFFD,
                 // which breaks the `os.fsencode(os.getcwd())` round trip and
                 // makes two different directories compare equal.
-                #[cfg(feature = "sandbox")]
-                {
-                    let cwd = crate::host_seam::ops::getcwd()
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    Ok(crate::gateway::fsdecode_filename_bytes(&cwd))
-                }
-                #[cfg(all(unix, not(feature = "sandbox")))]
+                #[cfg(unix)]
                 {
                     let cwd = getcwdb_bytes()?;
                     Ok(crate::gateway::fsdecode_filename_bytes(&cwd))
                 }
-                #[cfg(all(not(unix), not(feature = "sandbox")))]
+                #[cfg(not(unix))]
                 {
                     #[cfg(feature = "host_env")]
                     {
@@ -7539,18 +7504,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "getcwdb",
             |_| {
-                #[cfg(feature = "sandbox")]
-                {
-                    let cwd = crate::host_seam::ops::getcwd()
-                        .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                    Ok(pyre_object::w_bytes_from_bytes(&cwd))
-                }
-                #[cfg(all(unix, not(feature = "sandbox")))]
+                #[cfg(unix)]
                 {
                     let cwd = getcwdb_bytes()?;
                     Ok(pyre_object::w_bytes_from_bytes(&cwd))
                 }
-                #[cfg(all(not(unix), not(feature = "sandbox")))]
+                #[cfg(not(unix))]
                 {
                     #[cfg(feature = "host_env")]
                     {
@@ -7823,26 +7782,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             ));
                         }
                     };
-                    #[cfg(feature = "sandbox")]
-                    {
-                        let msg = crate::host_seam::ops::strerror(code)
-                            .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
-                        // The text comes from the C library in the current
-                        // locale, so a byte with no UTF-8 spelling takes the
-                        // surrogateescape rather than U+FFFD.
-                        return Ok(crate::typedef::charp2uni(&msg));
-                    }
-                    #[cfg(all(unix, not(feature = "sandbox")))]
-                    {
-                        let msg = majit_rlib::rposix::strerror(code).map_err(|()| {
-                            crate::PyError::value_error("strerror() argument out of range")
-                        })?;
-                        Ok(crate::typedef::charp2uni(&msg))
-                    }
-                    #[cfg(all(not(unix), not(feature = "sandbox")))]
-                    Ok(pyre_object::w_str_new_managed(
-                        &rustpython_host_env::time::strerror(code),
-                    ))
+                    let msg = majit_rlib::rposix::strerror(code).map_err(|()| {
+                        crate::PyError::value_error("strerror() argument out of range")
+                    })?;
+                    Ok(crate::typedef::charp2uni(&msg))
                 },
                 1,
             )
@@ -12074,9 +12017,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // not be followed, or the effective ids are the ones to ask
                     // about. `rposix.py` is the flag mapping.
                     let allowed = if dir_fd.is_some() || !follow_symlinks || effective_ids {
-                        let c_path = std::ffi::CString::new(path.as_slice()).map_err(|_| {
-                            crate::PyError::value_error("embedded null character")
-                        })?;
+                        let c_path = std::ffi::CString::new(path.as_slice())
+                            .map_err(|_| crate::PyError::value_error("embedded null character"))?;
                         let mut flags = 0;
                         if !follow_symlinks {
                             flags |= libc::AT_SYMLINK_NOFOLLOW;
@@ -15576,8 +15518,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // directly under sandbox.  Overwrite each with a raising stub, mirroring the
     // RPython sandbox where unsupported externals are simply unavailable.  The
     // mediated names (open/read/write/close/lseek/stat/access/getcwd/listdir/
-    // getenv/isatty/strerror/get{u,g}id/unlink/mkdir) are intentionally absent
-    // here — they stay live through host_seam.
+    // isatty/strerror/get{u,g}id/unlink/mkdir) stay live through the rposix
+    // wrappers; getenv stays on host_seam.
     #[cfg(feature = "sandbox")]
     {
         fn sandbox_unavailable(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

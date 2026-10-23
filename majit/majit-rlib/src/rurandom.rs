@@ -149,13 +149,26 @@ pub fn urandom(
     Ok(result)
 }
 
+/// Count-only `ll_os.ll_os_urandom` shape. `sandlib` has this name as a pyre
+/// extension. The product host `interp_posix.urandom` still calls [`urandom`]
+/// with a signal checker, which the trampoline cannot marshal.
+#[majit_macros::replace_os_function("urandom")]
+pub fn urandom_os(count: i64) -> Result<Vec<u8>, i32> {
+    if count < 0 {
+        return Err(libc::EINVAL);
+    }
+    urandom(count as usize, None)
+}
+
 #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
 mod tests {
-    use super::urandom;
+    use super::{urandom, urandom_os};
 
     #[test]
     fn urandom_16_bytes() {
         let buf = urandom(16, None).expect("rurandom.urandom");
         assert_eq!(buf.len(), 16);
+        assert_eq!(urandom_os(16).unwrap().len(), 16);
+        assert_eq!(urandom_os(-1), Err(libc::EINVAL));
     }
 }

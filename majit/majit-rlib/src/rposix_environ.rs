@@ -133,6 +133,8 @@ pub fn envkeys_llimpl() -> Vec<Vec<u8>> {
 }
 
 /// `rposix_environ.envitems_llimpl` (Unix `make_env_impls` arm).
+/// `register_external(..., export_name='ll_os.ll_os_envitems')`.
+#[majit_macros::replace_os_function("envitems")]
 pub fn envitems_llimpl() -> Vec<(Vec<u8>, Vec<u8>)> {
     let _keepalive = byname();
     let environ = os_get_environ();
@@ -154,6 +156,8 @@ pub fn envitems_llimpl() -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// `rposix_environ.getenv_llimpl`.
+/// `register_external(..., export_name='ll_os.ll_os_getenv')`.
+#[majit_macros::replace_os_function("getenv")]
 pub fn getenv_llimpl(name: &[u8]) -> Option<Vec<u8>> {
     let l_name = rffi::scoped_str2charp::new(Some(name));
     let _keepalive = byname();

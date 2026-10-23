@@ -24764,23 +24764,14 @@ fn file_is_binary(self_obj: PyObjectRef) -> bool {
         .unwrap_or(false)
 }
 
-/// Reduce a [`SeamError`] to a `std::io::Error` so the fd helpers keep their
-/// `io::Result` signature (the caller's `fd_io_err` then maps it to `OSError`).
-#[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
-fn seam_to_io(e: crate::host_seam::SeamError) -> std::io::Error {
-    match e {
-        crate::host_seam::SeamError::Os(errno) => std::io::Error::from_raw_os_error(errno),
-        _ => std::io::Error::other("sandbox error"),
-    }
-}
-
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
 pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     #[cfg(feature = "sandbox")]
     {
         // The controller services one read per request; copy the reply (at most
         // `buf.len()` bytes) into the caller's buffer.
-        let data = crate::host_seam::ops::read(fd, buf.len() as i64).map_err(seam_to_io)?;
+        let data = majit_rlib::rposix::read(fd, buf.len() as i64)
+            .map_err(std::io::Error::from_raw_os_error)?;
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
         return Ok(n);
@@ -25245,65 +25236,45 @@ pub(crate) unsafe fn file_write_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>
     }
 }
 
-/// One CPython `_Py_write_impl` attempt, including its Windows nonblocking
+/// One `_Py_write_impl` attempt, including its Windows nonblocking
 /// pipe handling. The caller owns EINTR retry and the distinction between
 /// `os.write` (raise EAGAIN) and `FileIO.write` (return None on EAGAIN).
-#[cfg(all(
-    feature = "host_env",
-    not(feature = "sandbox"),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn crt_write_once(fd: libc::c_int, data: &[u8]) -> (i64, i32) {
     let mut count = data.len().min(i32::MAX as usize);
-    #[cfg(windows)]
     if count > 32_767 && crt_call!(libc::isatty(fd)) != 0 {
-        // CPython `_Py_write_impl`, issue #11395: the Windows console cannot
+        // `_Py_write_impl`, issue #11395: the Windows console cannot
         // reliably accept a larger binary write.
         count = 32_767;
     }
 
-    #[cfg(windows)]
-    {
-        unsafe extern "C" {
-            fn __doserrno() -> *mut u32;
-        }
-        let mut write_count = count;
-        loop {
-            let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
-                // CPython writes `_doserrno = 0` immediately before `write`.
-                // This thread-local CRT slot distinguishes a full
-                // nonblocking pipe from a real device/disk ENOSPC.
-                *__doserrno() = 0;
-                libc::write(fd, data.as_ptr() as *const libc::c_void, write_count as _)
-            });
-            let doserrno = unsafe { *__doserrno() };
-            if ret >= 0 || errno != libc::ENOSPC || doserrno != 0 {
-                // `rposix.c_write` is `save_err=RFFI_SAVE_ERRNO`:
-                // `_errno_after` saves errno whatever the call returned.
-                majit_rlib::rposix::set_saved_errno(errno);
-                return (ret as i64, errno);
-            }
-            write_count /= 2;
-            if write_count == 0 {
-                // CPython assigns `errno = EAGAIN` before returning -1.
-                // BufferedWriter reads that saved errno after FileIO has
-                // translated the syscall result to None.
-                majit_rlib::rposix::set_saved_errno(libc::EAGAIN);
-                return (ret as i64, libc::EAGAIN);
-            }
-        }
+    unsafe extern "C" {
+        fn __doserrno() -> *mut u32;
     }
-    #[cfg(not(windows))]
-    {
-        let ret = unsafe {
-            majit_rlib::rposix::c_write(fd, data.as_ptr() as majit_rlib::rffi::VOIDP, count)
-        };
-        let errno = if ret < 0 {
-            majit_rlib::rposix::get_saved_errno()
-        } else {
-            0
-        };
-        (ret as i64, errno)
+    let mut write_count = count;
+    loop {
+        let (ret, errno) = crate::module::thread::call_external_function(|| unsafe {
+            // `_doserrno = 0` immediately before `write`.
+            // This thread-local CRT slot distinguishes a full
+            // nonblocking pipe from a real device/disk ENOSPC.
+            *__doserrno() = 0;
+            libc::write(fd, data.as_ptr() as *const libc::c_void, write_count as _)
+        });
+        let doserrno = unsafe { *__doserrno() };
+        if ret >= 0 || errno != libc::ENOSPC || doserrno != 0 {
+            // `rposix.c_write` is `save_err=RFFI_SAVE_ERRNO`:
+            // `_errno_after` saves errno whatever the call returned.
+            majit_rlib::rposix::set_saved_errno(errno);
+            return (ret as i64, errno);
+        }
+        write_count /= 2;
+        if write_count == 0 {
+            // Assigns `errno = EAGAIN` before returning -1.
+            // BufferedWriter reads that saved errno after FileIO has
+            // translated the syscall result to None.
+            majit_rlib::rposix::set_saved_errno(libc::EAGAIN);
+            return (ret as i64, libc::EAGAIN);
+        }
     }
 }
 
@@ -25332,7 +25303,16 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         };
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
-            #[cfg(not(feature = "sandbox"))]
+            #[cfg(unix)]
+            let n = loop {
+                let count = bytes.len().min(i32::MAX as usize);
+                match majit_rlib::rposix::write(fd, &bytes[..count]) {
+                    Ok(n) => break n,
+                    Err(errno) if errno == libc::EAGAIN => return Ok(w_none()),
+                    Err(errno) => eintr_retry(std::io::Error::from_raw_os_error(errno))?,
+                }
+            };
+            #[cfg(not(unix))]
             let n = loop {
                 let (n, errno) = crt_write_once(fd, &bytes);
                 if n >= 0 {
@@ -25351,9 +25331,6 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 // rather than as `InterruptedError`.
                 eintr_retry(std::io::Error::from_raw_os_error(errno))?;
             };
-            #[cfg(feature = "sandbox")]
-            let n = crate::host_seam::ops::write(fd, &bytes)
-                .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
             return Ok(w_int_new(n));
         }
         #[cfg(all(feature = "host_env", target_arch = "wasm32"))]

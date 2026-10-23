@@ -408,6 +408,30 @@ fn handle_posix_error(result: i64) -> Result<i64, i32> {
     }
 }
 
+/// `rposix.read` (`replace_os_function('read')`). `count < 0` is `EINVAL`
+/// before the buffer is allocated.
+#[cfg(unix)]
+#[majit_macros::replace_os_function("read")]
+pub fn read(fd: i32, count: i64) -> Result<Vec<u8>, i32> {
+    if count < 0 {
+        return Err(libc::EINVAL);
+    }
+    let n = count as usize;
+    let mut buf = vec![0u8; n];
+    let got = handle_posix_error(unsafe { c_read(fd, buf.as_mut_ptr().cast(), n) } as i64)?;
+    buf.truncate(got as usize);
+    Ok(buf)
+}
+
+/// `rposix.write` (`replace_os_function('write')`).
+#[cfg(unix)]
+#[majit_macros::replace_os_function("write")]
+pub fn write(fd: i32, data: &[u8]) -> Result<i64, i32> {
+    handle_posix_error(
+        unsafe { c_write(fd, data.as_ptr() as *mut libc::c_void, data.len()) } as i64,
+    )
+}
+
 /// `rposix.close` (`replace_os_function('close')`).
 #[cfg(unix)]
 #[majit_macros::replace_os_function("close")]
@@ -569,10 +593,11 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-/// `rposix.getcwd`. Start `bufsize` 256, `c_getcwd`, on null if
-/// `get_saved_errno() != ERANGE` return that errno, else `bufsize *= 4`
-/// until `bufsize > 1024*1024`. Returns the C-string bytes.
+/// `rposix.getcwd` (`replace_os_function('getcwd')`). Start `bufsize` 256,
+/// `c_getcwd`, on null if `get_saved_errno() != ERANGE` return that errno,
+/// else `bufsize *= 4` until `bufsize > 1024*1024`. Returns the C-string bytes.
 #[cfg(unix)]
+#[majit_macros::replace_os_function("getcwd")]
 pub fn getcwd() -> Result<Vec<u8>, i32> {
     let mut bufsize = 256usize;
     loop {
@@ -601,8 +626,10 @@ crate::rffi::llexternal!(
     releasegil = false
 );
 
-/// `rposix.strerror`. A null host result is `Err`.
+/// `rposix.strerror` (`replace_os_function('strerror')`). A null host result
+/// is `Err(())`, the `ValueError` `interp_posix.strerror` raises.
 #[cfg(unix)]
+#[majit_macros::replace_os_function("strerror")]
 pub fn strerror(errnum: crate::rffi::INT) -> Result<Vec<u8>, ()> {
     let res = unsafe { c_strerror(errnum) };
     if res.is_null() {
@@ -1617,8 +1644,9 @@ pub fn _listdir(dirp: *mut libc::DIR, rewind: bool) -> Result<Vec<Vec<u8>>, i32>
     if error != 0 { Err(error) } else { Ok(result) }
 }
 
-/// `rposix.listdir`.
+/// `rposix.listdir` (`replace_os_function('listdir')`).
 #[cfg(unix)]
+#[majit_macros::replace_os_function("listdir")]
 pub fn listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
     let c_path = std::ffi::CString::new(path).map_err(|_| libc::EINVAL)?;
     let dirp = unsafe { c_opendir(c_path.as_ptr()) };
@@ -3481,17 +3509,19 @@ mod tests {
         .unwrap();
         assert!(fd >= 0);
         assert!(!isatty(fd));
-        assert_eq!(
-            unsafe { c_write(fd, b"xy".as_ptr() as *mut libc::c_void, 2) },
-            2
-        );
+        assert_eq!(read(fd, -1), Err(libc::EINVAL));
+        assert_eq!(write(fd, b"xy").unwrap(), 2);
         assert_eq!(lseek(fd, 0, 0).unwrap(), 0);
+        assert_eq!(read(fd, 2).unwrap(), b"xy");
         assert_eq!(lseek(fd, 0, libc::SEEK_END).unwrap(), 2);
         let fst = crate::rposix_stat::fstat(fd).unwrap();
         assert_eq!(fst.st_size, 2);
         close(fd).unwrap();
         assert!(close(fd).is_err());
         assert!(access(path.as_os_str().as_bytes(), libc::R_OK));
+        let names = listdir(dir.as_os_str().as_bytes()).unwrap();
+        assert!(names.iter().any(|n| n == b"f"));
+        assert!(!getcwd().unwrap().is_empty());
         unlink(path.as_os_str().as_bytes()).unwrap();
         assert!(!access(path.as_os_str().as_bytes(), libc::F_OK));
         let _ = std::fs::remove_dir_all(&dir);

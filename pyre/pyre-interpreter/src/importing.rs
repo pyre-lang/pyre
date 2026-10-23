@@ -480,12 +480,6 @@ impl SourceProvider for SeamSourceProvider {
     }
     fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         use std::os::unix::ffi::OsStrExt;
-        fn to_io(e: crate::host_seam::SeamError) -> std::io::Error {
-            match e {
-                crate::host_seam::SeamError::Os(errno) => std::io::Error::from_raw_os_error(errno),
-                _ => std::io::Error::other("sandbox source read failed"),
-            }
-        }
         let bytes = path.as_os_str().as_bytes();
         let fd = loop {
             match majit_rlib::rposix::open(bytes, libc::O_RDONLY | libc::O_CLOEXEC, 0) {
@@ -496,12 +490,13 @@ impl SourceProvider for SeamSourceProvider {
         };
         let mut data = Vec::new();
         loop {
-            match crate::host_seam::ops::read(fd, 65536) {
+            match majit_rlib::rposix::read(fd, 65536) {
                 Ok(chunk) if chunk.is_empty() => break,
                 Ok(chunk) => data.extend_from_slice(&chunk),
-                Err(e) => {
+                Err(err) if err == libc::EINTR => continue,
+                Err(err) => {
                     let _ = majit_rlib::rposix::close(fd);
-                    return Err(to_io(e));
+                    return Err(std::io::Error::from_raw_os_error(err));
                 }
             }
         }
@@ -3329,7 +3324,7 @@ fn compute_startup_path_config() -> StartupPathConfig {
 fn compute_startup_path_config() -> StartupPathConfig {
     use std::os::unix::ffi::OsStrExt;
     let executable = PathBuf::from("/bin/pyre");
-    let stdlib = crate::host_seam::ops::getenv(b"PYRE_STDLIB")
+    let stdlib = crate::host_seam::getenv(b"PYRE_STDLIB")
         .ok()
         .flatten()
         .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
@@ -4443,10 +4438,10 @@ fn ensure_stdlib_path() {
             config.prefix
         );
         // A sandbox build compiles this path too, and there the real stderr is
-        // not ours to write; `host_seam::ops` is that build's stderr.  It is
+        // not ours to write; `rposix.write` is that build's stderr.  It is
         // also the only build that has it, so the ordinary one keeps `eprint!`.
         #[cfg(feature = "sandbox")]
-        let _ = crate::host_seam::ops::write(2, warning.as_bytes());
+        let _ = majit_rlib::rposix::write(2, warning.as_bytes());
         #[cfg(not(feature = "sandbox"))]
         eprint!("{warning}");
     }

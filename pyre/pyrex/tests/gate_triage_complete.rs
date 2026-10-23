@@ -80,7 +80,7 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 ///
 /// `env::var` (with its `_os` suffix) is the common one, but a search for it
 /// alone misses the host seam: `host_os::var` on the sandbox path and
-/// `host_seam::ops::getenv`, which takes a *byte* string. `PYRE_STDLIB` is read
+/// `host_seam::getenv`, which takes a *byte* string. `PYRE_STDLIB` is read
 /// through both seam forms in `pyre-interpreter/src/importing.rs` and stays
 /// visible to a `std::env` search only because unrelated `env::var` readers
 /// exist in `pyre-wasm-runner`. A wasm- or sandbox-only gate would have no such
@@ -192,7 +192,7 @@ fn gates_read_by(text: &str) -> Vec<&str> {
                 continue;
             };
             let rest = rest.trim_start();
-            // `host_seam::ops::getenv` names its gate with a byte string.
+            // `host_seam::getenv` names its gate with a byte string.
             let rest = rest.strip_prefix('b').unwrap_or(rest);
             let Some(rest) = rest.strip_prefix('"') else {
                 continue;
@@ -228,7 +228,7 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
             "PYRE_C",
         );
         host_os::var("PYRE_D").ok();
-        crate::host_seam::ops::getenv(b"PYRE_E");
+        crate::host_seam::getenv(b"PYRE_E");
         os.environ.get("PYRE_F")
         os.getenv("PYRE_G")
         println!("cargo::rerun-if-env-changed=PYRE_H");

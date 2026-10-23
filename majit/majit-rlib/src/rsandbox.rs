@@ -216,6 +216,34 @@ impl SandboxLoad for Vec<Vec<u8>> {
     }
 }
 
+impl SandboxLoad for Vec<(Vec<u8>, Vec<u8>)> {
+    fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
+        match load_value(loader)? {
+            MarshalValue::List(items) => {
+                let mut pairs = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        MarshalValue::Tuple(mut kv) if kv.len() == 2 => {
+                            let value = as_bytes(kv.pop().unwrap())?;
+                            let key = as_bytes(kv.pop().unwrap())?;
+                            pairs.push((key, value));
+                        }
+                        _ => {
+                            return Err(SandboxError::Protocol(
+                                "expected (str,str) env item".into(),
+                            ));
+                        }
+                    }
+                }
+                Ok(pairs)
+            }
+            _ => Err(SandboxError::Protocol(
+                "expected list[(str,str)] reply".into(),
+            )),
+        }
+    }
+}
+
 impl<T: SandboxLoad> SandboxLoad for Result<T, i32> {
     fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
         Ok(Ok(T::load(loader)?))
@@ -224,6 +252,22 @@ impl<T: SandboxLoad> SandboxLoad for Result<T, i32> {
     fn from_error(err: SandboxError) -> Self {
         match err {
             SandboxError::Os(errno) => Err(errno),
+            other => std::panic::panic_any(other),
+        }
+    }
+}
+
+/// `rposix.strerror` returns `Err(())` for the host null that
+/// `interp_posix.strerror` turns into `ValueError`. Other trampoline
+/// errors keep the panic path, matching [`Result<T, i32>`] for non-Os.
+impl<T: SandboxLoad> SandboxLoad for Result<T, ()> {
+    fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
+        Ok(Ok(T::load(loader)?))
+    }
+
+    fn from_error(err: SandboxError) -> Self {
+        match err {
+            SandboxError::Value => Err(()),
             other => std::panic::panic_any(other),
         }
     }
@@ -420,29 +464,9 @@ pub fn load_result<N: NeedMore>(
             )),
             _ => Err(SandboxError::Protocol("expected list[str] reply".into())),
         },
-        ResultKind::EnvItems => match load_value(loader)? {
-            MarshalValue::List(items) => {
-                let mut pairs = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        MarshalValue::Tuple(mut kv) if kv.len() == 2 => {
-                            let value = as_bytes(kv.pop().unwrap())?;
-                            let key = as_bytes(kv.pop().unwrap())?;
-                            pairs.push((key, value));
-                        }
-                        _ => {
-                            return Err(SandboxError::Protocol(
-                                "expected (str,str) env item".into(),
-                            ));
-                        }
-                    }
-                }
-                Ok(SyscallResult::EnvItems(pairs))
-            }
-            _ => Err(SandboxError::Protocol(
-                "expected list[(str,str)] reply".into(),
-            )),
-        },
+        ResultKind::EnvItems => Ok(SyscallResult::EnvItems(Vec::<(Vec<u8>, Vec<u8>)>::load(
+            loader,
+        )?)),
         ResultKind::StatResult => Ok(SyscallResult::Stat(load_statresult(loader)?)),
         ResultKind::Float => Ok(SyscallResult::Float(load_float(loader)?)),
     }
@@ -569,6 +593,59 @@ mod tests {
         assert_eq!(
             crate::rposix_stat::fstat_sandbox_request_bytes(3),
             encode_request("ll_os.ll_os_fstat", &[MarshalValue::Int(3)])
+        );
+        assert_eq!(
+            crate::rposix::read_sandbox_request_bytes(3, 16),
+            encode_request(
+                "ll_os.ll_os_read",
+                &[MarshalValue::Int(3), MarshalValue::Int(16)]
+            )
+        );
+        assert_eq!(
+            crate::rposix::write_sandbox_request_bytes(1, b"hi"),
+            encode_request(
+                "ll_os.ll_os_write",
+                &[MarshalValue::Int(1), MarshalValue::Str(b"hi".to_vec())]
+            )
+        );
+        assert_eq!(
+            crate::rposix::getcwd_sandbox_request_bytes(),
+            encode_request("ll_os.ll_os_getcwd", &[])
+        );
+        assert_eq!(
+            crate::rposix::listdir_sandbox_request_bytes(b"/tmp"),
+            encode_request(
+                "ll_os.ll_os_listdir",
+                &[MarshalValue::Str(b"/tmp".to_vec())]
+            )
+        );
+        assert_eq!(
+            crate::rposix::strerror_sandbox_request_bytes(2),
+            encode_request("ll_os.ll_os_strerror", &[MarshalValue::Int(2)])
+        );
+        assert_eq!(
+            crate::rposix_environ::getenv_llimpl_sandbox_request_bytes(b"PATH"),
+            encode_request("ll_os.ll_os_getenv", &[MarshalValue::Str(b"PATH".to_vec())])
+        );
+        assert_eq!(
+            crate::rposix_environ::envitems_llimpl_sandbox_request_bytes(),
+            encode_request("ll_os.ll_os_envitems", &[])
+        );
+        assert_eq!(
+            crate::rtime::time_sandbox_request_bytes(),
+            encode_request("ll_time.ll_time_time", &[])
+        );
+        assert_eq!(
+            crate::rtime::clock_sandbox_request_bytes(),
+            encode_request("ll_time.ll_time_clock", &[])
+        );
+        assert_eq!(
+            crate::rtime::sleep_sandbox_request_bytes(0.25),
+            encode_request("ll_time.ll_time_sleep", &[MarshalValue::Float(0.25)])
+        );
+        assert_eq!(
+            crate::rurandom::urandom_os_sandbox_request_bytes(16),
+            encode_request("ll_os.ll_os_urandom", &[MarshalValue::Int(16)])
         );
     }
 

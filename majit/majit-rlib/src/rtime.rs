@@ -76,7 +76,15 @@ pub const CLOCK_UPTIME_RAW_APPROX: libc::clockid_t = libc::CLOCK_UPTIME_RAW_APPR
 
 crate::rffi::external_compilation_info! {
     const TIME_ECI = {
-        includes: ["sys/time.h", "time.h", "errno.h", "sys/types.h", "unistd.h", "sys/resource.h"],
+        includes: [
+            "sys/time.h",
+            "time.h",
+            "errno.h",
+            "sys/types.h",
+            "unistd.h",
+            "sys/resource.h",
+            "sys/select.h",
+        ],
     };
 }
 
@@ -215,7 +223,17 @@ pub fn decode_timeval_ns(t: &TIMEVAL) -> i64 {
         .saturating_add((t.tv_usec as i64).saturating_mul(1000))
 }
 
-/// `rtime.time`.
+// `rtime.c_select` (`save_err=RFFI_SAVE_ERRNO`; default `releasegil=True`).
+crate::rffi::llexternal!(
+    pub c_select = "select",
+    [INT, VOIDP, VOIDP, VOIDP, *mut TIMEVAL],
+    INT,
+    compilation_info = TIME_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+/// `rtime.time` (`replace_time_function('time')`).
+#[majit_macros::replace_time_function("time")]
 pub fn time() -> f64 {
     let mut t = unsafe { std::mem::zeroed::<TIMEVAL>() };
     let tz = std::ptr::null_mut::<TIMEZONE>();
@@ -224,6 +242,55 @@ pub fn time() -> f64 {
         return decode_timeval(&t);
     }
     unsafe { c_time(std::ptr::null_mut()) as f64 }
+}
+
+/// `rtime.clock` (`replace_time_function('clock')`).
+#[majit_macros::replace_time_function("clock")]
+pub fn clock() -> f64 {
+    #[cfg(not(any(
+        target_os = "illumos",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "openbsd",
+        target_os = "wasi",
+    )))]
+    {
+        let mut ts = unsafe { std::mem::zeroed::<TIMESPEC>() };
+        if unsafe { c_clock_gettime(CLOCK_PROCESS_CPUTIME_ID as SIGNED, &mut ts) } == 0 {
+            return ts.tv_sec as f64 + ts.tv_nsec as f64 * 0.000000001;
+        }
+    }
+    let mut ru = unsafe { std::mem::zeroed::<RUSAGE>() };
+    unsafe {
+        c_getrusage(RUSAGE_SELF, &mut ru);
+    }
+    decode_timeval(&ru.ru_utime) + decode_timeval(&ru.ru_stime)
+}
+
+/// `rtime.sleep` (`replace_time_function('sleep')`). EINTR from `c_select`
+/// is swallowed; any other saved errno is `OSError`.
+#[majit_macros::replace_time_function("sleep")]
+pub fn sleep(secs: f64) -> Result<(), i32> {
+    let mut t = TIMEVAL {
+        tv_sec: secs as TIME_T,
+        tv_usec: ((secs % 1.0) * 1_000_000.0) as libc::suseconds_t,
+    };
+    let ret = unsafe {
+        c_select(
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut t,
+        )
+    };
+    if ret != 0 {
+        let errno = crate::rposix::get_saved_errno();
+        if errno != libc::EINTR {
+            return Err(errno);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
@@ -320,5 +387,15 @@ mod tests {
         };
         assert!(n > 0);
         assert_eq!(&buf[..n], b"1970");
+    }
+
+    #[test]
+    fn clock_is_nonnegative() {
+        assert!(clock() >= 0.0);
+    }
+
+    #[test]
+    fn sleep_zero_returns() {
+        sleep(0.0).unwrap();
     }
 }

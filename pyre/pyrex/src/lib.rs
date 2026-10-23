@@ -485,19 +485,19 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
 }
 
 /// The working directory to seed `sys.path` with. Under sandbox it is read from
-/// the controller (the virtual `/tmp`) through the seam, so an untrusted child
-/// never learns the trusted parent's real working directory; off sandbox it is
-/// the process cwd.
+/// the controller (the virtual `/tmp`) through `rposix.getcwd`, so an untrusted
+/// child never learns the trusted parent's real working directory; off sandbox
+/// it is the process cwd.
 fn sys_path_cwd() -> std::path::PathBuf {
-    #[cfg(feature = "sandbox")]
+    #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        if let Ok(bytes) = pyre_interpreter::host_seam::ops::getcwd() {
-            return std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes));
+        match majit_rlib::rposix::getcwd() {
+            Ok(bytes) => std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)),
+            Err(_) => Path::new(".").to_path_buf(),
         }
-        Path::new(".").to_path_buf()
     }
-    #[cfg(not(feature = "sandbox"))]
+    #[cfg(not(unix))]
     {
         std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf())
     }
@@ -562,19 +562,16 @@ fn prompt_requested(run_code: bool) -> bool {
 
 /// `sys.stdin.read()` — the whole of stdin as the program source.
 fn read_stdin_source() -> std::io::Result<String> {
-    // Under sandbox the read goes through the seam, so a sandboxed child
+    // Under sandbox the read goes through `rposix.read`, so a sandboxed child
     // observes virtual stdin rather than the trusted parent's stdin.
     #[cfg(feature = "sandbox")]
     let data = {
-        use pyre_interpreter::host_seam::{SeamError, ops};
-
         let mut data = Vec::new();
         loop {
-            match ops::read(0, 65536) {
+            match majit_rlib::rposix::read(0, 65536) {
                 Ok(chunk) if chunk.is_empty() => break,
                 Ok(chunk) => data.extend_from_slice(&chunk),
-                Err(SeamError::Os(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
-                Err(_) => return Err(std::io::Error::other("stdin read failed")),
+                Err(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
             }
         }
         data

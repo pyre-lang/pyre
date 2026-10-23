@@ -16,9 +16,8 @@ host_env = ["dep:rustpython-host_env", "pyre-native/host_env", "majit-rlib/host_
 # the same single hash path production wires at boot. Off in every non-test
 # build (dev-dependencies never participate there).
 test-hooks = []
-# RPython-style sandbox: route every OS call through host_seam's marshalling
-# trampoline instead of the real syscall. Implies host_env (same call surface,
-# swapped bodies); the real-vs-trampoline choice lives only inside host_seam.
+# RPython-style sandbox: `replace_os_function` / `replace_time_function`
+# wrappers expand to marshalling trampolines. Implies host_env.
 sandbox = ["host_env", "dep:pyre-sandbox", "pyre-native/sandbox", "majit-rlib/sandbox"]
 # Load C extension modules built against pyre's own ABI. The build-time switch
 # is upstream's: `has_so_extension` reads `config.objspace.usemodules.cpyext`

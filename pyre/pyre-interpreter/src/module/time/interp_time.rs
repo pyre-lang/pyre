@@ -222,7 +222,7 @@ fn system_clock(info: Option<&mut ClockInfo>) -> Option<std::time::Duration> {
         if let Some(info) = info {
             *info = ClockInfo::new("clock_gettime(CLOCK_REALTIME)", 1.0e-9, false, true);
         }
-        let secs = crate::host_seam::ops::time().unwrap_or(0.0).max(0.0);
+        let secs = majit_rlib::rtime::time().max(0.0);
         Some(std::time::Duration::from_secs_f64(secs))
     }
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
@@ -413,11 +413,10 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // assertions on its first allocation or blocking call.
     #[cfg(feature = "sandbox")]
     {
-        // The controller services the sleep; signal handling is its concern.
-        // Every trampolined seam op already brackets its round trip, and the
-        // bracket does not nest — a second one would leave the census twice.
-        crate::host_seam::ops::sleep(dur.as_secs_f64())
-            .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+        // The controller services `rtime.sleep`; signal handling is its
+        // concern. The trampoline body does not nest a second GIL leave.
+        majit_rlib::rtime::sleep(dur.as_secs_f64())
+            .map_err(|errno| crate::PyError::os_error_syscall(errno, pyre_object::PY_NULL))?;
         Ok(w_none())
     }
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
@@ -740,10 +739,9 @@ fn get_clock_info_resolution(_name: &str) -> f64 {
 fn process_time_impl(w_info: PyObjectRef, return_ns: bool) -> Result<PyObjectRef, crate::PyError> {
     #[cfg(feature = "sandbox")]
     {
-        // The seam's `clock` op is the `ll_time_clock` analog, which is
+        // `rtime.clock` is the `ll_time_clock` analog, which is
         // `_clock_impl`'s `clock()` with its `1 / CLOCKS_PER_SEC`.
-        let secs =
-            crate::host_seam::ops::clock().map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
+        let secs = majit_rlib::rtime::clock();
         if !w_info.is_null() {
             setinfo(w_info, &ClockInfo::new("clock()", 1.0e-6, true, false))?;
         }

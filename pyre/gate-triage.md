@@ -174,7 +174,7 @@ The counts to quote, distinguished:
 and `sort -u` counts (file, name) pairs instead. Each read form is here because
 something was hiding behind it:
 
-- `host_os::var` and `host_seam::ops::getenv` (a **byte** string) are how
+- `host_os::var` and `host_seam::getenv` (a **byte** string) are how
   `importing.rs` reads `PYRE_STDLIB`. Neither adds a name — that gate is also
   read through `env::var` in `pyre-wasm-runner` — but a sandbox- or wasm-only
   gate would have had no such cover.
