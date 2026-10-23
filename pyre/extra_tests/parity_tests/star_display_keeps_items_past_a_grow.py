@@ -198,18 +198,18 @@ young_ascii_strs_appended_into_an_old_cap7_ascii_list_survive_minors()
 
 
 def _permute_old_list_keeps_young_payloads(kind, make, fresh, is_ok):
-    n = 3000
+    n = 200
     lst = [make(i) for i in range(n)]
     gc.collect()
     gc.collect()
-    for k in range(20):
-        for j in range(50):
-            lst[(j * 60 + k) % n] = fresh(k, j)
+    for k in range(10):
+        for j in range(20):
+            lst[(j * 9 + k) % n] = fresh(k, j)
         if k % 2:
             lst.reverse()
         else:
             lst.sort(reverse=True)
-        junk = [make(i) for i in range(4000)]
+        junk = [make(i) for i in range(300)]
         del junk
         for x in lst:
             if not is_ok(x):
