@@ -359,6 +359,10 @@ mod imp {
         {
             if tc == "O" {
                 let num = unsafe { *(p as *const usize) };
+                if num == 0 {
+                    // `O_get` on a NULL word.
+                    return Err(pyre_interpreter::PyError::value_error("PyObject is NULL"));
+                }
                 return Ok(cdata::pyobj_container_get(num).unwrap_or_else(pyre_object::w_none));
             }
             return Ok(cdata::decoded_to_pyobject(unsafe {

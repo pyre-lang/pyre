@@ -1681,7 +1681,7 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
                 }
                 return Ok(pyre_object::longobject::w_long_new(BigInt::from(raw)));
             }
-            Ok(cdata::decode_slot(&tc, &field_bytes))
+            cdata::decode_slot(&tc, &field_bytes)
         }
         ParamFunc::Array => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
@@ -2529,7 +2529,7 @@ fn array_get_index(mut obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResu
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("instance has no buffer"))?;
             let end = (offset + meta.element_size).min(all.len());
             let start = offset.min(end);
-            Ok(cdata::decode_slot(&tc, &all[start..end]))
+            cdata::decode_slot(&tc, &all[start..end])
         }
         ParamFunc::Struct | ParamFunc::Union | ParamFunc::Array | ParamFunc::Pointer => Ok(
             cdata::make_indexed_subview(meta.proto, obj, offset, meta.element_size, idx),
@@ -3187,7 +3187,7 @@ fn pointer_get_index(mut obj: PyObjectRef, index: isize) -> PyResult {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("element has no '_type_'"))?;
             let bytes = unsafe { cfield::borrow_memory(addr as *const u8, element_size) };
-            Ok(cdata::decode_slot(&tc, bytes))
+            cdata::decode_slot(&tc, bytes)
         }
         _ => Ok(cdata::make_at_address(proto, addr, element_size, obj)),
     }

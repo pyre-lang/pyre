@@ -56,10 +56,8 @@ const STORAGE_KEYS: [&str; 7] = [
 /// upstream.  The table is an ordinary movable `list`, forwarded by
 /// [`walk_pyobj_container_roots`].
 ///
-/// One deviation from upstream, deliberate: the stored word is `num + 1`.
-/// A zero-based `num` would collide with the zero a fresh buffer holds, which
-/// both `_SimpleCData.__repr__`'s `<NULL>` and an unset `.value` read as "no
-/// object".
+/// The stored word is `num + 1` so 0 remains the NULL word; see
+/// [`pyobj_container_add`].
 static PYOBJ_CONTAINER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Forward the container for the process-global root walk.
@@ -74,7 +72,13 @@ pub fn walk_pyobj_container_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef))
     PYOBJ_CONTAINER.store(root.0, Release);
 }
 
-/// `pyobj_container.add(obj)`, returning the word the buffer stores.
+/// `GlobalPyobjContainer.add`, returning the word the buffer stores.
+///
+/// Upstream returns a zero-based `num`.  The word here is `num + 1` so that
+/// 0 remains the NULL word `O_get` raises `ValueError("PyObject is NULL")`
+/// on.  A zero-based slot would alias that NULL, which is why
+/// `GlobalPyobjContainer.get` answers `objs[0]` (or `IndexError` when the
+/// table is empty) for an unset `py_object`.
 fn pyobj_container_add(obj: PyObjectRef) -> usize {
     use std::sync::atomic::Ordering::{AcqRel, Acquire};
     // Both the cell and the append allocate, so `obj` is published before the
@@ -121,9 +125,11 @@ fn pyobj_container_add(obj: PyObjectRef) -> usize {
     }
 }
 
-/// `pyobj_container.get(num)` for the word a `py_object` buffer holds.
-/// `None` for the zero a buffer starts at, and for a weakref whose target has
-/// since died -- upstream's `self.objs[num]()` answers `None` there too.
+/// `GlobalPyobjContainer.get` for the word a `py_object` buffer holds.
+/// `None` for the zero a buffer starts at (keepalive treats that as no
+/// referent), and for a weakref whose target has since died -- upstream's
+/// `self.objs[num]()` answers `None` there too.  A Python-visible read of
+/// word 0 raises in [`decode_slot`].
 pub(super) fn pyobj_container_get(num: usize) -> Option<PyObjectRef> {
     use std::sync::atomic::Ordering::Acquire;
     let table = PYOBJ_CONTAINER.load(Acquire) as PyObjectRef;
@@ -723,7 +729,7 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
         return Ok(pyre_object::w_str_new_managed(&format!("{name}(<NULL>)")));
     }
     let bytes = pyre_object::with_roots!(cls => cdata_bytes(obj)).unwrap_or(&[]);
-    let value = pyre_object::with_roots!(cls => decode_slot(&tc, bytes));
+    let value = pyre_object::with_roots!(cls => decode_slot(&tc, bytes))?;
     let rendered =
         unsafe { pyre_object::with_roots!(cls => pyre_interpreter::display::py_repr_wtf8(value)) }?;
     let name = unsafe { pyre_object::typeobject::w_type_get_name(cls) };
@@ -949,12 +955,12 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     // tables — so it is read before the reversal below could reach it.
     #[cfg(windows)]
     if tc == "X" {
-        return Ok(decode_slot(&tc, bytes));
+        return decode_slot(&tc, bytes);
     }
     // Neither does `O`, and its word is a container slot rather than a value:
     // reversing it would name a different object.
     if tc == "O" {
-        return Ok(decode_slot(&tc, bytes));
+        return decode_slot(&tc, bytes);
     }
     let swapped =
         unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
@@ -963,7 +969,7 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
         owned = bytes.iter().rev().copied().collect::<Vec<_>>();
         bytes = &owned;
     }
-    Ok(decode_slot(&tc, bytes))
+    decode_slot(&tc, bytes)
 }
 
 /// `_SimpleCData.value` setter — `(descr, instance, value)`.
@@ -2105,21 +2111,31 @@ pub(super) fn bstr_to_pyobject(bytes: &[u8]) -> PyObjectRef {
 /// The host's decode table answers None for a code it does not know, and it
 /// does not know the BSTR one; `X_get` reads that out of the length the string
 /// itself records.
-pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
+///
+/// A Python-visible `"O"` read raises `ValueError("PyObject is NULL")` when
+/// the word is 0, the way `O_get` does.  Keepalive bookkeeping goes through
+/// [`pyobj_container_get`] and treats 0 as no referent.
+pub(super) fn decode_slot(
+    tc: &str,
+    bytes: &[u8],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     #[cfg(windows)]
     if tc == "X" {
-        return bstr_to_pyobject(bytes);
+        return Ok(bstr_to_pyobject(bytes));
     }
     // `O_get` — the buffer holds the container slot, not the object.  An
     // address stored here would dangle the first time the target moved.
     if tc == "O" {
-        return pyobj_container_get(cfield::read_pointer_from_buffer(bytes))
-            .unwrap_or_else(pyre_object::w_none);
+        let num = cfield::read_pointer_from_buffer(bytes);
+        if num == 0 {
+            return Err(pyre_interpreter::PyError::value_error("PyObject is NULL"));
+        }
+        return Ok(pyobj_container_get(num).unwrap_or_else(pyre_object::w_none));
     }
     // `P_get` reads a null pointer as `None`, the way `z_get` and `Z_get` read
     // a null string as one; the host's table answers the address either way.
     if tc == "P" && cfield::read_pointer_from_buffer(bytes) == 0 {
-        return pyre_object::w_none();
+        return Ok(pyre_object::w_none());
     }
     // Cut to the code's own width first.  A return value arrives as the
     // register image it came back in rather than as a slot of its type, and
@@ -2130,7 +2146,7 @@ pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
         Some(size) if size < bytes.len() => &bytes[..size],
         _ => bytes,
     };
-    decoded_to_pyobject(cfield::decode_type_code(tc, bytes))
+    Ok(decoded_to_pyobject(cfield::decode_type_code(tc, bytes)))
 }
 
 /// Release the BSTR a slot holds before something else is written over it.

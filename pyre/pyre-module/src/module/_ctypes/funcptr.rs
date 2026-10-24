@@ -1568,7 +1568,7 @@ fn convert_one_callback_arg_inner(
         // Evidence: v3.15.1 `Modules/_ctypes/cfield.c` `P_get`.
         let bytes = cdata::cdata_buffer_copy(pyre_object::gc_roots::shadow_stack_get(cdata_slot))
             .unwrap_or_default();
-        return Ok(cdata::decode_slot("P", &bytes));
+        return cdata::decode_slot("P", &bytes);
     }
     if is_primitive_argtype(pyre_object::gc_roots::shadow_stack_get(base)) {
         return pyre_interpreter::baseobjspace::getattr_str(
@@ -1777,7 +1777,7 @@ pub(super) fn callback_result(
         Ret::Void => Ok(pyre_object::w_none()),
         Ret::Code(code) => {
             let bytes = cdata::encode_value_into(&code, result, obj, "result")?;
-            Ok(cdata::decode_slot(&code, &bytes))
+            cdata::decode_slot(&code, &bytes)
         }
         Ret::Pointer(_) | Ret::Aggregate(_) => Ok(result),
     }
@@ -2635,7 +2635,7 @@ fn build_return_value(
                 CallValue::Scalar(b) | CallValue::Aggregate(b) => b,
                 CallValue::Pointer(p) => p.to_ne_bytes().to_vec(),
             };
-            Ok(cdata::decode_slot(&c, &bytes))
+            cdata::decode_slot(&c, &bytes)
         }
     }
 }
