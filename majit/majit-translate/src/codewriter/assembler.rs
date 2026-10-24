@@ -2326,6 +2326,16 @@ impl AssemblerEncode for Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
+                // `jtransform.py rewrite_op_getfield` `cpu.fielddescrof(
+                // STRUCT, quasiimmut.get_mutate_field_name(...))` raises
+                // when the hidden field is absent. Ordinary field Missing
+                // still mints; only the mutate operand is required.
+                require_mutate_field_resolved(
+                    callcontrol,
+                    mutate_field,
+                    Some(field),
+                    "record_quasiimmut_field",
+                );
                 for fd in [field, mutate_field] {
                     let descr_idx = self.emit_ready_descr(fielddescrof(
                         fd,
@@ -2366,6 +2376,15 @@ impl AssemblerEncode for Assembler {
                         argcodes.push('r');
                     }
                 }
+                // `jtransform.py rewrite_op_jit_force_quasi_immutable`
+                // `cpu.fielddescrof(v_inst.concretetype.TO, c_fieldname.value)`
+                // raises when that mutate field is absent.
+                require_mutate_field_resolved(
+                    callcontrol,
+                    mutate_field,
+                    None,
+                    "jit_force_quasi_immutable",
+                );
                 let descr_idx = self.emit_ready_descr(fielddescrof(
                     mutate_field,
                     &crate::model::ValueType::Unknown,
@@ -4883,6 +4902,36 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
         })
         .map(BhFieldLookup::Layout)
         .unwrap_or(BhFieldLookup::Missing)
+}
+
+/// `cpu.fielddescrof(STRUCT, get_mutate_field_name(name))` raises at
+/// translation when the hidden field `rclass.py InstanceRepr._setup_repr`
+/// synthesizes as `mutate_<name>` is absent. Ordinary field `Missing`
+/// still mints offset 0; only a mutate operand of
+/// `record_quasiimmut_field` / `jit_force_quasi_immutable` is required.
+fn require_mutate_field_resolved(
+    callcontrol: Option<&CallControl>,
+    mutate_field: &crate::model::FieldDescriptor,
+    watched_field: Option<&crate::model::FieldDescriptor>,
+    opname: &str,
+) {
+    let Some(cc) = callcontrol else {
+        return;
+    };
+    if !matches!(bh_field_lookup(cc, mutate_field), BhFieldLookup::Missing) {
+        return;
+    }
+    let owner = mutate_field.owner_root.as_deref().unwrap_or("<unknown>");
+    let mutate_name = mutate_field.name.as_str();
+    let watched = watched_field
+        .map(|field| field.name.as_str())
+        .or_else(|| mutate_name.strip_prefix("mutate_"))
+        .unwrap_or("<unknown>");
+    panic!(
+        "{opname}: mutate descr `{owner}.{mutate_name}` is missing from the owner layout \
+         (watching `{watched}`); the hidden field must be named mutate_<name> \
+         (rclass.py InstanceRepr._setup_repr)"
+    );
 }
 
 /// Offset and size of a by-value substructure that has no flattened field
@@ -9721,22 +9770,62 @@ mod tests {
         assert_eq!(body.c_num_regs_f as usize, 0);
     }
 
-    /// `OpKind::RecordQuasiImmutField` must lower to a single opcode
-    /// keyed `record_quasiimmut_field/rdd`, with the field+mutate
-    /// FieldDescriptor pair pushed as two `BhDescr::Field` entries — see
-    /// `rpython/jit/codewriter/jtransform.py:901-903` and
-    /// `rpython/jit/metainterp/blackhole.py:1537-1539`.
-    #[test]
-    fn assembles_record_quasiimmut_field_with_two_descrs() {
-        use crate::call::CallControl;
+    const QUASIIMMUT_CELL_OWNER: &str = "assembler_quasiimmut_mutate_layout_test::Cell";
+
+    /// Assemble a quasi-immut `value` read. `include_mutate` registers the
+    /// hidden `mutate_value` field `rclass.py InstanceRepr._setup_repr`
+    /// synthesizes; omitting it is the Missing lookup `cpu.fielddescrof`
+    /// raises on.
+    fn assemble_record_quasiimmut_cell(include_mutate: bool) -> Assembler {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
         use crate::flatten::flatten_graph;
         use crate::jtransform::{GraphTransformConfig, Transformer};
         use crate::model::{FieldDescriptor, FunctionGraph, ImmutableRank, OpKind, ValueType};
 
+        let owner = QUASIIMMUT_CELL_OWNER;
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut fields = vec![StructFieldLayout {
+            name: "value".into(),
+            offset: 0,
+            size: 8,
+            flag: majit_ir::descr::ArrayFlag::Signed,
+            field_type: majit_ir::value::Type::Int,
+            rank: Some(ImmutableRank::QuasiImmutable),
+        }];
+        let mut size = 8usize;
+        if include_mutate {
+            fields.push(StructFieldLayout {
+                name: "mutate_value".into(),
+                offset: 8,
+                size: 16,
+                flag: majit_ir::descr::ArrayFlag::Pointer,
+                field_type: majit_ir::value::Type::Ref,
+                rank: None,
+            });
+            size = 24;
+        }
+
         let mut cc = CallControl::new();
         cc.immutable_fields_by_struct.insert(
-            "Cell".to_string(),
+            owner.to_string(),
             vec![("value".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields,
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
         );
 
         let mut graph = FunctionGraph::new("read_cell");
@@ -9746,7 +9835,7 @@ mod tests {
                 graph.startblock,
                 OpKind::FieldRead {
                     base: base_var.clone(),
-                    field: FieldDescriptor::new("value", Some("Cell".to_string())),
+                    field: FieldDescriptor::new("value", Some(owner.to_string())),
                     ty: ValueType::Int,
                     pure: false,
                 },
@@ -9764,12 +9853,20 @@ mod tests {
         regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &mut regallocs);
-        // `assemble` derives every operand kind from the variable
-        // concretetype + the `regallocs` coloring (lookup_coloring_var,
-        // flatten.py:386-387); pass the same canonical-exceptblock-
-        // augmented graph and regallocs that the flatten pass consumed.
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        asm
+    }
+
+    /// `OpKind::RecordQuasiImmutField` must lower to a single opcode
+    /// keyed `record_quasiimmut_field/rdd`, with the field+mutate
+    /// FieldDescriptor pair pushed as two `BhDescr::Field` entries — see
+    /// `rpython/jit/codewriter/jtransform.py Transformer.rewrite_op_getfield`
+    /// (quasi-immutable arm that emits `record_quasiimmut_field`) and
+    /// `rpython/jit/metainterp/blackhole.py BlackholeInterpreter.bhimpl_record_quasiimmut_field`.
+    #[test]
+    fn assembles_record_quasiimmut_field_with_two_descrs() {
+        let asm = assemble_record_quasiimmut_cell(true);
 
         let key_count = asm
             .insns
@@ -9797,7 +9894,9 @@ mod tests {
         let field_descr_names: Vec<&str> = descrs
             .iter()
             .filter_map(|d| match d {
-                crate::jitcode::BhDescr::Field { name, owner, .. } if owner == "Cell" => {
+                crate::jitcode::BhDescr::Field { name, owner, .. }
+                    if owner == QUASIIMMUT_CELL_OWNER =>
+                {
                     Some(name.as_str())
                 }
                 _ => None,
@@ -9808,6 +9907,18 @@ mod tests {
             "expected Field descrs for `value` + `mutate_value`, got {:?}",
             field_descr_names
         );
+    }
+
+    /// `cpu.fielddescrof(STRUCT, 'mutate_value')` raises at translation
+    /// when the hidden field is absent (`get_field_descr` /
+    /// `getattr(STRUCT, fieldname)`). A Missing lookup must not mint
+    /// offset 0.
+    #[test]
+    #[should_panic(
+        expected = "the hidden field must be named mutate_<name> (rclass.py InstanceRepr._setup_repr)"
+    )]
+    fn record_quasiimmut_field_missing_mutate_field_fails_translation() {
+        let _ = assemble_record_quasiimmut_cell(false);
     }
 
     /// `OpKind::JitForceQuasiImmutable` must lower to a single opcode
@@ -9868,6 +9979,64 @@ mod tests {
             "expected Field descr for `mutate_code`, got {:?}",
             field_descr_names
         );
+    }
+
+    /// `rewrite_op_jit_force_quasi_immutable` `cpu.fielddescrof` raises
+    /// when the mutate field is absent from the owner layout.
+    #[test]
+    #[should_panic(
+        expected = "the hidden field must be named mutate_<name> (rclass.py InstanceRepr._setup_repr)"
+    )]
+    fn jit_force_quasi_immutable_missing_mutate_field_fails_translation() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        let owner = "assembler_quasiimmut_mutate_layout_test::Function";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![StructFieldLayout {
+                    name: "code".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mut graph = FunctionGraph::new("force_qmut_missing");
+        let base_var = push_input_var(&mut graph, "func", ValueType::Ref(None));
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::JitForceQuasiImmutable {
+                base: LinkArg::Value(base_var.clone()),
+                mutate_field: FieldDescriptor::new("mutate_code", Some(owner.to_string())),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::GcRef);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
     }
 
     /// A Constant ref `base` still keys `jit_force_quasi_immutable/rd`
