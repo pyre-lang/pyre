@@ -466,6 +466,9 @@ pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bo
         return false;
     }
     let path = peel_pointer_spelling(path);
+    // `_alloc_flavor_` is a class attribute: every instantiation of the
+    // ADT (`CodeObject<ConstantData>`) shares its flavor.
+    let path = path.split('<').next().unwrap_or(path);
     let identity = majit_ir::descr::canonical_struct_name(path);
     if raw.contains(path) || raw.contains(&identity) {
         return true;

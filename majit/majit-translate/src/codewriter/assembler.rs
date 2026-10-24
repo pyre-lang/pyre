@@ -818,7 +818,9 @@ fn panic_if_gc_host_object_int_dest(
         Some("type-static")
     } else if empty_array_host_object_name(obj).is_some() {
         Some("empty array")
-    } else if empty_class_prebuilt_instance(obj, callcontrol).is_some() {
+    } else if empty_class_prebuilt_instance(obj, callcontrol)
+        .is_some_and(|prebuilt| prebuilt.is_gc_managed)
+    {
         Some("prebuilt instance")
     } else {
         None
@@ -1701,7 +1703,15 @@ impl AssemblerEncode for Assembler {
                                 'i',
                             )
                         } else {
-                            self.emit_const_i_allow_short(bits, use_c_form("int_copy"), state)
+                            // `emit_const` pools `cast_ptr_to_adr` of the
+                            // represented low-level object; `identity_id`
+                            // is the translator's own bookkeeping address.
+                            panic!(
+                                "Assembler.emit_const: raw HostObject {} has no runtime \
+                                 counterpart — graph {:?}",
+                                obj.qualname(),
+                                self.current_graph_name,
+                            )
                         };
                         finish_const_copy(
                             self,

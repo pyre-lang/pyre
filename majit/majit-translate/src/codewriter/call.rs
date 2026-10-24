@@ -3835,9 +3835,18 @@ fn is_known_by_value_struct(
 
 /// Pointee spelling of an `AtomicPtr<T>`.
 fn atomic_ptr_pointee(type_name: &str) -> Option<&str> {
-    let leaf = type_name.rsplit("::").next().unwrap_or(type_name);
-    let rest = leaf.strip_prefix("AtomicPtr<")?;
-    rest.strip_suffix('>')
+    let (base, args) = type_name.split_once('<')?;
+    (outer_type_leaf(base) == "AtomicPtr")
+        .then(|| args.strip_suffix('>'))
+        .flatten()
+}
+
+/// Last path segment of a type spelling's outer constructor, its generic
+/// arguments dropped first so a qualified argument (`AtomicPtr<a::B>`)
+/// does not supply the segment.
+fn outer_type_leaf(type_name: &str) -> &str {
+    let base = type_name.split('<').next().unwrap_or(type_name);
+    base.rsplit("::").next().unwrap_or(base)
 }
 
 /// Layout-transparent `core::sync::atomic` wrappers. `AtomicI64` occupies
@@ -3848,8 +3857,7 @@ pub(crate) fn atomic_wrapper_leaf(
     type_name: &str,
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> Option<(majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize)> {
-    let leaf = type_name.rsplit("::").next().unwrap_or(type_name);
-    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    let leaf = outer_type_leaf(type_name);
     let word = crate::layout::target_word_size();
     use majit_ir::descr::ArrayFlag;
     match leaf {
@@ -13131,8 +13139,7 @@ pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
     if type_str == "()" {
         return true;
     }
-    let leaf = type_str.rsplit("::").next().unwrap_or(type_str);
-    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    let leaf = outer_type_leaf(type_str);
     leaf == "PhantomData" || leaf == "BuildHasherDefault"
 }
 
@@ -21603,6 +21610,22 @@ mod tests {
         }
         assert_eq!(get_type_flag("AtomicPtr<PyObject>", &raw), fallback);
         assert_eq!(get_type_flag("AtomicPtr<PyObject>", &empty), fallback);
+        // The flavor belongs to the ADT, so an instantiation and a
+        // qualified pointee inside the atomic wrapper resolve the same way.
+        let qualified: HashSet<String> = ["bytecode::CodeObject", "loop_headers::LoopHeaderInfo"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for spelling in [
+            "*const bytecode::CodeObject<bytecode::ConstantData>",
+            "std::sync::atomic::AtomicPtr<loop_headers::LoopHeaderInfo>",
+        ] {
+            assert_eq!(get_type_flag(spelling, &qualified), expected, "{spelling}");
+            assert_eq!(get_type_flag(spelling, &empty), fallback, "{spelling}");
+        }
+        assert!(type_str_leaf_is_void_zst(
+            "core::marker::PhantomData<pyre_object::PyObject>"
+        ));
     }
 
     /// A one-word-item Vec field is `Ptr(Struct(raw) "RustVec")`
