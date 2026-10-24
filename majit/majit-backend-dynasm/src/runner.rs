@@ -526,6 +526,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_finalizer_hooks(
         Some(dynasm_register_finalizer),
         Some(dynasm_finalizer_next_dead),
+        Some(dynasm_get_finalizer_queue_index),
     );
 }
 
@@ -1169,12 +1170,19 @@ fn dynasm_collect_oldgen_nonmoving() {
     majit_gc::gc_sync::gc_op(|g| g.collect_oldgen_nonmoving());
 }
 
-fn dynasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
-    with_dynasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj, trigger));
+fn dynasm_register_finalizer(fq_index: usize, obj: GcRef) {
+    with_dynasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj));
+}
+
+fn dynasm_get_finalizer_queue_index(tag: majit_gc::FinalizerQueueTag) -> usize {
+    with_dynasm_active_gc_mut(|gc| gc.get_finalizer_queue_index(tag)).unwrap_or(0)
 }
 
 fn dynasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
-    with_dynasm_active_gc_mut(|gc| gc.finalizer_next_dead(fq_index)).flatten()
+    with_dynasm_active_gc(|gc| gc.finalizer_deque(fq_index))
+        .flatten()
+        .and_then(|deque| deque.popleft())
+        .map(GcRef)
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.

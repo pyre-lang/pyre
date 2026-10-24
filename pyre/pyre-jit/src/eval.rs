@@ -200,18 +200,14 @@ fn pyre_object_gc_isenabled_trampoline() -> bool {
     majit_gc::gc_isenabled()
 }
 
-fn pyre_object_gc_register_finalizer_trampoline(
-    fq_index: usize,
-    obj: pyre_object::PyObjectRef,
-    trigger: pyre_object::gc_hook::GcFinalizerTriggerFn,
-) {
-    majit_gc::gc_register_finalizer(fq_index, majit_ir::GcRef(obj as usize), trigger);
+fn pyre_object_gc_register_finalizer_trampoline(fq_index: usize, obj: pyre_object::PyObjectRef) {
+    majit_gc::gc_register_finalizer(fq_index, majit_ir::GcRef(obj as usize));
 }
 
 fn pyre_object_gc_get_finalizer_queue_index_trampoline(
-    trigger: pyre_object::gc_hook::GcFinalizerTriggerFn,
+    tag: pyre_object::gc_hook::GcFinalizerQueueTag,
 ) -> usize {
-    majit_gc::gc_get_finalizer_queue_index(trigger)
+    majit_gc::gc_get_finalizer_queue_index(tag)
 }
 
 fn pyre_object_gc_ignore_finalizer_trampoline(obj: pyre_object::PyObjectRef) {

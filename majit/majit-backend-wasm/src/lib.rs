@@ -1402,6 +1402,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_finalizer_hooks(
         Some(wasm_register_finalizer),
         Some(wasm_finalizer_next_dead),
+        Some(wasm_get_finalizer_queue_index),
     );
 }
 
@@ -1792,12 +1793,19 @@ fn wasm_id_or_identityhash(addr: usize) -> usize {
     addr
 }
 
-fn wasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
-    with_wasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj, trigger));
+fn wasm_register_finalizer(fq_index: usize, obj: GcRef) {
+    with_wasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj));
+}
+
+fn wasm_get_finalizer_queue_index(tag: majit_gc::FinalizerQueueTag) -> usize {
+    with_wasm_active_gc_mut(|gc| gc.get_finalizer_queue_index(tag)).unwrap_or(0)
 }
 
 fn wasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
-    with_wasm_active_gc_mut(|gc| gc.finalizer_next_dead(fq_index)).flatten()
+    with_wasm_active_gc(|gc| gc.finalizer_deque(fq_index))
+        .flatten()
+        .and_then(|deque| deque.popleft())
+        .map(GcRef)
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.

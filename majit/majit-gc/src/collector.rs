@@ -7,6 +7,7 @@
 //!
 //! Modeled after incminimark's minor/major collection.
 use majit_ir::GcRef;
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -51,7 +52,7 @@ use crate::nursery::{DEFAULT_NURSERY_SIZE, Nursery};
 use crate::oldgen::OldGen;
 use crate::rawrefcount::{self, RrcList};
 use crate::trace::{ClassTypeLayout, TypeEntry, TypeInfo, TypeInfoLayout, TypeRegistry};
-use crate::{FinalizerTriggerFn, GcAllocator};
+use crate::{FinalizerQueueTag, FinalizerTriggerFn, GcAllocator};
 
 /// `inspector.py HeapDumper.BUFSIZE` raw signed-word writer. Keeping the
 /// fixed-size buffer here avoids materializing the full heap dump in memory.
@@ -954,8 +955,60 @@ impl IncrementalMarkState {
     }
 }
 
+/// Per-queue death deque (`framework.py get_finalizer_queue_index` `adr_deque`).
+/// Allocated separately from the collector so `ll_next_dead` can `popleft`
+/// without a collector borrow. The GIL serialises every access.
+pub struct FinalizerDeque {
+    inner: UnsafeCell<VecDeque<usize>>,
+}
+
+// AddressDeque is a nongc instance; the GIL is held for every mutator that
+// reaches a FinalizerQueue, so concurrent access cannot occur.
+unsafe impl Sync for FinalizerDeque {}
+unsafe impl Send for FinalizerDeque {}
+
+impl FinalizerDeque {
+    /// Leak a fresh deque. `framework.py get_finalizer_queue_index` keeps
+    /// `adr_deque` for the life of the process.
+    pub fn leak() -> &'static Self {
+        Box::leak(Box::new(Self {
+            inner: UnsafeCell::new(VecDeque::new()),
+        }))
+    }
+
+    fn inner(&self) -> &VecDeque<usize> {
+        unsafe { &*self.inner.get() }
+    }
+
+    fn inner_mut(&self) -> &mut VecDeque<usize> {
+        unsafe { &mut *self.inner.get() }
+    }
+
+    pub fn append(&self, addr: usize) {
+        self.inner_mut().push_back(addr);
+    }
+
+    pub fn non_empty(&self) -> bool {
+        !self.inner().is_empty()
+    }
+
+    pub fn popleft(&self) -> Option<usize> {
+        self.inner_mut().pop_front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner().len()
+    }
+
+    pub fn get(&self, i: usize) -> Option<usize> {
+        self.inner().get(i).copied()
+    }
+}
+
 struct FinalizerHandler {
-    deque: VecDeque<usize>,
+    /// Address of the FinalizerQueue instance (`finalizer_queue_indexes` key).
+    fq: usize,
+    deque: &'static FinalizerDeque,
     trigger: FinalizerTriggerFn,
 }
 
@@ -2660,23 +2713,32 @@ impl MiniMarkGC {
     }
 
     /// framework.py `get_finalizer_queue_index`. Each FinalizerQueue is
-    /// identified by its `ll_finalizer_trigger` fn pointer
+    /// identified by the instance address in `tag.fq`
     /// (`finalizer_queue_indexes[fq]`); a first visit takes
     /// `len(finalizer_handlers)` and pushes that queue's deque and trigger.
-    pub fn get_finalizer_queue_index(&mut self, trigger: FinalizerTriggerFn) -> usize {
+    pub fn get_finalizer_queue_index(&mut self, tag: FinalizerQueueTag) -> usize {
         if let Some(index) = self
             .finalizer_handlers
             .iter()
-            .position(|handler| std::ptr::fn_addr_eq(handler.trigger, trigger))
+            .position(|handler| handler.fq == tag.fq)
         {
             return index;
         }
         let index = self.finalizer_handlers.len();
         self.finalizer_handlers.push(FinalizerHandler {
-            deque: VecDeque::new(),
-            trigger,
+            fq: tag.fq,
+            deque: FinalizerDeque::leak(),
+            trigger: tag.trigger,
         });
         index
+    }
+
+    /// The `adr_deque` of handler `fq_index`, for `ll_next_dead` to pop
+    /// without borrowing the collector.
+    pub fn finalizer_deque(&self, fq_index: usize) -> Option<&'static FinalizerDeque> {
+        self.finalizer_handlers
+            .get(fq_index)
+            .map(|handler| handler.deque)
     }
 
     /// Initialize a nursery object's header.
@@ -6635,13 +6697,17 @@ impl MiniMarkGC {
 
         // gc/base.py `enum_pending_finalizers`: objects already moved to a
         // death queue remain GC roots until app-level code pops them.
-        let pending: Vec<usize> = self
-            .finalizer_handlers
-            .iter()
-            .flat_map(|handler| handler.deque.iter().copied())
-            .collect();
-        for addr in pending {
-            result.push(GcRef(addr));
+        let mut h = 0;
+        while h < self.finalizer_handlers.len() {
+            let deque = self.finalizer_handlers[h].deque;
+            let mut j = 0;
+            while j < deque.len() {
+                if let Some(addr) = deque.get(j) {
+                    result.push(GcRef(addr));
+                }
+                j += 1;
+            }
+            h += 1;
         }
         result.extend(self.run_old_style_finalizers.iter().copied().map(GcRef));
         result
@@ -6727,10 +6793,12 @@ impl MiniMarkGC {
         // they survive or move to the death queue.
         let mut h = 0;
         while h < self.finalizer_handlers.len() {
+            let deque = self.finalizer_handlers[h].deque;
             let mut j = 0;
-            while j < self.finalizer_handlers[h].deque.len() {
-                let addr = self.finalizer_handlers[h].deque[j];
-                seed(self, GcRef(addr), "finalizer_death_queue", false);
+            while j < deque.len() {
+                if let Some(addr) = deque.get(j) {
+                    seed(self, GcRef(addr), "finalizer_death_queue", false);
+                }
                 j += 1;
             }
             h += 1;
@@ -7381,13 +7449,17 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_rescan_roots(|gcref| {
             self.seed_major_root(*gcref, "rescan_tls_exception");
         });
-        let pending: Vec<usize> = self
-            .finalizer_handlers
-            .iter()
-            .flat_map(|handler| handler.deque.iter().copied())
-            .collect();
-        for addr in pending {
-            self.seed_major_root(GcRef(addr), "rescan_finalizer_death_queue");
+        let mut h = 0;
+        while h < self.finalizer_handlers.len() {
+            let deque = self.finalizer_handlers[h].deque;
+            let mut j = 0;
+            while j < deque.len() {
+                if let Some(addr) = deque.get(j) {
+                    self.seed_major_root(GcRef(addr), "rescan_finalizer_death_queue");
+                }
+                j += 1;
+            }
+            h += 1;
         }
         while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
             self.mark_object(obj_addr);
@@ -9488,7 +9560,7 @@ impl MiniMarkGC {
                 } else {
                     self.finalizer_handlers[fq_index as usize]
                         .deque
-                        .push_back(obj_addr);
+                        .append(obj_addr);
                 }
                 self.recursively_clear_finalization_ordering(obj_addr);
             } else {
@@ -9503,10 +9575,17 @@ impl MiniMarkGC {
             return;
         }
         self.finalizer_lock = true;
-        for handler in &self.finalizer_handlers {
-            if !handler.deque.is_empty() {
-                (handler.trigger)();
+        // gc/base.py `execute_finalizers`: copy `(deque, trigger)` out so
+        // the trigger (`ll_next_dead` / `next_dead`) holds no reference into
+        // `finalizer_handlers`.
+        let mut i = 0;
+        while i < self.finalizer_handlers.len() {
+            let deque = self.finalizer_handlers[i].deque;
+            let trigger = self.finalizer_handlers[i].trigger;
+            if deque.non_empty() {
+                trigger();
             }
+            i += 1;
         }
         // GCBase.execute_finalizers runs old-style callbacks only after every
         // new-style queue trigger. Pop before calling so a nested collection
@@ -11130,19 +11209,18 @@ impl GcAllocator for MiniMarkGC {
         self.isenabled()
     }
 
-    fn get_finalizer_queue_index(&mut self, trigger: FinalizerTriggerFn) -> usize {
-        MiniMarkGC::get_finalizer_queue_index(self, trigger)
+    fn get_finalizer_queue_index(&mut self, tag: FinalizerQueueTag) -> usize {
+        MiniMarkGC::get_finalizer_queue_index(self, tag)
     }
 
-    fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+    fn register_finalizer(&mut self, fq_index: usize, obj: GcRef) {
         if obj.is_null() || !self.is_managed_heap_object(obj.0) {
             return;
         }
         // framework.py `gct_gc_fq_register` calls `get_finalizer_queue_index`
         // first; the handler already exists.
         assert!(
-            fq_index < self.finalizer_handlers.len()
-                && std::ptr::fn_addr_eq(self.finalizer_handlers[fq_index].trigger, trigger),
+            fq_index < self.finalizer_handlers.len(),
             "finalizer queue index must come from get_finalizer_queue_index"
         );
         let fq_index = isize::try_from(fq_index).expect("finalizer queue index exceeds Signed");
@@ -11163,10 +11241,13 @@ impl GcAllocator for MiniMarkGC {
     }
 
     fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
-        self.finalizer_handlers
-            .get_mut(fq_index)
-            .and_then(|handler| handler.deque.pop_front())
+        self.finalizer_deque(fq_index)
+            .and_then(|deque| deque.popleft())
             .map(GcRef)
+    }
+
+    fn finalizer_deque(&self, fq_index: usize) -> Option<&'static FinalizerDeque> {
+        MiniMarkGC::finalizer_deque(self, fq_index)
     }
 
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
@@ -11530,10 +11611,18 @@ impl Drop for MiniMarkGC {
 mod tests {
     use super::*;
 
+    fn tag_for(trigger: FinalizerTriggerFn) -> FinalizerQueueTag {
+        FinalizerQueueTag {
+            fq: trigger as usize,
+            trigger,
+        }
+    }
+
     /// framework.py `get_finalizer_queue_index` then `register_finalizer`.
     fn register_on_fq(gc: &mut MiniMarkGC, obj: GcRef, trigger: FinalizerTriggerFn) -> usize {
-        let fq_index = GcAllocator::get_finalizer_queue_index(gc, trigger);
-        GcAllocator::register_finalizer(gc, fq_index, obj, trigger);
+        let tag = tag_for(trigger);
+        let fq_index = GcAllocator::get_finalizer_queue_index(gc, tag);
+        GcAllocator::register_finalizer(gc, fq_index, obj);
         fq_index
     }
 
@@ -13552,8 +13641,11 @@ mod tests {
 
         TRIGGERS.store(0, Ordering::Relaxed);
         let mut gc = test_gc(4096);
+        let deque = FinalizerDeque::leak();
+        deque.append(0xfeed);
         gc.finalizer_handlers.push(FinalizerHandler {
-            deque: VecDeque::from([0xfeed]),
+            fq: 0,
+            deque,
             trigger,
         });
         gc.gc_state = GcState::Sweeping;
@@ -18726,20 +18818,20 @@ cache size\t: 8192 kB\n";
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
 
-        let index_a = GcAllocator::get_finalizer_queue_index(&mut gc, trigger_a);
-        let index_b = GcAllocator::get_finalizer_queue_index(&mut gc, trigger_b);
+        let index_a = GcAllocator::get_finalizer_queue_index(&mut gc, tag_for(trigger_a));
+        let index_b = GcAllocator::get_finalizer_queue_index(&mut gc, tag_for(trigger_b));
         assert_ne!(index_a, index_b);
         assert_eq!(
-            GcAllocator::get_finalizer_queue_index(&mut gc, trigger_a),
+            GcAllocator::get_finalizer_queue_index(&mut gc, tag_for(trigger_a)),
             index_a
         );
         assert_eq!(
-            GcAllocator::get_finalizer_queue_index(&mut gc, trigger_b),
+            GcAllocator::get_finalizer_queue_index(&mut gc, tag_for(trigger_b)),
             index_b
         );
 
         let obj_b = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
-        GcAllocator::register_finalizer(&mut gc, index_b, obj_b, trigger_b);
+        GcAllocator::register_finalizer(&mut gc, index_b, obj_b);
 
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(TRIGGERS_A.load(Ordering::Relaxed), 0);
@@ -18751,6 +18843,38 @@ cache size\t: 8192 kB\n";
         );
         assert!(GcAllocator::finalizer_next_dead(&mut gc, index_a).is_none());
         assert!(GcAllocator::finalizer_next_dead(&mut gc, index_b).is_none());
+    }
+
+    /// framework.py `get_finalizer_queue_index` keys `finalizer_queue_indexes`
+    /// by the FinalizerQueue instance (`fq`), not by the trigger fn.
+    #[test]
+    fn get_finalizer_queue_index_keys_by_fq_instance() {
+        fn shared_trigger() {}
+
+        let mut gc = test_gc(4096);
+        let tag_a = FinalizerQueueTag {
+            fq: 0xA,
+            trigger: shared_trigger,
+        };
+        let tag_b = FinalizerQueueTag {
+            fq: 0xB,
+            trigger: shared_trigger,
+        };
+        let index_a = GcAllocator::get_finalizer_queue_index(&mut gc, tag_a);
+        let index_b = GcAllocator::get_finalizer_queue_index(&mut gc, tag_b);
+        assert_ne!(index_a, index_b);
+        assert_eq!(
+            GcAllocator::get_finalizer_queue_index(&mut gc, tag_a),
+            index_a
+        );
+        assert_eq!(
+            GcAllocator::get_finalizer_queue_index(&mut gc, tag_b),
+            index_b
+        );
+        assert_eq!(
+            GcAllocator::get_finalizer_queue_index(&mut gc, tag_a),
+            index_a
+        );
     }
 
     /// After `do_collect_oldgen_nonmoving` with a young finalizer object, no
@@ -18783,11 +18907,9 @@ cache size\t: 8192 kB\n";
 
         gc.do_collect_oldgen_nonmoving();
 
+        let death_deque = gc.finalizer_handlers[fq_index].deque;
         assert!(
-            gc.finalizer_handlers[fq_index]
-                .deque
-                .iter()
-                .all(|&addr| !gc.is_in_nursery(addr)),
+            (0..death_deque.len()).all(|j| !gc.is_in_nursery(death_deque.get(j).unwrap())),
             "death queue must not hold a nursery address"
         );
         assert!(

@@ -445,6 +445,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_finalizer_hooks(
         Some(register_finalizer_via_active_runtime),
         Some(finalizer_next_dead_via_active_runtime),
+        Some(get_finalizer_queue_index_via_active_runtime),
     );
 }
 
@@ -1916,16 +1917,24 @@ fn collect_oldgen_nonmoving_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_oldgen_nonmoving());
 }
 
-fn register_finalizer_via_active_runtime(
-    fq_index: usize,
-    obj: GcRef,
-    trigger: majit_gc::FinalizerTriggerFn,
-) {
-    with_cranelift_gc(|gc| gc.register_finalizer(fq_index, obj, trigger));
+fn register_finalizer_via_active_runtime(fq_index: usize, obj: GcRef) {
+    with_cranelift_gc(|gc| gc.register_finalizer(fq_index, obj));
+}
+
+fn get_finalizer_queue_index_via_active_runtime(tag: majit_gc::FinalizerQueueTag) -> usize {
+    with_cranelift_gc(|gc| gc.get_finalizer_queue_index(tag)).unwrap_or(0)
 }
 
 fn finalizer_next_dead_via_active_runtime(fq_index: usize) -> Option<GcRef> {
-    with_cranelift_gc(|gc| gc.finalizer_next_dead(fq_index)).flatten()
+    if let Some(deque) = gc_box::with_reentrant_ref(|gc| gc.finalizer_deque(fq_index)) {
+        return deque.and_then(|d| d.popleft()).map(GcRef);
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_query_reentrant(|gc| gc.finalizer_deque(fq_index))
+            .and_then(|d| d.popleft())
+            .map(GcRef);
+    }
+    None
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.

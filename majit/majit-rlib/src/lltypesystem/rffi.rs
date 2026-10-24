@@ -14,7 +14,6 @@
 use parking_lot::Mutex;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, OnceLock};
 
 use super::rstr::{STR_CHARS_OFFSET, StrHeader, str_as_bytes};
@@ -105,11 +104,18 @@ struct _StrFinalizerQueue {
 
 impl _StrFinalizerQueue {
     /// framework.py `get_finalizer_queue_index`, cached like the
-    /// translation-time constant. This queue's `finalizer_trigger` is the
-    /// identity key.
+    /// translation-time constant. `tag.fq` is the address of
+    /// `_fq_addr_from_string`.
+    fn fq_tag() -> majit_gc::FinalizerQueueTag {
+        majit_gc::FinalizerQueueTag {
+            fq: std::ptr::addr_of!(_fq_addr_from_string) as usize,
+            trigger: finalizer_trigger,
+        }
+    }
+
     fn fq_index() -> usize {
         static INDEX: OnceLock<usize> = OnceLock::new();
-        *INDEX.get_or_init(|| majit_gc::gc_get_finalizer_queue_index(finalizer_trigger))
+        *INDEX.get_or_init(|| majit_gc::gc_get_finalizer_queue_index(Self::fq_tag()))
     }
 
     fn next_dead() -> Option<majit_ir::GcRef> {
@@ -120,26 +126,7 @@ impl _StrFinalizerQueue {
         if !majit_gc::current_thread_gc_available() || !majit_gc::rgil::am_i_holding_the_gil() {
             return;
         }
-        majit_gc::gc_register_finalizer(Self::fq_index(), gcptr, finalizer_trigger);
-    }
-
-    fn drain() {
-        loop {
-            let Some(gcptr) = Self::next_dead() else {
-                break;
-            };
-            if gcptr.is_null() {
-                break;
-            }
-            let key = majit_gc::gc_id_or_identityhash(gcptr.0);
-            let ptr = {
-                let mut fq = _fq_addr_from_string.lock();
-                fq.raw_copies.remove(&key).unwrap_or(0)
-            };
-            if ptr != 0 {
-                unsafe { free_charp(ptr as *mut u8, false) };
-            }
-        }
+        majit_gc::gc_register_finalizer(Self::fq_index(), gcptr);
     }
 }
 
@@ -151,25 +138,33 @@ static _fq_addr_from_string: LazyLock<Mutex<_StrFinalizerQueue>> = LazyLock::new
     })
 });
 
-/// `execute_finalizer_triggers` runs inside `gc_op`; `gc_fq_next_dead` is
-/// another `gc_op` (`ReentryGuard`). Set here, drained once `gc_op` returns.
-static STR_FQ_DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
-
 /// `_StrFinalizerQueue.finalizer_trigger` (`rffi.py`).
 fn finalizer_trigger() {
-    if majit_gc::gc_sync::in_gc_op() {
-        STR_FQ_DRAIN_PENDING.store(true, Ordering::Release);
-        return;
+    loop {
+        let Some(gcptr) = _StrFinalizerQueue::next_dead() else {
+            break;
+        };
+        if gcptr.is_null() {
+            break;
+        }
+        // `objectmodel.compute_unique_id`. Backends' `*_id_or_identityhash`
+        // pick `gc_query_reentrant` under `in_gc_op()`; with no hook the
+        // fallback is `addr`.
+        let key = majit_gc::gc_id_or_identityhash(gcptr.0);
+        let ptr = {
+            let fq = _fq_addr_from_string.lock();
+            fq.raw_copies.get(&key).copied().unwrap_or(0)
+        };
+        if ptr != 0 {
+            #[cfg(test)]
+            STR_FQ_FREE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            unsafe { free_charp(ptr as *mut u8, false) };
+        }
     }
-    STR_FQ_DRAIN_PENDING.store(false, Ordering::Release);
-    _StrFinalizerQueue::drain();
 }
 
-fn drain_str_fq_if_pending() {
-    if STR_FQ_DRAIN_PENDING.load(Ordering::Acquire) {
-        finalizer_trigger();
-    }
-}
+#[cfg(test)]
+static STR_FQ_FREE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// `_get_raw_address_buf_from_string` (`rffi.py`). Cache key is
 /// `objectmodel.compute_unique_id` via `majit_gc::gc_id_or_identityhash`.
@@ -178,15 +173,18 @@ fn drain_str_fq_if_pending() {
 /// Upstream has no JIT hint; the only caller is `get_raw_address_of_string`.
 #[allow(non_snake_case)]
 pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
-    drain_str_fq_if_pending();
     let key = majit_gc::gc_id_or_identityhash(string as usize);
-    let mut fq = _fq_addr_from_string.lock();
-    if let Some(&ptr) = fq.raw_copies.get(&key) {
-        return ptr as *mut u8;
+    {
+        let fq = _fq_addr_from_string.lock();
+        if let Some(&ptr) = fq.raw_copies.get(&key) {
+            return ptr as *mut u8;
+        }
     }
     let ptr = unsafe { str2charp(str_as_bytes(string as *const u8), false) };
-    fq.raw_copies.insert(key, ptr as usize);
-    drop(fq);
+    {
+        let mut fq = _fq_addr_from_string.lock();
+        fq.raw_copies.insert(key, ptr as usize);
+    }
     _StrFinalizerQueue::register_finalizer(majit_ir::GcRef(string as usize));
     ptr
 }
@@ -341,8 +339,8 @@ mod tests {
         }
     }
 
-    /// Host MiniMark: copy, drop the last root, collect, drain
-    /// `_StrFinalizerQueue.finalizer_trigger`, the raw copy is gone.
+    /// Host MiniMark: copy, drop the last root, collect; the trigger frees
+    /// the raw copy during that collection and `raw_copies` keeps the key.
     #[test]
     fn get_raw_address_buf_from_string_finalizer_frees_raw_copy() {
         with_host_gc_mutator(|| {
@@ -368,13 +366,17 @@ mod tests {
                 assert_eq!(fq.raw_copies.get(&key).copied(), Some(copy as usize));
             }
 
+            let frees_before = STR_FQ_FREE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
             majit_gc::gc_sync::gc_op(|gc| gc.roots.remove(&mut root));
             majit_gc::gc_sync::gc_op(|gc| gc.do_collect_oldgen_nonmoving());
-            finalizer_trigger();
+            assert_eq!(
+                STR_FQ_FREE_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+                frees_before + 1
+            );
 
             {
                 let fq = _fq_addr_from_string.lock();
-                assert!(!fq.raw_copies.contains_key(&key));
+                assert_eq!(fq.raw_copies.get(&key).copied(), Some(copy as usize));
             }
             assert!(majit_gc::gc_fq_next_dead(_StrFinalizerQueue::fq_index()).is_none());
         });

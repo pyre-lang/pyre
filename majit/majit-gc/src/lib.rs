@@ -1,4 +1,4 @@
-pub use collector::HEAP_DUMP_EIO;
+pub use collector::{FinalizerDeque, HEAP_DUMP_EIO};
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use header::{
     GC_FLAG_SHIFT, GC_HEADER_WORD_SIZE, GC_IMMORTAL_LEAF_HEADER, GC_TYPE_ID_BITS,
@@ -293,6 +293,16 @@ bitflags::bitflags! {
 /// Low-level trigger stored in an RPython finalizer handler.  It must only
 /// schedule app-level work; finalizers themselves run after collection.
 pub type FinalizerTriggerFn = fn();
+
+/// The `'FinalizerQueue TAG'` constant of `framework.py`.
+///
+/// `fq` is the address of the queue's `'static` instance, the identity
+/// `finalizer_queue_indexes` keys by. `trigger` is its `ll_finalizer_trigger`.
+#[derive(Clone, Copy)]
+pub struct FinalizerQueueTag {
+    pub fq: usize,
+    pub trigger: FinalizerTriggerFn,
+}
 
 /// True when the `gc_stress` test feature is compiled in: every allocation
 /// may then run a full collection inside `alloc_with_type`, so JIT fast
@@ -1255,16 +1265,16 @@ pub trait GcAllocator: Send {
     }
 
     /// framework.py `get_finalizer_queue_index`: map a FinalizerQueue (keyed
-    /// by its `ll_finalizer_trigger`) to its handler index, allocating the
-    /// handler on first visit. Backends without finalizer queues return 0.
-    fn get_finalizer_queue_index(&mut self, _trigger: FinalizerTriggerFn) -> usize {
+    /// by `tag.fq`) to its handler index, allocating the handler on first
+    /// visit. Backends without finalizer queues return 0.
+    fn get_finalizer_queue_index(&mut self, _tag: FinalizerQueueTag) -> usize {
         0
     }
 
     /// rgc.py `FinalizerQueue.register_finalizer` /
     /// framework.py `gc_fq_register`: register `obj` with one translated
     /// finalizer handler.  Backends without finalizer queues ignore it.
-    fn register_finalizer(&mut self, _fq_index: usize, _obj: GcRef, _trigger: FinalizerTriggerFn) {}
+    fn register_finalizer(&mut self, _fq_index: usize, _obj: GcRef) {}
 
     /// incminimark.py `ignore_finalizer` / framework.py
     /// `gct_gc_ignore_finalizer`: mark `obj` so the finalizer queues skip it.
@@ -1274,6 +1284,12 @@ pub trait GcAllocator: Send {
 
     /// rgc.py `FinalizerQueue.next_dead` / framework.py `gc_fq_next_dead`.
     fn finalizer_next_dead(&mut self, _fq_index: usize) -> Option<GcRef> {
+        None
+    }
+
+    /// The `adr_deque` of handler `fq_index`. `ll_next_dead` pops it without
+    /// entering the collector. Backends without finalizer queues return None.
+    fn finalizer_deque(&self, _fq_index: usize) -> Option<&'static FinalizerDeque> {
         None
     }
 
@@ -2122,17 +2138,22 @@ impl GcAllocator for GcHandle {
     fn isenabled(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.isenabled())
     }
-    fn get_finalizer_queue_index(&mut self, trigger: FinalizerTriggerFn) -> usize {
-        gc_sync::gc_op(|gc| gc.get_finalizer_queue_index(trigger))
+    fn get_finalizer_queue_index(&mut self, tag: FinalizerQueueTag) -> usize {
+        gc_sync::gc_op(|gc| gc.get_finalizer_queue_index(tag))
     }
-    fn register_finalizer(&mut self, fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
-        gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger))
+    fn register_finalizer(&mut self, fq_index: usize, obj: GcRef) {
+        gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj))
     }
     fn ignore_finalizer(&mut self, obj: GcRef) {
         gc_sync::gc_op(|gc| gc.ignore_finalizer(obj))
     }
     fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
-        gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index))
+        gc_sync::gc_query_reentrant(|gc| gc.finalizer_deque(fq_index))
+            .and_then(|deque| deque.popleft())
+            .map(GcRef)
+    }
+    fn finalizer_deque(&self, fq_index: usize) -> Option<&'static FinalizerDeque> {
+        gc_sync::gc_query_reentrant(|gc| gc.finalizer_deque(fq_index))
     }
     fn id_or_identityhash(&mut self, obj_addr: usize) -> usize {
         gc_sync::gc_op(|gc| gc.id_or_identityhash(obj_addr))
@@ -4545,11 +4566,11 @@ pub fn gc_remove_root(slot: *mut GcRef) -> bool {
 }
 
 /// rgc.py `FinalizerQueue.register_finalizer` - routed to the active backend GC.
-pub type RegisterFinalizerFn = fn(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn);
+pub type RegisterFinalizerFn = fn(fq_index: usize, obj: GcRef);
 /// rgc.py `FinalizerQueue.next_dead` - routed to the active backend GC.
 pub type FinalizerNextDeadFn = fn(fq_index: usize) -> Option<GcRef>;
 /// framework.py `get_finalizer_queue_index` - routed to the active backend GC.
-pub type GetFinalizerQueueIndexFn = fn(trigger: FinalizerTriggerFn) -> usize;
+pub type GetFinalizerQueueIndexFn = fn(tag: FinalizerQueueTag) -> usize;
 
 global_hook!(static ACTIVE_REGISTER_FINALIZER: RegisterFinalizerFn);
 global_hook!(static ACTIVE_FINALIZER_NEXT_DEAD: FinalizerNextDeadFn);
@@ -4559,31 +4580,27 @@ global_hook!(static ACTIVE_GET_FINALIZER_QUEUE_INDEX: GetFinalizerQueueIndexFn);
 pub fn set_active_finalizer_hooks(
     register: Option<RegisterFinalizerFn>,
     next_dead: Option<FinalizerNextDeadFn>,
+    get_index: Option<GetFinalizerQueueIndexFn>,
 ) {
     ACTIVE_REGISTER_FINALIZER.set(register);
     ACTIVE_FINALIZER_NEXT_DEAD.set(next_dead);
-}
-
-/// Install the active backend's `get_finalizer_queue_index` trampoline.
-/// Pass `None` to clear; [`gc_get_finalizer_queue_index`] then uses `gc_sync`.
-pub fn set_active_get_finalizer_queue_index(hook: Option<GetFinalizerQueueIndexFn>) {
-    ACTIVE_GET_FINALIZER_QUEUE_INDEX.set(hook);
+    ACTIVE_GET_FINALIZER_QUEUE_INDEX.set(get_index);
 }
 
 /// framework.py `get_finalizer_queue_index` — allocate or reuse the handler
-/// index for this FinalizerQueue, identified by its trigger fn.
-pub fn gc_get_finalizer_queue_index(trigger: FinalizerTriggerFn) -> usize {
+/// index for this FinalizerQueue, identified by `tag.fq`.
+pub fn gc_get_finalizer_queue_index(tag: FinalizerQueueTag) -> usize {
     match ACTIVE_GET_FINALIZER_QUEUE_INDEX.get() {
-        Some(f) => f(trigger),
-        None => gc_sync::gc_op(|gc| gc.get_finalizer_queue_index(trigger)),
+        Some(f) => f(tag),
+        None => gc_sync::gc_op(|gc| gc.get_finalizer_queue_index(tag)),
     }
 }
 
 /// Register an object with an RPython-style finalizer queue on the active GC.
-pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTriggerFn) {
+pub fn gc_register_finalizer(fq_index: usize, obj: GcRef) {
     match ACTIVE_REGISTER_FINALIZER.get() {
-        Some(f) => f(fq_index, obj, trigger),
-        None => gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger)),
+        Some(f) => f(fq_index, obj),
+        None => gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj)),
     }
 }
 
@@ -4678,10 +4695,21 @@ pub fn gc_ignore_finalizer(obj: GcRef) {
 }
 
 /// Pop one object from the active GC's RPython-style finalizer death queue.
+///
+/// `framework.py ll_next_dead` pops the queue's `AddressDeque` directly; this
+/// fetches `adr_deque` with a read that is legal inside `gc_op` and pops with
+/// no collector borrow held.
 pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
     match ACTIVE_FINALIZER_NEXT_DEAD.get() {
         Some(f) => f(fq_index),
-        None => gc_sync::gc_op(|gc| gc.finalizer_next_dead(fq_index)),
+        None => {
+            if !gc_sync::is_initialized() {
+                return None;
+            }
+            gc_sync::gc_query_reentrant(|gc| gc.finalizer_deque(fq_index))
+                .and_then(|deque| deque.popleft())
+                .map(GcRef)
+        }
     }
 }
 
