@@ -1886,6 +1886,9 @@ two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl_mutab
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::ioctl_readonly
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::stage_ioctl
 two-phase-annotate-skipped	pyre_module::module::gc::hook::__majit_wrap_set
+two-phase-annotate-skipped	pyre_module::module::math::interp_math::__majit_wrap_math_sqrt
+two-phase-annotate-skipped	pyre_module::module::math::interp_math::sqrt_from_double
+two-phase-annotate-skipped	pyre_module::module::math::interp_math::sqrt_translate_ll_error
 two-phase-annotate-skipped	pyre_module::module::mmap::interp_mmap::__majit_wrap_mmap_flush
 two-phase-annotate-skipped	pyre_module::module::mmap::interp_mmap::__majit_wrap_mmap_flush::<Impl>::call_once
 two-phase-annotate-skipped	pyre_module::module::mmap::interp_mmap::__majit_wrap_mmap_size
