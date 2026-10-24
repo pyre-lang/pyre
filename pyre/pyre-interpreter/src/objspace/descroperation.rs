@@ -7745,6 +7745,11 @@ pub fn pos_inner(mut a: PyObjectRef) -> PyResult {
             ));
         }
         if is_float(a) {
+            // `floatobject.py descr_pos` → `descr_float`: an exact `float`
+            // returns `self`; a subclass copies `W_FloatObject(self.floatval)`.
+            if pyre_object::is_exact_builtin_instance(a) {
+                return Ok(a);
+            }
             return _float_pos(w_float_get_value(a));
         }
         if is_complex(a) {
@@ -7792,7 +7797,7 @@ pub(crate) fn _int_neg(x: i64) -> PyResult {
     }) as PyObjectRef)
 }
 
-/// floatobject.py `descr_pos`: `W_FloatObject(self.floatval)`.
+/// floatobject.py `descr_float` copy arm: `W_FloatObject(self.floatval)`.
 #[inline(never)]
 pub fn _float_pos(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {

@@ -421,28 +421,24 @@ mod imp {
             .collect())
     }
 
-    fn obj_to_cstring(o: PyObjectRef, what: &str) -> Result<CString, PyError> {
+    fn obj_to_cstring(o: PyObjectRef, _what: &str) -> Result<CString, PyError> {
+        // `seqstr2charpp` → `space.bytes0_w`: bytes only, then reject NUL.
+        // `args` / `cwd` keep `collect_fsencoded_cstrings` (`fsencode_w`).
         let bytes = unsafe {
-            if is_str(o) {
-                // The exec boundary carries OS bytes: a program name or argv
-                // entry that came back from the filesystem holds surrogate
-                // escapes, which fold back to the original bytes here rather
-                // than having no `&str` spelling at all.
-                pyre_interpreter::gateway::fsencode(o)?
-            } else if is_bytes(o) {
+            if is_bytes(o) {
                 w_bytes_data(o).to_vec()
             } else {
                 return Err(PyError::type_error(format!(
-                    "fork_exec(): {what} must be str or bytes"
+                    "expected bytes, got {} object",
+                    pyre_interpreter::baseobjspace::object_functionstr_type_name(o),
                 )));
             }
         };
-        CString::new(bytes)
-            .map_err(|_| PyError::value_error(format!("fork_exec(): embedded null in {what}")))
+        CString::new(bytes).map_err(|_| PyError::value_error("embedded null byte"))
     }
 
     fn collect_cstrings(o: PyObjectRef, what: &str) -> Result<Vec<CString>, PyError> {
-        // `obj_to_cstring` / `fsencode` allocate, so the sequence and the
+        // `obj_to_cstring` / `bytes0_w` allocate, so the sequence and the
         // current item are re-read from the shadow stack rather than held
         // as a `Vec` of raw pointers across that call.
         let _roots = pyre_object::gc_roots::push_roots();
@@ -755,6 +751,9 @@ mod imp {
         // Python and collect, so every argument is read from its slot.
         let _roots = pyre_object::gc_roots::push_roots();
         let pos_base = _roots.pin_roots(pos);
+        // `unwrap_spec(allow_vfork=int)`: convert and discard. PyPy treats
+        // the value as a NOOP after the int unwrap.
+        let _ = pyre_interpreter::baseobjspace::int_w(_roots.get(pos_base + 22))?;
         // Decode everything (and pre-allocate the argv/envp arrays) before
         // fork(): the child must not allocate before exec.
         let args_list = collect_fsencoded_cstrings(_roots.get(pos_base), "args")?;

@@ -6786,7 +6786,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         ("inode", dir_entry_inode),
                         ("__fspath__", dir_entry_fspath),
                         ("__repr__", dir_entry_repr),
-                        ("__reduce_ex__", dir_entry_reduce_ex),
                     ] {
                         crate::__pyre_put_new!(
                             ns_slot,
@@ -6794,6 +6793,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             crate::make_builtin_function_with_arity(name, f, 1)
                         );
                     }
+                    // `interp_scandir.py descr_reduce_ex(self, space, w_protocol)`:
+                    // pickle always supplies the protocol.
+                    crate::__pyre_put_new!(
+                        ns_slot,
+                        "__reduce_ex__",
+                        crate::make_builtin_function_with_arity(
+                            "__reduce_ex__",
+                            dir_entry_reduce_ex,
+                            2,
+                        )
+                    );
                     // CPython 3.14 Modules/posixmodule.c DirEntry_methods —
                     // Py_GenericAlias with METH_CLASS.
                     {
