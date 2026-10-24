@@ -18598,11 +18598,17 @@ mod tests {
         }
         let catch_pc = catch_pc.expect("try body should be covered by the exception table");
         assert_eq!(
-            crate::call_jit::resumed_catch_level(&[(w_code as usize, catch_pc), (0, 0)]),
+            crate::call_jit::resumed_catch_level(&[
+                (w_code as usize, catch_pc, 0, 0),
+                (0, 0, 0, 0)
+            ]),
             Some(0)
         );
         assert!(crate::call_jit::resolve_jitcode_for_blackhole(helper_index, 0).is_some());
-        assert!(crate::call_jit::resolve_jitcode_for_blackhole(abort_index, 0).is_none());
+        // A helper body may carry `abort()` on unlowered arms;
+        // `blackhole.py` `_resume_mainloop` still dispatches it.
+        assert!(crate::call_jit::resolve_jitcode_for_blackhole(abort_index, 0).is_some());
         assert!(crate::call_jit::resolve_jitcode_for_blackhole(portal_index, 0).is_some());
+        assert!(crate::call_jit::resolve_jitcode_for_blackhole(portal_index, -1).is_none());
     }
 }

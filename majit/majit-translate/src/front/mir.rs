@@ -65213,7 +65213,7 @@ fn tuple_residual_return_token(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<String> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
-    let stripped = TyRef::Other(node.clone());
+    let stripped = TyRef::Other(node.clone().into());
     if tyref_tuple_suffix(&stripped, llbc).is_empty() {
         return None;
     }
@@ -82325,9 +82325,8 @@ mod tests {
         is_class_pytype_assoc_const, is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, no_tombstoned_leaves, primitive_float_const,
         push_cast_ptr_to_int, push_direct_ptradd, push_gc_ptr_as_signed_address,
-        push_ptr_to_unsigned_cast,
-        scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
-        simplify_lowered_graph, static_key_segments, tuple_field_value_type,
+        push_ptr_to_unsigned_cast, scalar_replace_named_struct_aggregates, scalar_to_const_value,
+        shaped_array_parts, simplify_lowered_graph, static_key_segments, tuple_field_value_type,
         type_decl_is_closure_env, tyref_array_suffix, tyref_fn_ptr_input_class_root,
         tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
         tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec, tyref_ref_param_class_root,
@@ -91598,6 +91597,7 @@ mod tests {
             &pair_fields,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
         );
         let mut cc = crate::codewriter::call::CallControl::new();
         cc.set_struct_fields(fields.clone());
@@ -104745,38 +104745,6 @@ mod tests {
         assert_ne!(usize_ty, i64_ty);
     }
 
-    fn result_enum(def_id: u64) -> serde_json::Value {
-        let span = serde_json::json!({"data": {
-            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
-        }});
-        serde_json::json!({
-            "def_id": def_id,
-            "item_meta": {
-                "name": [
-                    {"Ident": ["core", 0]},
-                    {"Ident": ["result", 0]},
-                    {"Ident": ["Result", 0]}
-                ],
-                "span": span,
-                "source_text": null,
-                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
-                "is_local": false
-            },
-            "kind": {"Enum": [
-                {
-                    "name": "Ok",
-                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
-                    "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
-                },
-                {
-                    "name": "Err",
-                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
-                    "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
-                }
-            ]}
-        })
-    }
-
     fn result_adt_node(
         def_id: u64,
         ok: serde_json::Value,
@@ -104804,9 +104772,12 @@ mod tests {
         // Layout / String.
         let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![]);
         let dest = |ok: serde_json::Value, err: serde_json::Value| {
-            TyRef::Other(serde_json::json!({
-                "Value": [7, result_adt_node(0, ok, err)]
-            }))
+            TyRef::Other(
+                serde_json::json!({
+                    "Value": [7, result_adt_node(0, ok, err)]
+                })
+                .into(),
+            )
         };
         let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
         let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});

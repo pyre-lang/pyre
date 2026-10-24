@@ -8593,6 +8593,17 @@ pub(crate) fn recipe_live_boxes(recipe: &ReconstructRecipe) -> Vec<OpRef> {
     boxes
 }
 
+/// `consume_boxes` (`resume.py rebuild_from_resumedata`) writes
+/// `MIFrame.registers_r[color]`. A Python-frame recipe keeps that bank in
+/// `color_registers_r`; `registers_r` is slot-indexed.
+pub(crate) fn recipe_consume_boxes_ref_at_color(recipe: &ReconstructRecipe, color: usize) -> OpRef {
+    recipe
+        .color_registers_r
+        .get(color)
+        .copied()
+        .unwrap_or(OpRef::NONE)
+}
+
 /// `MIFrame.registers_r` / `resume.py consume_boxes`: each live Ref color's
 /// box is the stream value at that position in `live_ref` order. Portal-red
 /// scratch (no semantic slot, color == pframe_reg/pec_reg) stays NONE; the

@@ -534,6 +534,7 @@ mod tests {
             &pair_fields,
             &HashSet::new(),
             &HashMap::new(),
+            &HashSet::new(),
         );
         let installed: Vec<_> = program_struct_layouts(&fields, &exact_layouts, &provider)
             .into_iter()

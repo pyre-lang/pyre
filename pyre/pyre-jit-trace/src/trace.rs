@@ -1744,7 +1744,7 @@ fn discard_bridge_carrier_walk<Sym: WalkSym>(
 /// The multi-frame depth cap bounds reconstructed `PyFrame`s, so a level that
 /// reconstructs none — `descr_call`'s tail, which only substitutes its
 /// callee's result — must not consume one of its slots.
-fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
+pub(crate) fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
     carrier
         .recipes
         .iter()
