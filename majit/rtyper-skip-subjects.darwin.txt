@@ -4,8 +4,6 @@
 # done-when.
 # corpus=089d5a210f161682 platform=darwin
 direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>::new::<Impl>::call_once
-two-phase-annotate-skipped	argument::raise_type_error__spec_String_f3a4935218b38edd
-two-phase-annotate-skipped	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-annotate-skipped	error::write_exception__spec_Global__4755b4afeb6210aa
 two-phase-annotate-skipped	error::write_traceback_chain__spec_Global__2580a76b7040af99
 two-phase-annotate-skipped	error::write_traceback_chain_from_exc__spec_Global__84a4cec7694f0eb7
@@ -41,6 +39,8 @@ two-phase-annotate-skipped	pyre_interpreter::app_functional::is_published_sorted
 two-phase-annotate-skipped	pyre_interpreter::argument::<Impl>::_combine_wrapped
 two-phase-annotate-skipped	pyre_interpreter::argument::<Impl>::new
 two-phase-annotate-skipped	pyre_interpreter::argument::<Impl>::positional_only
+two-phase-annotate-skipped	pyre_interpreter::argument::_orig_check_not_duplicate_kwargs
+two-phase-annotate-skipped	pyre_interpreter::argument::check_not_duplicate_kwargs
 two-phase-annotate-skipped	pyre_interpreter::argument::combine_starargs_wrapped
 two-phase-annotate-skipped	pyre_interpreter::argument::combine_starstarargs_wrapped
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::<Impl>::into_bytes

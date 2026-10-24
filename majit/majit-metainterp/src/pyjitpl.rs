@@ -6626,7 +6626,12 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        if self.tracing.is_some() {
+        // `with_trace_ctx_and_framestack` parks the recorder in
+        // `compile_tracing`, so `self.tracing` is empty while
+        // `compile_and_run_once`'s `profiler.start_tracing` is still open.
+        // `warmstate.py` `bound_reached` builds a fresh `MetaInterp` for a
+        // residual `can_enter_jit`; this one is shared and must not re-enter.
+        if self.trace_attempt_in_progress() {
             return BackEdgeAction::AlreadyTracing;
         }
         // warmstate.py maybe_compile_and_run is bound on this driver's
@@ -6819,7 +6824,10 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        if self.tracing.is_some() {
+        // Same decline as `force_start_tracing`: a parked recorder still owns
+        // this attempt. Return before `force_start_tracing_for_key` marks
+        // `JC_TRACING` and before `prepare_trace_start_runtime`.
+        if self.trace_attempt_in_progress() {
             return BackEdgeAction::AlreadyTracing;
         }
         // warmstate.py bound_reached: `jitcounter.decay_all_counters()`,
@@ -6910,7 +6918,11 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         green_key_raw: (usize, usize),
     ) -> HotResult {
-        if self.tracing.is_some() {
+        // The commit calls `bound_reached`. Decline before the tick when a
+        // parked attempt already owns this `MetaInterp` (`compile_and_run_once`
+        // is not re-entrant). `maybe_compile_and_run` on the eval door still
+        // ticks; this decision is the occupied-cell half.
+        if self.trace_attempt_in_progress() {
             return HotResult::AlreadyTracing;
         }
 
@@ -8227,9 +8239,31 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Whether the engine is currently tracing.
+    ///
+    /// The recorder slot only. `with_trace_ctx_and_framestack` parks it in
+    /// `compile_tracing` for the walk; callers that would record or abort
+    /// must keep using this, not [`Self::trace_attempt_in_progress`].
     #[inline]
     pub fn is_tracing(&self) -> bool {
         self.tracing.is_some()
+    }
+
+    /// Whether this `MetaInterp` already owns a trace attempt.
+    ///
+    /// `warmstate.py` `bound_reached` builds a fresh `MetaInterp` and calls
+    /// `compile_and_run_once`, whose `profiler.start_tracing` is not
+    /// re-entrant (`pyjitpl.py` `compile_and_run_once`,
+    /// `handle_guard_failure`). This process shares one `MetaInterp`.
+    /// `with_trace_ctx_and_framestack` parks the recorder in
+    /// `compile_tracing` so a residual can borrow warmstate the way
+    /// `do_recursive_call` does; `is_tracing` is then false while
+    /// `profiler.start_tracing` is still open. A residual `can_enter_jit`
+    /// must decline here instead of calling `prepare_trace_start_runtime`.
+    /// `maybe_compile_and_run` still ticks a different cell, and
+    /// `EnterJitAssembler` still runs a procedure token.
+    #[inline]
+    pub fn trace_attempt_in_progress(&self) -> bool {
+        self.tracing.is_some() || self.compile_tracing.is_some() || self.profiler_tracing_active
     }
 
     /// The active session asked `jit_merge_point_keyed` not to start a nested
@@ -17796,6 +17830,12 @@ impl<M: Clone> MetaInterp<M> {
         // is not that gate: a sibling driver can overwrite the numeric
         // key, and a memmgr prune can drop the frontend entry while the
         // descr still names a live token.
+        // `handle_guard_failure` runs on a fresh `MetaInterp` after
+        // `execute_token` unwinds. A residual guard while the recorder is
+        // parked must not call `enter_profiler_tracing`.
+        if self.trace_attempt_in_progress() {
+            return None;
+        }
         crate::mc_diag_bump(6); // start_retrace_from_guard entered
         // compile.py _trace_and_compile_from_bridge: MetaInterp(...) then
         // handle_guard_failure. Attempt fields start as `__init__` left them.
@@ -35505,6 +35545,10 @@ mod tests {
             meta.tracing.is_some(),
             "bound_reached must force-start tracing"
         );
+        assert!(
+            meta.trace_attempt_in_progress(),
+            "a live recorder is an open attempt"
+        );
 
         let key = majit_ir::GreenKey::with_types(
             vec![pc as i64, 0, code as i64],
@@ -35516,6 +35560,77 @@ mod tests {
                 .is_some(),
             "force-started cell must carry a typed comparekey"
         );
+    }
+
+    #[test]
+    fn bound_reached_declines_while_the_recorder_is_parked() {
+        // `with_trace_ctx_and_framestack` moves `tracing` into
+        // `compile_tracing` for the walk. `compile_and_run_once` is not
+        // re-entrant (`profiler.start_tracing`). A second `bound_reached`
+        // must decline before `prepare_trace_start_runtime` and must not
+        // mark the inner cell `JC_TRACING`.
+        use crate::BackEdgeAction;
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let outer_code: usize = 0x5100;
+        let outer_pc: usize = 4;
+        let outer_key = crate::green_key_from_code_ptr(outer_code, outer_pc);
+        let started = meta.bound_reached(
+            outer_key,
+            (outer_code, outer_pc),
+            None,
+            None,
+            &[Value::Int(0)],
+        );
+        assert!(matches!(started, BackEdgeAction::StartedTracing));
+        assert!(meta.profiler_tracing_active);
+        meta.compile_tracing = meta.tracing.take();
+        assert!(meta.compile_tracing.is_some());
+        assert!(!meta.is_tracing());
+        assert!(meta.trace_attempt_in_progress());
+
+        let inner_code: usize = 0x5200;
+        let inner_pc: usize = 9;
+        let inner_key = crate::green_key_from_code_ptr(inner_code, inner_pc);
+        let nested = meta.bound_reached(
+            inner_key,
+            (inner_code, inner_pc),
+            None,
+            None,
+            &[Value::Int(1)],
+        );
+        assert!(matches!(nested, BackEdgeAction::AlreadyTracing));
+        assert!(meta.tracing.is_none(), "the parked attempt stays parked");
+        assert!(meta.compile_tracing.is_some());
+        assert!(meta.profiler_tracing_active);
+        let inner_typed = majit_ir::GreenKey::with_types(
+            vec![inner_pc as i64, 0, inner_code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let inner_marked = meta
+            .warm_state_for_driver(0)
+            .lookup_chain_with_key(&inner_typed)
+            .is_some_and(|cell| cell.is_tracing());
+        assert!(!inner_marked, "a declined attempt must not mark JC_TRACING");
+
+        let forced = meta.force_start_tracing(
+            inner_key,
+            (inner_code, inner_pc),
+            None,
+            None,
+            &[Value::Int(1)],
+        );
+        assert!(matches!(forced, BackEdgeAction::AlreadyTracing));
+        let decided =
+            meta.on_back_edge_typed_decision_on_driver(0, inner_key, (inner_code, inner_pc));
+        assert!(matches!(
+            decided,
+            crate::warmstate::HotResult::AlreadyTracing
+        ));
+
+        meta.tracing = meta.compile_tracing.take();
+        meta.abort_trace(false);
+        assert!(!meta.trace_attempt_in_progress());
     }
 
     #[test]

@@ -3317,6 +3317,20 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         }
     }
 
+    // `BH_LAST_EXC_VALUE` stands in for the blackhole interpreter's
+    // `exception_last_value` (`blackhole.py`). `resume_in_blackhole` starts
+    // the chain with the only exception `_prepare_resume_from_failure`
+    // (`cpu.grab_exc_value(deadframe)`) returns, which a non-exception guard
+    // leaves null (`pyjitpl.py` `_prepare_exception_resumption`). The backend
+    // cell is the CPU's exception state (`_store_exception`) and is not the
+    // blackhole's; it is left as is. A `StopIteration` an inner generator
+    // call published and compiled `FOR_ITER` already matched would otherwise
+    // be re-raised by `bhimpl_abort_permanent` and reported by `generator.py`
+    // `_leak_stopiteration`.
+    if guard_exc == 0 {
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    }
+
     // blackhole.py _run_forever parity.
     loop {
         // `_resume_mainloop` can hand an unhandled exception to a suspended
@@ -5316,21 +5330,25 @@ fn jit_ca_handle_guard_failure(
     if deadframe.is_null() {
         return None;
     }
-    // `enter_profiler_tracing` is not re-entrant (pyjitpl.py handle_guard_failure — RPython's
-    // `handle_guard_failure` unwinds to the top-level `execute_token` before any
-    // tracing decision, so a guard never fires while another trace is open).
-    // pyre's CALL_ASSEMBLER guard callback runs synchronously from the backend
-    // trampoline, so it CAN fire mid-trace: the self-recursion fold replays its
-    // CALL_ASSEMBLER concretely while the outer trace is still recording, and a
-    // deopt in that callee reaches here with the outer trace's profiler event
-    // still open.  Starting a nested bridge trace would panic in
-    // `start_retrace_from_guard`'s `enter_profiler_tracing`.  Bail to the
-    // blackhole resume (return false) so the callee completes in the interpreter
-    // and the outer trace keeps recording; the deferred bridge compiles later
-    // when this guard fails outside a trace.
+    // `enter_profiler_tracing` is not re-entrant (`pyjitpl.py`
+    // `handle_guard_failure` — RPython unwinds to the top-level
+    // `execute_token` before any tracing decision, so a guard never fires
+    // while another trace is open). pyre's CALL_ASSEMBLER guard callback
+    // runs synchronously from the backend trampoline, so it CAN fire
+    // mid-trace: the self-recursion fold replays its CALL_ASSEMBLER
+    // concretely while the outer trace is still recording, and a deopt in
+    // that callee reaches here with the outer trace's profiler event still
+    // open. `with_trace_ctx_and_framestack` parks the recorder in
+    // `compile_tracing`, so `is_tracing` is false for that window;
+    // `trace_attempt_in_progress` still sees the open
+    // `profiler.start_tracing`. Starting a nested bridge would panic in
+    // `start_retrace_from_guard`'s `enter_profiler_tracing`. Bail to the
+    // blackhole resume (return false) so the callee completes in the
+    // interpreter and the outer trace keeps recording; the deferred bridge
+    // compiles later when this guard fails outside a trace.
     {
         let (driver, _) = crate::eval::driver_pair();
-        if driver.is_tracing() {
+        if driver.trace_attempt_in_progress() {
             return None;
         }
     }

@@ -3517,7 +3517,10 @@ mod tests {
         let fst = crate::rposix_stat::fstat(fd).unwrap();
         assert_eq!(fst.st_size, 2);
         close(fd).unwrap();
-        assert!(close(fd).is_err());
+        // A second close of `fd` can reap a descriptor another test just
+        // opened (the kernel reuses the number). `close(-1)` is the error
+        // path without touching a live fd.
+        assert!(close(-1).is_err());
         assert!(access(path.as_os_str().as_bytes(), libc::R_OK));
         let names = listdir(dir.as_os_str().as_bytes()).unwrap();
         assert!(names.iter().any(|n| n == b"f"));

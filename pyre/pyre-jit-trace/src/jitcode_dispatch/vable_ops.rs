@@ -232,6 +232,8 @@ mod frame_replacement_tests {
             parents: vec![InlineParentFrame {
                 jitcode_index: 0,
                 call_jitcode_pc: Some(0),
+                call_pc: Some(0),
+                resume_pc: None,
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
                 resume_coord: ParentResumeCoord::Backxlat(0),
@@ -394,6 +396,8 @@ mod frame_replacement_tests {
             parents: vec![InlineParentFrame {
                 jitcode_index: 0,
                 call_jitcode_pc: Some(0),
+                call_pc: Some(0),
+                resume_pc: None,
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
                 resume_coord: ParentResumeCoord::Backxlat(0),

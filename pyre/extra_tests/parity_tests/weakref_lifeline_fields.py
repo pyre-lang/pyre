@@ -6,10 +6,11 @@
 
 """Weakref lifelines on builtin instances round-trip and collect.
 
-One instance of each builtin that both runtimes allow `weakref.ref` on.
-`weakref.getweakrefcount` matches `weakref.getweakrefs`, a
-`WeakValueDictionary` keeps the value while the owner is alive, and the
-callback runs once `del` plus `gc.collect` drops the owner.
+One instance of each builtin that both runtimes allow `weakref.ref` on,
+plus a subclass of `_local` and of `ModuleType`. `weakref.getweakrefcount`
+matches `weakref.getweakrefs`, a `WeakValueDictionary` keeps the value
+while the owner is alive, and the callback runs once `del` plus
+`gc.collect` drops the owner. `type` itself stays alive.
 """
 
 import array
@@ -151,6 +152,14 @@ class ExcSub(ValueError):
     pass
 
 
+class SubLocal(_thread._local):
+    pass
+
+
+class SubMod(types.ModuleType):
+    pass
+
+
 exercise(lambda: _thread.RLock())
 exercise(lambda: _thread.allocate_lock())
 exercise(lambda: _thread._local())
@@ -195,6 +204,10 @@ exercise(lambda: ListSub())
 exercise(lambda: DequeSub())
 exercise(lambda: SetSub())
 exercise(lambda: ExcSub())
+exercise(SubLocal)
+exercise(lambda: SubMod("lifeline-submod"))
+# `type` itself cannot be collected. The lifeline still has to resolve.
+assert weakref.ref(type)() is type
 
 expect_type_error(object)
 expect_type_error(lambda: 1)

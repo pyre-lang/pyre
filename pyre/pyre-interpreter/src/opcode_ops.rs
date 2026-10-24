@@ -1038,10 +1038,10 @@ pub fn dict_merge_value(
         // prefix. pyopcode.py `_dict_merge` uses `raise_type_error` /
         // `"%s argument after ** must be a mapping, not %T"`.
         if !crate::baseobjspace::ismapping_w(source()) {
-            let type_name = crate::error::type_name_of(source());
-            return Err(PyError::type_error(format!(
-                "Value after ** must be a mapping, not {type_name}"
-            )));
+            return Err(crate::argument::type_error_oefmt(
+                "Value after ** must be a mapping, not %T",
+                &[crate::error::FmtArg::Obj(source())],
+            ));
         }
     } else {
         // `pyopcode.py _dict_merge`: an empty target calls `update1`
@@ -1091,10 +1091,10 @@ fn _dict_merge_loop(
     let keys_method = match crate::baseobjspace::getattr_str(source(), "keys") {
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            let type_name = crate::error::type_name_of(source());
-            return Err(PyError::type_error(format!(
-                "Value after ** must be a mapping, not {type_name}"
-            )));
+            return Err(crate::argument::type_error_oefmt(
+                "Value after ** must be a mapping, not %T",
+                &[crate::error::FmtArg::Obj(source())],
+            ));
         }
         Err(e) => return Err(e),
     };
@@ -1135,14 +1135,10 @@ fn _dict_merge_loop(
         // after it rather than held across it.
         let key = || pyre_object::gc_roots::shadow_stack_get(key_slot);
         if crate::baseobjspace::contains(dict(), key())? {
-            let key_str = unsafe { crate::display::py_str_wtf8(key()) }?;
-            return Err(crate::argument::raise_type_error(
+            return Err(crate::raise_type_error!(
                 w_callable(),
-                crate::display::wtf8_format!(
-                    "got multiple values for keyword argument '",
-                    key_str,
-                    "'"
-                ),
+                "got multiple values for keyword argument '%S'",
+                &[crate::error::FmtArg::Obj(key())],
             ));
         }
         unsafe {
@@ -1195,14 +1191,10 @@ fn _dict_merge_dict(
         let key = || pyre_object::gc_roots::shadow_stack_get(iteration_roots);
         let value = || pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
         if crate::baseobjspace::contains(dict(), key())? {
-            let key_str = unsafe { crate::display::py_str_wtf8(key()) }?;
-            return Err(crate::argument::raise_type_error(
+            return Err(crate::raise_type_error!(
                 w_callable(),
-                crate::display::wtf8_format!(
-                    "got multiple values for keyword argument '",
-                    key_str,
-                    "'"
-                ),
+                "got multiple values for keyword argument '%S'",
+                &[crate::error::FmtArg::Obj(key())],
             ));
         }
         unsafe { pyre_object::w_dict_store(dict(), key(), value()) };
