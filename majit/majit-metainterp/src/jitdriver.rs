@@ -7026,7 +7026,9 @@ impl<S: JitState> JitDriver<S> {
             // (`warmstate.py maybe_compile_and_run` `confirm_enter_jit(*args)`
             // with greens then reds). The same buffers feed
             // `EnterJitAssembler` after the veto, so this is not a second
-            // extract. Virtualizable expansion stays below, after confirm.
+            // extract. The LABEL-ordered direct buffer is not the portal
+            // tuple; the hook gets `confirm_enter_jit_reds` there.
+            // Virtualizable expansion stays below, after confirm.
             let mut scratch = self.take_entry_scratch();
             let values_are_label_ordered = direct_live_values.is_some();
             if let Some(values) = direct_live_values {
@@ -7039,7 +7041,10 @@ impl<S: JitState> JitDriver<S> {
                     &mut scratch.types,
                 );
             }
-            let confirm_types = greenargs.map(|(_, types)| types).unwrap_or(&[]);
+            let confirm_types = self.confirm_enter_jit_green_types(greenargs);
+            let confirm_reds = values_are_label_ordered
+                .then(|| self.confirm_enter_jit_reds(state, env, target_pc));
+            let confirm_reds_slice = confirm_reds.as_deref().unwrap_or(&scratch.live_values);
             // warmstate.py `WarmEnterState.make_entry_point` /
             // `maybe_compile_and_run`: the confirmation veto sits between
             // finding the procedure token and `EnterJitAssembler`.
@@ -7049,8 +7054,8 @@ impl<S: JitState> JitDriver<S> {
                 .is_some_and(|warm| {
                     warm.confirm_compiled_entry_for_cell_key(
                         green_key,
-                        confirm_types,
-                        &scratch.live_values,
+                        &confirm_types,
+                        confirm_reds_slice,
                     )
                 })
             {
@@ -10000,8 +10005,11 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Green types the packing wrapper uses when a hook is installed.
-    /// `greenargs` is the portal spec; without it the driver's
-    /// `_green_args_spec`. Empty when no hook is installed.
+    /// `greenargs` is the portal spec; without it `jitdriver_sd._green_args_spec`
+    /// from `MetaInterpStaticData.jitdrivers_sd` (`warmspot.py`
+    /// `make_args_specification`). Falls back to this driver's descriptor
+    /// when that table has no slot. Empty when no hook is installed, or
+    /// when both sources are missing.
     fn confirm_enter_jit_green_types(
         &self,
         greenargs: Option<(&[i64], &[GreenType])>,
@@ -10012,9 +10020,12 @@ impl<S: JitState> JitDriver<S> {
         if let Some((_, types)) = greenargs {
             return types.to_vec();
         }
-        self.descriptor
-            .as_ref()
-            .map(|d| d.green_args_spec())
+        self.meta
+            .staticdata
+            .jitdrivers_sd
+            .get(self.index().unwrap_or(0))
+            .map(|jd| jd.green_args_spec())
+            .or_else(|| self.descriptor.as_ref().map(|d| d.green_args_spec()))
             .unwrap_or_default()
     }
 
@@ -12566,6 +12577,11 @@ mod tests {
             vec![Type::Int, Type::Int, Type::Ref],
         );
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.declare_schema(
+            vec![("pc", Type::Int), ("zero", Type::Int), ("code", Type::Ref)],
+            vec![("y", Type::Int)],
+        );
+        driver.ensure_descriptor_registered();
         // A real frontend constructs its JitDriver before hashing any Ref
         // greens: WarmEnterState::new installs the GC-owned identity-hash
         // resolver.  Keep the fixture in that order too, otherwise `hash`
@@ -12708,21 +12724,16 @@ mod tests {
         );
     }
 
-    /// `test_ajit.py test_confirm_enter_jit`: greens `['x']`, reds `['y']`.
-    /// The hook sees both portal arguments and can refuse on the red.
-    #[test]
-    fn a_confirm_enter_jit_hook_sees_the_green_and_the_red() {
-        static SEEN_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-        static SEEN_RED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-        fn refuse_odd_red(args: &[Value]) -> bool {
-            SEEN_GREEN.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
-            SEEN_RED.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
-            args[1].as_int() % 2 == 0
-        }
-
-        let x = 10i64;
+    /// Compiled loop for `test_ajit.py test_confirm_enter_jit`: greens `['x']`,
+    /// reds `['y']`. Registers the driver so `jitdrivers_sd._green_args_spec`
+    /// is the portal spec a `greenargs = None` door still hands the hook.
+    fn confirm_enter_jit_hook_compiled_loop(
+        x: i64,
+    ) -> (JitDriver<TypedRestoreState>, u64, GreenKey) {
         let key = GreenKey::with_types(vec![x], vec![Type::Int]);
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.declare_schema(vec![("x", Type::Int)], vec![("y", Type::Int)]);
+        driver.ensure_descriptor_registered();
         let hash = key.get_uhash();
         let mut resume_asm = majit_jitcode::codewriter::assembler::Assembler::new();
         resume_asm.register_insn("live/", crate::jitcode::insns::BC_LIVE);
@@ -12760,7 +12771,23 @@ mod tests {
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(hash));
+        (driver, hash, key)
+    }
 
+    /// `test_ajit.py test_confirm_enter_jit`: greens `['x']`, reds `['y']`.
+    /// The hook sees both portal arguments and can refuse on the red.
+    #[test]
+    fn a_confirm_enter_jit_hook_sees_the_green_and_the_red() {
+        static SEEN_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SEEN_RED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn refuse_odd_red(args: &[Value]) -> bool {
+            SEEN_GREEN.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
+            SEEN_RED.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
+            args[1].as_int() % 2 == 0
+        }
+
+        let x = 10i64;
+        let (mut driver, hash, key) = confirm_enter_jit_hook_compiled_loop(x);
         driver
             .meta
             .warm_state_for_driver(0)
@@ -12799,6 +12826,54 @@ mod tests {
             &(),
             || even_pre_ran = true,
         );
+        assert!(
+            even_outcome.is_some(),
+            "an even red is the portal argument the hook accepted"
+        );
+        assert!(even_pre_ran);
+        assert_eq!(SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed), x);
+        assert_eq!(SEEN_RED.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    /// `back_edge_keyed` passes `greenargs = None` into `back_edge_internal`.
+    /// The compiled-entry hook still needs `jitdriver_sd._green_args_spec`
+    /// (`warmstate.py` `make_entry_point` / `confirm_enter_jit(*args)`).
+    #[test]
+    fn a_confirm_enter_jit_hook_on_a_keyed_back_edge_gets_the_driver_green_types() {
+        static SEEN_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SEEN_RED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn refuse_odd_red(args: &[Value]) -> bool {
+            SEEN_GREEN.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
+            SEEN_RED.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
+            args[1].as_int() % 2 == 0
+        }
+
+        let x = 10i64;
+        let (mut driver, hash, _key) = confirm_enter_jit_hook_compiled_loop(x);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_confirm_enter_jit(Some(refuse_odd_red));
+
+        let mut odd_state = TypedRestoreState {
+            live_values: vec![3],
+            ..Default::default()
+        };
+        let mut odd_pre_ran = false;
+        let odd_outcome =
+            driver.back_edge_keyed(hash, 19, &mut odd_state, &(), || odd_pre_ran = true);
+        assert_eq!(odd_outcome, None);
+        assert!(!odd_pre_ran, "an odd red is refused before compiled entry");
+        assert_eq!(SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed), x);
+        assert_eq!(SEEN_RED.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+        let mut even_state = TypedRestoreState {
+            live_values: vec![4],
+            ..Default::default()
+        };
+        let mut even_pre_ran = false;
+        let even_outcome =
+            driver.back_edge_keyed(hash, 19, &mut even_state, &(), || even_pre_ran = true);
         assert!(
             even_outcome.is_some(),
             "an even red is the portal argument the hook accepted"
