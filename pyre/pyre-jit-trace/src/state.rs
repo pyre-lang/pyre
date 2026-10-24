@@ -5481,55 +5481,6 @@ fn is_type_version_tag_descr(descr: &DescrRef) -> bool {
     name == "version_tag" || name.ends_with(".version_tag")
 }
 
-/// `mutate_<name>` or a display name ending `.mutate_<name>`.
-///
-/// The `_lock` leaf is the second word of `QuasiImmutField`, not the mutate
-/// field `get_current_qmut_instance` reads. An index of `u32::MAX` is the
-/// unassigned sentinel (`Descr::index` default / ALIAS SENTINEL).
-///
-/// `SimpleFieldDescr::index` may replace that sentinel on first read, so the
-/// name plus a parent listing of the same mutate slot is what marks the descr
-/// resolved. Assembler `fielddescrof` for a missing `mutate_<name>` (PyCode
-/// `mutate_w_globals`) leaves offset 0 and no parent slot; treating that as
-/// resolved would pass the object header to `get_current_qmut_instance`.
-fn is_resolved_mutate_field_descr(mutate: &DescrRef) -> bool {
-    if mutate.index() == u32::MAX {
-        return false;
-    }
-    let Some(fd) = mutate.as_field_descr() else {
-        return false;
-    };
-    is_mutate_field_name(fd.field_name()) && mutate_slot_is_listed_on_parent(fd)
-}
-
-/// True when the parent SizeDescr lists a `mutate_<name>` (not `_lock`) at
-/// this descr's offset. Upstream `QuasiImmutDescr.__init__` /
-/// `get_current_qmut_instance` always read that hidden field; a mint whose
-/// parent does not name it is the Step B gap.
-fn mutate_slot_is_listed_on_parent(fd: &dyn majit_ir::descr::FieldDescr) -> bool {
-    let Some(parent) = fd.get_parent_descr() else {
-        return false;
-    };
-    let Some(size) = parent.as_size_descr() else {
-        return false;
-    };
-    let offset = fd.offset();
-    size.all_fielddescrs()
-        .iter()
-        .any(|sib| sib.offset() == offset && is_mutate_field_name(sib.field_name()))
-}
-
-fn is_mutate_field_name(name: &str) -> bool {
-    let leaf = match name.rsplit_once('.') {
-        Some((_, leaf)) => leaf,
-        None => name,
-    };
-    let Some(rest) = leaf.strip_prefix("mutate_") else {
-        return false;
-    };
-    !rest.is_empty() && !rest.ends_with("_lock")
-}
-
 /// Watcher from the mutate descr: `QuasiImmutDescr.__init__` /
 /// `get_current_qmut_instance`.
 fn quasi_immut_descr_from_mutate(
@@ -5562,16 +5513,25 @@ fn resolve_quasi_immut_descr(
     mutatefielddescr: Option<&DescrRef>,
 ) -> Option<DescrRef> {
     if let Some(mutate) = mutatefielddescr {
-        if is_resolved_mutate_field_descr(mutate) {
-            if let Some(fd) = mutate.as_field_descr() {
-                return quasi_immut_descr_from_mutate(ctx, obj, descr, fd);
-            }
+        // `quasiimmut.py QuasiImmutDescr.__init__` /
+        // `get_current_qmut_instance` always read the watcher from the
+        // supplied mutate descr. A mint that is not a field descr, or
+        // whose field has no parent slot, is a codewriter invariant
+        // violation: upstream `fielddescrof` would have failed at
+        // translation.
+        let Some(fd) = mutate.as_field_descr() else {
+            panic!(
+                "record_quasiimmut_field mutate descr is not a field descr (index={:#x})",
+                mutate.index()
+            );
+        };
+        if fd.get_parent_descr().is_none() {
+            panic!(
+                "record_quasiimmut_field mutate descr has no parent slot: {}",
+                fd.field_name()
+            );
         }
-        // Step B gap: `Some(mutate)` that is not a resolved mutate field
-        // descr falls back to the field-descr-index ladder. Upstream
-        // `QuasiImmutDescr.__init__` / `get_current_qmut_instance` always
-        // reads the watcher from the mutate descr; there is no per-field
-        // lookup table.
+        return quasi_immut_descr_from_mutate(ctx, obj, descr, fd);
     }
     quasi_immut_descr(ctx, obj, descr)
 }
@@ -13159,22 +13119,18 @@ mod tests {
             &crate::descr::w_function_size_descr(),
             pyre_interpreter::function::FUNCTION_MUTATE_CODE_OFFSET,
         );
+        let mutate_fd = mutate
+            .as_field_descr()
+            .expect("mutate_code is a field descr");
         assert!(
-            is_resolved_mutate_field_descr(&mutate),
-            "Function.mutate_code must be a resolved mutate field descr"
+            mutate_fd.get_parent_descr().is_some(),
+            "Function.mutate_code must carry a parent slot"
         );
 
         let ladder =
             quasi_immut_descr(&mut ctx, obj, &field).expect("ladder resolves Function.code");
-        let generic = quasi_immut_descr_from_mutate(
-            &mut ctx,
-            obj,
-            &field,
-            mutate
-                .as_field_descr()
-                .expect("mutate_code is a field descr"),
-        )
-        .expect("generic route resolves Function.mutate_code");
+        let generic = quasi_immut_descr_from_mutate(&mut ctx, obj, &field, mutate_fd)
+            .expect("generic route resolves Function.mutate_code");
 
         let ladder_id = ladder
             .as_quasi_immut_descr()
@@ -13191,25 +13147,62 @@ mod tests {
     }
 
     #[test]
-    fn mutate_w_globals_without_parent_slot_is_not_a_resolved_quasi_mutate_descr() {
-        // Assembler `fielddescrof` for PyCode `mutate_w_globals` mints offset 0
-        // with no parent listing. Name matches `mutate_<name>` and `index()` is
-        // assigned, but `QuasiImmutDescr.__init__` still has no mutate field.
-        let descr: DescrRef =
-            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
-                0x1234,
-                0,
-                8,
-                Type::Ref,
-                false,
-                majit_ir::descr::ArrayFlag::Pointer,
-                "PyCode.mutate_w_globals".to_string(),
-                "mutate_w_globals".to_string(),
-            ));
-        assert!(
-            !is_resolved_mutate_field_descr(&descr),
-            "offset-0 mutate_w_globals without a parent slot must fall back to the ladder"
+    fn pycode_mutate_w_globals_descr_resolves_to_embedded_quasi_immut_field() {
+        let offset = std::mem::offset_of!(pyre_interpreter::pycode::PyCode, mutate_w_globals);
+        let mutate = majit_ir::descr::field_descr_from_parent_by_offset(
+            &crate::descr::pycode_size_descr(),
+            offset,
         );
+        let fd = mutate
+            .as_field_descr()
+            .expect("PyCode.mutate_w_globals is a field descr");
+        assert_eq!(fd.offset(), offset);
+        assert!(
+            fd.get_parent_descr().is_some(),
+            "PyCode.mutate_w_globals must carry a parent slot"
+        );
+    }
+
+    #[test]
+    fn pycode_w_globals_quasiimmut_instance_identity_agrees_between_ladder_and_mutate_descr() {
+        pyre_interpreter::test_hooks::install_hash_hook();
+        let _hook_guard = QmutHookGuard::install();
+
+        let raw_code = 0xDEAD_BEEF as *const ();
+        let w_code = pyre_interpreter::w_code_new(raw_code);
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let obj = ctx.const_ref(w_code as i64);
+        let field = crate::descr::pycode_w_globals_quasi_descr();
+        let mutate = majit_ir::descr::field_descr_from_parent_by_offset(
+            &crate::descr::pycode_size_descr(),
+            std::mem::offset_of!(pyre_interpreter::pycode::PyCode, mutate_w_globals),
+        );
+        let mutate_fd = mutate
+            .as_field_descr()
+            .expect("mutate_w_globals is a field descr");
+        assert!(
+            mutate_fd.get_parent_descr().is_some(),
+            "PyCode.mutate_w_globals must carry a parent slot"
+        );
+
+        let ladder =
+            quasi_immut_descr(&mut ctx, obj, &field).expect("ladder resolves PyCode.w_globals");
+        let generic = quasi_immut_descr_from_mutate(&mut ctx, obj, &field, mutate_fd)
+            .expect("generic route resolves PyCode.mutate_w_globals");
+
+        let ladder_id = ladder
+            .as_quasi_immut_descr()
+            .expect("ladder QuasiImmutDescr")
+            .qmut()
+            .instance_identity();
+        let generic_id = generic
+            .as_quasi_immut_descr()
+            .expect("generic QuasiImmutDescr")
+            .qmut()
+            .instance_identity();
+        assert_eq!(ladder_id, generic_id);
+        assert_ne!(ladder_id, 0);
     }
 
     #[test]
