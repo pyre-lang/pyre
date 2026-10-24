@@ -14845,8 +14845,15 @@ fn handle<Sym: WalkSym>(
         // `pyjitpl.py opimpl_jit_force_quasi_immutable`:
         //
         // ```text
-        // mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R,
-        //                                     mutatefielddescr, box)
+        // if mutatefielddescr.is_pointer_field():
+        //     mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R,
+        //                                         mutatefielddescr, box)
+        // elif mutatefielddescr.is_float_field():
+        //     mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R,
+        //                                         mutatefielddescr, box)
+        // else:
+        //     mutatebox = self.execute_with_descr(rop.GETFIELD_GC_I,
+        //                                         mutatefielddescr, box)
         // if mutatebox.nonnull():
         //     from rpython.jit.metainterp.quasiimmut import do_force_quasi_immutable
         //     do_force_quasi_immutable(self.metainterp.cpu, box.getref_base(),
@@ -14855,7 +14862,7 @@ fn handle<Sym: WalkSym>(
         // self.metainterp.generate_guard(rop.GUARD_ISNULL, mutatebox,
         //                                resumepc=orgpc)
         // ```
-        // `execute_with_descr` records and executes GETFIELD_GC_R; it does
+        // `execute_with_descr` records and executes the load; it does
         // not consult or populate the heapcache (unlike
         // `_opimpl_getfield_gc_any_pureornot`).
         // An unobserved mutate value declines (upstream `execute_with_descr`
@@ -14863,10 +14870,24 @@ fn handle<Sym: WalkSym>(
         "jit_force_quasi_immutable/rd" => {
             let obj = read_ref_reg(code, op, 0, ctx)?;
             let descr = read_descr(code, op, 1, ctx)?;
+            let tp = {
+                let Some(fd) = descr.as_field_descr() else {
+                    panic!("jit_force_quasi_immutable/rd: descr.as_field_descr() is None");
+                };
+                #[allow(clippy::if_same_then_else)]
+                if fd.is_pointer_field() {
+                    majit_ir::Type::Ref
+                } else if fd.is_float_field() {
+                    majit_ir::Type::Ref
+                } else {
+                    majit_ir::Type::Int
+                }
+            };
             let mutatebox =
-                crate::state::execute_getfield_gc_r_uncached(ctx.trace_ctx, obj, descr.clone());
+                crate::state::execute_getfield_gc_uncached(ctx.trace_ctx, obj, descr.clone(), tp);
             let installed = match ctx.trace_ctx.box_value(mutatebox) {
                 Some(majit_ir::Value::Ref(r)) => r.0 != 0,
+                Some(majit_ir::Value::Int(i)) => i != 0,
                 _ => {
                     return Err(DispatchError::ForceQuasiImmutableValueNotConcrete {
                         pc: op.pc,
