@@ -12,19 +12,25 @@
 //! never makes it a candidate, because the only caller is the refused
 //! `get_raw_address_of_string` graph.
 //!
-//! Effect analysis walks the translator helper graph
-//! (`build_ll_get_raw_address_of_string_helper_graph`): `gc_can_move`,
+//! Effect analysis walks the translator helper graphs:
+//! `build_ll_get_raw_address_of_string_helper_graph` (`gc_can_move`,
 //! `gc_move_out_of_nursery`, NUL `setarrayitem` on `STR.chars`, and a
-//! `direct_call` to `_get_raw_address_buf_from_string`. Native LLBC of
-//! the majit-rlib body would hide those as `RawStore` / `HashMap` and
-//! miss `CollectAnalyzer`.
+//! `direct_call` to `_get_raw_address_buf_from_string`) and
+//! `build_get_raw_address_buf_from_string_helper_graph` (`gc_id`,
+//! `ll_dict_getitem` with a KeyError exit, `str2charp`, `ll_dict_setitem`,
+//! `cast_opaque_ptr`, `gc_fq_register`). Native LLBC of the majit-rlib
+//! body would hide those as `RawStore` / `HashMap` and miss
+//! `CollectAnalyzer`.
 
 use crate::codewriter::call::{CallControl, effect_graph_from_rtyped_helper};
 use crate::flowspace::model::Variable;
-use crate::model::{CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation, ValueType};
+use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 use crate::runtime_names::shims;
-use crate::translator::rtyper::lltypesystem::rffi::build_ll_get_raw_address_of_string_helper_graph;
+use crate::translator::rtyper::lltypesystem::rffi::{
+    build_get_raw_address_buf_from_string_helper_graph,
+    build_ll_get_raw_address_of_string_helper_graph,
+};
 
 /// Rtyper helper name (`lowlevel_helper_function_with_builder`).
 pub const LL_GET_RAW_ADDRESS_OF_STRING: &str = "ll_get_raw_address_of_string";
@@ -80,6 +86,10 @@ fn register(cc: &mut CallControl) {
         "majit_gc",
         "gc_move_out_of_nursery",
     ]));
+    // `gc_id` (`lloperation.py`) is `canmallocgc`; `ll_dict_setitem`
+    // resizes the entries array (`rordereddict.py`).
+    cc.mark_canmallocgc(CallPath::from_segments(["gc_id"]));
+    cc.mark_canmallocgc(CallPath::from_segments(["ll_dict_setitem"]));
     register_buf_effect_graph(cc);
     register_residual_graph(cc, NATIVE_LEAF);
     register_residual_graph(cc, LL_GET_RAW_ADDRESS_OF_STRING);
@@ -100,14 +110,18 @@ fn bind_fnaddr(cc: &mut CallControl, dest_leaf: &str, src_leaf: &str) {
 /// `_get_raw_address_buf_from_string` (`rffi.py`) has no
 /// `@jit.dont_look_inside`. `CallControl.find_all_graphs` never makes it
 /// a candidate: the only caller is the refused `get_raw_address_of_string`
-/// graph. Register the graph for `getcalldescr` analyzers without a
-/// tracing prohibition and without `add_candidate_graph_if_look_inside`.
+/// graph. Register the rtyped body (`gc_id`, `ll_dict_getitem` with a
+/// KeyError miss, `str2charp`, `ll_dict_setitem`, `cast_opaque_ptr`,
+/// `gc_fq_register`) for `getcalldescr` analyzers without a tracing
+/// prohibition and without `add_candidate_graph_if_look_inside`.
 fn register_buf_effect_graph(cc: &mut CallControl) {
     let path = CallPath::from_segments([BUF_LEAF]);
     if cc.has_function_graph(&path) {
         return;
     }
-    let graph = residual_buf_from_string_graph();
+    let py = build_get_raw_address_buf_from_string_helper_graph(BUF_LEAF)
+        .expect("_get_raw_address_buf_from_string helper graph");
+    let graph = effect_graph_from_rtyped_helper(&py.graph.borrow());
     cc.register_function_graph(path, graph);
 }
 
@@ -128,38 +142,6 @@ fn residual_helper_graph(name: &str) -> FunctionGraph {
     let py = build_ll_get_raw_address_of_string_helper_graph(name)
         .expect("ll_get_raw_address_of_string helper graph");
     effect_graph_from_rtyped_helper(&py.graph.borrow())
-}
-
-/// `_get_raw_address_buf_from_string` (`rffi.py`): dict insert into
-/// `_fq_addr_from_string.raw_copies` plus `str2charp`. The translator
-/// graph is a `functionptr_with_external_name`; the dict resize is a
-/// GC malloc (`CollectAnalyzer` / `RaiseAnalyzer` MemoryError).
-fn residual_buf_from_string_graph() -> FunctionGraph {
-    let mut graph = FunctionGraph::new(BUF_LEAF);
-    let start = graph.startblock;
-    let s = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-    graph.push_inputarg_var(start, s.clone());
-    graph.push_op_with_result_var(
-        start,
-        OpKind::Input {
-            name: "s".to_string(),
-            ty: ValueType::Str,
-            class_root: None,
-        },
-        s,
-    );
-    let dict = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-    graph.push_op_with_result_var(
-        start,
-        OpKind::New {
-            owner: "raw_copies".to_string(),
-        },
-        dict,
-    );
-    let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
-    graph.push_op_with_result_var(start, OpKind::ConstInt(0), result.clone());
-    graph.set_return(start, Some(result));
-    graph.with_return_type("i64")
 }
 
 #[cfg(test)]
@@ -336,10 +318,80 @@ mod tests {
             .get(&CallPath::from_segments([BUF_LEAF]))
             .expect("buf helper graph");
         assert!(
-            graph
-                .iter_block_ops()
-                .any(|(_, op)| matches!(op.kind, OpKind::New { .. })),
-            "raw_copies insert is a GC malloc"
+            graph.iter_block_ops().any(|(_, op)| match &op.kind {
+                OpKind::Call { target, .. } => match target {
+                    CallTarget::FunctionPath { segments, .. } => {
+                        segments
+                            .iter()
+                            .any(|s| s == "ll_dict_setitem" || s == "gc_id")
+                    }
+                    _ => false,
+                },
+                OpKind::UnaryOp { op, .. } => op == "gc_id",
+                OpKind::New { .. } => true,
+                _ => false,
+            }),
+            "gc_id / ll_dict_setitem collect"
+        );
+    }
+
+    #[test]
+    fn get_raw_address_buf_from_string_graph_has_finalizer_getitem_str2charp() {
+        use crate::model::{ExitCase, ExitSwitch};
+        let cc = mint();
+        let graph = cc
+            .function_graphs()
+            .get(&CallPath::from_segments([BUF_LEAF]))
+            .expect("buf helper graph");
+        let kinds: Vec<String> = graph
+            .iter_block_ops()
+            .map(|(_, op)| format!("{:?}", op.kind))
+            .collect();
+        assert!(
+            graph.iter_block_ops().any(|(_, op)| match &op.kind {
+                OpKind::Call { target, .. } => match target {
+                    CallTarget::FunctionPath { segments, .. } => {
+                        segments.iter().any(|s| s == "gc_fq_register")
+                    }
+                    _ => false,
+                },
+                OpKind::UnaryOp { op, .. } => op == "gc_fq_register",
+                _ => false,
+            }),
+            "gc_fq_register: {kinds:?}"
+        );
+        assert!(
+            graph.iter_block_ops().any(|(_, op)| match &op.kind {
+                OpKind::Call { target, .. } => match target {
+                    CallTarget::FunctionPath { segments, .. } => {
+                        segments.iter().any(|s| s == "ll_dict_getitem")
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }),
+            "ll_dict_getitem: {kinds:?}"
+        );
+        let saw_keyerror = graph.iterblocks().iter().any(|block| {
+            matches!(block.exitswitch, Some(ExitSwitch::LastException))
+                && block.exits.iter().any(|link| match &link.exitcase {
+                    Some(ExitCase::Const(c)) => format!("{c:?}").contains("KeyError"),
+                    _ => false,
+                })
+        });
+        assert!(saw_keyerror, "KeyError exit on getitem: {kinds:?}");
+        assert!(
+            graph.iter_block_ops().any(|(_, op)| match &op.kind {
+                OpKind::Call { target, .. } => match target {
+                    CallTarget::FunctionPath { segments, .. } => {
+                        segments.iter().any(|s| s == "str2charp")
+                    }
+                    _ => false,
+                },
+                OpKind::RawMalloc { .. } | OpKind::New { .. } | OpKind::NewArray { .. } => true,
+                _ => false,
+            }),
+            "str2charp call/malloc: {kinds:?}"
         );
     }
 }

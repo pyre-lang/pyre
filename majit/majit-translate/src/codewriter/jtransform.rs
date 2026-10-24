@@ -12566,9 +12566,11 @@ impl<'a> Transformer<'a> {
     ///
     /// `getkind(op.args[0].concretetype)`: int → `record_exact_value_i`,
     /// ref → `record_exact_value_r`, no result. Constants stay operands
-    /// (`op.args` passed through upstream); pyre materialises them as the
-    /// Const* defines other `_i`/`_r` ops use, including null and
-    /// non-null GC pointer constants.
+    /// (`op.args` passed through upstream). `LoweredBlackholeOp.args` is
+    /// `Vec<Variable>`, so a Constant becomes the Const* define
+    /// `record_exact_value_const_opkind` picks — `ConstStr` for a
+    /// prebuilt `Ptr(STR)` so `assembler.py Assembler.emit_const` can
+    /// pool it through `emit_const_r`.
     ///
     /// `alias_result` is the Call result of `rlib/jit.py record_exact_value`
     /// (`majit_rlib::jit::record_exact_value`). `Entry.specialize_call` is
@@ -15102,10 +15104,11 @@ fn is_record_exact_value_helper(target: &CallTarget) -> bool {
 
 /// Const* define other `_i`/`_r` ops already emit for a Constant
 /// operand. `rewrite_op_jit_record_exact_value` keeps `op.args`
-/// unchanged upstream; `LoweredBlackholeOp` takes Variables, so a
-/// Constant becomes this define. Null GC pointers are `ConstRefNull`;
-/// a non-null `lltype._ptr` / HostObject is the same ConstRefAddr /
-/// ConstRef path `ref_copy` uses.
+/// unchanged upstream; `LoweredBlackholeOp.args` is `Vec<Variable>`,
+/// so a Constant becomes this define. Null GC pointers are
+/// `ConstRefNull`. A prebuilt `Ptr(STR)` is `ConstStr`, the same
+/// define `ref_copy` already lowers through `emit_const_r`. HostObject
+/// stays `ConstRef`.
 pub(crate) fn record_exact_value_const_opkind(
     value: &crate::flowspace::model::ConstValue,
 ) -> OpKind {
@@ -15118,15 +15121,30 @@ pub(crate) fn record_exact_value_const_opkind(
         ConstValue::None => OpKind::ConstRefNull,
         ConstValue::LLAddress(_address::Null) => OpKind::ConstRefNull,
         ConstValue::LLAddress(_address::IntCast(addr)) => OpKind::ConstRefAddr(*addr),
-        ConstValue::LLAddress(_address::Fake(p)) if !p.nonzero() => OpKind::ConstRefNull,
-        ConstValue::LLAddress(_address::Fake(p)) => {
-            OpKind::ConstRefAddr(p._hashable_identity() as i64)
-        }
-        ConstValue::LLPtr(p) if !p.nonzero() => OpKind::ConstRefNull,
-        ConstValue::LLPtr(p) => OpKind::ConstRefAddr(p._hashable_identity() as i64),
+        ConstValue::LLAddress(_address::Fake(p)) => record_exact_value_gcptr_opkind(p),
+        ConstValue::LLPtr(p) => record_exact_value_gcptr_opkind(p),
         ConstValue::HostObject(obj) => OpKind::ConstRef(obj.clone()),
         other => panic!("rewrite_op_jit_record_exact_value: unsupported constant {other:?}"),
     }
+}
+
+/// `assembler.py Assembler.emit_const` pools a GC `Ptr` as the pointed-to
+/// object (`cast_opaque_ptr(GCREF, value)`). A translator `_ptr` is
+/// process-local, so a prebuilt `Ptr(STR)` becomes `ConstStr` (bytes
+/// plus hash, minted by `emit_const_r`); a null pointer is
+/// `ConstRefNull`.
+fn record_exact_value_gcptr_opkind(
+    p: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> OpKind {
+    if !p.nonzero() {
+        return OpKind::ConstRefNull;
+    }
+    if let Some((bytes, _)) =
+        crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
+    {
+        return OpKind::ConstStr(bytes);
+    }
+    panic!("rewrite_op_jit_record_exact_value: non-null GC pointer constant is not a prebuilt STR")
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
@@ -23437,9 +23455,8 @@ mod tests {
             );
         } else {
             assert!(
-                ops.iter()
-                    .any(|op| matches!(op.kind, OpKind::ConstRefAddr(_))),
-                "non-null ConstPtr materialises as ConstRefAddr: {ops:?}"
+                ops.iter().any(|op| matches!(op.kind, OpKind::ConstStr(_))),
+                "non-null Ptr(STR) materialises as ConstStr: {ops:?}"
             );
         }
         let rec = ops
@@ -23464,9 +23481,19 @@ mod tests {
         transform_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(true), true);
     }
 
+    fn strptr_const() -> crate::flowspace::model::Constant {
+        use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, const_str_cache_llstr};
+        crate::flowspace::model::Constant::with_concretetype(
+            crate::flowspace::model::ConstValue::LLPtr(Box::new(
+                const_str_cache_llstr(b"hello").expect("cache llstr"),
+            )),
+            STRPTR.clone(),
+        )
+    }
+
     #[test]
     fn transform_graph_lowers_jit_record_exact_value_constptr_to_record_exact_value_r() {
-        transform_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(false), false);
+        transform_graph_lowers_jit_record_exact_value_ref_const(strptr_const(), false);
     }
 
     fn transform_graph_helper_record_exact_value_keeps_result(

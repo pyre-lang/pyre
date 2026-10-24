@@ -22,7 +22,8 @@ use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDesc
 use crate::flowspace::argument::Signature;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{
-    CallTarget, FlagReturn, FunctionGraph, InstanceFlags, LinkArg, OpKind, SpaceOperation,
+    CallTarget, FieldDescriptor, FlagReturn, FunctionGraph, InstanceFlags, LinkArg, OpKind,
+    SpaceOperation,
 };
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
@@ -14212,6 +14213,18 @@ fn effect_materialize(
                     let n = i64::from(bytes.first().copied().unwrap_or(0));
                     (OpKind::ConstInt(n), LowLevelType::Signed)
                 }
+                ConstValue::None => (OpKind::ConstRefNull, LowLevelType::Void),
+                ConstValue::LLPtr(ptr) => {
+                    let lltype = c
+                        .concretetype
+                        .clone()
+                        .unwrap_or_else(|| LowLevelType::Ptr(Box::new(ptr._TYPE.clone())));
+                    let kind = match ptr._obj0_value() {
+                        Ok(None) => OpKind::ConstRefNull,
+                        _ => OpKind::ConstRefAddr(ptr._hashable_identity() as i64),
+                    };
+                    (kind, lltype)
+                }
                 other => {
                     panic!("effect_graph_from_rtyped_helper: cannot materialise constant {other:?}")
                 }
@@ -14243,6 +14256,109 @@ fn effect_callee_name_from_funcptr(hlv: &crate::flowspace::model::Hlvalue) -> St
             panic!("effect_graph_from_rtyped_helper: direct_call callee is not a Func: {other:?}")
         }
     }
+}
+
+fn effect_field_name(hlv: &crate::flowspace::model::Hlvalue) -> String {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::ByteStr(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            other => panic!(
+                "effect_graph_from_rtyped_helper: field-name operand is not a ByteStr: {other:?}"
+            ),
+        },
+        Hlvalue::Variable(_) => {
+            panic!("effect_graph_from_rtyped_helper: field-name operand is a Variable")
+        }
+    }
+}
+
+fn effect_owner_root(base: &crate::flowspace::model::Variable) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match base.concretetype()? {
+        LowLevelType::Ptr(ptr) => match ptr.TO {
+            PtrTarget::Struct(s) => Some(s._name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn effect_malloc_owner(hlv: &crate::flowspace::model::Hlvalue) -> String {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => match &**lltype {
+                LowLevelType::Struct(s) => s._name.clone(),
+                LowLevelType::Array(a) => format!("Array({})", a.OF.short_name()),
+                other => other.short_name(),
+            },
+            other => panic!(
+                "effect_graph_from_rtyped_helper: malloc first operand is not a LowLevelType const: {other:?}"
+            ),
+        },
+        Hlvalue::Variable(_) => {
+            panic!("effect_graph_from_rtyped_helper: malloc first operand is a Variable")
+        }
+    }
+}
+
+fn effect_malloc_array_type_id(hlv: &crate::flowspace::model::Hlvalue) -> Option<String> {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => match &**lltype {
+                LowLevelType::Array(a) => {
+                    let elem = match a.OF {
+                        LowLevelType::Char => "Char",
+                        LowLevelType::UniChar => "UniChar",
+                        LowLevelType::Signed => "Signed",
+                        LowLevelType::Unsigned => "Unsigned",
+                        LowLevelType::Bool => "Bool",
+                        LowLevelType::Float => "Float",
+                        _ => return Some(lltype.short_name()),
+                    };
+                    Some(format!("Array({elem})"))
+                }
+                _ => Some(lltype.short_name()),
+            },
+            _ => None,
+        },
+        Hlvalue::Variable(_) => None,
+    }
+}
+
+/// `CollectAnalyzer.analyze_simple_operation` (`collectanalyze.py`):
+/// `malloc` / `malloc_varsize` collect only when `flags['flavor'] == 'gc'`.
+fn effect_malloc_flavor_is_raw(flags: &crate::flowspace::model::Hlvalue) -> bool {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    let Hlvalue::Constant(c) = flags else {
+        return false;
+    };
+    let ConstValue::Dict(map) = &c.value else {
+        return false;
+    };
+    match map.get(&ConstValue::byte_str("flavor")) {
+        Some(ConstValue::ByteStr(b)) => b.as_slice() == b"raw",
+        Some(ConstValue::UniStr(s)) => s == "raw",
+        _ => false,
+    }
+}
+
+fn effect_malloc_zero(flags: &crate::flowspace::model::Hlvalue) -> bool {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    let Hlvalue::Constant(c) = flags else {
+        return false;
+    };
+    let ConstValue::Dict(map) = &c.value else {
+        return false;
+    };
+    matches!(
+        map.get(&ConstValue::byte_str("zero")),
+        Some(ConstValue::Bool(true))
+    )
 }
 
 fn effect_transduce_op(
@@ -14364,7 +14480,7 @@ fn effect_transduce_op(
             );
         }
         name @ ("cast_ptr_to_adr" | "cast_adr_to_ptr" | "cast_primitive" | "cast_bool_to_int"
-        | "cast_char_to_int" | "cast_int_to_char") => {
+        | "cast_char_to_int" | "cast_int_to_char" | "cast_opaque_ptr") => {
             let operand = effect_materialize(out, block, &op.args[0]);
             let result = effect_expect_var(&op.result);
             let _ = name;
@@ -14378,7 +14494,8 @@ fn effect_transduce_op(
                 result,
             );
         }
-        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "bool_not") => {
+        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "bool_not"
+        | "ptr_nonzero" | "ptr_iszero") => {
             let operand = effect_materialize(out, block, &op.args[0]);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
@@ -14389,6 +14506,106 @@ fn effect_transduce_op(
                     result_ty: effect_value_type_of(&result),
                 },
                 result,
+            );
+        }
+        name @ ("gc_id" | "gc_fq_register") => {
+            // `gc_id`: `LLOp(sideeffects=False, canmallocgc=True)` so
+            // `canraise=(MemoryError,)`. Graph-less `Call` +
+            // `mark_canmallocgc(["gc_id"])` is how CollectAnalyzer sees
+            // `canmallocgc`. `gc_fq_register`: `LLOp()` defaults
+            // (side effects, `canmallocgc=False`, `canraise=()`).
+            let args: Vec<_> = op
+                .args
+                .iter()
+                .map(|a| effect_materialize(out, block, a))
+                .collect();
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::function_path([name]),
+                    args: crate::model::call_args(args),
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        "malloc" => {
+            let owner = effect_malloc_owner(&op.args[0]);
+            let result = effect_expect_var(&op.result);
+            let raw = op.args.get(1).is_some_and(effect_malloc_flavor_is_raw);
+            let kind = if raw {
+                OpKind::RawMalloc {
+                    owner,
+                    zero: effect_malloc_zero(&op.args[1]),
+                }
+            } else {
+                OpKind::New { owner }
+            };
+            out.push_op_with_result_var(block, kind, result);
+        }
+        "malloc_varsize" => {
+            let result = effect_expect_var(&op.result);
+            if op.args.get(1).is_some_and(effect_malloc_flavor_is_raw) {
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::RawMalloc {
+                        owner: effect_malloc_owner(&op.args[0]),
+                        zero: effect_malloc_zero(&op.args[1]),
+                    },
+                    result,
+                );
+            } else {
+                let length = effect_materialize(out, block, &op.args[2]);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::NewArray {
+                        length,
+                        item_ty: effect_value_type_of(&result),
+                        array_type_id: effect_malloc_array_type_id(&op.args[0]),
+                    },
+                    result,
+                );
+            }
+        }
+        "free" => {
+            let ptr = effect_materialize(out, block, &op.args[0]);
+            out.push_op_var(block, OpKind::RawFree { ptr }, false);
+        }
+        "getfield" => {
+            let base = effect_expect_var(&op.args[0]);
+            let field_name = effect_field_name(&op.args[1]);
+            let owner_root = effect_owner_root(&base);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new(field_name, owner_root),
+                    ty: effect_value_type_of(&result),
+                    pure: false,
+                },
+                result,
+            );
+        }
+        "setfield" => {
+            let base = effect_expect_var(&op.args[0]);
+            let field_name = effect_field_name(&op.args[1]);
+            let owner_root = effect_owner_root(&base);
+            let value = effect_linkarg(&op.args[2]);
+            let ty = match &op.args[2] {
+                crate::flowspace::model::Hlvalue::Variable(v) => effect_value_type_of(v),
+                crate::flowspace::model::Hlvalue::Constant(_) => ValueType::Int,
+            };
+            out.push_op_var(
+                block,
+                OpKind::FieldWrite {
+                    base,
+                    field: FieldDescriptor::new(field_name, owner_root),
+                    value,
+                    ty,
+                },
+                false,
             );
         }
         name @ ("int_add" | "int_sub" | "int_mul" | "int_and" | "int_or" | "int_xor"

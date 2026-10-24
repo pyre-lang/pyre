@@ -9791,6 +9791,148 @@ mod tests {
         assert!(asm.insns.contains_key("ref_return/r"));
     }
 
+    fn assemble_record_exact_value(
+        value_ty: crate::model::ValueType,
+        value_kind: crate::model::ConcreteType,
+        const_value: crate::flowspace::model::Constant,
+        return_value: bool,
+    ) -> (Assembler, crate::jitcode::JitCodeBody) {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, transform_graph};
+        use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("record_exact_value_const");
+        let value = push_input_var(&mut graph, "v", value_ty);
+        FunctionGraph::set_concretetype_of_inline(&value, value_kind);
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_record_exact_value"]),
+                args: vec![LinkArg::from(value.clone()), LinkArg::Const(const_value)],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(
+            graph.startblock,
+            if return_value {
+                Some(value.clone())
+            } else {
+                None
+            },
+        );
+
+        let mut rewritten = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+        FunctionGraph::set_concretetype_of_inline(&value, value_kind);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+        (asm, body)
+    }
+
+    #[test]
+    fn assembles_record_exact_value_r_prebuilt_str_matches_emit_const_r() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            STRPTR, const_str_cache_llstr, ll_strhash_value,
+        };
+
+        let p = const_str_cache_llstr(b"hello").expect("cache llstr");
+        let str_const =
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(p.clone())), STRPTR.clone());
+        let (asm, body) = assemble_record_exact_value(
+            crate::model::ValueType::Ref(None),
+            crate::model::ConcreteType::GcRef,
+            str_const,
+            true,
+        );
+
+        assert!(
+            asm.insns.contains_key("record_exact_value_r/rr"),
+            "expected record_exact_value_r/rr, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(body.str_consts.len(), 1);
+        assert_eq!(body.str_consts[0].bytes, b"hello".to_vec());
+        assert_eq!(
+            body.str_consts[0].precomputed_hash,
+            ll_strhash_value(b"hello")
+        );
+        let idx = body.str_consts[0].constants_r_index;
+        let pooled = body.constants_r[idx].get();
+        assert_eq!(pooled, str_const_sentinel(0));
+        assert_ne!(
+            pooled,
+            p._hashable_identity() as i64,
+            "ref pool must not store the translator _ptr counter"
+        );
+
+        let mut direct = Assembler::new();
+        let mut state = empty_state();
+        let _ = direct.emit_const_r(&ConstValue::LLPtr(Box::new(p)), &mut state, None);
+        assert_eq!(state.constants_r[0], pooled);
+        assert_eq!(state.str_consts[0].bytes, b"hello".to_vec());
+    }
+
+    #[test]
+    fn assembles_record_exact_value_r_null_ptr_to_null_ref() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
+
+        let LowLevelType::Ptr(objectptr) = crate::translator::rtyper::rclass::OBJECTPTR.clone()
+        else {
+            unreachable!()
+        };
+        let null = lltype::nullptr(objectptr.TO.clone().into()).expect("null OBJECTPTR");
+        let (asm, body) = assemble_record_exact_value(
+            crate::model::ValueType::Ref(None),
+            crate::model::ConcreteType::GcRef,
+            Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(null)),
+                crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+            ),
+            true,
+        );
+
+        assert!(
+            asm.insns.contains_key("record_exact_value_r/rr"),
+            "expected record_exact_value_r/rr, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            body.constants_r.iter().any(|slot| slot.get() == 0),
+            "null ptr must pool as a null ref, got {:?}",
+            body.constants_r.iter().map(|s| s.get()).collect::<Vec<_>>()
+        );
+        assert!(body.str_consts.is_empty());
+    }
+
+    #[test]
+    fn assembles_record_exact_value_i_int_constant_unchanged() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let (asm, body) = assemble_record_exact_value(
+            crate::model::ValueType::Int,
+            crate::model::ConcreteType::Signed,
+            Constant::with_concretetype(ConstValue::Int(1000), LowLevelType::Signed),
+            true,
+        );
+
+        assert!(
+            asm.insns.contains_key("record_exact_value_i/ii"),
+            "expected record_exact_value_i/ii, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            body.constants_i.contains(&1000),
+            "int constant must stay 1000, got {:?}",
+            body.constants_i
+        );
+    }
+
     #[test]
     fn emit_const_r_records_prebuilt_string_descriptor_and_dedups() {
         use crate::translator::rtyper::lltypesystem::rstr::{

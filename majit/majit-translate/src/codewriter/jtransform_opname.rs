@@ -62,7 +62,7 @@ use crate::flowspace::model::{
     Block as FlowBlock, ConstValue, FunctionGraph as FlowGraph, Hlvalue,
 };
 use crate::model::{BlockId, ExitCase, ExitSwitch, Link, LinkArg, OpKind, ValueType};
-use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
 
 /// Block identity key — flowspace blocks are `Rc<RefCell<Block>>` with no
 /// inherent id, so identity is the allocation address (RPython compares
@@ -485,8 +485,9 @@ fn transduce_op(
         // int → `record_exact_value_i`, ref → `record_exact_value_r`.
         // Void result, same `push_op_var(..., false)` shape as `keepalive`
         // / `copystrcontent`. Operands pass through unchanged upstream;
-        // Constants (including null and non-null GC pointers) become the
-        // same Const* defines other `_r` ops use.
+        // Constants become the Const* defines
+        // `record_exact_value_const_opkind` picks (`ConstStr` for a
+        // prebuilt `Ptr(STR)`).
         "jit_record_exact_value" => {
             let kind0 = hlvalue_getkind(&op.args[0]);
             let kind1 = hlvalue_getkind(&op.args[1]);
@@ -586,6 +587,35 @@ fn transduce_op(
                     result,
                 );
             }
+        }
+        // `jtransform.py Transformer.rewrite_op_ptr_nonzero` /
+        // `rewrite_op_ptr_iszero` alias `_rewrite_cmp_ptrs`.  A GC pointer
+        // stays the unary `ptr_nonzero` / `ptr_iszero` (blackhole
+        // `bhimpl_ptr_nonzero`); a raw pointer becomes `int_is_true` /
+        // `int_is_zero`.  The GC form is the same `UnaryOp` the `ptr_ne` /
+        // `ptr_eq` NULL arm emits, so `optimize_goto_if_not` folds the
+        // exitswitch into `goto_if_not_ptr_nonzero` /
+        // `goto_if_not_ptr_iszero`.
+        "ptr_nonzero" | "ptr_iszero" => {
+            let operand = expect_var(&op.args[0]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            let unop = if lltype_is_gc_ptr(&operand) {
+                op.opname.as_str()
+            } else if op.opname == "ptr_nonzero" {
+                "int_is_true"
+            } else {
+                "int_is_zero"
+            };
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: unop.to_string(),
+                    operand,
+                    result_ty,
+                },
+                result,
+            );
         }
         // `setfield(s, "field", v)` → `FieldWrite`.  Field name and owner are
         // resolved exactly like `getfield`; the stored value is an
@@ -834,9 +864,9 @@ fn resolve_string(chars_alias: &HashMap<FVar, FVar>, arr: &Hlvalue) -> FVar {
 
 /// `jit_record_exact_value` operands: Variables pass through, Constants
 /// become the Const* define `record_exact_value_const_opkind` picks —
-/// ints/bools plus null and non-null GC pointer constants. Generic
-/// [`materialize`] stays int/bool-only; a ref constant here is an
-/// ordinary `_r` operand, not an int-bank literal.
+/// ints/bools, null refs, HostObject, and prebuilt `Ptr(STR)` as
+/// `ConstStr`. Generic [`materialize`] stays int/bool-only; a ref
+/// constant here is an ordinary `_r` operand, not an int-bank literal.
 fn materialize_record_exact_value_arg(
     out: &mut crate::model::FunctionGraph,
     block: BlockId,
@@ -941,6 +971,16 @@ fn owner_root_of(base: &FVar) -> Option<String> {
 /// the second operand of the builder `ll_bool` `ptr_ne(builder, NULL)`.
 fn is_null_const(hlv: &Hlvalue) -> bool {
     matches!(hlv, Hlvalue::Constant(c) if c.value == ConstValue::None)
+}
+
+/// `rgc.lltype_is_gc` / `jtransform.py Transformer._is_gc`:
+/// `v.concretetype.TO._gckind == 'gc'`.
+fn lltype_is_gc_ptr(var: &FVar) -> bool {
+    match var.concretetype() {
+        Some(LowLevelType::Ptr(ptr)) => ptr.TO._gckind() == GcKind::Gc,
+        Some(LowLevelType::InteriorPtr(ip)) => ip.TO._gckind() == GcKind::Gc,
+        _ => false,
+    }
 }
 
 /// Map a flowspace link arg (`Variable` or `Constant`) to the model
@@ -1113,7 +1153,8 @@ mod tests {
         STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
     };
     use crate::translator::rtyper::lltypesystem::rstr::{
-        STRPTR, chars_array_ptr_lltype_from_strptr, struct_lltype_from_strptr,
+        STRPTR, build_ll_search_helper_graph, chars_array_ptr_lltype_from_strptr,
+        struct_lltype_from_strptr,
     };
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
     use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
@@ -1389,9 +1430,8 @@ mod tests {
             );
         } else {
             assert!(
-                ops.iter()
-                    .any(|op| matches!(op.kind, OpKind::ConstRefAddr(_))),
-                "non-null ConstPtr materialises as ConstRefAddr: {ops:?}"
+                ops.iter().any(|op| matches!(op.kind, OpKind::ConstStr(_))),
+                "non-null Ptr(STR) materialises as ConstStr: {ops:?}"
             );
         }
         let rec = ops
@@ -1421,9 +1461,19 @@ mod tests {
         lower_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(true), true);
     }
 
+    fn strptr_const() -> Hlvalue {
+        use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, const_str_cache_llstr};
+        constant_with_lltype(
+            ConstValue::LLPtr(Box::new(
+                const_str_cache_llstr(b"hello").expect("cache llstr"),
+            )),
+            STRPTR.clone(),
+        )
+    }
+
     #[test]
     fn lower_graph_lowers_jit_record_exact_value_constptr_to_record_exact_value_r() {
-        lower_graph_lowers_jit_record_exact_value_ref_const(objectptr_const(false), false);
+        lower_graph_lowers_jit_record_exact_value_ref_const(strptr_const(), false);
     }
 
     /// The integer fragment in `LLHelpers.ll_int2hex` is not the all-binary
@@ -2055,6 +2105,185 @@ mod tests {
         }
         assert_eq!(unops, vec!["ptr_nonzero"]);
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    fn build_ptr_null_test_graph(opname: &str, ptr_lltype: LowLevelType) -> FlowGraph {
+        let p = variable_with_lltype("p", ptr_lltype);
+        let startblock = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let return_var = variable_with_lltype("result", LowLevelType::Bool);
+        let graph = FlowGraph::with_return_var(
+            format!("ll_test_{opname}"),
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let nz = variable_with_lltype("nz", LowLevelType::Bool);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            vec![Hlvalue::Variable(p)],
+            Hlvalue::Variable(nz.clone()),
+        ));
+        startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(nz));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![bool_const(true)],
+                Some(graph.returnblock.clone()),
+                Some(bool_const(true)),
+            )
+            .into_ref(),
+            Link::new(
+                vec![bool_const(false)],
+                Some(graph.returnblock.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+        ]);
+        graph
+    }
+
+    fn startblock_unops(model: &crate::model::FunctionGraph) -> Vec<String> {
+        model
+            .block(model.startblock)
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => Some(op.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Rtyped `ptr_nonzero(p: Ptr(STR))` / `ptr_iszero` stay the unary
+    /// null test (`jtransform.py Transformer._rewrite_cmp_ptrs` GC
+    /// branch); the bool exitswitch is the same shape `optimize_goto_if_not`
+    /// folds for `ll_bool`.
+    #[test]
+    fn lower_graph_lowers_ptr_nonzero_and_ptr_iszero_on_str() {
+        let nonzero = lower_graph(&build_ptr_null_test_graph("ptr_nonzero", STRPTR.clone()));
+        assert_eq!(startblock_unops(&nonzero), vec!["ptr_nonzero"]);
+        let start = nonzero.block(nonzero.startblock);
+        assert!(matches!(start.exitswitch, Some(ExitSwitch::Value(_))));
+        assert_eq!(start.exits.len(), 2);
+        let cases: Vec<&Option<ExitCase>> = start.exits.iter().map(|l| &l.exitcase).collect();
+        assert!(cases.contains(&&Some(ExitCase::Bool(true))));
+        assert!(cases.contains(&&Some(ExitCase::Bool(false))));
+
+        let iszero = lower_graph(&build_ptr_null_test_graph("ptr_iszero", STRPTR.clone()));
+        assert_eq!(startblock_unops(&iszero), vec!["ptr_iszero"]);
+        let start = iszero.block(iszero.startblock);
+        assert!(matches!(start.exitswitch, Some(ExitSwitch::Value(_))));
+        assert_eq!(start.exits.len(), 2);
+    }
+
+    /// `_rewrite_cmp_ptrs` maps a raw (non-GC) pointer's `ptr_nonzero` /
+    /// `ptr_iszero` to `int_is_true` / `int_is_zero`.
+    #[test]
+    fn lower_graph_rewrites_raw_ptr_nonzero_to_int_is_true() {
+        let raw = LowLevelType::Ptr(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::NONGCREF.clone(),
+        ));
+        let nonzero = lower_graph(&build_ptr_null_test_graph("ptr_nonzero", raw.clone()));
+        assert_eq!(startblock_unops(&nonzero), vec!["int_is_true"]);
+        let iszero = lower_graph(&build_ptr_null_test_graph("ptr_iszero", raw));
+        assert_eq!(startblock_unops(&iszero), vec!["int_is_zero"]);
+    }
+
+    /// `LLHelpers.ll_search` `assert value is not None`: `ptr_nonzero`
+    /// then the False arm raises AssertionError on the graph exceptblock
+    /// (`exception_args`).  `lower_graph` keeps that raise link.
+    #[test]
+    fn lower_graph_keeps_ptr_nonzero_assertionerror_except_link() {
+        use crate::translator::rtyper::rtyper::exception_args;
+
+        let p = variable_with_lltype("p", STRPTR.clone());
+        let startblock = Block::shared(vec![Hlvalue::Variable(p.clone())]);
+        let return_var = variable_with_lltype("result", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_assert_ptr_not_none",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let nz = variable_with_lltype("nz", LowLevelType::Bool);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "ptr_nonzero",
+            vec![Hlvalue::Variable(p.clone())],
+            Hlvalue::Variable(nz.clone()),
+        ));
+        startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(nz));
+        let exc_args = exception_args("AssertionError").expect("AssertionError args");
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(p)],
+                Some(graph.returnblock.clone()),
+                Some(bool_const(true)),
+            )
+            .into_ref(),
+            Link::new(
+                exc_args,
+                Some(graph.exceptblock.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        assert_eq!(startblock_unops(&model), vec!["ptr_nonzero"]);
+        let start = model.block(model.startblock);
+        let false_link = start
+            .exits
+            .iter()
+            .find(|l| l.exitcase == Some(ExitCase::Bool(false)))
+            .expect("false exit");
+        assert_eq!(false_link.target, model.exceptblock);
+        assert_eq!(false_link.args.len(), 2);
+        match &false_link.args[0] {
+            LinkArg::Const(c) => match &c.value {
+                ConstValue::HostObject(h) => {
+                    assert_eq!(h.qualname(), "AssertionError");
+                }
+                other => panic!("except class is not a HostObject: {other:?}"),
+            },
+            other => panic!("except class is not a Const: {other:?}"),
+        }
+    }
+
+    /// `build_ll_search_helper_graph` start / check-other blocks are
+    /// `ptr_nonzero` with False → exceptblock AssertionError.  Both raise
+    /// links survive `lower_graph`.
+    #[test]
+    fn lower_graph_lowers_ll_search_assertionerror_raise() {
+        let helper = build_ll_search_helper_graph("ll_search", STRPTR.clone())
+            .expect("build_ll_search_helper_graph");
+        let flow = helper.graph.borrow();
+        let model = lower_graph(&flow);
+
+        let unops: Vec<String> = model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => Some(op.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unops, vec!["ptr_nonzero", "ptr_nonzero"]);
+
+        let assertionerror_exits = model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.exits)
+            .filter(|link| {
+                link.target == model.exceptblock
+                    && matches!(
+                        link.args.first(),
+                        Some(LinkArg::Const(c))
+                            if matches!(
+                                &c.value,
+                                ConstValue::HostObject(h) if h.qualname() == "AssertionError"
+                            )
+                    )
+            })
+            .count();
+        assert_eq!(assertionerror_exits, 2);
     }
 
     /// `ll_getlength(builder)` is `total_size - (current_end - current_pos)`.

@@ -70,7 +70,8 @@ pub fn _search_elidable(s1: *const u8, s2: *const u8, start: i64, end: i64, mode
 /// `_search` sends STR through `_search_elidable` and UNICODE through
 /// `_search_normal`; this residual takes two `Ptr(UNICODE)` and is
 /// published on `HELPER_FNADDRS` as `_search_normal`, the way the STR
-/// residual is published as `_search_elidable`.
+/// residual is published as `_search_elidable`. A residual specialization
+/// aliases this row only when its argument layout is `Ptr(UNICODE)`.
 pub extern "C" fn _search_normal_unicode(
     s1: *const u8,
     s2: *const u8,
