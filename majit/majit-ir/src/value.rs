@@ -1610,6 +1610,33 @@ impl GreenKey {
     pub fn hash_u64(&self) -> u64 {
         self.get_uhash()
     }
+
+    /// history.py `ConstPtr.value` — a `GreenType::Ref` slot is a GC pointer
+    /// copied into this key; the walker rewrites the address after a move.
+    /// Null is skipped. `Str` / `Unicode` are frontend string slots, not
+    /// moving GC pointers (`hash_whatever` hashes their content).
+    pub fn walk_refs(&mut self, visitor: &mut impl FnMut(&mut GcRef)) {
+        for i in 0..self.values.len() {
+            let tp = self.types.get(i).copied().unwrap_or(GreenType::Int);
+            if tp == GreenType::Ref && self.values[i] != 0 {
+                let mut gcref = GcRef(self.values[i] as usize);
+                visitor(&mut gcref);
+                self.values[i] = gcref.0 as i64;
+            }
+        }
+    }
+
+    /// pyjitpl.py `same_greenkey` calls `Const.same_constant`: `ConstInt`
+    /// value equality, `ConstFloat` bit equality (`history.py`
+    /// `ConstFloat.same_constant`), `ConstPtr` pointer identity
+    /// (`ConstPtr.same_constant`). GreenKey values are raw i64 words
+    /// (Float as bits, Ref/Str/Unicode as addresses), so this is
+    /// element-wise i64 equality of `values` (plus equal length).
+    ///
+    /// `PartialEq` stays `equal_whatever` (`JitCell.comparekey`).
+    pub fn same_constant(&self, other: &GreenKey) -> bool {
+        self.values == other.values
+    }
 }
 
 /// Allocation-free `get_uhash` for the pypyjit portal green tuple
@@ -2186,6 +2213,25 @@ mod tests {
         assert_ne!(k1, k3);
         assert_eq!(k1.hash_u64(), k2.hash_u64());
         assert_eq!(k1, GreenKey::from_greenargs(&k1.values, &k1.types));
+    }
+
+    /// pyjitpl.py `same_greenkey` / history.py `ConstFloat.same_constant`
+    /// and `ConstPtr.same_constant`. `equal_whatever` is the warm-cell
+    /// predicate and is a different comparison.
+    #[test]
+    fn same_constant_is_elementwise_i64_identity() {
+        let pos_zero = GreenKey::with_types(vec![0.0f64.to_bits() as i64], vec![GreenType::Float]);
+        let neg_zero =
+            GreenKey::with_types(vec![(-0.0f64).to_bits() as i64], vec![GreenType::Float]);
+        assert!(!pos_zero.same_constant(&neg_zero));
+
+        let addr1 = make_str_slot("same-content");
+        let addr2 = make_str_slot("same-content");
+        assert_ne!(addr1, addr2);
+        let str_a = GreenKey::with_types(vec![addr1], vec![GreenType::Str]);
+        let str_b = GreenKey::with_types(vec![addr2], vec![GreenType::Str]);
+        assert!(!str_a.same_constant(&str_b));
+        assert!(str_a.same_constant(&str_a));
     }
 
     #[test]

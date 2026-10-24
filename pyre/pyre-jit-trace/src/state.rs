@@ -13562,7 +13562,7 @@ mod tests {
         {
             let meta = pair.0.meta_interp_mut();
             meta.abort_trace_live(false);
-            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7));
+            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7), &[]);
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),
                 "maybe_compile_and_run still finds the already-compiled portal cell"
@@ -13665,7 +13665,7 @@ mod tests {
                 !portal_cell.flags.get().contains(JcFlags::JC_FORCE_FINISH),
                 "prepare_trace_segmenting must not run when names() caused the bloat"
             );
-            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7));
+            let (step, _) = meta.maybe_compile_and_run_step(portal_hash, (0xC0DE, 7), &[]);
             assert!(
                 !matches!(step, majit_metainterp::warmstate::HotResult::NotHot),
                 "maybe_compile_and_run still finds the already-compiled portal cell"

@@ -4369,7 +4369,9 @@ fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
             return crate::jitcode_runtime::portal_jitcode().map(|jc| jc.index());
         }
         1 => "baseobjspace::unpackiterable_portal",
-        2 => crate::genentry_state::GENENTRY_PORTAL_KEY,
+        crate::genentry_state::GENERATORENTRY_JD_INDEX => {
+            crate::genentry_state::GENENTRY_PORTAL_KEY
+        }
         _ => return None,
     };
     crate::jitcode_runtime::portal_jitcode_for_key(key).map(|jc| jc.index())

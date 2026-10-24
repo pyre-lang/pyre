@@ -3967,7 +3967,7 @@ pub fn trace_and_compile_from_bridge(
         jd_index.and_then(|idx| driver.meta_interp().jitdriver_has_vinfo(idx))
     };
     if has_vinfo == Some(false) {
-        if jd_index != Some(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize) {
+        if jd_index != Some(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX) {
             return BridgeResolution::ResumeBlackhole;
         }
         return trace_bridge_via_interpret(
@@ -4960,7 +4960,7 @@ fn trace_bridge_via_interpret(
     }
 
     let _plain = pyre_interpreter::call::force_plain_eval();
-    let jd_index = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize;
+    let jd_index = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
 
     let retrace = {
         let (driver, _) = crate::eval::driver_pair();
