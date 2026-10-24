@@ -7436,17 +7436,15 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 // a close that leaves only the bucket hash makes
                 // `attach_procedure_to_interp` mint a cell without a
                 // `comparekey`, which no `get_jitcell` walk can match.
-                let key = crate::driver::make_green_key(w_code, loop_header_pc, is_being_profiled);
+                let typed =
+                    crate::driver::make_green_key_typed(w_code, loop_header_pc, is_being_profiled);
+                let key = typed.get_uhash();
                 ctx.set_green_key(key, (w_code as usize, loop_header_pc));
                 ctx.header_pc = loop_header_pc;
                 if loop_header_pc != start_pc {
-                    ctx.cut_inner_green_key = Some(key);
+                    ctx.cut_inner_green_key = Some(typed.clone());
                 }
-                ctx.set_close_typed_key(crate::driver::make_green_key_typed(
-                    w_code,
-                    loop_header_pc,
-                    is_being_profiled,
-                ));
+                ctx.set_close_typed_key(typed);
                 TraceAction::CloseLoopWithArgs {
                     jump_args,
                     loop_header_pc: Some(loop_header_pc),

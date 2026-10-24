@@ -5756,8 +5756,7 @@ impl<S: JitState> JitDriver<S> {
             let Some(ctx) = self.meta.trace_ctx() else {
                 return false;
             };
-            ctx.find_merge_point_same_greenkey(target_key, Some(&key_typed))
-                .is_some()
+            ctx.find_merge_point_same_greenkey(&key_typed).is_some()
         };
         if already {
             return false;
@@ -16863,7 +16862,7 @@ mod cross_loop_cut_close_tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             if cut {
-                ctx.cut_inner_green_key = Some(key);
+                ctx.cut_inner_green_key = Some(typed.clone());
             }
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());

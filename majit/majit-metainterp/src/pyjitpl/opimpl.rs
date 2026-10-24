@@ -4801,7 +4801,7 @@ where
                     };
                     if !already_compiled_here
                         && ctx
-                            .find_merge_point_same_greenkey(close_key, Some(&close_key_typed))
+                            .find_merge_point_same_greenkey(&close_key_typed)
                             .is_none()
                     {
                         let original_boxes = live_arg_boxes.to_vec();
@@ -5009,7 +5009,7 @@ where
                     // reached_loop_header entry above (pyjitpl.py).
                     return TraceAction::CloseLoop;
                 } else if ctx
-                    .find_merge_point_same_greenkey(inner_key, Some(&inner_key_typed))
+                    .find_merge_point_same_greenkey(&inner_key_typed)
                     .is_some()
                 {
                     if crate::jitdriver::spdiag_enabled() {
@@ -5034,7 +5034,7 @@ where
                     // close HERE and cut the outer prefix as preamble.
                     // Setting cut_inner_green_key routes compile_loop
                     // through cross_loop_cut (compile.py compile_loop).
-                    ctx.cut_inner_green_key = Some(inner_key);
+                    ctx.cut_inner_green_key = Some(inner_key_typed.clone());
                     // pyjitpl.py `get_procedure_token(greenboxes)`
                     // reads the greens of the merge point just
                     // reached — here the INNER loop's, not the
