@@ -34,9 +34,8 @@ use pyre_object::{PY_NULL, w_float_get_value, w_int_get_value, w_int_new};
 /// pyre mirrors that with a shared `Arc`. The wrapper keeps only
 /// `index` (the SD-local `jitcode.index = len(all_jitcodes)` from
 /// codewriter.py:68) on the SD side; `code_for_jitcode_index` recovers
-/// the wrapping `PyObjectRef` from the payload's `code_ptr` through the
-/// live-wrapper registry, so the wrapper no longer stores a `code`
-/// field.
+/// the wrapping `PyObjectRef` from `payload.w_code`, so the wrapper no
+/// longer stores a `code` field.
 // SAFETY: JitCode is only written once (during creation) and then
 // read-only. The code pointer is stable for the program lifetime.
 unsafe impl Sync for JitCode {}
@@ -312,15 +311,15 @@ impl MetaInterpStaticData {
         if code.is_null() {
             return None;
         }
-        // A raw `CodeObject*` IS the canonical key (jitcodes compare
-        // `raw_code()` identity).  Post-#16 callers pass the raw code
-        // identity directly (`ReconstructRecipe.code_ptr`); recognize it via
-        // the live-wrapper registry — keyed by raw code identity — before
-        // dereferencing `code` as a `PyCode` wrapper, which would read a
-        // garbage field out of a raw `CodeObject`.
-        if !pyre_interpreter::live_code_wrapper(code).is_null() {
-            return Some(code as usize);
-        }
+        // Wrapper in → `w_code_get_ptr`. A raw `CodeObject*` here would
+        // be read as a `PyCode` (`w_code_get_ptr` loads `PyCode.code_ptr`).
+        // Callers that already hold the body use
+        // `installed_jitcode_pos_for_raw_key` / `pyjitcode_for_jitcode_index`.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            unsafe { pyre_interpreter::pycode::is_code(code as pyre_object::PyObjectRef) },
+            "canonical_code_key_opt `code` must be a PyCode wrapper"
+        );
         let raw = unsafe { pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef) };
         if raw.is_null() {
             None
@@ -387,6 +386,8 @@ impl MetaInterpStaticData {
                 !payload.is_skeleton(),
                 "make_jitcodes returned an unpopulated JitCode skeleton"
             );
+            #[cfg(debug_assertions)]
+            debug_assert_python_jitcode_carries_wrapper(&payload);
             let raw_key = payload.code_ptr as usize;
             let existing_pos = self.installed_jitcode_pos_for_raw_key(raw_key);
             match existing_pos {
@@ -445,6 +446,12 @@ impl MetaInterpStaticData {
         supplied: Option<std::sync::Arc<crate::PyJitCode>>,
     ) -> *const JitCode {
         self.reserve_build_time_index_space();
+        if let Some(payload) = supplied.as_ref() {
+            #[cfg(debug_assertions)]
+            if !payload.is_skeleton() {
+                debug_assert_python_jitcode_carries_wrapper(payload);
+            }
+        }
         let raw_key = Self::canonical_code_key_opt(code).unwrap_or(0);
         if let Some(pos) = self.installed_jitcode_pos_for_raw_key(raw_key) {
             match supplied {
@@ -477,6 +484,10 @@ impl MetaInterpStaticData {
             };
             std::sync::Arc::new(crate::PyJitCode::skeleton(raw_code))
         });
+        #[cfg(debug_assertions)]
+        if !payload.is_skeleton() {
+            debug_assert_python_jitcode_carries_wrapper(&payload);
+        }
         let index = self.jitcodes.len() as i32;
         Self::stamp_payload_index(index, &payload);
         let jitcode = Box::new(JitCode { index, payload });
@@ -770,10 +781,16 @@ pub fn take_trace_abort_requested() -> bool {
 /// pyjitpl.py `MetaInterpStaticData.finish_setup` parity entry point.
 ///
 /// RPython runs `finish_setup` once per `MetaInterpStaticData` object. Pyre's
-/// `METAINTERP_SD` is thread-local, so the setup guard also lives on
-/// `MetaInterpStaticData`; only the unrelated callback registration below is
-/// process-global.
-fn ensure_finish_setup() {
+/// `METAINTERP_SD` is thread-local, so the opcode/liveness setup guard also
+/// lives on `MetaInterpStaticData`. The build-time descr pool is the frozen
+/// `Assembler.descrs` artifact (`setup_descrs` / blackhole.py
+/// `BlackholeInterpBuilder.setup_descrs`) and is process-global.
+pub fn ensure_finish_setup() {
+    // pyjitpl.py `self.setup_descrs(asm.descrs)` and blackhole.py
+    // `BlackholeInterpBuilder.setup_descrs(asm.descrs)` share one list.
+    // This is the single owner; every other path runs this function
+    // rather than installing the pool itself.
+    crate::jitcode_runtime::install_global_build_descr_pool();
     use crate::assembler::ASSEMBLER_STATE;
     use std::sync::Once;
     static FRAME_VALUE_COUNT_INIT: Once = Once::new();
@@ -797,8 +814,9 @@ fn ensure_finish_setup() {
     });
 }
 
-/// pyjitpl.py setup: frame.jitcode — resolve the JitCode for the frame's code
-/// object through the writer-side CallControl.get_jitcode path.
+/// pyjitpl.py setup: frame.jitcode — resolve the JitCode for the frame's
+/// `PyCode` wrapper through the writer-side CallControl.get_jitcode path.
+/// `code` is the wrapper, never a raw `CodeObject*`.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
     if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
@@ -837,6 +855,21 @@ pub fn install_jitcode_for(
     payload: std::sync::Arc<crate::PyJitCode>,
 ) -> *const () {
     ensure_finish_setup();
+    // Production callers pass the owner `PyCode` wrapper. Stamp it
+    // unconditionally; a debug assertion checks the type instead of a
+    // production `ob_type` branch that guesses what `code` is.
+    if !code.is_null() {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            unsafe { pyre_interpreter::pycode::is_code(code as pyre_object::PyObjectRef) },
+            "install_jitcode_for `code` must be a PyCode wrapper"
+        );
+        payload.stamp_w_code(code);
+    }
+    #[cfg(debug_assertions)]
+    if !payload.is_skeleton() {
+        debug_assert_python_jitcode_carries_wrapper(&payload);
+    }
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, Some(payload)) as *const ())
 }
 
@@ -956,18 +989,41 @@ pub fn install_codeless_jitcode(payload: std::sync::Arc<crate::PyJitCode>) -> i3
 /// `framework.py root_walker.walk_roots` parity for the persistent
 /// `MetaInterpStaticData.jitcodes` list (warmspot.py:282
 /// `self.metainterp_sd.jitcodes = jitcodes`).  Each entry's PyCode
-/// wrapper is recovered from its `payload.code_ptr` via the live-wrapper
-/// registry.
+/// wrapper is the payload `w_code` slot.
+///
+/// Also forwards `payload.w_code` of every jitcode still owned by the
+/// running `CallControl.jitcodes` (via `walk_writer_jitcode_code_roots`).
+/// `get_jitcode` stamps the wrapper on a skeleton there; `install_jitcodes`
+/// rejects skeletons, so that dict is the owner until the drain installs
+/// a populated payload.
 ///
 /// PyCode wrappers are ordinary movable GC objects. The visitor therefore
-/// forwards each `LIVE_CODE_WRAPPERS` value in place on minor collections as
-/// well as marking it on majors. Keeping this walk on the same per-mutator
-/// area as the jitcode constants preserves the owner: RPython reaches both
-/// through `MetaInterpStaticData.jitcodes`.
+/// forwards each slot in place on minor collections as well as marking it
+/// on majors. Keeping this walk on the same per-mutator area as the jitcode
+/// constants preserves the owner: RPython reaches both through
+/// `MetaInterpStaticData.jitcodes`.
 pub fn walk_jitcode_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_code_roots_in(&state.borrow(), visitor);
     });
+}
+
+/// Forward `payload.w_code` in place. Shared by the SD walk and by
+/// `CallControl.jitcodes` while a skeleton is queued.
+pub fn walk_payload_w_code(
+    payload: &crate::PyJitCode,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let cell = &payload.w_code;
+    let mut gcref = majit_ir::GcRef(cell.get() as usize);
+    if gcref.0 == 0 {
+        return;
+    }
+    let before = gcref.0;
+    visitor(&mut gcref);
+    if gcref.0 != before {
+        cell.set(gcref.0 as i64);
+    }
 }
 
 fn walk_jitcode_code_roots_in(
@@ -977,39 +1033,33 @@ fn walk_jitcode_code_roots_in(
     use std::sync::atomic::Ordering::Relaxed;
     let probe = probe14_enabled();
     for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
-        pyre_interpreter::pycode::walk_live_code_wrapper(
-            jc.payload.code_ptr as *const (),
-            &mut |wrapper| {
-                let old = *wrapper as usize;
-                if old == 0 {
-                    return;
-                }
-                if probe {
-                    PROBE14_CODE_SLOTS.fetch_add(1, Relaxed);
-                    probe14_note_nursery(
-                        "CODE WRAPPER",
-                        old,
-                        jc.payload.jitcode.name(),
-                        jitcode_index,
+        walk_payload_w_code(&jc.payload, &mut |gcref| {
+            let before = gcref.0;
+            if probe {
+                PROBE14_CODE_SLOTS.fetch_add(1, Relaxed);
+                probe14_note_nursery(
+                    "PAYLOAD W_CODE",
+                    before,
+                    jc.payload.jitcode.name(),
+                    jitcode_index,
+                );
+            }
+            visitor(gcref);
+            if probe && gcref.0 != before {
+                let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
+                if n <= 20 {
+                    eprintln!(
+                        "[probe14] RELOCATION KEPT #{n}: payload w_code 0x{before:x} -> 0x{:x} \
+                         (jitcode {jitcode_index}/{})",
+                        gcref.0,
+                        sd.jitcodes.len(),
                     );
                 }
-                let root = unsafe {
-                    &mut *(wrapper as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef)
-                };
-                visitor(root);
-                if probe && root.0 != old {
-                    let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
-                    if n <= 20 {
-                        eprintln!(
-                            "[probe14] RELOCATION KEPT #{n}: code wrapper 0x{old:x} -> 0x{:x} \
-                             (jitcode {jitcode_index}/{})",
-                            root.0,
-                            sd.jitcodes.len(),
-                        );
-                    }
-                }
-            },
-        );
+            }
+        });
+    }
+    if let Some(cb) = crate::callbacks::try_get() {
+        (cb.walk_writer_jitcode_code_roots)(visitor);
     }
 }
 
@@ -1067,6 +1117,29 @@ pub fn install_jitcodes(jitcodes: Vec<std::sync::Arc<crate::PyJitCode>>) {
     METAINTERP_SD.with(|r| {
         r.borrow_mut().set_jitcodes_from_make_result(jitcodes);
     });
+}
+
+/// A jitcode whose `code_ptr` names a Python `CodeObject` must carry
+/// that object's `PyCode` wrapper, and the wrapper's `code_ptr` field
+/// must be the same graph identity.
+#[cfg(debug_assertions)]
+fn debug_assert_python_jitcode_carries_wrapper(payload: &crate::PyJitCode) {
+    if payload.code_ptr.is_null() {
+        return;
+    }
+    let w = payload.w_code.get();
+    debug_assert!(
+        w != 0,
+        "Python-code jitcode (code_ptr={:p}) must carry a non-null payload.w_code",
+        payload.code_ptr,
+    );
+    let wrapped = unsafe {
+        pyre_interpreter::w_code_get_ptr(w as pyre_object::PyObjectRef) as *const CodeObject
+    };
+    debug_assert_eq!(
+        wrapped, payload.code_ptr,
+        "payload.w_code's code_ptr must equal payload.code_ptr"
+    );
 }
 
 /// Return the SD-local `jitcode.index` for this `PyCode`, ensuring
@@ -1148,11 +1221,13 @@ pub fn jitcode_payload_at(jitcode_index: i32) -> Option<std::sync::Arc<crate::Py
     })
 }
 
-/// `MetaInterpStaticData.jitcodes[jitcode_index]`: resolve the snapshot index
-/// to the corresponding CodeObject pointer.
+/// `MetaInterpStaticData.jitcodes[jitcode_index]`: the owner `PyCode`
+/// wrapper stamped on that payload (`payload.w_code`). Codeless portals
+/// keep the slot null.
 pub fn code_for_jitcode_index(jitcode_index: i32) -> Option<*const ()> {
     let payload = jitcode_payload_at(jitcode_index)?;
-    Some(pyre_interpreter::live_code_wrapper(payload.code_ptr as *const ()) as *const ())
+    let w = payload.w_code.get();
+    (w != 0).then_some(w as *const ())
 }
 
 /// `MetaInterpStaticData.jitcodes[jitcode_index]` helper: resolve the indexed
@@ -1339,8 +1414,8 @@ pub static PROBE14_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static PROBE14_SLOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static PROBE14_RELOCATED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-/// Companion witnesses for the OTHER half of this area, the `code_ptr ->
-/// wrapper` roots, and for the invariant a relocation count cannot test.
+/// Companion witnesses for the OTHER half of this area, the `payload.w_code`
+/// roots, and for the invariant a relocation count cannot test.
 ///
 /// A relocation counter alone cannot refute that the remembered-set boundary
 /// missed a movable object: a missed pool is never offered to the visitor.
@@ -1489,9 +1564,10 @@ fn walk_jitcode_constants_refs_in(
     }
 }
 
-/// Resolve by PyCode wrapper through the trace-side
+/// Resolve by `PyCode` wrapper through the trace-side
 /// MetaInterpStaticData store. Used by blackhole paths that must see
-/// CodeWriter-drained entries.
+/// CodeWriter-drained entries. A raw `CodeObject*` is not a key;
+/// resume reconstruct uses `pyjitcode_for_jitcode_index`.
 pub fn pyjitcode_for_code(code: *const ()) -> Option<std::sync::Arc<crate::PyJitCode>> {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -3127,6 +3203,9 @@ pub trait WalkSym {
     fn set_live_vable_frame_addr(&mut self, value: usize);
     fn bridge_walk_entry_pc(&self) -> Option<usize>;
     fn bridge_walk_entry_jitcode_index(&self) -> i32;
+    fn set_bridge_walk_entry(&mut self, pc: usize, jitcode_index: i32) {
+        let _ = (pc, jitcode_index);
+    }
     fn bridge_registers_r(&self) -> Option<&crate::jitcode_dispatch::RegisterList>;
     fn bridge_registers_r_mut(&mut self) -> &crate::jitcode_dispatch::RegisterList;
     fn bridge_stack_oprefs(&self) -> Option<&crate::jitcode_dispatch::RegisterList>;
@@ -3261,6 +3340,12 @@ impl WalkSym for PyreSym {
     #[inline]
     fn bridge_walk_entry_jitcode_index(&self) -> i32 {
         self.bridge_walk_entry_jitcode_index
+    }
+
+    #[inline]
+    fn set_bridge_walk_entry(&mut self, pc: usize, jitcode_index: i32) {
+        self.bridge_walk_entry_pc = Some(pc);
+        self.bridge_walk_entry_jitcode_index = jitcode_index;
     }
 
     #[inline]
@@ -8508,6 +8593,207 @@ pub(crate) fn recipe_live_boxes(recipe: &ReconstructRecipe) -> Vec<OpRef> {
     boxes
 }
 
+/// `consume_boxes` (`resume.py rebuild_from_resumedata`) writes
+/// `MIFrame.registers_r[color]`. A Python-frame recipe keeps that bank in
+/// `color_registers_r`; `registers_r` is slot-indexed.
+pub(crate) fn recipe_consume_boxes_ref_at_color(recipe: &ReconstructRecipe, color: usize) -> OpRef {
+    recipe
+        .color_registers_r
+        .get(color)
+        .copied()
+        .unwrap_or(OpRef::NONE)
+}
+
+/// `MIFrame.registers_r` / `resume.py consume_boxes`: each live Ref color's
+/// box is the stream value at that position in `live_ref` order. Portal-red
+/// scratch (no semantic slot, color == pframe_reg/pec_reg) stays NONE; the
+/// parent builder routes those to the frame/ec box.
+#[allow(clippy::too_many_arguments)]
+fn fill_color_registers_from_stream(
+    ctx: &mut majit_metainterp::TraceCtx,
+    live_ref: &[u32],
+    values: &[&majit_ir::resumedata::RebuiltValue],
+    color_registers_r: &mut Vec<OpRef>,
+    color_concrete_r: &mut Vec<majit_ir::Value>,
+    nlocals: usize,
+    stack_only: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    pframe_reg: u32,
+    pec_reg: u32,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
+    cache: &mut BridgeVirtualCache<'_>,
+) {
+    for (pos, &color) in live_ref.iter().enumerate() {
+        if pos >= values.len() {
+            continue;
+        }
+        let c = color as usize;
+        let slots = semantic_ref_slots_for_reg_color(nlocals, stack_only, pcdep_entries, c);
+        if slots.is_empty() && (color == pframe_reg || color == pec_reg) {
+            continue;
+        }
+        let (box_ref, value) = bridge_decode_box(
+            ctx,
+            values[pos],
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        if c >= color_registers_r.len() {
+            color_registers_r.resize(c + 1, OpRef::NONE);
+            color_concrete_r.resize(c + 1, majit_ir::Value::Void);
+        }
+        color_registers_r[c] = box_ref;
+        color_concrete_r[c] = publish_fresh_recipe_ref(ctx, box_ref, value);
+    }
+}
+
+/// An uninitialized live Ref color is `CONST_NULL`
+/// (`pyjitpl.py get_list_of_active_boxes`). Portal-red scratch stays NONE.
+fn seed_uninitialized_live_ref_colors(
+    ctx: &mut majit_metainterp::TraceCtx,
+    color_registers_r: &mut Vec<OpRef>,
+    color_concrete_r: &mut Vec<majit_ir::Value>,
+    live_ref: &[u32],
+    nlocals: usize,
+    stack_only: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    pframe_reg: u32,
+    pec_reg: u32,
+    pending_result_color: Option<usize>,
+) {
+    let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+    let null_val = value_for_slot(Type::Ref, 0);
+    for &color in live_ref {
+        let c = color as usize;
+        if Some(c) == pending_result_color {
+            continue;
+        }
+        let slots = semantic_ref_slots_for_reg_color(nlocals, stack_only, pcdep_entries, c);
+        if slots.is_empty() && (color == pframe_reg || color == pec_reg) {
+            continue;
+        }
+        if color_registers_r.get(c).copied().unwrap_or(OpRef::NONE) != OpRef::NONE {
+            continue;
+        }
+        if c >= color_registers_r.len() {
+            color_registers_r.resize(c + 1, OpRef::NONE);
+            color_concrete_r.resize(c + 1, majit_ir::Value::Void);
+        }
+        color_registers_r[c] = null_ref;
+        color_concrete_r[c] = publish_fresh_recipe_ref(ctx, null_ref, null_val);
+    }
+}
+
+fn live_ref_color_missing(
+    color_registers_r: &[OpRef],
+    color: u32,
+    nlocals: usize,
+    stack_only: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    pframe_reg: u32,
+    pec_reg: u32,
+    pending_result_color: Option<usize>,
+    unreconstructable_operand_floor: Option<usize>,
+) -> bool {
+    let c = color as usize;
+    if Some(c) == pending_result_color {
+        return false;
+    }
+    let slot = semantic_ref_slot_for_reg_color(nlocals, stack_only, pcdep_entries, c);
+    if slot.is_none() && (color == pframe_reg || color == pec_reg) {
+        return false;
+    }
+    if let Some(slot) = slot
+        && unreconstructable_operand_floor.is_some_and(|floor| slot >= floor)
+    {
+        return false;
+    }
+    color_registers_r.get(c).copied().unwrap_or(OpRef::NONE) == OpRef::NONE
+}
+
+/// `resume.py consume_boxes` after `setup_resume_at_op(pc)`:
+/// `registers_r[color] = box`. The color-indexed bank is
+/// `ReconstructRecipe.color_registers_r` (`MIFrame.registers_r`).
+#[allow(clippy::too_many_arguments)]
+fn consume_boxes_color_bank(
+    ctx: &mut majit_metainterp::TraceCtx,
+    live_ref: &[u32],
+    live_ref_all: &[u32],
+    values: &[&majit_ir::resumedata::RebuiltValue],
+    nlocals: usize,
+    stack_only: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    pframe_reg: u32,
+    pec_reg: u32,
+    pending_result_color: Option<usize>,
+    unreconstructable_operand_floor: Option<usize>,
+    rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+    resume_data: &majit_metainterp::ResumeDataResult,
+    fail_values: &[i64],
+    fail_types: &[Type],
+    backend: &dyn majit_backend::Backend,
+    cache: &mut BridgeVirtualCache<'_>,
+) -> Option<(Vec<OpRef>, Vec<majit_ir::Value>)> {
+    let mut color_registers_r = Vec::new();
+    let mut color_concrete_r = Vec::new();
+    fill_color_registers_from_stream(
+        ctx,
+        live_ref,
+        values,
+        &mut color_registers_r,
+        &mut color_concrete_r,
+        nlocals,
+        stack_only,
+        pcdep_entries,
+        pframe_reg,
+        pec_reg,
+        rd_virtuals,
+        resume_data,
+        fail_values,
+        fail_types,
+        backend,
+        cache,
+    );
+    seed_uninitialized_live_ref_colors(
+        ctx,
+        &mut color_registers_r,
+        &mut color_concrete_r,
+        live_ref_all,
+        nlocals,
+        stack_only,
+        pcdep_entries,
+        pframe_reg,
+        pec_reg,
+        pending_result_color,
+    );
+    for &color in live_ref_all {
+        if live_ref_color_missing(
+            &color_registers_r,
+            color,
+            nlocals,
+            stack_only,
+            pcdep_entries,
+            pframe_reg,
+            pec_reg,
+            pending_result_color,
+            unreconstructable_operand_floor,
+        ) {
+            crate::jitcode_dispatch::census_record("P2Recipe::MandatoryOperandMissing");
+            return None;
+        }
+    }
+    Some((color_registers_r, color_concrete_r))
+}
+
 /// A descended helper body (`list.pop`, `w_list_getitem`, …) is a real
 /// `MIFrame` (`capture_resumedata`). Rebuild its color-indexed banks from
 /// the numbered section so the carrier can walk that jitcode from the
@@ -8628,9 +8914,11 @@ fn reconstruct_transparent_helper_recipe(
         nlocals: 0,
         valuestackdepth: 0,
         registers_i,
-        registers_r,
+        registers_r: registers_r.clone(),
         registers_f,
         concrete_r: Vec::new(),
+        color_registers_r: registers_r,
+        color_concrete_r: Vec::new(),
         frame: OpRef::NONE,
         nargs: 0,
         return_substitute: None,
@@ -8720,6 +9008,8 @@ fn reconstruct_inline_recipe(
             registers_r: Vec::new(),
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            color_registers_r: Vec::new(),
+            color_concrete_r: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
             return_substitute: Some(instance),
@@ -8770,6 +9060,8 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            color_registers_r: Vec::new(),
+            color_concrete_r: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
             return_substitute: None,
@@ -8819,10 +9111,10 @@ fn reconstruct_inline_recipe(
     // pyframe.py get_w_globals get_w_globals_storage(): the reconstructed callee frame's
     // globals come from its own pycode (`assemble_bridge_inline_pending`
     // resolves them the same way via `recover_inline_callee_globals`). If the
-    // callee code never ran under known globals (no live wrapper recovers a
-    // namespace), there is nothing to restore, so abort to the single-frame
-    // bridge — the forward inline path declines the same way.
-    if recover_inline_callee_globals(raw_code as *const ()).is_null() {
+    // payload's owner PyCode carries no globals yet, there is nothing to
+    // restore, so abort to the single-frame bridge — the forward inline path
+    // declines the same way.
+    if recover_inline_callee_globals(frame.jitcode_index).is_null() {
         decline!("NoCalleeGlobals");
     }
     let frame_nlocals = code_ref.varnames.len();
@@ -8904,6 +9196,7 @@ fn reconstruct_inline_recipe(
     // resumedata. Drop its encoded value from the SAME position so the liveness
     // enumeration and the consumed value section stay aligned
     // (resume.py consume_boxes).
+    let live_ref_all = reg_indices.ref_.clone();
     let mut pending_value_index: Option<usize> = None;
     if let Some(color) = pending_result_color {
         if let Some(ref_pos) = reg_indices.ref_.iter().position(|&c| c as usize == color) {
@@ -9155,6 +9448,25 @@ fn reconstruct_inline_recipe(
                 backend,
                 cache,
             );
+            let (color_registers_r, color_concrete_r) = consume_boxes_color_bank(
+                ctx,
+                &reg_indices.ref_,
+                &live_ref_all,
+                &ref_values,
+                nlocals,
+                stack_only,
+                &maps.pcdep_entries,
+                pframe_reg,
+                pec_reg,
+                pending_result_color,
+                unreconstructable_operand_floor,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            )?;
             crate::jitcode_dispatch::census_record("P2Recipe::MaterializedFrameAdmit");
             return Some(ReconstructRecipe {
                 code_ptr: raw_code as *const (),
@@ -9166,6 +9478,8 @@ fn reconstruct_inline_recipe(
                 registers_r,
                 registers_f,
                 concrete_r,
+                color_registers_r,
+                color_concrete_r,
                 frame: frame_box,
                 nargs: frame_nlocals,
                 return_substitute: None,
@@ -9225,15 +9539,21 @@ fn reconstruct_inline_recipe(
         let mut registers_r = vec![OpRef::NONE; valuestackdepth];
         let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
         // locals_cells_stack_w is SEMANTIC-slot-ordered ([locals | stack]) and a
-        // W_Root array — every live slot is Ref. An UNINITIALIZED local stays
-        // NULL in the rebuilt frame; a missing operand-stack slot is
-        // unreconstructable and declines below.
+        // W_Root array — every live slot is Ref. An UNINITIALIZED live local is
+        // CONST_NULL (`pyjitpl.py get_list_of_active_boxes`); a missing
+        // operand-stack slot is unreconstructable and declines below.
         for k in 0..valuestackdepth {
             if Some(k) == pending_result_abs_slot || stream_covered[k] {
                 continue;
             }
             let tag = arr[k];
             if tag == UNINITIALIZED_TAG {
+                if k < nlocals {
+                    let opref = ctx.const_ref(pyre_object::PY_NULL as i64);
+                    registers_r[k] = opref;
+                    concrete_r[k] =
+                        publish_fresh_recipe_ref(ctx, opref, value_for_slot(Type::Ref, 0));
+                }
                 continue;
             }
             let opref = decode_fieldnum(ctx, tag, rd_virtuals, resume_data, cache);
@@ -9267,6 +9587,25 @@ fn reconstruct_inline_recipe(
             backend,
             cache,
         );
+        let (color_registers_r, color_concrete_r) = consume_boxes_color_bank(
+            ctx,
+            &reg_indices.ref_,
+            &live_ref_all,
+            &ref_values,
+            nlocals,
+            stack_only,
+            &maps.pcdep_entries,
+            pframe_reg,
+            pec_reg,
+            pending_result_color,
+            unreconstructable_operand_floor,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        )?;
         for s in nlocals..valuestackdepth {
             if Some(s) == pending_result_abs_slot
                 || unreconstructable_operand_floor.is_some_and(|floor| s >= floor)
@@ -9326,6 +9665,8 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f,
             concrete_r,
+            color_registers_r,
+            color_concrete_r,
             frame: frame_red,
             nargs: frame_nlocals,
             return_substitute: None,
@@ -9473,6 +9814,34 @@ fn reconstruct_inline_recipe(
         }
     }
 
+    seed_uninitialized_live_ref_colors(
+        ctx,
+        &mut by_color_r,
+        &mut by_color_c,
+        &live_ref_all,
+        nlocals,
+        stack_only,
+        &maps.pcdep_entries,
+        pframe_reg,
+        pec_reg,
+        pending_result_color,
+    );
+    for &color in &live_ref_all {
+        if live_ref_color_missing(
+            &by_color_r,
+            color,
+            nlocals,
+            stack_only,
+            &maps.pcdep_entries,
+            pframe_reg,
+            pec_reg,
+            pending_result_color,
+            unreconstructable_operand_floor,
+        ) {
+            decline!("MandatoryOperandMissing");
+        }
+    }
+
     Some(ReconstructRecipe {
         code_ptr: raw_code as *const (),
         jitcode_index: frame.jitcode_index,
@@ -9483,6 +9852,8 @@ fn reconstruct_inline_recipe(
         registers_r,
         registers_f,
         concrete_r,
+        color_registers_r: by_color_r,
+        color_concrete_r: by_color_c,
         frame: OpRef::NONE,
         nargs: frame_nlocals,
         return_substitute: None,
@@ -12971,6 +13342,7 @@ pub(crate) fn ensure_trace_test_driver() -> &'static mut crate::driver::JitDrive
             driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
             ensure_majit_jitcode: |_, _| false,
             drain_backend_jit_exc: || {},
+            walk_writer_jitcode_code_roots: |_| {},
         }));
         crate::callbacks::init(cb);
     });
@@ -13754,6 +14126,7 @@ mod tests {
         let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         pyjit.jitcode = std::sync::Arc::new(builder.finish());
         pyjit.metadata.is_drained = true;
+        pyjit.stamp_w_code(code_ref);
         METAINTERP_SD.with(|r| {
             r.borrow_mut()
                 .set_jitcodes_from_make_result(vec![std::sync::Arc::new(pyjit)]);
@@ -15077,6 +15450,7 @@ mod tests {
             },
             std::ptr::null(),
             false,
+            std::ptr::null(),
         ));
         let jitcode_index = METAINTERP_SD.with(|r| unsafe {
             let ptr = r.borrow_mut().jitcode_for(code_ref, Some(pyjit));
@@ -15241,6 +15615,226 @@ mod tests {
         assert_eq!(
             ctx.box_value(OpRef::input_arg_ref(8)),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize))),
+        );
+    }
+
+    fn zip_two_tuple_next_helper_index_and_live_pc() -> (i32, i32) {
+        let zip = crate::jitcode_runtime::pathed_jitcode(
+            "pyre_interpreter::baseobjspace::zip_two_tuple_next",
+        )
+        .expect("zip_two_tuple_next must be a discovered jitcode");
+        let helper_index =
+            zip.try_index()
+                .expect("zip_two_tuple_next must have a jitcode index") as i32;
+        let helper_pjc = ensure_build_time_jitcode_at(helper_index as usize)
+            .expect("zip helper must install as a PyJitCode");
+        assert!(
+            helper_pjc.code_ptr.is_null(),
+            "zip_two_tuple_next is a helper jitcode"
+        );
+        let live_pc = crate::jitcode_runtime::decoded_ops(&zip.code)
+            .find(|op| op.opname == "live")
+            .map(|op| op.pc as i32)
+            .expect("zip_two_tuple_next must have a -live-");
+        let op_live = crate::state::op_live();
+        assert!(
+            zip.can_decode_live_vars(live_pc as usize, op_live),
+            "helper resume pc must be a decodable -live-"
+        );
+        (helper_index, live_pc)
+    }
+
+    fn rebuilt_values_for_banks(
+        banks: &FrameLivenessRegIndices,
+    ) -> Vec<majit_ir::resumedata::RebuiltValue> {
+        use majit_ir::resumedata::RebuiltValue;
+        let mut values = Vec::with_capacity(banks.total_len());
+        for _ in &banks.int {
+            values.push(RebuiltValue::Const(majit_ir::Const::Int(0)));
+        }
+        for _ in &banks.ref_ {
+            values.push(RebuiltValue::Const(majit_ir::Const::from_gcref(
+                majit_ir::GcRef::NULL,
+            )));
+        }
+        for _ in &banks.float {
+            values.push(RebuiltValue::Const(majit_ir::Const::Float(0.0)));
+        }
+        values
+    }
+
+    /// `rebuild_from_resumedata` `newframe(jitcode)` rebuilds a helper
+    /// section with no `CodeObject`. `setup_bridge_sym` must keep that
+    /// level as a resume-only recipe instead of `NullWCode` wiping the
+    /// carrier.
+    #[test]
+    fn setup_bridge_sym_keeps_helper_resume_recipe() {
+        use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
+        use majit_metainterp::jitcode::JitCodeBuilder;
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+
+        let (helper_index, live_pc) = zip_two_tuple_next_helper_index_and_live_pc();
+        let helper_banks = frame_liveness_reg_indices_by_bank_from_pc(helper_index, live_pc);
+        let helper_values = rebuilt_values_for_banks(&helper_banks);
+        assert_eq!(helper_values.len(), helper_banks.total_len());
+
+        let raw_code = compile_exec("len(x)").expect("test code should compile");
+        let mut frame = PyFrame::new(raw_code);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let code_ref = frame.pycode as *const ();
+        let live_off = crate::state::intern_liveness(&[], &[0, 1, 2, 3, 4], &[])
+            .expect("bridge liveness must fit in the shared buffer");
+        let mut builder = JitCodeBuilder::new();
+        let patch = builder.live_placeholder();
+        builder.patch_live_offset(patch, live_off);
+        let runtime_jitcode = std::sync::Arc::new(builder.finish());
+        let pyjit = std::sync::Arc::new(crate::PyJitCode::from_parts(
+            runtime_jitcode,
+            crate::PyJitCodeMetadata {
+                forward_py_pc_marker_by_jit_pc: Vec::new(),
+                forward_py_pc_pred_by_jit_pc: Vec::new(),
+                after_residual_call_resume_marker_by_jit_pc: Vec::new(),
+                after_residual_call_resume_pred_by_jit_pc: Vec::new(),
+                n_py_instrs: 0,
+                block_head_py_by_jit_pc: vec![(0, 0)],
+                py_floor_by_jit_pc: Vec::new(),
+                py_exact_by_jit_pc: Vec::new(),
+                abort_permanent_py_pc_by_jit_pc: Vec::new(),
+                merge_entry_by_green: Vec::new(),
+                pcdep_by_jit_pc: vec![(0, Vec::new())],
+                depth_pred_by_jit_pc: vec![(0, 1)],
+                depth_trivia_marker_by_jit_pc: vec![(0, Some(1))],
+                depth_trivia_pred_by_jit_pc: vec![(0, Some(1))],
+                depth_containing_by_jit_pc: Vec::new(),
+                depth_block_head_by_jit_pc: Vec::new(),
+                pcdep_trivia_marker_by_jit_pc: Vec::new(),
+                pcdep_trivia_pred_by_jit_pc: Vec::new(),
+                const_ref_trivia_marker_by_jit_pc: Vec::new(),
+                const_ref_trivia_pred_by_jit_pc: Vec::new(),
+                result_color_trivia_marker_by_jit_pc: Vec::new(),
+                result_color_trivia_pred_by_jit_pc: Vec::new(),
+                resume_marker_marker_by_jit_pc: Vec::new(),
+                resume_marker_pred_by_jit_pc: vec![(0, Some(0))],
+                after_residual_marker_marker_by_jit_pc: Vec::new(),
+                after_residual_marker_pred_by_jit_pc: Vec::new(),
+                result_color_after_residual_marker_by_jit_pc: Vec::new(),
+                result_color_after_residual_pred_by_jit_pc: Vec::new(),
+                depth_after_residual_marker_by_jit_pc: Vec::new(),
+                depth_after_residual_pred_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_marker_by_jit_pc: Vec::new(),
+                after_residual_fallthrough_py_pc_pred_by_jit_pc: Vec::new(),
+                has_color_map: false,
+                portal_frame_reg: 3,
+                portal_ec_reg: 4,
+                built_as_portal: true,
+                stack_base: 1,
+                max_stackdepth: 0,
+                const_ref_slots_by_jit_pc: Vec::new(),
+                is_drained: true,
+            },
+            std::ptr::null(),
+            false,
+            std::ptr::null(),
+        ));
+        let portal_index = METAINTERP_SD.with(|r| unsafe {
+            let ptr = r.borrow_mut().jitcode_for(code_ref, Some(pyjit));
+            (*ptr).index
+        });
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.frame = OpRef::input_arg_ref(0);
+        sym.execution_context = OpRef::input_arg_ref(1);
+        sym.nlocals = 2;
+        sym.valuestackdepth = 2;
+        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+
+        let portal_values = vec![
+            RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
+            RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
+            RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
+            RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
+            RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
+        ];
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: vec![
+                RebuiltFrame {
+                    jitcode_index: portal_index,
+                    pc: 0,
+                    values: portal_values,
+                },
+                RebuiltFrame {
+                    jitcode_index: helper_index,
+                    pc: live_pc,
+                    values: helper_values,
+                },
+            ],
+            // [vable, last_instr, pycode, valuestackdepth, debugdata]
+            virtualizable_boxes: vec![
+                RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef(frame_ptr))),
+                RebuiltValue::Const(majit_ir::Const::Int(0)),
+                RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef(
+                    code_ref as usize,
+                ))),
+                RebuiltValue::Const(majit_ir::Const::Int(2)),
+                RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
+            ],
+            virtualref_values: Vec::new(),
+            storage: None,
+            num_failargs: 0,
+            fail_arg_types: Vec::new(),
+        };
+
+        let mut reader = BridgeVirtualCache::new(4, crate::descr::make_array_descr);
+        let boxes = <PyreJitState as majit_metainterp::JitState>::consume_vref_and_vable_boxes(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &[],
+            &[],
+            &mut reader,
+        );
+        <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &[],
+            &[],
+            &mut reader,
+            &boxes,
+        );
+
+        let carrier = ctx
+            .take_bridge_inline_carrier()
+            .expect("two-section numbering must publish a carrier");
+        assert_eq!(
+            carrier.recipes.len(),
+            1,
+            "helper section must become one resume recipe, not NullWCode wipe"
+        );
+        let recipe = &carrier.recipes[0];
+        assert!(
+            jitcode_is_transparent_helper(recipe.jitcode_index),
+            "innermost recipe must be a helper resume"
+        );
+        assert!(recipe.code_ptr.is_null());
+        assert_eq!(recipe.jitcode_index, helper_index);
+        assert_eq!(recipe.jitcode_pc, live_pc);
+        assert_eq!(crate::trace::carrier_py_frame_depth(&carrier), 0);
+        assert!(!reconstructed_callee_recipe_is_portable(recipe));
+
+        let helper_pjc = pyjitcode_for_jitcode_index(helper_index)
+            .expect("helper recipe must resolve through the jitcode table");
+        assert_eq!(helper_pjc.jitcode.index() as i32, helper_index);
+        let entry = resolve_bridge_walk_entry_at(helper_index, live_pc);
+        assert!(
+            entry.is_some(),
+            "helper recipe must select a drive_bridge_frame_subwalk entry"
         );
     }
 
@@ -15768,6 +16362,7 @@ mod tests {
             metadata,
             std::ptr::null(),
             false,
+            std::ptr::null(),
         ));
         let jitcode_index = METAINTERP_SD.with(|r| unsafe {
             let ptr = r.borrow_mut().jitcode_for(code_ref, Some(pyjit));
@@ -16215,13 +16810,26 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
     }
 }
 
+/// Recover the callee's owner `PyCode` for a reconstructed inline frame.
+///
+/// `code_for_jitcode_index` reads `payload.w_code` on the resume header's
+/// jitcode. A reconstructed frame's `pycode` red has to be this object, not
+/// the raw body the recipe carries for layout: every consumer treats it as a
+/// `W_Code` (constant pool reads, `PyTraceback` node construction). Returns
+/// `PY_NULL` when the payload carries no owner.
+pub(crate) fn recover_inline_callee_code(jitcode_index: i32) -> pyre_object::PyObjectRef {
+    code_for_jitcode_index(jitcode_index)
+        .map(|w| w as pyre_object::PyObjectRef)
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
 /// Recover the callee module's globals OBJECT for a reconstructed inline frame.
 ///
-/// The globals-stamped `PyCode` wrapper is recovered from the raw code pointer
-/// through the `code_ptr → live wrapper` registry. Returns `PY_NULL` when no
-/// live wrapper is registered or it carries no globals yet — the callers
-/// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
-/// null result as "decline the multi-frame path".
+/// Reads `w_globals` off the owner `PyCode` [`recover_inline_callee_code`]
+/// returns. Returns `PY_NULL` when that wrapper is missing or carries no
+/// globals yet — the callers (`reconstruct_inline_recipe` and
+/// `assemble_bridge_inline_pending`) treat a null result as "decline the
+/// multi-frame path".
 ///
 /// Reading the globals off the code object is `PyFrame.get_w_globals`
 /// (pyframe.py): with no `FrameDebugData` override it returns
@@ -16230,30 +16838,17 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// forward inline declines a callee whose function globals differ from that
 /// first-seen namespace (`w_code_frame_stores_global` in `inline_call.rs`),
 /// so every callee a bridge can reconstruct carries the code's own globals.
-/// Recover the callee's `W_Code` OBJECT for a reconstructed inline frame.
-///
-/// Sibling of [`recover_inline_callee_globals`], reading the same
-/// `code_ptr → live wrapper` registry.  A reconstructed frame's `pycode` red
-/// has to be this object, not the raw code pointer the recipe carries: every
-/// consumer treats it as a `W_Code` (constant pool reads, `PyTraceback` node
-/// construction).  Returns `PY_NULL` when no live wrapper is registered.
-pub(crate) fn recover_inline_callee_code(code_ptr: *const ()) -> pyre_object::PyObjectRef {
-    let live = pyre_interpreter::live_code_wrapper(code_ptr);
+pub(crate) fn recover_inline_callee_globals(jitcode_index: i32) -> pyre_object::PyObjectRef {
+    let live = recover_inline_callee_code(jitcode_index);
     if live.is_null() {
         return pyre_object::PY_NULL;
     }
-    live
-}
-
-pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object::PyObjectRef {
-    let live = pyre_interpreter::live_code_wrapper(code_ptr);
-    if !live.is_null() {
-        let globals = unsafe { pyre_interpreter::w_code_get_w_globals(live) };
-        if !globals.is_null() {
-            return globals;
-        }
+    let globals = unsafe { pyre_interpreter::w_code_get_w_globals(live) };
+    if globals.is_null() {
+        pyre_object::PY_NULL
+    } else {
+        globals
     }
-    pyre_object::PY_NULL
 }
 
 /// Assemble one decoded inline-callee [`ReconstructRecipe`]
@@ -16268,7 +16863,7 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// callee-frame helper / GUARD_NO_EXCEPTION belong to a LIVE caller making a
 /// call; a reconstructed suspended frame is simply pushed.
 ///
-/// The callee frame's globals come from its OWN pycode (`recipe.code_ptr`),
+/// The callee frame's globals come from its OWN pycode (`payload.w_code`),
 /// matching `pyframe.py get_w_globals_storage()` where a frame's globals
 /// derive from its promoted pycode rather than the caller; a cross-module
 /// inlined callee's LOAD_GLOBAL then resolves against the callee module's
@@ -16289,22 +16884,21 @@ pub(crate) fn assemble_bridge_inline_pending(
     let nlocals = recipe.nlocals;
     let valuestackdepth = recipe.valuestackdepth;
 
-    // Recover the callee's globals-stamped PyCode wrapper from the
-    // `code_ptr -> live-wrapper` registry. It is the SAME wrapper the forward
-    // inline push obtains via `getcode(callable)` (raw code identity is 1:1
-    // with its wrapper), so keying the reconstructed frame's greenkey by it
+    // Owner PyCode stamped on this resume header's jitcode (`payload.w_code`).
+    // It is the SAME wrapper the forward inline push obtains via
+    // `getcode(callable)`, so keying the reconstructed frame's greenkey by it
     // preserves the recursion-depth / inline-position identity.
-    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
+    let w_code = recover_inline_callee_code(recipe.jitcode_index) as *const ();
 
     // pyframe.py get_w_globals get_w_globals_storage(): a frame's globals come from its OWN
     // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
-    // the callee's globals OBJECT for `recipe.code_ptr` — the same
+    // the callee's globals OBJECT for that wrapper — the same
     // `pycode.w_globals` the callee module exposes through its function's
     // `w_func_globals_obj` — so a cross-module inlined callee's LOAD_GLOBAL
     // sees the callee module's namespace. `reconstruct_inline_recipe` aborts
     // the multi-frame path when the callee code has no resolved globals
     // object, so this is non-null here.
-    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    let w_globals = recover_inline_callee_globals(recipe.jitcode_index);
 
     // resume.py rebuild_from_resumedata newframe + reload: the decoded boxes are reloaded
     // into the symbolic frame below. `setup_reconstructed_callee_frame`
@@ -16488,8 +17082,13 @@ fn publish_fresh_recipe_ref(
 }
 
 pub(crate) fn publish_recipe_refs(ctx: &mut TraceCtx, recipe: &ReconstructRecipe) {
-    for (k, &opref) in recipe.registers_r.iter().enumerate() {
-        let Some(captured) = recipe.concrete_r.get(k).copied() else {
+    publish_recipe_ref_bank(ctx, &recipe.registers_r, &recipe.concrete_r);
+    publish_recipe_ref_bank(ctx, &recipe.color_registers_r, &recipe.color_concrete_r);
+}
+
+fn publish_recipe_ref_bank(ctx: &mut TraceCtx, registers: &[OpRef], concretes: &[majit_ir::Value]) {
+    for (k, &opref) in registers.iter().enumerate() {
+        let Some(captured) = concretes.get(k).copied() else {
             continue;
         };
         let live = rooted_recipe_ref(ctx, opref, captured);
@@ -16556,8 +17155,8 @@ fn emit_reconstructed_callee_pyframe(
     let code_ref = unsafe { &*raw_code };
     let (stack_base, frame_array_size) = callee_layout_for_call_assembler(code_ref);
     let nlocals = code_ref.varnames.len();
-    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
-    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    let w_code = recover_inline_callee_code(recipe.jitcode_index) as *const ();
+    let w_globals = recover_inline_callee_globals(recipe.jitcode_index);
     let pycode_const = ctx.const_ref(w_code as i64);
     let w_globals_const = ctx.const_ref(w_globals as i64);
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
@@ -16851,8 +17450,8 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let valuestackdepth = recipe.valuestackdepth;
     let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
 
-    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
-    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    let w_code = recover_inline_callee_code(recipe.jitcode_index) as *const ();
+    let w_globals = recover_inline_callee_globals(recipe.jitcode_index);
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     // The resume section's own frame, when it is a block the walk can keep.
     // Building a second frame would split the traceback `f_back` chain.
@@ -16896,7 +17495,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
         crate::helpers::emit_current_execution_context(ctx, "ExecutionContext::ReconstructedCallee")
     };
 
-    // A callee whose code object has no live wrapper cannot receive a
+    // A callee whose payload carries no owner PyCode cannot receive a
     // concrete frame; its residual calls and the blackhole preflight would
     // both decline on the unset frame pointer, so decline here.
     if w_code.is_null() {
@@ -17210,6 +17809,38 @@ pub(crate) fn setup_reconstructed_callee_frame(
             }
         }
     }
+    // `consume_boxes` (`resume.py rebuild_from_resumedata`) fills
+    // `MIFrame.registers_r[color]` for every live Ref color. `argboxes_r` is
+    // that register file (`setup_call` / `argboxes[i] → registers[i]`). Slot
+    // inversion above recovers a color that owns a `locals_cells_stack_w`
+    // slot; a live color with no semantic slot is only in `color_registers_r`.
+    // Portal-red scratch stays NONE there so the frame/ec seeds remain.
+    for (c, &opref) in recipe.color_registers_r.iter().enumerate() {
+        if opref.is_none() {
+            continue;
+        }
+        if c >= argboxes_r.len() {
+            argboxes_r.resize(c + 1, OpRef::NONE);
+        }
+        argboxes_r[c] = opref;
+        if opref.is_constant() {
+            continue;
+        }
+        if let Some(v @ majit_ir::Value::Int(_)) = recipe.color_concrete_r.get(c).copied() {
+            ctx.set_opref_concrete(opref, v);
+        } else if let Some(majit_ir::Value::Ref(gc)) = recipe.color_concrete_r.get(c).copied()
+            && !gc.is_null()
+            && gc != majit_ir::GcRef::NO_CONCRETE
+        {
+            let live = rooted_recipe_ref(ctx, opref, majit_ir::Value::Ref(gc));
+            if let majit_ir::Value::Ref(g) = live
+                && !g.is_null()
+                && g != majit_ir::GcRef::NO_CONCRETE
+            {
+                ctx.set_opref_concrete(opref, live);
+            }
+        }
+    }
     drop(held_callee_roots);
 
     Some((pending, argboxes_r))
@@ -17296,8 +17927,9 @@ mod indirectcalltargets_tests {
     //! thread-local `METAINTERP_SD` singleton so concurrent callers
     //! (and unrelated tests that use the thread-local) do not alias.
     use super::{
-        MetaInterpStaticData, MetainterpSdGuard, pyjitcode_for_jitcode_index,
-        raw_code_for_jitcode_index, walk_jitcode_constants_refs_in,
+        MetaInterpStaticData, MetainterpSdGuard, code_for_jitcode_index,
+        pyjitcode_for_jitcode_index, raw_code_for_jitcode_index, walk_jitcode_code_roots_in,
+        walk_jitcode_constants_refs_in,
     };
     use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
     use pyre_interpreter::bytecode::CodeObject;
@@ -17363,7 +17995,7 @@ mod indirectcalltargets_tests {
         (code, raw_code)
     }
 
-    fn populated_pyjit(raw_code: *const CodeObject) -> Arc<crate::PyJitCode> {
+    fn populated_pyjit(raw_code: *const CodeObject, w_code: *const ()) -> Arc<crate::PyJitCode> {
         let mut pyjit = crate::PyJitCode::skeleton(raw_code);
         // A drained PerCodeObject install has non-empty `code` and
         // `is_drained` set; give the fixture both so it is not classified
@@ -17376,6 +18008,7 @@ mod indirectcalltargets_tests {
         });
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.is_drained = true;
+        pyjit.stamp_w_code(w_code);
         Arc::new(pyjit)
     }
 
@@ -17437,7 +18070,7 @@ mod indirectcalltargets_tests {
     fn compiled_jitcode_lookup_returns_populated_entry() {
         let mut sd = MetaInterpStaticData::new();
         let (code, raw_code) = make_code("x = 1\n");
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code)]);
+        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code, code)]);
 
         let hit = sd
             .compiled_jitcode_lookup(code)
@@ -17449,10 +18082,31 @@ mod indirectcalltargets_tests {
     }
 
     #[test]
+    fn walk_jitcode_code_roots_forwards_payload_w_code() {
+        let mut sd = MetaInterpStaticData::new();
+        let pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.w_code.set(0x1000);
+        sd.jitcodes.push(Box::new(super::JitCode {
+            index: 0,
+            payload: Arc::new(pyjit),
+        }));
+
+        let mut seen = 0;
+        walk_jitcode_code_roots_in(&sd, &mut |slot| {
+            if slot.0 == 0x1000 {
+                seen += 1;
+                slot.0 = 0x2000;
+            }
+        });
+        assert_eq!(seen, 1);
+        assert_eq!(sd.jitcodes[0].payload.w_code.get(), 0x2000);
+    }
+
+    #[test]
     fn compiled_jitcode_lookup_scans_by_raw_code_identity() {
         let mut sd = MetaInterpStaticData::new();
         let (code, raw_code) = make_code("x = 1\n");
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code)]);
+        sd.set_jitcodes_from_make_result(vec![populated_pyjit(raw_code, code)]);
 
         let hit = sd
             .compiled_jitcode_lookup(code)
@@ -17463,14 +18117,16 @@ mod indirectcalltargets_tests {
     #[test]
     fn raw_code_for_jitcode_index_returns_canonical_graph_pointer() {
         let mut sd = MetaInterpStaticData::new();
-        let (_code, expected_raw) = make_code("x = 1\n");
-        sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw)]);
+        let (code, expected_raw) = make_code("x = 1\n");
+        sd.set_jitcodes_from_make_result(vec![populated_pyjit(expected_raw, code)]);
         // The install appends above the reserved build-time index space.
         let index = sd.jitcodes.len() as i32 - 1;
         let _sd_guard = MetainterpSdGuard::swap(sd);
 
         let hit = raw_code_for_jitcode_index(index).expect("installed jitcode index must resolve");
         assert_eq!(hit, expected_raw);
+        let wrapper = code_for_jitcode_index(index).expect("payload.w_code is the wrapper");
+        assert_eq!(wrapper, code);
     }
 }
 

@@ -33,11 +33,17 @@ fn terminal_ref_return_finishes_the_frame_and_leaves_its_execution_scope() {
             code.body_mut().code = vec![op_live, live as u8, (live >> 8) as u8, op_return, 0];
             code.body_mut().c_num_regs_r = 1;
             code.body_mut().startpoints = Some([0_usize, 3].into_iter().collect());
-            let payload = pyre_jit_trace::PyJitCode::from_core_degenerate(
+            let mut payload = pyre_jit_trace::PyJitCode::from_core_degenerate(
                 Arc::new(code),
                 std::ptr::null(),
                 false,
             );
+            // This stream stands in for a portal Python frame's
+            // `_done_with_this_frame` (`blackhole.py`). Stamp the portal
+            // frame red so `leave_resumed_blackhole_frame` still sees the
+            // virtualizable; a helper jitcode (`portal_red_regs_at` →
+            // `u16::MAX`) must not own that pointer.
+            payload.metadata.portal_frame_reg = 0;
             let index = pyre_jit_trace::state::install_codeless_jitcode(Arc::new(payload));
 
             // Run twice through the same builder, including its release/reuse

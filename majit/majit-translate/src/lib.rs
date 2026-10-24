@@ -1618,6 +1618,7 @@ fn analyze_pipeline_from_module_paths(
         Option<String>,
         Vec<String>,
         crate::model::LazyGraph,
+        Option<u64>,
     )> = Vec::new();
     let mut canonical_function_graphs: std::collections::HashMap<
         crate::parse::CallPath,
@@ -1701,18 +1702,18 @@ fn analyze_pipeline_from_module_paths(
     for func in &program.functions {
         match (&func.self_ty_root, &func.trait_root) {
             // Concrete trait-impl method: `impl Trait for Type { fn m }`.
-            // Registration-wise it behaves exactly like an inherent
-            // method (`[Owner, method]` graph + hints below); routing it
-            // through `register_trait_method` instead would also seed
-            // `method_to_impl_types`, flipping `resolve_method`'s
-            // name-based lookup for every same-named method.  The trait
-            // identity feeds two complementary direct-path consumers:
-            // the `concrete_trait_methods` loop below binds the unique
-            // impl when the trait method has NO default body, and the
-            // `trait_method_overrides` lookup inside the default-body
-            // registration prefers the unique override over the default
-            // (`classdesc.py` — a concrete override shadows the
-            // trait default in the MRO walk).
+            // rustc's method-call rule (Reference, "Method-call
+            // expressions") picks an inherent method before any trait
+            // method of the same name, so this row is NOT registered at
+            // owner-leaf when the owner has an inherent of this leaf
+            // (`register_trait_impl_method` / vacant-only alias). The
+            // trait identity feeds two complementary direct-path
+            // consumers: the `concrete_trait_methods` loop below binds
+            // the unique impl when the trait method has NO default body,
+            // and the `trait_method_overrides` lookup inside the
+            // default-body registration prefers the unique override over
+            // the default (`classdesc.py` — a concrete override shadows
+            // the trait default in the MRO walk).
             (Some(owner), Some(trait_leaf)) => {
                 concrete_trait_methods.push((
                     trait_leaf.clone(),
@@ -1724,6 +1725,7 @@ fn analyze_pipeline_from_module_paths(
                     func.return_type.clone(),
                     func.hints.clone(),
                     func.lazy_graph().clone(),
+                    func.trait_impl_id,
                 ));
                 index_concrete_trait_method(
                     func,
@@ -2008,63 +2010,42 @@ fn analyze_pipeline_from_module_paths(
     // classification, immutability rank, and size stay as the provider
     // computed them; only the byte offsets and the struct size are corrected.
     prof.mark("  call_control setup");
-    for struct_name in program.struct_fields.fields.keys() {
-        // Resolve the (possibly multi-spelled) field-registry key to its
-        // identity token; an unresolved / ambiguous bare leaf has no
-        // identity to key a layout on, so skip it.
-        let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
-            continue;
-        };
-        // `exact_layouts` originates on Charon's defining TypeDecl. Concrete
-        // generic identities are derived later from use-site type arguments,
-        // so inherit the declaration's exact offsets when it has no concrete
-        // entry (notably the explicit translated `Result` shell).
-        let exact = program.exact_layouts.get(&sid).or_else(|| {
-            majit_ir::descr::struct_template_id_for_name(struct_name)
-                .and_then(|template| program.exact_layouts.get(&template))
-        });
-        // An opaque/shadow declaration can share the runtime identity of its
-        // defining type (e.g. pyre-interpreter's zero-field GetSetProperty
-        // marker versus pyre-object's real definition).  If Charon's exact
-        // definition carries fields but this spelling has no rows, it is an
-        // alias consumer, not a layout producer; letting it write would erase
-        // the real field layout according to HashMap iteration order.
-        let incomplete_shadow = exact.is_some_and(|layout| !layout.field_offsets.is_empty())
-            && program
-                .struct_fields
-                .fields
-                .get(struct_name)
-                .is_some_and(Vec::is_empty);
-        if incomplete_shadow {
-            continue;
+    // `descr.py` `get_field_descr(STRUCT, fieldname)` keys on the lltype
+    // STRUCT object. Exact Charon layouts are installed by that identity
+    // first, including monomorphizations whose name spelling the merge
+    // withdrew. Remaining names (templates, instantiations without a
+    // Charon row) keep a heuristic layout so size/offset queries do not
+    // fall through to the C-order accumulator.
+    for entry in crate::layout::program_struct_layouts(
+        &program.struct_fields,
+        &program.exact_layouts,
+        provider,
+    ) {
+        let crate::layout::ProgramStructLayout {
+            spelling: struct_name,
+            sid,
+            exact,
+            mut layout,
+        } = entry;
+        if let Some(host) = exact.as_ref().and_then(|item| item.host.clone()) {
+            layout.host = Some(host);
         }
-        let layout = match exact {
-            Some(exact) => {
-                provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
-            }
-            None => provider.get_struct_layout(struct_name),
+        layout.gckind = if declared_gc.contains(&sid) {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+        } else {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
         };
-        if let Some(mut layout) = layout {
-            if let Some(host) = exact.and_then(|item| item.host.clone()) {
-                layout.host = Some(host);
-            }
-            layout.gckind = if declared_gc.contains(&sid) {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+        if census_struct_layouts {
+            let variants = struct_layout_variants.entry(sid).or_default();
+            if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
+                observed.size == layout.size && observed.fields == layout.fields
+            }) {
+                spellings.push(struct_name.clone());
             } else {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-            };
-            if census_struct_layouts {
-                let variants = struct_layout_variants.entry(sid).or_default();
-                if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
-                    observed.size == layout.size && observed.fields == layout.fields
-                }) {
-                    spellings.push(struct_name.clone());
-                } else {
-                    variants.push((layout.clone(), vec![struct_name.clone()]));
-                }
+                variants.push((layout.clone(), vec![struct_name.clone()]));
             }
-            call_control.set_struct_layout(sid, layout);
         }
+        call_control.set_struct_layout(sid, layout);
     }
     if census_struct_layouts {
         let struct_id_count = struct_layout_variants.len();
@@ -2139,21 +2120,35 @@ fn analyze_pipeline_from_module_paths(
         let path = crate::parse::CallPath::from_segments(
             crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),
         );
-        let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &[]);
-        if func.hints.is_empty() {
-            call_control.register_function_graph(path, graph);
-        } else {
-            call_control.register_function_graph_with_hints(path, graph, func.hints.clone());
+        let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &func.hints);
+        call_control.register_function_graph(path, graph.clone());
+        // rustc method-call rule: owner-leaf binds the inherent method
+        // when the owner has one. A trait-impl is always named by
+        // `CallPath::for_trait_impl_method` (`<Impl#{id}>`); owner-leaf
+        // is filled only when vacant. Upstream `call.py
+        // CallControl.get_jitcode(graph)` keys by the graph object, so
+        // the CallPath must be injective over the graphs a direct call
+        // can name.
+        if let Some(impl_id) = func.trait_impl_id {
+            call_control.register_trait_impl_method(
+                owner,
+                impl_id,
+                &func.name,
+                func.trait_root.as_deref(),
+                func.self_ty_root.is_some(),
+                graph,
+            );
         }
     }
     prof.mark("  register concrete trait-impl identities");
     // `rpbc.py FunctionReprBase.call`: the `c_graphs` constant is the full
     // `row_of_graphs.values()` PBC family, including concrete overrides of a
-    // required trait method.  Concrete impl graphs stay on the
-    // receiver-driven inherent-method registration path below (so
-    // name-based method lookup is unchanged), but their graph identities
-    // must also populate the independent indirect-call family row.
-    for (trait_leaf, _, method_name, owner, _, _, _) in &concrete_trait_methods {
+    // required trait method. Identity-path members are recorded above;
+    // owner-leaf is only the fallback when the impl has no Charon id.
+    for (trait_leaf, _, method_name, owner, _, _, _, impl_id) in &concrete_trait_methods {
+        if impl_id.is_some() {
+            continue;
+        }
         call_control.register_trait_family_member(method_name, trait_leaf, owner);
     }
     prof.mark("  register concrete indirect-call families");
@@ -2364,7 +2359,7 @@ fn analyze_pipeline_from_module_paths(
     }
     let mut concrete_impl_counts: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
-    for (trait_leaf, _, method_name, _, _, _, _) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _, _, _, _, _) in &concrete_trait_methods {
         *concrete_impl_counts
             .entry((trait_leaf.clone(), method_name.clone()))
             .or_insert(0) += 1;
@@ -2376,7 +2371,7 @@ fn analyze_pipeline_from_module_paths(
     // this is annotation-only metadata — it pulls no graph bodies into
     // callers.
     let mut trait_impl_owners: TraitImplOwners = std::collections::HashMap::new();
-    for (_, trait_qualified, _, owner, _, _, _) in &concrete_trait_methods {
+    for (_, trait_qualified, _, owner, _, _, _, _) in &concrete_trait_methods {
         // Keyed by the trait's qualified `name_path()` — two distinct
         // traits sharing a leaf name must not pool their impl owners
         // (`tyref_generic_trait_bound_root` resolves bound-trait
@@ -2465,7 +2460,9 @@ fn analyze_pipeline_from_module_paths(
     call_control.set_trait_family_registrations(trait_family_registrations);
     let trait_unique_impls = unique_trait_impl_roots(&program, trait_impl_owners);
     call_control.set_trait_unique_impls(trait_unique_impls);
-    for (trait_leaf, _, method_name, _owner, return_type, hints, graph) in &concrete_trait_methods {
+    for (trait_leaf, _, method_name, _owner, return_type, hints, graph, _) in
+        &concrete_trait_methods
+    {
         let key = (trait_leaf.clone(), method_name.clone());
         if concrete_impl_counts.get(&key) != Some(&1) || default_trait_methods.contains(&key) {
             continue;
@@ -2505,6 +2502,10 @@ fn analyze_pipeline_from_module_paths(
     // RPython: direct_call → funcobj.graph — inherent methods are resolved
     // by direct graph linkage, not name-based trait method lookup.
     // Register only in function_graphs under qualified path (Type::method).
+    // rustc method-call rule: this owner-leaf bind replaces a trait-impl
+    // that occupied the slot first (`register_trait_impl_method` is
+    // vacant-only). `method_info.graph` is this inherent's body even when
+    // `lookup_impl_method` is ambiguous against a same-leaf trait-impl.
     for method_info in &canonical_inherent_methods {
         let impl_type = method_info
             .self_ty_root
@@ -2513,8 +2514,8 @@ fn analyze_pipeline_from_module_paths(
         let path = crate::parse::CallPath::for_impl_method(impl_type, method_info.name.as_str());
         // Read the MIR-built graph; `method_info.graph` is the
         // residual fallback for the handful of MIR-uncovered entries,
-        // effectively unreached because every inherent method
-        // registered above carries a graph.
+        // and for a same-leaf trait-impl that makes the lookup
+        // ambiguous.
         let graph: &model::LazyGraph = mir_graph_lookup
             .lookup_impl_method(impl_type, &method_info.name)
             .unwrap_or(&method_info.graph);
@@ -2556,6 +2557,14 @@ fn analyze_pipeline_from_module_paths(
             }
         }
     }
+    // Vacant owner-leaf (no inherent of this leaf) still names the
+    // trait-impl graph; collapse those family members onto owner-leaf
+    // so ICT vtable matching sees `IntDictStrategy::length`. A
+    // collision keeps `<Impl#{id}>` so the family lists the trait-impl
+    // (Fun 18817), never the inherent (Fun 9899). `find_all_graphs`
+    // materialize repeats this (idempotent) after any later family
+    // inserts.
+    call_control.prefer_owner_leaf_aliases_in_trait_families();
     prof.mark("  concrete-trait + inherent method registration");
     for &(full_path, fnaddr) in fnaddr_bindings {
         call_control.register_macro_helper_trace_fnaddr(full_path, fnaddr);

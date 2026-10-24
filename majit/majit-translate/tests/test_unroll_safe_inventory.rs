@@ -60,6 +60,9 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "get_and_call_function",
         "descroperation.py get_and_call_function",
     ),
+    // `function.py Function.funccall(self, *args_w)`:
+    // `*args_w` has a length fixed per call site, so the copies unroll.
+    ("funccall_result", "function.py Function.funccall"),
     // `baseobjspace.py call_function(self, w_func, *args_w)`: the same
     // per-call-site `*args_w`, copied by `list(args_w)`.
     ("call_function_impl_result", "baseobjspace.py call_function"),

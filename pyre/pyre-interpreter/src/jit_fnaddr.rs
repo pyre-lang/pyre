@@ -5097,12 +5097,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::eval::frame_anchor_release",
         crate::eval::frame_anchor_release_jit_abi,
     );
-    pa1!(
-        &mut entries,
-        "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
-        "pyre_interpreter::execution_context_builtin_cache_get",
-        crate::executioncontext::execution_context_builtin_cache_get,
-    );
     cpa0!(
         &mut entries,
         "pyre_object::dict_eq_hook::has_compares_by_identity_hook",

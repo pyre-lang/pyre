@@ -201,7 +201,7 @@ mod tests {
 
     /// jd1's extracted main JitCode carries an empty per-jitcode `exec.descrs`;
     /// its `d`/`j` argcodes resolve through the shared global build-time descr
-    /// pool (`install_global_build_descr_pool` -> `JitCode::descr_at`),
+    /// pool (`ensure_finish_setup` -> `JitCode::descr_at`),
     /// mirroring RPython's single shared `Assembler.descrs`. This checks that
     /// resolution wiring — not the full trace walk, which executes each
     /// residual (`self.next`, `items.append`) for real and so needs the live
@@ -236,7 +236,7 @@ mod tests {
         );
         assert_eq!(banks.red_f.len(), 0);
 
-        crate::jitcode_runtime::install_global_build_descr_pool();
+        crate::state::ensure_finish_setup();
         let jitcode = JitCode::from_canonical((*canonical).clone());
         // A build-time jitcode has no per-jitcode descr pool; every resolution
         // below therefore exercises the global fallback in `descr_at`.

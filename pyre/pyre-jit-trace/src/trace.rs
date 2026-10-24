@@ -1660,7 +1660,7 @@ fn record_carrier_crossed_frame_traceback(
     if exc_ptr.is_null() {
         return;
     }
-    let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr);
+    let w_code = crate::state::recover_inline_callee_code(recipe.jitcode_index);
     // A synthetic frame carries the sentinel or null instead of a real code
     // object; the hook dereferences it, so both checks precede `is_code`, whose
     // type check would deref the sentinel.
@@ -1670,7 +1670,7 @@ fn record_carrier_crossed_frame_traceback(
     if !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
         return;
     }
-    let w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr);
+    let w_globals = crate::state::recover_inline_callee_globals(recipe.jitcode_index);
     majit_metainterp::record_inline_application_traceback_for_recording(
         exc_ptr as usize as i64,
         w_code as usize as i64,
@@ -1744,7 +1744,7 @@ fn discard_bridge_carrier_walk<Sym: WalkSym>(
 /// The multi-frame depth cap bounds reconstructed `PyFrame`s, so a level that
 /// reconstructs none — `descr_call`'s tail, which only substitutes its
 /// callee's result — must not consume one of its slots.
-fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
+pub(crate) fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> usize {
     carrier
         .recipes
         .iter()
@@ -1854,7 +1854,7 @@ fn carrier_contains_recursive_portal(
 ) -> bool {
     let mut seen = vec![root_w_code as usize];
     for recipe in carrier.recipes.iter() {
-        let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr) as usize;
+        let w_code = crate::state::recover_inline_callee_code(recipe.jitcode_index) as usize;
         if w_code != 0 && seen.contains(&w_code) {
             return true;
         }
@@ -2009,7 +2009,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::census_record("P2Drain::SetupFailed");
                 return p2_drain_abort();
             };
-            let Some(callee_pjc) = crate::state::pyjitcode_for_code(recipe.code_ptr) else {
+            let Some(callee_pjc) = crate::state::pyjitcode_for_jitcode_index(recipe.jitcode_index)
+            else {
                 discard_bridge_carrier_walk(
                     ctx,
                     sym,
@@ -2051,9 +2052,8 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
                 return p2_drain_abort();
             }
-
             let callee_w_globals =
-                crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
+                crate::state::recover_inline_callee_globals(recipe.jitcode_index) as usize;
             // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
             // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
             // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
@@ -2585,7 +2585,8 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             }
             continue;
         }
-        let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+        let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+        else {
             crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
             return None;
         };
@@ -2673,8 +2674,8 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
             }
             continue;
         }
-        let middle_pjc =
-            crate::state::pyjitcode_for_code(middle.code_ptr).expect("pre-validated above");
+        let middle_pjc = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index)
+            .expect("pre-validated above");
         if let Some(catch_target) = carrier_catch_target(
             middle_pjc.jitcode.code.as_slice(),
             middle.jitcode_pc as usize,
@@ -2817,7 +2818,7 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
         return None;
     };
-    let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+    let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index) else {
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
         return None;
     };
@@ -2830,7 +2831,8 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
         return None;
     };
-    let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
+    let middle_w_globals =
+        crate::state::recover_inline_callee_globals(middle.jitcode_index) as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
@@ -3191,7 +3193,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
         return None;
     };
-    let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
+    let Some(middle_pjc) = crate::state::pyjitcode_for_jitcode_index(middle.jitcode_index) else {
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
         return None;
     };
@@ -3204,7 +3206,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
         return None;
     };
-    let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
+    let middle_w_globals =
+        crate::state::recover_inline_callee_globals(middle.jitcode_index) as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];

@@ -208,6 +208,113 @@ impl LayoutProvider for HeuristicLayoutProvider {
     }
 }
 
+/// One STRUCT's layout ready to install on `CallControl`.
+///
+/// Exact Charon layouts are emitted first, keyed by STRUCT identity
+/// (`descr.py` `get_field_descr(STRUCT, fieldname)`). The field rows come
+/// from a registry spelling that resolves to that same identity. Heuristic
+/// layouts fill remaining names.
+pub(crate) struct ProgramStructLayout {
+    pub spelling: String,
+    pub sid: majit_ir::descr::StructId,
+    pub exact: Option<crate::front::semantic::ExactLayout>,
+    pub layout: StructLayout,
+}
+
+fn field_rows_cover_exact(
+    rows: &[crate::front::semantic::FieldRow],
+    exact: &crate::front::semantic::ExactLayout,
+) -> bool {
+    exact
+        .field_offsets
+        .keys()
+        .all(|name| rows.iter().any(|row| row.name == *name))
+}
+
+/// Registry spelling whose STRUCT identity is `sid` and whose rows name
+/// every field in `exact`. `get_field_descr(STRUCT, fieldname)` reads
+/// FIELD off STRUCT; a covering name of a different identity is not
+/// that STRUCT.
+fn spelling_covering_exact<'a>(
+    sid: majit_ir::descr::StructId,
+    exact: &crate::front::semantic::ExactLayout,
+    struct_fields: &'a crate::front::semantic::StructFieldRegistry,
+) -> Option<&'a str> {
+    for (name, rows) in struct_fields.fields.iter() {
+        if rows.is_empty() || !field_rows_cover_exact(rows, exact) {
+            continue;
+        }
+        if majit_ir::descr::struct_id_for_name(name) == Some(sid) {
+            return Some(name.as_str());
+        }
+    }
+    None
+}
+
+/// Exact layouts by STRUCT identity, then heuristic layouts for names
+/// that still have no identity-keyed row.
+///
+/// An instantiated STRUCT does not inherit the template's offsets, but a
+/// missing Charon row must still get a layout: otherwise
+/// `compute_struct_size` / `fielddescrof_concrete` fall through to the
+/// C-order accumulator on every use.
+pub(crate) fn program_struct_layouts(
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
+    exact_layouts: &HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
+    provider: &dyn LayoutProvider,
+) -> Vec<ProgramStructLayout> {
+    let mut installed = HashSet::new();
+    let mut out = Vec::new();
+    for (sid, exact) in exact_layouts {
+        if exact.field_offsets.is_empty() {
+            continue;
+        }
+        let Some(spelling) = spelling_covering_exact(*sid, exact, struct_fields) else {
+            continue;
+        };
+        let Some(layout) =
+            provider.get_struct_layout_exact(spelling, &exact.field_offsets, exact.size)
+        else {
+            continue;
+        };
+        installed.insert(*sid);
+        out.push(ProgramStructLayout {
+            spelling: spelling.to_string(),
+            sid: *sid,
+            exact: Some(exact.clone()),
+            layout,
+        });
+    }
+    for (struct_name, rows) in struct_fields.fields.iter() {
+        let Some(sid) = majit_ir::descr::struct_id_for_name(struct_name) else {
+            continue;
+        };
+        if !installed.insert(sid) {
+            continue;
+        }
+        let exact = exact_layouts.get(&sid);
+        if exact.is_some_and(|layout| !layout.field_offsets.is_empty()) && rows.is_empty() {
+            continue;
+        }
+        let layout = match exact {
+            Some(exact) if !exact.field_offsets.is_empty() => {
+                provider.get_struct_layout_exact(struct_name, &exact.field_offsets, exact.size)
+            }
+            _ => provider.get_struct_layout(struct_name),
+        };
+        let Some(layout) = layout else {
+            continue;
+        };
+        out.push(ProgramStructLayout {
+            spelling: struct_name.clone(),
+            sid,
+            exact: exact.cloned(),
+            layout,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +492,57 @@ mod tests {
                 .unwrap()
                 .offset,
             0
+        );
+    }
+
+    /// `get_field_descr(STRUCT, fieldname)` reads FIELD off STRUCT. An
+    /// exact layout whose identity has no registry spelling must not
+    /// borrow another STRUCT's rows because the field names match.
+    #[test]
+    fn exact_layout_does_not_borrow_another_structs_rows() {
+        use crate::front::semantic::{ExactLayout, FieldRow, StructFieldRegistry};
+        use crate::test_support::register_struct_ids_serialized;
+
+        let owner = "OtherStruct";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let orphan = majit_ir::descr::StructId::from_canonical("OrphanStruct");
+        assert_ne!(owner_id, orphan);
+
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![FieldRow::named("a", "i64"), FieldRow::named("b", "i64")],
+        );
+        let _registry =
+            register_struct_ids_serialized(HashMap::from([(owner.to_string(), Some(owner_id))]));
+
+        let mut field_offsets = HashMap::new();
+        field_offsets.insert("a".to_string(), 0u64);
+        field_offsets.insert("b".to_string(), 8u64);
+        let mut exact_layouts = HashMap::new();
+        exact_layouts.insert(
+            orphan,
+            ExactLayout {
+                size: Some(16),
+                align: Some(8),
+                field_offsets,
+                host: None,
+            },
+        );
+        let pair_fields: HashMap<String, Vec<(String, String)>> = fields.fields.clone().into();
+        let provider = HeuristicLayoutProvider::from_struct_fields(
+            &pair_fields,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let installed: Vec<_> = program_struct_layouts(&fields, &exact_layouts, &provider)
+            .into_iter()
+            .map(|entry| entry.sid)
+            .collect();
+        assert!(
+            !installed.contains(&orphan),
+            "orphan exact layout must not borrow OtherStruct rows"
         );
     }
 }

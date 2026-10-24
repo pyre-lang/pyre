@@ -961,10 +961,16 @@ impl Llbc {
 /// `serde_json::Value` of the whole document — keeps peak memory at the
 /// few thousand small type bodies actually deduplicated, instead of the
 /// ~26× blow-up of an exploded Value tree. The byte scan finds nested
-/// occurrences automatically (each is its own literal in the text), and
-/// a `seen` set keeps only the first body per `id` — every occurrence of
-/// a hash-consed `id` carries an identical body, so the choice is
-/// immaterial and the post-sort `dedup_by_key` result is unchanged.
+/// occurrences automatically (each is its own literal in the text).
+///
+/// Charon numbers types, trait refs, constants, layouts and spans from
+/// zero independently, and serializes every interned value as
+/// `"Value":[id, body]`. The same numeric `id` therefore appears with
+/// a type body (`Ref` / `Adt` / …) and with a layout (`Plus` / `Max`),
+/// a span (`data`), a const array, or a trait `kind`. Each kind has
+/// its own `seen` set so a layout `Plus` that is written first does
+/// not steal the later type body (`clause_spec::Space`). Within one
+/// space the bodies are identical, so the first one is kept.
 fn collect_dedup_bodies(
     bytes: &[u8],
     adt: &mut Vec<(u64, u64)>,
@@ -1345,6 +1351,39 @@ mod tests {
         let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
         assert_eq!(l.dedup_body(3), Some(&serde_json::json!("Never")));
         assert_eq!(l.dedup_body(4), None);
+    }
+
+    #[test]
+    fn a_later_ty_body_is_kept_when_the_same_id_first_appeared_as_other() {
+        // Linux Charon writes layout `Plus` / `Max` under the same
+        // numeric id as a later type `Ref` / `Adt` (`Space` tables
+        // restart at 0). The type body must still land in `dedup_body`.
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[]},
+            "pad":[
+                {"Value":[536,{"Plus":[{"Deduplicated":0},{"Deduplicated":0}]}]},
+                {"Value":[33,{"Adt":{"id":354,"generics":{"regions":[],"types":[],"const_generics":[],"trait_refs":[]},"builtin":null}}]},
+                {"Value":[536,{"Ref":[{"Var":{"Bound":[0,0]}},{"Deduplicated":33},"Shared"]}]}
+            ]}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        assert_eq!(
+            l.dedup_body(33),
+            Some(&serde_json::json!({"Adt":{
+                "id":354,
+                "generics":{"regions":[],"types":[],"const_generics":[],"trait_refs":[]},
+                "builtin":null
+            }}))
+        );
+        assert_eq!(
+            l.dedup_body(536),
+            Some(&serde_json::json!({"Ref":[
+                {"Var":{"Bound":[0,0]}},
+                {"Deduplicated":33},
+                "Shared"
+            ]}))
+        );
+        assert_eq!(l.dedup_to_adt_def_id(33), Some(354));
+        assert_eq!(l.dedup_to_adt_def_id(536), None);
     }
 
     #[test]

@@ -4648,10 +4648,8 @@ pub(crate) fn residual_callee_is_walk_self_recursive<Sym: WalkSym>(
         if sym.jitcode().is_null() {
             return false;
         }
-        let caller_code =
-            pyre_interpreter::live_code_wrapper((*sym.jitcode()).raw_code() as *const ())
-                as *const ();
-        w_code as usize == caller_code as usize
+        let caller_code = (&(*sym.jitcode()).payload).w_code.get();
+        caller_code != 0 && w_code as usize == caller_code as usize
     }
 }
 
@@ -5870,39 +5868,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                     last_instr,
                     majit_ir::Value::Int(py_pc as i64),
                 );
-                // Record the runtime heap half of the same `_opimpl_setfield_vable`
-                // shape.  The mirror above synchronizes the tracing-time shadow
-                // and live frame; this store keeps compiled execution paired too.
-                //
-                // Upstream needs neither at a residual call: its frame readers are
-                // traced in and read `last_instr` off the virtual frame.  pyre
-                // residualizes them and reads the heap, and the frame-chain walk no
-                // longer forces (`ExecutionContext::force_frame`), so without this
-                // store nothing keeps the field current in compiled code: left at
-                // the last resume point, `_warnings::setup_context` keys its
-                // registry on the wrong line and re-issues a warning the
-                // interpreted run already deduplicated.
-                if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
-                    && let Some(idx) = info.static_field_index_by_name("last_instr")
-                {
-                    // Record under the PARENT-STRUCT field descr, the resolution
-                    // `vable_setfield` applies through `vable_static_record_descr`;
-                    // `vable_setfield_descr` is a raw pass-through and does not.
-                    // The vinfo's own `static_field_descrs[i]` numbers the field by
-                    // the vinfo `[token, statics, arrays]` order, which diverges
-                    // from PyFrame's struct declaration order, so the store pairs
-                    // against the wrong slot.  `virtualizable.py:71` builds the
-                    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so
-                    // upstream's vinfo descr and the descr an ordinary
-                    // `setfield_gc` carries are one object and the question cannot
-                    // arise there.  Here it decides whether this publish and
-                    // `emit_traceback_node`'s store — same frame, same offset —
-                    // supersede each other or survive as two independent
-                    // locations flushed in an arbitrary order.
-                    let descr = info.static_field_struct_descr(idx);
-                    ctx.trace_ctx
-                        .vable_setfield_descr(vable_ref, last_instr, descr);
-                }
+                // The compiled heap store of the same field lives in
+                // [`maybe_walker_vable_and_vrefs_before_residual_call`], which
+                // runs before the CALL op is recorded.  Recording it here
+                // lands `SETFIELD_GC last_instr` between `CALL_RELEASE_GIL`
+                // and `GUARD_NOT_FORCED`.  `do_residual_call` records the
+                // call then `generate_guard(GUARD_NOT_FORCED)` with nothing
+                // in between; `_store_force_index(+1)`
+                // (`assembler.py _genop_call_release_gil`) requires that
+                // adjacency.  LiveLastInstrGuard below is the concrete heap
+                // half for this execute.
             }
         }
         unsafe {
@@ -7294,11 +7269,11 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
 /// Publish the opcode this walk is inside onto the portal frame before a
 /// residual that hands that frame to Python.
 ///
-/// `try_execute_residual_call_via_executor` does this ahead of a may-force
-/// call. `dispatch_bytecode` writes `last_instr` before every opcode; a
-/// portal loop carries only the merge point's coordinate in its
-/// virtualizable, and a reader inside the residual (`f_lineno` from an
-/// audit hook) otherwise reports that line. The mirror keeps the
+/// [`maybe_walker_vable_and_vrefs_before_residual_call`] calls this ahead
+/// of FORCE_TOKEN / CALL. `dispatch_bytecode` writes `last_instr` before
+/// every opcode; a portal loop carries only the merge point's coordinate
+/// in its virtualizable, and a reader inside the residual (`f_lineno`
+/// from an audit hook) otherwise reports that line. The mirror keeps the
 /// tracing-time shadow and live frame on this opcode.
 /// `vable_setfield_descr` is the store compiled code executes: the
 /// following call receives the frame, so the heap cache flushes the lazy
@@ -7338,9 +7313,16 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     );
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let idx = info.static_field_index_by_name("last_instr")?;
-    // Parent-struct descr, matching the publish in
-    // `try_execute_residual_call_via_executor`: the vinfo's own static
-    // descr numbers fields in vinfo order, which is not PyFrame's.
+    // Parent-struct descr, the resolution `vable_setfield` applies through
+    // `vable_static_record_descr`; `vable_setfield_descr` is a raw
+    // pass-through and does not. The vinfo's own `static_field_descrs[i]`
+    // numbers fields in vinfo `[token, statics, arrays]` order, which is
+    // not PyFrame's struct order, so that descr stores the wrong slot.
+    // `virtualizable.py` builds vinfo descrs with `cpu.fielddescrof(VTYPE,
+    // name)`, so upstream's vinfo descr and an ordinary `setfield_gc` are
+    // one object. Here the choice decides whether this store and
+    // `emit_traceback_node`'s — same frame, same offset — supersede each
+    // other or survive as two locations flushed in an arbitrary order.
     let descr = info.static_field_struct_descr(idx);
     ctx.trace_ctx
         .vable_setfield_descr(vable_ref, last_instr, descr);
@@ -7356,6 +7338,18 @@ pub(crate) fn maybe_walker_vable_and_vrefs_before_residual_call<Sym: WalkSym>(
     jit_pc: usize,
 ) {
     record_and_publish_inline_callee_last_instr(ctx, jit_pc);
+    // Portal `last_instr` heap store before FORCE_TOKEN / CALL.  pyre
+    // residualizes frame readers (`_warnings::setup_context` keys on the
+    // heap field); `dispatch_bytecode` writes `self.last_instr =
+    // intmask(next_instr)` before the opcode, and `do_residual_call`
+    // records CALL then `generate_guard(GUARD_NOT_FORCED)` with nothing
+    // in between (`_store_force_index(+1)`).  Publishing here — not
+    // inside the executor after the CALL op is already in the history —
+    // keeps that adjacency for `CALL_RELEASE_GIL`, which `heap.py`
+    // does not postpone.
+    if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box() {
+        publish_portal_executing_last_instr(ctx, vable_ref, std::ptr::null_mut());
+    }
     walker_vable_and_vrefs_before_residual_call(ctx.trace_ctx);
 }
 
@@ -9071,23 +9065,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // Range GET_ITER: virtualize exact machine-word `range` into the same
-    // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
+    // GET_ITER records `W_Range.descr_iter` (`RANGE_ITER_DESCENT`) for
+    // exact `range`, `iter_w` for exact `zip` / `map` / `filter`, and
+    // `descr_iter` for exact sequence iterators. Not a spec-fold row —
+    // HelperDescent, the `newdict` twin.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter
     {
-        if let Some(iter_op) = spec_gate(SpecFold::GetIter, || {
-            try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)
-        })? {
+        if let Some(iter_op) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, iter_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
-        // `W_Range.descr_iter`. The hand fold above needs a non-inlined
-        // concrete box and declines the virtual `range` that the same outer
-        // trace just allocated; this walks the interpreter body instead.
-        // Not a spec-fold row.
-        if let Some(outcome) = try_walker_orthodox_get_iter(ctx, op.pc, &r_args, dst, dst_bank)? {
-            return Ok((outcome, op.next_pc));
         }
         // The instance arm of `iter`: a user class's `__iter__` is Python, and
         // left residual it costs an interpreter frame and the virtualref
@@ -9127,6 +9114,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if let Some(item_op) =
             try_walker_orthodox_list_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
         {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // Exact `zip` records `W_Zip.next_w` (`zip_two_tuple_next` /
+        // `zip_next_method`). Not a spec-fold row.
+        if let Some(item_op) = try_walker_orthodox_zip_next(ctx, op.pc, &r_args, dst, dst_bank)? {
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
@@ -9223,6 +9216,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if let Some(outcome) =
             try_walker_orthodox_empty_newlist(ctx, op.pc, &r_args, dst, dst_bank)?
         {
+            return Ok((outcome, op.next_pc));
+        }
+    }
+
+    // BUILD_MAP 0 (`{}`) is `space.newdict()` (`pyopcode.py BUILD_MAP`).
+    // Descend `newdict_empty` (`allocate_and_init_instance` empty-dict arm)
+    // so the trace records `new_with_vtable` + dstorage/dstrategy, matching
+    // PyPy.  Not a spec-fold row — HelperDescent, the `newfloat` twin.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewEmptyDict
+    {
+        if let Some(outcome) = try_walker_orthodox_newdict(ctx, op, dst, dst_bank)? {
             return Ok((outcome, op.next_pc));
         }
     }
@@ -9349,18 +9355,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // An exact `range(...)` constructor call becomes a virtual W_Range whose
-    // four wrapped-int fields can fold directly into GET_ITER virtualization.
-    // Non-canonical callables and arguments fall through to the residual.
+    // An exact `range(...)` records `W_Range.descr_new` (`RANGE_NEW_*_DESCENT`)
+    // with the raw bound boxes. The leaf applies `space.index` and the
+    // zero-step `ValueError`. Not a spec-fold row — HelperDescent, the
+    // `newfloat` twin.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && try_walker_orthodox_range_new(ctx, code, op, &r_args, dst)?.is_some()
     {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
-            try_walker_specialize_builtin_range(ctx, code, op, funcptr, &r_args, call_descr, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // Zero-argument `locals()` / `vars()` / `dir()` on the walk's own portal

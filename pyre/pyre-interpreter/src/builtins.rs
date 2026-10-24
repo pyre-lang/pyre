@@ -5686,38 +5686,160 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(w_none())
 }
 
-/// `functional.py W_Range.descr_new` stores `space.index` of each bound.
-/// `descroperation.py index` returns the operand when `type(w) is int`;
-/// `W_LongObject` is that type (`W_AbstractIntObject`), so a bignum bound
-/// is the original ref — `range(i).stop is i` with `i = 2**64`.  A bool
-/// is not `int` and is rewrapped; an exact machine int already is.
-///
-/// # Safety
-/// `obj` must be a valid object.
-unsafe fn range_index_bound(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+/// `descroperation.py ObjSpace.index` as used by `W_Range.descr_new`.
+/// `_index` returns the operand when it is already an int; `index` then
+/// rewraps a non-exact-int (a bool, a strict subclass) as a plain int.
+/// `W_LongObject` is `W_AbstractIntObject`, so a bignum bound is the
+/// original ref — `range(i).stop is i` with `i = 2**64`.
+fn range_index_bound(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let w = crate::baseobjspace::space_index(obj)?;
     // `is_int` is true for a bool, so bool has to be tested first or a `True`
     // bound would be preserved as `True`. Exact `int` / `long` pass through
     // (`space.index` of `W_AbstractIntObject`). Anything else is a subclass
     // `index` rewrapped as a plain int.
-    if pyre_object::is_bool(w) {
-        Ok(w_int_new(pyre_object::w_bool_get_value(w) as i64))
-    } else if pyre_object::is_int(w) || pyre_object::is_long(w) {
-        Ok(w)
-    } else if let Some(value) = pyre_object::range_obj_as_i64(w) {
-        Ok(w_int_new(value))
-    } else {
-        Ok(pyre_object::range_bigint_to_obj(
-            pyre_object::range_obj_to_bigint(w),
-        ))
+    unsafe {
+        if pyre_object::is_bool(w) {
+            Ok(w_int_new(pyre_object::w_bool_get_value(w) as i64))
+        } else if pyre_object::is_int(w) || pyre_object::is_long(w) {
+            Ok(w)
+        } else if let Some(value) = pyre_object::range_obj_as_i64(w) {
+            Ok(w_int_new(value))
+        } else {
+            Ok(pyre_object::range_bigint_to_obj(
+                pyre_object::range_obj_to_bigint(w),
+            ))
+        }
     }
 }
 
+/// `functional.py compute_range_length` — wrapped-object length using the
+/// same `space.lt` / `space.neg` / `space.sub` / `space.floordiv` /
+/// `space.add` / `space.newint` BINARY_OP / COMPARE_OP reach for ints.
+///
+/// Do not pin at the head: `pin_root` is `dont_look_inside` and inlines
+/// to a `with_shadow_stack` closure with no lifted counterpart
+/// (`gc_roots.rs with_roots!`). A residual there aborts
+/// `RANGE_NEW_*_DESCENT` (`compare()` / `compare_value_from_tag_inner`).
+/// Per-call `with_roots!` (`RootBracketPlan`) reloads every GC local live
+/// across a collecting call; `neg` / `sub` on the bigint path allocate
+/// through the collecting nursery.
+#[inline(never)]
+fn compute_range_length(
+    mut w_start: PyObjectRef,
+    mut w_stop: PyObjectRef,
+    mut w_step: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if pyre_object::with_roots!(w_start, w_stop, w_step => {
+        crate::baseobjspace::is_true(crate::objspace::descroperation::compare(
+            w_step,
+            w_int_new(0),
+            crate::objspace::descroperation::CompareOp::Lt,
+        )?)
+    })? {
+        core::mem::swap(&mut w_start, &mut w_stop);
+        w_step = pyre_object::with_roots!(w_start, w_stop => {
+            crate::objspace::descroperation::neg(w_step)
+        })?;
+    }
+    if pyre_object::with_roots!(w_start, w_stop, w_step => {
+        crate::baseobjspace::is_true(crate::objspace::descroperation::compare(
+            w_start,
+            w_stop,
+            crate::objspace::descroperation::CompareOp::Lt,
+        )?)
+    })? {
+        let mut w_diff = pyre_object::with_roots!(w_step => {
+            crate::objspace::descroperation::sub(w_stop, w_start)
+        })?;
+        w_diff = pyre_object::with_roots!(w_step => {
+            crate::objspace::descroperation::sub(w_diff, w_int_new(1))
+        })?;
+        crate::objspace::descroperation::add(
+            crate::objspace::descroperation::floordiv(w_diff, w_step)?,
+            w_int_new(1),
+        )
+    } else {
+        Ok(w_int_new(0))
+    }
+}
+
+/// `functional.py W_Range.descr_new` tail: `compute_range_length` then
+/// `allocate_instance` / `__init__`.
+#[inline(never)]
+pub(crate) fn w_range_new(
+    mut start: PyObjectRef,
+    mut stop: PyObjectRef,
+    mut step: PyObjectRef,
+    promote_step: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `with_roots!` is the walkable bracket (`RootBracketPlan`); free
+    // `pin_root` inlines to a closure residual and aborts the descent.
+    pyre_object::with_roots!(start, stop, step => {
+        let mut w_length = compute_range_length(start, stop, step)?;
+        pyre_object::with_roots!(start, stop, step, w_length => {
+            Ok(pyre_object::w_range_allocate(
+                start, stop, step, w_length, promote_step,
+            ))
+        })
+    })
+}
+
+/// `functional.py W_Range.descr_new` nargs==1 after arity unpacking
+/// (`gateway.py BuiltinCode1.fastcall_1`). The raw bound is `w_start`;
+/// `space.index` then `w_start, w_stop = 0, w_start`. `builtin_range`
+/// calls this for `range(stop)`; the walker descends it
+/// (`specialize.rs RANGE_NEW_STOP_DESCENT`).
+#[inline(never)]
+pub(crate) fn w_range_new_stop(mut w_start: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    w_start = pyre_object::with_roots!(w_start => range_index_bound(w_start))?;
+    w_range_new(w_int_new(0), w_start, w_int_new(1), true)
+}
+
+/// `functional.py W_Range.descr_new` nargs==2 after arity unpacking
+/// (`gateway.py BuiltinCode2.fastcall_2`). Raw bounds, then `space.index`
+/// on each. `builtin_range` calls this for `range(start, stop)`.
+#[inline(never)]
+pub(crate) fn w_range_new_start_stop(
+    mut w_start: PyObjectRef,
+    mut w_stop: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    w_start = pyre_object::with_roots!(w_start, w_stop => range_index_bound(w_start))?;
+    w_stop = pyre_object::with_roots!(w_start, w_stop => range_index_bound(w_stop))?;
+    w_range_new(w_start, w_stop, w_int_new(1), true)
+}
+
+/// `functional.py W_Range.descr_new` nargs==3 after arity unpacking
+/// (`gateway.py BuiltinCode3.fastcall_3`). Raw bounds, `space.index` on
+/// each, then `space.int_w(w_step) == 0` → `ValueError`. `builtin_range`
+/// calls this for `range(start, stop, step)`.
+#[inline(never)]
+pub(crate) fn w_range_new_start_stop_step(
+    mut w_start: PyObjectRef,
+    mut w_stop: PyObjectRef,
+    mut w_step: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    w_start = pyre_object::with_roots!(w_start, w_stop, w_step => range_index_bound(w_start))?;
+    w_stop = pyre_object::with_roots!(w_start, w_stop, w_step => range_index_bound(w_stop))?;
+    w_step = pyre_object::with_roots!(w_start, w_stop, w_step => range_index_bound(w_step))?;
+    // `descr_new`: `space.int_w(w_step)` then `step == 0` → ValueError;
+    // OverflowError (a bigint that does not fit) is not zero.
+    if let Ok(0) = pyre_object::with_roots!(w_start, w_stop, w_step => {
+        crate::baseobjspace::int_w(w_step)
+    }) {
+        return Err(crate::PyError::value_error(
+            "step argument must not be zero",
+        ));
+    }
+    w_range_new(w_start, w_stop, w_step, false)
+}
+
 /// `range(stop)` / `range(start, stop[, step])` — `functional.py
-/// W_Range.descr_new`.  Each bound passes through `space.index`
-/// (`__index__`) and is stored wrapped, so a range may span past a
-/// machine word; `iter()` then produces a `rangeiterator` (machine-int,
-/// JIT-specializable) or a `longrange_iterator` accordingly.
+/// W_Range.descr_new` arity check, then the per-arity leaf
+/// (`gateway.py BuiltinCode1/2/3.fastcall_N`). Each leaf applies
+/// `space.index` (`__index__`) and stores the bound wrapped, so a
+/// range may span past a machine word; `iter()` then produces a
+/// `rangeiterator` (machine-int, JIT-specializable) or a
+/// `longrange_iterator` accordingly.
 pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let n = args.len();
     if n == 0 {
@@ -5730,62 +5852,12 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             "range expected at most 3 arguments, got {n}"
         )));
     }
-    unsafe {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let args_base = pyre_object::gc_roots::pin_roots(args);
-        let start_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(range_index_bound(
-            pyre_object::gc_roots::shadow_stack_get(args_base),
-        )?);
-        let stop_slot;
-        let step_slot;
-        if n == 1 {
-            // Only `stop` given — `w_start, w_stop = 0, w_start`.
-            stop_slot = start_slot;
-            let start0_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
-            step_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
-            let start_slot = start0_slot;
-            Ok(pyre_object::w_range_new(
-                pyre_object::gc_roots::shadow_stack_get(start_slot),
-                pyre_object::gc_roots::shadow_stack_get(stop_slot),
-                pyre_object::gc_roots::shadow_stack_get(step_slot),
-                true,
-            ))
-        } else {
-            stop_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(range_index_bound(
-                pyre_object::gc_roots::shadow_stack_get(args_base + 1),
-            )?);
-            if n == 3 {
-                step_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(range_index_bound(
-                    pyre_object::gc_roots::shadow_stack_get(args_base + 2),
-                )?);
-                let w_step = pyre_object::gc_roots::shadow_stack_get(step_slot);
-                let step_is_zero = match pyre_object::range_obj_as_i64(w_step) {
-                    Some(step) => step == 0,
-                    None => pyre_object::range_obj_to_bigint(w_step) == BigInt::from(0),
-                };
-                if step_is_zero {
-                    return Err(crate::PyError::value_error(
-                        "step argument must not be zero",
-                    ));
-                }
-            } else {
-                step_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
-            }
-            // `descr_new` promotes the step exactly when no step argument was
-            // given, so `range(0, 10, 1)` keeps the general iterator.
-            Ok(pyre_object::w_range_new(
-                pyre_object::gc_roots::shadow_stack_get(start_slot),
-                pyre_object::gc_roots::shadow_stack_get(stop_slot),
-                pyre_object::gc_roots::shadow_stack_get(step_slot),
-                n != 3,
-            ))
-        }
+    if n == 1 {
+        w_range_new_stop(args[0])
+    } else if n == 2 {
+        w_range_new_start_stop(args[0], args[1])
+    } else {
+        w_range_new_start_stop_step(args[0], args[1], args[2])
     }
 }
 

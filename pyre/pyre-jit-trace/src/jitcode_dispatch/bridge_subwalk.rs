@@ -1436,7 +1436,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     root_sym: &Sym,
     root_pc: usize,
     callee_pjc: &std::sync::Arc<crate::PyJitCode>,
-    callee_code_key: usize,
+    _callee_code_key: usize,
     callee_w_globals: usize,
     entry: usize,
     argboxes_r: &[OpRef],
@@ -1633,16 +1633,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
 
     let callee_code = jc.code.as_slice();
     let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
-    // `callee_w_code` is the callee frame's `pycode` red — a
-    // `W_Code` object.  `callee_code_key` is the raw compiled-code pointer the
-    // recipe carries, which is the JIT-side key, not that object; the live
-    // wrapper is what `recover_inline_callee_globals` already reads
-    // `w_globals` out of.  Passing the key through made every consumer that
-    // type-checks it decline (the inlined callee then contributed no
-    // `PyTraceback` node) and every consumer that does not re-read it as a
-    // `W_Code` of the wrong type.
-    let callee_w_code =
-        crate::state::recover_inline_callee_code(callee_code_key as *const ()) as usize;
+    // `callee_w_code` is the callee frame's `pycode` red — the owner
+    // `PyCode` stamped on this jitcode's payload. Passing the raw body
+    // pointer through made every consumer that type-checks it decline
+    // (the inlined callee then contributed no `PyTraceback` node) and
+    // every consumer that does not re-read it as a `W_Code` of the wrong
+    // type.
+    let callee_w_code = callee_pjc.w_code.get() as usize;
     let consts = InlineCalleeConsts {
         jitcode_index: jc.try_index().map_or(-1, |index| index as i32),
     };
@@ -1755,7 +1752,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // every frame through `MetaInterp.newframe(jitcode)`, so
         // `MIFrame.greenkey` is `None` and `_opimpl_recursive_call` skips it.
         let parent_w_code =
-            crate::state::recover_inline_callee_code(parent_recipe.code_ptr) as usize;
+            crate::state::recover_inline_callee_code(parent_recipe.jitcode_index) as usize;
         if parent_w_code == 0 {
             return None;
         }

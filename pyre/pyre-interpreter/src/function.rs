@@ -4066,6 +4066,8 @@ pub(crate) fn function_call_obj_args(
 /// whether or not a trace is recording: the CALL walker intercepts the
 /// `CallFn` residual, and after `abort: force quasi-immut` the regular
 /// interpreter still wants the gateway rather than `space.call_function`.
+/// `function.py Function.funccall`: `*args_w` has a length fixed per call site.
+#[majit_macros::unroll_safe]
 pub fn funccall_result(
     func: PyObjectRef,
     args: &[PyObjectRef],

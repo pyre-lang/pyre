@@ -1632,13 +1632,59 @@ pub unsafe fn alloc_fixed_array_with_header(
     }
 }
 
+/// `rlist.py` `_ll_alloc_and_clear`: nursery `malloc` of a cleared
+/// `GcArray(PyObjectRef)`, `@jit.oopspec("newlist_clear(count)")`.
+/// A traced call is `new_array_clear` (`jtransform.py`
+/// `do_fixed_newlist_clear`); the fill loop stays in this body so the
+/// `_ll_alloc_and_set_jit` dispatcher has none. No remember: a NULL fill
+/// is not a young pointer (`incminimark.py write_barrier`).
+///
+/// # Safety
+/// `len` is the frame locals array length. The returned block is unpublished
+/// until the caller roots it.
+#[inline(never)]
+#[majit_macros::oopspec("newlist_clear(count)")]
+unsafe fn alloc_frame_locals_array_clear(len: usize) -> *mut FixedObjectArray {
+    let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
+        + len * std::mem::size_of::<pyre_object::PyObjectRef>();
+    let raw = pyre_object::gc_hook::GcAllocOutcome::from_hook(pyre_object::gc_hook::try_gc_alloc(
+        pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
+        payload,
+    ))
+    .allocated_or_abort(payload)
+    .unwrap_or(std::ptr::null_mut());
+    if !raw.is_null() {
+        // Nursery memory is not zero-filled. The length and every item are
+        // written before the next collection point, so the array is never
+        // reachable from a root while it still holds allocator garbage; the
+        // caller publishes the completed array.
+        let arr = raw as *mut FixedObjectArray;
+        unsafe {
+            (*arr).len = len;
+            let items = (*arr).items_mut_ptr();
+            for i in 0..len {
+                items.add(i).write(pyre_object::PY_NULL);
+            }
+        }
+        return arr;
+    }
+    unsafe { alloc_fixed_array_with_header(len, pyre_object::PY_NULL) }
+}
+
 /// Allocate a frame locals array in the lifetime regime selected by its owner.
 /// The old-gen form is the type-9 GcArray layout `[GcHeader | len | items]`.
+///
+/// `rlist.py` `_ll_alloc_and_set_jit`: `_ll_zero_or_null(item)` then
+/// `_ll_alloc_and_clear`. The dispatcher is loop-free; the NULL nursery
+/// fill lives in [`alloc_frame_locals_array_clear`].
 unsafe fn alloc_frame_locals_array(
     len: usize,
     fill: pyre_object::PyObjectRef,
     allocation: FrameLocalsArrayAllocation,
 ) -> *mut FixedObjectArray {
+    if matches!(allocation, FrameLocalsArrayAllocation::NurseryGc) && fill.is_null() {
+        return unsafe { alloc_frame_locals_array_clear(len) };
+    }
     let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
         + len * std::mem::size_of::<pyre_object::PyObjectRef>();
     let raw = match allocation {
@@ -1661,10 +1707,7 @@ unsafe fn alloc_frame_locals_array(
         let arr = raw as *mut FixedObjectArray;
         unsafe {
             (*arr).len = len;
-            let items = (*arr).items_mut_ptr();
-            for i in 0..len {
-                items.add(i).write(fill);
-            }
+            frame_locals_arrayfill(arr, fill);
         }
         // `incminimark.py write_barrier` remembers only after a young
         // pointer lands. A NULL fill is not one; running the barrier here
@@ -1679,6 +1722,26 @@ unsafe fn alloc_frame_locals_array(
         return arr;
     }
     unsafe { alloc_fixed_array_with_header(len, fill) }
+}
+
+/// `rgc.py` `ll_arrayfill` (`@jit.dont_look_inside`): one write-barrier
+/// then a bare store loop. The barrier stays at the caller
+/// (`remember_frame_locals_array` after a non-NULL fill); this body is
+/// the store loop. `#[inline(never)]` keeps it a Call so the
+/// `_ll_alloc_and_set_jit` dispatcher stays loop-free.
+///
+/// # Safety
+/// `arr` is a freshly allocated locals array whose `len` is already stored.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn frame_locals_arrayfill(arr: *mut FixedObjectArray, fill: pyre_object::PyObjectRef) {
+    unsafe {
+        let len = (*arr).len;
+        let items = (*arr).items_mut_ptr();
+        for i in 0..len {
+            items.add(i).write(fill);
+        }
+    }
 }
 
 /// Write barrier for a batch of stores into a frame's
@@ -2348,9 +2411,21 @@ pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
 /// projection, which `vable_projection_census` allows only on
 /// `FrameBox::new`. `inline(never)` keeps the deref in this function's
 /// LLBC so the census does not attribute it to the caller.
+///
+/// `pyframe.py PyFrame.__init__` does `self = hint(self,
+/// access_directly=True, fresh_virtualizable=True)` before writing
+/// `self.locals_cells_stack_w`.  pyre's hint is per-block
+/// (`hint_fresh_virtualizable`), so this helper — the write's own
+/// graph once `finish_for_call_with_globals_obj` is looked inside —
+/// needs the same pair.  Without it `is_virtualizable_getset` classifies
+/// the array field as a live virtualizable and `rewrite_op_setfield`
+/// panics (`jtransform.py`: "writing the array field itself").
 #[inline(never)]
 unsafe fn store_locals_cells_stack_w(frame_ptr: *mut PyFrame, array: *mut FixedObjectArray) {
     unsafe {
+        let frame_ptr = majit_metainterp::jit::hint_fresh_virtualizable(
+            majit_metainterp::jit::hint_access_directly(frame_ptr),
+        );
         (*frame_ptr).locals_cells_stack_w = array;
     }
 }
@@ -6478,6 +6553,14 @@ impl PyFrame {
     /// `pick_builtin(w_globals)`, which raises a non-KeyError
     /// `OperationError` straight out of `__init__`.  Fallible frame builder
     /// mirroring that path.
+    ///
+    /// `function.py _flat_pycall` is `@jit.unroll_safe`: the argument
+    /// copy into `locals_cells_stack_w` is over a length fixed per call
+    /// site.  This builder's `args` loop is that copy (plus the live-set
+    /// reload around `pick_builtin`).  Without the hint
+    /// `look_inside_graph` residualizes the whole frame construction,
+    /// so `funccall` never reaches `new_frame.run`.
+    #[majit_macros::unroll_safe]
     pub fn try_new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6562,6 +6645,13 @@ impl PyFrame {
     /// Common tail of the frame builders: everything in `Frame.__init__`
     /// except the `pick_builtin` resolution, which is lifted to the callers
     /// so the fallible variant can propagate its error.
+    ///
+    /// `pyframe.py initialize_frame_scopes` is `@jit.unroll_safe`.  The
+    /// cellvar / freevar / positional-arg loops below are that body
+    /// fused into `Frame.__init__`; without the hint
+    /// `look_inside_graph` residualizes the constructor and the
+    /// FLATPYCALL path never looks inside to `new_frame.run`.
+    #[majit_macros::unroll_safe]
     fn finish_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
