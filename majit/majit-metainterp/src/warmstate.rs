@@ -9,7 +9,8 @@ use indexmap::IndexMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use majit_backend::JitCellToken;
-use majit_ir::{GreenKey, GreenType, RetainedGreens, Type};
+use majit_ir::{GREEN_INLINE, GcRef, GreenKey, GreenType, RetainedGreens, Type, Value};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 use crate::counter::{DEFAULT_SIZE, JitCounter};
@@ -184,6 +185,17 @@ impl BaseJitCell {
         }
     }
 
+    /// Live `JitCell.gN` values (`warmstate.py` `make_jitcell_subclass`).
+    ///
+    /// `greens` holds the addresses copied at install. Each `gN` is a
+    /// GC-managed field upstream, so a retained Ref is read through
+    /// `retained_greens.current_value`.
+    pub fn current_greens(&self) -> SmallVec<[i64; GREEN_INLINE]> {
+        (0..self.greens.len())
+            .map(|i| self.retained_greens.current_value(i, self.greens[i]))
+            .collect()
+    }
+
     /// warmstate.py `JitCell.comparekey(*greenargs2)`:
     ///
     /// ```python
@@ -201,24 +213,16 @@ impl BaseJitCell {
     /// (`jitdriver_sd._green_args_spec`), used only to pick
     /// `equal_whatever`'s TYPE. There is no types comparison: every
     /// caller has already checked `cell.jitdriver_sd`
-    /// (`isinstance(cell, JitCell)`).
+    /// (`isinstance(cell, JitCell)`). Each `gN` is the same per-index
+    /// read as [`Self::current_greens`].
     #[inline(always)]
     pub fn comparekey(&self, greenargs: &[i64], types: &[GreenType]) -> bool {
         debug_assert_eq!(types.len(), greenargs.len());
-        let greens = &self.greens[..];
-        if greens.len() != types.len() {
+        if self.greens.len() != types.len() {
             return false;
         }
-        if self.retained_greens.is_empty() {
-            for i in 0..types.len() {
-                if !majit_ir::equal_whatever(types[i], greens[i], greenargs[i]) {
-                    return false;
-                }
-            }
-            return true;
-        }
         for i in 0..types.len() {
-            let item1 = self.retained_greens.current_value(i, greens[i]);
+            let item1 = self.retained_greens.current_value(i, self.greens[i]);
             if !majit_ir::equal_whatever(types[i], item1, greenargs[i]) {
                 return false;
             }
@@ -740,14 +744,10 @@ pub struct WarmEnterState {
     /// without borrowing this state.
     ///
     /// `warmspot.py make_driverhook_graphs` builds this hook with
-    /// `onlygreens=False`, so upstream passes every portal green and red.
-    /// This layer supplies the green values (`confirm_enter_jit(*args)`),
-    /// not a key object. It still cannot supply reds: they remain owned by
-    /// the interpreter portal (`PyFrame` / execution context in pyre), while
-    /// `WarmEnterState` owns only cells and counters. Exact argument parity
-    /// therefore requires moving the hook boundary to the portal or threading
-    /// an interpreter-defined red-argument carrier into every policy call.
-    confirm_enter_jit_ptr: Rc<Cell<Option<fn(&[i64]) -> bool>>>,
+    /// `onlygreens=False`, so the pointer is `confirm_enter_jit(*args)` —
+    /// greens then reds as one portal tuple (`_portal_args_s`). Callers
+    /// thread the live portal reds into [`Self::confirm_enter_jit`].
+    confirm_enter_jit_ptr: Rc<Cell<Option<fn(&[Value]) -> bool>>>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -816,6 +816,17 @@ impl crate::jit::JitParameterTarget for WarmEnterState {
     }
 }
 
+/// One green word as a portal `Value` (`warmspot.py` `_make_hook_graph`
+/// TYPE). Void greens are packed as `Int`, matching the specialized
+/// portal tuple `confirm_enter_jit(*args)` receives.
+fn value_from_green_word(word: i64, tp: GreenType) -> Value {
+    match tp {
+        GreenType::Int | GreenType::Void => Value::Int(word),
+        GreenType::Float => Value::Float(f64::from_bits(word as u64)),
+        GreenType::Ref | GreenType::Str | GreenType::Unicode => Value::Ref(GcRef(word as usize)),
+    }
+}
+
 impl WarmEnterState {
     /// `warmstate.py maybe_compile_and_run`: a `JC_DONT_TRACE_HERE` cell that
     /// has never seen a procedure token is retried — immediately the first
@@ -853,12 +864,18 @@ impl WarmEnterState {
     /// `warmstate.py maybe_compile_and_run` after the chain walk. Callers look
     /// up `cell`, choose `hash` / `increment` / the veto greens, and map the
     /// result; this body is the order.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "greenargs/types/reds are the portal *args split make_entry_point passes as confirm_enter_jit(*args)"
+    )]
     fn maybe_compile_and_run_decision(
         &mut self,
         cell: Option<&BaseJitCell>,
         hash: u64,
         increment: f64,
         greenargs: Option<&[i64]>,
+        green_types: &[GreenType],
+        reds: &[Value],
         is_runnable: bool,
         door: WarmEntryDoor,
     ) -> HotResult {
@@ -950,7 +967,7 @@ impl WarmEnterState {
 
         if is_runnable {
             // warmstate.py maybe_compile_and_run: confirm_enter_jit before EnterJitAssembler.
-            if !self.confirm_enter_jit_if_available(greenargs) {
+            if !self.confirm_enter_jit_if_available(greenargs, green_types, reds) {
                 return HotResult::NotHot;
             }
             return HotResult::RunCompiled;
@@ -984,10 +1001,16 @@ impl WarmEnterState {
     /// `Some(key)` installs `JitCell(*greenargs)` (`warmstate.py
     /// bound_reached`). `None` names an already-installed cell; a tracing
     /// start without one needs greens — use the `_for_key` twin.
-    fn start_tracing_cell(&mut self, cell_key: u64, green_key: Option<&GreenKey>) -> HotResult {
+    fn start_tracing_cell(
+        &mut self,
+        cell_key: u64,
+        green_key: Option<&GreenKey>,
+        green_types: &[GreenType],
+        reds: &[Value],
+    ) -> HotResult {
         match green_key {
             Some(key) => {
-                if !self.confirm_enter_jit_if_available(Some(&key.values)) {
+                if !self.confirm_enter_jit_if_available(Some(&key.values), &key.types, reds) {
                     return HotResult::NotHot;
                 }
                 self.ensure_cell_for_key(key);
@@ -997,7 +1020,8 @@ impl WarmEnterState {
                     "the hash form names an installed cell; a tracing start without one needs greens, \
                      warmstate.py bound_reached JitCell(*greenargs) — use the `_for_key` twin",
                 );
-                if !self.confirm_enter_jit_if_available(Some(&cell.greens[..])) {
+                let greens = cell.current_greens();
+                if !self.confirm_enter_jit_if_available(Some(&greens[..]), green_types, reds) {
                     return HotResult::NotHot;
                 }
             }
@@ -1086,12 +1110,15 @@ impl WarmEnterState {
         let cell = self.cell_by_key(cell_key);
         let is_runnable = cell.as_ref().is_some_and(|c| c.is_compiled());
         let hash = self.bucket_of(cell_key);
+        let greens = cell.as_ref().map(|c| c.current_greens());
         matches!(
             self.maybe_compile_and_run_decision(
                 cell.as_deref(),
                 hash,
                 self.increment_threshold,
-                cell.as_ref().map(|c| &c.greens[..]),
+                greens.as_deref(),
+                &[],
+                &[],
                 is_runnable,
                 WarmEntryDoor::BackEdge,
             ),
@@ -1132,17 +1159,22 @@ impl WarmEnterState {
         &mut self,
         cell_key: u64,
         has_compiled_meta: impl FnOnce(u64) -> bool,
+        green_types: &[GreenType],
+        reds: &[Value],
     ) -> HotResult {
         let cell = self.cell_by_key(cell_key);
         let is_runnable = cell
             .as_ref()
             .is_some_and(|c| c.is_compiled() && has_compiled_meta(cell_key));
         let hash = self.bucket_of(cell_key);
+        let greens = cell.as_ref().map(|c| c.current_greens());
         self.maybe_compile_and_run_decision(
             cell.as_deref(),
             hash,
             self.increment_threshold,
-            cell.as_ref().map(|c| &c.greens[..]),
+            greens.as_deref(),
+            green_types,
+            reds,
             is_runnable,
             WarmEntryDoor::BackEdge,
         )
@@ -1152,7 +1184,7 @@ impl WarmEnterState {
     /// represented by the warm cell itself.
     #[inline]
     pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
-        self.maybe_compile_decision_with_meta(cell_key, |_| true)
+        self.maybe_compile_decision_with_meta(cell_key, |_| true, &[], &[])
     }
 
     /// [`Self::maybe_compile_decision`] followed by the mark that
@@ -1172,7 +1204,7 @@ impl WarmEnterState {
     #[cfg(test)]
     pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
         match self.maybe_compile_decision(cell_key) {
-            HotResult::StartTracing => self.start_tracing_cell(cell_key, None),
+            HotResult::StartTracing => self.start_tracing_cell(cell_key, None, &[], &[]),
             other => other,
         }
     }
@@ -1197,8 +1229,8 @@ impl WarmEnterState {
     /// The typed chain-walk variant [`Self::finish_tracing_for_key`] keeps
     /// the typed path's full lifecycle self-consistent on its own buckets.
     pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
-        match self.maybe_compile_decision_with_key(key, |_| true) {
-            HotResult::StartTracing => self.start_tracing_cell_for_key(key),
+        match self.maybe_compile_decision_with_key(key, |_| true, &[]) {
+            HotResult::StartTracing => self.start_tracing_cell_for_key(key, &[]),
             other => other,
         }
     }
@@ -1211,6 +1243,7 @@ impl WarmEnterState {
         &mut self,
         key: &GreenKey,
         has_compiled_meta: impl FnOnce(u64) -> bool,
+        reds: &[Value],
     ) -> HotResult {
         let hash = key.get_uhash();
         let cell = self.lookup_chain_with_key(key);
@@ -1228,6 +1261,8 @@ impl WarmEnterState {
             hash,
             self.increment_threshold,
             Some(&key.values),
+            &key.types,
+            reds,
             is_runnable,
             WarmEntryDoor::BackEdge,
         )
@@ -1248,11 +1283,11 @@ impl WarmEnterState {
     /// `tracing_generation`, rather than the bucket head. Pairs with
     /// [`Self::maybe_compile_with_key`] so a typed greenkey always
     /// transitions its own cell on a hash collision.
-    fn start_tracing_cell_for_key(&mut self, key: &GreenKey) -> HotResult {
+    fn start_tracing_cell_for_key(&mut self, key: &GreenKey, reds: &[Value]) -> HotResult {
         let hash = key.get_uhash();
-        // `warmstate.py:427` — see `start_tracing_cell`, whose position this
-        // is the typed twin of.
-        if !self.confirm_enter_jit(&key.values) {
+        // `warmstate.py` `bound_reached` — see `start_tracing_cell`, whose
+        // position this is the typed twin of.
+        if !self.confirm_enter_jit(&key.values, &key.types, reds) {
             return HotResult::NotHot;
         }
         self.counter.reset(hash);
@@ -1286,13 +1321,14 @@ impl WarmEnterState {
     /// driver, so the stored greens always match that spec.
     pub fn installed_greenkey(&self, cell_key: u64, types: &[GreenType]) -> Option<GreenKey> {
         self.cell_by_key(cell_key).map(|c| {
+            let greens = c.current_greens();
             assert_eq!(
-                c.greens.len(),
+                greens.len(),
                 types.len(),
                 "cell greens match the driver's _green_args_spec \
                  (warmstate.py make_jitcell_subclass)"
             );
-            GreenKey::with_types(c.greens.to_vec(), types.to_vec())
+            GreenKey::with_types(greens, types.to_vec())
         })
     }
 
@@ -1315,7 +1351,8 @@ impl WarmEnterState {
     pub fn force_start_tracing(&mut self, cell_key: u64) -> HotResult {
         if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() {
-                if !self.confirm_enter_jit_if_available(Some(&cell.greens[..])) {
+                let greens = cell.current_greens();
+                if !self.confirm_enter_jit_if_available(Some(&greens[..]), &[], &[]) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1347,7 +1384,7 @@ impl WarmEnterState {
             }
         }
 
-        self.start_tracing_cell(cell_key, None)
+        self.start_tracing_cell(cell_key, None, &[], &[])
     }
 
     /// Typed-key variant of [`Self::force_start_tracing`]: reads the
@@ -1355,10 +1392,10 @@ impl WarmEnterState {
     /// `Self::start_tracing_cell_for_key`, so a force-started cell
     /// (function-entry / can_enter_jit) carries a `comparekey` like the
     /// [`Self::maybe_compile_with_key`] path.
-    pub fn force_start_tracing_for_key(&mut self, key: &GreenKey) -> HotResult {
+    pub fn force_start_tracing_for_key(&mut self, key: &GreenKey, reds: &[Value]) -> HotResult {
         if let Some(cell) = self.lookup_chain_with_key(key) {
             if cell.is_compiled() {
-                if !self.confirm_enter_jit(&key.values) {
+                if !self.confirm_enter_jit(&key.values, &key.types, reds) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1380,7 +1417,7 @@ impl WarmEnterState {
             }
         }
 
-        self.start_tracing_cell_for_key(key)
+        self.start_tracing_cell_for_key(key, reds)
     }
 
     /// Mark that tracing is done for a green key. Clears the TRACING flag.
@@ -2021,7 +2058,7 @@ impl WarmEnterState {
     /// with no frontend meta there is no runnable loop to return early for.
     pub fn should_trace_function_entry(&mut self, cell_key: u64) -> bool {
         matches!(
-            self.function_entry_step(cell_key, None, || false, false),
+            self.function_entry_step(cell_key, None, || false, false, &[]),
             FunctionEntryStep::Proceed
         )
     }
@@ -2044,6 +2081,7 @@ impl WarmEnterState {
         green_key: Option<&GreenKey>,
         has_compiled_meta: impl FnOnce() -> bool,
         engine_is_tracing: bool,
+        reds: &[Value],
     ) -> FunctionEntryStep {
         let cell = self.cell_by_key(cell_key);
         let is_runnable = cell.as_ref().is_some_and(|c| {
@@ -2053,11 +2091,17 @@ impl WarmEnterState {
                     .is_some_and(|token| token.has_compiled_code())
         });
         let hash = self.bucket_of(cell_key);
+        let (greenargs, green_types) = match green_key {
+            Some(key) => (Some(key.values.as_slice()), key.types.as_slice()),
+            None => (None, [].as_slice()),
+        };
         match self.maybe_compile_and_run_decision(
             cell.as_deref(),
             hash,
             self.increment_function_threshold,
-            green_key.map(|k| k.values.as_slice()),
+            greenargs,
+            green_types,
+            reds,
             is_runnable,
             WarmEntryDoor::FunctionEntry { engine_is_tracing },
         ) {
@@ -2090,6 +2134,8 @@ impl WarmEnterState {
                 hash,
                 self.increment_function_threshold,
                 Some(&key.values),
+                &key.types,
+                &[],
                 false,
                 WarmEntryDoor::FunctionEntry {
                     engine_is_tracing: false,
@@ -2298,16 +2344,25 @@ impl WarmEnterState {
     /// `def confirm_enter_jit(*args): return True` substitution
     /// (`warmstate.py`) when it was not.
     ///
-    /// Called at both of upstream's veto positions: `warmstate.py` at the
-    /// head of `bound_reached`, which is [`Self::start_tracing_cell`] /
-    /// [`Self::start_tracing_cell_for_key`] here, and `warmstate.py`
-    /// before entering already-compiled machine code.
+    /// Packs greens then reds into one portal tuple
+    /// (`warmspot.py` `_make_hook_graph(..., onlygreens=False)`).
     #[inline]
-    pub fn confirm_enter_jit(&self, greenargs: &[i64]) -> bool {
-        match self.confirm_enter_jit_ptr.get() {
-            None => true,
-            Some(hook) => hook(greenargs),
+    pub fn confirm_enter_jit(
+        &self,
+        greens: &[i64],
+        green_types: &[GreenType],
+        reds: &[Value],
+    ) -> bool {
+        let Some(hook) = self.confirm_enter_jit_ptr.get() else {
+            return true;
+        };
+        let mut args = SmallVec::<[Value; 8]>::new();
+        for (i, &word) in greens.iter().enumerate() {
+            let tp = green_types.get(i).copied().unwrap_or(GreenType::Int);
+            args.push(value_from_green_word(word, tp));
         }
+        args.extend_from_slice(reds);
+        hook(&args)
     }
 
     /// Call the installed `confirm_enter_jit` hook with `greenargs` when both
@@ -2315,10 +2370,15 @@ impl WarmEnterState {
     /// rather than inventing a tuple; no hook installed is always allow
     /// (`warmstate.py` `def confirm_enter_jit(*args): return True`).
     #[inline]
-    fn confirm_enter_jit_if_available(&self, greenargs: Option<&[i64]>) -> bool {
-        match (self.confirm_enter_jit_ptr.get(), greenargs) {
+    fn confirm_enter_jit_if_available(
+        &self,
+        greens: Option<&[i64]>,
+        green_types: &[GreenType],
+        reds: &[Value],
+    ) -> bool {
+        match (self.confirm_enter_jit_ptr.get(), greens) {
             (None, _) => true,
-            (Some(hook), Some(values)) => hook(values),
+            (Some(_), Some(values)) => self.confirm_enter_jit(values, green_types, reds),
             (Some(_), None) => {
                 crate::mc_diag_bump(95); // confirm_enter_jit_missing_key
                 false
@@ -2327,14 +2387,21 @@ impl WarmEnterState {
     }
 
     /// Consult the compiled-entry veto for a resolved cell key. The cell's
-    /// greens (`JitCell.__init__` `setattr`) are what the hook inspects.
+    /// greens (`JitCell.__init__` `setattr`) plus the portal reds are what
+    /// the hook inspects (`confirm_enter_jit(*args)`).
     #[inline]
-    pub(crate) fn confirm_compiled_entry_for_cell_key(&self, cell_key: u64) -> bool {
+    pub(crate) fn confirm_compiled_entry_for_cell_key(
+        &self,
+        cell_key: u64,
+        green_types: &[GreenType],
+        reds: &[Value],
+    ) -> bool {
         if self.confirm_enter_jit_ptr.get().is_none() {
             return true;
         }
         let cell = self.cell_by_key(cell_key);
-        self.confirm_enter_jit_if_available(cell.as_ref().map(|c| &c.greens[..]))
+        let greens = cell.as_ref().map(|c| c.current_greens());
+        self.confirm_enter_jit_if_available(greens.as_deref(), green_types, reds)
     }
 
     /// `warmspot.py` `make_driverhook_graphs` —
@@ -2343,7 +2410,7 @@ impl WarmEnterState {
     /// Upstream builds the pointer from the `JitDriver` declaration; nothing
     /// below the declaration can know what it said, so an interpreter installs
     /// its own here. `None` restores the no-hook default.
-    pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&[i64]) -> bool>) {
+    pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&[Value]) -> bool>) {
         self.confirm_enter_jit_ptr.set(hook);
     }
 
@@ -2357,7 +2424,7 @@ impl WarmEnterState {
 
     /// The `make_entry_point` capture of `confirm_enter_jit`. `JitDriver`
     /// holds another handle to this same cell.
-    pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&[i64]) -> bool>>> {
+    pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&[Value]) -> bool>>> {
         Rc::clone(&self.confirm_enter_jit_ptr)
     }
 
@@ -4113,7 +4180,7 @@ mod tests {
         let key = gk(42);
 
         // Without any ticks, force_start_tracing should start tracing
-        match ws.force_start_tracing_for_key(&key) {
+        match ws.force_start_tracing_for_key(&key, &[]) {
             HotResult::StartTracing => {}
             _ => panic!("force_start_tracing should start tracing immediately"),
         }
@@ -4123,7 +4190,7 @@ mod tests {
         assert!(cell.is_tracing());
 
         // Second call sees AlreadyTracing
-        match ws.force_start_tracing_for_key(&key) {
+        match ws.force_start_tracing_for_key(&key, &[]) {
             HotResult::AlreadyTracing => {}
             _ => panic!("expected AlreadyTracing on second force_start_tracing"),
         }
@@ -4826,7 +4893,7 @@ mod tests {
 
         assert!(!ws.counter_tick_checked(ws.cell_key_for(&gk(key as i64)).expect("cell")));
         assert!(ws.counter_tick_checked(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        ws.force_start_tracing_for_key(&gk(key as i64));
+        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
         ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
@@ -4856,7 +4923,7 @@ mod tests {
 
         assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
         assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        ws.force_start_tracing_for_key(&gk(key as i64));
+        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
         ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
@@ -4893,7 +4960,7 @@ mod tests {
 
         assert!(!ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
         assert!(ws.should_trace_function_entry(ws.cell_key_for(&gk(key as i64)).expect("cell")));
-        ws.force_start_tracing_for_key(&gk(key as i64));
+        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
         ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
         let token = JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED);
         attach_alive(&mut ws, key, token);
@@ -4943,7 +5010,8 @@ mod tests {
                 ws.cell_key_for(&gk(key as i64)).expect("cell"),
                 None,
                 || false,
-                false
+                false,
+                &[],
             ),
             FunctionEntryStep::NotHot
         ));
@@ -4952,12 +5020,13 @@ mod tests {
                 ws.cell_key_for(&gk(key as i64)).expect("cell"),
                 None,
                 || false,
-                false
+                false,
+                &[],
             ),
             FunctionEntryStep::Proceed
         ));
 
-        ws.force_start_tracing_for_key(&gk(key as i64));
+        ws.force_start_tracing_for_key(&gk(key as i64), &[]);
         ws.finish_tracing(ws.cell_key_for(&gk(key as i64)).expect("cell"));
         let token = token_with_compiled_code(&mut ws);
         attach_alive(&mut ws, key, token);
@@ -4967,7 +5036,8 @@ mod tests {
                 ws.cell_key_for(&gk(key as i64)).expect("cell"),
                 None,
                 || true,
-                false
+                false,
+                &[],
             ),
             FunctionEntryStep::RunCompiled(_)
         ));
@@ -4976,7 +5046,8 @@ mod tests {
                 ws.cell_key_for(&gk(key as i64)).expect("cell"),
                 None,
                 || false,
-                false
+                false,
+                &[],
             ),
             FunctionEntryStep::NotHot
         ));
@@ -4997,7 +5068,8 @@ mod tests {
                     ws.cell_key_for(&gk(key as i64)).expect("cell"),
                     None,
                     || false,
-                    true
+                    true,
+                    &[],
                 ),
                 FunctionEntryStep::Proceed
             ));
@@ -5035,7 +5107,13 @@ mod tests {
         attach_alive_for_key(&mut ws, &key, token);
         for _ in 0..50 {
             assert!(matches!(
-                ws.function_entry_step(ws.cell_key_for(&key).expect("cell"), None, || false, false),
+                ws.function_entry_step(
+                    ws.cell_key_for(&key).expect("cell"),
+                    None,
+                    || false,
+                    false,
+                    &[]
+                ),
                 FunctionEntryStep::NotHot
             ));
         }
@@ -5048,19 +5126,19 @@ mod tests {
         let mut ws = WarmEnterState::new(2);
         let key = gk(0xA11);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::NotHot
         ));
         ws.set_threshold(0);
         for _ in 0..8 {
             assert!(matches!(
-                ws.maybe_compile_decision_with_key(&key, |_| true),
+                ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
                 HotResult::NotHot
             ));
         }
         ws.set_threshold(2);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::StartTracing
         ));
 
@@ -5069,7 +5147,7 @@ mod tests {
         attach_alive_for_key(&mut ws, &compiled, JitCellToken::new(1));
         ws.set_threshold(0);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&compiled, |_| true),
+            ws.maybe_compile_decision_with_key(&compiled, |_| true, &[]),
             HotResult::NotHot
         ));
 
@@ -5080,7 +5158,8 @@ mod tests {
                 ws.cell_key_for(&gk(0xA12)).expect("cell"),
                 None,
                 || true,
-                false
+                false,
+                &[],
             ),
             FunctionEntryStep::NotHot
         ));
@@ -5099,7 +5178,7 @@ mod tests {
         assert!(ws.lookup_chain_with_key(&aborted).is_some());
         ws.set_threshold(0);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&aborted, |_| true),
+            ws.maybe_compile_decision_with_key(&aborted, |_| true, &[]),
             HotResult::NotHot
         ));
         assert!(
@@ -5121,7 +5200,7 @@ mod tests {
         let cell_key = ws.cell_key_for(&key).expect("compiled cell key");
 
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::AlreadyTracing
         ));
         assert!(matches!(
@@ -5129,11 +5208,11 @@ mod tests {
             HotResult::AlreadyTracing
         ));
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            ws.function_entry_step(cell_key, Some(&key), || true, false, &[]),
             FunctionEntryStep::NotHot
         ));
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, true),
+            ws.function_entry_step(cell_key, Some(&key), || true, true, &[]),
             FunctionEntryStep::Proceed
         ));
     }
@@ -5153,11 +5232,11 @@ mod tests {
         assert!(cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE));
 
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::NotHot
         ));
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::StartTracing
         ));
 
@@ -5354,6 +5433,25 @@ mod tests {
             assert!(
                 cell.comparekey_matches(&moved_key),
                 "comparekey must read the collector-forwarded owner-root value"
+            );
+            assert_eq!(
+                cell.current_greens()[2],
+                MOVED_REF_GREEN,
+                "current_greens reads the same forwarded gN as comparekey"
+            );
+            let cell_key = cell.cell_key.get().expect("installed cell has a key");
+            let types = [
+                GreenType::Int,
+                GreenType::Int,
+                GreenType::Ref,
+                GreenType::Ref,
+            ];
+            let installed = ws
+                .installed_greenkey(cell_key, &types)
+                .expect("the retained cell is named by its cell key");
+            assert_eq!(
+                installed.values[2], MOVED_REF_GREEN,
+                "installed_greenkey reconstructs from forwarded gN values"
             );
         }
 
@@ -5757,7 +5855,7 @@ mod tests {
             "JC_TEMPORARY counts normally despite DONT_TRACE_HERE"
         );
         assert!(matches!(
-            ws.force_start_tracing_for_key(&key),
+            ws.force_start_tracing_for_key(&key, &[]),
             HotResult::StartTracing
         ));
 
@@ -5882,7 +5980,7 @@ mod tests {
     /// the veto is what the answer turns on here.
     #[test]
     fn a_confirm_enter_jit_veto_stops_the_tracing_start() {
-        fn refuse(_greenargs: &[i64]) -> bool {
+        fn refuse(_args: &[Value]) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5908,9 +6006,9 @@ mod tests {
     fn the_confirm_enter_jit_hook_can_inspect_the_greens() {
         static FIRST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
         static SECOND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-        fn refuse(greenargs: &[i64]) -> bool {
-            FIRST.store(greenargs[0], std::sync::atomic::Ordering::Relaxed);
-            SECOND.store(greenargs[1], std::sync::atomic::Ordering::Relaxed);
+        fn refuse(args: &[Value]) -> bool {
+            FIRST.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
+            SECOND.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
             false
         }
 
@@ -5927,7 +6025,7 @@ mod tests {
     /// procedure token and `raise EnterJitAssembler`.
     #[test]
     fn a_confirm_enter_jit_veto_stops_entry_into_compiled_code() {
-        fn refuse(_greenargs: &[i64]) -> bool {
+        fn refuse(_args: &[Value]) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5945,7 +6043,7 @@ mod tests {
              entering the machine code",
         );
         assert!(
-            matches!(ws.force_start_tracing_for_key(&key), HotResult::NotHot),
+            matches!(ws.force_start_tracing_for_key(&key, &[]), HotResult::NotHot),
             "the force-start door must not turn an already-compiled cell into \
              an unchecked compiled entry",
         );
@@ -5958,7 +6056,7 @@ mod tests {
     #[test]
     fn a_permissive_confirm_enter_jit_preserves_hash_compiled_entry() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn allow(_greenargs: &[i64]) -> bool {
+        fn allow(_args: &[Value]) -> bool {
             CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
@@ -5989,7 +6087,7 @@ mod tests {
     /// `NotHot` is the caller's instruction to keep interpreting the frame.
     #[test]
     fn a_confirm_enter_jit_veto_stops_the_function_entry_door() {
-        fn refuse(_greenargs: &[i64]) -> bool {
+        fn refuse(_args: &[Value]) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5999,12 +6097,12 @@ mod tests {
         let cell_key = ws.cell_key_for(&key).expect("fixture installed the cell");
 
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            ws.function_entry_step(cell_key, Some(&key), || true, false, &[]),
             FunctionEntryStep::RunCompiled(_),
         ));
         ws.set_confirm_enter_jit(Some(refuse));
         assert!(matches!(
-            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            ws.function_entry_step(cell_key, Some(&key), || true, false, &[]),
             FunctionEntryStep::NotHot,
         ));
     }
@@ -6019,7 +6117,7 @@ mod tests {
     #[test]
     fn the_confirm_enter_jit_hook_fires_once_per_tracing_start() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn allow(_greenargs: &[i64]) -> bool {
+        fn allow(_args: &[Value]) -> bool {
             CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
@@ -6041,7 +6139,7 @@ mod tests {
         );
 
         assert!(matches!(
-            ws.force_start_tracing_for_key(&key),
+            ws.force_start_tracing_for_key(&key, &[]),
             HotResult::StartTracing
         ));
         assert_eq!(
@@ -6056,8 +6154,8 @@ mod tests {
     #[test]
     fn no_declared_hook_confirms_every_entry() {
         let ws = WarmEnterState::new(3);
-        assert!(ws.confirm_enter_jit(&[0]));
-        assert!(ws.confirm_enter_jit(&[i64::MAX]));
+        assert!(ws.confirm_enter_jit(&[0], &[], &[]));
+        assert!(ws.confirm_enter_jit(&[i64::MAX], &[], &[]));
     }
 
     /// warmstate.py — typed variant of `maybe_compile_and_run`.
@@ -6671,7 +6769,7 @@ mod tests {
 
         assert!(
             matches!(
-                ws.maybe_compile_decision_with_key(&second, |cell_key| cell_key == minted),
+                ws.maybe_compile_decision_with_key(&second, |cell_key| cell_key == minted, &[]),
                 HotResult::RunCompiled
             ),
             "the second cell's compiled metadata lives under its minted key",
@@ -7461,7 +7559,7 @@ mod tests {
         assert!(!ws.tick_empty_chain(hash));
 
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::NotHot
         ));
         assert!(
@@ -7469,22 +7567,22 @@ mod tests {
             "a tokenless aborted cell is cleanup_chain",
         );
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::NotHot
         ));
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::NotHot
         ));
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&key, |_| true),
+            ws.maybe_compile_decision_with_key(&key, |_| true, &[]),
             HotResult::StartTracing
         ));
 
         let dnt = GreenKey::new(vec![0xD017, 0x11]);
         ws.disable_noninlinable_function_for_key(&dnt);
         assert!(matches!(
-            ws.maybe_compile_decision_with_key(&dnt, |_| true),
+            ws.maybe_compile_decision_with_key(&dnt, |_| true, &[]),
             HotResult::StartTracing
         ));
         assert!(
