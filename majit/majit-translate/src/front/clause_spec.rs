@@ -24,6 +24,10 @@ use serde_json::Value;
 #[derive(Clone)]
 pub(crate) struct SpecRequest {
     pub fn_id: u64,
+    /// `FunDecl.item_meta.name_path()` of the generic. A call in another
+    /// crate's LLBC may name an opaque `fn_id`; the body is the FunDecl
+    /// under this path that carries `Unstructured`.
+    pub fn_path: String,
     /// Last path segment. Carries the full instantiation key because a
     /// jitcode name keeps only that segment.
     pub leaf: String,
@@ -297,6 +301,176 @@ pub(crate) fn substituted_unstructured(
         .map(|proj| proj.unstructured)
 }
 
+/// Rewrite `req`'s type arguments from `from`'s id space into `to`'s, and
+/// point `fn_id` at `to`'s FunDecl. `FunctionDesc.cachedgraph` copies the
+/// body in one type universe; Charon numbers TypeDecl / TraitImpl ids per
+/// artefact, so a call in another crate's LLBC has to name the same
+/// types by `name_path` before substitution walks the owning body.
+pub(crate) fn remap_spec_request(
+    req: SpecRequest,
+    from: &Llbc,
+    to: &Llbc,
+    fn_id: u64,
+) -> SpecRequest {
+    let maps = IdMaps::build(from, to);
+    SpecRequest {
+        fn_id,
+        fn_path: req.fn_path,
+        leaf: req.leaf,
+        trait_refs: req
+            .trait_refs
+            .into_iter()
+            .map(|v| remap_value(v, from, &maps, Space::TraitRef))
+            .collect(),
+        types: req
+            .types
+            .into_iter()
+            .map(|v| remap_value(v, from, &maps, Space::Ty))
+            .collect(),
+        const_generics: req
+            .const_generics
+            .into_iter()
+            .map(|v| remap_value(v, from, &maps, Space::Const))
+            .collect(),
+    }
+}
+
+struct IdMaps {
+    types: HashMap<u64, u64>,
+    traits: HashMap<u64, u64>,
+    impls: HashMap<u64, u64>,
+    funs: HashMap<u64, u64>,
+}
+
+impl IdMaps {
+    fn build(from: &Llbc, to: &Llbc) -> Self {
+        let type_to: HashMap<String, u64> = to
+            .iter_type_decls()
+            .map(|td| (td.item_meta.name_path(), td.def_id))
+            .collect();
+        let types = from
+            .iter_type_decls()
+            .filter_map(|td| {
+                type_to
+                    .get(&td.item_meta.name_path())
+                    .copied()
+                    .map(|to_id| (td.def_id, to_id))
+            })
+            .collect();
+        let trait_to: HashMap<String, u64> = to
+            .iter_trait_decls()
+            .map(|td| (td.item_meta.name_path(), td.def_id))
+            .collect();
+        let traits = from
+            .iter_trait_decls()
+            .filter_map(|td| {
+                trait_to
+                    .get(&td.item_meta.name_path())
+                    .copied()
+                    .map(|to_id| (td.def_id, to_id))
+            })
+            .collect();
+        let impl_to: HashMap<String, u64> = (0..to.trait_impls_raw().len() as u64)
+            .filter_map(|id| render_trait_impl(to, id).map(|name| (name, id)))
+            .collect();
+        let impls = (0..from.trait_impls_raw().len() as u64)
+            .filter_map(|id| {
+                render_trait_impl(from, id)
+                    .and_then(|name| impl_to.get(&name).copied())
+                    .map(|to_id| (id, to_id))
+            })
+            .collect();
+        let fun_to: HashMap<String, u64> = to
+            .iter_local_fns()
+            .map(|fd| (fd.item_meta.name_path(), fd.def_id))
+            .collect();
+        let funs = from
+            .iter_local_fns()
+            .filter_map(|fd| {
+                fun_to
+                    .get(&fd.item_meta.name_path())
+                    .copied()
+                    .map(|to_id| (fd.def_id, to_id))
+            })
+            .collect();
+        Self {
+            types,
+            traits,
+            impls,
+            funs,
+        }
+    }
+}
+
+fn remap_value(mut v: Value, from: &Llbc, maps: &IdMaps, space: Space) -> Value {
+    remap_value_at(&mut v, from, maps, space, None, 0);
+    v
+}
+
+fn remap_value_at(
+    v: &mut Value,
+    from: &Llbc,
+    maps: &IdMaps,
+    space: Space,
+    key: Option<&str>,
+    depth: usize,
+) {
+    if depth > 64 {
+        return;
+    }
+    let expanded = v.as_object().and_then(|obj| {
+        obj.get("Deduplicated")
+            .and_then(Value::as_u64)
+            .and_then(|id| space.dedup_body(from, id).cloned())
+            .or_else(|| {
+                obj.get("Value")
+                    .and_then(Value::as_array)
+                    .filter(|arr| arr.len() == 2)
+                    .map(|arr| arr[1].clone())
+            })
+    });
+    if let Some(mut plain) = expanded {
+        remap_value_at(&mut plain, from, maps, space, None, depth + 1);
+        *v = plain;
+        return;
+    }
+    match v {
+        Value::Array(items) => {
+            for (i, item) in items.iter_mut().enumerate() {
+                remap_value_at(item, from, maps, space.element(key, i), None, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(id) = map.get("Fun").and_then(Value::as_u64)
+                && let Some(&to_id) = maps.funs.get(&id)
+            {
+                map.insert("Fun".to_string(), Value::from(to_id));
+            }
+            if let Some(id) = map.get("id").and_then(Value::as_u64) {
+                let mapped = match key {
+                    Some("Adt") => maps.types.get(&id).copied(),
+                    Some("TraitImpl") => maps.impls.get(&id).copied(),
+                    Some("skip_binder") if space == Space::TraitRef => {
+                        maps.traits.get(&id).copied()
+                    }
+                    _ => None,
+                };
+                if let Some(to_id) = mapped {
+                    map.insert("id".to_string(), Value::from(to_id));
+                }
+            }
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                let item_space = space.field(&k);
+                if let Some(item) = map.get_mut(&k) {
+                    remap_value_at(item, from, maps, item_space, Some(&k), depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
 pub(crate) fn resolved_trait_impl_id(payload: &Value, llbc: &Llbc) -> Option<u64> {
     let arr = payload.as_array()?;
@@ -317,6 +491,68 @@ pub(crate) fn trait_impl_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Va
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
     Some((fn_id, generics))
+}
+
+/// The provided default body of a trait method the impl does not override,
+/// instantiated at that impl's `Self`.
+///
+/// `specialize.py` `default_specialize` / `FunctionDesc.cachedgraph`: a
+/// resolved impl that inherits a default is still one graph per `Self`.
+/// `None` when the ref is a `Clause`, the impl supplies its own method, the
+/// trait has no default at this index, or `Self` is not a concrete type.
+pub(crate) fn trait_default_method(payload: &Value, llbc: &Llbc) -> Option<(u64, Value)> {
+    let arr = payload.as_array()?;
+    let resolved = resolve_trait_ref(arr.first()?, llbc, 0)?;
+    let impl_id = trait_impl_id(&resolved, llbc, 0)?;
+    let method_idx = arr.get(1)?.as_u64()?;
+    if impl_method_fn_id(llbc, impl_id, method_idx).is_some() {
+        return None;
+    }
+    let fn_id = trait_default_fn_id(llbc, impl_id, method_idx)?;
+    let generics = default_instantiation_generics(llbc, impl_id, &resolved)?;
+    Some((fn_id, generics))
+}
+
+fn trait_default_fn_id(llbc: &Llbc, impl_id: u64, method_idx: u64) -> Option<u64> {
+    let row = trait_impl_row(llbc, impl_id)?;
+    let trait_id = row.get("impl_trait")?.get("id")?.as_u64()?;
+    llbc.trait_by_id(trait_id)?
+        .methods
+        .get(method_idx as usize)?
+        .pointer("/skip_binder/default/id")
+        .and_then(Value::as_u64)
+}
+
+fn default_instantiation_generics(llbc: &Llbc, impl_id: u64, resolved: &Value) -> Option<Value> {
+    let row = trait_impl_row(llbc, impl_id)?;
+    let types = resolved
+        .pointer("/trait_decl_ref/skip_binder/generics/types")
+        .cloned()
+        .or_else(|| row.pointer("/impl_trait/generics/types").cloned())
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    if types.as_array().is_none_or(|items| items.is_empty()) {
+        return None;
+    }
+    let const_generics = resolved
+        .pointer("/trait_decl_ref/skip_binder/generics/const_generics")
+        .cloned()
+        .or_else(|| row.pointer("/impl_trait/generics/const_generics").cloned())
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let mut trait_refs = vec![resolved.clone()];
+    if let Some(implied) = row.get("implied_trait_refs").and_then(Value::as_array) {
+        trait_refs.extend(implied.iter().cloned());
+    }
+    Some(serde_json::json!({
+        "regions": [],
+        "types": types,
+        "const_generics": const_generics,
+        "trait_refs": trait_refs,
+    }))
+}
+
+fn trait_impl_row(llbc: &Llbc, impl_id: u64) -> Option<&Value> {
+    llbc.trait_impl_by_id(impl_id)
+        .or_else(|| llbc.trait_impls_raw().get(impl_id as usize))
 }
 
 /// The impl's own body for the trait's `method_idx`-th method. Each impl
@@ -572,7 +808,7 @@ fn subst_vars(
 
 /// Depth-0 `TypeVar` index: `{"TypeVar":{"Bound":[0, i]}}` or
 /// `{"TypeVar":{"Free": i}}`.
-fn type_var_index(v: &Value) -> Option<usize> {
+pub(crate) fn type_var_index(v: &Value) -> Option<usize> {
     let var = v.as_object()?.get("TypeVar")?;
     if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
         if bound.first()?.as_u64()? != 0 {
@@ -881,6 +1117,21 @@ pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize, expand_aliase
     }
     if let Some(fnptr) = obj.get("FnPtr") {
         return spec_fn_ptr(fnptr, llbc, depth, expand_aliases);
+    }
+    // Associated-type projection. `charon_type_value_to_ast_string` resolves
+    // a unique impl to the bound type and otherwise keeps `??TraitType`.
+    // Dumping the Charon JSON here is not a Rust path: residual shims
+    // turbofish it into generated source.
+    if let Some(arr) = obj.get("TraitType").and_then(Value::as_array)
+        && arr.len() == 3
+    {
+        if let Some(rendered) =
+            crate::front::mir::resolve_trait_assoc_type(&arr[0], &arr[1], llbc, depth)
+            && !rendered.starts_with('?')
+        {
+            return rendered;
+        }
+        return "?TraitType".to_string();
     }
     canonical_type_json(v, llbc, depth)
 }
@@ -1363,6 +1614,14 @@ mod tests {
         ])
     }
 
+    #[test]
+    fn switch_data_branches_are_read_from_the_const_table() {
+        // `Switch.data.branches[i][0]` is a ConstantExpr. Its Deduplicated
+        // id is a const-table id, not a type-table id.
+        assert_eq!(Space::Ty.element(Some("branches"), 0), Space::Const);
+        assert_eq!(Space::Ty.element(Some("branches"), 3), Space::Const);
+    }
+
     /// `fn f<const N: usize>()` at `N = 4` and `N = 8` is two graphs.
     #[test]
     fn spec_leaf_distinguishes_const_generic_values() {
@@ -1523,6 +1782,56 @@ mod tests {
                 format!("m::{}", spec_leaf("f", 3, &args, &llbc))
             );
         });
+    }
+
+    /// TypeDecl ids in a call's type arguments are rewritten to the
+    /// owning crate's ids of the same `name_path`.
+    #[test]
+    fn remap_spec_request_rewrites_adt_ids_by_name_path() {
+        let decl = |def_id: u64, name: &str| {
+            json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": [{"Ident": ["c", 0]}, {"Ident": [name, 0]}],
+                    "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "kind": "Opaque",
+                "signature": {"is_unsafe": false, "inputs": [], "output": {"Scalar": {"Integer": {"Unsigned": "Usize"}}}}
+            })
+        };
+        let file = |crate_name: &str, type_id: u64| {
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": crate_name,
+                    "type_decls": [decl(type_id, "PyFrame")],
+                    "fun_decls": [],
+                    "files": []
+                }
+            })
+        };
+        let from = Llbc::from_slice(file("caller", 9).to_string().as_bytes()).expect("from");
+        let to = Llbc::from_slice(file("owner", 3).to_string().as_bytes()).expect("to");
+        let req = SpecRequest {
+            fn_id: 1669,
+            fn_path: "c::f".to_string(),
+            leaf: "f__spec_x".to_string(),
+            trait_refs: vec![],
+            types: vec![
+                json!({"Adt": {"id": 9, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}, "builtin": null}}),
+            ],
+            const_generics: vec![],
+        };
+        let remapped = remap_spec_request(req, &from, &to, 3225);
+        assert_eq!(remapped.fn_id, 3225);
+        assert_eq!(
+            remapped.types[0].pointer("/Adt/id").and_then(Value::as_u64),
+            Some(3)
+        );
     }
 
     /// `&T` stays distinct from `T`.
@@ -1965,6 +2274,51 @@ mod tests {
         assert_eq!(
             names,
             vec!["fixture::Wrapper<*mut fixture::Inner>".to_string()]
+        );
+    }
+
+    /// An unresolved associated-type projection is not Charon JSON.
+    /// Residual shims turbofish `spec_type_name`; `{ "TraitType": … }`
+    /// is not a Rust type.
+    #[test]
+    fn spec_type_name_of_an_unresolved_trait_type_is_not_json() {
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "fun_decls": [],
+                "type_decls": [],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let projection = json!({
+            "TraitType": [
+                {
+                    "kind": {"Clause": {"Bound": [0, 0]}},
+                    "trait_decl_ref": {
+                        "regions": [],
+                        "skip_binder": {
+                            "generics": {
+                                "const_generics": [],
+                                "regions": [],
+                                "trait_refs": [],
+                                "types": [{"TypeVar": {"Bound": [1, 0]}}]
+                            },
+                            "id": "pyre_object::setobject::AbstractUnwrappedSetStrategy"
+                        }
+                    }
+                },
+                0,
+                {"const_generics": [], "regions": [], "trait_refs": [], "types": []}
+            ]
+        });
+        let name = spec_type_name(&projection, &llbc, 0, false);
+        assert_eq!(name, "?TraitType");
+        assert!(
+            !name.contains('{'),
+            "Charon JSON is not a Rust path: {name}"
         );
     }
 

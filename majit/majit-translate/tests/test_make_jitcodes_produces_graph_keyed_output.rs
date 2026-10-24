@@ -312,7 +312,7 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
                         .as_ref()
                         .unwrap_or(path)
                         .last_segment()
-                        == Some(required_leaf)
+                        .is_some_and(|leaf| leaf_without_spec(leaf) == required_leaf)
                 }),
                 "ordinary portal closure must contain `{required_leaf}`",
             );
@@ -328,6 +328,16 @@ fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
     });
 
     assert_no_instruction_keyed_output_map();
+}
+
+/// `FunctionDesc.cachedgraph` names a specialized copy `{leaf}__spec_…`.
+/// The compiled JitCode is that copy; the portal-closure census names
+/// the original leaf (`clause_spec::unspecialized_leaf`).
+fn leaf_without_spec(leaf: &str) -> &str {
+    match leaf.find("__spec_") {
+        Some(at) => &leaf[..at],
+        None => leaf,
+    }
 }
 
 fn assert_registry_is_graph_keyed(reg: &AllJitCodes) {

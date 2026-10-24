@@ -452,6 +452,7 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
 
     let mut field_reads: Vec<(String, Option<String>)> = Vec::new();
     let mut field_writes: Vec<(String, Option<String>)> = Vec::new();
+    let mut field_write_tys: Vec<majit_translate::model::ValueType> = Vec::new();
     let mut ctor_count = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
@@ -459,8 +460,9 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
                 OpKind::FieldRead { field, .. } => {
                     field_reads.push((field.name.clone(), field.owner_root.clone()));
                 }
-                OpKind::FieldWrite { field, .. } => {
+                OpKind::FieldWrite { field, ty, .. } => {
                     field_writes.push((field.name.clone(), field.owner_root.clone()));
+                    field_write_tys.push(ty.clone());
                 }
                 OpKind::Call {
                     target: CallTarget::SyntheticTransparentCtor { .. },
@@ -485,6 +487,14 @@ fn lowers_tuple_roundtrip_with_symmetric_positional_field_reads() {
             ("__pos_1".to_string(), Some("Tuple<i64,i64>".to_string())),
         ],
         "tuple construction must emit a __pos_0 / __pos_1 FieldWrite chain"
+    );
+    assert_eq!(
+        field_write_tys,
+        vec![
+            majit_translate::model::ValueType::Int,
+            majit_translate::model::ValueType::Int
+        ],
+        "tuple i64 items are Signed (`history.py` getkind), not the empty-spelling Ref fallback"
     );
 
     // Exactly the two genuine tuple reads become FieldReads. The three
@@ -1137,73 +1147,28 @@ fn header_read_narrows_to_a_typed_field_read() {
     );
 }
 
-/// A boxing allocation becomes `NewWithVtable` only after its class-static
-/// address is known. Exercise the fusion directly so the unresolved and
-/// resolved cases differ by that input alone.
+/// A boxing allocation becomes `NewWithVtable` once its class-static
+/// address is a constant. An immutable static is that constant
+/// (`bookkeeper.py immutablevalue`); a residual FunctionPath of the
+/// static's name was the deviation this branch deleted.
 #[test]
 fn boxing_cluster_fuses_once_the_class_address_resolves() {
-    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    use majit_translate::model::{CallTarget, OpKind};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
-    let attrs = std::collections::HashMap::from([
-        (
-            "ObjectHeader".to_string(),
-            vec![
-                ("ob_type".to_string(), ValueType::Ref(None)),
-                ("w_class".to_string(), ValueType::Ref(None)),
-            ],
-        ),
-        (
-            "W_IntObject".to_string(),
-            vec![
-                ("ob_header".to_string(), ValueType::Ref(None)),
-                ("intval".to_string(), ValueType::Int),
-            ],
-        ),
-    ]);
 
     let llbc = load_corpus();
 
-    // Without a resolvable class address the cluster is left alone.
-    let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
-    assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
-        0,
-        "an unresolvable class-static address declines the fuse, silently",
-    );
-
-    // Stand in for the driver-supplied static address.
-    let mut graph = lower_function(llbc, "w_new_int").expect("lowering");
-    let mut substituted = 0usize;
-    for b in &mut graph.blocks {
-        for op in &mut b.operations {
-            let is_class_static = matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } if segments.last().map(String::as_str) == Some("INT_CLASS")
-            );
-            if is_class_static {
-                op.kind = OpKind::ConstRefAddr(CLASS_ADDR);
-                substituted += 1;
-            }
-        }
-    }
-    assert_eq!(
-        substituted, 2,
-        "ob_type and w_class each read the class static",
-    );
-
-    assert_eq!(
-        majit_translate::model::fuse_boxing_alloc(&mut graph, &attrs),
-        1,
-        "the cluster fuses once the class address is a constant",
-    );
-
+    // `bookkeeper.py immutablevalue`: an immutable class static is a
+    // ConstRefAddr of the declaration itself, never a residual
+    // FunctionPath of the static's name. Lowering fuses from that
+    // identity; the host-registered address is the sibling
+    // `boxing_cluster_fuses_from_the_host_supplied_class_address`.
+    let graph = lower_function(llbc, "w_new_int").expect("lowering");
     let mut fused = Vec::new();
     let mut payload_stores = 0usize;
     let mut residual_mallocs = 0usize;
+    let mut residual_class_reads = 0usize;
     for b in &graph.blocks {
         for op in &b.operations {
             match &op.kind {
@@ -1212,27 +1177,42 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } if segments.last().map(String::as_str) == Some("malloc_typed") => {
-                    residual_mallocs += 1
-                }
+                } => match segments.last().map(String::as_str) {
+                    Some("malloc_typed") => residual_mallocs += 1,
+                    Some("INT_CLASS") => residual_class_reads += 1,
+                    _ => {}
+                },
                 _ => {}
             }
         }
     }
     assert_eq!(
-        fused,
-        vec![("W_IntObject".to_string(), CLASS_ADDR)],
-        "one NewWithVtable carrying the real class pointer",
+        residual_class_reads, 0,
+        "INT_CLASS is a ConstRefAddr, not a residual call",
     );
-    // Two: the re-emitted store after the `NewWithVtable`, plus the original
-    // aggregate store, which is dead but not yet swept — `fuse_boxing_alloc`
-    // leaves that to the `remove_dead_aggregates` pass in
-    // `simplify_lowered_graph`.
-    assert_eq!(payload_stores, 2, "the intval payload store is re-emitted");
     assert_eq!(
         residual_mallocs, 0,
         "the malloc_typed call is consumed, not left residual",
     );
+    assert_eq!(
+        fused.len(),
+        1,
+        "the cluster fuses from the immutable static"
+    );
+    assert_eq!(
+        fused[0].0, "W_IntObject",
+        "one NewWithVtable carrying the class static"
+    );
+    assert_ne!(
+        fused[0].1, 0,
+        "vtable is the static's identity, not a null placeholder"
+    );
+    assert_ne!(
+        fused[0].1, CLASS_ADDR,
+        "without HostStaticAddrs the vtable is the declaration sentinel"
+    );
+    // Whole-graph lowering runs `remove_dead_aggregates` after the fuse.
+    assert_eq!(payload_stores, 1, "the intval payload store is re-emitted");
 }
 
 /// The production lowering receives class-static addresses through
@@ -3404,6 +3384,29 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
     }
 }
 
+/// `from_type_and_value` does `unwrap_or(PyErrorKind::RuntimeError)`.
+/// `PyErrorKind` is a fieldless enum (Int). Recasting the tag onto the
+/// enum class (`rclass.py` `cast_instance`) is the non-pointer operand
+/// the annotator rejects, and dual-gate Skip then hydrates a Ref first
+/// arg for residual `make_pyerror` (FUNC.ARGS Int).
+#[test]
+fn from_type_and_value_does_not_cast_fieldless_kind() {
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let graph = lower_named(llbc, "from_type_and_value")
+        .unwrap_or_else(|e| panic!("lower from_type_and_value: {e}"));
+    let kind_casts: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| majit_translate::model::cast_instance_root(&op.kind))
+        .filter(|root| *root == "PyErrorKind")
+        .collect();
+    assert!(
+        kind_casts.is_empty(),
+        "PyErrorKind is a fieldless enum; must not __cast_instance_intrinsic the tag; roots={kind_casts:?}"
+    );
+}
+
 /// Graphs that pass a guard-containing pointer to a residual callee are
 /// declined. The interpreter corpus has none. `pyre-jit` used to resume a
 /// native `FailArgSource` (it holds the guard) through residual `llmodel`
@@ -3462,4 +3465,310 @@ fn call_names_owner_root_guard(call: &str) -> bool {
         || call.contains("shadow_stack::<Impl>::get")
         || call.contains("shadow_stack::<Impl>::set")
         || call.contains("shadow_stack::<Impl>::drop")
+}
+
+/// lowered body, not a `__cast_pointer` of the `FrameBox` onto `PyFrame`.
+#[test]
+fn flat_pycall_frame_comes_from_deref_mut() {
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
+    use std::collections::HashSet;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let context = LowerContext::new(&llbc);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path() == "pyre_interpreter::function::_flat_pycall")
+        .unwrap_or_else(|| {
+            let hits: Vec<_> = llbc
+                .iter_local_fns()
+                .filter(|fd| fd.item_meta.name_path().contains("_flat_pycall"))
+                .map(|fd| fd.item_meta.name_path())
+                .collect();
+            panic!("missing pyre_interpreter::function::_flat_pycall, hits: {hits:?}");
+        });
+    let graph =
+        lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower _flat_pycall: {err}"));
+    let live = reachable_blocks(&graph);
+
+    fn value_id(arg: &LinkArg) -> Option<u64> {
+        match arg {
+            LinkArg::Value(var) => Some(var.id()),
+            LinkArg::Const(_) => None,
+        }
+    }
+
+    fn call_leaf(target: &CallTarget) -> &str {
+        match target {
+            CallTarget::Method { name, .. } => name,
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().map(String::as_str).unwrap_or("")
+            }
+            _ => "",
+        }
+    }
+
+    fn op_result<'a>(graph: &'a FunctionGraph, id: u64) -> Option<&'a SpaceOperation> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref().is_some_and(|var| var.id() == id))
+        })
+    }
+
+    fn phi_sources(
+        graph: &FunctionGraph,
+        id: u64,
+        live: &HashSet<majit_translate::model::BlockId>,
+    ) -> Vec<u64> {
+        let Some(block) = graph
+            .blocks
+            .iter()
+            .find(|block| block.inputargs.iter().any(|var| var.id() == id))
+        else {
+            return Vec::new();
+        };
+        let pos = block
+            .inputargs
+            .iter()
+            .position(|var| var.id() == id)
+            .expect("input position");
+        graph
+            .blocks
+            .iter()
+            .filter(|pred| live.contains(&pred.id))
+            .flat_map(|pred| pred.exits.iter())
+            .filter(|link| link.target == block.id)
+            .filter_map(|link| link.args.get(pos).and_then(value_id))
+            .collect()
+    }
+
+    fn is_frame_box_new(llbc: &Llbc, kind: &OpKind) -> bool {
+        let OpKind::Call { target, .. } = kind else {
+            return false;
+        };
+        let Some(id) = target.fun_decl_id() else {
+            return false;
+        };
+        llbc.fn_by_id(id).is_some_and(|fd| {
+            fd.item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+        })
+    }
+
+    fn receiver_id(kind: &OpKind) -> Option<u64> {
+        let OpKind::Call { args, .. } = kind else {
+            return None;
+        };
+        args.first().and_then(value_id)
+    }
+
+    let mut frame_boxes = HashSet::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            if is_frame_box_new(&llbc, &op.kind)
+                && let Some(var) = &op.result
+            {
+                frame_boxes.insert(var.id());
+            }
+        }
+    }
+    assert!(
+        !frame_boxes.is_empty(),
+        "no FrameBox::new result in _flat_pycall"
+    );
+    // A loop-carried block argument is the same handle when every source
+    // reaches `FrameBox::new` and none reaches a different value. A source
+    // that only cycles counts once some other source is grounded.
+    fn frame_box_verdict(
+        graph: &FunctionGraph,
+        id: u64,
+        live: &HashSet<majit_translate::model::BlockId>,
+        known: &HashSet<u64>,
+        stack: &mut HashSet<u64>,
+    ) -> u8 {
+        if known.contains(&id) {
+            return 2;
+        }
+        if !stack.insert(id) {
+            return 1;
+        }
+        let verdict = if let Some(op) = op_result(graph, id) {
+            match &op.kind {
+                OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                    frame_box_verdict(graph, operand.id(), live, known, stack)
+                }
+                _ => 0,
+            }
+        } else {
+            let srcs = phi_sources(graph, id, live);
+            if srcs.is_empty() {
+                0
+            } else {
+                let mut any_yes = false;
+                let mut any_no = false;
+                for src in srcs {
+                    match frame_box_verdict(graph, src, live, known, stack) {
+                        2 => any_yes = true,
+                        0 => any_no = true,
+                        _ => {}
+                    }
+                }
+                if any_no {
+                    0
+                } else if any_yes {
+                    2
+                } else {
+                    1
+                }
+            }
+        };
+        stack.remove(&id);
+        verdict
+    }
+    let mut candidates = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        candidates.extend(block.inputargs.iter().map(|var| var.id()));
+        for op in &block.operations {
+            let OpKind::UnaryOp { op: name, .. } = &op.kind else {
+                continue;
+            };
+            if name == "same_as"
+                && let Some(var) = &op.result
+            {
+                candidates.push(var.id());
+            }
+        }
+    }
+    loop {
+        let before = frame_boxes.len();
+        for id in &candidates {
+            if frame_boxes.contains(id) {
+                continue;
+            }
+            let mut stack = HashSet::new();
+            if frame_box_verdict(&graph, *id, &live, &frame_boxes, &mut stack) == 2 {
+                frame_boxes.insert(*id);
+            }
+        }
+        if frame_boxes.len() == before {
+            break;
+        }
+    }
+
+    fn is_frame_box_pyframe_cast(kind: &OpKind, frame_boxes: &HashSet<u64>) -> bool {
+        majit_translate::model::cast_pointer_root(kind) == Some("PyFrame")
+            && receiver_id(kind).is_some_and(|id| frame_boxes.contains(&id))
+    }
+
+    let mut cast_ops = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            if is_frame_box_pyframe_cast(&op.kind, &frame_boxes) {
+                cast_ops.push(format!("{:?}", op.kind));
+            }
+        }
+    }
+    assert!(
+        cast_ops.is_empty(),
+        "__cast_pointer(PyFrame) of the FrameBox value: {cast_ops:?}"
+    );
+
+    fn forward_id(kind: &OpKind) -> Option<u64> {
+        match kind {
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => Some(operand.id()),
+            OpKind::Call { .. } if majit_translate::model::cast_instance_root(kind).is_some() => {
+                receiver_id(kind)
+            }
+            _ => None,
+        }
+    }
+
+    fn from_deref_mut_or_body(
+        graph: &FunctionGraph,
+        id: u64,
+        frame_boxes: &HashSet<u64>,
+        live: &HashSet<majit_translate::model::BlockId>,
+        seen: &mut HashSet<u64>,
+    ) -> bool {
+        if !seen.insert(id) {
+            return false;
+        }
+        let ok = if frame_boxes.contains(&id) {
+            false
+        } else if let Some(op) = op_result(graph, id) {
+            if is_frame_box_pyframe_cast(&op.kind, frame_boxes) {
+                false
+            } else if let OpKind::Call { target, .. } = &op.kind
+                && receiver_id(&op.kind).is_some_and(|recv| frame_boxes.contains(&recv))
+                && matches!(call_leaf(target), "deref_mut" | "frame_ptr")
+            {
+                true
+            } else if let OpKind::FieldRead { field, base, .. } = &op.kind
+                && matches!(field.name.as_str(), "owner_root" | "ptr")
+                && frame_boxes.contains(&base.id())
+            {
+                true
+            } else if let Some(next) = forward_id(&op.kind) {
+                from_deref_mut_or_body(graph, next, frame_boxes, live, seen)
+            } else {
+                false
+            }
+        } else {
+            let srcs = phi_sources(graph, id, live);
+            !srcs.is_empty()
+                && srcs
+                    .iter()
+                    .all(|src| from_deref_mut_or_body(graph, *src, frame_boxes, live, seen))
+        };
+        seen.remove(&id);
+        ok
+    }
+
+    let mut eval_args = Vec::new();
+    for block in &graph.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if call_leaf(target) != "eval_current_frame_raw" {
+                continue;
+            }
+            let arg = args
+                .first()
+                .and_then(value_id)
+                .unwrap_or_else(|| panic!("eval_current_frame_raw has no value argument"));
+            eval_args.push(arg);
+        }
+    }
+    assert!(
+        !eval_args.is_empty(),
+        "no eval_current_frame_raw call in _flat_pycall"
+    );
+    for arg in eval_args {
+        let mut seen = HashSet::new();
+        assert!(
+            from_deref_mut_or_body(&graph, arg, &frame_boxes, &live, &mut seen),
+            "eval_current_frame_raw argument v{arg} is not the deref_mut result or its lowered body"
+        );
+    }
 }

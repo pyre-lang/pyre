@@ -163,6 +163,7 @@ fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
     let out = run(&[
         ("PYRE_FBW_MULTIFRAME_DEPTH", "1"),
         ("PYRE_FBW_DEBUG_ABORT", "1"),
+        ("MAJIT_STATS", "1"),
     ]);
     let text = format!(
         "{}{}",
@@ -182,9 +183,21 @@ fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
         report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
     );
     // `_getframe().f_lineno` now reads the compiled last_instr store, so this
-    // fixture no longer forces a multi-frame blackhole terminal.  The depth-cap
-    // bypass is the `OverMultiframeDepth: 0` count above; the answer and the
-    // escape arm still prove the recursive body ran.
+    // fixture no longer forces a multi-frame blackhole terminal. Portal
+    // interpret may compile the recursive callee at function entry
+    // (`fbw_walks=0`). The depth-cap bypass is the `OverMultiframeDepth: 0`
+    // count above; either FBW adopted the terminal or interpret compiled.
+    let adopted = text
+        .lines()
+        .any(|l| l.starts_with("[fbw-blackhole] adopted multi-frame terminal"));
+    let compiled = text
+        .lines()
+        .any(|l| l.contains("loops_compiled=") && !l.contains("loops_compiled=0"));
+    assert!(
+        adopted || compiled,
+        "neither the FBW drain nor portal interpret handled the recursive carrier\n{}",
+        report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
+    );
     assert_answers("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out);
     // The rollback the arm exists to avoid: an abort that ran effects and found
     // no image to adopt.

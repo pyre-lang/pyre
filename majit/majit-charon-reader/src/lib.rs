@@ -80,6 +80,17 @@ pub struct Llbc {
     /// retain layout attributes but may expose the type body as `Opaque`; the
     /// defining crate supplies the missing one-field scalar shape.
     transparent_scalar_kinds: parking_lot::RwLock<Vec<(String, TransparentScalarKind)>>,
+    /// Qualified paths of by-value raw structs harvested from a defining
+    /// crate (`adt_def_is_raw_storage`). An `Opaque` dependent has no field
+    /// list; membership here is that missing layout, so `getkind` of the
+    /// raw `Ptr` stays `'int'` across the linked input.
+    raw_struct_paths: parking_lot::RwLock<Vec<String>>,
+    /// Structs whose `_alloc_flavor_<Struct>` marker is `"raw"`
+    /// (`rclass.py getgcflavor` / `classdesc.get_param('_alloc_flavor_')`).
+    /// A pointer to one is a raw-flavored `Ptr` in the annotator; `history.py`
+    /// `getkind` `'int'` is the JIT kind only. Sorted; lookup matches the
+    /// intern-key leaf as well as the qualified path.
+    raw_alloc_flavor_paths: parking_lot::RwLock<Vec<String>>,
     /// Folded initializer of one global, keyed by that global's `def_id`
     /// inside this artefact. The encoded literal is owned by the global
     /// the lowering already loads with `global_by_id`; it is not a path
@@ -322,6 +333,8 @@ impl Llbc {
             dedup_layout,
             span_bodies,
             transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
+            raw_struct_paths: parking_lot::RwLock::new(Vec::new()),
+            raw_alloc_flavor_paths: parking_lot::RwLock::new(Vec::new()),
             foldable_const_lits: parking_lot::RwLock::new(Vec::new()),
             eval_hook_graphs: parking_lot::RwLock::new(Vec::new()),
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
@@ -592,6 +605,69 @@ impl Llbc {
             .binary_search_by(|(known, _)| known.as_str().cmp(path))
             .ok()?;
         Some(kinds[index].1)
+    }
+
+    /// Merge all-raw struct paths discovered across the linked LLBC set.
+    /// Entries are kept sorted for deterministic, allocation-free lookup.
+    pub fn register_raw_struct_paths(&self, entries: impl IntoIterator<Item = String>) {
+        let mut paths = self.raw_struct_paths.write();
+        for path in entries {
+            if let Err(index) = paths.binary_search(&path) {
+                paths.insert(index, path);
+            }
+        }
+    }
+
+    /// Whether `path` is a by-value raw struct in some artefact of the
+    /// linked translation input.
+    pub fn is_raw_struct_path(&self, path: &str) -> bool {
+        self.raw_struct_paths
+            .read()
+            .binary_search_by(|known| known.as_str().cmp(path))
+            .is_ok()
+    }
+
+    /// Merge harvested `_alloc_flavor_ = raw` struct names. Entries are
+    /// kept sorted; both the bare leaf (`CodeObject`) and a crate-stripped
+    /// qualified path are stored, matching the harvest set.
+    pub fn register_raw_alloc_flavor_paths(&self, entries: impl IntoIterator<Item = String>) {
+        let mut paths = self.raw_alloc_flavor_paths.write();
+        for path in entries {
+            if let Err(index) = paths.binary_search(&path) {
+                paths.insert(index, path);
+            }
+        }
+    }
+
+    /// Whether `path` names a struct harvested as `_alloc_flavor_ = raw`.
+    ///
+    /// The harvest stores the crate-stripped intern key
+    /// (`bytecode::CodeObject`). A TypeDecl `name_path` still carries the
+    /// crate (`rustpython_compiler_core::bytecode::CodeObject`); strip that
+    /// first segment the way `alloc_flavor_raw_contains` does. A stored
+    /// bare leaf still matches the query leaf.
+    pub fn is_raw_alloc_flavor_path(&self, path: &str) -> bool {
+        let paths = self.raw_alloc_flavor_paths.read();
+        if paths.is_empty() {
+            return false;
+        }
+        if Self::raw_alloc_flavor_contains(&paths, path) {
+            return true;
+        }
+        if let Some((_, stripped)) = path.split_once("::")
+            && Self::raw_alloc_flavor_contains(&paths, stripped)
+        {
+            return true;
+        }
+        let leaf = path.rsplit("::").next().unwrap_or(path);
+        let leaf = leaf.split('<').next().unwrap_or(leaf);
+        leaf != path && Self::raw_alloc_flavor_contains(&paths, leaf)
+    }
+
+    fn raw_alloc_flavor_contains(paths: &[String], key: &str) -> bool {
+        paths
+            .binary_search_by(|known| known.as_str().cmp(key))
+            .is_ok()
     }
 
     /// Resolve a Charon `Deduplicated: <id>` type reference to the
@@ -1335,6 +1411,35 @@ mod tests {
     }
 
     #[test]
+    fn size_align_survives_unresolved_field_offsets() {
+        // `layout_for_target` drops the whole layout when a field offset
+        // is still `chosen: null`. `size_of` / `align_of` only need the
+        // two words (`llmemory.sizeof`).
+        let doc = r#"{"charon_version":"t","has_errors":false,
+            "translated":{"crate_name":"c","fun_decls":[],"type_decls":[{
+                "def_id":0,
+                "item_meta":{"name":[{"Ident":["S",0]}],
+                    "span":{"data":{"file_id":0,"beg":{"line":1,"col":0},"end":{"line":1,"col":1}}},
+                    "source_text":null,
+                    "attr_info":{"attributes":[],"inline":null,"rename":null,"public":true},
+                    "is_local":true},
+                "kind":{"Struct":[]},
+                "layout":[{"key":"t","value":{
+                    "size":16,
+                    "align":8,
+                    "variant_layouts":[{"field_offsets":[{"chosen":null}]}]
+                }}]
+            }]}}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("fixture parses");
+        let decl = l.type_by_id(0).expect("decl");
+        assert!(decl.layout_for_target(&l, "t").is_none());
+        assert_eq!(
+            decl.size_align_for_target(&l, "t"),
+            Some((Some(16), Some(8)))
+        );
+    }
+
+    #[test]
     fn a_payload_free_type_kind_is_a_string_body() {
         // `!` hash-conses as `{"Value": [id, "Never"]}`; a monomorphized
         // `ControlFlow<Result<!, E>, T>` names it among its instance
@@ -1421,6 +1526,23 @@ mod tests {
         assert!(llbc.span_data(&missing).is_none());
         let present = ullbc::SpanRef::Deduplicated(4);
         assert_eq!(llbc.span_data(&present).unwrap().beg.line, 4);
+    }
+
+    #[test]
+    fn raw_alloc_flavor_path_matches_crate_stripped_intern_key() {
+        let doc = r#"{"charon_version":"t","has_errors":false,
+                      "translated":{"crate_name":"c","fun_decls":[]}}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("loads");
+        l.register_raw_alloc_flavor_paths(["bytecode::CodeObject".to_string()]);
+        assert!(l.is_raw_alloc_flavor_path("bytecode::CodeObject"));
+        assert!(
+            l.is_raw_alloc_flavor_path("rustpython_compiler_core::bytecode::CodeObject"),
+            "TypeDecl name_path keeps the crate; harvest stores the intern key"
+        );
+        assert!(
+            !l.is_raw_alloc_flavor_path("other::CodeObject"),
+            "a different module's CodeObject is not the harvested intern key"
+        );
     }
 
     #[test]

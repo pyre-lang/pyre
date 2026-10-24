@@ -526,16 +526,19 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
 /// with each native base descriptor preserves that slot decision for mixed
 /// inheritance: `class C(bytearray, A)` stays native, while
 /// `class C(A, bytearray)` reaches `A.__buffer__`.
-unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
+unsafe fn memoryview_is_native_buffer_descr(mut descr: PyObjectRef) -> bool {
     unsafe {
         crate::typedef::ensure_array_typeobjects();
+        let w_buffer_name = pyre_object::with_roots!(descr => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__buffer__"))
+        });
         for base in [
             crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
             crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
             crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
         ] {
-            if crate::baseobjspace::lookup_in_type(base, "__buffer__")
+            if crate::baseobjspace::lookup_in_type(base, w_buffer_name)
                 .is_some_and(|native| std::ptr::eq(native, descr))
             {
                 return true;
@@ -549,8 +552,9 @@ unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
 /// type uses a native buffer slot (or has no Python-visible descriptor).
 unsafe fn memoryview_python_buffer_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
-        let descr = crate::baseobjspace::lookup(obj, "__buffer__")?;
-        (!memoryview_is_native_buffer_descr(descr)).then_some(descr)
+        let mut descr = crate::baseobjspace::lookup(obj, "__buffer__")?;
+        (!pyre_object::with_roots!(descr => memoryview_is_native_buffer_descr(descr)))
+            .then_some(descr)
     }
 }
 
@@ -1289,8 +1293,11 @@ unsafe fn memoryview_check_dimension(
 /// substitute its own "not an index" message for a miss while anything
 /// `__index__` itself raises still propagates unchanged.  Converting here
 /// instead would both run a user slot twice and relabel its exception.
-pub(crate) unsafe fn index_check(w: PyObjectRef) -> bool {
-    unsafe { pyre_object::is_int(w) || crate::baseobjspace::lookup(w, "__index__").is_some() }
+pub(crate) unsafe fn index_check(mut w: PyObjectRef) -> bool {
+    unsafe {
+        pyre_object::is_int(w)
+            || pyre_object::with_roots!(w => crate::baseobjspace::lookup(w, "__index__")).is_some()
+    }
 }
 
 /// `_start_from_tuple` — the wrapped, bounds-checked index of every dimension
@@ -1303,8 +1310,8 @@ unsafe fn memoryview_start_from_tuple(
         let n = pyre_object::w_tuple_len(index) as i64;
         let mut indices = Vec::with_capacity(n as usize);
         for dim in 0..n {
-            let w = pyre_object::w_tuple_getitem(index, dim).unwrap_or(w_none());
-            if !index_check(w) {
+            let mut w = pyre_object::w_tuple_getitem(index, dim).unwrap_or(w_none());
+            if !pyre_object::with_roots!(mv, index, w => index_check(w)) {
                 return Err(crate::PyError::type_error("memoryview: invalid slice key"));
             }
             let index = pyre_object::with_roots!(index, mv => getindex_w(w))?;
@@ -1339,14 +1346,14 @@ unsafe fn memoryview_unpack_at(
 
 /// Classify a tuple key: all-integer is a multi-index element access,
 /// all-slice (non-empty) is multi-dimensional slicing.
-unsafe fn memoryview_tuple_kind(index: PyObjectRef) -> (bool, bool) {
+unsafe fn memoryview_tuple_kind(mut index: PyObjectRef) -> (bool, bool) {
     unsafe {
         let n = pyre_object::w_tuple_len(index);
         let mut all_index = true;
         let mut all_slice = n > 0;
         for i in 0..n {
-            let w = pyre_object::w_tuple_getitem(index, i as i64).unwrap_or(w_none());
-            if !index_check(w) {
+            let mut w = pyre_object::w_tuple_getitem(index, i as i64).unwrap_or(w_none());
+            if !pyre_object::with_roots!(index, w => index_check(w)) {
                 all_index = false;
             }
             if !pyre_object::is_slice(w) {
@@ -1362,7 +1369,7 @@ unsafe fn memoryview_tuple_kind(index: PyObjectRef) -> (bool, bool) {
 /// tuple reads an element of an N-D view.
 fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut mv = args.first().copied().unwrap_or(w_none());
-    let index = args.get(1).copied().unwrap_or(w_none());
+    let mut index = args.get(1).copied().unwrap_or(w_none());
     unsafe {
         use pyre_object::memoryview::*;
         memoryview_check_released(mv)?;
@@ -1375,7 +1382,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if pyre_object::is_slice(index) {
             return memoryview_slice_view(mv, index);
         }
-        if index_check(index) {
+        if pyre_object::with_roots!(mv, index => index_check(index)) {
             memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
             if ndim == 0 {
                 return Err(crate::PyError::type_error(
@@ -1399,7 +1406,8 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             return memoryview_unpack_at(mv, &[index], fmt, itemsize as usize);
         }
         if pyre_object::is_tuple(index) {
-            let (all_index, all_slice) = memoryview_tuple_kind(index);
+            let (all_index, all_slice) =
+                pyre_object::with_roots!(mv, index => memoryview_tuple_kind(index));
             if all_index {
                 memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
                 let length = pyre_object::w_tuple_len(index) as i64;
@@ -2140,15 +2148,18 @@ unsafe fn release_native_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool 
 }
 
 /// Is `descr` a native `bf_releasebuffer` wrapper rather than a Python slot?
-unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
+unsafe fn memoryview_is_native_release_descr(mut descr: PyObjectRef) -> bool {
     unsafe {
         crate::typedef::ensure_array_typeobjects();
+        let w_release_name = pyre_object::with_roots!(descr => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__release_buffer__"))
+        });
         for base in [
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
             crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
             crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE),
         ] {
-            if crate::baseobjspace::lookup_in_type(base, "__release_buffer__")
+            if crate::baseobjspace::lookup_in_type(base, w_release_name)
                 .is_some_and(|native| std::ptr::eq(native, descr))
             {
                 return true;
@@ -2161,8 +2172,9 @@ unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
 /// Python `slot_bf_releasebuffer` selected by the concrete type's MRO.
 unsafe fn memoryview_python_release_descr(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
-        let descr = crate::baseobjspace::lookup(obj, "__release_buffer__")?;
-        (!memoryview_is_native_release_descr(descr)).then_some(descr)
+        let mut descr = crate::baseobjspace::lookup(obj, "__release_buffer__")?;
+        (!pyre_object::with_roots!(descr => memoryview_is_native_release_descr(descr)))
+            .then_some(descr)
     }
 }
 
@@ -2225,9 +2237,14 @@ unsafe fn w_memoryview_new_restricted_snapshot(source: PyObjectRef) -> PyObjectR
 /// Run a Python release override for a native exporter with the temporary
 /// restricted view used by CPython, then make that temporary unusable even
 /// when user code retained it.
-unsafe fn memoryview_release_native_python_slot(exporter: PyObjectRef, source: PyObjectRef) {
+unsafe fn memoryview_release_native_python_slot(
+    mut exporter: PyObjectRef,
+    mut source: PyObjectRef,
+) {
     unsafe {
-        let Some(descr) = memoryview_python_release_descr(exporter) else {
+        let Some(descr) = pyre_object::with_roots!(exporter, source => {
+            memoryview_python_release_descr(exporter)
+        }) else {
             return;
         };
         let _roots = pyre_object::gc_roots::push_roots();
@@ -6054,9 +6071,14 @@ pub(crate) unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
             return true;
         }
     }
-    let Some((src, _)) =
-        (unsafe { crate::baseobjspace::lookup_where_with_method_cache(w_class, "__abs__") })
-    else {
+    let mut w_class = w_class;
+    let mut obj = obj;
+    let Some((src, _)) = (unsafe {
+        pyre_object::with_roots!(obj, w_class => crate::baseobjspace::lookup_where_with_method_cache(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__abs__")),
+        ))
+    }) else {
         return true;
     };
     [
@@ -6075,21 +6097,25 @@ pub(crate) extern "C" fn bh_abs_uses_builtin(obj: PyObjectRef) -> i64 {
     i64::from(unsafe { abs_uses_builtin(obj) })
 }
 
-fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn builtin_abs_obj(mut obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // operation.py `abs` → `space.abs` → descroperation `_make_unaryop_impl`
     // (`__abs__`).  The exact-type shortcut is `use_special_method_shortcut`:
     // a receiver whose `w_class` is still the builtin numeric type cannot
     // carry a replacement.  Anything else looks `__abs__` up on the live
     // type (typedef.py user-subclass shortcut reset) and calls it.
-    if unsafe { abs_uses_builtin(obj) } {
+    if unsafe { pyre_object::with_roots!(obj => abs_uses_builtin(obj)) } {
         return abs_structural(obj);
     }
     unsafe {
         let Some(tp) = crate::typedef::r#type(obj) else {
             return Err(abs_bad_operand(obj));
         };
+        let mut tp = tp.as_ptr();
         // typeobject.py `lookup` = `lookup_where_with_method_cache`.
-        match crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__abs__") {
+        match pyre_object::with_roots!(obj, tp => crate::baseobjspace::lookup_where_with_method_cache(
+            tp,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__abs__")),
+        )) {
             Some((src, method))
                 if [
                     &pyre_object::INT_TYPE,
@@ -6101,9 +6127,7 @@ fn builtin_abs_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             {
                 abs_structural(obj)
             }
-            Some((_, method)) => {
-                crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])
-            }
+            Some((_, method)) => crate::baseobjspace::get_and_call_function(method, obj, tp, &[]),
             None => Err(abs_bad_operand(obj)),
         }
     }
@@ -6725,9 +6749,12 @@ pub fn space_index_w(mut obj: PyObjectRef) -> Result<i64, crate::PyError> {
         if let Some(v) = as_index_value(obj) {
             return v;
         }
+        let w_index_name = pyre_object::with_roots!(obj => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__"))
+        });
         if let Some(w_type) = crate::typedef::r#type(obj)
             && let Some(index_fn) =
-                crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__index__")
+                crate::baseobjspace::lookup_in_type(w_type.as_ptr(), w_index_name)
         {
             let result = pyre_object::with_roots!(obj =>
                 crate::call::call_function_impl_result(index_fn, &[obj])
@@ -9363,16 +9390,19 @@ fn os_error_use_init(w_self: PyObjectRef) -> bool {
 
 /// `_use_init` keyed on the type object directly (the `__new__` half has the
 /// subtype, not yet an instance).
-fn os_error_type_use_init(w_type: PyObjectRef) -> bool {
-    let Some(w_os_error) = lookup_exc_class("OSError") else {
+fn os_error_type_use_init(mut w_type: PyObjectRef) -> bool {
+    let Some(mut w_os_error) = lookup_exc_class("OSError") else {
         return false;
     };
     // The exact OSError type is never `_use_init` (line 542-543).
     if std::ptr::eq(w_type, w_os_error) {
         return false;
     }
-    let self_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") };
-    let base_init = unsafe { crate::baseobjspace::lookup_in_type(w_os_error, "__init__") };
+    let w_init_name = pyre_object::with_roots!(w_type, w_os_error => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__"))
+    });
+    let self_init = unsafe { crate::baseobjspace::lookup_in_type(w_type, w_init_name) };
+    let base_init = unsafe { crate::baseobjspace::lookup_in_type(w_os_error, w_init_name) };
     let overrides_init = match (self_init, base_init) {
         (Some(a), Some(b)) => !std::ptr::eq(a, b),
         (Some(_), None) => true,
@@ -9389,7 +9419,12 @@ fn os_error_type_use_init(w_type: PyObjectRef) -> bool {
     // unreliable; instead detect a *Python-level* override — a user
     // `def __new__` resolves to a Function backed by a code object, while the
     // inherited family `__new__` is a builtin function backed by a `BuiltinCode`.
-    let Some(self_new) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }) else {
+    let Some(self_new) = (pyre_object::with_roots!(w_type => unsafe {
+        crate::baseobjspace::lookup_in_type(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+        )
+    })) else {
         return false;
     };
     unsafe {
@@ -9424,15 +9459,19 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // override `OSError.__init__`, every slot is already filled by `__new__`
     // (`os_error_fill_slots`), so re-stamping here would corrupt the args/errno
     // that construction already set.
-    if !os_error_use_init(w_self) {
-        return Ok(pyre_object::w_none());
-    }
     // `W_OSError.descr_init`: `args_w, kwds_w = __args__.unpack()` then
     // reject a non-empty `kwds_w`. Pin `self` and the rest slice first —
-    // `unpack` / `text_w` can collect with those pointers live.
+    // `unpack` / `text_w` can collect with those pointers live. The
+    // `os_error_use_init` probe interned `__new__` while this slice was live.
     let _roots = pyre_object::gc_roots::push_roots();
     let n = args.len();
     let base = pyre_object::gc_roots::pin_roots(args);
+    if !{
+        let mut args_obj = pyre_object::gc_roots::shadow_stack_get(base);
+        pyre_object::with_roots!(args_obj => os_error_use_init(args_obj))
+    } {
+        return Ok(pyre_object::w_none());
+    }
     let rest: Vec<PyObjectRef> = if n <= 1 {
         Vec::new()
     } else {
@@ -9458,10 +9497,10 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 }
 
 fn exc_os_error_init_args(
-    w_self: PyObjectRef,
+    mut w_self: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if !os_error_use_init(w_self) {
+    if !pyre_object::with_roots!(w_self => os_error_use_init(w_self)) {
         return Ok(pyre_object::w_none());
     }
     if arguments_has_keywords(args) {
@@ -14015,11 +14054,14 @@ pub(crate) fn py_ascii_obj(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyErr
     let Some(tp) = (unsafe { crate::typedef::r#type(r) }) else {
         return Ok(w_str_new_managed(&out));
     };
-    let Some(new_fn) = (unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__new__") })
-    else {
+    let mut tp = tp.as_ptr();
+    let w_new_name = pyre_object::with_roots!(tp => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__"))
+    });
+    let Some(new_fn) = (unsafe { crate::baseobjspace::lookup_in_type(tp, w_new_name) }) else {
         return Ok(w_str_new_managed(&out));
     };
-    crate::builtins::call_and_check(new_fn, &[tp.as_ptr(), w_str_new_managed(&out)])
+    crate::builtins::call_and_check(new_fn, &[tp, w_str_new_managed(&out)])
 }
 
 /// `bltinmodule.c:builtin_ascii` — like `repr`, but escape every
@@ -14086,7 +14128,9 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             return Ok(obj);
         }
         // intobject.py:994: space.lookup(w_value, '__int__')
-        if unsafe { crate::baseobjspace::lookup(obj, "__int__") }.is_some() {
+        if pyre_object::with_roots!(obj => unsafe { crate::baseobjspace::lookup(obj, "__int__") })
+            .is_some()
+        {
             // intobject.py: w_intvalue = space.int(w_value)
             let w_intvalue = crate::baseobjspace::space_int(obj)?;
             return ensure_baseint_result(w_intvalue);
@@ -14095,7 +14139,9 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // this PyPy source was removed from `int()` after Python 3.11.  Our
         // language target is 3.14, so proceed directly to `__index__`.
         // intobject.py: space.lookup(w_value, '__index__')
-        if unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_some() {
+        if pyre_object::with_roots!(obj => unsafe { crate::baseobjspace::lookup(obj, "__index__") })
+            .is_some()
+        {
             // intobject.py:1016: w_obj = space.index(w_value)
             let w_obj = crate::baseobjspace::space_index(obj)?;
             return ensure_baseint_result(w_obj);
@@ -14211,7 +14257,9 @@ pub fn getindex_w(mut w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
             );
         }
         // baseobjspace.py: w_index = self.index(w_obj)
-        if let Some(method) = crate::baseobjspace::lookup(w_obj, "__index__") {
+        if let Some(method) =
+            pyre_object::with_roots!(w_obj => crate::baseobjspace::lookup(w_obj, "__index__"))
+        {
             let w_index = pyre_object::with_roots!(w_obj => call_and_check(method, &[w_obj]))?;
             if is_int(w_index) {
                 return Ok(w_int_get_value(w_index));
@@ -14625,13 +14673,17 @@ pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     }
     // descroperation.py float — type-MRO __float__ then __index__
     if let Some(tp) = crate::typedef::r#type(obj) {
-        if let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__float__") }
-        {
+        let mut tp = tp.as_ptr();
+        if let Some((_, method)) = unsafe {
+            pyre_object::with_roots!(obj, tp => crate::baseobjspace::lookup_where_with_method_cache(
+                tp,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__float__")),
+            ))
+        } {
             let mut result = unsafe {
-                pyre_object::with_roots!(obj =>
-                    crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])
-                )?
+                pyre_object::with_roots!(obj, tp => {
+                    crate::baseobjspace::get_and_call_function(method, obj, tp, &[])
+                })?
             };
             unsafe {
                 if is_float(result) {
@@ -14661,11 +14713,14 @@ pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 "{value_type}.__float__ returned non-float (type {result_type})",
             )));
         }
-        if let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__index__") }
-        {
+        if let Some((_, method)) = unsafe {
+            pyre_object::with_roots!(obj, tp => crate::baseobjspace::lookup_where_with_method_cache(
+                tp,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
+            ))
+        } {
             let r = unsafe {
-                crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
+                pyre_object::with_roots!(obj, tp => crate::baseobjspace::get_and_call_function(method, obj, tp, &[]))?
             };
             // descroperation.py `space.index` returns an arbitrary-size
             // Python int.  Accept both the machine-word and W_LongObject
@@ -15100,6 +15155,9 @@ pub(crate) fn builtin_set_add_items_intersection(
     builtin_set_add_items_impl(Some(set), items, false).map(|_| ())
 }
 
+/// The per-item `add` loop of `pyopcode.py BUILD_SET`, which is
+/// `@jit.unroll_safe`: the item count is the opcode's constant argument.
+#[majit_macros::unroll_safe]
 fn builtin_set_add_items_impl(
     set: Option<PyObjectRef>,
     items: &[PyObjectRef],
@@ -15560,7 +15618,7 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `callable(obj)` — PyPy: baseobjspace.py callable
 fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let obj = args[0];
+    let mut obj = args[0];
     // `PyCallable_Check` — true when `type(obj)` has `tp_call`.  The builtin
     // callable kinds (function / builtin function, bound method,
     // staticmethod, type) are dispatched through dedicated slots in `call.rs`
@@ -15572,7 +15630,13 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
             || pyre_object::is_method(obj)
             || pyre_object::function::is_staticmethod(obj)
             || crate::typedef::r#type(obj)
-                .and_then(|t| crate::baseobjspace::lookup_in_type(t.as_ptr(), "__call__"))
+                .and_then(|t| {
+                    let mut t = t.as_ptr();
+                    let w_call_name = pyre_object::with_roots!(t, obj => {
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__"))
+                    });
+                    crate::baseobjspace::lookup_in_type(t, w_call_name)
+                })
                 .is_some()
     };
     Ok(w_bool_from(is_callable))
@@ -19735,9 +19799,9 @@ pub fn exec_or_eval(
             pyre_object::gc_roots::shadow_stack_get(code_slot) as pyre_object::PyObjectRef
         ) as *const crate::CodeObject
     };
-    let globals_arg = reload_ns(1);
-    let locals_arg = reload_ns(2);
-    let closure = reload_ns(3);
+    let mut globals_arg = reload_ns(1);
+    let mut locals_arg = reload_ns(2);
+    let mut closure = reload_ns(3);
 
     // pypy/interpreter/eval.py Code.exec_code keeps w_globals and
     // w_locals as separate dict references — STORE_GLOBAL writes to
@@ -19920,7 +19984,12 @@ pub fn exec_or_eval(
         return Err(crate::PyError::type_error(message));
     }
     if !is_none_or_null(locals_arg)
-        && unsafe { crate::baseobjspace::lookup(locals_arg, "__getitem__").is_none() }
+        && unsafe {
+            pyre_object::with_roots!(globals_arg, locals_arg, closure => {
+                crate::baseobjspace::lookup(locals_arg, "__getitem__")
+            })
+            .is_none()
+        }
     {
         let message = if is_eval {
             "locals must be a mapping".to_string()
@@ -20591,28 +20660,35 @@ pub(crate) fn builtin_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             args.iter().filter(|w| !w.is_null()).count()
         )));
     }
-    let obj = args[0];
+    let mut obj = args[0];
     // app_inspect.py — dir() is driven by the object's `__dir__`:
     // `lookup_special(obj, '__dir__')` then `sorted(result)`.  pyre's builtin
     // types do not register a default `__dir__` slot, so the manual
     // enumeration below stands in for the default object / type / module
     // `__dir__`; a `__dir__` found on the type here is a user override (or a
     // builtin such as traceback) and drives dir() directly.
-    if let Some(w_type) = crate::typedef::r#type(obj)
-        && let Some((owner, dir_meth)) =
-            unsafe { crate::baseobjspace::lookup_where_pair(w_type.as_ptr(), "__dir__") }
-    {
-        // The default object.__dir__ is implemented by the manual generic
-        // paths below.  Keep descending when it is merely inherited so
-        // module.__dir__, type.__dir__, and their surrogate-preserving
-        // namespace walkers retain their specialized behavior.  A real
-        // override on any other owner is invoked directly, exactly as
-        // app_inspect.py's lookup_special requires.
-        if !std::ptr::eq(owner, crate::typedef::w_object()) {
-            let result = unsafe {
-                crate::baseobjspace::get_and_call_function(dir_meth, obj, w_type.as_ptr(), &[])
-            }?;
-            return builtin_sorted(&[result]);
+    if let Some(w_type) = crate::typedef::r#type(obj) {
+        let mut w_type = w_type.as_ptr();
+        if let Some((owner, mut dir_meth)) = unsafe {
+            pyre_object::with_roots!(obj, w_type => crate::baseobjspace::lookup_where_pair(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__dir__")),
+            ))
+        } {
+            // The default object.__dir__ is implemented by the manual generic
+            // paths below.  Keep descending when it is merely inherited so
+            // module.__dir__, type.__dir__, and their surrogate-preserving
+            // namespace walkers retain their specialized behavior.  A real
+            // override on any other owner is invoked directly, exactly as
+            // app_inspect.py's lookup_special requires.
+            if !std::ptr::eq(owner, crate::typedef::w_object()) {
+                let result = unsafe {
+                    pyre_object::with_roots!(obj, w_type, dir_meth => {
+                        crate::baseobjspace::get_and_call_function(dir_meth, obj, w_type, &[])
+                    })
+                }?;
+                return builtin_sorted(&[result]);
+            }
         }
     }
     // `GenericAlias.__dir__` (`_pypy_generic_alias.py`) merges the alias's
@@ -20938,7 +21014,11 @@ pub(crate) fn frozendict_structural_hash(obj: PyObjectRef) -> Result<i64, crate:
     Ok(_hash_frozenset(&pair_hashes))
 }
 
-pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+/// `space.hash` for interpreter-level dict and set probes.  The exact-type
+/// scan and the `__hash__` protocol it falls back to are not traced; the call
+/// stays a residual.
+#[majit_macros::dont_look_inside]
+pub fn try_hash_value(mut obj: PyObjectRef) -> Result<i64, crate::PyError> {
     if obj.is_null() {
         return Err(crate::PyError::type_error("hash() argument is null"));
     }
@@ -20980,12 +21060,15 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // lookup reaches the subclass entry before the inherited typedef
             // value (`descroperation.py:556-565`), so only reject the object
             // after giving a non-None override the call.
-            if let Some(w_type) = crate::typedef::r#type(obj)
-                && let Some(method) =
-                    crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
-                && !pyre_object::is_none(method)
-            {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
+            if let Some(w_type) = crate::typedef::r#type(obj) {
+                let mut w_type = w_type.as_ptr();
+                if let Some(method) = pyre_object::with_roots!(obj, w_type => crate::baseobjspace::lookup_in_type(
+                    w_type,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__hash__")),
+                )) && !pyre_object::is_none(method)
+                {
+                    return hash_call_normalize(method, obj, w_type);
+                }
             }
             // The concrete kind decides that the object is unhashable; the
             // refusal names the receiver's own type, which for a subclass is
@@ -21011,20 +21094,30 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         if ((is_tuple_recv && !is_exact_type(obj, &TUPLE_TYPE))
             || (is_frozenset_recv && !is_exact_type(obj, &pyre_object::setobject::FROZENSET_TYPE)))
             && let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
         {
-            if pyre_object::is_none(method) {
-                return Err(unhashable_type_error(obj));
-            }
-            let base = if is_tuple_recv {
-                crate::typedef::gettypefor(&TUPLE_TYPE)
-            } else {
-                crate::typedef::gettypefor(&pyre_object::setobject::FROZENSET_TYPE)
-            };
-            let base_hash =
-                base.and_then(|b| crate::baseobjspace::lookup_in_type(b.as_ptr(), "__hash__"));
-            if Some(method) != base_hash {
-                return hash_call_normalize(method, obj, w_type.as_ptr());
+            let mut w_type = w_type.as_ptr();
+            if let Some(mut method) = pyre_object::with_roots!(obj, w_type => crate::baseobjspace::lookup_in_type(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__hash__")),
+            )) {
+                if pyre_object::is_none(method) {
+                    return Err(unhashable_type_error(obj));
+                }
+                let base = if is_tuple_recv {
+                    crate::typedef::gettypefor(&TUPLE_TYPE)
+                } else {
+                    crate::typedef::gettypefor(&pyre_object::setobject::FROZENSET_TYPE)
+                };
+                let base_hash = base.and_then(|b| {
+                    let mut b = b.as_ptr();
+                    pyre_object::with_roots!(obj, w_type, method, b => crate::baseobjspace::lookup_in_type(
+                        b,
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__hash__")),
+                    ))
+                });
+                if Some(method) != base_hash {
+                    return hash_call_normalize(method, obj, w_type);
+                }
             }
         }
         if is_tuple(obj) {
@@ -21055,9 +21148,12 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         if pyre_object::is_union(obj) {
             return crate::_pypy_generic_alias::union_hash_value(obj);
         }
+        let w_hash_name = pyre_object::with_roots!(obj => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__hash__"))
+        });
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, w_hash_name) {
                 if pyre_object::is_none(method) {
                     return Err(unhashable_type_error(obj));
                 }
@@ -21070,7 +21166,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
         // covers the builtin/typed-payload layouts before the identity-hash
         // fallback.
         if let Some(w_type) = crate::typedef::r#type(obj)
-            && let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__hash__")
+            && let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), w_hash_name)
         {
             if pyre_object::is_none(method) {
                 return Err(unhashable_type_error(obj));
@@ -21081,7 +21177,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             // computes the correct per-type builtin hash for the base
             // payload rather than a pointer identity.
             let default_hash =
-                crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__hash__");
+                crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), w_hash_name);
             if default_hash != Some(method) {
                 return hash_call_normalize(method, obj, w_type.as_ptr());
             }
@@ -21822,9 +21918,12 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             // partition and never repartitions against mutable hash slots.
             return hash_value(pyre_object::w_union_get_hashable_args(obj));
         }
+        let w_hash_name = pyre_object::with_roots!(obj => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__hash__"))
+        });
         if pyre_object::is_instance(obj) {
             let w_type = pyre_object::w_instance_get_type(obj);
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
+            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, w_hash_name) {
                 // `hash_value` is the infallible callback arm, so a failed or
                 // non-int `__hash__` falls through and reads `obj` again for
                 // the identity hash.  `framework.py get_livevars_for_roots`
@@ -22255,9 +22354,10 @@ pub(crate) fn builtin_reversed(
     // honors a subclass override and the inherited builtin `list.__reversed__`,
     // and any user object defining `__reversed__`.
     let obj = unsafe { pyre_object::gc_roots::shadow_stack_get(obj_slot) };
+    let w_reversed_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__reversed__"));
     if let Some(tp) = crate::typedef::r#type(obj)
         && let Some(method) =
-            unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__reversed__") }
+            unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), w_reversed_name) }
     {
         // Python 3.14 `slot1` semantics: explicitly assigning None disables
         // the protocol and does not fall back to `__len__`/`__getitem__`.
@@ -22284,9 +22384,10 @@ pub(crate) fn builtin_reversed(
     // protocol. `PySequence_Check` first (an object with `__getitem__`): a
     // non-sequence is "not reversible", while a sequence missing `__len__`
     // raises the regular "has no len()" from `len`.
+    let w_getitem_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__"));
     if let Some(tp) = crate::typedef::r#type(obj) {
         let has_getitem =
-            unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__getitem__") }.is_some();
+            unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), w_getitem_name) }.is_some();
         if has_getitem {
             // `functional.py` — reverse lazily through `W_ReversedIterator`.
             let n = crate::baseobjspace::len_w(obj)?;
@@ -24297,6 +24398,16 @@ fn file_check_writable(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
 
 /// One `space.acquire_writebuf` export held for a FileIO `readinto` call.
 /// PyPy's `with view:` keeps this lock until after `output_slice`/`c_read`.
+///
+/// Host stack storage (`lltype.malloc(T, flavor='raw')`), never a GC object.
+/// `rclass.py getgcflavor` reads `_alloc_flavor_` off the classdesc so a
+/// pointer to this struct is a raw-flavored `Ptr` in the annotator
+/// (`getinstancerepr` builds a raw `InstanceRepr`); `history.getkind` `'int'`
+/// is the JIT kind only.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_WritableBuffer: &str = "raw";
+
 pub struct WritableBuffer {
     _roots: pyre_object::gc_roots::RootScope,
     owner_slot: usize,
@@ -27253,8 +27364,8 @@ fn increment_decimal_digits(digits: &mut Vec<u8>) {
 ///
 /// # Safety
 /// `obj` must point to a valid object whose header is readable.
-unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
-    let w_class = unsafe { (*obj).w_class };
+unsafe fn round_uses_builtin(mut obj: PyObjectRef) -> bool {
+    let mut w_class = unsafe { (*obj).w_class };
     if w_class.is_null() {
         return true;
     }
@@ -27265,9 +27376,12 @@ unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
             return true;
         }
     }
-    let Some((src, _)) =
-        (unsafe { crate::baseobjspace::lookup_where_with_method_cache(w_class, "__round__") })
-    else {
+    let Some((src, _)) = (unsafe {
+        pyre_object::with_roots!(obj, w_class => crate::baseobjspace::lookup_where_with_method_cache(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__round__")),
+        ))
+    }) else {
         return true;
     };
     [&pyre_object::INT_TYPE, &pyre_object::FLOAT_TYPE]
@@ -27302,7 +27416,7 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
             args.len()
         )));
     }
-    let obj = args[0];
+    let mut obj = args[0];
     let ndigits_arg = if args.len() > 1 && !args[1].is_null() {
         Some(args[1])
     } else {
@@ -27315,7 +27429,7 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
         // — is dispatched by the lookup at the end of this function rather
         // than rounded structurally here.  Arriving through the slot has
         // already answered that question the other way.
-        let structural = slot || round_uses_builtin(obj);
+        let structural = slot || pyre_object::with_roots!(obj => round_uses_builtin(obj));
         if structural && is_float(obj) {
             let v = floatobject::w_float_get_value(obj);
             return match ndigits {
@@ -27420,18 +27534,24 @@ fn round_receiver(args: &[PyObjectRef], slot: bool) -> Result<PyObjectRef, crate
     // argument.  The slot skips this: it is the lookup's own target.
     if let Some(tp) = crate::typedef::r#type(obj)
         && !slot
-        && let Some((_, method)) =
-            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__round__") }
     {
-        let result = unsafe {
-            match ndigits {
-                Some(nd) if !pyre_object::is_none(*nd) => {
-                    crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[*nd])?
+        let mut tp = tp.as_ptr();
+        let w_round_name = pyre_object::with_roots!(obj, tp => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__round__"))
+        });
+        if let Some((_, method)) =
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp, w_round_name) }
+        {
+            let result = unsafe {
+                match ndigits {
+                    Some(nd) if !pyre_object::is_none(*nd) => {
+                        crate::baseobjspace::get_and_call_function(method, obj, tp, &[*nd])?
+                    }
+                    _ => crate::baseobjspace::get_and_call_function(method, obj, tp, &[])?,
                 }
-                _ => crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?,
-            }
-        };
-        return Ok(result);
+            };
+            return Ok(result);
+        }
     }
     let type_name = match crate::typedef::r#type(obj) {
         Some(tp) => unsafe { pyre_object::w_type_get_name(tp.as_ptr()).to_string() },
@@ -27752,7 +27872,10 @@ fn try_complex_special_method(mut obj: PyObjectRef) -> Result<Option<(f64, f64)>
     let mut w_type = w_type_ref.as_ptr();
     let Some(mut w_complex) = (unsafe {
         pyre_object::with_roots!(obj, w_type => {
-            crate::baseobjspace::lookup_in_type(w_type, "__complex__")
+            crate::baseobjspace::lookup_in_type(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__complex__")),
+            )
         })
     }) else {
         return Ok(None);

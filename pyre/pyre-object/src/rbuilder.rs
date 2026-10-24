@@ -595,7 +595,12 @@ pub mod rbuilder_runtime {
     /// constant (typically a still-virtual builder) the copy stays in the
     /// trace. Otherwise fall through so `ll_jit_append` residuals
     /// `ll_append_res0`.
-    #[majit_macros::unroll_safe]
+    ///
+    /// The low-level string is an integer word in this module, but a
+    /// `current_buf` field read is a GC pointer. Flatten then emits a
+    /// Ref register into an Int-bank copy. Residualize until that body
+    /// is one bank, matching `ll_append_res0`.
+    #[majit_macros::dont_look_inside]
     fn ll_jit_try_append_slice(builder: i64, ll_str: i64, start: i64, size: i64) -> bool {
         if !majit_rlib::jit::isconstant(&size) {
             return false;
@@ -664,6 +669,15 @@ pub mod rbuilder_runtime {
             _ => return false,
         }
         true
+    }
+
+    /// Residual `ll_build` (`rbuilder.py AbstractStringBuilderRepr.rtype_method_build`).
+    /// The front's `__majit_stringbuilder_build` marker retargets here; `item_size`
+    /// is the STR width RPython's `ll_build` closes over. This wrapper is
+    /// the 1-arg ABI; looking inside reaches `ll_build`'s
+    /// `look_inside_iff(isvirtual)` so a virtual builder is traced.
+    pub extern "C" fn jit_ll_build(builder: crate::PyObjectRef) -> crate::PyObjectRef {
+        ll_build(builder as i64, STR_ITEM_SIZE) as crate::PyObjectRef
     }
 
     /// `ll_append_res0(ll_builder, ll_str)` = `_ll_append(ll_builder, ll_str, 0,

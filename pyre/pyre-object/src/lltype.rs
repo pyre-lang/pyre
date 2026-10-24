@@ -631,10 +631,8 @@ pub fn malloc_typed_managed<T: GcType>(value: T) -> *mut T {
     // `Some(null)` is a GC that owns the heap and could not satisfy the
     // request, which the fallback below must not answer; only a missing hook
     // leaves this path free to take it.
-    if let Some(raw) =
-        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(type_id, T::SIZE))
-            .allocated_or_abort(T::SIZE)
-    {
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(type_id, T::SIZE);
+    if !raw.is_null() {
         unsafe {
             std::ptr::write(raw as *mut T, value);
             // The no-collect allocator may fall back to old-gen when the

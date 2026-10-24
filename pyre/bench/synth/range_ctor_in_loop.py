@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=builtin_range
 # pyre-check: trace-shape=main:absent=CallMayForceR
 # Pins virtual range construction for one-, two-, and three-bound calls while
 # retaining correct residual behavior for exceptional, subclass, index, and

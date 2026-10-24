@@ -6764,7 +6764,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     ] {
                         unsafe {
                             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                                ns,
+                                pyre_object::gc_roots::shadow_stack_get(ns_slot),
                                 name,
                                 with_posix_kwonly_defaults(
                                     crate::make_builtin_function_with_signature(
@@ -11651,29 +11651,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // that still fits a C long but fails the round trip is "less than
             // minimum" (including 2**32, whose truncation reads as underflow),
             // while one too wide for a long is "greater than maximum".
-            let id_of =
-                |w: pyre_object::PyObjectRef, what: &str| -> Result<Option<u32>, crate::PyError> {
-                    if !unsafe { crate::builtins::index_check(w) } {
-                        return Err(crate::PyError::type_error(format!(
-                            "{what} should be integer, not {}",
-                            crate::type_methods::arg_type_name(w)
-                        )));
-                    }
-                    let w_index = crate::baseobjspace::space_index(w)?;
-                    let raw = crate::baseobjspace::int_w(w_index).map_err(|_| {
-                        crate::PyError::overflow_error(format!("{what} is greater than maximum"))
-                    })?;
-                    if raw == -1 {
-                        return Ok(None);
-                    }
-                    let narrowed = raw as u32;
-                    if i64::from(narrowed) != raw {
-                        return Err(crate::PyError::overflow_error(format!(
-                            "{what} is less than minimum"
-                        )));
-                    }
-                    Ok(Some(narrowed))
-                };
+            let id_of = |mut w: pyre_object::PyObjectRef,
+                         what: &str|
+             -> Result<Option<u32>, crate::PyError> {
+                if !unsafe { pyre_object::with_roots!(w => crate::builtins::index_check(w)) } {
+                    return Err(crate::PyError::type_error(format!(
+                        "{what} should be integer, not {}",
+                        crate::type_methods::arg_type_name(w)
+                    )));
+                }
+                let w_index = crate::baseobjspace::space_index(w)?;
+                let raw = crate::baseobjspace::int_w(w_index).map_err(|_| {
+                    crate::PyError::overflow_error(format!("{what} is greater than maximum"))
+                })?;
+                if raw == -1 {
+                    return Ok(None);
+                }
+                let narrowed = raw as u32;
+                if i64::from(narrowed) != raw {
+                    return Err(crate::PyError::overflow_error(format!(
+                        "{what} is less than minimum"
+                    )));
+                }
+                Ok(Some(narrowed))
+            };
             let roots = pyre_object::gc_roots::push_roots();
             let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
             let gid_slot = roots.pin_roots(&[gid_obj]);
@@ -13631,7 +13632,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // `conv_confname` gates on `PyIndex_Check` before converting, so an
             // object that is neither a str nor index-able is this TypeError,
             // while an `__index__` that raises propagates its own exception.
-            if !unsafe { crate::builtins::index_check(w) } {
+            let mut w = w;
+            if !unsafe { pyre_object::with_roots!(w => crate::builtins::index_check(w)) } {
                 return Err(crate::PyError::type_error(
                     "configuration names must be strings or integers",
                 ));

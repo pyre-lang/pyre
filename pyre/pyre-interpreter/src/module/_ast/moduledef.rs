@@ -4,6 +4,7 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 const LOCATION_ATTRIBUTES: &[&str] = &["lineno", "col_offset", "end_lineno", "end_col_offset"];
 
@@ -343,9 +344,9 @@ fn is_ast_method_descriptor(descr: PyObjectRef, expected: crate::gateway::Builti
 /// unchanged, and uses the default metaclass do we invoke those same two
 /// descriptor bodies with the raw kwargs dict.
 fn call_type_with_raw_kwargs(
-    w_type: PyObjectRef,
+    mut w_type: PyObjectRef,
     positional: &[PyObjectRef],
-    kwargs: PyObjectRef,
+    mut kwargs: PyObjectRef,
 ) -> Option<crate::PyResult> {
     if !unsafe { pyre_object::is_type(w_type) } {
         return None;
@@ -356,40 +357,58 @@ fn call_type_with_raw_kwargs(
     if unsafe { pyre_object::w_instance_get_type(w_type) } != crate::typedef::w_type() {
         return None;
     }
-    let init_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") }?;
+    let positional_len = positional.len();
+    let _name_roots = pyre_object::gc_roots::push_roots();
+    let positional_base = pyre_object::gc_roots::pin_roots(positional);
+    let init_descr = {
+        let w_init_name = pyre_object::with_roots!(w_type, kwargs => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__"))
+        });
+        unsafe { crate::baseobjspace::lookup_in_type(w_type, w_init_name) }?
+    };
     if !is_ast_method_descriptor(init_descr, ast_init) {
         return None;
     }
-    let new_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }?;
+    let w_new_name = pyre_object::with_roots!(w_type, kwargs => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__"))
+    });
+    let new_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, w_new_name) }?;
     let object_new =
-        unsafe { crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__new__") }?;
+        unsafe { crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), w_new_name) }?;
     if new_descr != object_new {
         return None;
     }
 
     Some((|| -> crate::PyResult {
         // The type, positionals and kwargs dict all cross object.__new__
-        // and ast_type_init, both allocating calls.  Publish the caller-owned
-        // slice and rebuild each argument list from the forwarded slots.
+        // and ast_type_init, both allocating calls.  Rebuild the caller-owned
+        // slice from the forwarded slots pinned across intern, then publish
+        // that restored list for the allocations below.
+        let mut forwarded = Vec::with_capacity(positional_len);
+        for index in 0..positional_len {
+            forwarded.push(pyre_object::gc_roots::shadow_stack_get(
+                positional_base + index,
+            ));
+        }
         let roots = pyre_object::gc_roots::push_roots();
         let type_slot = roots.publish(&[w_type]);
-        let positional_base = roots.publish(positional);
+        let positional_base = roots.publish(&forwarded);
         let kwargs_slot = roots.publish(&[kwargs]);
-        roots.normalize(type_slot, positional.len() + 2);
+        roots.normalize(type_slot, positional_len + 2);
         let current_positional = |index: usize| roots.get(positional_base + index);
 
-        let mut new_args = Vec::with_capacity(positional.len() + 1);
+        let mut new_args = Vec::with_capacity(positional_len + 1);
         new_args.push(roots.get(type_slot));
-        for index in 0..positional.len() {
+        for index in 0..positional_len {
             new_args.push(current_positional(index));
         }
         let instance = crate::typedef::object_descr_new(&new_args)?;
         let instance_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(instance);
 
-        let mut init_args = Vec::with_capacity(positional.len() + 1);
+        let mut init_args = Vec::with_capacity(positional_len + 1);
         init_args.push(roots.get(instance_slot));
-        for index in 0..positional.len() {
+        for index in 0..positional_len {
             init_args.push(current_positional(index));
         }
         ast_init_from(&init_args, Some(roots.get(kwargs_slot)))?;

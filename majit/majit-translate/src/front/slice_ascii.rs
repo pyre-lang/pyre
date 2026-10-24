@@ -373,6 +373,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: is_ascii_segments(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![slice]),
                 result_ty: ValueType::Bool,

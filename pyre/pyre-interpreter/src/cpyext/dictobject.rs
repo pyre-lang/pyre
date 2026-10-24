@@ -4,6 +4,7 @@ use super::object::{argument, arguments};
 use super::pyerrors::trap;
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 use std::ffi::{CStr, c_char, c_int};
 
 #[unsafe(no_mangle)]
@@ -615,8 +616,14 @@ fn iterates_as_dict(object: PyObjectRef) -> bool {
     let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
     unsafe {
         match (
-            crate::baseobjspace::lookup_in_type(own_type.as_ptr(), "__iter__"),
-            crate::baseobjspace::lookup_in_type(dict_type, "__iter__"),
+            crate::baseobjspace::lookup_in_type(
+                own_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+            ),
+            crate::baseobjspace::lookup_in_type(
+                dict_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+            ),
         ) {
             (Some(own), Some(canonical)) => std::ptr::eq(own, canonical),
             _ => true,

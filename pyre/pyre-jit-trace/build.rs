@@ -100,6 +100,11 @@ fn emit_llbc_extraction_placeholders() {
     .unwrap();
     std::fs::write(format!("{out_dir}/descrs.bin"), b"").unwrap();
     std::fs::write(
+        format!("{out_dir}/callinfos.bin"),
+        bincode::serialize(&Vec::<(u16, u32, i64)>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
         format!("{out_dir}/descrs_index.bin"),
         bincode::serialize(&(
             vec![0_u32],
@@ -163,6 +168,15 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(
         format!("{out_dir}/symbolic_fnaddr_paths.bin"),
         bincode::serialize(&Vec::<(i64, String)>::new()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{out_dir}/generated_residual_shims.rs"),
+        "#[derive(Clone, Copy)]\n\
+         pub struct ResidualShimAddr(pub *const ());\n\
+         unsafe impl Sync for ResidualShimAddr {}\n\
+         unsafe impl Send for ResidualShimAddr {}\n\
+         pub static GENERATED_RESIDUAL_SHIMS: &[(&str, ResidualShimAddr)] = &[];\n",
     )
     .unwrap();
 }

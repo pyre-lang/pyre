@@ -176,11 +176,11 @@ mod imp {
         }
     }
 
-    fn ffi_type_for_arg(at: PyObjectRef) -> Result<FfiType, pyre_interpreter::PyError> {
-        if funcptr::argtype_is_pointer_kind(at) {
+    fn ffi_type_for_arg(mut at: PyObjectRef) -> Result<FfiType, pyre_interpreter::PyError> {
+        if pyre_object::with_roots!(at => funcptr::argtype_is_pointer_kind(at)) {
             return Ok(callproc::ffi_pointer_type());
         }
-        if let Some(tc) = cdata::type_code_of(at)
+        if let Some(tc) = pyre_object::with_roots!(at => cdata::type_code_of(at))
             && let Some(ty) = callproc::ffi_type_from_code(&tc)
         {
             return Ok(ty);
@@ -340,10 +340,10 @@ mod imp {
     }
 
     fn decode_arg(
-        at: PyObjectRef,
+        mut at: PyObjectRef,
         p: *const c_void,
     ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-        if funcptr::is_funcptr_type(at) {
+        if pyre_object::with_roots!(at => funcptr::is_funcptr_type(at)) {
             let address = unsafe { *(p as *const usize) };
             let inst = pyre_interpreter::call::type_call_instantiate(at, &[])?;
             let inst_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -354,7 +354,7 @@ mod imp {
             )?;
             return Ok(pyre_object::gc_roots::shadow_stack_get(inst_slot));
         }
-        if let Some(tc) = cdata::type_code_of(at)
+        if let Some(tc) = pyre_object::with_roots!(at => cdata::type_code_of(at))
             && !funcptr::is_simple_subclass(at)
         {
             if tc == "O" {

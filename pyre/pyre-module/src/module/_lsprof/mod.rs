@@ -4,7 +4,7 @@
 //! returned by `Profiler.getstats()` but are not bound in the module namespace.
 
 use pyre_object::*;
-use rustpython_wtf8::Wtf8Buf;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -378,7 +378,7 @@ fn module_name_wtf8(w_module: PyObjectRef) -> Option<Wtf8Buf> {
     }
 }
 
-fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObjectRef {
+fn create_spec_for_method(mut w_function: PyObjectRef, mut w_type: PyObjectRef) -> PyObjectRef {
     let name = if !w_function.is_null()
         && unsafe { pyre_interpreter::function::is_function(w_function) }
     {
@@ -391,9 +391,14 @@ fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObj
         && !w_type.is_null()
         && unsafe { pyre_object::is_type(w_type) }
     {
-        unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_type, &name) }
-            .map(|(w_realclass, _)| unsafe { pyre_object::w_type_get_name(w_realclass) })
-            .unwrap_or_else(|| unsafe { pyre_object::w_type_get_name(w_type) })
+        pyre_object::with_roots!(w_function, w_type => unsafe {
+            pyre_interpreter::baseobjspace::lookup_where_pair(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name.as_str())),
+            )
+        })
+        .map(|(w_realclass, _)| unsafe { pyre_object::w_type_get_name(w_realclass) })
+        .unwrap_or_else(|| unsafe { pyre_object::w_type_get_name(w_type) })
     } else if !w_type.is_null() && unsafe { pyre_object::is_type(w_type) } {
         unsafe { pyre_object::w_type_get_name(w_type) }
     } else {
@@ -428,21 +433,21 @@ fn create_spec_for_object(w_type: PyObjectRef) -> PyObjectRef {
     pyre_object::w_str_new_managed(&format!("<'{class_name}' object>"))
 }
 
-fn prepare_spec(w_arg: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
+fn prepare_spec(mut w_arg: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
     if !w_arg.is_null() && unsafe { pyre_object::function::is_method(w_arg) } {
-        let w_func = unsafe { pyre_object::function::w_method_get_func(w_arg) };
+        let mut w_func = unsafe { pyre_object::function::w_method_get_func(w_arg) };
         let w_self = unsafe { pyre_object::function::w_method_get_self(w_arg) };
-        let w_type = pyre_interpreter::typedef::r#type(w_self)
+        let mut w_type = pyre_interpreter::typedef::r#type(w_self)
             .map_or(pyre_object::PY_NULL, |ty| ty.as_ptr());
-        let w_frame = create_spec_for_method(w_func, w_type);
+        let w_frame = pyre_object::with_roots!(w_arg, w_func, w_type => create_spec_for_method(w_func, w_type));
         (w_func, w_type, w_frame)
     } else if !w_arg.is_null() && unsafe { pyre_interpreter::function::is_function(w_arg) } {
-        let w_frame = create_spec_for_function(w_arg);
+        let w_frame = pyre_object::with_roots!(w_arg => create_spec_for_function(w_arg));
         (w_arg, pyre_object::PY_NULL, w_frame)
     } else {
-        let w_type =
+        let mut w_type =
             pyre_interpreter::typedef::r#type(w_arg).map_or(pyre_object::PY_NULL, |ty| ty.as_ptr());
-        let w_frame = create_spec_for_object(w_type);
+        let w_frame = pyre_object::with_roots!(w_arg, w_type => create_spec_for_object(w_type));
         (pyre_object::PY_NULL, w_type, w_frame)
     }
 }

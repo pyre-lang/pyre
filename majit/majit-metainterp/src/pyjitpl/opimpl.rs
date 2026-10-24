@@ -232,6 +232,8 @@ where
         table[jitcode::insns::BC_RECORD_EXACT_CLASS as usize] = Self::opimpl_record_exact_class;
         table[jitcode::insns::BC_RECORD_EXACT_VALUE_I as usize] = Self::opimpl_record_exact_value_i;
         table[jitcode::insns::BC_RECORD_EXACT_VALUE_R as usize] = Self::opimpl_record_exact_value_r;
+        table[jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD as usize] =
+            Self::opimpl_record_quasiimmut_field;
         table[jitcode::insns::BC_REF_GUARD_VALUE as usize] = Self::opimpl_ref_guard_value;
         table[jitcode::insns::BC_FLOAT_GUARD_VALUE as usize] = Self::opimpl_float_guard_value;
         table[jitcode::insns::BC_GUARD_CLASS as usize] = Self::opimpl_guard_class;
@@ -247,6 +249,7 @@ where
         table[jitcode::insns::BC_INT_ISCONSTANT as usize] = Self::opimpl_int_isconstant;
         table[jitcode::insns::BC_REF_ISCONSTANT as usize] = Self::opimpl_ref_isconstant;
         table[jitcode::insns::BC_INT_ISVIRTUAL as usize] = Self::opimpl_int_isvirtual;
+        table[jitcode::insns::BC_INT_ISVIRTUAL_R as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_REF_ISVIRTUAL as usize] = Self::opimpl_ref_isvirtual;
         table[jitcode::insns::BC_STRLEN as usize] = Self::opimpl_strlen;
         table[jitcode::insns::BC_STRGETITEM as usize] = Self::opimpl_strgetitem;
@@ -546,7 +549,7 @@ where
         // *records* New / NewWithVtable so the optimizer can virtualize
         // the struct away when it does not escape.
         let with_vtable = bytecode == jitcode::insns::BC_NEW_WITH_VTABLE;
-        let (size, vtable, type_id, headerless, descr, dest) = {
+        let (size, bh_vtable, type_id, headerless, descr, dest) = {
             let frame = self.frames.current_mut();
             let (descr_idx, dest) = frame.read_new();
             let bh = frame
@@ -560,6 +563,18 @@ where
                 size_descr_ref_from_bh(bh),
                 dest,
             )
+        };
+        // `pyjitpl.py opimpl_new_with_vtable`: the class word is
+        // `descr.get_vtable()`. Assembler may leave BhDescr.vtable
+        // at 0; the published size descr in `_cache_size` holds it.
+        let vtable = if with_vtable {
+            descr
+                .as_size_descr()
+                .map(|sd| sd.vtable())
+                .filter(|&v| v != 0)
+                .unwrap_or(bh_vtable)
+        } else {
+            bh_vtable
         };
         // A `headerless` descr means the interpreter owns this struct in
         // its own collected pool (`headerless_structs`), which is what
@@ -618,7 +633,28 @@ where
             return TraceAction::Abort;
         }
         if with_vtable && vtable != 0 {
-            unsafe { *(ptr as *mut usize) = vtable };
+            // Allocation stays in this arm. `cpu.bh_new_with_vtable`
+            // refuses a raw fallback once a collector is installed,
+            // and cranelift's copy skips a headerless descr. Tests
+            // trace with no backend installed
+            // (`TraceCtx::for_test`), so there is no cpu to call.
+            // The header stores are still the one helper the
+            // backends use. An unconfigured `vtable_offset` keeps
+            // the offset-0 type word this arm has always written;
+            // a configured offset replaces it. The class word is
+            // written only when the backend was given one.
+            let (vtable_offset, w_class_offset) = match ctx.blackhole_cpu() {
+                Some(cpu) => (cpu.vtable_offset().or(Some(0)), cpu.w_class_offset()),
+                None => (Some(0), None),
+            };
+            unsafe {
+                majit_backend::write_new_with_vtable_header(
+                    ptr as *mut u8,
+                    vtable,
+                    vtable_offset,
+                    w_class_offset,
+                );
+            }
         }
         let kind = if with_vtable {
             OpCode::NewWithVtable
@@ -745,6 +781,16 @@ where
             {
                 majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
             }
+            let shadow = match bytecode {
+                jitcode::insns::BC_SETFIELD_GC_R => {
+                    majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize))
+                }
+                jitcode::insns::BC_SETFIELD_GC_F => {
+                    majit_ir::Value::Float(f64::from_bits(concrete as u64))
+                }
+                _ => majit_ir::Value::Int(concrete),
+            };
+            ctx.sync_shadow_if_vable_heap_store(struct_ptr, offset, value_opref, shadow);
         }
         TraceAction::Continue
     }
@@ -4578,6 +4624,9 @@ where
                     jdindex,
                     result_dst,
                     &green_values,
+                    &[],
+                    &[],
+                    &[],
                 ) {
                     TraceAction::Continue => {}
                     // Abort propagates (missing fresh-reds / target).
@@ -4692,8 +4741,8 @@ where
             // vocabulary — which is `Box.same_constant` per Const type
             // (ConstInt/ConstFloat bitwise, ConstPtr pointer identity),
             // exactly what plain slot-grouped `Vec` equality performs.
-            // The reference is NOT `green_key_values` (the
-            // back-edge/can_enter_jit key carries a different arity) nor
+            // The reference is NOT `green_key_values` (that is the hashed
+            // form of the same declared greens) nor
             // `current_merge_points[0].green_boxes` (InputArg placeholders,
             // no Const → an always-empty filter that would decline every
             // close and hang).
@@ -4827,6 +4876,22 @@ where
                     // `recover`.
                     ctx.walk_final_pc = mp_green_pc.map(Self::guest_pc_position);
                     ctx.walk_final_reds = std::mem::take(&mut walk_reds).into_vec();
+                }
+                // pyjitpl.py `reached_loop_header`: before `compile_loop`,
+                // `get_procedure_token(greenboxes)` + `has_compiled_targets`
+                // records a JUMP into the loop that already owns this merge
+                // point (`compile_trace`). A root trace has no `bridge_info`,
+                // so the guard-origin block never runs; publishing the token
+                // key is what makes the driver take `compile_trace_from_interp`
+                // instead of `compile_loop`'s `ABORT_BAD_LOOP`.
+                if !ctx.is_bridge_trace
+                    && let Some(close_key) = ctx.close_green_key_hash()
+                    && ctx
+                        .has_compiled_targets_fn
+                        .as_ref()
+                        .is_some_and(|f| f(close_key))
+                {
+                    ctx.close_jump_into_key = Some(close_key);
                 }
                 // GUARD_FUTURE_CONDITION already emitted unconditionally at
                 // the reached_loop_header entry above (pyjitpl.py).
@@ -5764,6 +5829,17 @@ where
             let is_loopinvariant =
                 effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
 
+            if let Some(action) = self.try_record_set_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                &args,
+                &raw_r,
+            ) {
+                return action;
+            }
+
             // pyjitpl.py execute_varargs parity (plain
             // CALL_N / LOOPINVARIANT_N branch) and pyjitpl.py
             // (MAY_FORCE_N branch).  Both branches share the same
@@ -6174,6 +6250,13 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps
@@ -6273,13 +6356,18 @@ where
                     let frame = self.frames.current_mut();
                     eprintln!(
                         "[interpret] residual may_force jitcode={} last_op={} cursor={} \
-                         extraeffect={:?} can_raise={} next={:?}",
+                         extraeffect={:?} can_raise={} next={:?} fnaddr={:#x} classes={:?} \
+                         ret={} last_exc={:#x}",
                         frame.jitcode.name(),
                         frame.last_opcode_position,
                         frame.code_cursor,
                         effectinfo.extraeffect,
                         effectinfo.check_can_raise(false),
                         frame.jitcode.code.get(frame.code_cursor),
+                        concrete_ptr as usize,
+                        calldescr.arg_classes,
+                        concrete,
+                        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
                     );
                 }
                 let action = self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable);
@@ -6483,6 +6571,25 @@ where
                 return TraceAction::Continue;
             }
 
+            if let Some(action) = self.try_record_load_global_exc_class(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                &raw_i,
+                dst,
+            ) {
+                return action;
+            }
+            if let Some(action) = self.try_record_get_current_exception(
+                ctx,
+                concrete_ptr as i64,
+                trace_ptr as i64,
+                effectinfo.runtime_helper,
+                dst,
+            ) {
+                return action;
+            }
+
             // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_R branch parity:
             // clear_exception precedes vable_and_vrefs_before_residual_call
             // (vrefs walk + vinfo stamp; see void arm for full citation).
@@ -6521,6 +6628,13 @@ where
             {
                 return action;
             }
+            // `dont_look_inside_cannot_raise` residuals skip the
+            // may_force finalize. `dispatch_exception_handler`
+            // still `frame.push`es the caught exception, so the
+            // heap vsd moves while the vable shadow does not.
+            // Reload vsd/stack only — a full static reload
+            // clobbers last_instr (shadow newer than heap).
+            ctx.reload_vable_stack_if_heap_moved();
             // pyjitpl.py — vrefs_after_residual_call
             // (see void arm for the explanation; gated on
             // `is_forces` because the before-hook only stamps

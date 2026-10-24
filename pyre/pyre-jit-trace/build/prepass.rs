@@ -70,6 +70,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "insns.bin",
     "descrs.bin",
     "descrs_index.bin",
+    "callinfos.bin",
     "descr_layouts.bin",
     "descr_layouts_index.bin",
     "effect_infos.bin",
@@ -85,6 +86,7 @@ const CODEGEN_OUTPUTS: &[&str] = &[
     "symbolic_fnaddr_paths.bin",
     "static_pytype_bindings.bin",
     "static_ref_bindings.bin",
+    "generated_residual_shims.rs",
 ];
 
 /// Outputs carrying this build-script process's own addresses, by
@@ -136,6 +138,7 @@ const HOST_ADDRESSED_OUTPUTS: &[&str] = &[
     "jitcodes.bin",
     "indirectcalltargets.bin",
     "descrs.bin",
+    "callinfos.bin",
     "descr_layouts.bin",
     "effect_infos.bin",
     "fnaddr_bindings.bin",
@@ -1208,6 +1211,68 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // `space.newbool` (`baseobjspace.py` `newbool`): `if b:
+                // return w_True; else: return w_False`. The residual
+                // wrapper is `dont_look_inside`; these bodies are the
+                // look-inside graphs portal interpret descends.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "bool_value_from_truth",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "boolobject",
+                    "w_bool_from",
+                ]),
+                // `_float_math1` / `_float_math2` name the unboxed math
+                // leaves (`descroperation.rs`). `complex_abs` is their
+                // look-inside caller, but `builtin_abs_complex` is
+                // `dont_look_inside`, so `call.py find_all_graphs` never
+                // scans the hub. Seed it the way that walk seeds
+                // `inline_calls_to` helpers the codewriter residualizes.
+                //
+                // `_float_mul` / `_float_truediv` are the same unboxed
+                // leaves the walker descends (`FLOAT_MUL_DESCENT` /
+                // `FLOAT_TRUEDIV_DESCENT`). `mul_impl` contains the
+                // sequence-repeat loop, so `look_inside_graph` declines
+                // it and BFS never reaches the leaf from
+                // `binary_value_from_tag`; seed the leaves the walker
+                // looks up by path.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_mul",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_truediv",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_math1",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "objspace",
+                    "descroperation",
+                    "_float_math2",
+                ]),
+                // `w_list_getitem` and `list_iter_getitem_locked` are
+                // `dont_look_inside`; the walker descends
+                // `w_list_getitem_inner` by name (`list_getitem_jitcode`).
+                // A declined callee is not scanned, so seed the inner
+                // like `list_iter_descr_next`.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "listobject",
+                    "w_list_getitem_inner",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.
@@ -1252,6 +1317,13 @@ fn real_main() {
                         "call_jit",
                         "ll_portal_runner_shim",
                     ])),
+                    // `eval_current_frame_raw` inlines to this; five args are
+                    // `portalfunc_ARGS`. `rewrite_jit_merge_point` still
+                    // calls `ll_portal_runner_shim`.
+                    portal_enter: Some(majit_translate::CallPath::from_segments([
+                        "call",
+                        "recursive_portal_enter",
+                    ])),
                     greens: pypyjit_driver_layout::PYPYJIT_GREEN_VARS
                         .iter()
                         .map(|(name, _)| (*name).to_string())
@@ -1290,6 +1362,7 @@ fn real_main() {
                         "eval",
                         "ll_unpackiterable_portal_runner_shim",
                     ])),
+                    portal_enter: None,
                     greens: vec!["greenkey".to_string()],
                     reds: vec![],
                     green_kinds: vec![majit_ir::Type::Ref],
@@ -1314,6 +1387,7 @@ fn real_main() {
                         "eval",
                         "ll_generatorentry_portal_runner_shim",
                     ])),
+                    portal_enter: None,
                     greens: vec!["pycode".to_string()],
                     reds: vec!["gen".to_string(), "w_arg".to_string()],
                     green_kinds: vec![majit_ir::Type::Ref],
@@ -1985,6 +2059,14 @@ fn real_main() {
         .unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
         std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
+        // `CallControl.callinfocollection` rows, indexed into the descr
+        // table just written. `func` is the build-time address (or a
+        // symbolic path hash), so the file is host-addressed.
+        std::fs::write(
+            format!("{out_dir}/callinfos.bin"),
+            bincode::serialize(&pipeline.callinfo_rows).unwrap(),
+        )
+        .unwrap();
 
         let mut descr_layouts_bin = Vec::new();
         let mut descr_layout_offsets = Vec::with_capacity(canonical_layouts.len() + 1);
@@ -2187,6 +2269,33 @@ fn real_main() {
             bincode::serialize(&ref_bindings_owned).unwrap(),
         )
         .unwrap();
+
+        let cargo_toml =
+            std::fs::read_to_string(format!("{manifest_dir}/Cargo.toml")).unwrap_or_default();
+        let enabled_features: std::collections::BTreeSet<String> = std::env::vars()
+            .filter_map(|(key, _)| {
+                key.strip_prefix("CARGO_FEATURE_")
+                    .map(|rest| rest.to_ascii_lowercase().replace('_', "-"))
+            })
+            .collect();
+        let nameability = majit_translate::residual_shim::Nameability::from_cargo_and_sources(
+            &cargo_toml,
+            &enabled_features,
+            &source_paths,
+        );
+        let (shim_source, shim_census) = majit_translate::residual_shim::emit_residual_shim_source(
+            &pipeline.residual_shim_targets,
+            &nameability,
+        );
+        std::fs::write(
+            format!("{out_dir}/generated_residual_shims.rs"),
+            &shim_source,
+        )
+        .unwrap();
+        eprintln!(
+            "[pyre-jit-trace build.rs] residual-shims: {}",
+            shim_census.line()
+        );
 
         // Report
         eprintln!(

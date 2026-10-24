@@ -13,6 +13,7 @@
 use majit_rlib::rbigint::RBigInt as BigInt;
 use num_traits::ToPrimitive;
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 
 /// True on a big-endian build; the native (`@` / no-prefix) byte order.
 const fn native_is_bigendian() -> bool {
@@ -340,7 +341,7 @@ fn parse_format(format: &str) -> Result<Parsed, crate::PyError> {
 
 /// `PackFormatIterator._accept_integral` — an int / bool / `__index__`
 /// object as a `BigInt` for range checking.
-unsafe fn accept_int(arg: PyObjectRef) -> Result<BigInt, crate::PyError> {
+unsafe fn accept_int(mut arg: PyObjectRef) -> Result<BigInt, crate::PyError> {
     unsafe {
         if is_int(arg) || is_long(arg) {
             return Ok(crate::builtins::obj_to_bigint(arg));
@@ -349,7 +350,13 @@ unsafe fn accept_int(arg: PyObjectRef) -> Result<BigInt, crate::PyError> {
             return Ok(BigInt::from(if w_bool_get_value(arg) { 1 } else { 0 }));
         }
         if let Some(tp) = crate::typedef::r#type(arg)
-            && let Some(index_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__index__")
+            && let Some(index_fn) = {
+                let mut tp = tp.as_ptr();
+                pyre_object::with_roots!(arg, tp => crate::baseobjspace::lookup_in_type(
+                    tp,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__index__")),
+                ))
+            }
         {
             let r = crate::call::call_function_impl_result(index_fn, &[arg])?;
             if is_int(r) || is_long(r) {
@@ -365,7 +372,7 @@ unsafe fn accept_int(arg: PyObjectRef) -> Result<BigInt, crate::PyError> {
 
 /// `PackFormatIterator.accept_float_arg` — a float / int / `__float__`
 /// object as an `f64`.
-unsafe fn accept_float(arg: PyObjectRef) -> Result<f64, crate::PyError> {
+unsafe fn accept_float(mut arg: PyObjectRef) -> Result<f64, crate::PyError> {
     unsafe {
         if is_float(arg) {
             return Ok(w_float_get_value(arg));
@@ -387,7 +394,13 @@ unsafe fn accept_float(arg: PyObjectRef) -> Result<f64, crate::PyError> {
             return Ok(if w_bool_get_value(arg) { 1.0 } else { 0.0 });
         }
         if let Some(tp) = crate::typedef::r#type(arg)
-            && let Some(float_fn) = crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__")
+            && let Some(float_fn) = {
+                let mut tp = tp.as_ptr();
+                pyre_object::with_roots!(arg, tp => crate::baseobjspace::lookup_in_type(
+                    tp,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__float__")),
+                ))
+            }
         {
             let r = crate::call::call_function_impl_result(float_fn, &[arg])?;
             if is_float(r) {

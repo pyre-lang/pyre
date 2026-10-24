@@ -44,6 +44,7 @@ fn build_caller_graph(name: &str, callee_path: &CallPath) -> FunctionGraph {
                 target: CallTarget::FunctionPath {
                     segments: callee_path.segments.clone(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: Vec::new(),
                 result_ty: ValueType::Int,

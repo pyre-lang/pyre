@@ -727,15 +727,25 @@ pub fn compare_op_from_tag(tag: i64) -> Option<ComparisonOperator> {
     })
 }
 
-/// One-word residual ABI for [`build_list_from_refs`].
-///
-/// The items argument is a length-prefixed `GcTypedArray` (`bh_newlist_from_array`).
+/// Residual ABI for [`build_list_from_refs`]: the items argument arrives as
+/// its `(ptr, len)` pair.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn build_list_from_refs_jit_abi(
-    array: *const pyre_object::object_array::GcTypedArray,
+    items: *const PyObjectRef,
+    len: usize,
 ) -> PyObjectRef {
-    let items = pyre_object::gc_roots::gcarray_ref_items(array);
-    build_list_from_refs(&items)
+    build_list_from_refs(unsafe { ref_pair_items(items, len) })
+}
+
+/// View a `(ptr, len)` pair argument as a slice.
+///
+/// # Safety
+/// `items` must point at `len` live refs.
+unsafe fn ref_pair_items<'a>(items: *const PyObjectRef, len: usize) -> &'a [PyObjectRef] {
+    if len == 0 {
+        return &[];
+    }
+    unsafe { std::slice::from_raw_parts(items, len) }
 }
 
 pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
@@ -750,15 +760,14 @@ pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
     w_list_new(live)
 }
 
-/// One-word residual ABI for [`build_tuple_from_refs`].
-///
-/// Same length-prefixed array word as [`build_list_from_refs_jit_abi`].
+/// Residual ABI for [`build_tuple_from_refs`] over the same `(ptr, len)`
+/// pair as [`build_list_from_refs_jit_abi`].
 #[majit_macros::dont_look_inside]
 pub extern "C" fn build_tuple_from_refs_jit_abi(
-    array: *const pyre_object::object_array::GcTypedArray,
+    items: *const PyObjectRef,
+    len: usize,
 ) -> PyObjectRef {
-    let items = pyre_object::gc_roots::gcarray_ref_items(array);
-    build_tuple_from_refs(&items)
+    build_tuple_from_refs(unsafe { ref_pair_items(items, len) })
 }
 
 pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {

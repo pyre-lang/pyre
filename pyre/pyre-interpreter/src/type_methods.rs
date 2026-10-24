@@ -3754,7 +3754,7 @@ unsafe fn is_shared_builtin_format(val: PyObjectRef, meth: PyObjectRef) -> bool 
 /// apply the shared builtin spec parser, with an empty spec collapsing to
 /// `str(value)`.  Shared by `format()`, the `FormatSimple`/`FormatWithSpec`
 /// f-string opcodes, and `str.format` field formatting.
-pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
+pub fn format_value_dispatch(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
     // Fast path for common types.  An exact `str` or `int` cannot carry a
     // `__format__` override, and with an empty spec its builtin `__format__`
     // is `str(value)` — so resolve and call nothing.  `bool` is excluded (it
@@ -3776,7 +3776,8 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
     // the shared default takes the fast path below, which formats the
     // underlying value directly.  `__format__` is resolved on the type (not
     // the instance) so an instance-dict attribute does not shadow it.
-    if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }
+    if let Some(meth) =
+        unsafe { pyre_object::with_roots!(val => crate::baseobjspace::lookup(val, "__format__")) }
         && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
     {
         let _roots = pyre_object::gc_roots::push_roots();
@@ -3876,7 +3877,10 @@ fn format_simple_slow(val: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
 
 /// [`format_w`] for every shape its empty-spec `str` / `int` arms do not
 /// answer: a long, a `__format__` dispatch, and the spec parser.
-fn format_w_slow(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn format_w_slow(
+    mut val: PyObjectRef,
+    mut w_spec: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     let spec_is_str = !w_spec.is_null() && unsafe { is_str(w_spec) };
     let spec_is_empty = !spec_is_str || unsafe { pyre_object::w_str_get_wtf8(w_spec) }.is_empty();
 
@@ -3891,8 +3895,9 @@ fn format_w_slow(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, c
         }));
     }
 
-    if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }
-        && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
+    if let Some(meth) = unsafe {
+        pyre_object::with_roots!(val, w_spec => crate::baseobjspace::lookup(val, "__format__"))
+    } && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
     {
         let spec_obj = if spec_is_str {
             w_spec
@@ -7022,12 +7027,14 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     // a sequence of pairs reaches the absent arm without an
     // AttributeError being built. Only a missing attribute reads as
     // absent (`PyObject_GetOptionalAttr`).
-    let w_keys_method = match crate::baseobjspace::getattr_str_impl(data(), "keys", true, true) {
-        Ok(value) if value.is_null() => None,
-        Ok(value) => Some(value),
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
-        Err(e) => return Err(e),
-    };
+    let w_keys_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("keys"));
+    let w_keys_method =
+        match crate::baseobjspace::getattr_str_impl(data(), "keys", true, true, w_keys_name) {
+            Ok(value) if value.is_null() => None,
+            Ok(value) => Some(value),
+            Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
+            Err(e) => return Err(e),
+        };
     let Some(w_method) = w_keys_method else {
         return dict_update1_pairs(dict(), data());
     };
@@ -7406,11 +7413,12 @@ pub fn dict_descr_init_args(
 /// `is_dict` already established the W_DictMultiObject side; this
 /// helper performs the `findattr` identity check to keep
 /// `__iter__`-overriding subclasses on the slow `keys()` path.
-pub(crate) fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
+pub(crate) fn dict_subclass_uses_default_iter(mut other: PyObjectRef) -> bool {
     let Some(other_type) = crate::typedef::r#type(other) else {
         return false;
     };
-    let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
+    let mut other_type = other_type.as_ptr();
+    let mut dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
     if dict_type.is_null() {
         // No registered dict typeobject yet (init order quirk) —
         // degrade to "fast path" (treat as plain dict) to preserve
@@ -7419,16 +7427,18 @@ pub(crate) fn dict_subclass_uses_default_iter(other: PyObjectRef) -> bool {
     }
     // Real `dict` type — no subclass at all, so __iter__ is by
     // definition unshadowed.
-    if std::ptr::eq(other_type.as_ptr() as *const _, dict_type as *const _) {
+    if std::ptr::eq(other_type as *const _, dict_type as *const _) {
         return true;
     }
     // [3.14-spec] dictmultiobject.py update1 compares space.findattr(space.type(w_data), "__iter__");
     // CPython v3.14.6 dict_merge compares the tp_iter slot (C source at tag v3.14.6), i.e. the
     // type's MRO entry, so a metaclass attribute named __iter__ does not count. space.lookup is
     // that MRO lookup.
-    let other_iter =
-        unsafe { crate::baseobjspace::lookup_in_type(other_type.as_ptr(), "__iter__") };
-    let dict_iter = unsafe { crate::baseobjspace::lookup_in_type(dict_type, "__iter__") };
+    let w_iter_name = pyre_object::with_roots!(other, other_type, dict_type => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__"))
+    });
+    let other_iter = unsafe { crate::baseobjspace::lookup_in_type(other_type, w_iter_name) };
+    let dict_iter = unsafe { crate::baseobjspace::lookup_in_type(dict_type, w_iter_name) };
     match (other_iter, dict_iter) {
         (Some(a), Some(b)) => std::ptr::eq(a, b),
         _ => false,

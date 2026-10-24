@@ -377,9 +377,9 @@ pub struct TraceCtx {
     /// later visit's greens to decline closing when a scalar green differs
     /// from the header.  `None` until captured;
     /// bridges never populate it (they close through the compiled-loop
-    /// registry).  This is the merge-point green vocabulary — distinct from
-    /// `green_key_values`, the back-edge/can_enter_jit key, which carries a
-    /// different arity and cannot be compared against a merge point directly.
+    /// registry).  This is the merge-point green vocabulary — the same
+    /// declared-green tuple `green_key_values` hashes (`pyjitpl.py`
+    /// `original_boxes[:num_green_args]`).
     pub(crate) header_greens: Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
     /// pyjitpl.py:3005 `greenboxes` at the merge point the trace actually
     /// closed on, in the same `(ints, refs, floats)` slot grouping as
@@ -4553,7 +4553,7 @@ impl TraceCtx {
     ///
     /// The trailing identity slot is excluded, matching `check_boxes`'
     /// closing `assert len(boxes) == i + 1`.
-    pub fn check_synchronized_virtualizable(&self) {
+    pub fn check_synchronized_virtualizable(&mut self) {
         if !cfg!(debug_assertions) {
             return;
         }
@@ -4599,7 +4599,7 @@ impl TraceCtx {
             let ty = info.array_fields[a_idx].item_type;
             for item_idx in 0..length {
                 if cursor >= shadow_data_len {
-                    return;
+                    break;
                 }
                 let Some(value) = self.box_runtime_concrete(boxes[cursor]) else {
                     cursor += 1;
@@ -4770,6 +4770,37 @@ impl TraceCtx {
         };
         *slot = value;
         true
+    }
+
+    /// A `SetfieldGc` of a virtualizable static field on the live
+    /// virtualizable object must keep `virtualizable_boxes` in sync.
+    /// After `reload_top_root` the codewriter can emit `SETFIELD_GC`
+    /// instead of `SETFIELD_VABLE`; without this the next
+    /// `getfield_vable` trips `check_synchronized_virtualizable`.
+    pub fn sync_shadow_if_vable_heap_store(
+        &mut self,
+        struct_ptr: i64,
+        field_offset: usize,
+        value: OpRef,
+        concrete: Value,
+    ) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        if struct_ptr == 0 || struct_ptr as usize != heap_ptr as usize {
+            return;
+        }
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(index) = info
+            .static_fields
+            .iter()
+            .position(|field| field.offset == field_offset)
+        else {
+            return;
+        };
+        self.set_virtualizable_entry_at(index, value, concrete);
     }
 
     /// Update a standard virtualizable slot: store `valuebox` and stamp it
@@ -5422,6 +5453,109 @@ impl TraceCtx {
         clippy::not_unsafe_ptr_arg_deref,
         reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
     )]
+    /// True when a residual wrote a static virtualizable field through the
+    /// heap without updating the shadow (token not forced).
+    pub fn vable_heap_static_diverged(
+        &self,
+        info: &crate::virtualizable::VirtualizableInfo,
+        vable_ptr: *const u8,
+    ) -> bool {
+        if vable_ptr.is_null() {
+            return false;
+        }
+        for (i, field) in info.static_fields.iter().enumerate() {
+            let Some((_, shadow)) = self.virtualizable_entry_at(i) else {
+                break;
+            };
+            let bits = unsafe { info.read_field(vable_ptr, i) };
+            let heap = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
+            if shadow != heap {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// After `dispatch_exception_handler` (`dont_look_inside_cannot_raise`)
+    /// `frame.push`es the caught exception, the heap vsd/stack have moved
+    /// and the vable shadow has not. Copy only `valuestackdepth` and the
+    /// newly pushed slots (`old_vsd..new_vsd`). Locals stay as the resume
+    /// Virtuals (`virtualizable.py load_list_of_boxes`). A full
+    /// [`Self::load_fields_from_virtualizable`] also reloads `last_instr`
+    /// from the heap (often 0) and replaces those Virtuals with ConstPtrs.
+    pub fn reload_vable_stack_if_heap_moved(&mut self) {
+        let (Some(info), Some(ptr)) = (
+            self.virtualizable_info().cloned(),
+            self.standard_virtualizable_ptr(),
+        ) else {
+            return;
+        };
+        if ptr == 0 {
+            return;
+        }
+        let heap_ptr = ptr as *const u8;
+        let Some(vsd_idx) = info
+            .static_fields
+            .iter()
+            .position(|f| f.name == "valuestackdepth")
+        else {
+            return;
+        };
+        let Some((_, shadow)) = self.virtualizable_entry_at(vsd_idx) else {
+            return;
+        };
+        let bits = unsafe { info.read_field(heap_ptr, vsd_idx) };
+        let heap = crate::pyjitpl::heap_value_for_pub(info.static_fields[vsd_idx].field_type, bits);
+        if shadow == heap {
+            return;
+        }
+        let old_vsd = match shadow {
+            Value::Int(n) if n >= 0 => n as usize,
+            _ => return,
+        };
+        let new_vsd = match bits {
+            n if n >= 0 => n as usize,
+            _ => return,
+        };
+        let vsd_box = self.const_int(bits);
+        self.set_virtualizable_entry_at(vsd_idx, vsd_box, heap);
+        // `valuestackdepth` is the absolute index into
+        // `locals_cells_stack_w` (pyframe.py `push` / pyframe.rs). A
+        // cannot_raise handler only `frame.push`es, so the new slots are
+        // `old_vsd..new_vsd`. Locals and the previous stack stay as the
+        // resume Virtuals (`virtualizable.py load_list_of_boxes` /
+        // `pyjitpl.py _opimpl_getarrayitem_vable`). Replacing those with
+        // heap ConstPtrs folds immutable `intval` to the recording-time
+        // counter and the compiled bridge hangs.
+        if new_vsd <= old_vsd {
+            return;
+        }
+        let lengths = self
+            .virtualizable_array_lengths()
+            .map(|lengths| lengths.to_vec())
+            .unwrap_or_default();
+        let Some(&length) = lengths.first() else {
+            return;
+        };
+        let ty = match info.array_fields.first() {
+            Some(field) => field.item_type,
+            None => return,
+        };
+        let array_base = info.num_static_extra_boxes;
+        let end = new_vsd.min(length);
+        for item_idx in old_vsd..end {
+            let item_bits = unsafe { info.read_array_item(heap_ptr, 0, item_idx) };
+            let item_val = crate::pyjitpl::heap_value_for_pub(ty, item_bits);
+            let item_box = match ty {
+                majit_ir::Type::Int => self.const_int(item_bits),
+                majit_ir::Type::Ref => self.const_ref(item_bits),
+                majit_ir::Type::Float => self.const_float(item_bits),
+                majit_ir::Type::Void => continue,
+            };
+            self.set_virtualizable_entry_at(array_base + item_idx, item_box, item_val);
+        }
+    }
+
     pub fn load_fields_from_virtualizable(
         &mut self,
         info: &VirtualizableInfo,
@@ -6798,11 +6932,15 @@ impl TraceCtx {
                 return None;
             }
             // pyjitpl.py:1173-1199 nonstandard vable miss delegates to
-            // the standard heap operation.
+            // the standard heap operation. `execute_setfield_gc` records
+            // through `execute_and_record`, which runs `do_setfield_gc`
+            // (`bh_setfield_gc_*`) before the `SETFIELD_GC` is appended —
+            // the same concrete store `BC_SETFIELD_GC_*` performs.
+            let stored = concrete.or_else(|| self.box_value(value));
             self.execute_and_record(
                 None,
                 OpCode::SetfieldGc,
-                Some(record_descr),
+                Some(record_descr.clone()),
                 &[vable_opref, value],
                 None,
                 0,
@@ -6813,8 +6951,35 @@ impl TraceCtx {
             // stamped at the calling record-site with `concrete` via
             // `set_opref_concrete`, so cache-hit sanity readers retrieve
             // it through `box_value(cached)`.
-            let _ = concrete;
             self.heapcache_setfield_cached(vable_opref, field_index, value);
+            let vable_concrete = self.concrete_of_opref(vable_opref);
+            if let Some(stored) = stored
+                && let Some(ptr) = match vable_concrete {
+                    Some(Value::Ref(r)) => live_gc_ptr(r),
+                    _ => None,
+                }
+            {
+                self.field_store(ptr, &record_descr, stored);
+            }
+            // reload_top_root can make the portal frame look nonstandard
+            // (new box, same heap). The heap store above then desyncs the
+            // shadow; read the field back when the dest is the live vable.
+            let heap = match vable_concrete {
+                Some(Value::Ref(r)) => r.0 as i64,
+                _ => 0,
+            };
+            if let (Some(info), Some(heap_ptr)) = (
+                self.virtualizable_info.as_ref(),
+                self.virtualizable_heap_ptr,
+            ) && heap != 0
+                && heap as usize == heap_ptr as usize
+                && let Some(idx) = info.static_field_by_descr(&fielddescr)
+            {
+                let ty = info.static_fields[idx].field_type;
+                let bits = unsafe { info.read_field(heap_ptr, idx) };
+                let stored = crate::pyjitpl::heap_value_for_pub(ty, bits);
+                self.set_virtualizable_entry_at(idx, value, stored);
+            }
             return None;
         }
         // index = self._get_virtualizable_field_index(fielddescr)
@@ -7188,10 +7353,11 @@ impl TraceCtx {
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
-            return (
-                self.vable_getarrayitem_int_descr(array_opref, index, adescr),
-                None,
-            );
+            let op = self.vable_getarrayitem_int_descr(array_opref, index, adescr.clone());
+            let value = self.concrete_of_opref(op).or_else(|| {
+                self.array_live_value(array_opref, index_runtime_value, &adescr, Type::Int)
+            });
+            return (op, value);
         }
         // pyjitpl.py:1170,1177,1184,1228 — the reader asserts the shadow is
         // coherent; it never repairs it.
@@ -7268,7 +7434,15 @@ impl TraceCtx {
         // `get_parent_descr` upgrades a `Weak`. The field descr stored on the
         // op is the only other owner, so the parent has to stay alive itself.
         Self::keep_embedded_parent(parent);
-        self.record_op_with_descr(OpCode::GetfieldGcR, &[container], field)
+        let field: DescrRef = field;
+        let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[container], field.clone());
+        if let Some(Value::Ref(container_ref)) = self.concrete_of_opref(container)
+            && let Some(ptr) = live_gc_ptr(container_ref)
+            && let Some(items) = self.field_sanity_load(ptr, &field, Type::Ref)
+        {
+            self.set_opref_concrete(op, items);
+        }
+        op
     }
 
     fn vable_embedded_items_base_descr(&mut self, container: OpRef, fdescr: &DescrRef) -> OpRef {
@@ -7402,7 +7576,7 @@ impl TraceCtx {
             );
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
-            let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr);
+            let item = self.vable_getarrayitem_ref_descr(array_opref, index, adescr.clone());
             if crate::vable_read_probe_enabled() {
                 eprintln!(
                     "[vable-read-probe] exit=nonstandard concrete={}",
@@ -7413,7 +7587,13 @@ impl TraceCtx {
                 self.set_opref_concrete(item, v);
                 return (item, Some(v));
             }
-            return (item, None);
+            let loaded = self.concrete_of_opref(item).or_else(|| {
+                self.array_live_value(array_opref, index_runtime_value, &adescr, Type::Ref)
+            });
+            if let Some(v) = loaded {
+                self.set_opref_concrete(item, v);
+            }
+            return (item, loaded);
         }
         let flat_idx = self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr);
         let entry = flat_idx.and_then(|flat_idx| self.vable_box_result_at(flat_idx));
@@ -7508,10 +7688,11 @@ impl TraceCtx {
         if nonstandard {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
-            return (
-                self.vable_getarrayitem_float_descr(array_opref, index, adescr),
-                None,
-            );
+            let op = self.vable_getarrayitem_float_descr(array_opref, index, adescr.clone());
+            let value = self.concrete_of_opref(op).or_else(|| {
+                self.array_live_value(array_opref, index_runtime_value, &adescr, Type::Float)
+            });
+            return (op, value);
         }
         if let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
@@ -7681,7 +7862,14 @@ impl TraceCtx {
         if nonstandard {
             let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
             let array_opref = self.vable_embedded_items_base_descr(array_opref, &fdescr);
-            self.execute_setarrayitem_gc(array_opref, index, value, adescr);
+            self.execute_setarrayitem_gc(
+                array_opref,
+                index,
+                value,
+                adescr,
+                index_runtime_value,
+                concrete,
+            );
             return VableArrayStore::Stored(None);
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
@@ -8083,21 +8271,25 @@ impl TraceCtx {
 
     /// `execute_setarrayitem_gc(arraydescr, arraybox, indexbox, itembox)`
     /// (pyjitpl.py): record the `SETARRAYITEM_GC`, then publish the stored item
-    /// to the heapcache.  `gen_store_back_in_vable` deliberately does NOT come
-    /// through here — it records the op directly — so the raw recording form
-    /// stays available as `vable_setarrayitem_descr`.
+    /// to the heapcache, then run `do_setarrayitem_gc` (`cpu.bh_setarrayitem_gc_*`)
+    /// so the interpret walk observes the store.  `gen_store_back_in_vable`
+    /// deliberately does NOT come through here — it records the op directly —
+    /// so the raw recording form stays available as `vable_setarrayitem_descr`.
     ///
     /// The heapcache write is what keeps a later read of the same slot from
     /// forwarding the value the cache was seeded with: the element cache is the
     /// only thing a nonstandard virtualizable's reads consult for the stored
     /// box, so a store that skips it leaves every subsequent read answering the
-    /// pre-store value.
+    /// pre-store value.  The concrete store is what the rest of the interpret
+    /// walk (and residual callees) actually read.
     fn execute_setarrayitem_gc(
         &mut self,
         array_opref: OpRef,
         index: OpRef,
         value: OpRef,
         descr: DescrRef,
+        index_runtime_value: i64,
+        concrete: Value,
     ) {
         let descr_index = descr.index();
         // A store has no `resvalue` and `SETARRAYITEM_GC` is never pure, so
@@ -8105,12 +8297,17 @@ impl TraceCtx {
         self.execute_and_record(
             None,
             OpCode::SetarrayitemGc,
-            Some(descr),
+            Some(descr.clone()),
             &[array_opref, index, value],
             None,
             0,
         );
         self.heapcache_setarrayitem(array_opref, index, descr_index, value);
+        let array_ptr = match self.concrete_of_opref(array_opref) {
+            Some(Value::Ref(r)) => live_gc_ptr(r).unwrap_or(0),
+            _ => 0,
+        };
+        self.array_store(array_ptr, index_runtime_value, &descr, concrete);
     }
 }
 
@@ -8264,6 +8461,69 @@ mod tests {
             _fielddescr: &majit_jitcode::jitcode::BhDescr,
         ) -> f64 {
             self.float_value
+        }
+    }
+
+    /// Test cpu that uses the default `bh_getfield_gc_*` / `bh_setarrayitem_gc_*`
+    /// memory accessors (`llmodel.py`), so a nonstandard vable store/load
+    /// through `field_sanity_load` / `array_store` hits the live array.
+    struct LiveMemTestCpu;
+    impl majit_backend::Backend for LiveMemTestCpu {
+        fn compile_loop(
+            &mut self,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("LiveMemTestCpu::compile_loop")
+        }
+        fn compile_bridge(
+            &mut self,
+            _fail_descr: &dyn majit_ir::FailDescr,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _original_token: &majit_backend::JitCellToken,
+            _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("LiveMemTestCpu::compile_bridge")
+        }
+        fn execute_token(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            _args: &[majit_ir::Value],
+        ) -> majit_backend::DeadFrame {
+            unimplemented!("LiveMemTestCpu::execute_token")
+        }
+        fn get_latest_descr<'a>(
+            &self,
+            _frame: &'a majit_backend::DeadFrame,
+        ) -> &'a dyn majit_ir::FailDescr {
+            unimplemented!("LiveMemTestCpu::get_latest_descr")
+        }
+        fn get_latest_descr_arc(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+        ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+            unimplemented!("LiveMemTestCpu::get_latest_descr_arc")
+        }
+        fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+            unimplemented!("LiveMemTestCpu::get_int_value")
+        }
+        fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+            self.get_int_value(frame, slot)
+        }
+        fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+            unimplemented!("LiveMemTestCpu::get_float_value")
+        }
+        fn get_ref_value(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+            _index: usize,
+        ) -> majit_ir::GcRef {
+            unimplemented!("LiveMemTestCpu::get_ref_value")
+        }
+        fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+            unimplemented!("LiveMemTestCpu::invalidate_loop")
         }
     }
 
@@ -9277,6 +9537,22 @@ mod tests {
         ctx.walk_virtualizable_value_refs(visitor);
     }
 
+    fn make_test_vable_info_with_vsd_array() -> crate::virtualizable::VirtualizableInfo {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("valuestackdepth", Type::Int, 8);
+        info.add_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Ref),
+        );
+        let parent = majit_ir::descr::make_size_descr(0);
+        info.set_parent_descr(parent);
+        info
+    }
+
     // Test helper: typed placeholder matching each slot's declared type so
     // the Box's (OpRef, concrete) pair stays internally consistent — the
     // `virtualizable_boxes[index] = valuebox` invariant.  Tests
@@ -10067,6 +10343,66 @@ mod tests {
     }
 
     #[test]
+    fn reload_vable_stack_keeps_resume_virtuals() {
+        let info = make_test_vable_info_with_vsd_array();
+        let fd24 = info.array_pointer_field_descr(0);
+        let adesc = info.array_item_descr(0);
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let vsd = recorder.record_input_arg(Type::Int);
+        let local0 = recorder.record_input_arg(Type::Ref);
+        let local1 = recorder.record_input_arg(Type::Ref);
+        let stack0 = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+
+        #[repr(C)]
+        struct Heap {
+            _pad: usize,
+            vsd: isize,
+            _pad2: usize,
+            array: *mut usize,
+        }
+        let mut items = [0x1000usize, 0x2000, 0x3000, 0];
+        let heap = Heap {
+            _pad: 0,
+            vsd: 3,
+            _pad2: 0,
+            array: items.as_mut_ptr(),
+        };
+        let heap_ptr = &heap as *const Heap as *const u8;
+
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            Value::Ref(majit_ir::GcRef(heap_ptr as usize)),
+            &[vsd, local0, local1, stack0],
+            &[
+                Value::Int(2),
+                Value::Ref(majit_ir::GcRef(0x10)),
+                Value::Ref(majit_ir::GcRef(0x20)),
+                Value::Ref(majit_ir::GcRef(0x30)),
+            ],
+            &[3],
+        );
+
+        ctx.reload_vable_stack_if_heap_moved();
+
+        let (r0, _) = ctx.vable_getarrayitem_ref_vable(vable, &fd24, 0, adesc.clone());
+        let (r1, _) = ctx.vable_getarrayitem_ref_vable(vable, &fd24, 1, adesc.clone());
+        assert_eq!(r0, local0, "local 0 must stay the resume Virtual");
+        assert_eq!(r1, local1, "local 1 must stay the resume Virtual");
+        let (r2, _) = ctx.vable_getarrayitem_ref_vable(vable, &fd24, 2, adesc);
+        assert!(
+            r2.is_constant(),
+            "newly pushed slot comes from the heap ConstPtr"
+        );
+    }
+
+    #[test]
     fn vable_setarrayitem_writes_to_boxes() {
         let info = make_test_vable_info_with_array();
         let fd24 = info.array_pointer_field_descr(0);
@@ -10354,6 +10690,71 @@ mod tests {
             ops.iter().all(|op| op.opcode != OpCode::GetarrayitemGcR),
             "heapcache hit must not record GETARRAYITEM_GC_R: {ops:?}"
         );
+    }
+
+    #[test]
+    fn nonstandard_setarrayitem_vable_writes_concrete_array() {
+        // `_opimpl_setarrayitem_vable` nonstandard leg calls
+        // `execute_setarrayitem_gc` / `do_setarrayitem_gc`, which stores
+        // through the live array the way `BC_SETARRAYITEM_GC_*` does.
+        let info = make_test_vable_info_with_array();
+        let fd = info.array_pointer_field_descr(0);
+        let adesc = info.array_item_descr(0);
+
+        #[repr(C)]
+        struct Vable {
+            _pad: [u8; 24],
+            array: *mut i64,
+        }
+        let mut items = [0i64, 99i64];
+        let vable = Vable {
+            _pad: [0; 24],
+            array: items.as_mut_ptr(),
+        };
+
+        let mut recorder = Trace::new();
+        let portal = recorder.record_input_arg(Type::Ref);
+        let callee = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let stored = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let cpu = LiveMemTestCpu;
+        ctx.set_cpu(Some(&cpu));
+        ctx.init_virtualizable_boxes(
+            &info,
+            portal,
+            ph(Type::Ref),
+            &[box_pc, stored],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[2],
+        );
+        ctx.set_opref_concrete(
+            callee,
+            Value::Ref(majit_ir::GcRef(&vable as *const Vable as usize)),
+        );
+        let index = ctx.const_int(0);
+        ctx.vable_setarrayitem_checked(
+            true,
+            0,
+            callee,
+            index,
+            0,
+            fd.clone(),
+            adesc.clone(),
+            stored,
+            Value::Int(42),
+            false,
+        );
+        assert_eq!(items[0], 42, "nonstandard setarrayitem_vable must store");
+        assert_eq!(items[1], 99, "untouched slot stays");
+
+        let (_got, value) =
+            ctx.vable_getarrayitem_int_checked(true, 0, callee, index, 0, fd, adesc);
+        assert_eq!(value, Some(Value::Int(42)));
     }
 
     #[test]

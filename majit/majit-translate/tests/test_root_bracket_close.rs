@@ -36,13 +36,16 @@ use common::{
     object_llbc,
 };
 use majit_charon_reader::Llbc;
-use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
+use majit_charon_reader::ullbc::{
+    CallFunc, CallKind, FunId, PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured,
+};
 use majit_translate::CallPath;
 use majit_translate::HostStaticAddrs;
 use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{
-    LowerContext, erased_root_bracket_guards, lower_fun_decl, lower_fun_decl_with_static_addrs,
+    LowerContext, discover_stack_param_slots_fns, erased_root_bracket_guards, lower_fun_decl,
+    lower_fun_decl_with_static_addrs, shadow_stack_erase_status,
 };
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -777,6 +780,15 @@ fn set_add_value_bracket_is_scalar_replaced() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
+    let fd = fun_decl_named(llbc, "set_add_value");
+    let body = fd
+        .unstructured()
+        .expect("set_add_value has an unstructured body");
+    match shadow_stack_erase_status(llbc, fd, &body) {
+        Ok(true) => {}
+        Ok(false) => panic!("set_add_value has no bracket to erase"),
+        Err(reason) => panic!("set_add_value erase refused: {reason}"),
+    }
     let graph = lower_named(llbc, "set_add_value");
     for leaf in [
         "push_roots",
@@ -794,6 +806,265 @@ fn set_add_value_bracket_is_scalar_replaced() {
             "set_add_value still calls {leaf} after the bracket was scalar-replaced"
         );
     }
+}
+
+/// `wrap_set_element_hash_error` reads `err.message_wtf8()` through
+/// `PyError.0` (the GCREF handle). That field is not a slot index, so
+/// harvest must not classify the body as ParamSlots.
+#[test]
+fn wrap_set_element_hash_error_is_not_param_slots() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let hits = discover_stack_param_slots_fns(llbc);
+    let wrap = hits
+        .iter()
+        .filter(|(path, _)| path.ends_with("wrap_set_element_hash_error"))
+        .collect::<Vec<_>>();
+    assert!(
+        wrap.is_empty(),
+        "wrap_set_element_hash_error must not harvest as ParamSlots: {wrap:?}"
+    );
+}
+
+fn residual_vec_rangefrom_index(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target:
+            CallTarget::FunctionPath {
+                segments,
+                generic_rust_args,
+                ..
+            },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    let joined = segments.join("::");
+    let gens = generic_rust_args.join(",");
+    (joined.contains("RangeFrom") || gens.contains("RangeFrom"))
+        && (segments.last().is_some_and(|s| s == "index") || joined.contains("::index"))
+        && (joined.contains("Vec") || joined.contains("vec::"))
+}
+
+fn leftover_unsuffixed_getslice_rangefrom(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.first().map(String::as_str) == Some("__getslice_rangefrom") && segments.len() < 2
+}
+
+fn residual_dict_operation_guard_ctor(kind: &OpKind) -> bool {
+    match kind {
+        OpKind::Call {
+            target:
+                CallTarget::SyntheticTransparentCtor {
+                    name, owner_path, ..
+                },
+            ..
+        } => {
+            name.contains("DictOperationGuard")
+                || owner_path.iter().any(|s| s.contains("DictOperationGuard"))
+        }
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            let joined = segments.join("::");
+            joined.contains("DictOperationGuard") && joined.contains("synthetic-transparent-ctor")
+        }
+        _ => false,
+    }
+}
+
+/// ULLBC terminator whose callee is `Vec::index` of a `RangeFrom`.
+fn body_calls_vec_rangefrom_index(llbc: &Llbc, body: &Unstructured) -> bool {
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let path = match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => llbc
+                .fn_by_id(*id)
+                .map(|fd| fd.item_meta.name_path())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let gens = reg.generics.to_string();
+        if (path.contains("RangeFrom") || gens.contains("RangeFrom"))
+            && (path.contains("::index") || path.ends_with("index") || gens.contains("index"))
+            && (path.contains("Vec") || path.contains("vec::") || gens.contains("Vec"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `Vec<*mut PyObject>[k..]` is `l[start:]` (`ll_listslice_startonly`).
+/// An Int-banked header must not remain a residual `Vec::index` RangeFrom.
+#[test]
+fn object_vec_rangefrom_index_is_getslice_not_residual() {
+    let programs: Vec<_> = [object_llbc(), interpreter_llbc()]
+        .into_iter()
+        .flatten()
+        .map(|llbc| (llbc, lower_context_for(llbc)))
+        .collect();
+    assert!(
+        !programs.is_empty(),
+        "object or interpreter LLBC must be present"
+    );
+    let mut work: Vec<(&LowerContext<'_>, &majit_charon_reader::ullbc::FunDecl)> = Vec::new();
+    for (llbc, context) in &programs {
+        for fd in llbc.iter_local_fns() {
+            let Some(body) = fd.unstructured() else {
+                continue;
+            };
+            let path = fd.item_meta.name_path();
+            let known = path.contains("new_for_call_with_closure_and_globals_obj")
+                || path.contains("try_new_for_call_with_closure_and_globals_obj");
+            if known || body_calls_vec_rangefrom_index(llbc, &body) {
+                work.push((context, fd));
+            }
+        }
+    }
+    assert!(
+        !work.is_empty(),
+        "no Vec::index RangeFrom callsite in object/interpreter LLBC"
+    );
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(work.len().max(1));
+    let chunk = work.len().div_ceil(threads).max(1);
+    let hits =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                work.chunks(chunk)
+                    .map(|slice| {
+                        scope.spawn(move || {
+                            let mut hits = Vec::new();
+                            for &(context, fd) in slice {
+                                let Ok(graph) = lower_fun_decl(context, fd) else {
+                                    continue;
+                                };
+                                if graph.blocks.iter().flat_map(|block| &block.operations).any(
+                                    |op| {
+                                        residual_vec_rangefrom_index(&op.kind)
+                                            || leftover_unsuffixed_getslice_rangefrom(&op.kind)
+                                    },
+                                ) {
+                                    hits.push(fd.item_meta.name_path().to_string());
+                                }
+                            }
+                            hits
+                        })
+                    })
+                    .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("rangefrom worker"))
+                .collect::<Vec<_>>()
+        });
+    assert!(
+        hits.is_empty(),
+        "Vec::index RangeFrom of an object-pointer Vec must lower to a suffixed getslice, residual in {hits:?}"
+    );
+}
+
+/// jtransform mints `ll_listslice_startonly` from the suffixed marker.
+/// A bare `__getslice_rangefrom` has no array identity and stays residual.
+#[test]
+fn object_vec_rangefrom_jtransform_rewrites_getslice_marker() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let graph = lower_named(llbc, "try_new_for_call_with_closure_and_globals_obj");
+    let markers: Vec<Vec<String>> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.first().map(String::as_str) == Some("__getslice_rangefrom") => {
+                Some(segments.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !markers.is_empty(),
+        "try_new_for_call_with_closure_and_globals_obj must plant a getslice marker"
+    );
+    assert!(
+        markers.iter().all(|s| s.len() == 2),
+        "getslice marker must carry the object-array suffix, got {markers:?}"
+    );
+    let mut cc = CallControl::new();
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let out = transformer.transform(&graph);
+    let leftover: Vec<String> = out
+        .graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.first().map(String::as_str) == Some("__getslice_rangefrom") => {
+                Some(segments.join("::"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "jtransform must mint ll_listslice_startonly, leftover {leftover:?}"
+    );
+}
+
+/// A raw `DictOperationGuard` ctor is Int SROA / a dummy, not a residual
+/// fnaddr. `new0`..`new3` are looked inside; the leftover empty-arg ctor
+/// is what pickle traced as a symbolic path.
+#[test]
+fn dict_operation_guard_ctor_is_not_a_residual_fnaddr() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let context = lower_context_for(llbc);
+    let mut hits = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        let path = fd.item_meta.name_path();
+        if !path.contains("DictOperationGuard") {
+            continue;
+        }
+        let Ok(graph) = lower_fun_decl(context, fd) else {
+            continue;
+        };
+        if graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| residual_dict_operation_guard_ctor(&op.kind))
+        {
+            hits.push(path.to_string());
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "DictOperationGuard ctor must not remain a residual call: {hits:?}"
+    );
 }
 
 /// `int_ll_newlist` is `@oopspec("newlist(length)")`. After jtransform the
@@ -1117,5 +1388,39 @@ fn isinstance_bracket_is_scalar_replaced() {
             0,
             "isinstance still calls {leaf} after the bracket was scalar-replaced"
         );
+    }
+}
+
+/// The portal's cached-slot handle is gctransform-level (`gc_enter_roots_frame`
+/// after `warmspot.py` `make_jitcodes`). The erase pass takes it out of
+/// `eval_loop_jit` by looking through wrapper bodies, without naming them.
+#[test]
+fn eval_loop_jit_erases_the_cached_slot_handle() {
+    let path = format!(
+        "{}/../../build/llbc/pyre-jit.ullbc",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if !std::path::Path::new(&path).is_file() {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py pyre-jit`");
+        return;
+    }
+    let llbc = Llbc::load(&path).expect("load pyre-jit");
+    let named = |leaf: &str| {
+        llbc.iter_fun_decls()
+            .find(|fd| fd.item_meta.name_path().ends_with(leaf))
+            .unwrap_or_else(|| panic!("{leaf} present in pyre-jit.ullbc"))
+    };
+    for leaf in ["::reload_entered", "::eval_loop_jit"] {
+        let fd = named(leaf);
+        let body = fd
+            .unstructured()
+            .unwrap_or_else(|| panic!("{} has an unstructured body", fd.item_meta.name_path()));
+        match shadow_stack_erase_status(&llbc, fd, &body) {
+            Ok(true) => {}
+            other => panic!(
+                "{} must erase the cached-slot handle, got {other:?}",
+                fd.item_meta.name_path()
+            ),
+        }
     }
 }

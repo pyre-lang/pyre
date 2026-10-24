@@ -101,19 +101,26 @@ pub(crate) unsafe fn try_call_dunder_obj_above_object(
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(w_type.as_ptr(), name)
-        else {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            w_name,
+        ) else {
             return Ok(None);
         };
         if method.is_null() || std::ptr::eq(src, crate::typedef::w_object()) {
             return Ok(None);
         }
         let _ = pyre_object::gc_roots::pin_root(method);
-        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-        let result =
-            crate::baseobjspace::get_and_call_function(method(), obj(), w_type.as_ptr(), &[])?;
+        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+        let result = crate::baseobjspace::get_and_call_function(
+            method(),
+            obj(),
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            &[],
+        )?;
         if pyre_object::is_str(result) {
             return Ok(Some(result));
         }
@@ -645,9 +652,13 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(w_class);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, found)) = crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
-        else {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+        let Some((src, found)) = crate::baseobjspace::lookup_where_with_method_cache(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            w_name,
+        ) else {
             return Ok(None);
         };
         // `object`'s inherited default is not a leaf override — fall through
@@ -661,7 +672,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             return Ok(None);
         }
         let _ = pyre_object::gc_roots::pin_root(found);
-        let found = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let found = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
         // A raising override propagates; a non-string return is a TypeError.
         let r = crate::builtins::call_and_check(found(), &[obj()])?;
         if pyre_object::is_str(r) {
@@ -752,10 +763,13 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(metaclass.as_ptr());
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(metaclass.as_ptr(), name)
-        else {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            w_name,
+        ) else {
             return Ok(None);
         };
         if std::ptr::eq(src, crate::typedef::w_type())
@@ -764,7 +778,7 @@ pub(crate) unsafe fn type_metaclass_dunder_obj(
             return Ok(None);
         }
         let _ = pyre_object::gc_roots::pin_root(method);
-        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
         let result = crate::builtins::call_and_check(method(), &[obj()])?;
         if pyre_object::is_str(result) {
             return Ok(Some(result));
@@ -799,10 +813,13 @@ pub(crate) unsafe fn exc_user_dunder_obj(
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(w_class);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
-        else {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            w_name,
+        ) else {
             return Ok(None);
         };
         // `object`'s and `BaseException`'s registrations are the two the
@@ -823,7 +840,7 @@ pub(crate) unsafe fn exc_user_dunder_obj(
             return Ok(None);
         }
         let _ = pyre_object::gc_roots::pin_root(method);
-        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
         let r = crate::builtins::call_and_check(method(), &[obj()])?;
         if pyre_object::is_str(r) {
             return Ok(Some(r));
@@ -856,20 +873,25 @@ unsafe fn module_user_dunder_obj(
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
+        let _ = pyre_object::gc_roots::pin_root(w_class);
+        let _ = pyre_object::gc_roots::pin_root(module_class);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
-        let Some((src, method)) =
-            crate::baseobjspace::lookup_where_with_method_cache(w_class, name)
-        else {
+        let module_class = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
+        let Some((src, method)) = crate::baseobjspace::lookup_where_with_method_cache(
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+            w_name,
+        ) else {
             return Ok(None);
         };
         if method.is_null()
-            || std::ptr::eq(src, module_class)
+            || std::ptr::eq(src, module_class())
             || std::ptr::eq(src, crate::typedef::w_object())
         {
             return Ok(None);
         }
         let _ = pyre_object::gc_roots::pin_root(method);
-        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let method = || pyre_object::gc_roots::shadow_stack_get(root_base + 3);
         let r = crate::builtins::call_and_check(method(), &[obj()])?;
         if pyre_object::is_str(r) {
             return Ok(Some(r));
@@ -969,6 +991,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `'pwd.struct_passwd(pw_name=..., ...)'` instead of the
             // bare tuple form.  Plain `tuple()` keeps the fast path
             // because its `w_class` is the canonical tuple type.
+            let w_repr_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__repr__"));
             let w_class = (*obj()).w_class;
             let tuple_class = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
             if !w_class.is_null() && !std::ptr::eq(w_class, tuple_class) {
@@ -980,7 +1003,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 // tuple formatting in that case rather than printing the
                 // generic `<object at ...>`.
                 if let Some((src, method)) =
-                    crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
+                    crate::baseobjspace::lookup_where_with_method_cache(w_class, w_repr_name)
                     && !std::ptr::eq(src, crate::typedef::w_object())
                     && !method.is_null()
                 {
@@ -1343,10 +1366,11 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `_struct.Struct`) — dispatch it before the generic
             // `<name object at 0x...>` fallback.  Mirrors the tuple-subclass
             // path above.
+            let w_repr_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__repr__"));
             let w_class = (*obj()).w_class;
             if !w_class.is_null()
                 && let Some((src, method)) =
-                    crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")
+                    crate::baseobjspace::lookup_where_with_method_cache(w_class, w_repr_name)
                 && !std::ptr::eq(src, crate::typedef::w_object())
                 && !method.is_null()
             {

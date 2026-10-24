@@ -11,6 +11,7 @@
 
 use pyre_object::PyObjectRef;
 use rustpython_host_env::winsound as host_winsound;
+use rustpython_wtf8::Wtf8;
 
 /// Play from a buffer rather than from a name.
 const SND_MEMORY: i32 = host_winsound::SND_MEMORY as i32;
@@ -41,7 +42,10 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, pyre_interpreter::PyError>
         // `type(sound).__fspath__(sound)` — the descriptor read off the type is
         // unbound, so the object is supplied as the sole argument.
         let Some(fspath_fn) = pyre_interpreter::typedef::r#type(sound).and_then(|pt| unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__")
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                pt.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__fspath__")),
+            )
         }) else {
             return Err(pyre_interpreter::PyError::type_error(format!(
                 "expected str, bytes or os.PathLike object, not {}",

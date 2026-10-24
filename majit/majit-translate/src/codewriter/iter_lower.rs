@@ -18,8 +18,12 @@
 //! * slice iteration (`ll_listnext`): the `__iter_next` block branches on
 //!   `index < len(container)` into a fresh advance block reading
 //!   `container[index]` and stepping `index + 1`;
-//! * range iteration (`ll_rangenext`): the carried value is the range's
-//!   stop, the branch is `index < stop`, and the item is the index;
+//! * range iteration (`ll_rangenext_up`): the carried value is the range's
+//!   stop (`RANGEITER` is `GcStruct("range", ("next", Signed), ("stop",
+//!   Signed))`), the branch is `index < stop`, and the item is the index.
+//!   Loop-reachable forwarders phi both fields, because `regalloc.py`
+//!   `make_dependencies` only keeps a value live across a back-edge when
+//!   that edge's `link.args` name it;
 //! * enumerate iteration (`EnumerateIteratorRepr.rtype_next`, `rrange.py`):
 //!   `x = __majit_enumerate(lst)` feeds the `iter` op, the carried value is
 //!   the list, and the item is the `(index, lst[index])` tuple — the index
@@ -30,7 +34,7 @@
 //! iterators, a `next` outside a `StopIteration` block) is left alone and
 //! keeps today's symbolic residual.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::codewriter::getslice::{LinkClasses, array_identity_of_base};
 use crate::codewriter::type_state::valuetype_to_concrete;
@@ -45,18 +49,18 @@ use crate::runtime_names::shims::{ENUMERATE, RANGE};
 /// Scalarise every lowerable iterator site in `graph`, one at a time —
 /// each rewrite invalidates the link classes the next site is judged by.
 pub fn lower_iterators(graph: &mut FunctionGraph) {
-    // The rtyper's `rtype_next` meets SSI graphs, where every block of a
-    // loop carries the iterator it steps through its inputargs.  The front
-    // emits global SSA instead: a block inside the loop body passes the
-    // constructor's iterator straight back to the loop head.  Thread it
-    // first (`ssa.py SSA_to_SSI`) so those blocks are loop members.
-    let has_site = graph.blocks.iter().any(|block| {
-        block
-            .operations
-            .iter()
-            .any(|op| is_slice_iter_call(&op.kind))
-    });
-    if has_site {
+    // The rtyper's `rtype_next` meets SSI graphs, where the `__iter_next`
+    // block carries the iterator through its inputargs. The front emits
+    // global SSA, so a header that calls `__iter_next(it)` without that
+    // inputarg would decline. Thread it first (`ssa.py SSA_to_SSI`) in
+    // that case only. A seed / merge / back-edge-only body that already
+    // has a member header must stay an extra_index carrier: RANGEITER is
+    // `("next", Signed), ("stop", Signed)` (`rrange.py`), and
+    // `checkgraph` (`flowspace/model.py`) forbids a seed from naming the
+    // constructor's locals. Unconditional SSI would promote those
+    // carriers into members and pass the constructor's stop name on the
+    // back-edge.
+    if next_sites_need_ssi(graph) {
         crate::model_ssa::ssa_to_ssi(graph);
     }
     // More sites than any real graph carries; a backstop, not a budget.
@@ -338,19 +342,49 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         }
     }
 
-    // Every predecessor of a member block must be able to supply the
-    // index: the constructor block or another member.  A constant in an
-    // iterator slot means the phi mixes non-iterator values.
-    for (si, block) in graph.blocks.iter().enumerate() {
+    // Every predecessor of a member block must supply the iterator as a
+    // value. A constant in that slot means the phi mixes non-iterator
+    // values. A non-member that feeds a member — loop-reachable merge or
+    // constructor-adjacent seed — already carries the iterator object
+    // (`ll_rangenext_up` keeps `iter.next` and `iter.stop` on it);
+    // scalarisation phis both. `checkgraph` (`flowspace/model.py`)
+    // forbids a seed from naming the constructor's locals, so the seed
+    // is a carrier too: the constructor is the only block that still
+    // passes the original `carried` / start.
+    let mut extra_index_blocks: HashSet<usize> = HashSet::new();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (si, block) in graph.blocks.iter().enumerate() {
+            if si == d || member_positions.contains_key(&si) || extra_index_blocks.contains(&si) {
+                continue;
+            }
+            for link in &block.exits {
+                let feeds_index_carrier = member_positions.contains_key(&link.target.0)
+                    || extra_index_blocks.contains(&link.target.0);
+                if !feeds_index_carrier {
+                    continue;
+                }
+                if let Some(positions) = member_positions.get(&link.target.0) {
+                    for &p in positions {
+                        if !matches!(link.args.get(p), Some(LinkArg::Value(_))) {
+                            return Err(format!(
+                                "iterator slot {p} of block {} fed a constant",
+                                link.target.0
+                            ));
+                        }
+                    }
+                }
+                extra_index_blocks.insert(si);
+                grew = true;
+            }
+        }
+    }
+    for block in graph.blocks.iter() {
         for link in &block.exits {
             let Some(positions) = member_positions.get(&link.target.0) else {
                 continue;
             };
-            if si != d && !member_positions.contains_key(&si) {
-                return Err(format!(
-                    "block {si} feeds the iterator loop without carrying it"
-                ));
-            }
             for &p in positions {
                 if !matches!(link.args.get(p), Some(LinkArg::Value(_))) {
                     return Err(format!(
@@ -365,7 +399,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
     // mutation: everything below is committed
 
     let mut idx_of: HashMap<usize, Variable> = HashMap::new();
-    for &bi in member_positions.keys() {
+    for &bi in member_positions.keys().chain(extra_index_blocks.iter()) {
         let idx = graph.alloc_value_var();
         FunctionGraph::set_concretetype_of_inline(&idx, ConcreteType::Signed);
         idx_of.insert(bi, idx);
@@ -393,6 +427,20 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                 rename_link_uses(&mut site.break_link, &old, &fresh);
             }
         }
+    }
+
+    // Per-block SSA name of the RANGEITER `.stop` (or the slice / enumerate
+    // container). Members already hold it in the rewritten iterator slot.
+    // Loop-reachable forwarders get a fresh phi; advance blocks record the
+    // copy they already take as an inputarg.
+    let mut carried_of: HashMap<usize, Variable> = HashMap::new();
+    for (&bi, positions) in &member_positions {
+        carried_of.insert(bi, graph.blocks[bi].inputargs[positions[0]].clone());
+    }
+    for &bi in &extra_index_blocks {
+        let c = graph.alloc_value_var();
+        c.set_concretetype(carried_ct.clone());
+        carried_of.insert(bi, c);
     }
 
     for site in &next_sites {
@@ -590,10 +638,21 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         .with_llexitcase_from_exitcase();
         graph.set_control_flow_metadata(a, Some(ExitSwitch::Value(cond)), vec![exhausted, advance]);
         idx_of.insert(bp.0, next_idx);
+        carried_of.insert(bp.0, map[&site.iter_arg].clone());
     }
 
-    // Thread the index through every block that carries the iterator.
-    for &bi in member_positions.keys() {
+    // Thread the index through every block that carries it: members and
+    // loop-reachable forwarders. `rrange.py` `RangeIteratorRepr.rtype_next`
+    // keeps that index on the iterator object as it flows through a merge.
+    // Advance blocks minted below already take the index as an inputarg
+    // on the constructed edge; they are in `idx_of` so a successor can
+    // read the stepped index, but they are not in this carrier set.
+    let index_carriers: HashSet<usize> = member_positions
+        .keys()
+        .copied()
+        .chain(extra_index_blocks.iter().copied())
+        .collect();
+    for &bi in &index_carriers {
         graph.push_inputarg_var(BlockId(bi), idx_of[&bi].clone());
     }
     let init_arg = match &kind {
@@ -605,26 +664,55 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
     for bi in 0..graph.blocks.len() {
         for li in 0..graph.blocks[bi].exits.len() {
             let target = graph.blocks[bi].exits[li].target.0;
-            if !member_positions.contains_key(&target) {
+            if !index_carriers.contains(&target) {
                 continue;
             }
             let arg = match idx_of.get(&bi) {
                 Some(idx) => LinkArg::Value(idx.clone()),
-                None => {
-                    debug_assert_eq!(
-                        bi, d,
-                        "validated: only the constructor block lacks an index"
-                    );
-                    init_arg.clone()
-                }
+                None => match &init_arg {
+                    LinkArg::Const(_) => init_arg.clone(),
+                    LinkArg::Value(v) if in_scope(graph, bi, v) => init_arg.clone(),
+                    _ => panic!(
+                        "iter_lower: block {bi} has no live index to pass \
+                         (graph {:?})",
+                        graph.name
+                    ),
+                },
             };
+            graph.blocks[bi].exits[li].args.push(arg);
+        }
+    }
+
+    // `regalloc.py` `make_dependencies` pops `link.args` from `die_at`, so
+    // a value lives through a block only when a successor still names it.
+    // Members already carry stop in the iterator slot; extra_index
+    // forwarders (and a body that only names the iterator on the
+    // back-edge) must too, otherwise `ConstInt(1)` / `args_base + i` in
+    // the advance or body reuse the header's bound colour and the loop
+    // compare reads the index.
+    for &bi in &extra_index_blocks {
+        graph.push_inputarg_var(BlockId(bi), carried_of[&bi].clone());
+    }
+    for bi in 0..graph.blocks.len() {
+        for li in 0..graph.blocks[bi].exits.len() {
+            let target = graph.blocks[bi].exits[li].target.0;
+            if !extra_index_blocks.contains(&target) {
+                continue;
+            }
+            let arg = LinkArg::Value(live_carried(graph, bi, &carried, &carried_of));
             graph.blocks[bi].exits[li].args.push(arg);
         }
     }
 
     // Retire the constructor: the iterator value becomes the carried
     // one, and the range or enumerate marker (whose only consumer was the
-    // constructor) goes with it.
+    // constructor) goes with it. Rewrite every non-member edge into a
+    // member, not only `d`'s: a forwarding block may still name the
+    // constructor's `it`. An extra_index predecessor passes its live
+    // stop phi, not the constructor's global-SSA name — that name is
+    // not live in the predecessor, so using it would leave the same
+    // colour free for a loop temp (`regalloc.py` only interferes inside
+    // a block).
     let removed: Vec<Variable> = match &kind {
         IterKind::Range { .. } | IterKind::Enumerate { .. } => vec![it.clone(), x.clone()],
         IterKind::Slice { .. } => vec![it.clone()],
@@ -633,10 +721,29 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
         .block_mut(d_id)
         .operations
         .retain(|op| !op.result.as_ref().is_some_and(|r| removed.contains(r)));
-    for link in &mut graph.block_mut(d_id).exits {
-        for arg in &mut link.args {
-            if matches!(arg, LinkArg::Value(v) if *v == it) {
-                *arg = LinkArg::Value(carried.clone());
+    for bi in 0..graph.blocks.len() {
+        if member_positions.contains_key(&bi) {
+            continue;
+        }
+        let names_it_into_member = graph.blocks[bi].exits.iter().any(|link| {
+            member_positions.contains_key(&link.target.0)
+                && link
+                    .args
+                    .iter()
+                    .any(|a| matches!(a, LinkArg::Value(v) if *v == it))
+        });
+        if !names_it_into_member {
+            continue;
+        }
+        let replacement = live_carried(graph, bi, &carried, &carried_of);
+        for link in &mut graph.blocks[bi].exits {
+            if !member_positions.contains_key(&link.target.0) {
+                continue;
+            }
+            for arg in &mut link.args {
+                if matches!(arg, LinkArg::Value(v) if *v == it) {
+                    *arg = LinkArg::Value(replacement.clone());
+                }
             }
         }
     }
@@ -675,6 +782,61 @@ fn in_scope(graph: &FunctionGraph, block: usize, v: &Variable) -> bool {
     b.inputargs.contains(v) || b.operations.iter().any(|op| op.result.as_ref() == Some(v))
 }
 
+/// The stop / container a block may pass on an exit. `checkgraph`
+/// (`flowspace/model.py`) only lets a link name a Variable defined in
+/// its source. Members and extra_index carriers already hold a live phi
+/// in `carried_of`; using the constructor's global-SSA name would leave
+/// that colour free for a loop temp (`regalloc.py` `make_dependencies`).
+/// The constructor itself is not in `carried_of` and still passes the
+/// original `carried`.
+fn live_carried(
+    graph: &FunctionGraph,
+    bi: usize,
+    carried: &Variable,
+    carried_of: &HashMap<usize, Variable>,
+) -> Variable {
+    if let Some(phi) = carried_of.get(&bi) {
+        return phi.clone();
+    }
+    if in_scope(graph, bi, carried) {
+        carried.clone()
+    } else {
+        panic!(
+            "iter_lower: block {bi} has no live stop to pass (graph {:?})",
+            graph.name
+        )
+    }
+}
+
+/// True when some `__iter_next` reads an iterator that is not already an
+/// inputarg of its block. Those headers need `ssa.py SSA_to_SSI` before
+/// `rtype_next` can see a member. Seed / merge / back-edge-only bodies
+/// that feed an already-member header do not.
+fn next_sites_need_ssi(graph: &FunctionGraph) -> bool {
+    let has_site = graph.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| is_slice_iter_call(&op.kind))
+    });
+    if !has_site {
+        return false;
+    }
+    let classes = LinkClasses::of(graph);
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(args) = is_marker_call(&op.kind, "__iter_next", 1) else {
+                continue;
+            };
+            let iter_arg = &args[0];
+            if !block.inputargs.iter().any(|v| classes.same(v, iter_arg)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn push(graph: &mut FunctionGraph, block: BlockId, kind: OpKind) -> Variable {
     graph
         .push_op_var(block, kind, true)
@@ -701,12 +863,14 @@ fn rename_link_uses(link: &mut Link, old: &Variable, fresh: &Variable) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn call(segments: &[&str], args: Vec<Variable>) -> OpKind {
         OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: segments.iter().map(|s| s.to_string()).collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(args),
             result_ty: ValueType::Ref(None),
@@ -729,6 +893,73 @@ mod tests {
 
     fn stopiteration() -> ExitCase {
         ExitCase::Const(ConstValue::builtin("StopIteration"))
+    }
+
+    /// `flowspace/model.py` `checkgraph`: every Variable a block uses
+    /// (op operand, exitswitch, `link.args`) is defined in that block.
+    fn assert_model_checkgraph(graph: &FunctionGraph) {
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            let mut defined: HashSet<Variable> = block.inputargs.iter().cloned().collect();
+            for op in &block.operations {
+                for v in op_operand_vars(&op.kind) {
+                    assert!(
+                        defined.contains(&v),
+                        "checkgraph: block {bi} uses {} before definition (graph {:?})",
+                        v.name(),
+                        graph.name
+                    );
+                }
+                if let Some(r) = &op.result {
+                    defined.insert(r.clone());
+                }
+            }
+            match &block.exitswitch {
+                Some(ExitSwitch::Value(v)) => {
+                    assert!(
+                        defined.contains(v),
+                        "checkgraph: block {bi} exitswitch {} used before definition (graph {:?})",
+                        v.name(),
+                        graph.name
+                    );
+                }
+                Some(ExitSwitch::Fused { args, .. }) => {
+                    for v in args {
+                        assert!(
+                            defined.contains(v),
+                            "checkgraph: block {bi} fused exitswitch {} used before definition \
+                             (graph {:?})",
+                            v.name(),
+                            graph.name
+                        );
+                    }
+                }
+                Some(ExitSwitch::LastException) | None => {}
+            }
+            for (li, link) in block.exits.iter().enumerate() {
+                let n_in = graph.block(link.target).inputargs.len();
+                assert_eq!(
+                    link.args.len(),
+                    n_in,
+                    "checkgraph: block {bi} link[{li}] has {} args, target {} has {n_in} inputargs \
+                     (graph {:?})",
+                    link.args.len(),
+                    link.target.0,
+                    graph.name
+                );
+                for (ai, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(v) = arg else {
+                        continue;
+                    };
+                    assert!(
+                        defined.contains(v),
+                        "checkgraph: block {bi} link[{li}].args[{ai}] {} used before definition \
+                         (graph {:?})",
+                        v.name(),
+                        graph.name
+                    );
+                }
+            }
+        }
     }
 
     /// `for i in 0..n { use(i) }` in the front's shape.
@@ -793,6 +1024,7 @@ mod tests {
         FunctionGraph::set_concretetype_of_inline(&g.block(head).inputargs[0], ConcreteType::GcRef);
         lower_iterators(&mut g);
         assert_eq!(marker_count(&g), 0);
+        assert_model_checkgraph(&g);
 
         // The next block now branches on the index.
         let head_block = g.block(head);
@@ -832,12 +1064,277 @@ mod tests {
         }
     }
 
+    /// Constructor → empty forwarder → header, the shape `get_and_call_function`
+    /// emits between `Vec::with_capacity` and the `0..len` header.
+    /// `RangeIteratorRepr.rtype_next` seeds start on that edge.
+    #[test]
+    fn a_range_loop_with_a_seed_forwarder_scalarises() {
+        let mut g = FunctionGraph::new("f");
+        let d = g.startblock;
+        let n = g.alloc_value_var();
+        g.push_inputarg_var(d, n.clone());
+        g.push_op_with_result_var(
+            d,
+            OpKind::Input {
+                name: "n".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            n.clone(),
+        );
+        let zero = push(&mut g, d, OpKind::ConstInt(0));
+        let t = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&[RANGE], vec![zero.clone(), n]), t.clone());
+        let it = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&["core", "slice", "iter"], vec![t]), it.clone());
+        let (fwd, _) = g.create_block_with_arg_vars(0);
+        g.set_goto(d, fwd, vec![]);
+        let (head, head_args) = g.create_block_with_arg_vars(1);
+        g.set_goto(fwd, head, vec![it.clone()]);
+        let h_it = head_args[0].clone();
+        let item = g.alloc_value_var();
+        g.push_op_with_result_var(
+            head,
+            call(&["__iter_next"], vec![h_it.clone()]),
+            item.clone(),
+        );
+        let (body, body_args) = g.create_block_with_arg_vars(2);
+        let (done, _) = g.create_block_with_arg_vars(0);
+        let some_link =
+            Link::new_mixed(vec![LinkArg::Value(h_it), LinkArg::Value(item)], body, None);
+        let mut stop_link = Link::new_mixed(vec![], done, Some(stopiteration()));
+        stop_link.last_exception = Some(LinkArg::Value(g.alloc_value_var()));
+        stop_link.last_exc_value = Some(LinkArg::Value(g.alloc_value_var()));
+        g.set_control_flow_metadata(
+            head,
+            Some(ExitSwitch::LastException),
+            vec![some_link, stop_link],
+        );
+        g.set_goto(body, head, vec![body_args[0].clone()]);
+        g.set_return(done, None);
+        FunctionGraph::set_concretetype_of_inline(
+            &g.block(g.startblock).inputargs[0],
+            ConcreteType::Signed,
+        );
+        lower_iterators(&mut g);
+        assert_eq!(marker_count(&g), 0);
+        assert_model_checkgraph(&g);
+        // Seed is a carrier: constructor passes start and stop; the
+        // forwarder names its own phis (`checkgraph`).
+        assert_eq!(g.block(fwd).inputargs.len(), 2);
+        let d_args = &g.block(d).exits[0].args;
+        assert_eq!(&d_args[0], &LinkArg::Value(zero.clone()));
+        assert_eq!(
+            g.block(fwd).exits[0].args.last().unwrap(),
+            &LinkArg::Value(g.block(fwd).inputargs[0].clone()),
+        );
+    }
+
+    /// Constructor → merge forwarder → header, with the body jumping back
+    /// through the merge. The merge is loop-reachable and must phi the
+    /// index; seeding start on that back-edge would restart the loop.
+    #[test]
+    fn a_range_loop_with_a_merge_forwarder_phis_the_index() {
+        let mut g = FunctionGraph::new("f");
+        let d = g.startblock;
+        let n = g.alloc_value_var();
+        g.push_inputarg_var(d, n.clone());
+        g.push_op_with_result_var(
+            d,
+            OpKind::Input {
+                name: "n".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            n.clone(),
+        );
+        let zero = push(&mut g, d, OpKind::ConstInt(0));
+        let t = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&[RANGE], vec![zero.clone(), n]), t.clone());
+        let it = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&["core", "slice", "iter"], vec![t]), it.clone());
+        let (fwd, _) = g.create_block_with_arg_vars(0);
+        g.set_goto(d, fwd, vec![]);
+        let (head, head_args) = g.create_block_with_arg_vars(1);
+        g.set_goto(fwd, head, vec![it.clone()]);
+        let h_it = head_args[0].clone();
+        let item = g.alloc_value_var();
+        g.push_op_with_result_var(
+            head,
+            call(&["__iter_next"], vec![h_it.clone()]),
+            item.clone(),
+        );
+        let (body, body_args) = g.create_block_with_arg_vars(2);
+        let (done, _) = g.create_block_with_arg_vars(0);
+        let some_link =
+            Link::new_mixed(vec![LinkArg::Value(h_it), LinkArg::Value(item)], body, None);
+        let mut stop_link = Link::new_mixed(vec![], done, Some(stopiteration()));
+        stop_link.last_exception = Some(LinkArg::Value(g.alloc_value_var()));
+        stop_link.last_exc_value = Some(LinkArg::Value(g.alloc_value_var()));
+        g.set_control_flow_metadata(
+            head,
+            Some(ExitSwitch::LastException),
+            vec![some_link, stop_link],
+        );
+        g.set_goto(body, fwd, vec![]);
+        g.set_return(done, None);
+        let _ = body_args;
+        FunctionGraph::set_concretetype_of_inline(
+            &g.block(g.startblock).inputargs[0],
+            ConcreteType::Signed,
+        );
+        lower_iterators(&mut g);
+        assert_eq!(marker_count(&g), 0);
+        assert_model_checkgraph(&g);
+        // Index then stop: RANGEITER is `("next", Signed), ("stop", Signed)`.
+        assert_eq!(g.block(fwd).inputargs.len(), 2);
+        let d_args = &g.block(d).exits[0].args;
+        assert_eq!(&d_args[d_args.len() - 2], &LinkArg::Value(zero.clone()));
+        let body_exit = &g.block(body).exits[0].args;
+        assert!(matches!(&body_exit[body_exit.len() - 2], LinkArg::Value(_)));
+        assert_ne!(&body_exit[body_exit.len() - 2], &LinkArg::Value(zero));
+    }
+
+    /// Production `get_and_call_function` shape: the body uses `i` and
+    /// names the iterator only on the back-edge (global-SSA), so it is an
+    /// extra_index carrier rather than a member. Stop must still phi
+    /// through that body, or `regalloc.py` colours `ConstInt(1)` with the
+    /// header bound.
+    #[test]
+    fn a_range_loop_body_that_only_names_the_iterator_on_the_backedge_phis_stop() {
+        let mut g = FunctionGraph::new("f");
+        let d = g.startblock;
+        let n = g.alloc_value_var();
+        g.push_inputarg_var(d, n.clone());
+        g.push_op_with_result_var(
+            d,
+            OpKind::Input {
+                name: "n".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            n.clone(),
+        );
+        let zero = push(&mut g, d, OpKind::ConstInt(0));
+        let t = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&[RANGE], vec![zero, n.clone()]), t.clone());
+        let it = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&["core", "slice", "iter"], vec![t]), it.clone());
+        let (head, head_args) = g.create_block_with_arg_vars(1);
+        g.set_goto(d, head, vec![it.clone()]);
+        let h_it = head_args[0].clone();
+        let item = g.alloc_value_var();
+        g.push_op_with_result_var(
+            head,
+            call(&["__iter_next"], vec![h_it.clone()]),
+            item.clone(),
+        );
+        let (body, _) = g.create_block_with_arg_vars(1);
+        let (done, _) = g.create_block_with_arg_vars(0);
+        let some_link = Link::new_mixed(vec![LinkArg::Value(item)], body, None);
+        let mut stop_link = Link::new_mixed(vec![], done, Some(stopiteration()));
+        stop_link.last_exception = Some(LinkArg::Value(g.alloc_value_var()));
+        stop_link.last_exc_value = Some(LinkArg::Value(g.alloc_value_var()));
+        g.set_control_flow_metadata(
+            head,
+            Some(ExitSwitch::LastException),
+            vec![some_link, stop_link],
+        );
+        g.set_goto(body, head, vec![it]);
+        g.set_return(done, None);
+        FunctionGraph::set_concretetype_of_inline(&g.block(d).inputargs[0], ConcreteType::Signed);
+        lower_iterators(&mut g);
+        assert_eq!(marker_count(&g), 0);
+        assert_model_checkgraph(&g);
+        assert_eq!(g.block(head).inputargs.len(), 2);
+        // item, index, stop
+        assert_eq!(g.block(body).inputargs.len(), 3);
+        let back = &g.block(body).exits[0].args;
+        assert_eq!(
+            &back[0],
+            &LinkArg::Value(g.block(body).inputargs[2].clone()),
+            "back-edge must pass the body's live stop, not the constructor name"
+        );
+        let bp_id = g.block(head).exits[1].target;
+        let one = g
+            .block(bp_id)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ConstInt(1) => op.result.clone(),
+                _ => None,
+            })
+            .expect("advance steps the index by 1");
+        let stop = g.block(head).inputargs[0].clone();
+        let ints = crate::codewriter::regalloc::perform_register_allocation(
+            &g,
+            crate::flatten::RegKind::Int,
+        );
+        let stop_color = ints
+            .color_for_variable(&stop)
+            .expect("header stop is coloured");
+        let one_color = ints
+            .color_for_variable(&one)
+            .expect("ConstInt(1) is coloured");
+        assert_ne!(
+            stop_color, one_color,
+            "header stop must interfere with the advance temp (`regalloc.py` die_at on link.args)"
+        );
+        assemble_graph(g);
+    }
+
+    /// Global SSA: the header calls `__iter_next(it)` without carrying `it`
+    /// as an inputarg. `ssa.py SSA_to_SSI` threads it first so `rtype_next`
+    /// sees a member. Extra_index carriers that already have a member
+    /// header must not take this path.
+    #[test]
+    fn a_range_loop_whose_next_uses_the_constructor_name_still_scalarises() {
+        let mut g = FunctionGraph::new("f");
+        let d = g.startblock;
+        let n = g.alloc_value_var();
+        g.push_inputarg_var(d, n.clone());
+        g.push_op_with_result_var(
+            d,
+            OpKind::Input {
+                name: "n".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            n.clone(),
+        );
+        let zero = push(&mut g, d, OpKind::ConstInt(0));
+        let t = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&[RANGE], vec![zero, n]), t.clone());
+        let it = g.alloc_value_var();
+        g.push_op_with_result_var(d, call(&["core", "slice", "iter"], vec![t]), it.clone());
+        let (head, _) = g.create_block_with_arg_vars(0);
+        g.set_goto(d, head, vec![]);
+        let item = g.alloc_value_var();
+        g.push_op_with_result_var(head, call(&["__iter_next"], vec![it.clone()]), item.clone());
+        let (body, _) = g.create_block_with_arg_vars(1);
+        let (done, _) = g.create_block_with_arg_vars(0);
+        let some_link = Link::new_mixed(vec![LinkArg::Value(item)], body, None);
+        let mut stop_link = Link::new_mixed(vec![], done, Some(stopiteration()));
+        stop_link.last_exception = Some(LinkArg::Value(g.alloc_value_var()));
+        stop_link.last_exc_value = Some(LinkArg::Value(g.alloc_value_var()));
+        g.set_control_flow_metadata(
+            head,
+            Some(ExitSwitch::LastException),
+            vec![some_link, stop_link],
+        );
+        g.set_goto(body, head, vec![]);
+        g.set_return(done, None);
+        FunctionGraph::set_concretetype_of_inline(&g.block(d).inputargs[0], ConcreteType::Signed);
+        lower_iterators(&mut g);
+        assert_eq!(marker_count(&g), 0);
+        assert_model_checkgraph(&g);
+        assert_eq!(g.block(head).inputargs.len(), 2);
+    }
+
     /// The scalarised range slot keeps its integer kind through the rest of
     /// the codewriter: the rtyper typed that slot as the range iterator
     /// pointer, and nothing after jtransform may copy that type back.
-    #[test]
-    fn a_range_loop_assembles_through_the_codewriter() {
-        let (g, _, _, _) = range_loop_graph();
+    fn assemble_graph(g: FunctionGraph) {
         let path = crate::parse::CallPath::from_segments(["f"]);
         let mut callcontrol = crate::codewriter::call::CallControl::new();
         callcontrol.register_function_graph(path.clone(), g.clone());
@@ -870,6 +1367,12 @@ mod tests {
             FunctionGraph::concretetype_of(carried),
             ConcreteType::Signed,
         );
+    }
+
+    #[test]
+    fn a_range_loop_assembles_through_the_codewriter() {
+        let (g, _, _, _) = range_loop_graph();
+        assemble_graph(g);
     }
 
     /// `for &w in args_w { use(w) }` in the front's shape, with a sibling
@@ -954,6 +1457,7 @@ mod tests {
         assert_eq!(marker_count(&g), 2);
         lower_iterators(&mut g);
         assert_eq!(marker_count(&g), 0);
+        assert_model_checkgraph(&g);
 
         let head_block = g.block(head);
         assert!(matches!(head_block.exitswitch, Some(ExitSwitch::Value(_))));
@@ -983,6 +1487,7 @@ mod tests {
         assert_eq!(marker_count(&g), 3);
         lower_iterators(&mut g);
         assert_eq!(marker_count(&g), 0);
+        assert_model_checkgraph(&g);
 
         let head_block = g.block(head);
         assert!(matches!(head_block.exitswitch, Some(ExitSwitch::Value(_))));

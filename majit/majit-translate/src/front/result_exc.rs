@@ -375,6 +375,19 @@ fn option_payload_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_js
         .and_then(|t| t.get(0))
 }
 
+/// Reify a Charon type JSON node as [`TyRef`].
+///
+/// Externally-tagged `Deduplicated` / `Value` nodes deserialize as
+/// [`TyRef::Dedup`] / [`TyRef::Inline`]. A raw constructor (`Adt`,
+/// `Ref`, `RawPtr`, `Scalar`) does not; wrapping it as [`TyRef::Other`]
+/// keeps the node for `tyref_node` / `tyref_peel_ref_to_pointee`.
+/// `from_value::<TyRef>(…).ok()` dropped those constructors, so
+/// `Option<&OwnedFd>` lost `T` and a later Discriminant could not read
+/// `getkind(var.concretetype)` (`rnone.py` `rtype_is_None`).
+pub(crate) fn tyref_from_json(v: serde_json::Value) -> TyRef {
+    serde_json::from_value(v.clone()).unwrap_or(TyRef::Other(v))
+}
+
 /// The `T` of an `Option<T>` as its own [`TyRef`] — for an
 /// `Iterator::next()` return, the element the iterator yields.  Sibling of
 /// [`tyref_result_ok`].
@@ -382,7 +395,7 @@ fn option_payload_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_js
 /// A slice iterator yields `Option<&T>`, so the answer still carries the
 /// `&`; callers that want the item's own shape peel it (`strip_ty_wrappers`).
 pub(crate) fn tyref_option_payload(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
-    option_payload_slot(ty, llbc).and_then(|slot| serde_json::from_value(slot.clone()).ok())
+    option_payload_slot(ty, llbc).map(|slot| tyref_from_json(slot.clone()))
 }
 
 /// Collapse a scoped callee's returnblock to a genuine void return.
@@ -1167,9 +1180,9 @@ fn producer_is_some_shell(graph: &FunctionGraph, var: &Variable, result_owner: &
 }
 
 /// `Result<i64, …>` / `Result<bool, …>` / `Result<f64, …>`: the `Ok`
-/// payload is a machine scalar. A `Vec` of one-word items is the same
-/// bank (`RustVecRepr`, kind `int`): the header address, not a GC
-/// aggregate. Other spellings stay shells.
+/// payload is a machine scalar. A `Vec<T>` is the same bank
+/// (`RustVecRepr`, kind `int`): the header address, not a GC aggregate,
+/// for every item type T. Other spellings stay shells.
 fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
     let Some(args) = generic_args_body(spelling) else {
         return false;
@@ -1177,9 +1190,7 @@ fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
     let Some(ok) = split_top_level_args(args).into_iter().next() else {
         return false;
     };
-    if majit_ir::rvec::rust_vec_item_kind_for_spelling(ok, crate::layout::target_word_size())
-        .is_some()
-    {
+    if majit_ir::rvec::vec_item_spelling(ok).is_some() {
         return true;
     }
     matches!(
@@ -3152,6 +3163,7 @@ pub(crate) fn apply_foreign_from_residuals(
                     target: CallTarget::FunctionPath {
                         segments: conv.segments.clone(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args,
                     result_ty: ValueType::Ref(None),
@@ -11709,6 +11721,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             };
         }
         // The constructor's result variable now holds the exception object.
@@ -11844,6 +11857,7 @@ fn fuse_same_block_kind_ctor_raise(graph: &mut FunctionGraph) {
                     .map(str::to_string)
                     .to_vec(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             };
         }
         let payload = graph.blocks[bi].operations[ctor_idx]
@@ -11945,6 +11959,8 @@ mod static_result_shell_tests {
         assert!(result_spelling_ok_is_scalar(
             "Result<alloc::vec::Vec<*mut u8>, E>"
         ));
+        assert!(result_spelling_ok_is_scalar("Result<Vec<GCREF>, E>"));
+        assert!(result_spelling_ok_is_scalar("Result<Vec<u8>, PyError>"));
         assert!(!result_spelling_ok_is_scalar(
             "Result<PyObjectRef, PyError>"
         ));
@@ -13339,6 +13355,29 @@ mod carrier_tests {
             !tyref_is_result_of_carrier(&result, &llbc, d),
             "an undeclared carrier lowers nothing",
         );
+    }
+}
+
+#[cfg(test)]
+mod tyref_from_json_tests {
+    use super::tyref_from_json;
+    use majit_charon_reader::ullbc::TyRef;
+
+    #[test]
+    fn raw_adt_constructor_stays_other() {
+        let v = serde_json::json!({"Adt": {"id": 7}});
+        match tyref_from_json(v.clone()) {
+            TyRef::Other(got) => assert_eq!(got, v),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deduplicated_node_stays_dedup() {
+        match tyref_from_json(serde_json::json!({"Deduplicated": 3u64})) {
+            TyRef::Dedup { id } => assert_eq!(id, 3),
+            other => panic!("expected Dedup, got {other:?}"),
+        }
     }
 }
 

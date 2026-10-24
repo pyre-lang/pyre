@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# pyre-check: spec-folds=two_arg_super_call,load_attr_on_super,super_attr_unwrap
 # pyre-check: trace-shape=run:absent=CallMayForceR,absent=CallR
 # The loop folds to one add per iteration on both JITs, so N has to be in
 # the hundreds of millions before pypy's execution time is a measurement

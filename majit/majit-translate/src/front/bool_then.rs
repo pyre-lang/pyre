@@ -662,6 +662,7 @@ pub(crate) fn slice_len_op(
         target: CallTarget::FunctionPath {
             segments: vec![marker.to_string()],
             fun_decl_id: None,
+            generic_rust_args: Vec::new(),
         },
         args: crate::model::call_args(vec![base]),
         result_ty: ValueType::Int,

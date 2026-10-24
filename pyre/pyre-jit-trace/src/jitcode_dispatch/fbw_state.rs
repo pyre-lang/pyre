@@ -553,7 +553,7 @@ pub(crate) fn fbw_context_chained_contains(op: OpRef) -> bool {
 }
 
 /// Clear the store journal and residual-call census before a walk begins.
-pub(crate) fn fbw_store_journal_reset() {
+pub fn fbw_store_journal_reset() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
@@ -1357,7 +1357,7 @@ pub(crate) fn fbw_traceback_journal_push_if_attached(
 
 /// Commit-path epilogue: the walk's eager stores and appends stand; drop
 /// the undo logs.
-pub(crate) fn fbw_store_journal_commit() {
+pub fn fbw_store_journal_commit() {
     FBW_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow_mut().clear());
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().clear());
@@ -2676,7 +2676,7 @@ pub(crate) fn fbw_effect_journal_rollback_since(mark: FbwEffectJournalMark) {
 /// in-bounds at store time and stays in-bounds at the walk's final
 /// (max) length, so every restore lands while the list is still grown;
 /// shrinking first could push a restore index past the length and drop it.
-pub(crate) fn fbw_store_journal_rollback() {
+pub fn fbw_store_journal_rollback() {
     fbw_namespace_store_journal_rollback();
     FBW_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();

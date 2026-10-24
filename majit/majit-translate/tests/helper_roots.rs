@@ -25,6 +25,7 @@ fn helper_roots_compile_their_callees_without_a_portal_or_unrelated_graphs() {
                 target: CallTarget::FunctionPath {
                     segments: callee.segments.clone(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: Vec::new(),
                 result_ty: ValueType::Void,

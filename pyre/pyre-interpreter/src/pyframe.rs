@@ -65,6 +65,7 @@ macro_rules! locals_w_mut {
 /// attached to this type by the `frame` typedef; until then it is a bare
 /// identity tag so a frame carries a valid `ob_type` like every other
 /// W_Root (mirrors `pytraceback::PYTRACEBACK_TYPE`).
+#[majit_macros::prebuilt_static]
 pub static FRAME_TYPE: PyType = new_pytype("frame");
 
 /// CPython 3.14 `FrameLocalsProxy` — the write-through mapping exposed by
@@ -1634,7 +1635,46 @@ pub unsafe fn alloc_fixed_array_with_header(
 
 /// Allocate a frame locals array in the lifetime regime selected by its owner.
 /// The old-gen form is the type-9 GcArray layout `[GcHeader | len | items]`.
+///
+/// `pyframe.py __init__` `[None] * size`: the allocation and its fill loop run
+/// behind one residual call per regime, selected here.
 unsafe fn alloc_frame_locals_array(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+    allocation: FrameLocalsArrayAllocation,
+) -> *mut FixedObjectArray {
+    match allocation {
+        FrameLocalsArrayAllocation::NurseryGc => alloc_frame_locals_array_nursery(len, fill),
+        FrameLocalsArrayAllocation::OldGenGc => alloc_frame_locals_array_old_gen(len, fill),
+        FrameLocalsArrayAllocation::StdAlloc => alloc_frame_locals_array_std(len, fill),
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn alloc_frame_locals_array_nursery(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+) -> *mut FixedObjectArray {
+    unsafe { alloc_frame_locals_array_in(len, fill, FrameLocalsArrayAllocation::NurseryGc) }
+}
+
+#[majit_macros::dont_look_inside]
+fn alloc_frame_locals_array_old_gen(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+) -> *mut FixedObjectArray {
+    unsafe { alloc_frame_locals_array_in(len, fill, FrameLocalsArrayAllocation::OldGenGc) }
+}
+
+#[majit_macros::dont_look_inside]
+fn alloc_frame_locals_array_std(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+) -> *mut FixedObjectArray {
+    unsafe { alloc_frame_locals_array_in(len, fill, FrameLocalsArrayAllocation::StdAlloc) }
+}
+
+unsafe fn alloc_frame_locals_array_in(
     len: usize,
     fill: pyre_object::PyObjectRef,
     allocation: FrameLocalsArrayAllocation,
@@ -1642,11 +1682,10 @@ unsafe fn alloc_frame_locals_array(
     let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
         + len * std::mem::size_of::<pyre_object::PyObjectRef>();
     let raw = match allocation {
-        FrameLocalsArrayAllocation::NurseryGc => pyre_object::gc_hook::GcAllocOutcome::from_hook(
-            pyre_object::gc_hook::try_gc_alloc(pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID, payload),
-        )
-        .allocated_or_abort(payload)
-        .unwrap_or(std::ptr::null_mut()),
+        FrameLocalsArrayAllocation::NurseryGc => pyre_object::gc_hook::try_gc_alloc_nursery_raw(
+            pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
+            payload,
+        ),
         FrameLocalsArrayAllocation::OldGenGc => pyre_object::gc_hook::try_gc_alloc_stable_raw(
             pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
             payload,
@@ -1708,15 +1747,6 @@ pub fn remember_frame_locals_array(array: *mut FixedObjectArray) {
     if tracks_young {
         pyre_object::gc_hook::try_gc_write_barrier(array as pyre_object::gc_hook::GCREF);
     }
-}
-
-/// Same barrier as [`remember_frame_locals_array`], taking the frame so a
-/// looked-inside caller (`function.py funccall_valuestack`, `_flat_pycall`)
-/// does not pass `locals_cells_stack_w` (`jtransform.py check_no_vable_array`).
-#[inline]
-#[majit_macros::dont_look_inside]
-pub fn remember_frame_locals(frame: &PyFrame) {
-    remember_frame_locals_array(frame.locals_cells_stack_w);
 }
 
 /// Deallocate a `FixedObjectArray` allocated with
@@ -2305,7 +2335,9 @@ pub struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside
+    /// [`register_frame_locals_slot`].
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
         let registered = unsafe { register_frame_locals_slot(frame_ptr) };
         Self {
@@ -2348,8 +2380,17 @@ pub fn unregister_frame_locals_slot(frame_ptr: *mut PyFrame) {
 /// projection, which `vable_projection_census` allows only on
 /// `FrameBox::new`. `inline(never)` keeps the deref in this function's
 /// LLBC so the census does not attribute it to the caller.
+///
+/// The frame is the one its constructor is still building, so the store
+/// re-establishes the constructor's `hint(access_directly=True,
+/// fresh_virtualizable=True)` pair on the pointer, the way `pycode.py
+/// funcrun` re-hints the frame it just built; `pyframe.py __init__` stores
+/// `locals_cells_stack_w` under that hint.
 #[inline(never)]
 unsafe fn store_locals_cells_stack_w(frame_ptr: *mut PyFrame, array: *mut FixedObjectArray) {
+    let frame_ptr = majit_metainterp::jit::hint_fresh_virtualizable(
+        majit_metainterp::jit::hint_access_directly(frame_ptr),
+    );
     unsafe {
         (*frame_ptr).locals_cells_stack_w = array;
     }
@@ -3391,7 +3432,10 @@ pub fn deref_name_and_kind(code: &CodeObject, idx: usize) -> (&str, bool) {
 /// `__class__` cell used by methods.  A class body is non-optimized and the
 /// affected slot is a cell variable, never a free variable (`nonlocal
 /// __class__` must continue to mutate its enclosing cell).
-#[inline]
+///
+/// The answer depends only on the code object, the green key of every frame
+/// that asks, so the call is elidable and a trace folds it to a constant.
+#[majit_macros::elidable_cannot_raise]
 pub fn class_scope_class_deref_is_name(code: &CodeObject, idx: usize) -> bool {
     if code.flags.contains(CodeFlags::OPTIMIZED) {
         return false;
@@ -4885,10 +4929,23 @@ impl PyFrame {
         // Both writes below — the stack slot and the depth — have to land on
         // the live frame, so reload once and use it for both.
         let frame = self.live_mut();
-        frame.assert_stack_index(frame.valuestackdepth);
-        let idx = frame.valuestackdepth;
-        frame.set_locals_w(idx, value);
-        frame.valuestackdepth = idx + 1;
+        frame.push_on_self(value);
+    }
+
+    /// `pyframe.py pushvalue` — write the slot and the depth on `self`.
+    ///
+    /// [`push`] reloads through [`Self::live_mut`] first because it is the
+    /// post-allocation write and the caller's `&mut self` may name a
+    /// forwarded corpse. Callers that already hold the live frame —
+    /// [`crate::eval::FrameAnchor::live`] — write here so the tracer sees
+    /// the virtualizable stores instead of a `try_gc_current_object_address`
+    /// residual on the walk-local frame.
+    #[inline]
+    pub fn push_on_self(&mut self, value: PyObjectRef) {
+        self.assert_stack_index(self.valuestackdepth);
+        let idx = self.valuestackdepth;
+        self.set_locals_w(idx, value);
+        self.valuestackdepth = idx + 1;
     }
 
     /// Reads and writes through the caller's `&mut self`, without the
@@ -5039,7 +5096,6 @@ impl PyFrame {
     }
 
     /// PyPy-compatible `popvalues_mutable`.
-    /// Same residual-ABI constraint as `popvalues`.
     #[inline]
     pub fn popvalues_mutable(&mut self, n: usize) -> Vec<PyObjectRef> {
         self.popvalues(n)
@@ -5243,7 +5299,17 @@ impl PyFrame {
         if self._is_generator_or_coroutine() {
             self.initialize_as_generator()
         } else {
-            crate::call::get_eval_fn()(self, None)
+            // `Function.call_args` / `eval_current_frame_raw`: the five-word
+            // portal runner (`warmspot.py rewrite_jit_merge_point`), not the
+            // `EvalFn` pointer. A look-inside of `get_eval_fn()(self)` is an
+            // indirect call of that pointer through a word stub.
+            let result = crate::call::eval_current_frame_raw(self);
+            if result.is_null() {
+                Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| crate::PyError::value_error("call failed")))
+            } else {
+                Ok(result)
+            }
         }
     }
 
@@ -5447,7 +5513,7 @@ impl PyFrame {
 
     #[inline]
     pub fn failed_attr_after_stack_pop(&mut self) {
-        if !(1..=3).contains(&self.failed_attr_cleanup) {
+        if !matches!(self.failed_attr_cleanup, 1..=3) {
             return;
         }
         self.failed_attr_cleanup -= 1;
@@ -6478,6 +6544,10 @@ impl PyFrame {
     /// `pick_builtin(w_globals)`, which raises a non-KeyError
     /// `OperationError` straight out of `__init__`.  Fallible frame builder
     /// mirroring that path.
+    ///
+    /// The argument loop is the positional copy of `function.py
+    /// _flat_pycall`, which is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     pub fn try_new_for_call_with_closure_and_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6562,6 +6632,11 @@ impl PyFrame {
     /// Common tail of the frame builders: everything in `Frame.__init__`
     /// except the `pick_builtin` resolution, which is lifted to the callers
     /// so the fallible variant can propagate its error.
+    ///
+    /// Its loops are the positional copy of `function.py _flat_pycall` and
+    /// the cell/freevar setup of `pyframe.py initialize_frame_scopes`, both
+    /// `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn finish_for_call_with_globals_obj(
         code: *const (),
         args: &[PyObjectRef],
@@ -6586,11 +6661,18 @@ impl PyFrame {
         let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, w_builtin]);
         let args_base = _roots.publish(args);
         _roots.normalize(root_base, 4 + args.len());
-        let code_ref =
-            unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject) };
-        let num_locals = code_ref.varnames.len();
-        let num_cells = ncells(code_ref);
-        let max_stack = code_ref.max_stackdepth as usize;
+        // pyframe.py `__init__`: the sizes are the PyCode's own
+        // `co_nlocals` / `co_cellvars` / `co_freevars` / `co_stacksize`.
+        let pycode = _roots.get(root_base) as *const crate::pycode::PyCode;
+        let (num_locals, npure, nfreevars, max_stack) = unsafe {
+            (
+                (*pycode).co_nlocals as usize,
+                (*pycode).npure_cellvars as usize,
+                (*pycode).co_nfreevars as usize,
+                (*pycode).co_stacksize as usize,
+            )
+        };
+        let num_cells = npure + nfreevars;
 
         let locals_cells_stack_w = unsafe {
             alloc_frame_locals_array(num_locals + num_cells + max_stack, PY_NULL, allocation)
@@ -6621,7 +6703,6 @@ impl PyFrame {
             // Allocating cells for the overlap would shift freevar
             // indices and break LOAD_DEREF on `def repeat(n): def
             // wrap(fn): def inner(): return (n, fn)` style closures.
-            let npure = npure_cellvars(code_ref);
             for i in 0..npure {
                 // pyframe.py `PyFrame.initialize_frame_scopes` `Cell(None, self.pycode.cell_families[i])`.
                 let family = unsafe {
@@ -6633,7 +6714,6 @@ impl PyFrame {
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
-                let nfreevars = code_ref.freevars.len();
                 for i in 0..nfreevars {
                     let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
                     let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };

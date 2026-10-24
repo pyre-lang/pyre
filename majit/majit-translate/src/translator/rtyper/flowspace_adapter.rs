@@ -7653,6 +7653,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![obj.clone()]),
                         result_ty: ValueType::Int,
@@ -7727,6 +7728,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
                 result_ty: ValueType::Int,
@@ -7748,6 +7750,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
                 result_ty: ValueType::Int,
@@ -7952,6 +7955,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![dest.clone()]),
                         result_ty: ValueType::Int,
@@ -8122,6 +8126,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![view]),
                         result_ty: ValueType::Int,
@@ -8228,6 +8233,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![view]),
                         result_ty: ValueType::Int,
@@ -8783,6 +8789,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -8823,6 +8830,7 @@ mod tests {
                         "jit_force_virtualizable".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Void,
@@ -9032,6 +9040,7 @@ mod tests {
                         "reload_top_root".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9062,14 +9071,11 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "pyre_object".into(),
-                        "gc_hook".into(),
-                        "try_gc_current_object_address".into(),
-                    ],
-                    fun_decl_id: None,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "gc_hook",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -9102,14 +9108,11 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "user".into(),
-                        "gc_hook".into(),
-                        "try_gc_current_object_address".into(),
-                    ],
-                    fun_decl_id: None,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "user",
+                    "gc_hook",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -9133,10 +9136,10 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["pyre_object".into(), "try_gc_current_object_address".into()],
-                    fun_decl_id: None,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -9173,6 +9176,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__array_repeat".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
@@ -9208,6 +9212,7 @@ mod tests {
                         "try_pyobject_vec_with_capacity".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9248,6 +9253,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Void,
@@ -9303,6 +9309,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Int,
@@ -9359,10 +9366,7 @@ mod tests {
             .push_op_var(
                 entry,
                 OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath {
-                        segments: vec!["vec".into(), "Vec".into(), "index".into()],
-                        fun_decl_id: None,
-                    },
+                    target: crate::model::CallTarget::function_path(["vec", "Vec", "index"]),
                     args: crate::model::call_args(vec![v_var, i_var]),
                     result_ty: ValueType::Int,
                 },
@@ -9489,6 +9493,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9527,6 +9532,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9562,6 +9568,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9616,6 +9623,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["othermod".into(), "shared_leaf".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -9693,6 +9701,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["simple_call".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: vec![
                     LinkArg::from(ConstValue::HostObject(expected.clone())),
@@ -9742,6 +9751,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__dyn_call".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
@@ -9783,6 +9793,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["int".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -9836,6 +9847,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__builtin__".into(), "float".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Float,
@@ -9886,6 +9898,7 @@ mod tests {
                         "cast_ptr_to_int".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -9933,6 +9946,7 @@ mod tests {
                         "path".into(),
                     ],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,
@@ -10246,6 +10260,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: path.split("::").map(String::from).collect(),
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vars[2..2 + nargs].to_vec()),
                         result_ty: ValueType::Int,
@@ -10326,6 +10341,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::ENUMERATE.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10369,6 +10385,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UTF8_ITER.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10411,6 +10428,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Str,
@@ -10451,6 +10469,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Int,
@@ -10493,6 +10512,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_NEW.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -10525,6 +10545,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__majit_stringbuilder_new".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[2].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10558,6 +10579,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_APPEND.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Void,
@@ -10603,15 +10625,12 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[4].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "pyre_object".into(),
-                        "rordereddict".into(),
-                        "RDict".into(),
-                        "insert".into(),
-                    ],
-                    fun_decl_id: None,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "rordereddict",
+                    "RDict",
+                    "insert",
+                ]),
                 args: crate::model::call_args(vec![
                     vars[1].clone(),
                     vars[2].clone(),
@@ -10685,6 +10704,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10787,6 +10807,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: segments.clone(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vars[..arity].iter().cloned()),
                     result_ty: ValueType::Bool,
@@ -10865,10 +10886,9 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: segments.clone(),
-                    fun_decl_id: None,
-                },
+                // HOST_ENV builtin fixture: no FunDecl/generics.types.
+                // Production constructs this path with `function_path`.
+                target: crate::model::CallTarget::function_path(segments.clone()),
                 args: crate::model::call_args(vars[..3].iter().cloned()),
                 result_ty: ValueType::Ref(None),
             },
@@ -10934,6 +10954,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: segments.clone(),
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vars[..5].iter().cloned()),
                 result_ty: ValueType::Void,
@@ -11820,6 +11841,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -11947,6 +11969,7 @@ mod tests {
             target: crate::model::CallTarget::FunctionPath {
                 segments: segs.iter().map(|s| s.to_string()).collect(),
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args((0..argc).map(|_| Variable::new())),
             result_ty: ValueType::Int,
@@ -12849,6 +12872,7 @@ mod tests {
                     "-3".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -12891,6 +12915,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "hi".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -12910,6 +12935,7 @@ mod tests {
                     "re.IGNORECASE".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -12997,6 +13023,7 @@ mod tests {
                     "function".to_string(),
                 ],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: Vec::new(),
             result_ty: ValueType::Int,

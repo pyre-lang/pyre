@@ -839,6 +839,35 @@ pub fn emit_exception_new_inline(
     new_op
 }
 
+/// FBW `try_walker_lower_exc_info_residual`: PUSH_EXC_INFO
+/// `prev = GETFIELD_GC_R(ec, sys_exc_value)`.
+pub fn portal_emit_get_current_exception(ctx: &mut TraceCtx, ec: OpRef) -> (OpRef, i64) {
+    let descr = crate::descr::ec_sys_exc_value_descr();
+    let boxed = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[ec], descr);
+    let concrete = pyre_interpreter::eval::get_current_exception() as i64;
+    ctx.set_opref_concrete(boxed, Value::Ref(GcRef(concrete as usize)));
+    (boxed, concrete)
+}
+
+/// FBW `try_walker_lower_exc_info_residual`: PUSH_EXC_INFO /
+/// POP_EXCEPT `SETFIELD_GC(ec, exc, sys_exc_value)`.
+pub fn portal_emit_set_current_exception(ctx: &mut TraceCtx, ec: OpRef, exc: OpRef, exc_ptr: i64) {
+    let descr = crate::descr::ec_sys_exc_value_descr();
+    let idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[ec, exc], descr);
+    ctx.heapcache_setfield_cached(ec, idx, exc);
+    pyre_interpreter::eval::set_current_exception(exc_ptr as pyre_object::PyObjectRef);
+}
+
+/// `pyopcode.py LOAD_GLOBAL` looks inside the module-dict cell, so the
+/// opcode is not a residual whose result this can fold.
+pub fn portal_try_fold_load_global_exc_class(
+    _ctx: &mut TraceCtx,
+    _raw_i: &[i64],
+) -> Option<(OpRef, i64)> {
+    None
+}
+
 /// Emit inline `Method` creation (NewWithVtable + SetfieldGc for
 /// `w_function` / `w_self` / `w_class` and the inherited header
 /// `PyObject.w_class`), mirroring `function.rs w_method_new`.

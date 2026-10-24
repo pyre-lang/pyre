@@ -1731,7 +1731,10 @@ static W_UNICODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
                 "index_storage",
                 pyre_object::unicodeobject::UNICODE_INDEX_STORAGE_OFFSET,
                 std::mem::size_of::<*mut pyre_object::rutf8::Utf8IndexStorage>(),
-                Type::Ref,
+                // `*mut Utf8IndexStorage` is `*mut Vec<Utf8LocElem>`: the
+                // raw `RustVec` header address (`rrustvec.rs rust_vec_lltype`),
+                // kind `int`.
+                Type::Int,
                 false,
                 false,
                 false,
@@ -1817,7 +1820,9 @@ static W_BYTEARRAY_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
                 "data",
                 pyre_object::bytearrayobject::BYTEARRAY_DATA_OFFSET,
                 std::mem::size_of::<*mut Vec<u8>>(),
-                Type::Ref,
+                // `*mut Vec<u8>` is the raw `RustVec` header address
+                // (`rrustvec.rs rust_vec_lltype`), kind `int`.
+                Type::Int,
                 false,
                 false,
                 false,
@@ -3020,7 +3025,18 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         std::mem::size_of::<W_ListObject>(),
         W_LIST_GC_TYPE_ID,
         &pyre_object::pyobject::LIST_TYPE as *const _ as usize,
+        // Payload order is host offset order so listed `index_in_parent`
+        // is the position (`heaptracker.py get_fielddescr_index_in`).
         &[
+            (
+                "allocated",
+                std::mem::offset_of!(W_ListObject, allocated),
+                std::mem::size_of::<isize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
             // rlist.py `("length", Signed)`. Mutable: Object-strategy
             // push/pop/insert/remove/drain update it.
             (
@@ -3078,31 +3094,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // TODO vs listobject.py's
             // IntegerListStrategy at the interp level — upstream keeps
             // the unwrap inline and doesn't add a separate backing
-            // array).
-            (
-                "int_items.len",
-                std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            // Float-strategy typed storage.
-            (
-                "float_items.len",
-                std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            // `Ptr(GcArray(Signed))` / `Ptr(GcArray(Float))` — the typed
-            // strategy backing blocks (`erase([int])` / `erase([float])`).
-            // Read as a Ref so `GetarrayitemGcI` / `GetarrayitemGcF` address
-            // items[i] through the heap cache. Mutable: re-pointed on grow /
-            // strategy switch (like `W_ListObject.items`).
+            // array). `IntArray` is `{block, len}`.
             (
                 "int_items.block",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_BLOCK_OFFSET,
@@ -3113,10 +3105,73 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
             ),
             (
+                "int_items.len",
+                std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            // Float-strategy typed storage. `FloatArray` is `{block, len}`.
+            (
                 "float_items.block",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_BLOCK_OFFSET,
                 WORD,
                 Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "float_items.len",
+                std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            // listobject.py `BytesListStrategy` stores erased `rpython str`
+            // pointers in its own GcArray(GCREF). `BytesArray` is `{block, len}`.
+            (
+                "bytes_items.block",
+                std::mem::offset_of!(W_ListObject, bytes_items)
+                    + pyre_object::bytes_array::BYTES_ARRAY_BLOCK_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "bytes_items.len",
+                std::mem::offset_of!(W_ListObject, bytes_items)
+                    + pyre_object::bytes_array::BYTES_ARRAY_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            // AsciiListStrategy stores exact ASCII `_utf8` rpython-string
+            // pointers in the same GcArray(GCREF) representation.
+            (
+                "ascii_items.block",
+                std::mem::offset_of!(W_ListObject, ascii_items)
+                    + pyre_object::unicode_array::UNICODE_ARRAY_BLOCK_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "ascii_items.len",
+                std::mem::offset_of!(W_ListObject, ascii_items)
+                    + pyre_object::unicode_array::UNICODE_ARRAY_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
                 false,
                 false,
                 false,
@@ -3129,65 +3184,6 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 "w_class",
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            // CPython 3.14 `PyListObject.allocated`.  The orthodox append
-            // descent now walks `W_ListObject::sync_allocated`, so this field
-            // must belong to the canonical list descr group just like every
-            // other mutable field reached by the translated body.  Keep it at
-            // the end so the established list field indices remain stable.
-            (
-                "allocated",
-                std::mem::offset_of!(W_ListObject, allocated),
-                std::mem::size_of::<isize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            // listobject.py `BytesListStrategy` stores erased `rpython str`
-            // pointers in its own GcArray(GCREF).  Keep these entries at the
-            // end so the established descriptor indices above remain stable.
-            (
-                "bytes_items.len",
-                std::mem::offset_of!(W_ListObject, bytes_items)
-                    + pyre_object::bytes_array::BYTES_ARRAY_LEN_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "bytes_items.block",
-                std::mem::offset_of!(W_ListObject, bytes_items)
-                    + pyre_object::bytes_array::BYTES_ARRAY_BLOCK_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            // AsciiListStrategy stores exact ASCII `_utf8` rpython-string
-            // pointers in the same GcArray(GCREF) representation.
-            (
-                "ascii_items.len",
-                std::mem::offset_of!(W_ListObject, ascii_items)
-                    + pyre_object::unicode_array::UNICODE_ARRAY_LEN_OFFSET,
-                std::mem::size_of::<usize>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "ascii_items.block",
-                std::mem::offset_of!(W_ListObject, ascii_items)
-                    + pyre_object::unicode_array::UNICODE_ARRAY_BLOCK_OFFSET,
-                std::mem::size_of::<usize>(),
                 Type::Ref,
                 false,
                 false,
@@ -3213,7 +3209,18 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         std::mem::size_of::<W_TupleObject>(),
         W_TUPLE_GC_TYPE_ID,
         &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
+        // Payload order is host offset order so listed `index_in_parent`
+        // is the position (`heaptracker.py get_fielddescr_index_in`).
         &[
+            (
+                "hash",
+                std::mem::offset_of!(W_TupleObject, hash),
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
             // `Ptr(GcArray(OBJECTPTR))` — wrappeditems body. Immutable.
             (
                 "wrappeditems",
@@ -3230,15 +3237,6 @@ static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 WORD,
                 Type::Ref,
                 false,
-                false,
-                false,
-            ),
-            (
-                "hash",
-                std::mem::offset_of!(W_TupleObject, hash),
-                8,
-                Type::Int,
-                true,
                 false,
                 false,
             ),
@@ -3656,8 +3654,9 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// `lltype.Struct` and skips only Void and `typeptr`. The virtualizable
 /// token is `llmemory.GCREF` (`VirtualizableInstanceRepr._setup_repr_llfields`),
 /// so it is a `Type::Ref` row of `gc_fielddescrs` and `clear_gc_fields`
-/// zeroes it. The factory prepends the nested leaf so payload accessors
-/// that index this group keep their slots.
+/// zeroes it. The factory prepends the nested leaf; payload rows follow
+/// host offset order so listed `index_in_parent` is the position
+/// (`heaptracker.py get_fielddescr_index_in`).
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
@@ -3668,6 +3667,15 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         // tag as a `FrameBox`-constructed one.
         &pyre_interpreter::pyframe::FRAME_TYPE as *const _ as usize,
         &[
+            (
+                "pycode",
+                crate::frame_layout::PYFRAME_PYCODE_OFFSET,
+                WORD,
+                Type::Ref,
+                true,
+                false,
+                false,
+            ),
             (
                 "locals_cells_stack_w",
                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
@@ -3702,12 +3710,24 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pyframe.py:80 escaped` and its neighbours live in one `u8`, so
+            // the traced `mark_as_escaped` is a byte-wide read-or-write, not a
+            // word store.
             (
-                "pycode",
-                crate::frame_layout::PYFRAME_PYCODE_OFFSET,
-                WORD,
-                Type::Ref,
-                true,
+                "flags",
+                crate::frame_layout::PYFRAME_FLAGS_OFFSET,
+                std::mem::size_of::<u8>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "failed_attr_cleanup",
+                crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
+                std::mem::size_of::<u8>(),
+                Type::Int,
+                false,
                 false,
                 false,
             ),
@@ -3715,6 +3735,15 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 "debugdata",
                 crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
                 WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "vable_token",
+                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+                std::mem::size_of::<usize>(),
                 Type::Ref,
                 false,
                 false,
@@ -3751,37 +3780,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 "w_builtin",
                 crate::frame_layout::PYFRAME_W_BUILTIN_OFFSET,
                 WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            // `pyframe.py:80 escaped` and its neighbours live in one `u8`, so
-            // the traced `mark_as_escaped` is a byte-wide read-or-write, not a
-            // word store.  Appended after the named accessors that address
-            // this group by index.
-            (
-                "flags",
-                crate::frame_layout::PYFRAME_FLAGS_OFFSET,
-                std::mem::size_of::<u8>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "failed_attr_cleanup",
-                crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
-                std::mem::size_of::<u8>(),
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "vable_token",
-                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
-                std::mem::size_of::<usize>(),
                 Type::Ref,
                 false,
                 false,
@@ -6845,7 +6843,7 @@ pub fn list_w_class_descr() -> DescrRef {
 /// `tuple_length_descr` exists per upstream tupleobject.py:376-390
 /// (`W_TupleObject` carries no separate length field).
 pub fn tuple_wrappeditems_descr() -> DescrRef {
-    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 0)
+    field_descr_from_group_named(&W_TUPLE_DESCR_GROUP, "wrappeditems")
 }
 
 pub fn tuple_w_class_descr() -> DescrRef {
@@ -6853,7 +6851,7 @@ pub fn tuple_w_class_descr() -> DescrRef {
 }
 
 pub fn tuple_hash_descr() -> DescrRef {
-    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 1)
+    field_descr_from_group_named(&W_TUPLE_DESCR_GROUP, "hash")
 }
 
 /// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
@@ -7233,6 +7231,37 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::size_of::<u32>(),
                 false,
                 false,
+            ),
+            // `pycode.py PyCode._immutable_fields_`: `co_nlocals`,
+            // `co_stacksize`, `co_flags`. `co_nfreevars` is the length of
+            // `_immutable_fields_ co_freevars[*]`.
+            int_field(
+                "co_nlocals",
+                std::mem::offset_of!(PyCode, co_nlocals),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
+            ),
+            int_field(
+                "co_stacksize",
+                std::mem::offset_of!(PyCode, co_stacksize),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
+            ),
+            int_field(
+                "co_nfreevars",
+                std::mem::offset_of!(PyCode, co_nfreevars),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
+            ),
+            int_field(
+                "co_flags",
+                std::mem::offset_of!(PyCode, co_flags),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
             ),
             word_int(
                 "cell_families",
@@ -8767,44 +8796,44 @@ pub fn pyframe_size_descr() -> DescrRef {
 }
 
 pub fn pyframe_locals_cells_stack_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 0)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "locals_cells_stack_w")
 }
 
 pub fn pyframe_stack_depth_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 1)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "valuestackdepth")
 }
 
 pub fn pyframe_next_instr_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 2)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "last_instr")
 }
 
 pub fn pyframe_code_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 3)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "pycode")
 }
 
 /// rewrite.py `handle_call_assembler` scalar field read for the
 /// `debugdata` slot of the virtualizable expansion (Phase D-1 prereq).
 pub fn pyframe_debugdata_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "debugdata")
 }
 
 pub fn pyframe_f_generator_wref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "f_generator_wref")
 }
 
 pub fn pyframe_w_yielding_from_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "w_yielding_from")
 }
 
 pub fn pyframe_f_backref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "f_backref")
 }
 
 /// `pyframe.py PyFrame.get_builtin` — the per-frame builtin module selected
 /// when the frame is created.  IMPORT_NAME traces this ordinary field read
 /// before looking up `__import__` in the module dict.
 pub fn pyframe_w_builtin_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
+    field_descr_from_group_named(&PYFRAME_DESCR_GROUP, "w_builtin")
 }
 
 /// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
@@ -9549,7 +9578,7 @@ mod tests {
                 WORD,
                 Type::Ref,
                 false,
-                17,
+                21,
                 false,
             ),
             (
@@ -9624,6 +9653,10 @@ mod tests {
                 "PyCode.hidden_applevel",
                 "PyCode.fast_natural_arity",
                 "PyCode.npure_cellvars",
+                "PyCode.co_nlocals",
+                "PyCode.co_stacksize",
+                "PyCode.co_nfreevars",
+                "PyCode.co_flags",
                 "PyCode.cell_families",
                 "PyCode.globals_caches",
                 "PyCode.mapdict_caches",
@@ -9639,6 +9672,20 @@ mod tests {
                 "PyCode.jit_shape",
             ]
         );
+        // `heaptracker.py get_fielddescr_index_in` numbers after the
+        // typeptr skip. The group lists payload fields in `PyCode`
+        // declaration order and the mint adds the inherited `w_class`
+        // leaf at listed[0], so listed position *is* `index_in_parent`.
+        for (i, fd) in size.all_fielddescrs().iter().enumerate() {
+            assert_eq!(
+                fd.index_in_parent(),
+                i,
+                "field {} has index_in_parent {} at listed position {}",
+                fd.field_name(),
+                fd.index_in_parent(),
+                i,
+            );
+        }
     }
 
     #[test]
@@ -9900,12 +9947,11 @@ mod tests {
         assert!(user_sd.all_fielddescrs()[0].is_w_class());
     }
 
-    /// The named `pyframe_*_descr` accessors pick their descr by position in
-    /// `PYFRAME_DESCR_GROUP`, so removing a field from the group shifts every
-    /// later position.  A stale index hands out a neighbouring field's descr:
-    /// after `lastblock` left the group, `pyframe_f_backref_descr` answered
-    /// `w_builtin`, and every JIT-built frame lost its caller chain and its
-    /// builtins.
+    /// The named `pyframe_*_descr` accessors pick their descr by
+    /// `fieldname` (`descr.py get_field_descr`), so a neighbouring spec
+    /// cannot repoint them. A stale index used to: after `lastblock`
+    /// left the group, `pyframe_f_backref_descr` answered `w_builtin`,
+    /// and every JIT-built frame lost its caller chain and its builtins.
     #[test]
     fn pyframe_field_descr_accessors_name_their_own_offsets() {
         use crate::frame_layout as fl;
@@ -13044,7 +13090,10 @@ pub(crate) fn refresh_pyre_class_vtable_tids() {
 }
 
 fn publish_pyre_class_vtables_inner() {
-    let mut gc = majit_ir::descr::gc_cache().lock();
+    // Walk the class table without `GcCache`. The Once must not wait on
+    // that mutex: a holder that then calls `publish_pyre_class_vtables`
+    // (`force_declared_group`) would invert the order.
+    let mut rows = Vec::new();
     pyre_object::lltype::for_each_class_descriptor(|descr| {
         let vtable = descr.pytype_ptr as usize;
         if vtable == 0 {
@@ -13060,8 +13109,12 @@ fn publish_pyre_class_vtables_inner() {
             Some((_, rest)) => rest,
             None => descr.struct_path,
         };
-        gc.register_gcstruct_vtable(majit_ir::descr::path_hash(stripped), vtable, tid);
+        rows.push((majit_ir::descr::path_hash(stripped), vtable, tid));
     });
+    let mut gc = majit_ir::descr::gc_cache().lock();
+    for (hash, vtable, tid) in rows {
+        gc.register_gcstruct_vtable(hash, vtable, tid);
+    }
 }
 
 /// Force this module's own group for `cache_key`, if it declares one, so the

@@ -198,6 +198,7 @@
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame, WalkSym};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
+use rustpython_wtf8::Wtf8;
 
 /// Descriptor accessor carried by an active MIFrame walk.
 ///
@@ -1497,6 +1498,18 @@ fn stamp_traceback_node_concrete<Sym: WalkSym>(
         .set_opref_concrete(node, Value::Ref(majit_ir::GcRef(head as usize)));
 }
 
+/// The inlined frame's pycode, or the jitcode's own pycode when the frame
+/// carries the null / `usize::MAX` sentinel of a non-standard virtualizable.
+fn resolve_inline_w_code(w_code: usize, jitcode_index: i32) -> usize {
+    if w_code == 0 || w_code == usize::MAX {
+        crate::state::code_for_jitcode_index(jitcode_index)
+            .map(|ptr| ptr as usize)
+            .unwrap_or(0)
+    } else {
+        w_code
+    }
+}
+
 fn record_inline_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
@@ -1515,15 +1528,17 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     // A non-standard virtualizable frame in a bridge sub-walk carries the
     // `GcRef(usize::MAX)` sentinel (or null) as `w_code` instead of a real
     // `PyCode` — a synthetic frame with no Python code to anchor a node on.
-    // The host adapter (`record_inline_traceback_for_recording`) dereferences
-    // `w_code` through `createframe_obj`, so a sentinel / garbage pointer would
-    // SIGSEGV.  Skip null / sentinel / non-code; the null + sentinel checks run
-    // before `is_code`, whose `py_type_check` would deref the raw sentinel
-    // (`CAN_BE_TAGGED` is off).
-    let w_code = ctx.inline_w_code();
+    // Resolve the jitcode's own pycode rather than skipping: that skip is
+    // what left inlined raises with an empty traceback. The host adapter
+    // (`record_inline_traceback_for_recording`) dereferences `w_code` through
+    // `createframe_obj`, so a remaining sentinel / garbage pointer would
+    // SIGSEGV. The null + sentinel checks run before `is_code`, whose
+    // `py_type_check` would deref the raw sentinel (`CAN_BE_TAGGED` is off).
+    let w_code = resolve_inline_w_code(ctx.inline_w_code(), consts.jitcode_index);
     if w_code == 0 || w_code == usize::MAX {
         return;
     }
+    let w_globals = ctx.inline_w_globals();
     if !unsafe { pyre_interpreter::pycode::is_code(w_code as pyre_object::PyObjectRef) } {
         return;
     }
@@ -1592,6 +1607,15 @@ fn record_inline_application_traceback<Sym: WalkSym>(
                     consts.jitcode_index,
                     opcode_position as i32,
                 )
+            } else {
+                let live = pyre_object::gc_roots::shadow_stack_get(slot);
+                majit_metainterp::record_inline_application_traceback_for_recording(
+                    live as usize as i64,
+                    w_code as i64,
+                    w_globals as i64,
+                    consts.jitcode_index,
+                    opcode_position as i32,
+                );
             }
         });
         note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
@@ -1606,19 +1630,31 @@ fn record_inline_application_traceback<Sym: WalkSym>(
         })
         .unwrap_or(OpRef::NONE);
     let frame_hook = majit_metainterp::record_application_traceback_hook_address();
-    if emit_runtime && !frame_hook.is_null() && !exc.is_none() {
-        assert!(
-            !frame.is_none(),
-            "an inlined MIFrame must carry its own red PyFrame"
-        );
-        let jitcode = ctx.trace_ctx.const_int(i64::from(consts.jitcode_index));
-        let opcode = ctx.trace_ctx.const_int(opcode_position as i64);
-        ctx.trace_ctx.call_void_typed_with_effect(
-            frame_hook,
-            &[exc, frame, jitcode, opcode],
-            &[Type::Ref, Type::Ref, Type::Int, Type::Int],
-            default_effect_info(),
-        );
+    if emit_runtime && !exc.is_none() {
+        if !frame.is_none() && !frame_hook.is_null() {
+            let jitcode = ctx.trace_ctx.const_int(i64::from(consts.jitcode_index));
+            let opcode = ctx.trace_ctx.const_int(opcode_position as i64);
+            ctx.trace_ctx.call_void_typed_with_effect(
+                frame_hook,
+                &[exc, frame, jitcode, opcode],
+                &[Type::Ref, Type::Ref, Type::Int, Type::Int],
+                default_effect_info(),
+            );
+        } else {
+            let inline_hook = majit_metainterp::record_inline_application_traceback_hook_address();
+            if !inline_hook.is_null() {
+                let w_code_op = ctx.trace_ctx.const_ref(w_code as i64);
+                let w_globals_op = ctx.trace_ctx.const_ref(w_globals as i64);
+                let jitcode = ctx.trace_ctx.const_int(i64::from(consts.jitcode_index));
+                let opcode = ctx.trace_ctx.const_int(opcode_position as i64);
+                ctx.trace_ctx.call_void_typed_with_effect(
+                    inline_hook,
+                    &[exc, w_code_op, w_globals_op, jitcode, opcode],
+                    &[Type::Ref, Type::Ref, Type::Ref, Type::Int, Type::Int],
+                    default_effect_info(),
+                );
+            }
+        }
     }
 }
 
@@ -1871,7 +1907,10 @@ fn traceback_node_site<Sym: WalkSym>(
         (session.recording_jitcode_index, w_code)
     } else {
         ctx.inline_callee_consts.map_or((-1, 0), |consts| {
-            (consts.jitcode_index, ctx.inline_w_code())
+            (
+                consts.jitcode_index,
+                resolve_inline_w_code(ctx.inline_w_code(), consts.jitcode_index),
+            )
         })
     };
     if w_code == 0 || w_code == usize::MAX {
@@ -10827,7 +10866,12 @@ unsafe fn lookup_instance_dunder_call(
     if version_tag == 0 {
         return None;
     }
-    let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
+    let method = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
+        )
+    }?;
     Some((method, w_class, version_tag))
 }
 
@@ -10894,13 +10938,17 @@ unsafe fn resolve_type_call_builtin_new(
     {
         return None;
     }
-    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__new__") }?;
-    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    let new_name =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__new__"));
+    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, new_name) }?;
+    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, new_name) };
     if Some(tp_new) == obj_new || !unsafe { pyre_interpreter::is_function_carrier(tp_new) } {
         return None;
     }
-    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__init__") };
-    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
+    let init_name =
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__init__"));
+    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, init_name) };
+    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, init_name) };
     let builtin_init = if tp_init == obj_init {
         None
     } else {
@@ -15430,6 +15478,12 @@ fn handle<Sym: WalkSym>(
             write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        "int_isvirtual/r>i" => {
+            let src = read_ref_reg(code, op, 0, ctx)?;
+            let dst = code[op.pc + 2] as usize;
+            write_hint_bool(ctx, op.pc, dst, ctx.trace_ctx.is_likely_virtual(src))?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "ref_isvirtual/r>i" => {
             let src = read_ref_reg(code, op, 0, ctx)?;
             let dst = code[op.pc + 2] as usize;
@@ -15504,21 +15558,9 @@ fn handle<Sym: WalkSym>(
                 }
                 _ => None,
             };
-            if let Some(ptr) =
-                alloc_pin
-                    .as_ref()
-                    .map(|pin| pin.get().0)
-                    .or_else(|| match concrete {
-                        Some(Value::Ref(r)) => Some(r.0),
-                        _ => None,
-                    })
-                && let Some(w_class) = descr.as_size_descr().and_then(|size| size.w_class_obj())
-            {
-                unsafe {
-                    (*(ptr as *mut pyre_object::PyObject)).w_class =
-                        w_class as pyre_object::PyObjectRef;
-                }
-            }
+            // `bh_new_with_vtable` writes both header words when the backend
+            // has a class-word offset, so this arm does not store `w_class`
+            // again.
             let concrete = alloc_pin
                 .as_ref()
                 .map(|pin| Value::Ref(pin.get()))

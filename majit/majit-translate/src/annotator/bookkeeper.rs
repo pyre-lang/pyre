@@ -642,8 +642,8 @@ fn raw_struct_ptr_from_layout(
     if majit_charon_reader::ullbc::is_closure_leaf(leaf) {
         return None;
     }
-    // `GcKind::Raw` is every struct that is not on the GC field-0 chain.
-    // A dict strategy or a type object is still an instance; only a
+    // `GcKind::Raw` is raw storage (`adt_def_is_raw_storage`). A dict
+    // strategy or a type object is still an instance; only a
     // word-storage ADT is `SomePtr`. An empty set is a fixture that never
     // harvested owners, so the gckind test below stays in force.
     if !registry.raw_word_owners.is_empty()

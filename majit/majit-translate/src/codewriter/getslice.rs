@@ -45,6 +45,7 @@ use crate::codewriter::call::CallControl;
 use crate::flowspace::model::Variable;
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
+use majit_jitcode::codewriter::jtransform::{LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY};
 
 /// The leaf every minted helper shares, suffixed per array identity.
 pub const LL_LISTSLICE_STARTONLY: &str = "ll_listslice_startonly";
@@ -107,7 +108,7 @@ pub fn array_identity_of_base(
             OpKind::Input {
                 class_root: Some(root),
                 ..
-            } if root == OBJECT_REF_SLICE_CLASS_ROOT && op.result.as_ref().is_some_and(same) => {
+            } if is_object_slice_class_root(root) && op.result.as_ref().is_some_and(same) => {
                 object_slice_input = true;
             }
             _ => {}
@@ -132,6 +133,24 @@ pub fn array_identity_of_base(
 /// The class root the front stamps on a `&[PyObjectRef]` input
 /// (`front/mir.rs` field/param layout spelling).
 const OBJECT_REF_SLICE_CLASS_ROOT: &str = "[*mut PyObject]";
+
+/// `true` when `root` names the length-prefixed object-pointer array
+/// (`[*mut PyObject]` / `PyObjectRef` slice / the published gcarray id).
+fn is_object_slice_class_root(root: &str) -> bool {
+    if root == OBJECT_REF_SLICE_CLASS_ROOT || root == crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID
+    {
+        return true;
+    }
+    let peeled = root
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    matches!(
+        peeled,
+        "[*mut PyObject]" | "[*const PyObject]" | "[PyObjectRef]"
+    )
+}
 
 /// Union-find over the graph's links: `link.args[i]` and
 /// `target.inputargs[i]` carry one value.
@@ -254,6 +273,21 @@ fn register_listslice_helper(cc: &mut CallControl, path: CallPath, graph: Functi
     cc.add_candidate_graph(path);
 }
 
+/// `cpu.arraydescrof(GcArray(ITEM))` when the helper was minted without
+/// an ARRAY spelling. The three banks are the same lltypes
+/// `arraydescr_of_fixed_array` names for a nameless `newlist`.
+fn named_listslice_array_id(item_ty: &ValueType, array_type_id: Option<&str>) -> Option<String> {
+    if let Some(id) = array_type_id {
+        return Some(id.to_string());
+    }
+    match item_ty {
+        ValueType::Int | ValueType::Unsigned => Some(LIST_INT_ITEMS_ARRAY.to_string()),
+        ValueType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+        ValueType::Ref(_) => Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+        _ => None,
+    }
+}
+
 /// `ll_listslice_*__<item>[__<array identity>]`, the identity
 /// reduced to identifier characters so the leaf stays a plain path segment.
 fn helper_name(leaf: &str, item_ty: &ValueType, array_type_id: Option<&str>) -> String {
@@ -295,7 +329,11 @@ pub fn listslice_marker_suffix(item_ty: &ValueType, array_type_id: Option<&str>)
     if let Some(id) = array_type_id {
         let sanitized = sanitize_array_id(id);
         if restore_array_id(&sanitized).as_deref() != Some(id) {
-            return None;
+            // `Vec<u8>` and other spellings whose `<`/`>` do not survive
+            // sanitize still name an item kind. Keep that kind so
+            // jtransform can mint a helper; the ARRAY id stays on the
+            // sibling-array scan when it round-trips.
+            return Some(item.to_string());
         }
         suffix.push_str("__");
         suffix.push_str(&sanitized);
@@ -363,6 +401,7 @@ pub fn getslice_marker_identity(
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         args,
+        result_ty,
         ..
     } = &op.kind
     else {
@@ -374,7 +413,17 @@ pub fn getslice_marker_identity(
         return Some(decoded);
     }
     let base = args.first()?;
-    array_identity_of_base(graph, base)
+    if let Some(identity) = array_identity_of_base(graph, base) {
+        return Some(identity);
+    }
+    // A scalar-banked slice view (`&[u8]`, `&[i64]`, a Vec buffer word)
+    // carries its item kind in the marker result. A `Ref` result is the
+    // new list object, not the item kind — leave that to the scan.
+    match result_ty {
+        ValueType::Int | ValueType::Unsigned => Some((ValueType::Int, None)),
+        ValueType::Float => Some((ValueType::Float, None)),
+        _ => None,
+    }
 }
 
 /// `rlist.py ll_listslice_startonly` in the rich model, with `ll_arraycopy`
@@ -384,7 +433,7 @@ pub fn build_ll_listslice_startonly_graph(
     item_ty: &ValueType,
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
-    let array_type_id = array_type_id.map(str::to_string);
+    let array_type_id = named_listslice_array_id(item_ty, array_type_id);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -455,7 +504,7 @@ pub fn build_ll_listslice_minusone_graph(
     item_ty: &ValueType,
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
-    let array_type_id = array_type_id.map(str::to_string);
+    let array_type_id = named_listslice_array_id(item_ty, array_type_id);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -556,7 +605,7 @@ pub fn build_ll_listslice_rangeto_graph(
     item_ty: &ValueType,
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
-    let array_type_id = array_type_id.map(str::to_string);
+    let array_type_id = named_listslice_array_id(item_ty, array_type_id);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -650,7 +699,7 @@ pub fn build_ll_listslice_startstop_graph(
     item_ty: &ValueType,
     array_type_id: Option<&str>,
 ) -> FunctionGraph {
-    let array_type_id = array_type_id.map(str::to_string);
+    let array_type_id = named_listslice_array_id(item_ty, array_type_id);
     let mut graph = FunctionGraph::new(name);
     let start_block = graph.startblock;
 
@@ -758,6 +807,7 @@ fn emit_ll_arraycopy_call(
             target: CallTarget::FunctionPath {
                 segments: vec!["ll_arraycopy".into()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             args: crate::model::call_args(vec![l1, new_list.clone(), start, dest_start, newlength]),
             result_ty: ValueType::Void,
@@ -823,6 +873,14 @@ pub fn is_getslice_range(op: &SpaceOperation) -> bool {
 
 fn is_getslice_marker(segments: &[String], name: &str) -> bool {
     segments.first().map(String::as_str) == Some(name) && segments.len() <= 2
+}
+
+/// `true` when `op` is any front `__getslice_*` marker.
+pub fn is_any_getslice_marker(op: &SpaceOperation) -> bool {
+    is_getslice_rangefrom(op)
+        || is_getslice_minusone(op)
+        || is_getslice_rangeto(op)
+        || is_getslice_range(op)
 }
 
 #[cfg(test)]
@@ -955,6 +1013,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1007,6 +1066,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_range".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![
                     Variable::new(),
@@ -1151,6 +1211,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1176,6 +1237,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec![first.last_segment().unwrap().to_string()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1188,6 +1250,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1217,6 +1280,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_range".into(), suffix],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![items, Variable::new(), Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1252,6 +1316,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![items, Variable::new()]),
                 result_ty: ValueType::Ref(None),
@@ -1261,6 +1326,64 @@ mod tests {
         assert_eq!(
             getslice_marker_identity(&graph, &op),
             Some((ValueType::Float, Some("[f64]".into())))
+        );
+    }
+
+    #[test]
+    fn a_vec_spelling_keeps_the_item_kind_when_the_id_does_not_round_trip() {
+        assert_eq!(
+            listslice_marker_suffix(&ValueType::Int, Some("Vec<u8>")).as_deref(),
+            Some("int")
+        );
+    }
+
+    #[test]
+    fn an_int_banked_marker_result_is_the_scalar_item_kind() {
+        let graph = FunctionGraph::new("f");
+        let op = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__getslice_rangefrom".into()],
+                    fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
+                },
+                args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        assert_eq!(
+            getslice_marker_identity(&graph, &op),
+            Some((ValueType::Int, None))
+        );
+    }
+
+    #[test]
+    fn a_nameless_int_helper_names_the_gcarray_signed_array() {
+        let graph = build_ll_listslice_startonly_graph(
+            "ll_listslice_startonly__int",
+            &ValueType::Int,
+            None,
+        );
+        let start = graph.block(graph.startblock);
+        assert!(
+            start.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewArrayClear {
+                    item_ty: ValueType::Int,
+                    array_type_id,
+                    ..
+                } if array_type_id.as_deref() == Some(LIST_INT_ITEMS_ARRAY)
+            )),
+            "NewArrayClear must name GcArray<i64>"
+        );
+        assert!(
+            start.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayLen { array_type_id, .. }
+                    if array_type_id.as_deref() == Some(LIST_INT_ITEMS_ARRAY)
+            )),
+            "ArrayLen must name GcArray<i64>"
         );
     }
 }

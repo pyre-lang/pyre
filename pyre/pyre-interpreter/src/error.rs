@@ -4,7 +4,7 @@ use pyre_object::interp_exceptions::{
 };
 use ruff_text_size::Ranged;
 use rustpython_compiler::{ast, parser};
-use rustpython_wtf8::Wtf8Buf;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::collections::HashSet;
 use std::io::Write;
 
@@ -656,7 +656,7 @@ fn wtf8_from_message_str(ptr: pyre_object::gc_hook::GCREF) -> rustpython_wtf8::W
 /// and reloaded after: `shadowstack.py expand_pop_roots` writes the forwarded
 /// pointer back into the local.
 #[majit_macros::dont_look_inside]
-fn make_pyerror(
+pub fn make_pyerror(
     kind: PyErrorKind,
     message: DisplayMessage,
     exc_object: pyre_object::PyObjectRef,
@@ -3647,7 +3647,11 @@ fn exc_object_class_name(exc: PyObjectRef) -> Option<String> {
             return pyre_object::w_type_get_name(w_type).to_string();
         }
         let qualname = pyre_object::w_type_get_qualname(w_type).to_string();
-        let module = crate::baseobjspace::lookup_in_type(w_type, "__module__")
+        let mut w_type = w_type;
+        let w_module_name = pyre_object::with_roots!(w_type => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__module__"))
+        });
+        let module = crate::baseobjspace::lookup_in_type(w_type, w_module_name)
             .filter(|value| pyre_object::is_str(*value))
             .and_then(|value| {
                 crate::baseobjspace::str_utf8_w(value)

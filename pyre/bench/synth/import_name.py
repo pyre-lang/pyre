@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=205
+# pyre-check: trace-shape=main:absent=CallMayForceR
 N = 400000
 
 

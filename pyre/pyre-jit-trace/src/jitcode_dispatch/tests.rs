@@ -3405,8 +3405,7 @@ fn alloc_records_the_alloc_and_writes_the_ref_dst() {
 }
 
 /// Backend stub for the allocation-rooting tests: `bh_new*` hands back one
-/// caller-owned block so the handler observes a real, dereferenceable
-/// pointer (`new_with_vtable` writes `w_class` into it).
+/// caller-owned block so the recorded ref names real storage.
 struct AllocTestCpu {
     block: i64,
 }
@@ -3483,8 +3482,7 @@ impl majit_backend::Backend for AllocTestCpu {
 /// shadow, so pin it here rather than relying on a side list of executed
 /// allocations, which would duplicate a root the op graph already owns.
 fn alloc_result_is_stamped_onto_its_recorded_op(opname: &str, expected_opcode: OpCode) {
-    // Real backing storage: `new_with_vtable` writes `w_class` into the
-    // returned block, so a synthetic address would be a wild store.
+    // Real backing storage: the recorded ref names this allocation.
     let block: Box<[usize; 32]> = Box::new([0; 32]);
     let cpu = AllocTestCpu {
         block: block.as_ref().as_ptr() as i64,
@@ -5605,7 +5603,6 @@ fn float_binop_leaves_are_the_pypy_leaf() {
             !ops.iter().any(|op| op.starts_with("residual_call_irf")),
             "{path} must not residualize the payload; ops={ops:?}"
         );
-        eprintln!("{path} {} ops: {ops:?}", ops.len());
     }
 }
 
@@ -5830,7 +5827,10 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
         );
         eprintln!("{path} {} ops: {ops:?}", ops.len());
     }
-    // `space.newbool` is a singleton, not a boxed alloc.
+    // `space.newbool` is a singleton, not a boxed alloc: the result goes
+    // through the generated `w_bool_from` helper jitcode (one
+    // `inline_call_ir_r`, as in `float_cmp_leaves_are_the_pypy_leaf`), never
+    // `new_with_vtable`.
     let isclose = "pyre_interpreter::objspace::descroperation::_float_isclose";
     let jc = crate::jitcode_runtime::pathed_jitcode(isclose)
         .unwrap_or_else(|| panic!("{isclose} must be a discovered jitcode"));
@@ -5842,9 +5842,18 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
         "{isclose} must record the comparison; ops={ops:?}"
     );
     assert!(
-        !ops.iter()
-            .any(|op| *op == "new_with_vtable" || op.starts_with("residual_call")),
-        "{isclose} must neither box nor call out for its bool; ops={ops:?}"
+        !ops.iter().any(|op| *op == "new_with_vtable"),
+        "{isclose} must not box its bool; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .filter(|op| op.starts_with("inline_call"))
+            .all(|op| *op == "inline_call_ir_r"),
+        "{isclose} may inline_call only the newbool helper; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.starts_with("residual_call")),
+        "{isclose} must not residualize the comparison; ops={ops:?}"
     );
     eprintln!("{isclose} {} ops: {ops:?}", ops.len());
     // baseobjspace.py `newbool`: a branch on the value and one prebuilt

@@ -82,6 +82,11 @@ const WIDE_MAX_CHUNKS: usize = 8192;
 static NEXT_WIDE_ID: AtomicU32 = AtomicU32::new(1);
 static WIDE_CHUNKS: [AtomicPtr<Cell<WideStored>>; WIDE_MAX_CHUNKS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; WIDE_MAX_CHUNKS];
+/// Recycled `pack_stamp` ids (`history.py *FrontendOp` concrete slot).
+/// Operand `SmallWide` still holds a live id for the operand's lifetime;
+/// stamps release on `Op` drop, and a portal compile storm would otherwise
+/// exhaust the slab.
+static FREE_WIDE: parking_lot::Mutex<Vec<u32>> = parking_lot::Mutex::new(Vec::new());
 
 fn init_wide_chunk(chunk_i: usize) -> *mut Cell<WideStored> {
     let boxed: Box<[Cell<WideStored>]> = (0..WIDE_CHUNK)
@@ -138,9 +143,16 @@ pub(crate) fn fresh_wide(value: Value) -> u64 {
 }
 
 fn fresh_wide_stored(stored: WideStored) -> u64 {
-    let id = NEXT_WIDE_ID
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
+    let id = {
+        let mut free = FREE_WIDE.lock();
+        if let Some(id) = free.pop() {
+            id
+        } else {
+            NEXT_WIDE_ID
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .unwrap_or_else(|_| panic!("wide Const identity space exhausted"))
+        }
+    };
     wide_slot(id).set(stored);
     u64::from(id)
 }
@@ -149,6 +161,19 @@ fn fresh_wide_stored(stored: WideStored) -> u64 {
 #[doc(hidden)]
 pub fn wide_ids_minted() -> u32 {
     NEXT_WIDE_ID.load(Ordering::Relaxed)
+}
+
+pub(crate) fn release_wide(id: u32) {
+    if id == 0 {
+        return;
+    }
+    let slot = wide_slot(id);
+    debug_assert!(
+        !matches!(slot.get(), WideStored::Void),
+        "stamp wide id {id} released twice"
+    );
+    slot.set(WideStored::Void);
+    FREE_WIDE.lock().push(id);
 }
 
 pub(crate) fn wide_value(id: u64) -> Value {

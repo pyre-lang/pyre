@@ -1,4 +1,3 @@
-# pyre-check: spec-folds=load_bound_method_attr
 # pyre-check: trace-shape=warm_find:absent=CallMayForceR
 # The bound-method fold, 267 firings across the corpus and undeclared. The str
 # method calls below drive it 22 times, more than any other fixture.

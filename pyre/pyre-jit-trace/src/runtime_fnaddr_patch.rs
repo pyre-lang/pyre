@@ -168,7 +168,20 @@ fn runtime_static_addr_by_name(name: &str) -> Option<i64> {
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
-    RUNTIME_FNADDRS.get(path).copied()
+    if let Some(&addr) = RUNTIME_FNADDRS.get(path) {
+        return Some(addr);
+    }
+    generated_residual_shim_fnaddr(path)
+}
+
+fn generated_residual_shim_fnaddr(path: &str) -> Option<i64> {
+    static TABLE: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
+        crate::generated_residual_shims::GENERATED_RESIDUAL_SHIMS
+            .iter()
+            .map(|(name, addr)| (*name, addr.0 as usize as i64))
+            .collect()
+    });
+    TABLE.get(path).copied()
 }
 
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
@@ -1321,6 +1334,70 @@ mod tests {
         // The discriminant read the portal switch performs: one word at
         // offset 0 of the cell.
         assert_eq!(unsafe { *(addr as *const i64) }, 0);
+    }
+
+    #[test]
+    fn materialize_type_static_consts_overwrites_sentinel_with_live_int_type() {
+        use majit_jitcode::jitcode::TypeStaticConstDescriptor;
+
+        let jc = JitCode::new("test");
+        jc.set_body(JitCodeBody {
+            type_static_consts: vec![TypeStaticConstDescriptor {
+                constants_r_index: 0,
+                name: "pyobject::INT_TYPE".into(),
+            }],
+            constants_r: vec![
+                (majit_jitcode::codewriter::assembler::TYPE_STATIC_CONST_SENTINEL_BASE).into(),
+            ],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        materialize_type_static_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_eq!(
+            addr,
+            &pyre_object::INT_TYPE as *const _ as i64,
+            "sentinel must become the live INT_TYPE address"
+        );
+    }
+
+    #[test]
+    fn rebind_type_static_size_vtable_replaces_sentinel_with_live_int_type() {
+        use majit_jitcode::codewriter::assembler::type_static_const_sentinel;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let mut descr = BhDescr::Size {
+            size: 16,
+            type_id: 1,
+            vtable: type_static_const_sentinel(3) as u64,
+            owner: "pyobject::INT_TYPE".into(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
+        };
+        rebind_type_static_size_vtable(&mut descr);
+        let BhDescr::Size { vtable, owner, .. } = descr else {
+            panic!("size descr");
+        };
+        assert_eq!(vtable, &pyre_object::INT_TYPE as *const _ as u64);
+        assert!(
+            owner.is_empty(),
+            "the type-static name is only the wire key"
+        );
+
+        let mut concrete = BhDescr::Size {
+            size: 16,
+            type_id: 1,
+            vtable: 0x1000,
+            owner: "W_IntObject".into(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: true,
+        };
+        rebind_type_static_size_vtable(&mut concrete);
+        let BhDescr::Size { vtable, owner, .. } = concrete else {
+            panic!("size descr");
+        };
+        assert_eq!(vtable, 0x1000);
+        assert_eq!(owner, "W_IntObject");
     }
 
     #[test]
@@ -2635,6 +2712,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_fnaddr_by_path_resolves_generated_w_method_new_shim() {
+        assert!(
+            runtime_fnaddr_by_path("pyre_object::function::w_method_new").is_some(),
+            "w_method_new must resolve through a generated residual shim"
+        );
+    }
+
     /// A type static a traced body compares against (`is_int` reads
     /// `INT_USER_TYPE`) must reach the constant pool as its runtime address.
     /// One missing from `jit_static_pytype_addrs` stays a symbolic hash, and
@@ -2665,5 +2750,23 @@ mod tests {
             unbound.is_empty(),
             "type statics without a runtime address: {unbound:?}"
         );
+    }
+
+    #[test]
+    fn materialize_str_consts_unicode_object_slot_is_the_wrapper() {
+        let descs = vec![StrConstDescriptor {
+            constants_r_index: 0,
+            bytes: b"__add__".to_vec(),
+            precomputed_hash: 0,
+            as_unicode_object: true,
+        }];
+        let mut jcs = vec![jitcode_with_str_consts(descs)];
+        materialize_str_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        let wrapper =
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__add__"));
+        assert_eq!(addr, wrapper as i64);
+        let storage = unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) } as i64;
+        assert_ne!(addr, storage, "w_name is the wrapper, not the rstr payload");
     }
 }

@@ -99,6 +99,7 @@ pub(crate) static CONST_PTR_TABLE_TEST_LOCK: parking_lot::Mutex<()> = parking_lo
 
 pub mod blackhole;
 pub mod box_trace;
+pub use box_trace::{ExceptionTraceResidual, register_exception_trace_residual};
 pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
@@ -265,8 +266,8 @@ pub use pyjitpl::{
     record_inline_application_traceback_hook_address, residual_write_effect_info,
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
     resolve_symbolic_fnaddr_path, setup_frame_from_merge_point, trace_jitcode,
-    trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
-    trace_jitcode_with_args_and_runtime,
+    trace_jitcode_at_resume_framestack, trace_jitcode_at_resume_framestack_allowing_residuals,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, PendingRefArrayWrite, decode_fieldnum, default_bridge_array_descr,

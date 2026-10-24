@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=4.9
 # pyre-check: spec-folds=binary_op_descent,compare_op_descent
+# pyre-check: trace-shape=bool_arithmetic__main:present=GuardClass,present=GuardNoException
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they

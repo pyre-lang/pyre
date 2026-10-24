@@ -1210,6 +1210,24 @@ pub fn interned_str_from_typed_const(ptr: usize, kind: BoxStrConstKind) -> Optio
     }
 }
 
+/// Word-ABI intern for a UTF-8/WTF-8 name the residual call cannot pass
+/// as `&Wtf8` (`jit_fnaddr.rs` ResidualSlot: a fat pointer is two words).
+///
+/// `lookup_where_with_method_cache` boxes the dunder this way so the
+/// elidable MethodCache key is one register, matching the `w_name`
+/// contract on `_pure_lookup_where_with_method_cache`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn box_str_constant_jit_abi(ptr: i64, len: i64) -> i64 {
+    if ptr == 0 || len < 0 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    let Some(value) = Wtf8::from_bytes(bytes) else {
+        return 0;
+    };
+    box_str_constant(value) as i64
+}
+
 /// The `&str` view of a WTF-8 buffer already known to hold no lone
 /// surrogate.
 ///

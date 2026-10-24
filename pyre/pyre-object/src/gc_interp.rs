@@ -92,6 +92,18 @@ pub fn note_eval_activation_exit() {
     if depth <= 2 && EXPLICIT_OLDGEN_REQUEST.load(Ordering::Acquire) {
         majit_gc::collector::request_deferred_major_collection();
     }
+    // A nested Python eval just returned. Its frame is unrooted
+    // (`pyframe.py class PyFrame(W_Root)`). The dispatch-loop poll refuses
+    // while `EVAL_NESTING` is ≥ 3, so a recursive call never collects on
+    // its own bytecodes; arm `EB_GC` so the caller's next opcode — after
+    // CALL has finished — runs `do_collect_oldgen_nonmoving`.
+    if enabled()
+        && collect_enabled()
+        && crate::gc_hook::try_gc_isenabled()
+        && crate::gc_hook::try_gc_major_threshold_reached()
+    {
+        majit_gc::collector::request_deferred_major_collection();
+    }
 }
 
 impl EvalActivationGuard {
@@ -190,10 +202,11 @@ pub fn poll_due() -> bool {
 /// rollback switch for the born-old interpreter stepping stone. Reads the env
 /// once, then caches.
 ///
-/// Reads (and lazily initialises) the runtime `STATE` atomic; the value is not
-/// a build-time constant, so the JIT residualises the call instead of tracing
-/// into it (`@dont_look_inside`).
-#[majit_macros::dont_look_inside]
+/// Reads (and lazily initialises) the runtime `STATE` atomic. The env
+/// read is idempotent and cached, so `@elidable` (`rlib/jit.py`) can
+/// fold a traced result; `@dont_look_inside` would leave a residual
+/// `CallI` in every compiled loop.
+#[majit_macros::elidable_cannot_raise]
 pub fn enabled() -> bool {
     match STATE.load(Ordering::Relaxed) {
         1 => false,

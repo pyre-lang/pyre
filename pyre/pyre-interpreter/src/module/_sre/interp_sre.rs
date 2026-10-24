@@ -2518,7 +2518,7 @@ fn do_span(
 ) -> Result<(i64, i64), crate::PyError> {
     let groupnum: i64 = match w_arg {
         None => 0,
-        Some(w_arg) => {
+        Some(mut w_arg) => {
             // `match_getindex` — `PyIndex_Check(index)` gate: an operand whose
             // type defines `__index__` (any int subclass, or a duck-typed
             // integer) is the group number, and any error from that conversion
@@ -2526,7 +2526,10 @@ fn do_span(
             // treated as a group *name*, looked up in `srepat.w_groupindex`
             // (a miss → IndexError "no such group").
             let has_index = unsafe { pyre_object::pyobject::is_int_or_long(w_arg) }
-                || unsafe { crate::baseobjspace::lookup(w_arg, "__index__") }.is_some();
+                || pyre_object::with_roots!(w_arg => unsafe {
+                    crate::baseobjspace::lookup(w_arg, "__index__")
+                })
+                .is_some();
             if has_index {
                 crate::baseobjspace::getindex_w(w_arg)?
             } else {

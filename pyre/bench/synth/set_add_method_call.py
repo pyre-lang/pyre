@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=set_add_method
+# pyre-check: trace-shape=hot_add_subclass:present=GuardValue
 # `spec-folds` gates the arm directly: a residual produces the same result, so
 # output parity alone cannot tell whether the method-call substitution ran.
 #

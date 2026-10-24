@@ -791,6 +791,14 @@ fn publish_new_virtual(
     new_op
 }
 
+fn bridge_materialize_once(msg: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if crate::bridge_debug_enabled() && !ONCE.swap(true, Ordering::Relaxed) {
+        eprintln!("{msg}");
+    }
+}
+
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,
@@ -825,6 +833,25 @@ pub fn materialize_bridge_virtual(
     // resume.py:951 self.rd_virtuals[index] — direct indexing, IndexError on
     // an out-of-range virtual number is a bug, not a silent NONE fallback.
     let entry = &virtuals[vidx];
+    if vidx == 0 && crate::bridge_debug_enabled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            let kind = match entry.as_ref() {
+                majit_ir::RdVirtualInfo::VirtualInfo { .. } => "VirtualInfo",
+                majit_ir::RdVirtualInfo::VStructInfo { .. } => "VStructInfo",
+                majit_ir::RdVirtualInfo::VArrayInfoClear { .. } => "VArrayInfoClear",
+                majit_ir::RdVirtualInfo::VArrayInfoNotClear { .. } => "VArrayInfoNotClear",
+                majit_ir::RdVirtualInfo::VArrayStructInfo { .. } => "VArrayStructInfo",
+                majit_ir::RdVirtualInfo::VRawBufferInfo { .. } => "VRawBufferInfo",
+                _ => "other",
+            };
+            eprintln!(
+                "[bridgeB] virtual 0 is {kind} allocator={}",
+                cache.allocator().is_some()
+            );
+        }
+    }
 
     // resume.py VirtualInfo dispatch by virtual kind.
     // RPython: rd_virtuals[index].allocate(self, index) — polymorphic on
@@ -865,6 +892,9 @@ pub fn materialize_bridge_virtual(
                 // cannot, because that field is the heap the bridge resumes
                 // against.
                 if cache.allocator().is_some() {
+                    bridge_materialize_once(&format!(
+                        "[bridgeB] setfields undecoded field i={i} fnum={fnum}"
+                    ));
                     return false;
                 }
                 continue;
@@ -902,6 +932,10 @@ pub fn materialize_bridge_virtual(
             if let Some(allocator) = cache.allocator()
                 && !apply_setfield(ctx, cache, allocator, struct_op, value, fd_info)
             {
+                bridge_materialize_once(&format!(
+                    "[bridgeB] setfields apply failed i={i} offset={} ty={:?}",
+                    fd_info.offset, fd_info.field_type
+                ));
                 return false;
             }
             // Bridge virtual rematerialisation — `upd.setfield(valuebox)`
@@ -1301,6 +1335,7 @@ pub fn materialize_bridge_virtual(
             let buffer_addr = if let Some(allocator) = cache.allocator() {
                 let addr = allocator.allocate_raw_buffer(*func, *size);
                 if addr == 0 {
+                    bridge_materialize_once("[bridgeB] raw buffer alloc returned 0");
                     return OpRef::NONE;
                 }
                 ctx.set_opref_concrete(buffer, majit_ir::Value::Int(addr));
@@ -1350,6 +1385,9 @@ pub fn materialize_bridge_virtual(
                 );
                 if let (Some(allocator), Some(addr)) = (cache.allocator(), buffer_addr) {
                     let Some(value) = operand_concrete(ctx, cache, item) else {
+                        bridge_materialize_once(&format!(
+                            "[bridgeB] raw store item has no concrete i={i} fnum={fnum}"
+                        ));
                         return OpRef::NONE;
                     };
                     match (di.item_type, value) {
@@ -1358,6 +1396,10 @@ pub fn materialize_bridge_virtual(
                         }
                         (_, majit_ir::Value::Int(n)) => allocator.bh_raw_store_i(addr, off, n, di),
                         _ => {
+                            bridge_materialize_once(&format!(
+                                "[bridgeB] raw store bank mismatch i={i} ty={}",
+                                di.item_type
+                            ));
                             return OpRef::NONE;
                         }
                     }

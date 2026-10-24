@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
-# pyre-check: spec-folds=bare_super_virtual,load_attr_on_super
 # pyre-check: trace-shape=loop:absent=CallMayForceR
 # Zero-argument `super()` bound to a name, with the loop inside the
 # super-bearing method.

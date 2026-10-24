@@ -389,6 +389,20 @@ mod tests {
     }
 
     #[test]
+    fn str2charp_copies_through_address_memcopy() {
+        // `rstr.py copy_string_to_raw` / `copy_raw_to_string`: interior
+        // NULs stay. The Address conversion lives inside those residuals.
+        let src = b"addr\0copy";
+        let dst = str2charp(src, true);
+        assert_eq!(unsafe { charpsize2str(dst, src.len()) }, src);
+        unsafe { free_charp(dst, true) };
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll(src);
+        assert_eq!(flag, 0x06);
+        assert_eq!(unsafe { charpsize2str(buf, src.len()) }, src);
+        unsafe { free_nonmovingbuffer_ll(buf, llobj, flag) };
+    }
+
+    #[test]
     fn str2chararray_and_str2rawmem_copy_a_slice() {
         let (buf, gc, case) = alloc_buffer(8);
         assert_eq!(case, 2);

@@ -9790,6 +9790,13 @@ impl OptContext {
                 // this read for virtuals (virtualize.rs `is_w_class`); a
                 // non-virtual heap object's `__class__` read reaches here.
                 PtrInfo::instance(None, None)
+            } else if field_descr.get_parent_descr().is_none()
+                && field_descr.field_name().is_empty()
+            {
+                // A nameless placeholder FieldDescr (descr_index unset)
+                // has no SizeDescr parent. Treat it like the header read:
+                // arg0 is a non-null instance of unknown layout.
+                PtrInfo::instance(None, None)
             } else {
                 // optimizer.py:479-484: parent_descr.is_object() decides Instance vs Struct.
                 let parent_descr = field_descr.get_parent_descr().unwrap_or_else(|| {

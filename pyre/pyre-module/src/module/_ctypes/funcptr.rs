@@ -20,6 +20,7 @@ use super::callproc::{
 use super::cdata::{self, TypeCode};
 use super::stginfo::{self, ParamFunc};
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 
 use super::cfield;
 use super::ctypes_h;
@@ -908,11 +909,14 @@ fn restype_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
     if let Some(v) = pyre_object::with_roots!(obj => instance_get(obj, RESTYPE_KEY)) {
         return Ok(v);
     }
-    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    Ok(
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") }
-            .unwrap_or_else(pyre_object::w_none),
-    )
+    let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    Ok(pyre_object::with_roots!(obj, cls => unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_restype_")),
+        )
+    })
+    .unwrap_or_else(pyre_object::w_none))
 }
 
 fn restype_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -933,11 +937,14 @@ fn argtypes_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
     if let Some(v) = pyre_object::with_roots!(obj => instance_get(obj, ARGTYPES_KEY)) {
         return Ok(v);
     }
-    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    Ok(
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_argtypes_") }
-            .unwrap_or_else(pyre_object::w_none),
-    )
+    let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    Ok(pyre_object::with_roots!(obj, cls => unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_argtypes_")),
+        )
+    })
+    .unwrap_or_else(pyre_object::w_none))
 }
 
 fn argtypes_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -1036,8 +1043,13 @@ pub(super) enum Ret {
 
 pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, pyre_interpreter::PyError> {
     let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let rt = pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY))
-        .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") });
+    let mut obj = obj;
+    let rt = pyre_object::with_roots!(cls, obj => instance_get(obj, RESTYPE_KEY)).or_else(|| {
+        let w_restype_name = pyre_object::with_roots!(cls, obj => {
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_restype_"))
+        });
+        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, w_restype_name) }
+    });
     match rt {
         // CDLL functions default to c_int when no restype is set.
         None => Ok(Ret::Code(DEFAULT_RESTYPE_CODE)),
@@ -1052,7 +1064,7 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, pyre_interpreter:
                     _ => {}
                 }
             }
-            let tc = cdata::type_code_of(o)
+            let tc = pyre_object::with_roots!(o => cdata::type_code_of(o))
                 .ok_or_else(|| pyre_interpreter::PyError::type_error("invalid restype"))?;
             Ok(Ret::Code(tc))
         }
@@ -1062,14 +1074,22 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, pyre_interpreter:
 /// `restype._check_retval_` — the callable a return value passes through
 /// before the caller sees it.  `HRESULT` declares one so that a failed status
 /// raises `OSError` rather than being handed back as a negative number.
-fn resolve_checker(obj: PyObjectRef) -> Option<PyObjectRef> {
+fn resolve_checker(mut obj: PyObjectRef) -> Option<PyObjectRef> {
     let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let rt = pyre_object::with_roots!(cls => instance_get(obj, RESTYPE_KEY))
-        .or_else(|| unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_restype_") })?;
+    let mut rt =
+        pyre_object::with_roots!(cls, obj => instance_get(obj, RESTYPE_KEY)).or_else(|| {
+            let w_restype_name = pyre_object::with_roots!(cls, obj => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("_restype_"))
+            });
+            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, w_restype_name) }
+        })?;
     if !unsafe { pyre_object::is_type(rt) } {
         return None;
     }
-    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(rt, "_check_retval_") }
+    let w_check_name = pyre_object::with_roots!(cls, obj, rt => {
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new("_check_retval_"))
+    });
+    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(rt, w_check_name) }
 }
 
 /// `errcheck(result, self, arguments)` — the last word on what a call returns.
@@ -1165,8 +1185,13 @@ pub(super) fn resolve_argtypes(mut obj: PyObjectRef) -> Option<Vec<PyObjectRef>>
 
 /// The `_argtypes_` declared on type `cls` — what a constructor has to check
 /// paramflags against, the instance having none of its own yet.
-fn type_argtypes(cls: PyObjectRef) -> Option<Vec<PyObjectRef>> {
-    argtypes_seq(unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_argtypes_") }?)
+fn type_argtypes(mut cls: PyObjectRef) -> Option<Vec<PyObjectRef>> {
+    argtypes_seq(pyre_object::with_roots!(cls => unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_argtypes_")),
+        )
+    })?)
 }
 
 /// A settled `argtypes` value as a Vec; `None` means unset.
@@ -1198,7 +1223,10 @@ fn check_outarg_type(mut at: PyObjectRef, index: usize) -> Result<(), pyre_inter
     {
         return Ok(());
     }
-    if matches!(cdata::type_code_of(at).as_deref(), Some("P" | "z" | "Z")) {
+    if matches!(
+        pyre_object::with_roots!(at => cdata::type_code_of(at)).as_deref(),
+        Some("P" | "z" | "Z")
+    ) {
         return Ok(());
     }
     Err(pyre_interpreter::PyError::type_error(format!(
@@ -1292,9 +1320,14 @@ fn seq_to_vec(obj: PyObjectRef) -> Option<Vec<PyObjectRef>> {
     }
 }
 
-pub(super) fn funcptr_flags(obj: PyObjectRef) -> i64 {
-    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_flags_") } {
+pub(super) fn funcptr_flags(mut obj: PyObjectRef) -> i64 {
+    let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    match pyre_object::with_roots!(obj, cls => unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_flags_")),
+        )
+    }) {
         Some(o) if unsafe { pyre_object::is_int(o) } => unsafe { pyre_object::w_int_get_value(o) },
         _ => 0,
     }
@@ -1995,9 +2028,11 @@ fn cfuncptr_call_from(
                         argtypes.len()
                     )));
                 }
-                let kind = classify_argtype(at).ok_or_else(|| {
-                    pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
-                })?;
+                let mut at = at;
+                let kind =
+                    pyre_object::with_roots!(at => classify_argtype(at)).ok_or_else(|| {
+                        pyre_interpreter::PyError::type_error("argtype has no valid '_type_'")
+                    })?;
                 kinds.push(kind);
                 owned.push(marshal_typed_arg(
                     pyre_object::gc_roots::shadow_stack_get(call_args_base + i),
@@ -2637,7 +2672,9 @@ fn argument_address(mut obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyE
                 cdata::cdata_bytes(obj).unwrap_or(&[]),
             ));
         }
-        if cdata::type_code_of(cls).is_some_and(|tc| cdata::is_pointer_code(&tc)) {
+        if pyre_object::with_roots!(cls, obj => cdata::type_code_of(cls))
+            .is_some_and(|tc| cdata::is_pointer_code(&tc))
+        {
             return Ok(cfield::read_pointer_from_buffer(
                 cdata::cdata_bytes(obj).unwrap_or(&[]),
             ));
@@ -2659,24 +2696,26 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
             "cast() argument 2 must be a pointer type",
         ));
     }
-    let target = args[2];
+    let mut target = args[2];
     // `_ctypes.c cast_check_pointertype`: a pointer type, a function-pointer
     // type, or a simple type whose code is one of the pointer-shaped ones.
+    let mut src = args[0];
+    let mut extra = args[1];
     let is_pointer = stginfo::stginfo_of(target)
         .is_some_and(|i| stginfo::stginfo_paramfunc(i) == ParamFunc::Pointer)
-        || is_funcptr_type(target)
-        || cdata::type_code_of(target)
+        || pyre_object::with_roots!(src, extra, target => is_funcptr_type(target))
+        || pyre_object::with_roots!(src, extra, target => cdata::type_code_of(target))
             .is_some_and(|tc| matches!(tc.as_str(), "s" | "P" | "z" | "U" | "Z" | "X" | "O"));
     if !is_pointer {
         return Err(pyre_interpreter::PyError::type_error(
             "cast() argument 2 must be a pointer type",
         ));
     }
-    // The address read and the instance allocation both move.  The whole
-    // argument slice is pinned once; the source, the type, and the kept
-    // object are read from those slots afterwards.
+    // The address read and the instance allocation both move.  The copied
+    // arguments are pinned; the source, the type, and the kept object are
+    // read from those slots afterwards.
     let _roots = pyre_object::gc_roots::push_roots();
-    let args_base = pyre_object::gc_roots::pin_roots(args);
+    let args_base = pyre_object::gc_roots::pin_roots(&[src, extra, target]);
     let address = argument_address(pyre_object::gc_roots::shadow_stack_get(args_base))?;
     let result = pyre_interpreter::call::type_call_instantiate(
         pyre_object::gc_roots::shadow_stack_get(args_base + 2),
@@ -3069,7 +3108,7 @@ pub(super) enum ArgKind {
 /// The three questions a marshalled argument asks — pointer? aggregate? which
 /// code? — all read the same `StgInfo` and the same `_type_`, so they are
 /// asked together and the reads happen once.
-pub(super) fn classify_argtype(at: PyObjectRef) -> Option<ArgKind> {
+pub(super) fn classify_argtype(mut at: PyObjectRef) -> Option<ArgKind> {
     let info = stginfo::stginfo_of(at);
     let paramfunc = info.map_or(ParamFunc::Other, stginfo::stginfo_paramfunc);
     if info.is_some_and(|i| stginfo::stginfo_flags(i) & stginfo::TYPEFLAG_ISPOINTER != 0)
@@ -3077,7 +3116,7 @@ pub(super) fn classify_argtype(at: PyObjectRef) -> Option<ArgKind> {
     {
         return Some(ArgKind::Pointer);
     }
-    let code = cdata::type_code_of(at);
+    let code = pyre_object::with_roots!(at => cdata::type_code_of(at));
     if code.is_some_and(|c| cdata::is_pointer_code(&c)) || is_funcptr_type(at) {
         return Some(ArgKind::Pointer);
     }
@@ -3094,11 +3133,17 @@ pub(super) fn argtype_is_pointer_kind(at: PyObjectRef) -> bool {
 }
 
 /// Whether `t` is a concrete foreign-function type (`CFUNCTYPE`/`WINFUNCTYPE`).
-pub(super) fn is_funcptr_type(t: PyObjectRef) -> bool {
+pub(super) fn is_funcptr_type(mut t: PyObjectRef) -> bool {
     !t.is_null()
         && unsafe { pyre_object::is_type(t) }
         && !std::ptr::eq(t, cfuncptr_type())
-        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(t, "_flags_") }.is_some()
+        && pyre_object::with_roots!(t => unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                t,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("_flags_")),
+            )
+        })
+        .is_some()
 }
 
 fn is_funcptr_instance(obj: PyObjectRef) -> bool {
@@ -3277,10 +3322,10 @@ fn marshal_typed_arg(
 /// through and converts anything else, so a mismatched cdata cannot be
 /// reinterpreted through the wrong argtype.
 fn marshal_simple_arg(
-    arg: PyObjectRef,
+    mut arg: PyObjectRef,
     tc: TypeCode,
 ) -> Result<OwnedArg, pyre_interpreter::PyError> {
-    if let Some(bytes) = cdata::same_type_bytes(&tc, arg) {
+    if let Some(bytes) = pyre_object::with_roots!(arg => cdata::same_type_bytes(&tc, arg)) {
         return Ok(OwnedArg::Typed(tc, bytes));
     }
     let buf = cdata::encode_value(&tc, arg)?;
@@ -3289,7 +3334,7 @@ fn marshal_simple_arg(
 
 /// Marshal one argument with no explicit `argtype` (ConvParam defaults).
 fn marshal_default_arg(
-    arg: PyObjectRef,
+    mut arg: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
 ) -> Result<OwnedArg, pyre_interpreter::PyError> {
     // `byref()` carrier → the address it wraps.
@@ -3301,10 +3346,11 @@ fn marshal_default_arg(
     }
     // A scalar cdata is passed by value.
     if cdata::is_simplecdata_instance(arg) {
-        let cls = unsafe { pyre_object::w_instance_get_type(arg) };
-        let tc = cdata::type_code_of(cls).ok_or_else(|| {
-            pyre_interpreter::PyError::type_error("argument type has no '_type_'")
-        })?;
+        let mut cls = unsafe { pyre_object::w_instance_get_type(arg) };
+        let tc =
+            pyre_object::with_roots!(arg, cls => cdata::type_code_of(cls)).ok_or_else(|| {
+                pyre_interpreter::PyError::type_error("argument type has no '_type_'")
+            })?;
         let buf = cdata::cdata_bytes(arg).unwrap_or(&[]).to_vec();
         return Ok(OwnedArg::Typed(tc, buf));
     }

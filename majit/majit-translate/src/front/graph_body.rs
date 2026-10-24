@@ -13,6 +13,7 @@
 //! That requires the LLBC set to stay alive past the whole-program build,
 //! which is what a [`GraphBodyProvider`] owns.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -70,6 +71,10 @@ struct ProviderTables {
     /// Where every crate logs a declaration whose body did not lower; the
     /// pipeline reports it once the bodies it builds are built.
     skipped: mir::LoweringSkips,
+    /// Linked artefacts, in the order they were declared. A spec request
+    /// queued from an opaque local-crate call looks up the FunDecl that
+    /// actually has an `Unstructured` body here (`instance_leaf`).
+    crates: RefCell<Vec<Rc<ProvidedCrate>>>,
 }
 
 /// One lowered crate: its artefact and the lowering state its decls were
@@ -137,6 +142,7 @@ impl GraphBodyProvider {
             func_hints,
             declarations,
             skipped,
+            crates: RefCell::new(Vec::new()),
         };
         Self {
             crates: Vec::new(),
@@ -183,6 +189,7 @@ impl GraphBodyProvider {
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
+        self.tables.crates.borrow_mut().push(krate.clone());
         self.crates.push(krate);
         program
     }
@@ -220,6 +227,7 @@ impl GraphBodyProvider {
             &mut program.enum_variant_by_discriminant,
             Some(&program.struct_ids),
         );
+        self.tables.crates.borrow_mut().push(krate.clone());
         self.crates.push(krate);
         program
     }
@@ -354,7 +362,22 @@ impl ProvidedCrate {
     /// in queue order.
     fn declare_queued_specs(self: &Rc<Self>, tables: &Rc<ProviderTables>) {
         while let Some(req) = self.lowering(tables, |lowering| lowering.pop_spec()) {
-            if let Some(spec) = self.declare_spec(tables, req) {
+            if let Some(spec) = self.declare_spec(tables, req.clone()) {
+                tables.declarations.push(spec);
+                continue;
+            }
+            // Opaque local-crate call: this artefact has no body.
+            // `instance_leaf` / `FunctionDesc.cachedgraph` still name the
+            // copy the owning crate extracted.
+            let Some((owner, fn_id)) = tables.crate_with_fun_body(&req.fn_path) else {
+                continue;
+            };
+            if Rc::ptr_eq(&owner, self) {
+                continue;
+            }
+            let req =
+                crate::front::clause_spec::remap_spec_request(req, &self.llbc, &owner.llbc, fn_id);
+            if let Some(spec) = owner.declare_spec(tables, req) {
                 tables.declarations.push(spec);
             }
         }
@@ -483,6 +506,28 @@ fn declaration(
 }
 
 impl ProviderTables {
+    /// The artefact that extracted an `Unstructured` body for `name_path`.
+    /// `None` when no crate has one, or two do (`source_for_name_path`).
+    fn crate_with_fun_body(&self, name_path: &str) -> Option<(Rc<ProvidedCrate>, u64)> {
+        let crates = self.crates.borrow();
+        let mut found = None;
+        for krate in crates.iter() {
+            for fd in krate.llbc.iter_local_fns() {
+                if fd.item_meta.name_path() != name_path {
+                    continue;
+                }
+                if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((krate.clone(), fd.def_id));
+            }
+        }
+        found
+    }
+
     /// Run `f` with the borrowed [`crate::HostStaticAddrs`] view of the
     /// owned tables.
     fn with_static_addrs<R>(&self, f: impl FnOnce(crate::HostStaticAddrs<'_>) -> R) -> R {

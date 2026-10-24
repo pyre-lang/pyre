@@ -1012,8 +1012,8 @@ fn try_commit_midbody_abort_inner(
             crate::state::frame_array_write_barrier(cf_addr as *mut u8, arr_ptr);
             outer.last_instr = words.call_py_pc as isize;
             outer.valuestackdepth = outer_stack_base + below_now.len();
-            let mut next_instr = words.call_py_pc;
-            if pyre_interpreter::eval::handle_exception(outer, &mut operr, &mut next_instr) {
+            let next_instr = pyre_interpreter::eval::handle_exception(outer, &mut operr);
+            if next_instr >= 0 {
                 outer.last_instr = next_instr as isize - 1;
             } else {
                 WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = Some(operr));
@@ -1156,11 +1156,18 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // `setup_call` port and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
+    // Portal traces record `eval_loop_jit_portal` on every resume section.
+    // FBW `init_symbolic` then attaches the runtime per-CodeObject jitcode.
+    // Those are different numbering spaces; walking one body's pc against
+    // the other is how `select_recipe_entry` later yields NoCalleeEntry.
+    // Decline to the blackhole instead of panicking — the orthodox resume
+    // is `rebuild_from_resumedata` + `MetaInterp::interpret`, not FBW.
     if let Some(ref carrier) = carrier {
-        debug_assert_eq!(
-            unsafe { (*sym.jitcode()).index as i32 },
-            carrier.root_jitcode_index
-        );
+        let attached = unsafe { (*sym.jitcode()).index as i32 };
+        if attached != carrier.root_jitcode_index {
+            crate::jitcode_dispatch::census_record("P2Drain::PortalVsPerfnJitcode");
+            return (majit_metainterp::TraceAction::Abort, concrete_frame, false);
+        }
     }
     // Issue #215 item 2: drive the multiframe bridge-carrier resume via the
     // full-body walker (reconstruct the in-flight callee framestack + walk

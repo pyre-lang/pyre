@@ -39,16 +39,18 @@ fn inplace_dunder_name(op: BinaryOperator) -> Option<&'static str> {
 /// A sequence *subclass* that defines its own `__imul__` is exempt — that
 /// override is a real numeric slot and runs whatever the multiplier is, so
 /// `x = LI([1]); x *= "s"` is `LI.__imul__`, not the multiplier TypeError.
-fn skips_inplace_special(a: PyObjectRef, b: PyObjectRef, op: BinaryOperator) -> bool {
+fn skips_inplace_special(mut a: PyObjectRef, mut b: PyObjectRef, op: BinaryOperator) -> bool {
     matches!(op, BinaryOperator::InplaceMultiply)
         && unsafe { crate::objspace::descroperation::is_repeat_sequence(a) }
         && !unsafe {
-            crate::objspace::descroperation::seq_repeat_override(
+            pyre_object::with_roots!(a, b => crate::objspace::descroperation::seq_repeat_override(
                 a,
                 crate::objspace::descroperation::RepeatDunder::IMul,
-            )
+            ))
         }
-        && unsafe { crate::baseobjspace::lookup(b, "__index__").is_none() }
+        && unsafe {
+            pyre_object::with_roots!(a, b => crate::baseobjspace::lookup(b, "__index__")).is_none()
+        }
 }
 
 pub fn binary_value(
@@ -65,7 +67,7 @@ pub fn binary_value(
     // walk of this handler stops at that residual.  The chain evaluates the
     // guard only in the `Some` arm, exactly as `filter` did.
     if let Some(idunder) = inplace_dunder_name(op)
-        && !skips_inplace_special(a, b, op)
+        && !pyre_object::with_roots!(a, b => skips_inplace_special(a, b, op))
     {
         // `seq_bug_compat` applies only to `+=` / `*=`; pass the reflected
         // name so the builtin-sequence rhs-first branch can fire.
@@ -90,6 +92,32 @@ pub fn binary_value(
     // passes its own spelling — `&` for `a & b`, `&=` for `a &= b`.
     let symbol = operator_symbol(op);
     use crate::objspace::descroperation as desc;
+    let dunder = match op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => Some(desc::BinopDunder::Add),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => Some(desc::BinopDunder::Sub),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => Some(desc::BinopDunder::Mul),
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
+            Some(desc::BinopDunder::FloorDiv)
+        }
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+            Some(desc::BinopDunder::Mod)
+        }
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
+            Some(desc::BinopDunder::TrueDiv)
+        }
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => Some(desc::BinopDunder::LShift),
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => Some(desc::BinopDunder::RShift),
+        BinaryOperator::And | BinaryOperator::InplaceAnd => Some(desc::BinopDunder::And),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => Some(desc::BinopDunder::Or),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => Some(desc::BinopDunder::Xor),
+        _ => None,
+    };
+    if let Some(dunder) = dunder
+        && let Some(w_res) =
+            pyre_object::with_roots!(a, b => desc::try_binop_shortcut(a, b, dunder))?
+    {
+        return Ok(w_res);
+    }
     match op {
         BinaryOperator::Add | BinaryOperator::InplaceAdd => desc::add_impl(a, b, symbol),
         BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => desc::sub_impl(a, b, symbol),
@@ -104,10 +132,6 @@ pub fn binary_value(
             desc::truediv_impl(a, b, symbol)
         }
         BinaryOperator::Power => pow(a, b),
-        // PyPy `pyopcode.py:INPLACE_POWER` calls `space.inplace_pow`
-        // directly; unlike the generated `inplace_impl` family this operation
-        // has its own three-argument-aware dispatch in descroperation.py,
-        // and with it its own `**=` fallback.
         BinaryOperator::InplacePower => desc::inplace_pow(a, b),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => desc::lshift_impl(a, b, symbol),
         BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => {
@@ -115,8 +139,6 @@ pub fn binary_value(
         }
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => desc::rshift_impl(a, b, symbol),
         BinaryOperator::And | BinaryOperator::InplaceAnd => desc::and_impl(a, b, symbol),
-        // mappingproxy `__ior__` (read-only) raises TypeError, handled
-        // above by `try_inplace_special`; both fall through to `or_`.
         BinaryOperator::Or | BinaryOperator::InplaceOr => desc::or_impl(a, b, symbol),
         BinaryOperator::Xor | BinaryOperator::InplaceXor => desc::xor_impl(a, b, symbol),
         BinaryOperator::Subscr => getitem(a, b),
@@ -361,10 +383,7 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
             );
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&items);
-            let live: Vec<PyObjectRef> = (0..items.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
-                .collect();
-            return Ok(pyre_object::w_tuple_new(live));
+            return Ok(w_tuple_from_shadow(base, items.len()));
         }
     }
     Err(PyError::type_error("expected list for list_to_tuple"))
@@ -493,10 +512,7 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
         value_count += 1;
     }
     Ok(if all_match {
-        let values: Vec<PyObjectRef> = (0..value_count)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(values_base + i))
-            .collect();
-        pyre_object::w_tuple_new(values)
+        w_tuple_from_shadow(values_base, value_count)
     } else {
         pyre_object::w_none()
     })
@@ -655,8 +671,22 @@ pub fn match_class_value(
         }
     }
 
-    let values: Vec<PyObjectRef> = extracted.iter().map(|&slot| roots.get(slot)).collect();
-    Ok(pyre_object::w_tuple_new(values))
+    let packed = pyre_object::gc_roots::shadow_stack_len();
+    for &slot in &extracted {
+        let _ = pyre_object::gc_roots::pin_root(roots.get(slot));
+    }
+    Ok(w_tuple_from_shadow(packed, extracted.len()))
+}
+
+/// A traced `Vec<PyObjectRef>` is the raw header word. Building that `Vec`
+/// in the caller leaves the argument in the ref bank, so the tuple is
+/// assembled here from shadow-stack slots the caller already holds.
+#[majit_macros::dont_look_inside]
+fn w_tuple_from_shadow(base: usize, count: usize) -> PyObjectRef {
+    let values: Vec<PyObjectRef> = (0..count)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+        .collect();
+    pyre_object::w_tuple_new(values)
 }
 
 pub fn truth_value(value: PyObjectRef) -> Result<bool, PyError> {
@@ -755,20 +785,29 @@ pub fn newlist_from_iter_hint(last_val: PyObjectRef) -> Result<PyObjectRef, PyEr
 /// `bh_list_extend_fn`.  Mirrors `list.extend`: fast paths for list/tuple
 /// sources, generic iterator-protocol fallback otherwise (which surfaces
 /// "Value after * must be an iterable, not <T>" when not iterable).
-pub fn list_extend_value(list: PyObjectRef, mut iterable: PyObjectRef) -> Result<(), PyError> {
+pub fn list_extend_value(mut list: PyObjectRef, mut iterable: PyObjectRef) -> Result<(), PyError> {
     // pyopcode.py LIST_EXTEND calls the target list's `extend` method.  The
     // builtin body preserves exact-list/tuple storage fast paths while list
     // and tuple subclasses go through `iter()` so an overridden `__iter__`
     // is observed.
-    match pyre_object::with_roots!(iterable => crate::type_methods::list_method_extend(&[list, iterable]))
+    match pyre_object::with_roots!(list, iterable => crate::type_methods::list_method_extend(&[list, iterable]))
     {
         Ok(_) => Ok(()),
-        Err(error) if crate::baseobjspace::is_iterable(iterable) => Err(error),
-        Err(_) => {
-            let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
-            Err(PyError::type_error(format!(
-                "Value after * must be an iterable, not {type_name}"
-            )))
+        Err(mut error) => {
+            let roots = pyre_object::gc_roots::push_roots();
+            let err_slot = error.pin(&roots);
+            let ok = pyre_object::with_roots!(list, iterable => {
+                crate::baseobjspace::is_iterable(iterable)
+            });
+            error.reload(&roots, err_slot);
+            if ok {
+                Err(error)
+            } else {
+                let type_name = crate::baseobjspace::object_functionstr_type_name(iterable);
+                Err(PyError::type_error(format!(
+                    "Value after * must be an iterable, not {type_name}"
+                )))
+            }
         }
     }
 }
@@ -1692,6 +1731,7 @@ mod tests {
 
     #[test]
     fn test_binary_value_reuses_objspace_dispatch() {
+        crate::test_hooks::install_hash_hook();
         let result = binary_value(w_int_new(8), w_int_new(3), BinaryOperator::Subtract)
             .expect("binary dispatch should succeed");
         unsafe {

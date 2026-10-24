@@ -46,6 +46,9 @@ residual_scalar!(
 /// `OpArg` is `#[repr(transparent)] struct OpArg(u32)` — one word.
 impl ResidualSlot for rustpython_compiler_core::bytecode::OpArg {}
 
+/// `LoadAttr` is `#[repr(transparent)] struct LoadAttr(u32)` — one word.
+impl ResidualSlot for rustpython_compiler_core::bytecode::oparg::LoadAttr {}
+
 /// `Arg<T>` is the zero-sized oparg marker (`struct Arg<T>(PhantomData<T>)`).
 /// It consumes no slot at all rather than one: a zero-sized parameter is not
 /// passed in the Rust ABI, and the codewriter classifies it `Type::Void`,
@@ -66,6 +69,7 @@ impl ResidualSlot for crate::objspace::descroperation::BinopDunder {}
 impl ResidualSlot for crate::objspace::descroperation::UnaryDunder {}
 impl ResidualSlot for crate::objspace::descroperation::SeqBase {}
 impl ResidualSlot for crate::objspace::descroperation::RepeatDunder {}
+impl ResidualSlot for crate::eval::ContextSource {}
 
 impl<T> ResidualSlot for &T {}
 impl<T> ResidualSlot for &mut T {}
@@ -287,6 +291,10 @@ extern "C" fn bh_load_attr_name_idx(oparg: i64) -> i64 {
     )
 }
 
+fn load_attr_is_method_word(attr: rustpython_compiler_core::bytecode::oparg::LoadAttr) -> i64 {
+    i64::from(attr.is_method())
+}
+
 // `descr.py CallDescr.create_call_stub` constructs FuncType(ARGS, RESULT),
 // calls that typed function and only then casts its result to Signed. These
 // source-registry entries need the same stub: the override probes return bool,
@@ -341,6 +349,13 @@ override_enum_arg!(
     crate::objspace::descroperation::RepeatDunder,
     MulPair,
     IMul
+);
+#[cfg(target_arch = "wasm32")]
+override_enum_arg!(
+    context_source_arg,
+    crate::eval::ContextSource,
+    GeneratorChain,
+    ResumedFrameOnly
 );
 
 macro_rules! override_call_stub {
@@ -517,6 +532,16 @@ pub mod word_publish {
             unsafe { std::mem::transmute::<Self, u32>(self) as i64 }
         }
     }
+    impl WordAbi for rustpython_compiler_core::bytecode::oparg::LoadAttr {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            Self::from_u32(reg as u32)
+        }
+        fn into_reg(self) -> i64 {
+            self.as_u32() as i64
+        }
+    }
     impl<T: rustpython_compiler_core::bytecode::OpArgType> WordAbi
         for rustpython_compiler_core::bytecode::Arg<T>
     {
@@ -562,6 +587,16 @@ pub mod word_publish {
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
             super::repeat_dunder_arg(reg)
+        }
+        fn into_reg(self) -> i64 {
+            self as i64
+        }
+    }
+    impl WordAbi for crate::eval::ContextSource {
+        type Reg = i64;
+        const IS_WORD: bool = false;
+        fn from_reg(reg: i64) -> Self {
+            super::context_source_arg(reg)
         }
         fn into_reg(self) -> i64 {
             self as i64
@@ -1240,6 +1275,11 @@ macro_rules! p3 {
 macro_rules! pa3 {
     ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
         publish_pa3($e, $m, $r, $f, $f);
+    };
+}
+macro_rules! up3 {
+    ($e:expr, $p:expr, $f:path $(,)?) => {
+        publish_up3($e, $p, |a0, a1, a2| unsafe { $f(a0, a1, a2) }, $f);
     };
 }
 macro_rules! upa3 {
@@ -1931,11 +1971,131 @@ fn jit_trace_fnaddr_tables() -> &'static (Vec<(&'static str, i64)>, Vec<i64>) {
     TABLES.get_or_init(build_jit_trace_fnaddrs)
 }
 
+/// Runtime word of `lltype.cast_ptr_to_int`: the residual carries a GCREF.
+fn residual_cast_ptr_to_int(ptr: *const u8) -> i64 {
+    ptr as i64
+}
+
+/// Runtime word of `lltype.cast_int_to_ptr`: the residual returns a GCREF.
+fn residual_cast_int_to_ptr(value: i64) -> *const u8 {
+    value as *const u8
+}
+
+/// Word-ABI wrapper for `classify_callable`: Result lowering already
+/// advertises `(r) -> i`, so the residual/inline call must return the
+/// `CallableKind` discriminant and publish `PyError` on `BH_LAST_EXC_VALUE`.
+fn jit_classify_callable(callable: pyre_object::PyObjectRef) -> i64 {
+    match crate::runtime_ops::classify_callable(callable) {
+        Ok(crate::runtime_ops::CallableKind::Builtin) => 0,
+        Ok(crate::runtime_ops::CallableKind::User) => 1,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
+/// `pyopcode.py _load_global_failed` raises. The residual ABI cannot return
+/// `PyError` by value; publish the exception object and answer the void-word.
+fn jit_load_global_failed(w_varname: pyre_object::PyObjectRef) -> i64 {
+    crate::runtime_ops::jit_publish_residual_error(crate::eval::load_global_failed(w_varname))
+}
+
+/// `getitem_list` is `(r, r) -> r` once `PyResult` is erased.
+unsafe fn jit_getitem_list(
+    obj: pyre_object::PyObjectRef,
+    index: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    match crate::baseobjspace::getitem_list(obj, index) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::runtime_ops::jit_publish_residual_error(error);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// `setitem_list` is `(r, r, r) -> r` once `PyResult` is erased. The
+/// list fast path returns `w_none`; an error is `BH_LAST_EXC_VALUE`.
+unsafe fn jit_setitem_list(
+    obj: pyre_object::PyObjectRef,
+    index: pyre_object::PyObjectRef,
+    value: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    match crate::baseobjspace::setitem_list(obj, index, value) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::runtime_ops::jit_publish_residual_error(error);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// `getitem_tuple` is the same `(r, r) -> r` erasure as `getitem_list`.
+unsafe fn jit_getitem_tuple(
+    obj: pyre_object::PyObjectRef,
+    index: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    match crate::baseobjspace::getitem_tuple(obj, index) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::runtime_ops::jit_publish_residual_error(error);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
+/// `rbuilder.py` `StringBuilder` default `init_size=100`, STR item size 1.
+fn jit_stringbuilder_new() -> i64 {
+    pyre_object::rbuilder::rbuilder_runtime::ll_new(100, 1)
+}
+
 /// [`jit_trace_fnaddrs`] and the [`is_abi_unsound_argument_residual`] set,
 /// which the publication sites fill in one pass.
 fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     let mut entries = Vec::new();
     let mut abi_unsound_arguments = Vec::new();
+
+    // `is_method` is the other `LoadAttr` bit. A raw `-> bool` leaves the
+    // upper result bits unspecified; widen like `bh_w_type_issubtype`.
+    p1!(
+        &mut entries,
+        "bytecode::oparg::LoadAttr::is_method",
+        load_attr_is_method_word,
+    );
+    p1!(
+        &mut entries,
+        "pyre_interpreter::runtime_ops::classify_callable",
+        jit_classify_callable,
+    );
+    p1!(
+        &mut entries,
+        "pyre_interpreter::eval::load_global_failed",
+        jit_load_global_failed,
+    );
+    up2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::getitem_list",
+        jit_getitem_list,
+    );
+    up2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::getitem_tuple",
+        jit_getitem_tuple,
+    );
+    up3!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::setitem_list",
+        jit_setitem_list,
+    );
+    p0!(
+        &mut entries,
+        "__majit_stringbuilder_new",
+        jit_stringbuilder_new,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_object::gc_hook::try_gc_current_object_address",
+        "pyre_object::try_gc_current_object_address",
+        pyre_object::gc_hook::try_gc_current_object_address,
+    );
 
     // `code_pc_is_loop_header` is interpreter bytecode analysis, outside the
     // LLBC module set. `majit-translate` declares it through its annotator-only
@@ -2399,12 +2559,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // The bracket's close, which a lowered `Drop` of the guard calls with the
     // guard itself: one word in, nothing out, and the truncate above behind
     // it.  A crate that carries no declaration of the guard's fields cannot
-    // spell the close as those two reads, so it names this instead.
-    pa1!(
+    // spell the close as those two reads, so it names this instead.  The
+    // jitcode passes the guard's value, not its address (`front::mir` aliases
+    // `&guard` to the guard's own Variable), so the close is bound to the
+    // word bridge, as is every other `RootScope` residual below.
+    cpa1!(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        pyre_object::gc_roots::root_scope_close_jit_abi,
+    );
+    cpa0!(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots_jit_abi,
     );
     cpa2!(
         &mut entries,
@@ -2530,48 +2699,113 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::copy_object_slice_range_into_vec",
         pyre_object::gc_roots::copy_object_slice_range_into_vec_jit_abi,
     );
+    // `box_str_constant(&Wtf8)` is two words; the MethodCache key is the
+    // interned str the word-ABI intern returns.
+    cpa2!(
+        &mut entries,
+        "pyre_object::unicodeobject::box_str_constant_jit_abi",
+        "pyre_object::box_str_constant_jit_abi",
+        pyre_object::unicodeobject::box_str_constant_jit_abi,
+    );
     // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
     // `roots.get(slot)`: the same pin through the cached cell, and its
     // read-back half.  The codewriter names an inherent method by its
     // crate-stripped path, so that spelling is the alias.
-    pa2!(
+    cpa2!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_root",
         "gc_roots::RootScope::pin_root",
-        pyre_object::gc_roots::RootScope::pin_root,
+        pyre_object::gc_roots::root_scope_pin_root_jit_abi,
     );
-    pa2!(
+    cpa2!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::get",
         "gc_roots::RootScope::get",
-        pyre_object::gc_roots::RootScope::get,
+        pyre_object::gc_roots::root_scope_get_jit_abi,
     );
-    // The rest of the scope-local API a bracket body calls on its guard: the
-    // slice-taking pair through the one-word array ABI `publish_roots` uses,
-    // and the run normalize and slot write, whose arguments are words.
-    cpa2!(
+    cpa1!(
         &mut entries,
-        "pyre_object::gc_roots::RootScope::publish",
-        "gc_roots::RootScope::publish",
-        pyre_object::gc_roots::RootScope::publish_jit_abi,
+        "pyre_object::gc_roots::RootScope::base",
+        "gc_roots::RootScope::base",
+        pyre_object::gc_roots::root_scope_base_jit_abi,
     );
-    cpa2!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::pin_roots",
-        "gc_roots::RootScope::pin_roots",
-        pyre_object::gc_roots::RootScope::pin_roots_jit_abi,
-    );
-    pa3!(
-        &mut entries,
-        "pyre_object::gc_roots::RootScope::normalize",
-        "gc_roots::RootScope::normalize",
-        pyre_object::gc_roots::RootScope::normalize,
-    );
-    pa3!(
+    cpa3!(
         &mut entries,
         "pyre_object::gc_roots::RootScope::set",
         "gc_roots::RootScope::set",
-        pyre_object::gc_roots::RootScope::set,
+        pyre_object::gc_roots::root_scope_set_jit_abi,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::normalize",
+        "gc_roots::RootScope::normalize",
+        pyre_object::gc_roots::root_scope_normalize_jit_abi,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::normalize_moved",
+        "gc_roots::RootScope::normalize_moved",
+        pyre_object::gc_roots::root_scope_normalize_moved_jit_abi,
+    );
+    // The run normalize and slot write take word arguments. The slice-taking
+    // `publish` / `pin_roots` bridges are the `(save_point, ptr, len)` pair
+    // registered below.
+    cpa3!(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::publish",
+        "gc_roots::RootScope::publish",
+        pyre_object::gc_roots::root_scope_publish_jit_abi,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::pin_roots",
+        "gc_roots::RootScope::pin_roots",
+        pyre_object::gc_roots::root_scope_pin_roots_jit_abi,
+    );
+    pa2!(
+        &mut entries,
+        "pyre_object::gc_roots::publish_one_at",
+        "gc_roots::publish_one_at",
+        pyre_object::gc_roots::publish_one_at,
+    );
+    cpa1!(
+        &mut entries,
+        "gc_roots::RootScope::drop_in_place",
+        "pyre_object::gc_roots::RootScope::drop_in_place",
+        pyre_object::gc_roots::root_scope_drop_in_place_jit_abi,
+    );
+    // The list lock bracket (`rthread.py` `Lock.acquire` / `release`): the
+    // `ListGuard` is its lock word, which the jitcode's drop of the guard
+    // hands to `w_list_lock_release`.
+    upa1!(
+        &mut entries,
+        "pyre_object::listobject::w_list_lock_release",
+        "pyre_object::w_list_lock_release",
+        pyre_object::listobject::w_list_lock_release,
+    );
+    upa4!(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w",
+        "pyre_object::w_dict_setitem_str_hashed_w",
+        pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w,
+    );
+    upa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w",
+        "pyre_object::w_dict_getitem_str_hashed_w",
+        pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w,
+    );
+    pa2!(
+        &mut entries,
+        "pyre_object::gc_roots::get_at",
+        "gc_roots::get_at",
+        pyre_object::gc_roots::get_at,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_object::gc_roots::normalize_at",
+        "gc_roots::normalize_at",
+        pyre_object::gc_roots::normalize_at,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
@@ -2590,13 +2824,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_str_from_codepoint",
         pyre_object::unicodeobject::w_str_from_codepoint,
     );
-    cpa1!(
+    cpa2!(
         &mut entries,
         "pyre_interpreter::runtime_ops::build_tuple_from_refs",
         "pyre_interpreter::build_tuple_from_refs",
         crate::runtime_ops::build_tuple_from_refs_jit_abi,
     );
-    cpa1!(
+    cpa2!(
         &mut entries,
         "pyre_interpreter::runtime_ops::build_list_from_refs",
         "pyre_interpreter::build_list_from_refs",
@@ -2676,6 +2910,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_hook::try_gc_remove_root",
         "pyre_object::try_gc_remove_root",
         pyre_object::gc_hook::try_gc_remove_root,
+    );
+    // `FrameLocalsRoot::new` is look-inside; these word-ABI helpers keep
+    // `addr_of_mut!(locals_cells_stack_w)` out of compiled GCREF slots.
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::pyframe::unregister_frame_locals_slot",
+        "pyframe::unregister_frame_locals_slot",
+        crate::pyframe::unregister_frame_locals_slot,
     );
     // #346: direct allocation roots residualised via `#[dont_look_inside]`;
     // each binds both the qualified module path and the glob-re-exported root
@@ -2917,6 +3159,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_version_tag",
         crate::baseobjspace::__majit_call_target__orig__pure_version_tag_unlikely_name,
     );
+    // typeobject.py `self._version_tag` — the Acquire reader inside
+    // `_pure_version_tag`'s `@elidable_promote` original.  Unregistered it
+    // is a symbolic hash and interpret aborts before the MethodCache.
+    upa1!(
+        &mut entries,
+        "pyre_object::typeobject::w_type_get_version_tag",
+        "pyre_object::w_type_get_version_tag",
+        pyre_object::typeobject::w_type_get_version_tag,
+    );
     cpa3!(
         &mut entries,
         "pyre_interpreter::baseobjspace::_pure_lookup_where_with_method_cache",
@@ -2928,6 +3179,23 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::_pure_lookup_class_with_method_cache",
         "pyre_interpreter::_pure_lookup_class_with_method_cache",
         crate::baseobjspace::__majit_call_target__pure_lookup_class_with_method_cache,
+    );
+    // `compute_hash(name)` inside the method-cache probe: the jitcode passes
+    // the `&Wtf8` as the str object it came from.
+    cpa1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::name_content_hash",
+        "pyre_interpreter::name_content_hash",
+        crate::baseobjspace::name_content_hash_jit_abi,
+    );
+    // `celldict.py _getdictvalue_no_unwrapping_pure` over the interned key:
+    // the elidable module-dict probe LOAD_GLOBAL / LOAD_NAME reach through
+    // `getitem_str_w`.
+    cpa3!(
+        &mut entries,
+        "pyre_object::celldict::_getdictvalue_no_unwrapping_pure_w",
+        "pyre_object::_getdictvalue_no_unwrapping_pure_w",
+        pyre_object::celldict::__majit_call_target__getdictvalue_no_unwrapping_pure_w,
     );
     // `W_Super.getattribute` walks the MRO itself and reads each class's own
     // namespace, so it needs the single-type elidable rather than the
@@ -3344,14 +3612,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_portal_call_3",
         crate::importing::jit_portal_call_3,
     );
-    // `getdictvalue` mapdict arm: already `#[dont_look_inside]`, but
-    // unpublished so the `_initializing` read was a symbolic residual.
-    push_abi_unsound_argument_alias_pair(
+    // `getdictvalue` mapdict arm. The raw fn returns
+    // `Result<Option<PyObjectRef>, PyError>` through sret and takes `&Wtf8`
+    // as two words. The residual call is the one-word-result trampoline
+    // (`dont_look_inside` + `BH_LAST_EXC_VALUE`), same as the other
+    // `__majit_call_target_*` registrations.
+    cpa2!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked",
         "pyre_interpreter::instance_node_getdictvalue_checked",
-        crate::objspace::std::mapdict::instance_node_getdictvalue_checked as *const (),
+        crate::objspace::std::mapdict::__majit_call_target_instance_node_getdictvalue_checked,
     );
     // The same shape over four more runtime-mutable cells:
     // `_io::unsupported_operation_type` reads the `UNSUPPORTED_OPERATION_TYPE`
@@ -3573,10 +3843,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_compiler_bigint_to_rbigint",
         crate::jit_compiler_bigint_to_rbigint,
     );
-    // PyPy's getconstant_w is a pre-wrapped list read. Pyre's compiler stores
-    // ConstantData, so the first read realizes and atomically publishes that
-    // wrapped object. Keep this temporary compiler-boundary machinery opaque
-    // to source translation; all later reads return the same co_consts_w slot.
+    // `pyopcode.py getconstant_w` is look-inside. The address remains so a
+    // declined look-inside still has a real fnaddr instead of a symbolic hash.
     up2!(
         &mut entries,
         "pyre_interpreter::pycode::w_code_const",
@@ -3590,9 +3858,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::w_code_lookup_exceptiontable",
         crate::pycode::w_code_lookup_exceptiontable_jit_abi,
     );
-    // `named_key_hash` residualizes `w_code_getname_w` (`dont_look_inside`).
-    // Without this row the codewriter mints a symbolic path hash and
-    // `interpret()` aborts the first LOAD_NAME / LOAD_GLOBAL walk.
+    // `pyopcode.py getname_w` is the `co_names_w[index]` load. The address
+    // remains so a declined look-inside still has a real fnaddr.
     up2!(
         &mut entries,
         "pyre_interpreter::pycode::w_code_getname_w",
@@ -3611,6 +3878,30 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "bytecode::oparg::LoadAttr::name_idx",
         bh_load_attr_name_idx,
+    );
+    // `rtype_cast_ptr_to_int` / `rtype_cast_int_to_ptr` emit the
+    // `cast_ptr_to_int` / `cast_int_to_ptr` opcodes when the typer sees
+    // them. A residual call still names the RPython helper path; without
+    // these rows interpret panics on the symbolic hash.
+    p1!(
+        &mut entries,
+        "rpython::rtyper::lltypesystem::lltype::cast_ptr_to_int",
+        residual_cast_ptr_to_int,
+    );
+    p1!(
+        &mut entries,
+        "rpython::rtyper::lltypesystem::lltype::cast_int_to_ptr",
+        residual_cast_int_to_ptr,
+    );
+    p1!(
+        &mut entries,
+        "rtyper::lltypesystem::lltype::cast_ptr_to_int",
+        residual_cast_ptr_to_int,
+    );
+    p1!(
+        &mut entries,
+        "rtyper::lltypesystem::lltype::cast_int_to_ptr",
+        residual_cast_int_to_ptr,
     );
     // `compare` residualizes its `compare_slot` tail: the slot body reads two
     // `&[u8]` through `core::slice::cmp`, which has no LLBC, so the source lift
@@ -3744,6 +4035,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     cp2!(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
+        crate::objspace::descroperation::jit_bigint_mul,
+    );
+    // The MIR front residualizes the source `bigint_mul` path; the word-ABI
+    // payload is the same `jit_bigint_mul` already published above.
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::bigint_mul",
         crate::objspace::descroperation::jit_bigint_mul,
     );
     cp2!(
@@ -3921,6 +4219,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::intobject::w_small_int_const",
         "pyre_object::w_small_int_const",
         pyre_object::intobject::jit_w_small_int_const,
+    );
+    upa3!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::call_descr_obj_arg",
+        "pyre_interpreter::objspace::descroperation::call_descr_obj_arg",
+        crate::objspace::descroperation::call_descr_obj_arg,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::obj_has_binop_shortcut",
+        "pyre_interpreter::objspace::descroperation::obj_has_binop_shortcut",
+        crate::objspace::descroperation::obj_has_binop_shortcut,
     );
     cpa1!(
         &mut entries,
@@ -4679,6 +4989,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // leaf — the crate-root alias leaf must stay un-prefixed (strips to
     // `["ll_append_res0"]`) to satisfy both the leaf-name gate and the
     // `function_fnaddrs.contains_key` lookup; the real symbols carry `jit_`.
+    // `jit_ll_build` is the 1-arg residual of `__majit_stringbuilder_build`
+    // (`jtransform` retargets the marker onto `["jit_ll_build"]`, matching
+    // this crate-root alias). The runtime `ll_build` FunDecl stays `(i64, usize)`.
+    cpa1!(
+        &mut entries,
+        "pyre_object::rbuilder::jit_ll_build",
+        "pyre_object::jit_ll_build",
+        pyre_object::rbuilder::rbuilder_runtime::jit_ll_build,
+    );
     cpa2!(
         &mut entries,
         "pyre_object::rbuilder::ll_append_res0",
@@ -5082,6 +5401,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::eval::FrameAnchor::live",
         crate::eval::frame_anchor_live_method_jit_abi,
     );
+    cpa1!(
+        &mut entries,
+        "eval::FrameAnchor::drop_in_place",
+        "pyre_interpreter::eval::FrameAnchor::drop_in_place",
+        crate::eval::frame_anchor_drop_in_place_jit_abi,
+    );
+    cpa1!(
+        &mut entries,
+        "eval::FrameAnchor::drop",
+        "pyre_interpreter::eval::FrameAnchor::drop",
+        crate::eval::frame_anchor_drop_jit_abi,
+    );
     cp1!(
         &mut entries,
         "pyre_interpreter::eval::frame_anchor_push",
@@ -5437,6 +5768,88 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pyopcode::code_instructions_len",
         "pyre_interpreter::code_instructions_len",
         crate::pyopcode::code_instructions_len,
+    );
+    // Elidable `w_code_get_ptr` is a residual CALL, not an inlined getfield.
+    // Bind it so interpret can execute the call during the walk.
+    upa1!(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_get_ptr",
+        "pyre_interpreter::w_code_get_ptr",
+        crate::pycode::w_code_get_ptr,
+    );
+    // Portal residual-calls these (no extracted jitcode). i64 return is
+    // one word so interpret can take the handler pc and enter `except`.
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::eval::handle_exception",
+        "pyre_interpreter::handle_exception",
+        crate::eval::handle_exception,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::eval::dispatch_exception_handler",
+        "pyre_interpreter::dispatch_exception_handler",
+        crate::eval::dispatch_exception_handler,
+    );
+    pa1!(
+        &mut entries,
+        "pyre_interpreter::eval::is_valid_check_exc_match_class",
+        "pyre_interpreter::is_valid_check_exc_match_class",
+        crate::eval::is_valid_check_exc_match_class,
+    );
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::eval::check_exc_match_against",
+        "pyre_interpreter::check_exc_match_against",
+        crate::eval::check_exc_match_against,
+    );
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::exception_match",
+        "pyre_interpreter::exception_match",
+        crate::baseobjspace::exception_match,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::exception_is_valid_class_w",
+        "pyre_interpreter::exception_is_valid_class_w",
+        crate::baseobjspace::exception_is_valid_class_w,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::call::call_type_one_arg",
+        "pyre_interpreter::call_type_one_arg",
+        crate::call::call_type_one_arg,
+    );
+    cpa2!(
+        &mut entries,
+        "pyre_interpreter::call::call_zero_arg_in_frame",
+        "pyre_interpreter::call_zero_arg_in_frame",
+        crate::call::call_zero_arg_in_frame,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_interpreter::call::call_one_arg_in_frame",
+        "pyre_interpreter::call_one_arg_in_frame",
+        crate::call::call_one_arg_in_frame,
+    );
+    upa3!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::get_and_call_function0",
+        "pyre_interpreter::get_and_call_function0",
+        crate::baseobjspace::get_and_call_function0,
+    );
+    cpa1!(
+        &mut entries,
+        "pyre_interpreter::eval::raise_prepared_exc",
+        "pyre_interpreter::raise_prepared_exc",
+        crate::eval::raise_prepared_exc,
+    );
+    pa3!(
+        &mut entries,
+        "pyre_interpreter::eval::handle_exception_with_context",
+        "pyre_interpreter::handle_exception_with_context",
+        crate::eval::handle_exception_with_context,
     );
 
     cpa2!(
@@ -6566,6 +6979,17 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             .into_iter()
             .filter(|(_, addr)| !hand_written.contains(addr)),
     );
+    // Fold in `#[prebuilt_static]` class singletons. The macro publishes the
+    // fully-qualified static path. Dedup is on the address, same rule as the
+    // `#[pyre_class]` fold-in, so a hand-written or `#[pyre_class]` row for
+    // the same singleton wins.
+    let present: std::collections::HashSet<i64> = rows.iter().map(|&(_, addr)| addr).collect();
+    majit_ir::helper_fnaddr::for_each_prebuilt_class_static(|desc| {
+        let addr = desc.get() as i64;
+        if !present.contains(&addr) {
+            rows.push((desc.path, addr));
+        }
+    });
     rows
 }
 
@@ -7064,6 +7488,21 @@ mod tests {
         );
     }
 
+    /// Two macro helpers sharing one leaf name under different modules.
+    mod ambiguous_leaf_a {
+        #[majit_macros::dont_look_inside]
+        pub fn ambiguous_leaf_fixture(x: i64) -> i64 {
+            x + 1
+        }
+    }
+
+    mod ambiguous_leaf_b {
+        #[majit_macros::dont_look_inside]
+        pub fn ambiguous_leaf_fixture(x: i64) -> i64 {
+            x + 2
+        }
+    }
+
     #[test]
     fn jit_trace_fnaddrs_publishes_list_lock_at_the_calldescr_word_abi() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
@@ -7088,16 +7527,22 @@ mod tests {
     #[test]
     fn merge_macro_helper_fnaddrs_omits_ambiguous_crate_leaf_alias() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        assert_eq!(ambiguous_leaf_a::ambiguous_leaf_fixture(0), 1);
+        assert_eq!(ambiguous_leaf_b::ambiguous_leaf_fixture(0), 2);
         assert!(
-            bindings.contains_key("pyre_interpreter::call::register_frame_locals_slot"),
-            "call::register_frame_locals_slot must be registered"
+            bindings.contains_key(
+                "pyre_interpreter::jit_fnaddr::tests::ambiguous_leaf_a::ambiguous_leaf_fixture"
+            ),
+            "ambiguous_leaf_a::ambiguous_leaf_fixture must be registered"
         );
         assert!(
-            bindings.contains_key("pyre_interpreter::pyframe::register_frame_locals_slot"),
-            "pyframe::register_frame_locals_slot must be registered"
+            bindings.contains_key(
+                "pyre_interpreter::jit_fnaddr::tests::ambiguous_leaf_b::ambiguous_leaf_fixture"
+            ),
+            "ambiguous_leaf_b::ambiguous_leaf_fixture must be registered"
         );
         assert!(
-            !bindings.contains_key("pyre_interpreter::register_frame_locals_slot"),
+            !bindings.contains_key("pyre_interpreter::ambiguous_leaf_fixture"),
             "short alias shared by two full paths must not be emitted"
         );
     }
@@ -7476,6 +7921,22 @@ mod tests {
         std::borrow::Cow::Owned(format!("{parent}::{name}"))
     }
 
+    /// `look_inside_iff` publishes both `<name>` and `<name>_trampoline`
+    /// on the residual wrapper (`rlib/jit.py` `trampoline.__name__ =
+    /// func.__name__ + "_trampoline"`). Same parent, same item.
+    fn look_inside_iff_trampoline_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+        let Some((parent, leaf)) = path.rsplit_once("::") else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        let Some(name) = leaf.strip_suffix("_trampoline") else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        if name.is_empty() {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        std::borrow::Cow::Owned(format!("{parent}::{name}"))
+    }
+
     /// Crate-root glob re-exports in `lib.rs`: a top-level `pub use <module>::*;`
     /// after trimming whitespace and dropping comments. `gateway::{...}` and
     /// `majit_rlib::…` are not globs of a first-level module.
@@ -7544,6 +8005,8 @@ mod tests {
     fn are_alias_spellings(a: &str, b: &str) -> bool {
         let a_norm = elidable_body_spelling(a);
         let b_norm = elidable_body_spelling(b);
+        let a_norm = look_inside_iff_trampoline_spelling(a_norm.as_ref());
+        let b_norm = look_inside_iff_trampoline_spelling(b_norm.as_ref());
         let a = a_norm.as_ref();
         let b = b_norm.as_ref();
         if let (Some((crate_a, sym_a)), Some((crate_b, sym_b))) =
@@ -7699,6 +8162,20 @@ mod tests {
             "pyre_interpreter::_pure_version_tag",
             "pyre_interpreter::baseobjspace::_orig__pure_version_tag_unlikely_name",
         ));
+        // `look_inside_iff` publishes `<name>` and `<name>_trampoline` on
+        // the residual wrapper (`rlib/jit.py` `trampoline.__name__`).
+        assert!(are_alias_spellings(
+            "pyre_interpreter::_pow_mod",
+            "pyre_interpreter::_pow_mod_trampoline",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_interpreter::_pow_mod",
+            "pyre_interpreter::objspace::descroperation::_pow_mod_trampoline",
+        ));
+        assert!(!are_alias_spellings(
+            "pyre_interpreter::_pow_mod_trampoline",
+            "pyre_interpreter::_pow_nomod_trampoline",
+        ));
         assert!(!are_alias_spellings(
             "pyre_interpreter::baseobjspace::_orig_should_not_inline_unlikely_name",
             "pyre_interpreter::baseobjspace::_pure_version_tag",
@@ -7817,6 +8294,111 @@ mod tests {
         assert_eq!(
             bindings["function::METHOD_WRAPPER_TYPE"],
             &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64
+        );
+    }
+
+    #[test]
+    fn jit_static_pytype_addrs_covers_frame_type() {
+        let expected = &crate::pyframe::FRAME_TYPE as *const _ as i64;
+        assert!(
+            jit_static_pytype_addrs()
+                .into_iter()
+                .any(|(_, addr)| addr == expected),
+            "FRAME_TYPE must be published as a prebuilt class singleton"
+        );
+    }
+
+    #[test]
+    fn helper_fnaddrs_cover_fieldless_enum_residuals() {
+        let mut compare_slot = false;
+        let mut call_mode = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::objspace::descroperation::compare_slot_rest"
+                && row.arity == 3
+            {
+                compare_slot = true;
+            }
+            if row.path == "pyre_interpreter::call::call_non_function_callable_with_mode"
+                && row.arity == 5
+            {
+                call_mode = true;
+            }
+        });
+        assert!(
+            compare_slot,
+            "compare_slot_rest must be registered at arity 3"
+        );
+        assert!(
+            call_mode,
+            "call_non_function_callable_with_mode must be registered at arity 5"
+        );
+    }
+
+    /// Mapdict residuals whose `&Wtf8` name is one `Ref` word publish a
+    /// trampoline at the signature's arity. `instance_node_getdictvalue`
+    /// returns `Option<PyObjectRef>`, one nullable Ref word, and is registered
+    /// at arity 2. The `bool`-returning setter is registered at arity 3.
+    #[test]
+    fn helper_fnaddrs_cover_mapdict_wtf8_residuals() {
+        let mut setdict = false;
+        let mut getdict = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::objspace::std::mapdict::instance_node_setdictvalue"
+                && row.arity == 3
+            {
+                setdict = true;
+            }
+            if row.path == "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue"
+                && row.arity == 2
+            {
+                getdict = true;
+            }
+        });
+        assert!(
+            setdict,
+            "instance_node_setdictvalue must be registered at arity 3"
+        );
+        assert!(
+            getdict,
+            "instance_node_getdictvalue must be registered at arity 2"
+        );
+    }
+
+    /// A `PyResult`-returning residual with a slice argument (`&[PyObjectRef]`,
+    /// one Ref word) and one with only word arguments both publish a trampoline.
+    #[test]
+    fn helper_fnaddrs_cover_pyresult_residuals() {
+        let mut getattr_miss = false;
+        let mut builtin_call = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::baseobjspace::object_getattr_miss" && row.arity == 4 {
+                getattr_miss = true;
+            }
+            if row.path == "pyre_interpreter::gateway::builtin_code_call" && row.arity == 2 {
+                builtin_call = true;
+            }
+        });
+        assert!(
+            getattr_miss,
+            "object_getattr_miss must be registered at arity 4"
+        );
+        assert!(
+            builtin_call,
+            "builtin_code_call must be registered at arity 2"
+        );
+    }
+
+    #[test]
+    fn helper_fnaddrs_cover_sys_exc_info_code() {
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == "pyre_interpreter::function::SYS_EXC_INFO_CODE" && row.arity == 0 {
+                found = true;
+            }
+        });
+        assert!(
+            found,
+            "SYS_EXC_INFO_CODE getter must be registered at arity 0"
         );
     }
 
@@ -8016,6 +8598,74 @@ mod tests {
             "these wrapper descriptors cannot join the BuiltinCode.func PBC \
              family, so they get no jitcode: {stray:?}",
         );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_dict_setitem_str_hashed_w() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::dictmultiobject::w_dict_setitem_str_hashed_w"],
+            expected,
+        );
+        let drop_expected =
+            pyre_object::gc_roots::root_scope_drop_in_place_jit_abi as *const () as usize as i64;
+        assert_eq!(
+            bindings["gc_roots::RootScope::drop_in_place"],
+            drop_expected,
+        );
+        // Every `RootScope` residual takes the guard as its one word.
+        let word_bridges: [(&str, *const ()); 5] = [
+            (
+                "pyre_object::gc_roots::push_roots",
+                pyre_object::gc_roots::push_roots_jit_abi as *const (),
+            ),
+            (
+                "pyre_object::gc_roots::root_scope_close",
+                pyre_object::gc_roots::root_scope_close_jit_abi as *const (),
+            ),
+            (
+                "gc_roots::RootScope::pin_root",
+                pyre_object::gc_roots::root_scope_pin_root_jit_abi as *const (),
+            ),
+            (
+                "gc_roots::RootScope::get",
+                pyre_object::gc_roots::root_scope_get_jit_abi as *const (),
+            ),
+            (
+                "gc_roots::RootScope::base",
+                pyre_object::gc_roots::root_scope_base_jit_abi as *const (),
+            ),
+        ];
+        for (path, bridge) in word_bridges {
+            assert_eq!(bindings[path], bridge as usize as i64, "{path}");
+        }
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_dict_getitem_str_hashed_w() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected =
+            pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::dictmultiobject::w_dict_getitem_str_hashed_w"],
+            expected,
+        );
+        assert_eq!(
+            bindings["pyre_object::w_dict_getitem_str_hashed_w"],
+            expected
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_root_scope_publish_one() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = pyre_object::gc_roots::publish_one_at as *const () as usize as i64;
+        assert_eq!(bindings["pyre_object::gc_roots::publish_one_at"], expected,);
+        assert_eq!(bindings["gc_roots::publish_one_at"], expected);
+        let normalize = pyre_object::gc_roots::normalize_at as *const () as usize as i64;
+        assert_eq!(bindings["pyre_object::gc_roots::normalize_at"], normalize);
     }
 
     #[test]

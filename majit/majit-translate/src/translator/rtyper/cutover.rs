@@ -6795,13 +6795,12 @@ mod tests {
                 crate::model::SpaceOperation {
                     result: Some(v_fn.clone()),
                     kind: crate::model::OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath {
-                            segments: vec![
-                                crate::model::FN_CONST_HEAD.into(),
-                                "dummy_compute".into(),
-                            ],
-                            fun_decl_id: None,
-                        },
+                        // Dummy fn-const: no FunDecl, so
+                        // `call_site_generic_rust_args` has no types to stamp.
+                        target: crate::model::CallTarget::function_path([
+                            crate::model::FN_CONST_HEAD,
+                            "dummy_compute",
+                        ]),
                         args: vec![],
                         result_ty: ValueType::Int,
                     },
@@ -6809,14 +6808,13 @@ mod tests {
                 crate::model::SpaceOperation {
                     result: Some(v_out.clone()),
                     kind: crate::model::OpKind::Call {
-                        target: crate::model::CallTarget::FunctionPath {
-                            segments: vec![
-                                "majit_rlib".into(),
-                                "jit".into(),
-                                "conditional_call_elidable1".into(),
-                            ],
-                            fun_decl_id: None,
-                        },
+                        // HOST_ENV builtin: not a generic Rust item.
+                        // `attach_call_generic_instance` needs a FunDecl.
+                        target: crate::model::CallTarget::function_path([
+                            "majit_rlib",
+                            "jit",
+                            "conditional_call_elidable1",
+                        ]),
                         args: crate::model::call_args(vec![
                             v_value.clone(),
                             v_fn.clone(),
@@ -7077,10 +7075,7 @@ mod tests {
             crate::model::SpaceOperation {
                 result: None,
                 kind: crate::model::OpKind::Call {
-                    target: crate::model::CallTarget::FunctionPath {
-                        segments: vec!["no_such".into(), "callee".into()],
-                        fun_decl_id: None,
-                    },
+                    target: crate::model::CallTarget::function_path(["no_such", "callee"]),
                     args: Vec::new(),
                     result_ty: ValueType::Void,
                 },
@@ -8591,6 +8586,7 @@ mod tests {
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["ordinary_scalar_call".to_string()],
                 fun_decl_id: None,
+                generic_rust_args: Vec::new(),
             },
             ValueType::Int,
         );
@@ -9307,6 +9303,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["side_effect".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![base.clone(), index.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -9604,6 +9601,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["consume".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![pay.clone()]),
                     result_ty: ValueType::Int,
@@ -9682,6 +9680,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["consume_carrier".into()],
                     fun_decl_id: None,
+                    generic_rust_args: Vec::new(),
                 },
                 args: crate::model::call_args(vec![consumed_carrier.clone()]),
                 result_ty: ValueType::Void,
@@ -9953,6 +9952,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["consume".into()],
                             fun_decl_id: None,
+                            generic_rust_args: Vec::new(),
                         },
                         args: crate::model::call_args(vec![threaded.clone()]),
                         result_ty: ValueType::Int,
@@ -10795,6 +10795,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
                     result_ty: ValueType::Int,
@@ -11026,6 +11027,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: callee_segments.iter().map(|s| s.to_string()).collect(),
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Ref(None),
@@ -11206,6 +11208,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![v1_var.clone(), v2_var.clone()]),
                     result_ty: ValueType::Unknown,
@@ -11254,6 +11257,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        generic_rust_args: Vec::new(),
                     },
                     args: crate::model::call_args(vec![foo_v10_var.clone(), foo_v11_var.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -11893,8 +11897,8 @@ mod tests {
         };
         assert_eq!(
             vec.item_kind(),
-            Some(majit_ir::rvec::VecItemKind::Ref),
-            "Vec<*mut u8> items are managed references"
+            Some(majit_ir::rvec::VecItemKind::Int),
+            "Vec<*mut u8> items are CCHARP / Address words (`history.py` getkind of a primitive pointer is int)"
         );
     }
 

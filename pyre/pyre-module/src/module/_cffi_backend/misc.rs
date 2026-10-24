@@ -8,6 +8,7 @@
 
 use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
+use rustpython_wtf8::Wtf8;
 use std::ffi::{c_char, c_double, c_int};
 
 // `misc.py`'s `long double` shims.  Every one of them is C because Rust has
@@ -517,7 +518,7 @@ fn bigint_mask_u64(w_int: PyObjectRef) -> u64 {
 }
 
 /// `misc.py object_as_bool` — an `int`, a `float`, or a cdata holding one.
-pub fn object_as_bool(w_ob: PyObjectRef) -> Result<bool, PyError> {
+pub fn object_as_bool(mut w_ob: PyObjectRef) -> Result<bool, PyError> {
     if let Some(value) = standard_object_as_bool(w_ob) {
         return Ok(value);
     }
@@ -538,9 +539,15 @@ pub fn object_as_bool(w_ob: PyObjectRef) -> Result<bool, PyError> {
     // `space.lookup(w_ob, '__float__')` — the class's slot, not the
     // instance's, so a cdata never takes the float branch.
     let has_float = !is_cdata
-        && pyre_interpreter::typedef::r#type(w_ob).is_some_and(|w_type| unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type_where(w_type.as_ptr(), "__float__")
-                .is_some()
+        && pyre_interpreter::typedef::r#type(w_ob).is_some_and(|w_type| {
+            let mut w_type = w_type.as_ptr();
+            pyre_object::with_roots!(w_ob, w_type => unsafe {
+                pyre_interpreter::baseobjspace::lookup_in_type_where(
+                    w_type,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__float__")),
+                )
+            })
+            .is_some()
         });
     let w_io = if has_float {
         pyre_object::w_float_new(pyre_interpreter::baseobjspace::float_w(w_ob)?)

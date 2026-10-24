@@ -3,10 +3,17 @@
 
 mod common;
 
-use common::{INTERPRETER_LLBC, MODULE_LLBC, load_llbc, lower_named_with_static_addrs};
+use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
-use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind};
+use majit_translate::codewriter::jtransform::{GraphTransformConfig, transform_graph};
+use majit_translate::front::mir::{
+    LowerContext, erased_root_bracket_guards, function_touches_root_stack,
+    link_transparent_scalar_types, lower_fun_decl_with_static_addrs,
+    lower_function_with_static_addrs, pin_roots_published_locals, shadow_stack_erase_status,
+};
+use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
 use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
+use std::sync::{Mutex, MutexGuard};
 
 /// Load `pyre-interpreter.ullbc` once and share it across every test.
 ///
@@ -31,11 +38,16 @@ const ERROR_CARRIER: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
     from_exc_object: Some(("PyError", "from_exc_object")),
 };
 
-fn lower_function(
-    llbc: &'static Llbc,
+fn interp_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lower_function_unlocked(
+    llbc: &Llbc,
     function_name: &str,
 ) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
-    lower_named_with_static_addrs(
+    lower_function_with_static_addrs(
         llbc,
         function_name,
         HostStaticAddrs {
@@ -45,6 +57,14 @@ fn lower_function(
     )
 }
 
+fn lower_function(
+    llbc: &Llbc,
+    function_name: &str,
+) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
+    let _guard = interp_lock();
+    lower_function_unlocked(llbc, function_name)
+}
+
 /// [`lower_function`], then the codewriter's conversion of the carrier's
 /// exception edges into the runtime exception value
 /// (`codewriter::error_carrier_edges`): the raise paths the JitCode holds.
@@ -52,7 +72,8 @@ fn lower_function_to_runtime_edges(
     llbc: &'static Llbc,
     function_name: &str,
 ) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
-    let mut graph = lower_function(llbc, function_name)?;
+    let _guard = interp_lock();
+    let mut graph = lower_function_unlocked(llbc, function_name)?;
     majit_translate::codewriter::error_carrier_edges::lower_error_carrier_edges(
         &mut graph,
         &majit_translate::OwnedErrorCarrierSpec::own(ERROR_CARRIER),
@@ -61,11 +82,65 @@ fn lower_function_to_runtime_edges(
 }
 
 fn interp() -> &'static Llbc {
-    load_llbc(INTERPRETER_LLBC)
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    static LINK: std::sync::Once = std::sync::Once::new();
+    LINK.call_once(|| {
+        if std::path::Path::new(OBJECT_LLBC).is_file() {
+            let object = load_llbc(OBJECT_LLBC);
+            link_transparent_scalar_types(&[llbc, object]);
+        }
+    });
+    llbc
+}
+
+/// `Llbc::set_root_stack_effects` writes the shared OnceLock artefact.
+/// Restore the empty table when the seeding test finishes, including on
+/// panic, so a later test still sees the unpublished default.
+struct ResetRootStackEffects<'a>(&'a Llbc);
+
+impl Drop for ResetRootStackEffects<'_> {
+    fn drop(&mut self) {
+        self.0.set_root_stack_effects(Vec::new(), Vec::new());
+    }
 }
 
 fn optional_module() -> &'static Llbc {
     load_llbc(MODULE_LLBC)
+}
+
+#[test]
+fn pop_n_ok_payload_field_is_int() {
+    let g =
+        lower_function(interp(), "pyre_interpreter::shared_opcode::pop_n").expect("lower pop_n");
+    let writes: Vec<(String, String, String)> = g
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field, ty, value, ..
+            } if field.name == "__pos_0"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|o| o.contains("Result") && o.contains("Ok")) =>
+            {
+                Some((
+                    field.owner_root.clone().unwrap_or_default(),
+                    format!("{ty:?}"),
+                    format!("{value:?}"),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    for (owner, ty, value) in &writes {
+        assert!(
+            ty == "Int" || ty == "Unsigned",
+            "pop_n {owner}.__pos_0 ty={ty} value={value}; \
+             RustVecRepr.lowleveltype is raw Ptr, getkind int"
+        );
+    }
 }
 
 fn is_root_scope_close(op: &OpKind) -> bool {
@@ -879,6 +954,11 @@ fn raise_path_calls_in(llbc: &'static Llbc, name: &str) -> (usize, usize, usize)
                 | Some("pyerror_value_error_to_exc_object")
                 | Some("pyerror_index_error_to_exc_object") => fused += 1,
                 Some("pyerror_to_exc_object") => materialise += 1,
+                // `pin` / `reload` / `from_exc_object` live on `PyError` but
+                // they are the root-slot and rewrap helpers, not a raise
+                // constructor.  Counting them as ctors inflates a formatted
+                // `type_error` site that also pins across `is_iterable`.
+                Some("pin" | "reload" | "from_exc_object") => {}
                 Some(_) if segments.len() >= 2 && segments[segments.len() - 2] == "PyError" => {
                     ctors += 1
                 }
@@ -1015,8 +1095,11 @@ fn formatted_message_raise_sites_keep_the_two_call_form() {
         ctors > 0,
         "the fixture must still raise through a constructor"
     );
-    assert_eq!(
-        materialise, ctors,
+    // The formatted `type_error` site is constructor + `pyerror_to_exc_object`.
+    // `list_extend_value` also re-raises `list_method_extend`'s `Err`, which
+    // is a second materialise without a constructor in this body.
+    assert!(
+        materialise >= ctors,
         "every declined site keeps both halves of the pair"
     );
 }
@@ -1865,4 +1948,1540 @@ fn simplequeue_get_ok_or_else_is_lowered() {
 fn create_new_dict_ok_or_else_is_lowered() {
     let graph = lower_function(interp(), "create_new_dict").expect("create_new_dict lowers");
     assert_no_ok_or_else(&graph, "create_new_dict");
+}
+
+/// `with_roots!(value, w_name => force(obj))` is a `pin_roots(&[value, w_name])`
+/// run. Charon spells the Unsize as `Rvalue::Cast`; `RootBracketPlan` must
+/// still answer the restore so the name local is not residual-swapped with
+/// the value (`flowspace` `Constant` / `gctransform` `pin_src`).
+#[test]
+fn object_setattr_erases_with_roots_pin_run() {
+    let path = "pyre_interpreter::baseobjspace::object_setattr";
+    let llbc = interp();
+    let fd = llbc
+        .iter_fun_decls()
+        .find(|fd| fd.item_meta.name_path() == path)
+        .unwrap_or_else(|| panic!("{path} present in the shipped LLBC"));
+    let body = fd
+        .unstructured()
+        .unwrap_or_else(|| panic!("{path} has an unstructured body"));
+    // Single-artefact lowering has no linked table, so every foreign opaque
+    // is charged.  The product driver publishes the dependency crates first
+    // (`set_root_stack_effects`); seed the same shape so `force` is judged
+    // from its own body, not from `core::ptr::is_null`.
+    let _interp_guard = interp_lock();
+    llbc.set_root_stack_effects(
+        vec![
+            "pyre_object".into(),
+            "core".into(),
+            "alloc".into(),
+            "std".into(),
+            "majit_rlib".into(),
+        ],
+        Vec::new(),
+    );
+    let _reset = ResetRootStackEffects(llbc);
+    let erase_status = shadow_stack_erase_status(llbc, fd, &body);
+    let force_path = "pyre_interpreter::module::_weakref::interp__weakref::force";
+    let force_sensitive = llbc.is_stack_sensitive_fn(force_path);
+    let erased = erased_root_bracket_guards(llbc, fd, &body);
+    if !erased.contains(&7) {
+        use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
+        let callee_of = |call: &majit_charon_reader::ullbc::CallPayload| -> String {
+            match &call.func {
+                CallFunc::Regular(reg) => match &reg.kind {
+                    CallKind::Fun(FunId::Regular { id }) => llbc
+                        .fn_by_id(*id)
+                        .map(|f| f.item_meta.name_path())
+                        .unwrap_or_else(|| format!("fun#{id}")),
+                    other => format!("{other:?}"),
+                },
+                other => format!("{other:?}"),
+            }
+        };
+        let mut dump = String::new();
+        dump.push_str(&format!(
+            "erase_status={erase_status:?} force_sensitive={force_sensitive} force_touches={:?} proxy_touches={:?} deref_touches={:?}\n",
+            function_touches_root_stack(llbc, force_path),
+            function_touches_root_stack(
+                llbc,
+                "pyre_interpreter::module::_weakref::interp__weakref::is_w_abstract_proxy",
+            ),
+            function_touches_root_stack(
+                llbc,
+                "pyre_interpreter::module::_weakref::interp__weakref::dereference",
+            ),
+        ));
+        dump.push_str("--- object_setattr stack/root calls ---\n");
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                continue;
+            };
+            let callee = callee_of(call);
+            let leaf = callee.rsplit("::").next().unwrap_or("");
+            if !(leaf == "push_roots"
+                || leaf == "pin_roots"
+                || leaf == "pin_root"
+                || leaf == "get"
+                || leaf == "force"
+                || leaf == "is_true"
+                || callee.contains("gc_roots"))
+            {
+                continue;
+            }
+            dump.push_str(&format!(
+                "bb{bb_idx} CALL {callee} dest={:?} nargs={} sensitive={}\n",
+                call.dest.kind,
+                call.args.len(),
+                llbc.is_stack_sensitive_fn(&callee)
+            ));
+        }
+        if let Some(force_fd) = llbc
+            .iter_fun_decls()
+            .find(|fd| fd.item_meta.name_path() == force_path)
+            && let Some(force_body) = force_fd.unstructured()
+        {
+            dump.push_str("--- force callees ---\n");
+            for (bb_idx, bb) in force_body.body.iter().enumerate() {
+                let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                    continue;
+                };
+                let callee = callee_of(call);
+                let has_body = match &call.func {
+                    CallFunc::Regular(reg) => match &reg.kind {
+                        CallKind::Fun(FunId::Regular { id }) => {
+                            llbc.fn_by_id(*id).and_then(|f| f.unstructured()).is_some()
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                dump.push_str(&format!(
+                    "force bb{bb_idx} CALL {callee} nargs={} sensitive={} body={has_body} touches={:?}\n",
+                    call.args.len(),
+                    llbc.is_stack_sensitive_fn(&callee),
+                    function_touches_root_stack(llbc, &callee)
+                ));
+            }
+        }
+        for helper in [
+            "pyre_interpreter::module::_weakref::interp__weakref::is_w_abstract_proxy",
+            "pyre_interpreter::module::_weakref::interp__weakref::dereference",
+            "pyre_interpreter::module::_weakref::interp__weakref::weakref_obj_weak",
+            "pyre_interpreter::typedef::type",
+        ] {
+            dump.push_str(&format!("--- {helper} callees ---\n"));
+            if let Some(helper_fd) = llbc
+                .iter_fun_decls()
+                .find(|fd| fd.item_meta.name_path() == helper)
+                && let Some(helper_body) = helper_fd.unstructured()
+            {
+                for (bb_idx, bb) in helper_body.body.iter().enumerate() {
+                    let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                        continue;
+                    };
+                    let callee = callee_of(call);
+                    let (has_body, is_local) = match &call.func {
+                        CallFunc::Regular(reg) => match &reg.kind {
+                            CallKind::Fun(FunId::Regular { id }) => llbc
+                                .fn_by_id(*id)
+                                .map(|f| (f.unstructured().is_some(), f.item_meta.is_local))
+                                .unwrap_or((false, false)),
+                            _ => (false, false),
+                        },
+                        _ => (false, false),
+                    };
+                    dump.push_str(&format!(
+                        "  bb{bb_idx} CALL {callee} sensitive={} touches={:?} body={has_body} local={is_local}\n",
+                        llbc.is_stack_sensitive_fn(&callee),
+                        function_touches_root_stack(llbc, &callee),
+                    ));
+                }
+            }
+        }
+        dump.push_str(&format!(
+            "pin_slice_10={:?} pin_slice_8={:?} assigned_hint={:?}\n",
+            pin_roots_published_locals(llbc, &body, 10),
+            pin_roots_published_locals(llbc, &body, 8),
+            pin_roots_published_locals(llbc, &body, 9),
+        ));
+        dump.push_str("--- bb0-bb10 terminators ---\n");
+        for bb_idx in 0..11 {
+            let Some(bb) = body.body.get(bb_idx) else {
+                break;
+            };
+            match bb.term_ref(llbc) {
+                Ok(TermKind::Call {
+                    call,
+                    target,
+                    on_unwind,
+                }) => {
+                    dump.push_str(&format!(
+                        "bb{bb_idx} CALL {} dest={:?} nargs={} target={target} unwind={on_unwind}\n",
+                        callee_of(call),
+                        call.dest.kind,
+                        call.args.len(),
+                    ));
+                }
+                Ok(TermKind::Drop {
+                    place,
+                    fn_ptr,
+                    target,
+                    on_unwind,
+                }) => {
+                    let drop_path = match &fn_ptr.kind {
+                        CallKind::Fun(FunId::Regular { id }) => llbc
+                            .fn_by_id(*id)
+                            .map(|f| f.item_meta.name_path())
+                            .unwrap_or_else(|| format!("fun#{id}")),
+                        other => format!("{other:?}"),
+                    };
+                    dump.push_str(&format!(
+                        "bb{bb_idx} DROP {drop_path} place={:?} touches={:?} target={target} unwind={on_unwind}\n",
+                        place.kind,
+                        function_touches_root_stack(llbc, &drop_path)
+                    ));
+                }
+                Ok(other) => dump.push_str(&format!(
+                    "bb{bb_idx} TERM {}\n",
+                    format!("{other:?}").chars().take(180).collect::<String>()
+                )),
+                Err(_) => dump.push_str(&format!("bb{bb_idx} TERM-unparsed\n")),
+            }
+            for (si, stmt) in bb.statements.iter().enumerate() {
+                match stmt.stmt_kind_ref() {
+                    Ok(majit_charon_reader::ullbc::StmtKind::StorageLive(_))
+                    | Ok(majit_charon_reader::ullbc::StmtKind::StorageDead(_))
+                    | Ok(majit_charon_reader::ullbc::StmtKind::Borrowck(_)) => {}
+                    Ok(majit_charon_reader::ullbc::StmtKind::Assign(place, _))
+                        if matches!(
+                            place.kind,
+                            majit_charon_reader::ullbc::PlaceKind::Local(_)
+                        ) => {}
+                    other => dump.push_str(&format!("bb{bb_idx}.{si} NON-LOCAL {other:?}\n")),
+                }
+            }
+        }
+        panic!(
+            "{path}: first with_roots (local 7) not erased; erased={erased:?}. MIR dump:\n{dump}"
+        );
+    }
+    // Later brackets (`is_true` of `__abstractmethods__`, descriptor
+    // lookup) may still residualize: those callees can pin. Lowering
+    // the body must succeed once the first `with_roots!(value, w_name
+    // => force(obj))` is answered from SSA.
+    let graph = lower_function_unlocked(llbc, path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut promoted = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            let dump = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.join("::"),
+                CallTarget::Method {
+                    name,
+                    resolved_path,
+                    ..
+                } => {
+                    format!("{name} path={resolved_path:?}")
+                }
+                other => format!("{other:?}"),
+            };
+            if dump.contains("promoted_const") {
+                promoted.push(dump);
+            }
+        }
+    }
+    if !promoted.is_empty() {
+        use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, StmtKind, TermKind};
+        let mut dump = format!("residual promoted_const: {}\n", promoted.join("\n"));
+        dump.push_str("--- object_setattr calls to promoted_const ---\n");
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+                continue;
+            };
+            let callee = match &call.func {
+                CallFunc::Regular(reg) => match &reg.kind {
+                    CallKind::Fun(FunId::Regular { id }) => {
+                        let path = llbc
+                            .fn_by_id(*id)
+                            .map(|f| f.item_meta.name_path())
+                            .unwrap_or_else(|| format!("fun#{id}"));
+                        let promoted = llbc.fn_by_id(*id).is_some_and(|f| {
+                            f.item_meta.name.last().is_some_and(|seg| match seg {
+                                majit_charon_reader::ullbc::NameSeg::Other(v) => {
+                                    v.as_object()
+                                        .and_then(|m| m.get("Builtin"))
+                                        .and_then(serde_json::Value::as_array)
+                                        .and_then(|arr| arr.first())
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("PromotedConst")
+                                }
+                                _ => false,
+                            })
+                        });
+                        format!("{path} id={id} promoted={promoted} kind={:?}", reg.kind)
+                    }
+                    other => format!("kind={other:?}"),
+                },
+                other => format!("func={other:?}"),
+            };
+            if callee.contains("promoted_const") || callee.contains("PromotedConst") {
+                dump.push_str(&format!("bb{bb_idx} {callee} nargs={}\n", call.args.len()));
+            }
+        }
+        for fd in llbc.iter_fun_decls() {
+            let p = fd.item_meta.name_path();
+            if !(p.contains("object_setattr") && p.contains("promoted_const")) {
+                continue;
+            }
+            dump.push_str(&format!("--- {p} ---\n"));
+            let Some(body) = fd.unstructured() else {
+                dump.push_str("no body\n");
+                continue;
+            };
+            for (bb_idx, bb) in body.body.iter().enumerate() {
+                for (si, stmt) in bb.statements.iter().enumerate() {
+                    let kind = match stmt.stmt_kind_ref() {
+                        Ok(
+                            StmtKind::StorageLive(_)
+                            | StmtKind::StorageDead(_)
+                            | StmtKind::Borrowck(_),
+                        ) => {
+                            continue;
+                        }
+                        Ok(other) => format!("{other:?}"),
+                        Err(_) => format!("unparsed {}", stmt.kind_value()),
+                    };
+                    dump.push_str(&format!(
+                        "bb{bb_idx}.{si} {}\n",
+                        kind.chars().take(400).collect::<String>()
+                    ));
+                }
+                match bb.term_ref(llbc) {
+                    Ok(TermKind::Call {
+                        call,
+                        target,
+                        on_unwind,
+                    }) => {
+                        dump.push_str(&format!(
+                            "bb{bb_idx} CALL nargs={} target={target} unwind={on_unwind} dest={:?}\n",
+                            call.args.len(),
+                            call.dest.kind
+                        ));
+                    }
+                    Ok(other) => dump.push_str(&format!(
+                        "bb{bb_idx} TERM {}\n",
+                        format!("{other:?}").chars().take(300).collect::<String>()
+                    )),
+                    Err(_) => dump.push_str(&format!(
+                        "bb{bb_idx} TERM-raw {}\n",
+                        bb.terminator.kind_value()
+                    )),
+                }
+            }
+            dump.push_str(&format!(
+                "term_kind_value={} const_meta={:?}\n",
+                body.body[0].terminator.kind_value(),
+                {
+                    let mut found = None;
+                    for stmt in &body.body[0].statements {
+                        if let Ok(StmtKind::Assign(
+                            _,
+                            majit_charon_reader::ullbc::Rvalue::Use(
+                                majit_charon_reader::ullbc::Operand::Const(v),
+                                _,
+                            ),
+                        )) = stmt.stmt_kind_ref()
+                        {
+                            found = Some(format!(
+                                "literal={:?} kind={:?}",
+                                llbc.const_expr_literal(v)
+                                    .map(|l| format!("{l}").chars().take(240).collect::<String>()),
+                                llbc.const_expr_kind(v)
+                                    .map(|k| format!("{k}").chars().take(240).collect::<String>()),
+                            ));
+                        }
+                    }
+                    found
+                }
+            ));
+        }
+        panic!("{path}: {dump}");
+    }
+    let mut method_pin_roots = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            let dump = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.join("::"),
+                CallTarget::Method {
+                    name,
+                    resolved_path,
+                    ..
+                } => format!("{name} path={resolved_path:?}"),
+                other => format!("{other:?}"),
+            };
+            if dump.contains("RootScope") && dump.contains("pin_roots") {
+                method_pin_roots.push(format!("{dump} nargs={}", args.len()));
+            }
+        }
+    }
+    assert!(
+        method_pin_roots.is_empty(),
+        "{path}: method pin_roots must retarget to free pin_roots:\n{}",
+        method_pin_roots.join("\n")
+    );
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            let CallTarget::FunctionPath { segments, .. } = target else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("pin_roots") {
+                continue;
+            }
+            assert_eq!(
+                segments.as_slice(),
+                ["pyre_object", "gc_roots", "pin_roots"],
+                "{path}: leftover pin_roots must be the free helper: {}",
+                segments.join("::")
+            );
+            assert_eq!(
+                args.len(),
+                1,
+                "{path}: free pin_roots is one GcArray word, got {}",
+                args.len()
+            );
+        }
+    }
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    let mut array_news = Vec::new();
+    for block in &transformed.blocks {
+        for op in &block.operations {
+            if let OpKind::NewArrayClear { array_type_id, .. } = &op.kind {
+                array_news.push(array_type_id.clone());
+            }
+        }
+    }
+    assert!(
+        array_news.iter().any(|id| {
+            id.as_deref() == Some(majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+        }),
+        "{path}: with_roots array must become NewArrayClear of object GcArray, got {array_news:?}"
+    );
+}
+
+/// `get_and_call_function` publishes then normalizes. Method
+/// `RootScope::publish` is two Ref words; the bound helper is the 3-word
+/// pair ABI. The front retargets it to free `publish_roots` over the
+/// length-prefixed GcArray (`rlist.py` `GcArray(OBJECTPTR)`), the same
+/// split `pin_roots` already takes.
+#[test]
+fn get_and_call_function_publish_retargets_to_publish_roots() {
+    let path = "pyre_interpreter::baseobjspace::get_and_call_function";
+    let llbc = interp();
+    let _interp_guard = interp_lock();
+    llbc.set_root_stack_effects(
+        vec![
+            "pyre_object".into(),
+            "core".into(),
+            "alloc".into(),
+            "std".into(),
+            "majit_rlib".into(),
+        ],
+        Vec::new(),
+    );
+    let _reset = ResetRootStackEffects(llbc);
+    let graph = lower_function_unlocked(llbc, path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut method_publish = Vec::new();
+    let mut free_publish = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            let dump = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.join("::"),
+                CallTarget::Method {
+                    name,
+                    resolved_path,
+                    ..
+                } => format!("{name} path={resolved_path:?}"),
+                other => format!("{other:?}"),
+            };
+            if dump.contains("RootScope") && dump.contains("publish") {
+                method_publish.push(format!("{dump} nargs={}", args.len()));
+            }
+            if let CallTarget::FunctionPath { segments, .. } = target
+                && segments.last().map(String::as_str) == Some("publish_roots")
+            {
+                free_publish.push(args.len());
+                assert_eq!(
+                    segments.as_slice(),
+                    ["pyre_object", "gc_roots", "publish_roots"],
+                    "{path}: leftover publish_roots must be the free helper: {}",
+                    segments.join("::")
+                );
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "{path}: free publish_roots is one GcArray word, got {}",
+                    args.len()
+                );
+            }
+        }
+    }
+    assert!(
+        method_publish.is_empty(),
+        "{path}: method publish must retarget to free publish_roots:\n{}",
+        method_publish.join("\n")
+    );
+    assert!(
+        !free_publish.is_empty(),
+        "{path}: expected a free publish_roots call after retarget"
+    );
+}
+
+/// `call_explicit_args` / `call_kw` / `call_valuestack` do `args.reverse()`
+/// on `Vec<PyObjectRef>`. rustc inlines that to `<[T]>::reverse`; the
+/// FunDecl is opaque, so the front must retarget it to `ll_vec_reverse_*`
+/// (`rlist.py ll_reverse`).
+#[test]
+fn call_explicit_args_reverse_is_ll_vec_reverse() {
+    let path = "pyre_interpreter::eval::<Impl>::call_explicit_args";
+    check_vec_reverse_helper(path);
+    check_vec_reverse_helper("pyre_interpreter::eval::<Impl>::call_kw");
+    check_vec_reverse_helper("pyre_interpreter::baseobjspace::call_valuestack");
+}
+
+/// `argument_factory` does `args.extend_from_slice(_arguments)` on
+/// `&[PyObjectRef]`. The slice is a GcArray, not a pair; expand to
+/// `(items, length)` and retarget to `ll_vec_extend_from_slice_r`
+/// (`rlist.py ll_extend` / `rrustvec.rs` `VecOp::ExtendFromSlice`).
+#[test]
+fn argument_factory_extend_from_slice_is_ll_vec_extend() {
+    let path = "pyre_interpreter::pyframe::<Impl>::argument_factory";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut leftover = Vec::new();
+    let mut helpers = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            match target {
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("extend_from_slice") =>
+                {
+                    leftover.push(format!("{} nargs={}", segments.join("::"), args.len()));
+                }
+                CallTarget::FunctionPath { segments, .. }
+                    if segments
+                        .last()
+                        .is_some_and(|leaf| leaf.starts_with("ll_vec_extend")) =>
+                {
+                    helpers.push((segments.join("::"), args.len()));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        leftover.is_empty(),
+        "{path}: extend_from_slice must retarget to ll_vec_extend_*:\n{}",
+        leftover.join("\n")
+    );
+    // Object-slice `extend_from_slice` is `rlist.py ll_extend` with `l2`
+    // the GcArray word (`VecOp::Extend`, two args). A pair-spliced `&[T]`
+    // is `VecOp::ExtendFromSlice` (three args).
+    assert!(
+        helpers.iter().any(|(name, n)| {
+            (name.ends_with("ll_vec_extend_r") && *n == 2)
+                || (name.ends_with("ll_vec_extend_from_slice_r") && *n == 3)
+        }),
+        "{path}: expected ll_vec_extend_r/2 or ll_vec_extend_from_slice_r/3, got {helpers:?}"
+    );
+}
+
+fn check_vec_reverse_helper(path: &str) {
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut calls = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            calls.push(match target {
+                CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id,
+                    ..
+                } => format!(
+                    "FunctionPath {} nargs={} fun_decl_id={fun_decl_id:?}",
+                    segments.join("::"),
+                    args.len()
+                ),
+                CallTarget::Method {
+                    name,
+                    receiver_root,
+                    resolved_path,
+                    fun_decl_id,
+                    ..
+                } => format!(
+                    "Method {name} root={receiver_root:?} path={resolved_path:?} nargs={} fun_decl_id={fun_decl_id:?}",
+                    args.len()
+                ),
+                other => format!("{other:?} nargs={}", args.len()),
+            });
+        }
+    }
+    let dump = calls.join("\n");
+    assert!(
+        !dump.contains("core::slice::<Impl>::reverse"),
+        "{path}: slice reverse must not residualize:\n{dump}"
+    );
+    assert!(
+        dump.contains("ll_vec_reverse"),
+        "{path}: expected ll_vec_reverse helper:\n{dump}"
+    );
+}
+
+/// `_flat_pycall` passes `&[]` into `try_new_for_call_with_closure_and_globals_obj`.
+/// That slice is the length-prefixed object GcArray (`rlist.py` `GcArray(OBJECTPTR)`);
+/// `do_fixed_newlist_clear` allocates it with `new_array_clear(0)`.
+#[test]
+fn flat_pycall_empty_slice_is_a_cleared_object_gcarray() {
+    let path = "pyre_interpreter::function::_flat_pycall";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    assert!(
+        transformed
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::NewArrayClear {
+                        array_type_id: Some(id),
+                        ..
+                    } if id.as_str() == majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID
+                )
+            }),
+        "{path}: `&[]` must be new_array_clear(0) of the object GcArray"
+    );
+}
+
+/// `readinto_impl` returns `Result<i64, PyError>`. `Ok(0)` is `CONST_0`
+/// (`history.py`); coercing that payload to `ConstRefNull` made the CFG
+/// return kind `r` against `FUNC.RESULT=i`.
+#[test]
+fn readinto_impl_ok_zero_stays_int() {
+    let path = "buffered_random::<Impl>::readinto_impl";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    let mut null_returns = 0usize;
+    for block in &transformed.blocks {
+        for link in &block.exits {
+            if link.target != transformed.returnblock {
+                continue;
+            }
+            for arg in &link.args {
+                let Some(var) = arg.as_variable() else {
+                    continue;
+                };
+                if transformed
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| {
+                        op.result.as_ref() == Some(var) && matches!(op.kind, OpKind::ConstRefNull)
+                    })
+                {
+                    null_returns += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        null_returns, 0,
+        "{path}: Ok(0) must not return ConstRefNull"
+    );
+}
+
+/// `classify_callable` returns `Result<CallableKind, PyError>`.
+/// `CallableKind` is a fieldless enum (`Int`); `Ok(CallableKind::Builtin)`
+/// is discriminant 0, `CONST_0`, not `CONST_NULL`.
+#[test]
+fn classify_callable_ok_kind_stays_int() {
+    let path = "pyre_interpreter::runtime_ops::classify_callable";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    let mut null_returns = 0usize;
+    for block in &transformed.blocks {
+        for link in &block.exits {
+            if link.target != transformed.returnblock {
+                continue;
+            }
+            for arg in &link.args {
+                let Some(var) = arg.as_variable() else {
+                    continue;
+                };
+                if transformed
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| {
+                        op.result.as_ref() == Some(var) && matches!(op.kind, OpKind::ConstRefNull)
+                    })
+                {
+                    null_returns += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        null_returns, 0,
+        "{path}: Ok(CallableKind) must not return ConstRefNull"
+    );
+}
+
+/// `prepare_frame_resume` reads `PyFrame.w_yielding_from` (a GCREF) and
+/// stores `PY_NULL`. A null Ref is `ConstPtr(NULL)` (`history.py`
+/// `CONST_NULL`); an Int 0 in that slot is what `make_equal_to` later
+/// equates a `GetfieldGcR` to.
+#[test]
+fn yielding_from_null_store_is_const_ptr_null() {
+    let path = "pyre_interpreter::eval::prepare_frame_resume";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    let writes: Vec<_> = transformed
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "w_yielding_from"
+            )
+        })
+        .map(|op| &op.kind)
+        .collect();
+    assert!(
+        !writes.is_empty(),
+        "{path}: expected a w_yielding_from store: {writes:?}"
+    );
+    for kind in &writes {
+        let OpKind::FieldWrite { value, ty, .. } = kind else {
+            continue;
+        };
+        assert!(
+            matches!(ty, majit_translate::model::ValueType::Ref(_)),
+            "{path}: w_yielding_from store kind must be Ref: {kind:?}"
+        );
+        assert!(
+            !majit_translate::model::link_arg_is_int_zero(&transformed, value),
+            "{path}: null Ref store must not keep Int 0: {kind:?}"
+        );
+    }
+}
+
+/// `RustVecRepr.lowleveltype` is a raw `Ptr` (`history.py` `getkind` `'int'`)
+/// for every `Vec<T>`. `Result<Vec<u8>, PyError>::Ok.__pos_0` must use
+/// that bank; a field left `Ref` while the header address is `Int` is
+/// the `rewrite_op_setfield` kind mismatch in `read_all`.
+#[test]
+fn vec_u8_ok_payload_field_is_int() {
+    let path = "pyre_interpreter::module::_io::interp_textio::<Impl>::read_all";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let writes: Vec<(String, String, String)> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field, ty, value, ..
+            } if field.name == "__pos_0"
+                && field.owner_root.as_deref().is_some_and(|o| {
+                    o.contains("Result") && o.contains("Ok") && o.contains("Vec<u8>")
+                }) =>
+            {
+                Some((
+                    field.owner_root.clone().unwrap_or_default(),
+                    format!("{ty:?}"),
+                    format!("{value:?}"),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !writes.is_empty(),
+        "{path}: expected Result<Vec<u8>>::Ok.__pos_0 FieldWrite"
+    );
+    for (owner, ty, value) in &writes {
+        assert!(
+            ty == "Int" || ty == "Unsigned",
+            "{path} {owner}.__pos_0 ty={ty} value={value}; \
+             RustVecRepr.lowleveltype is raw Ptr, getkind int"
+        );
+    }
+    let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+}
+
+/// `fileio_writebuf` returns `Result<(&mut [u8], PyObjectRef, bool), …>`.
+/// `Tuple<[u8], …>::__pos_0` is the slice, whose `getkind` is `ref`.
+/// Aliasing `Vec<u8>::as_mut_slice` to the Vec header (`RustVecRepr`,
+/// kind `int`) stored an Int into that Ref field
+/// (`jtransform.py` `rewrite_op_setfield`).
+#[test]
+fn fileio_writebuf_u8_slice_tuple_field_is_not_int_into_ref() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg, ValueType};
+    let path = "pyre_interpreter::builtins::fileio_writebuf";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut writes = 0usize;
+    for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+        let OpKind::FieldWrite {
+            field, ty, value, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if field.name != "__pos_0" {
+            continue;
+        }
+        let Some(owner) = field.owner_root.as_deref() else {
+            continue;
+        };
+        if !(owner.contains("Tuple") && owner.contains("[u8]")) {
+            continue;
+        }
+        writes += 1;
+        let value_is_int = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var) == ConcreteType::Signed,
+            _ => false,
+        };
+        assert!(
+            !matches!(ty, ValueType::Ref(_) | ValueType::Str) || !value_is_int,
+            "{path} {owner}.__pos_0 ty={ty:?} value={value:?}; \
+             slice getkind is ref, Vec header getkind is int"
+        );
+    }
+    assert!(
+        writes >= 1,
+        "{path}: expected Tuple<[u8],…>::__pos_0 FieldWrite"
+    );
+    let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+}
+
+/// `WritableBuffer::acquire` constructs a struct of depth-word / slot /
+/// address scalars. A Ref stored into that Int base is `setfield_raw_r`
+/// (`jtransform.py` `rewrite_op_setfield`).
+#[test]
+fn acquire_does_not_store_ref_into_raw_struct() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg};
+    let path = "pyre_interpreter::builtins::<Impl>::acquire";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut raw_r = Vec::new();
+    for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+        let OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } = &op.kind
+        else {
+            continue;
+        };
+        let base_kind = FunctionGraph::concretetype_of(base);
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            LinkArg::Const(_) => continue,
+        };
+        let value_is_ref = matches!(value_kind, ConcreteType::GcRef | ConcreteType::Unknown)
+            || matches!(ty, ValueType::Ref(_) | ValueType::Str);
+        if base_kind == ConcreteType::Signed && value_is_ref {
+            raw_r.push(format!(
+                "{}.{} base={base_kind:?} ty={ty:?} value={value_kind:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+            ));
+        }
+    }
+    assert!(
+        raw_r.is_empty(),
+        "{path} setfield_raw_r candidates: {raw_r:?}"
+    );
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    let mut raw_r = Vec::new();
+    for op in transformed.blocks.iter().flat_map(|b| b.operations.iter()) {
+        let OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } = &op.kind
+        else {
+            continue;
+        };
+        let base_kind = FunctionGraph::concretetype_of(base);
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            LinkArg::Const(_) => continue,
+        };
+        let value_is_ref = matches!(value_kind, ConcreteType::GcRef | ConcreteType::Unknown)
+            || matches!(ty, ValueType::Ref(_) | ValueType::Str);
+        if base_kind == ConcreteType::Signed && value_is_ref {
+            raw_r.push(format!(
+                "{}.{} base={base_kind:?} ty={ty:?} value={value_kind:?}",
+                field.owner_root.as_deref().unwrap_or("?"),
+                field.name,
+            ));
+        }
+    }
+    assert!(
+        raw_r.is_empty(),
+        "{path} post-transform setfield_raw_r candidates: {raw_r:?}"
+    );
+}
+
+/// `readinto_impl` captures `&mut WritableBuffer`. The by-value local is
+/// `lltype.malloc(T, flavor='raw')` (`Ptr(T)`, annotator `SomePtr`);
+/// `history.getkind` `'int'` is the field lltype (`rewrite_op_setfield`).
+/// `_alloc_flavor_WritableBuffer` / `rclass.py getgcflavor` stamps that
+/// raw flavor; there is no `cast_int_to_ptr`.
+#[test]
+fn readinto_impl_closure_writable_buffer_capture_is_ptr() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg};
+    let path = "pyre_interpreter::module::_io::interp_bufferedio::<Impl>::readinto_impl";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut writes = Vec::new();
+    let mut saw_cast_int_to_ptr = false;
+    for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+        if let OpKind::Call { target, .. } = &op.kind
+            && let CallTarget::FunctionPath { segments, .. } = target
+            && segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+        {
+            saw_cast_int_to_ptr = true;
+        }
+        let OpKind::FieldWrite {
+            field, value, ty, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(owner) = field.owner_root.as_deref() else {
+            continue;
+        };
+        if field.name != "__pos_1" || !owner.contains("readinto_impl") || !owner.contains("closure")
+        {
+            continue;
+        }
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            LinkArg::Const(_) => continue,
+        };
+        writes.push((owner.to_string(), ty.clone(), value_kind));
+    }
+    assert!(
+        !writes.is_empty(),
+        "{path}: expected closure __pos_1 FieldWrite"
+    );
+    for (owner, ty, value_kind) in &writes {
+        assert!(
+            matches!(ty, ValueType::Int | ValueType::Unsigned),
+            "{owner}.__pos_1 ty={ty:?}; field lltype getkind of a raw Ptr is int"
+        );
+        assert_ne!(
+            *value_kind,
+            ConcreteType::Signed,
+            "{owner}.__pos_1 value={value_kind:?}; \
+             the local is Ptr(WritableBuffer), not a Signed address"
+        );
+    }
+    assert!(
+        !saw_cast_int_to_ptr,
+        "{path}: the local is already Ptr(T); no cast_int_to_ptr"
+    );
+    let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+}
+
+/// `bare_super_frame_layout` captures `&CodeObject`. `_alloc_flavor_CodeObject`
+/// / `rclass.py getgcflavor` makes that pointer a raw-flavored `Ptr`;
+/// the closure-field lltype getkind is `'int'`, matching the rtyped value.
+#[test]
+fn bare_super_frame_layout_closure_code_capture_is_raw_ptr_int_kind() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg};
+    let path = "pyre_interpreter::builtins::bare_super_frame_layout";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut writes = Vec::new();
+    let mut saw_cast_int_to_ptr = false;
+    for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+        if let OpKind::Call { target, .. } = &op.kind
+            && let CallTarget::FunctionPath { segments, .. } = target
+            && segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+        {
+            saw_cast_int_to_ptr = true;
+        }
+        let OpKind::FieldWrite {
+            field, value, ty, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(owner) = field.owner_root.as_deref() else {
+            continue;
+        };
+        if !owner.contains("bare_super_frame_layout") || !owner.contains("closure") {
+            continue;
+        }
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            LinkArg::Const(_) => continue,
+        };
+        writes.push((
+            owner.to_string(),
+            field.name.clone(),
+            ty.clone(),
+            value_kind,
+        ));
+    }
+    assert!(!writes.is_empty(), "{path}: expected closure FieldWrite");
+    assert!(
+        writes
+            .iter()
+            .any(|(_, _, ty, _)| matches!(ty, ValueType::Int | ValueType::Unsigned)),
+        "{path}: expected a raw-Ptr CodeObject capture; writes={writes:?}"
+    );
+    for (owner, name, ty, value_kind) in &writes {
+        if !matches!(ty, ValueType::Int | ValueType::Unsigned) {
+            continue;
+        }
+        assert_ne!(
+            *value_kind,
+            ConcreteType::Signed,
+            "{owner}.{name} ty={ty:?} value={value_kind:?}; annotator keeps the CodeObject pointer"
+        );
+    }
+    assert!(
+        !saw_cast_int_to_ptr,
+        "{path}: no cast_int_to_ptr of the CodeObject capture"
+    );
+    let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+}
+
+/// `_orig_parse_format` pushes `(Fmt, usize)` units. `Fmt` stores the
+/// payload enum `Code`, so it is a class instance (`getkind` ref), not
+/// a raw `Ptr`. `Tuple<Fmt,usize>::__pos_0` must use that bank;
+/// `getfield_raw_r` is refused (`jtransform.py` `rewrite_op_getfield`).
+#[test]
+fn orig_parse_format_fmt_tuple_field_is_not_int_into_ref() {
+    let path = "pyre_interpreter::module::struct::_orig_parse_format";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let writes: Vec<(String, String, String)> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field, ty, value, ..
+            } if field.name == "__pos_0"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|o| o.contains("Tuple") && o.contains("Fmt")) =>
+            {
+                Some((
+                    field.owner_root.clone().unwrap_or_default(),
+                    format!("{ty:?}"),
+                    format!("{value:?}"),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !writes.is_empty(),
+        "{path}: expected Tuple<Fmt,usize>::__pos_0 FieldWrite"
+    );
+    for (owner, ty, value) in &writes {
+        assert!(
+            ty.starts_with("Ref"),
+            "{path} {owner}.__pos_0 ty={ty} value={value}; \
+             payload-enum field makes the struct a class instance"
+        );
+    }
+    let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+}
+
+/// `pyopcode.py RAISE_VARARGS` maps over `Option<RaiseCause>`. The
+/// `call_once` args-tuple field kind equals the stored value's `getkind`,
+/// both Ref: `RaiseCause` holds a GC pointer, so it is a `GcStruct`
+/// (`lltype.py` `Struct.__init__` "cannot inline %s container";
+/// `Ptr._is_atomic` is false unless `TO._gckind == 'raw'`).
+#[test]
+fn raise_varargs_option_map_tuple_field_kind_matches_value_kind() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, LinkArg, ValueType};
+    let path = "pyre_interpreter::eval::<Impl>::raise_varargs";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let mut writes = 0usize;
+    for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+        let OpKind::FieldWrite {
+            field, ty, value, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if field.name != "__pos_0" {
+            continue;
+        }
+        let Some(owner) = field.owner_root.as_deref() else {
+            continue;
+        };
+        if !(owner.contains("Tuple") && owner.contains("RaiseCause")) {
+            continue;
+        }
+        writes += 1;
+        let value_kind = match value {
+            LinkArg::Value(var) => FunctionGraph::concretetype_of(var),
+            _ => ConcreteType::Unknown,
+        };
+        assert!(
+            matches!(ty, ValueType::Ref(_) | ValueType::Str),
+            "{path} {owner}.__pos_0 ty={ty:?} value={value:?} value_kind={value_kind:?}; \
+             RaiseCause field getkind is ref"
+        );
+        assert!(
+            value_kind == ConcreteType::GcRef || value_kind == ConcreteType::Unknown,
+            "{path} {owner}.__pos_0 ty={ty:?} value={value:?} value_kind={value_kind:?}; \
+             RaiseCause stored value getkind is ref"
+        );
+    }
+    assert!(
+        writes >= 1,
+        "{path}: expected Tuple<RaiseCause>::__pos_0 FieldWrite from Option::map"
+    );
+    let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+}
+
+fn call_targets_push_roots(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.iter().any(|s| s == "push_roots") && segments.iter().any(|s| s == "gc_roots")
+        }
+        _ => false,
+    }
+}
+
+/// `push_roots` returns `RootScope`, the save_point word (`history.py`
+/// `getkind` of a raw `Ptr` is `'int'`). FUNC.RESULT and any remaining
+/// call dest share that bank (`call.py` `RESULT == FUNC.RESULT`).
+#[test]
+fn push_roots_result_is_int() {
+    use majit_translate::model::ValueType;
+    let callers = [
+        "pyre_interpreter::call::call_function_impl_result",
+        "pyre_interpreter::call::call_function_impl",
+        "pyre_interpreter::call::call_function_impl_raw",
+    ];
+    let mut calls = 0usize;
+    for path in callers {
+        let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+        for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !call_targets_push_roots(target) {
+                continue;
+            }
+            calls += 1;
+            assert!(
+                matches!(result_ty, ValueType::Int),
+                "{path} push_roots result_ty={result_ty:?}; \
+                 RootScope getkind is the save_point word"
+            );
+        }
+        let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    }
+    let callee = "pyre_object::gc_roots::push_roots";
+    if let Ok(graph) = lower_function(interp(), callee) {
+        let token = graph.return_type.as_deref().unwrap_or("");
+        assert!(
+            token == "i64"
+                || token == "u64"
+                || token == "isize"
+                || token == "usize"
+                || token.starts_with("raw:"),
+            "{callee} return_type={token:?}; RootScope FUNC.RESULT is int"
+        );
+        calls += 1;
+        let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    }
+    assert!(
+        calls >= 1,
+        "expected a push_roots call dest or the push_roots graph"
+    );
+}
+
+fn call_targets_root_scope_new(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.last().is_some_and(|s| s == "new") && segments.iter().any(|s| s == "RootScope")
+        }
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => {
+            name == "new"
+                && receiver_root
+                    .as_deref()
+                    .is_some_and(|root| root.ends_with("::RootScope") || root == "RootScope")
+        }
+        _ => false,
+    }
+}
+
+/// `local_fn("…gc_roots::<Impl>::new")` returns the first inherent `new`
+/// in the module (`RootStack::new`). The save_point constructor is the
+/// one whose body writes that field.
+fn root_scope_new_decl(llbc: &Llbc) -> Option<&majit_charon_reader::ullbc::FunDecl> {
+    llbc.iter_fun_decls().find(|fd| {
+        fd.item_meta.name_path().ends_with("::new")
+            && fd
+                .item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|s| s.contains("save_point: shadow_stack_len()"))
+    })
+}
+
+fn lower_root_scope_new(llbc: &Llbc) -> Option<majit_translate::model::FunctionGraph> {
+    let fd = root_scope_new_decl(llbc)?;
+    let context = LowerContext::new(llbc);
+    let static_addrs = HostStaticAddrs {
+        error_carrier: ERROR_CARRIER,
+        ..Default::default()
+    };
+    Some(
+        lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
+            .unwrap_or_else(|e| panic!("lower RootScope::new: {e}")),
+    )
+}
+
+/// `RootScope::new` constructs the save_point word (`CFG i`). FUNC.RESULT
+/// shares that bank (`call.py` `get_jitcode_calldescr`; `rtyper` `getrepr`
+/// → `lowleveltype`; `getkind`).
+#[test]
+fn gc_roots_new_result_is_int() {
+    use majit_translate::model::ValueType;
+    let mut graphs = 0usize;
+    if let Some(graph) = lower_root_scope_new(interp()) {
+        assert_root_scope_new_func_result(&graph.name, &graph);
+        graphs += 1;
+        let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    }
+    if std::path::Path::new(OBJECT_LLBC).is_file() {
+        let object = load_llbc(OBJECT_LLBC);
+        if let Some(graph) = lower_root_scope_new(object) {
+            assert_root_scope_new_func_result(&graph.name, &graph);
+            graphs += 1;
+            let _transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+        }
+    }
+    let callers = [
+        "pyre_object::gc_roots::push_roots",
+        "pyre_interpreter::call::call_function_impl_result",
+    ];
+    for path in callers {
+        let Ok(graph) = lower_function(interp(), path) else {
+            continue;
+        };
+        for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+            let OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !call_targets_root_scope_new(target) {
+                continue;
+            }
+            graphs += 1;
+            assert!(
+                matches!(result_ty, ValueType::Int),
+                "{path} RootScope::new result_ty={result_ty:?}; \
+                 RootScope getkind is the save_point word"
+            );
+        }
+    }
+    assert!(
+        graphs >= 1,
+        "expected RootScope::new FUNC.RESULT, a CFG graph, or a call dest"
+    );
+}
+
+fn assert_root_scope_new_func_result(callee: &str, graph: &majit_translate::model::FunctionGraph) {
+    let token = graph.return_type.as_deref().unwrap_or("");
+    if token == "i64"
+        || token == "u64"
+        || token == "isize"
+        || token == "usize"
+        || token.starts_with("raw:")
+    {
+        return;
+    }
+    // look-inside: FUNC.RESULT is the CFG save_point word (`shadow_stack_len`).
+    let word = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                result_ty: ValueType::Int | ValueType::Unsigned,
+                ..
+            }
+        )
+    });
+    assert!(
+        word,
+        "{callee} return_type={token:?}; RootScope FUNC.RESULT is int"
+    );
+}
+
+/// A raw struct field read with a Ref result is `getfield_raw_r`, which
+/// `jtransform.py rewrite_op_getfield` refuses unless the field is
+/// immutable. `index_c_int_w::<Impl>::call_once` captures a callable
+/// in a closure env; that owner is a class instance (`src: Closure`),
+/// so the load is `getfield_gc_r`.
+#[test]
+fn index_c_int_w_call_once_has_no_mutable_getfield_raw_r() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, ValueType};
+    let llbc = interp();
+    let context = LowerContext::new(llbc);
+    let static_addrs = HostStaticAddrs {
+        error_carrier: ERROR_CARRIER,
+        ..Default::default()
+    };
+    let mut raw_ref = Vec::new();
+    let mut call_once = 0usize;
+    for fd in llbc.iter_fun_decls() {
+        let path = fd.item_meta.name_path();
+        if !path.contains("index_c_int_w") || !path.ends_with("call_once") {
+            continue;
+        }
+        let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
+            .unwrap_or_else(|e| panic!("lower {path}: {e}"));
+        call_once += 1;
+        let mut check = |label: &str, graph: &FunctionGraph| {
+            for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+                let OpKind::FieldRead {
+                    base,
+                    field,
+                    ty,
+                    pure,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                let base_ct = FunctionGraph::concretetype_of(base);
+                let result_ct = op.result.as_ref().map(FunctionGraph::concretetype_of);
+                let result_is_ref = matches!(ty, ValueType::Ref(_) | ValueType::Str)
+                    || result_ct == Some(ConcreteType::GcRef);
+                let owner_raw =
+                    field.owner_declared_gc == Some(false) || base_ct == ConcreteType::Signed;
+                if owner_raw && result_is_ref && !*pure {
+                    raw_ref.push(format!(
+                        "{label} {path} {}.{} ty={ty:?} declared_gc={:?} base_ct={base_ct:?}",
+                        field.owner_root.as_deref().unwrap_or("?"),
+                        field.name,
+                        field.owner_declared_gc,
+                    ));
+                }
+            }
+        };
+        check("lower", &graph);
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+        check("xform", &transformed);
+    }
+    assert!(
+        call_once >= 1,
+        "expected index_c_int_w::<Impl>::call_once in interpreter LLBC"
+    );
+    assert!(raw_ref.is_empty(), "mutable getfield_raw_r: {raw_ref:?}");
+}
+
+/// `PositionCookie::unpack` returns `Result<Self, PyError>`. After
+/// result_exc the success type is the cookie, a by-value raw struct:
+/// annotator `SomePtr` (`rclass.py` getgcflavor), `history.py` `getkind`
+/// `'int'` at FUNC.RESULT (`call.py` `get_jitcode_calldescr`).
+#[test]
+fn unpack_raw_struct_func_result_matches_cfg() {
+    use majit_translate::model::{ConcreteType, FunctionGraph};
+    let llbc = interp();
+    let context = LowerContext::new(llbc);
+    let static_addrs = HostStaticAddrs {
+        error_carrier: ERROR_CARRIER,
+        ..Default::default()
+    };
+    let mut seen = 0usize;
+    for fd in llbc.iter_fun_decls() {
+        let path = fd.item_meta.name_path();
+        if !path.contains("interp_textio") || !path.ends_with("unpack") {
+            continue;
+        }
+        let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
+            .unwrap_or_else(|e| panic!("lower {path}: {e}"));
+        seen += 1;
+        let check = |label: &str, graph: &FunctionGraph| {
+            let cfg = match graph.block(graph.returnblock).inputargs.first() {
+                None => 'v',
+                Some(arg) => match FunctionGraph::concretetype_of(arg) {
+                    ConcreteType::Signed => 'i',
+                    ConcreteType::GcRef => 'r',
+                    ConcreteType::Float => 'f',
+                    ConcreteType::Void => 'v',
+                    ConcreteType::Unknown => panic!("{label} {path}: returnblock unresolved"),
+                },
+            };
+            assert_eq!(
+                cfg, 'r',
+                "{label} {path}: annotator of a raw-flavored Ptr is SomePtr, got {cfg}"
+            );
+            if let Some(token) = graph.return_type.as_deref() {
+                assert!(
+                    token == "i64" || token == "u64",
+                    "{label} {path}: FUNC.RESULT={token:?}; raw struct getkind is int"
+                );
+            }
+        };
+        check("lower", &graph);
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+        check("xform", &transformed);
+    }
+    assert!(
+        seen >= 1,
+        "expected interp_textio::<Impl>::unpack in interpreter LLBC"
+    );
+}
+
+/// `unpack_units` matches `fmt.code`. `Code` is a payload enum (`Ref`);
+/// storing it makes `Fmt` a class instance so the read is
+/// `getfield_gc_r`. A raw `Fmt` would be `getfield_raw_r`
+/// (`jtransform.py` `rewrite_op_getfield`).
+#[test]
+fn unpack_units_has_no_mutable_getfield_raw_r() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, ValueType};
+    let path = "pyre_interpreter::module::struct::unpack_units";
+    let graph = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+    let check = |label: &str, graph: &FunctionGraph| {
+        let mut raw_ref = Vec::new();
+        for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+            let OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let base_ct = FunctionGraph::concretetype_of(base);
+            let result_ct = op.result.as_ref().map(FunctionGraph::concretetype_of);
+            let result_is_ref = matches!(ty, ValueType::Ref(_) | ValueType::Str)
+                || result_ct == Some(ConcreteType::GcRef);
+            let owner_raw =
+                field.owner_declared_gc == Some(false) || base_ct == ConcreteType::Signed;
+            if owner_raw && result_is_ref && !*pure {
+                raw_ref.push(format!(
+                    "{label} {path} {}.{} ty={ty:?} declared_gc={:?} base_ct={base_ct:?}",
+                    field.owner_root.as_deref().unwrap_or("?"),
+                    field.name,
+                    field.owner_declared_gc,
+                ));
+            }
+        }
+        assert!(raw_ref.is_empty(), "mutable getfield_raw_r: {raw_ref:?}");
+    };
+    check("lower", &graph);
+    let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+    check("xform", &transformed);
+}
+
+/// `stage_ioctl` builds `scoped_alloc_buffer` and returns
+/// `Result<(i32, Vec<u8>, bool), PyError>`. A Ref store into a raw
+/// (Int) owner is `setfield_raw_r`, which `jtransform.py`
+/// `rewrite_op_setfield` refuses.
+#[test]
+fn stage_ioctl_has_no_setfield_raw_r() {
+    use majit_translate::model::{ConcreteType, FunctionGraph, ValueType};
+    let llbc = optional_module();
+    let context = LowerContext::new(llbc);
+    let static_addrs = HostStaticAddrs {
+        error_carrier: ERROR_CARRIER,
+        ..Default::default()
+    };
+    let mut raw_ref = Vec::new();
+    let mut seen = 0usize;
+    for fd in llbc.iter_fun_decls() {
+        let path = fd.item_meta.name_path();
+        if !path.contains("interp_fcntl") || !path.ends_with("stage_ioctl") {
+            continue;
+        }
+        let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
+            .unwrap_or_else(|e| panic!("lower {path}: {e}"));
+        seen += 1;
+        let mut check = |label: &str, graph: &FunctionGraph| {
+            for op in graph.blocks.iter().flat_map(|b| b.operations.iter()) {
+                let OpKind::FieldWrite {
+                    base,
+                    field,
+                    ty,
+                    value,
+                } = &op.kind
+                else {
+                    continue;
+                };
+                let base_ct = FunctionGraph::concretetype_of(base);
+                let value_ct = match value {
+                    LinkArg::Value(var) => format!("{:?}", FunctionGraph::concretetype_of(var)),
+                    LinkArg::Const(_) => "const".to_string(),
+                };
+                let value_is_ref = match value {
+                    LinkArg::Value(var) => {
+                        FunctionGraph::concretetype_of(var) == ConcreteType::GcRef
+                    }
+                    LinkArg::Const(_) => matches!(ty, ValueType::Ref(_) | ValueType::Str),
+                };
+                let ty_is_ref = matches!(ty, ValueType::Ref(_) | ValueType::Str);
+                let owner_raw =
+                    field.owner_declared_gc == Some(false) || base_ct == ConcreteType::Signed;
+                if owner_raw && (value_is_ref || ty_is_ref) {
+                    raw_ref.push(format!(
+                        "{label} {path} {}.{} ty={ty:?} declared_gc={:?} base_ct={base_ct:?} value={value_ct}",
+                        field.owner_root.as_deref().unwrap_or("?"),
+                        field.name,
+                        field.owner_declared_gc,
+                    ));
+                }
+            }
+        };
+        check("lower", &graph);
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default()).graph;
+        check("xform", &transformed);
+    }
+    assert!(
+        seen >= 1,
+        "expected interp_fcntl::stage_ioctl in pyre-module LLBC"
+    );
+    assert!(raw_ref.is_empty(), "setfield_raw_r: {raw_ref:?}");
 }

@@ -364,19 +364,22 @@ pub fn combine_starargs_wrapped(
             arguments_w.extend(args_w);
             Ok(())
         }
-        Err(e) => {
+        Err(mut e) => {
             // argument.py:97-103 — TypeError + non-iterable surfaces
             // `"argument after * must be an iterable, not %T"`; other
             // errors propagate.
+            let err_slot = e.pin(&_roots);
             if e.kind == crate::PyErrorKind::TypeError
                 && !crate::baseobjspace::is_iterable(w_stararg())
             {
+                e.reload(&_roots, err_slot);
                 let tp = type_name_of(w_stararg());
                 Err(raise_type_error(
                     w_function(),
                     format!("argument after * must be an iterable, not {tp}"),
                 ))
             } else {
+                e.reload(&_roots, err_slot);
                 Err(e)
             }
         }
@@ -1183,10 +1186,13 @@ impl Arguments {
         // The scope buffer keeps its own run of slots: `w_firstarg` and the
         // positional copy above are in it already, and every later store goes
         // through `store` so the refresh before `Ok(())` reads the whole scope
-        // back at its current addresses.
+        // back at its current addresses. Capture the caller buffer as a raw
+        // pointer before the pin so the slice local's last use is the pin
+        // itself; later stores and the final copy go through the slots.
+        let scope_len = scope_w.len();
+        let scope_dst = scope_w.as_mut_ptr();
         let scope_base = pyre_object::gc_roots::pin_roots(scope_w);
-        let store = |scope_w: &mut [PyObjectRef], index: usize, w_value: PyObjectRef| {
-            scope_w[index] = w_value;
+        let store = |index: usize, w_value: PyObjectRef| {
             pyre_object::gc_roots::shadow_stack_set(scope_base + index, w_value);
         };
 
@@ -1205,7 +1211,7 @@ impl Arguments {
             };
             let loc = co_argcount + co_kwonlyargcount;
             let w_stararg = pyre_object::w_tuple_new(starargs_w);
-            store(scope_w, loc, w_stararg);
+            store(loc, w_stararg);
         } else if avail > co_argcount {
             too_many_args = true;
         }
@@ -1223,7 +1229,7 @@ impl Arguments {
             let _ =
                 pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new_kwargs());
             w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
-            store(scope_w, kwarg_loc, w_kwds);
+            store(kwarg_loc, w_kwds);
         }
 
         // argument.py:244-271 — keyword arg matching.
@@ -1320,7 +1326,7 @@ impl Arguments {
                         let w_value = pyre_object::gc_roots::shadow_stack_get(
                             keywords_base + kwds_index as usize,
                         );
-                        store(scope_w, i, w_value);
+                        store(i, w_value);
                     }
                 }
             }
@@ -1365,7 +1371,7 @@ impl Arguments {
                 if defnum >= 0 {
                     let w_default =
                         pyre_object::gc_roots::shadow_stack_get(defaults_base + defnum as usize);
-                    store(scope_w, i, w_default);
+                    store(i, w_default);
                 } else if let Some(list) = missing_positional.as_mut() {
                     list.push(signature.argnames[i].to_string());
                 } else {
@@ -1395,7 +1401,7 @@ impl Arguments {
                     pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
                     name,
                 )? {
-                    Some(w_def) => store(scope_w, i, w_def),
+                    Some(w_def) => store(i, w_def),
                     None => {
                         if let Some(list) = missing_kwonly.as_mut() {
                             list.push(name.to_string());
@@ -1425,7 +1431,9 @@ impl Arguments {
         // filled with.  The early `return Err(...)` paths skip this refresh and
         // leave pre-move words in the buffer; that is sound only because every
         // caller drops `scope_w` unread on an error.
-        pyre_object::gc_roots::shadow_stack_copy_range(scope_base, scope_w);
+        pyre_object::gc_roots::shadow_stack_copy_range(scope_base, unsafe {
+            std::slice::from_raw_parts_mut(scope_dst, scope_len)
+        });
         Ok(())
     }
 

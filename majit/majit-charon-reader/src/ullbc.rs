@@ -251,6 +251,25 @@ impl GlobalDecl {
     pub fn is_const_value(&self) -> bool {
         matches!(self.global_kind_str(), Some("NamedConst" | "AnonConst"))
     }
+
+    /// An immutable `static` (not `static mut`, not TLS).
+    ///
+    /// Charon records this as `global_kind: { Static: { is_mut: false,
+    /// is_thread_local: false } }`. That object is the declaration
+    /// RPython would read as a prebuilt constant
+    /// (`bookkeeper.py immutablevalue`); the interpreter never assigns
+    /// the binding after init.
+    pub fn is_immutable_static(&self) -> bool {
+        let Some(st) = self
+            .rest
+            .get("global_kind")
+            .and_then(|kind| kind.get("Static"))
+        else {
+            return false;
+        };
+        st.get("is_mut").and_then(Value::as_bool) == Some(false)
+            && st.get("is_thread_local").and_then(Value::as_bool) != Some(true)
+    }
 }
 
 /// User-defined type (`struct` / `enum` / `type` alias / opaque
@@ -1011,6 +1030,16 @@ impl ItemMeta {
         self.name.iter().rev().find_map(|seg| match seg {
             NameSeg::Other(v) => v.get("Impl")?.get("Trait")?.as_u64(),
             NameSeg::Ident { .. } => None,
+        })
+    }
+
+    /// True when a name segment is a Charon `PathElem::Impl` (inherent or
+    /// trait). The rendered `name_path` spells that segment `"<Impl>"`;
+    /// consumers that must not scan the rendering read this instead.
+    pub fn has_impl_path_elem(&self) -> bool {
+        self.name.iter().any(|seg| match seg {
+            NameSeg::Other(v) => v.get("Impl").is_some(),
+            NameSeg::Ident { .. } => false,
         })
     }
 
@@ -2540,6 +2569,48 @@ mod tests {
         assert!(is_const_initializer_leaf("anon_const#1"));
         assert!(!is_const_initializer_leaf("closure"));
         assert!(!is_const_initializer_leaf("getindex_w_index"));
+    }
+
+    /// Charon's `Static { is_mut: false }` is the prebuilt-constant
+    /// declaration (`bookkeeper.py immutablevalue`). `static mut` and
+    /// TLS are not.
+    #[test]
+    fn immutable_static_kind_is_the_declaration() {
+        let decl = |kind: Value| {
+            let mut g: GlobalDecl = serde_json::from_value(serde_json::json!({
+                "def_id": 1,
+                "item_meta": {
+                    "name": [{"Ident": ["fixture", 0]}, {"Ident": ["TABLE", 0]}],
+                    "span": {"Deduplicated": 0},
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                }
+            }))
+            .unwrap();
+            g.rest.insert("global_kind".into(), kind);
+            g
+        };
+        assert!(
+            decl(serde_json::json!({
+                "Static": {"is_mut": false, "is_safe": true, "is_thread_local": false}
+            }))
+            .is_immutable_static()
+        );
+        assert!(
+            !decl(serde_json::json!({
+                "Static": {"is_mut": true, "is_safe": true, "is_thread_local": false}
+            }))
+            .is_immutable_static()
+        );
+        assert!(
+            !decl(serde_json::json!({
+                "Static": {"is_mut": false, "is_safe": true, "is_thread_local": true}
+            }))
+            .is_immutable_static()
+        );
+        assert!(!decl(serde_json::json!("NamedConst")).is_immutable_static());
+        assert!(!decl(serde_json::json!("Static")).is_immutable_static());
     }
 
     /// A call to a monomorphized copy reads the copy's instance arguments

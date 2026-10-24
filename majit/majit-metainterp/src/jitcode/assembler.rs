@@ -7552,6 +7552,14 @@ mod tests {
                     bank.map(|kind| (kind, 9usize)),
                     "return slot for {args_r:?} args, bank {bank:?}",
                 );
+                // pyjitpl.py make_result_of_lastop: dest is bytecode[pc-1],
+                // kind is _resulttypes[pc]. Residual CALL helpers have no
+                // BC_INLINE_CALL encoding; resume still needs this pair.
+                assert_eq!(
+                    jitcode.result_slot_at_pc(end),
+                    bank.map(|kind| (kind, 9usize)),
+                    "result_slot_at_pc for {args_r:?} args, bank {bank:?}",
+                );
                 // Canonical `inline_call_r_*`: opcode + descr u16 + R-list
                 // + dest byte for a typed result.
                 let dest_bytes = usize::from(bank.is_some());
