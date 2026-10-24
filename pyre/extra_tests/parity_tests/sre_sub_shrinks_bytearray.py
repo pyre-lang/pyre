@@ -11,7 +11,48 @@
 
 """sub holds the subject's buffer export across the replacement callback."""
 
+import gc
 import re
+
+
+def bytearray_subclass_payload_survives_collect():
+    """A `bytearray` subclass keeps its payload across collect, then drops it."""
+
+    class B(bytearray):
+        pass
+
+    payload = b"x" * 4096
+    items = []
+    i = 0
+    while i < 300:
+        items.append(B(payload))
+        i += 1
+    i = 0
+    while i < 300:
+        if i % 2 == 0:
+            items[i].extend(b"yz")
+        i += 1
+    gc.collect()
+    contents_ok = True
+    i = 0
+    while i < 300:
+        item = items[i]
+        if i % 2 == 0:
+            if len(item) != 4098 or bytes(item) != payload + b"yz":
+                contents_ok = False
+        elif len(item) != 4096 or bytes(item) != payload:
+            contents_ok = False
+        i += 1
+    print(
+        "subclass_payload n=%d even_len=%d odd_len=%d contents_ok=%s"
+        % (len(items), len(items[0]), len(items[1]), contents_ok)
+    )
+    assert contents_ok
+    del items
+    gc.collect()
+
+
+bytearray_subclass_payload_survives_collect()
 
 subject = bytearray(b"aaXaaXaa")
 
