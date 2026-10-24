@@ -9071,14 +9071,11 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "pyre_object".into(),
-                        "gc_hook".into(),
-                        "try_gc_current_object_address".into(),
-                    ],
-                    fun_decl_id: None,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "gc_hook",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -9111,14 +9108,11 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec![
-                        "user".into(),
-                        "gc_hook".into(),
-                        "try_gc_current_object_address".into(),
-                    ],
-                    fun_decl_id: None,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "user",
+                    "gc_hook",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },
@@ -9142,10 +9136,10 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["pyre_object".into(), "try_gc_current_object_address".into()],
-                    fun_decl_id: None,
-                },
+                target: crate::model::CallTarget::function_path([
+                    "pyre_object",
+                    "try_gc_current_object_address",
+                ]),
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
             },

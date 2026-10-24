@@ -29703,6 +29703,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__strlen".to_string()],
                                 fun_decl_id: None,
+                                generic_rust_args: Vec::new(),
                             },
                             args: crate::model::call_args(vec![args[0].clone()]),
                             result_ty: ValueType::Int,
@@ -86097,12 +86098,11 @@ mod tests {
         primitive_float_const, push_cast_ptr_to_int, push_direct_ptradd, push_ptr_to_unsigned_cast,
         scalar_replace_named_struct_aggregates, scalar_to_const_value, shaped_array_parts,
         simplify_lowered_graph, static_key_segments, type_decl_is_closure_env,
-        tyref_aggregate_field_value_type, tyref_array_suffix,
-        tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
-        tyref_is_raw_byte_ptr, tyref_is_raw_struct_value, tyref_positional_aggregate_root,
-        tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
-        tyref_to_attr_value_type, tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
-        tyref_tuple_suffix,
+        tyref_aggregate_field_value_type, tyref_array_suffix, tyref_fn_ptr_input_class_root,
+        tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr,
+        tyref_is_raw_struct_value, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
+        tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type,
+        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
     };
     use crate::flowspace::model::{ConstValue, Variable};
     use crate::model::{
@@ -96937,6 +96937,7 @@ mod tests {
                 CallTarget::FunctionPath {
                     segments,
                     fun_decl_id,
+                    ..
                 } => (*fun_decl_id, segments.clone()),
                 other => panic!("expected a FunDecl call, got {other:?}"),
             };
@@ -97041,6 +97042,7 @@ mod tests {
                 CallTarget::FunctionPath {
                     segments,
                     fun_decl_id,
+                    ..
                 } if segments.last().map(String::as_str) == Some("setitem_str") => {
                     bindings.push((*fun_decl_id, segments.clone()))
                 }

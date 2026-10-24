@@ -2751,7 +2751,7 @@ pub fn call_user_function(
     args: &[PyObjectRef],
 ) -> PyResult {
     let _ = frame;
-    call_user_function_with_ctx(getexecutioncontext(), callable, args)
+    call_user_function_with_ctx(getexecutioncontext(), callable, args, false)
 }
 
 /// Plain interpreter-only user-function call.
