@@ -2400,22 +2400,31 @@ impl WarmEnterState {
         }
     }
 
-    /// Consult the compiled-entry veto for a resolved cell key. The cell's
-    /// greens (`JitCell.__init__` `setattr`) plus the portal reds are what
-    /// the hook inspects (`confirm_enter_jit(*args)`).
+    /// Consult the compiled-entry veto for a resolved cell key.
+    ///
+    /// `live_greens` is this invocation's arguments when the caller holds
+    /// them (`warmstate.py` `maybe_compile_and_run` `confirm_enter_jit(*args)`).
+    /// `None` falls back to the cell's greens (`JitCell.__init__` `setattr`)
+    /// for key-only doors.
     #[inline]
     pub(crate) fn confirm_compiled_entry_for_cell_key(
         &self,
         cell_key: u64,
+        live_greens: Option<&[i64]>,
         green_types: &[GreenType],
         reds: &[Value],
     ) -> bool {
         if self.confirm_enter_jit_ptr.get().is_none() {
             return true;
         }
-        let cell = self.cell_by_key(cell_key);
-        let greens = cell.as_ref().map(|c| c.current_greens());
-        self.confirm_enter_jit_if_available(greens.as_deref(), green_types, reds)
+        let stored;
+        let greens = if let Some(values) = live_greens {
+            Some(values)
+        } else {
+            stored = self.cell_by_key(cell_key).map(|c| c.current_greens());
+            stored.as_deref()
+        };
+        self.confirm_enter_jit_if_available(greens, green_types, reds)
     }
 
     /// `warmspot.py` `make_driverhook_graphs` —
@@ -6243,6 +6252,54 @@ mod tests {
                 Value::Float(1.5),
                 Value::Ref(GcRef(0x2000)),
             ]
+        );
+    }
+
+    /// `confirm_enter_jit(*args)` receives this invocation's greens when
+    /// the caller holds them (`warmstate.py` `maybe_compile_and_run`).
+    ///
+    /// `equal_whatever(Float)` is `f64 ==`, so +0.0 stored and -0.0 live
+    /// share a cell; the hook still sees the live bits.
+    #[test]
+    fn confirm_compiled_entry_prefers_live_greens_over_the_cells_stored_word() {
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        fn record(args: &[Value]) -> bool {
+            SEEN.store(
+                args[0].as_float().to_bits(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            true
+        }
+
+        let pos_bits = 0.0f64.to_bits();
+        let neg_bits = (-0.0f64).to_bits();
+        assert_ne!(pos_bits, neg_bits);
+        let pos = GreenKey::with_types(vec![pos_bits as i64], vec![GreenType::Float]);
+        let mut ws = WarmEnterState::new(3);
+        let token = token_with_compiled_code(&mut ws);
+        let _token = attach_alive_for_key(&mut ws, &pos, token);
+        let cell_key = ws.cell_key_for(&pos).expect("fixture installed the cell");
+        ws.set_confirm_enter_jit(Some(record));
+
+        SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(ws.confirm_compiled_entry_for_cell_key(
+            cell_key,
+            Some(&[neg_bits as i64]),
+            &[GreenType::Float],
+            &[],
+        ));
+        assert_eq!(
+            SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            neg_bits,
+            "Some(live) packs the invocation's greens, not the cell's +0.0"
+        );
+
+        SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(ws.confirm_compiled_entry_for_cell_key(cell_key, None, &[GreenType::Float], &[],));
+        assert_eq!(
+            SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            pos_bits,
+            "None falls back to the cell's stored greens"
         );
     }
 
