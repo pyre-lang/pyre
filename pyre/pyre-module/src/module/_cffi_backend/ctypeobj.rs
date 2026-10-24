@@ -116,8 +116,11 @@ pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.
     /// Quasi-immutable (`size?`): [`set_size`] is the only store.
     pub size: i64,
-    /// Hidden `mutate_size` for `size?`. Holds no GC pointers.
-    pub size_watchers: pyre_object::quasiimmut::QuasiImmutField,
+    /// Hidden `mutate_size` field `rclass.py InstanceRepr._setup_repr`
+    /// synthesizes as `mutate_<name>` for `ctypeobj.py` `"size?"`.
+    ///
+    /// Holds no GC pointers.
+    pub mutate_size: pyre_object::quasiimmut::QuasiImmutField,
     /// `W_CType.name`.  Interpreter-level, as upstream has it: `cname`
     /// wraps it on each read.  Every ctype is memoised and rooted for the
     /// process, so its name is leaked on the same terms.
@@ -182,6 +185,13 @@ pub struct W_CType {
     /// `W_CTypeStructOrUnion._lazy_s` as an index in `ctx.c_struct_unions`.
     pub lazy_sindex: i64,
 }
+
+/// Byte offset of `mutate_size` within [`W_CType`].
+/// `rclass.py InstanceRepr._setup_repr` / `quasiimmut.py get_mutate_field_name`.
+pub const W_CTYPE_MUTATE_SIZE_OFFSET: usize = std::mem::offset_of!(W_CType, mutate_size);
+
+const _: () = assert!(W_CTYPE_MUTATE_SIZE_OFFSET != 0);
+const _: () = assert!(W_CTYPE_MUTATE_SIZE_OFFSET != pyre_object::pyobject::W_CLASS_OFFSET);
 
 impl W_CType {
     /// `W_CType.name`.
@@ -382,7 +392,7 @@ pub fn new_ctype(
 
     W_CType::allocate_stable(W_CType {
         size,
-        size_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+        mutate_size: pyre_object::quasiimmut::QuasiImmutField::new(),
         name: String::leak(name.to_string()),
         name_position,
         kind,
@@ -408,7 +418,7 @@ impl Default for W_CType {
                 w_class: pyre_object::PY_NULL,
             },
             size: -1,
-            size_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_size: pyre_object::quasiimmut::QuasiImmutField::new(),
             name: "",
             name_position: 0,
             kind: KIND_VOID,
@@ -445,7 +455,7 @@ static ROOTED_CTYPES: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(
 pub fn set_size(ct: &mut W_CType, size: i64) {
     let ct_ptr = ct as *mut W_CType;
     unsafe {
-        (*ct_ptr).size_watchers.invalidate_then_store(|| {
+        (*ct_ptr).mutate_size.invalidate_then_store(|| {
             (*ct_ptr).size = size;
         });
     }
@@ -457,7 +467,7 @@ pub fn set_size(ct: &mut W_CType, size: i64) {
 /// `obj` must be a GC-dead `W_CType`, and this must run once.
 pub unsafe fn w_ctype_dealloc(obj: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_CType)).size_watchers.reclaim();
+        (*(obj as *mut W_CType)).mutate_size.reclaim();
     }
 }
 
@@ -1017,4 +1027,30 @@ fn ctype_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let items = (0..count).map(|i| roots.get(base + i)).collect();
     Ok(pyre_object::w_list_new(items))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `quasiimmut.py get_mutate_field_name` / `rclass.py InstanceRepr._setup_repr`
+    /// name the hidden field for `"size?"` `mutate_size`. The generic
+    /// `get_current_qmut_instance` route reads that slot; an offset-0 mint
+    /// would treat `w_class` as the field lock.
+    #[test]
+    fn mutate_size_is_the_size_question_hidden_field_not_the_object_header() {
+        assert_eq!(
+            W_CTYPE_MUTATE_SIZE_OFFSET,
+            std::mem::offset_of!(W_CType, size) + std::mem::size_of::<i64>()
+        );
+        let ct = W_CType::default();
+        assert_eq!(ct.ob.w_class, pyre_object::PY_NULL);
+        let _qmut = ct.mutate_size.get_current_qmut_instance();
+        assert_eq!(
+            ct.ob.w_class,
+            pyre_object::PY_NULL,
+            "get_current_qmut_instance on mutate_size must not treat w_class as the field lock"
+        );
+        assert!(ct.mutate_size.is_installed());
+    }
 }

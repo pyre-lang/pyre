@@ -9119,7 +9119,7 @@ mod tests {
         // `kind` at listed 0 is reused inside the kind-0 STRUCT walk
         // (`heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`),
         // where `kind` is listed after `w_class`, `size`, flattened
-        // `size_watchers`, `name`, and `name_position`. Mint the header
+        // `mutate_size`, `name`, and `name_position`. Mint the header
         // leaf whose listed index is 0.
         let group = majit_ir::descr::publish_borrowed_struct_layout(
             u32::MAX,

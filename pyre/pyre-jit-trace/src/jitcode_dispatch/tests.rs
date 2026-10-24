@@ -5240,6 +5240,53 @@ fn module_dict_strategy_mutated_assembles_jit_force_quasi_immutable_llop() {
 }
 
 #[test]
+fn assembled_w_ctype_mutate_size_quasi_descr_is_the_embedded_field() {
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // with mutate_field `mutate_size` for `ctypeobj.py W_CType.size?`.
+    // Assembler `fielddescrof` must resolve that name to the embedded
+    // `QuasiImmutField` `rclass.py InstanceRepr._setup_repr` synthesizes.
+    // An offset-0 mint sends `get_current_qmut_instance` into the object
+    // header (`w_class` is the lock word).
+    let expected = pyre_module::module::_cffi_backend::ctypeobj::W_CTYPE_MUTATE_SIZE_OFFSET;
+    let mut seen = 0usize;
+    for jc in crate::jitcode_runtime::all_jitcodes() {
+        for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+            if op.key != "record_quasiimmut_field/rdd" {
+                continue;
+            }
+            if op.pc + 6 > jc.code.len() {
+                continue;
+            }
+            let mutate_idx = u16::from_le_bytes([jc.code[op.pc + 4], jc.code[op.pc + 5]]) as usize;
+            match crate::jitcode_runtime::get_descr_by_index(mutate_idx) {
+                Some(majit_jitcode::jitcode::BhDescr::Field {
+                    name,
+                    offset,
+                    owner,
+                    ..
+                }) if name == "mutate_size" => {
+                    seen += 1;
+                    assert_eq!(
+                        *offset, expected,
+                        "{} mutate_size offset {offset} owner={owner} (expected {expected})",
+                        jc.name
+                    );
+                    assert_ne!(*offset, 0);
+                    assert_ne!(*offset, pyre_object::pyobject::W_CLASS_OFFSET);
+                }
+                _ => {}
+            }
+        }
+    }
+    #[cfg(feature = "pyre-module")]
+    assert!(
+        seen > 0,
+        "product translation must assemble at least one W_CType.size? /rdd with mutate_size"
+    );
+    let _ = (seen, expected);
+}
+
+#[test]
 fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
     // intobject.py `_truediv` + `space.newfloat`: the `/` descent walks
     // `int_truediv`, which looks inside `newfloat`.  `fuse_boxing_alloc`
