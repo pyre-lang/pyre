@@ -409,7 +409,8 @@ fn handle_posix_error(result: i64) -> Result<i64, i32> {
 }
 
 /// `rposix.read` (`replace_os_function('read')`). `count < 0` is `EINVAL`
-/// before the buffer is allocated.
+/// before the buffer is allocated. The buffer is `rffi.scoped_alloc_buffer`;
+/// only `got` bytes are copied out.
 #[cfg(unix)]
 #[majit_macros::replace_os_function("read")]
 pub fn read(fd: i32, count: i64) -> Result<Vec<u8>, i32> {
@@ -417,10 +418,9 @@ pub fn read(fd: i32, count: i64) -> Result<Vec<u8>, i32> {
         return Err(libc::EINVAL);
     }
     let n = count as usize;
-    let mut buf = vec![0u8; n];
-    let got = handle_posix_error(unsafe { c_read(fd, buf.as_mut_ptr().cast(), n) } as i64)?;
-    buf.truncate(got as usize);
-    Ok(buf)
+    let buf = crate::rffi::scoped_alloc_buffer::new(n);
+    let got = handle_posix_error(unsafe { c_read(fd, buf.raw.cast(), n) } as i64)?;
+    Ok(buf.str(got as usize))
 }
 
 /// `rposix.write` (`replace_os_function('write')`).

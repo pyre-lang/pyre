@@ -268,12 +268,15 @@ pub fn clock() -> f64 {
 }
 
 /// `rtime.sleep` (`replace_time_function('sleep')`). EINTR from `c_select`
-/// is swallowed; any other saved errno is `OSError`.
+/// is swallowed; any other saved errno is `OSError`. `frac` is
+/// `int(math.fmod(secs, 1.0) * 1000000.)` and must be `>= 0`.
 #[majit_macros::replace_time_function("sleep")]
 pub fn sleep(secs: f64) -> Result<(), i32> {
+    let frac = ((secs % 1.0) * 1_000_000.0) as libc::suseconds_t;
+    assert!(frac >= 0);
     let mut t = TIMEVAL {
         tv_sec: secs as TIME_T,
-        tv_usec: ((secs % 1.0) * 1_000_000.0) as libc::suseconds_t,
+        tv_usec: frac,
     };
     let ret = unsafe {
         c_select(

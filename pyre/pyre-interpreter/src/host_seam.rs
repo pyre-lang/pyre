@@ -256,14 +256,14 @@ pub use crate::host_seam_stub::catch_sandbox_stub;
 pub use crate::host_seam_stub::stub;
 
 /// The sandbox trampoline for `inspector.py raw_os_write`, whose
-/// `_nowrapper=True` declaration deliberately keeps the GIL held.  Heap
+/// `_nowrapper=True` declaration deliberately keeps the GIL held. Heap
 /// dumping calls this while it owns the collector's `&mut MiniMarkGC` and,
-/// when another mutator exists, the stop-the-world guard.  `rposix.write`
-/// releases the GIL around the controller round trip; a waiting mutator can
-/// then acquire it and park at the active STW safepoint while still holding
-/// it, preventing the dump owner from reacquiring the GIL forever.
+/// when another mutator exists, the stop-the-world guard. Protocol I/O is
+/// `ll_write_not_sandboxed` (`sandboxsafe=True`, `_nowrapper=True`); this
+/// private `client::syscall` path stays off `rposix.write` so the dump
+/// owner does not enter a wrapper while holding the collector.
 ///
-/// Keep this boundary private to the collector hook.  Every ordinary host
+/// Keep this boundary private to the collector hook. Every ordinary host
 /// write continues to use `rposix.write`.
 #[cfg(feature = "sandbox")]
 pub fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
@@ -289,6 +289,22 @@ pub fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
 /// Unix builds still go through the same wrapper (the `ll_os.ll_os_getenv`
 /// trampoline under sandbox).
 pub fn getenv(name: &[u8]) -> SeamResult<Option<Vec<u8>>> {
+    #[cfg(feature = "sandbox")]
+    {
+        // `getenv_llimpl` is `Option<Vec<u8>>`; a controller error panics
+        // with `SandboxError` (`rsandbox.reraise_error`). Startup callers
+        // sit outside `catch_sandbox_stub`, so convert here.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            majit_rlib::rposix_environ::getenv_llimpl(name)
+        })) {
+            Ok(value) => Ok(value),
+            Err(payload) => match payload.downcast::<SandboxError>() {
+                Ok(err) => Err((*err).into()),
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+        }
+    }
+    #[cfg(not(feature = "sandbox"))]
     Ok(majit_rlib::rposix_environ::getenv_llimpl(name))
 }
 

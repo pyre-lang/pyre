@@ -251,7 +251,13 @@ impl<T: SandboxLoad> SandboxLoad for Result<T, i32> {
 
     fn from_error(err: SandboxError) -> Self {
         match err {
-            SandboxError::Os(errno) => Err(errno),
+            SandboxError::Os(errno) => {
+                // Native `handle_posix_error` reads the errno `c_*` saved
+                // with `RFFI_SAVE_ERRNO`. The trampoline has no llexternal
+                // wrapper, so store the marshalled errno here.
+                crate::rposix::set_saved_errno(errno);
+                Err(errno)
+            }
             other => std::panic::panic_any(other),
         }
     }

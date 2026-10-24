@@ -543,6 +543,25 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
     ))
 }
 
+/// Catch a trampoline `SandboxError` so launcher startup does not unwind
+/// past `rsandbox.reraise_error`.
+#[cfg(all(unix, feature = "sandbox"))]
+fn catch_sandbox_os<T, F>(f: F) -> Result<T, i32>
+where
+    F: FnOnce() -> Result<T, i32>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => match payload.downcast::<majit_rlib::rsandbox::SandboxError>() {
+            Ok(err) => match *err {
+                majit_rlib::rsandbox::SandboxError::Os(errno) => Err(errno),
+                _ => Err(libc::EIO),
+            },
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
 /// The working directory to seed `sys.path` with. Under sandbox it is read from
 /// the controller (the virtual `/tmp`) through `rposix.getcwd`, so an untrusted
 /// child never learns the trusted parent's real working directory; off sandbox
@@ -551,7 +570,17 @@ fn sys_path_cwd() -> std::path::PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        match majit_rlib::rposix::getcwd() {
+        let got = {
+            #[cfg(feature = "sandbox")]
+            {
+                catch_sandbox_os(|| majit_rlib::rposix::getcwd())
+            }
+            #[cfg(not(feature = "sandbox"))]
+            {
+                majit_rlib::rposix::getcwd()
+            }
+        };
+        match got {
             Ok(bytes) => std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)),
             Err(_) => Path::new(".").to_path_buf(),
         }
@@ -627,7 +656,7 @@ fn read_stdin_source() -> std::io::Result<String> {
     let data = {
         let mut data = Vec::new();
         loop {
-            match majit_rlib::rposix::read(0, 65536) {
+            match catch_sandbox_os(|| majit_rlib::rposix::read(0, 65536)) {
                 Ok(chunk) if chunk.is_empty() => break,
                 Ok(chunk) => data.extend_from_slice(&chunk),
                 Err(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
