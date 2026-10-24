@@ -5193,6 +5193,53 @@ fn sub_jitcode_body_by_index_builds_w_list_append() {
 }
 
 #[test]
+fn module_dict_strategy_mutated_assembles_jit_force_quasi_immutable_llop() {
+    // `celldict.py ModuleDictStrategy.mutated` / `rclass.py
+    // InstanceRepr.hook_setfield`: the `version?` store is preceded by
+    // `jit_force_quasi_immutable(vinst, Const('mutate_version'))`.
+    // `jtransform.py rewrite_op_jit_force_quasi_immutable` turns that
+    // call into `-live-` + `jit_force_quasi_immutable`. Identity is the
+    // `#[jit_llop]` marker on the callee, so this graph must assemble
+    // that llop rather than look inside the native invalidation body.
+    let path = "celldict::ModuleDictStrategy::mutated";
+    let jc = crate::jitcode_runtime::pathed_jitcode(path)
+        .expect("ModuleDictStrategy.mutated must be a discovered jitcode");
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&jc.code).collect();
+    let keys: Vec<&str> = ops.iter().map(|op| op.key).collect();
+    let force = ops
+        .windows(2)
+        .find(|pair| pair[0].key == "live/" && pair[1].key == "jit_force_quasi_immutable/rd")
+        .map(|pair| &pair[1])
+        .unwrap_or_else(|| {
+            panic!("{path} must assemble live/ then jit_force_quasi_immutable/rd; ops={keys:?}")
+        });
+    assert_eq!(
+        force.argcodes, "rd",
+        "{path} jit_force_quasi_immutable must be keyed /rd; ops={keys:?}"
+    );
+    let descr_idx = {
+        let lo = jc.code[force.pc + 2] as u16;
+        let hi = jc.code[force.pc + 3] as u16;
+        (lo | (hi << 8)) as usize
+    };
+    match crate::jitcode_runtime::get_descr_by_index(descr_idx) {
+        Some(majit_jitcode::jitcode::BhDescr::Field { name, owner, .. }) => {
+            assert_eq!(
+                name, "mutate_version",
+                "{path} force descr {descr_idx} must be mutate_version; owner={owner}"
+            );
+            assert_eq!(
+                owner, "celldict::ModuleDictStrategy",
+                "{path} force descr {descr_idx} must be owned by ModuleDictStrategy"
+            );
+        }
+        other => {
+            panic!("{path} force descr {descr_idx} must be Field mutate_version; got {other:?}")
+        }
+    }
+}
+
+#[test]
 fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
     // intobject.py `_truediv` + `space.newfloat`: the `/` descent walks
     // `int_truediv`, which looks inside `newfloat`.  `fuse_boxing_alloc`
