@@ -1595,7 +1595,13 @@ fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession
         pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new("__main__"))
     };
     let canonical = w_globals;
-    let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
+    // PyPy `module.py Module` is an ordinary GC object. The managed twin
+    // matches that, so detaching `sys.modules` can make the module/dict
+    // cycle unreachable. The allocation can collect: the dict is already
+    // on `_root`, and the result is pinned before `set_sys_module`.
+    let main_module =
+        pyre_object::module::w_module_new_aliasing_dict_managed("__main__", canonical);
+    let main_module = pyre_object::gc_roots::pin_root(main_module);
     importing::set_sys_module("__main__", main_module);
 
     let result = (|| -> Result<(), pyre_interpreter::PyError> {
@@ -1604,6 +1610,11 @@ fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession
         runpy_run_module_as_main(canonical, ec_ptr, module, true)?;
         Ok(())
     })();
+    // Drop the launcher pin on `canonical` before `finalize_modules`
+    // collects. `sys.modules` still owns `__main__` until
+    // `release_sys_modules_for_shutdown`; `finalize_runtime` re-pins
+    // `canonical` only until that detach.
+    drop(_root);
 
     let inspect = prompt_requested(run_code);
     if let Err(e) = result {
@@ -2006,8 +2017,53 @@ fn eval_program_in_main(
         }
     };
 
-    let mut frame = match frame {
-        Ok(frame) => frame,
+    // The frame handle's `owner_root` and the extra pin below keep `w_globals`
+    // reachable for the run. Both must die before `finalize_modules` collects,
+    // or a `__main__` global's `__del__` never sees the detached `sys.modules`.
+    // PyPy `executioncontext.py leave` has already popped the frame.
+    let failure = match frame {
+        Ok(mut frame) => {
+            // The frame is a GC object, and the only root that reaches one is the
+            // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
+            // joins when `eval_with_jit` below installs it.  What runs between here
+            // and that call is Python -- the `linecache` registration below -- and can
+            // therefore drive a collection that would reclaim the frame and hand its
+            // storage to the next frame allocation.  RPython keeps a local holding a GC
+            // object alive through the translated shadow stack; publish it explicitly
+            // for the same span.
+            let _main_frame_root = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(
+                &*frame as *const PyFrame as pyre_object::PyObjectRef,
+            );
+
+            // `<string>` names no file, so `linecache._interactive_cache` is the only
+            // place a traceback frame or `inspect.getsource` can reach the command's
+            // text; publish the compiled tree there before it runs. A script keeps its
+            // own path and a stdin run keeps `<stdin>`, which is the same distinction
+            // `__file__` above already makes. Registration is cosmetic, so a failure
+            // must not stop the command.
+            if filename == "<string>"
+                && let Some(source) = source.as_deref()
+            {
+                let _ = repl::register_interactive_code(
+                    canonical,
+                    ec_ptr,
+                    frame.fget_f_code(),
+                    source,
+                    filename,
+                );
+            }
+
+            match eval_with_jit(&mut frame, None) {
+                Ok(result) => {
+                    if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
+                        println!("{}", PyDisplay(result));
+                    }
+                    None
+                }
+                Err(e) => Some(e),
+            }
+        }
         Err(e) => {
             pyre_interpreter::eprint_exception(&e, true);
             if prompt_requested(run_code) {
@@ -2015,44 +2071,6 @@ fn eval_program_in_main(
             }
             end_after_startup_failure(canonical, ec_ptr, 1);
         }
-    };
-    // The frame is a GC object, and the only root that reaches one is the
-    // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
-    // joins when `eval_with_jit` below installs it.  What runs between here
-    // and that call is Python -- the `linecache` registration below -- and can
-    // therefore drive a collection that would reclaim the frame and hand its
-    // storage to the next frame allocation.  RPython keeps a local holding a GC
-    // object alive through the translated shadow stack; publish it explicitly
-    // for the same span.
-    let _main_frame_root = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
-
-    // `<string>` names no file, so `linecache._interactive_cache` is the only
-    // place a traceback frame or `inspect.getsource` can reach the command's
-    // text; publish the compiled tree there before it runs. A script keeps its
-    // own path and a stdin run keeps `<stdin>`, which is the same distinction
-    // `__file__` above already makes. Registration is cosmetic, so a failure
-    // must not stop the command.
-    if filename == "<string>"
-        && let Some(source) = source.as_deref()
-    {
-        let _ = repl::register_interactive_code(
-            canonical,
-            ec_ptr,
-            frame.fget_f_code(),
-            source,
-            filename,
-        );
-    }
-
-    let failure = match eval_with_jit(&mut frame, None) {
-        Ok(result) => {
-            if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
-                println!("{}", PyDisplay(result));
-            }
-            None
-        }
-        Err(e) => Some(e),
     };
     // Asked once the program is done, because the program is one of the things
     // that answers it -- `os.environ["PYTHONINSPECT"] = "1"` is a request for

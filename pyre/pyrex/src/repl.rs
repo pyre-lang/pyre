@@ -111,8 +111,13 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
             // W_DictObject so REPL STORE_NAME writes, `globals()`,
             // `f.__globals__`, and `__main__.__dict__` all share one identity.
             let canonical = w_globals;
+            // PyPy `module.py Module` is an ordinary GC object. The managed twin
+            // matches that, so detaching `sys.modules` can make the module/dict
+            // cycle unreachable. The allocation can collect: the dict is already
+            // on `_root`, and the result is pinned before `set_sys_module`.
             let main_module =
-                pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
+                pyre_object::module::w_module_new_aliasing_dict_managed("__main__", canonical);
+            let main_module = pyre_object::gc_roots::pin_root(main_module);
             importing::set_sys_module("__main__", main_module);
 
             // pylifecycle.c init_importlib before site — see run_source.
@@ -287,6 +292,12 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
     if let Err(err) = repl.save_history(&history_path) {
         eprintln!("pyre: could not save REPL history: {err}");
     }
+
+    // Drop the launcher pin on `canonical` before `finalize_modules`
+    // collects. `sys.modules` still owns `__main__` until
+    // `release_sys_modules_for_shutdown`; `finalize_runtime` re-pins
+    // `canonical` only until that detach.
+    drop(_root);
 
     // `Py_FinalizeEx` runs after the prompt, not before it, and it is the same
     // one the program would have reached had no `-i` followed: `atexit`
