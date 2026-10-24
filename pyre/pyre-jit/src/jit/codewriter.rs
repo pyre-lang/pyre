@@ -2296,9 +2296,11 @@ const VABLE_CODE_FIELD_IDX: u16 = 1;
 const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
 const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
 
-/// `jtransform.py rewrite_op_getfield` virtualizable branch:
-/// `getfield_vable_r` of `[v_inst, descr]`. Shared by the portal
-/// merge-point pycode green and `pyframe.py PyFrame.getcode` on a
+/// `jtransform.py rewrite_op_getfield` virtualizable branch: `-live-`
+/// then `getfield_vable_r` of `[v_inst, descr]`. The `-live-` is the
+/// resume point of a guard `pyjitpl.py MIFrame._nonstandard_virtualizable`
+/// records at the read. Shared by the portal merge-point pycode green,
+/// `pyframe.py PyFrame.get_is_being_profiled` and `PyFrame.getcode` on a
 /// `jump_absolute` back-edge.
 fn emit_vable_getfield_ref(
     graph: &mut super::flow::FunctionGraph,
@@ -2307,6 +2309,7 @@ fn emit_vable_getfield_ref(
     field_idx: u16,
     offset: i64,
 ) -> super::flow::Variable {
+    record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
     emit_graph_op_with_result(
         graph,
         block,
@@ -18985,6 +18988,19 @@ mod tests {
                 .any(|&name| name == "getfield_vable_r"),
             "getcode reads vable pycode before promoting it, got {opnames:?}"
         );
+        // `jtransform.py rewrite_op_getfield`: every vable read follows
+        // its own `-live-`.
+        for (pos, _) in opnames
+            .iter()
+            .enumerate()
+            .filter(|&(_, &name)| name == "getfield_vable_r")
+        {
+            assert_eq!(
+                opnames[pos - 1],
+                "live",
+                "getfield_vable_r at op {pos} must follow a `-live-`, got {opnames:?}"
+            );
+        }
         assert!(
             opnames.contains(&"getfield_gc_i"),
             "non-null arm reads FrameDebugData.is_being_profiled, got {opnames:?}"
