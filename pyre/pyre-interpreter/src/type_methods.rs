@@ -3659,12 +3659,10 @@ pub fn format_with_spec_public(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf,
 }
 
 /// TypeError `descroperation.py format` raises when `__format__` answers a
-/// non-str. Shared by [`call_format_dispatch_w`] and the JIT operator tail.
-pub fn format_must_return_str(w_res: PyObjectRef) -> crate::PyError {
-    crate::PyError::type_error(format!(
-        "__format__ must return a str, not {}",
-        arg_type_name(w_res),
-    ))
+/// non-str: `%T.__format__() must return a str, not %T`. Shared by the JIT
+/// operator tail, which threads `receiver` as the formatted value.
+pub fn format_must_return_str(receiver: PyObjectRef, w_res: PyObjectRef) -> crate::PyError {
+    unsafe { crate::display::dunder_must_return(receiver, "__format__", w_res, "str") }
 }
 
 /// Bind the type-level `__format__` descriptor `meth` to `val` and call it
@@ -3675,15 +3673,15 @@ pub fn format_must_return_str(w_res: PyObjectRef) -> crate::PyError {
 /// through the descriptor protocol.  The spec is passed through untouched so
 /// the type's own `__format__` runs its validation.
 pub(crate) fn call_format_dispatch_w(
-    val: PyObjectRef,
-    meth: PyObjectRef,
-    spec_obj: PyObjectRef,
+    mut val: PyObjectRef,
+    mut meth: PyObjectRef,
+    mut spec_obj: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         let w_type = crate::typedef::r#type(val).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-        let result = crate::baseobjspace::get_and_call_function(meth, val, w_type, &[spec_obj])?;
+        let result = pyre_object::with_roots!(val, meth, spec_obj => crate::baseobjspace::get_and_call_function(meth, val, w_type, &[spec_obj]))?;
         if !pyre_object::is_str(result) {
-            return Err(format_must_return_str(result));
+            return Err(format_must_return_str(val, result));
         }
         // Returned as it came back: `format` (descroperation.py) checks
         // `isinstance_w(w_res, w_unicode)` and hands `w_res` itself on, so a

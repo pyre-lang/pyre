@@ -143,7 +143,13 @@ pub struct Context {
     capath_cache: Mutex<Option<(Vec<CapathStamp>, Arc<Vec<Vec<u8>>>)>>,
     crls: Vec<CertificateRevocationListDer<'static>>,
     cipher_suites: Option<Vec<rustls::SupportedCipherSuite>>,
-    ecdh_curve: Option<EcdhCurve>,
+    /// TLS 1.3 suites from `SSLContext.set_ciphersuites`.  Independent of
+    /// `cipher_suites` so `SSL_CTX_set_cipher_list` cannot drop TLS 1.3 and
+    /// `SSL_CTX_set_ciphersuites` cannot drop TLS 1.2.
+    tls13_cipher_suites: Option<Vec<rustls::SupportedCipherSuite>>,
+    kx_groups: Option<Vec<&'static dyn rustls::crypto::SupportedKxGroup>>,
+    /// Schemes from `SSLContext.set_server_sigalgs` (`SSL_CTX_set1_sigalgs_list`).
+    server_sigalgs: Option<Vec<rustls::SignatureScheme>>,
     certified_keys: Vec<Arc<CertifiedKey>>,
     num_tickets: Option<usize>,
     server_session_store: Arc<dyn rustls::server::StoresServerSessions>,
@@ -161,13 +167,6 @@ pub struct Context {
 type CapathStamp = (std::path::PathBuf, Option<SystemTime>);
 
 static NEXT_CONTEXT_IDENTITY: AtomicUsize = AtomicUsize::new(1);
-
-#[derive(Clone, Copy)]
-enum EcdhCurve {
-    Secp256r1,
-    Secp384r1,
-    X25519,
-}
 
 #[allow(non_upper_case_globals)]
 pub use host_ssl::{
@@ -307,7 +306,9 @@ impl Context {
             capath_cache: Mutex::new(None),
             crls: Vec::new(),
             cipher_suites: None,
-            ecdh_curve: None,
+            tls13_cipher_suites: None,
+            kx_groups: None,
+            server_sigalgs: None,
             certified_keys: Vec::new(),
             num_tickets: None,
             server_session_store: rustls::server::ServerSessionMemoryCache::new(256),
@@ -1582,14 +1583,23 @@ pub fn default_cipher_string() -> String {
     }
 }
 
-#[cfg(feature = "host_env")]
 fn suite_by_openssl_name(name: &str) -> Option<rustls::SupportedCipherSuite> {
     ensure_provider();
-    CryptoExt::get_ext()
-        .all_ciphers_or_default()
-        .iter()
-        .copied()
-        .find(|suite| cipher::describe(suite).name == name)
+    #[cfg(feature = "host_env")]
+    {
+        CryptoExt::get_ext()
+            .all_ciphers_or_default()
+            .iter()
+            .copied()
+            .find(|suite| cipher::describe(suite).name == name)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+            .iter()
+            .copied()
+            .find(|suite| openssl_cipher_name(*suite) == Some(name))
+    }
 }
 
 /// OpenSSL's name for each cipher suite rustls can negotiate.
@@ -1655,8 +1665,8 @@ fn cipher_pattern_matches(suite: rustls::SupportedCipherSuite, pattern: &str) ->
 }
 
 /// Whether the cipher named by [`cipher_name`] survives this context's
-/// `set_ciphers()` filter.  TLS 1.3 suites are never filtered, matching
-/// `SSL_CTX_set_cipher_list`.
+/// `set_ciphers()` / `set_ciphersuites()` filters.  TLS 1.3 suites ignore
+/// `SSL_CTX_set_cipher_list` and follow `SSL_CTX_set_ciphersuites`.
 ///
 /// # Safety
 /// `context` must point to a live [`Context`].
@@ -1664,12 +1674,17 @@ fn cipher_pattern_matches(suite: rustls::SupportedCipherSuite, pattern: &str) ->
 pub unsafe fn context_cipher_enabled(context: *const Context, index: usize) -> bool {
     let context = unsafe { &*context };
     let entry = CIPHERS[index];
+    if entry.protocol == "TLSv1.3" {
+        return match &context.tls13_cipher_suites {
+            Some(selected) => selected
+                .iter()
+                .any(|suite| openssl_cipher_name(*suite) == Some(entry.name)),
+            None => true,
+        };
+    }
     let Some(selected) = &context.cipher_suites else {
         return true;
     };
-    if entry.protocol == "TLSv1.3" {
-        return true;
-    }
     selected
         .iter()
         .any(|suite| openssl_cipher_name(*suite) == Some(entry.name))
@@ -1757,13 +1772,168 @@ pub unsafe fn context_set_ecdh_curve(
 ) -> Result<(), &'static str> {
     #[cfg(feature = "host_env")]
     let _ = cipher::kx_group_by_openssl_name(curve).ok_or("unknown elliptic curve")?;
-    let curve = match curve {
-        "prime256v1" | "secp256r1" => EcdhCurve::Secp256r1,
-        "secp384r1" => EcdhCurve::Secp384r1,
-        "X25519" | "x25519" => EcdhCurve::X25519,
-        _ => return Err("unknown elliptic curve name"),
+    let group = kx_group_from_openssl_list_name(curve).ok_or("unknown elliptic curve name")?;
+    unsafe { (*context).kx_groups = Some(vec![group]) };
+    Ok(())
+}
+
+fn parse_ciphersuites(pattern: &str) -> Result<Vec<rustls::SupportedCipherSuite>, &'static str> {
+    ensure_provider();
+    let mut selected = Vec::new();
+    let mut saw_token = false;
+    for raw in pattern.split(':') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        saw_token = true;
+        let Some(suite) = suite_by_openssl_name(name).filter(|suite| suite.tls13().is_some())
+        else {
+            continue;
+        };
+        if !selected
+            .iter()
+            .any(|known: &rustls::SupportedCipherSuite| known.suite() == suite.suite())
+        {
+            selected.push(suite);
+        }
+    }
+    if selected.is_empty() && (saw_token || !pattern.is_empty()) {
+        return Err("No cipher suite can be selected.");
+    }
+    Ok(selected)
+}
+
+/// `_ssl__SSLContext_set_ciphersuites_impl`: TLS 1.3 suites only.  Unknown
+/// names are skipped when at least one name is valid; an empty string clears
+/// the TLS 1.3 list.
+///
+/// # Safety
+/// `context` must point to a live [`Context`].
+#[inline(never)]
+pub unsafe fn context_set_ciphersuites(
+    context: *mut Context,
+    pattern: &str,
+) -> Result<(), &'static str> {
+    unsafe { (*context).tls13_cipher_suites = Some(parse_ciphersuites(pattern)?) };
+    Ok(())
+}
+
+fn kx_group_from_openssl_list_name(
+    name: &str,
+) -> Option<&'static dyn rustls::crypto::SupportedKxGroup> {
+    let mapped = match name {
+        "P-256" => "prime256v1",
+        "P-384" => "secp384r1",
+        "P-521" => "secp521r1",
+        other => other,
     };
-    unsafe { (*context).ecdh_curve = Some(curve) };
+    #[cfg(feature = "host_env")]
+    {
+        cipher::kx_group_by_openssl_name(mapped).or_else(|| cipher::kx_group_by_openssl_name(name))
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        Some(match mapped {
+            "prime256v1" | "secp256r1" => rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+            "secp384r1" | "prime384v1" => rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+            "X25519" | "x25519" => rustls::crypto::aws_lc_rs::kx_group::X25519,
+            _ => return None,
+        })
+    }
+}
+
+fn parse_groups(
+    list: &str,
+) -> Result<Option<Vec<&'static dyn rustls::crypto::SupportedKxGroup>>, &'static str> {
+    if list.is_empty() {
+        return Ok(None);
+    }
+    let mut selected = Vec::new();
+    let mut saw_token = false;
+    for raw in list.split(':') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        saw_token = true;
+        let group = kx_group_from_openssl_list_name(name).ok_or("unrecognized group")?;
+        if !selected
+            .iter()
+            .any(|known: &&'static dyn rustls::crypto::SupportedKxGroup| {
+                known.name() == group.name()
+            })
+        {
+            selected.push(group);
+        }
+    }
+    if !saw_token {
+        return Err("unrecognized group");
+    }
+    Ok(Some(selected))
+}
+
+/// `_ssl__SSLContext_set_groups_impl`: colon-separated OpenSSL group names.
+///
+/// # Safety
+/// `context` must point to a live [`Context`].
+#[inline(never)]
+pub unsafe fn context_set_groups(context: *mut Context, list: &str) -> Result<(), &'static str> {
+    unsafe { (*context).kx_groups = parse_groups(list)? };
+    Ok(())
+}
+
+fn signature_scheme_from_openssl_name(name: &str) -> Option<rustls::SignatureScheme> {
+    use rustls::SignatureScheme::*;
+    Some(match name {
+        "rsa_pss_rsae_sha256" => RSA_PSS_SHA256,
+        "rsa_pss_rsae_sha384" => RSA_PSS_SHA384,
+        "rsa_pss_rsae_sha512" => RSA_PSS_SHA512,
+        "rsa_pkcs1_sha256" => RSA_PKCS1_SHA256,
+        "rsa_pkcs1_sha384" => RSA_PKCS1_SHA384,
+        "rsa_pkcs1_sha512" => RSA_PKCS1_SHA512,
+        "ecdsa_secp256r1_sha256" => ECDSA_NISTP256_SHA256,
+        "ecdsa_secp384r1_sha384" => ECDSA_NISTP384_SHA384,
+        "ecdsa_secp521r1_sha512" => ECDSA_NISTP521_SHA512,
+        "ed25519" => ED25519,
+        "ed448" => ED448,
+        "rsa_pkcs1_sha1" => RSA_PKCS1_SHA1,
+        "ecdsa_sha1" => ECDSA_SHA1_Legacy,
+        _ => return None,
+    })
+}
+
+fn parse_sigalgs(list: &str) -> Result<Vec<rustls::SignatureScheme>, &'static str> {
+    let mut selected = Vec::new();
+    let mut saw_token = false;
+    for raw in list.split(':') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        saw_token = true;
+        let scheme =
+            signature_scheme_from_openssl_name(name).ok_or("unrecognized signature algorithm")?;
+        if !selected.contains(&scheme) {
+            selected.push(scheme);
+        }
+    }
+    if !saw_token {
+        return Err("unrecognized signature algorithm");
+    }
+    Ok(selected)
+}
+
+/// `_ssl__SSLContext_set_server_sigalgs_impl`: `SSL_CTX_set1_sigalgs_list`.
+///
+/// # Safety
+/// `context` must point to a live [`Context`].
+#[inline(never)]
+pub unsafe fn context_set_server_sigalgs(
+    context: *mut Context,
+    list: &str,
+) -> Result<(), &'static str> {
+    unsafe { (*context).server_sigalgs = Some(parse_sigalgs(list)?) };
     Ok(())
 }
 
@@ -2149,22 +2319,162 @@ fn provider_for_context(context: &Context) -> Arc<rustls::crypto::CryptoProvider
         .expect("the _ssl provider is installed")
         .as_ref()
         .clone();
-    if let Some(selected) = &context.cipher_suites {
-        provider.cipher_suites.retain(|suite| {
-            suite.tls13().is_some()
-                || selected
-                    .iter()
-                    .any(|chosen| chosen.suite() == suite.suite())
-        });
-    }
-    if let Some(curve) = context.ecdh_curve {
-        provider.kx_groups = vec![match curve {
-            EcdhCurve::Secp256r1 => rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
-            EcdhCurve::Secp384r1 => rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
-            EcdhCurve::X25519 => rustls::crypto::aws_lc_rs::kx_group::X25519,
-        }];
+    let tls12: Vec<_> = match &context.cipher_suites {
+        Some(selected) => selected
+            .iter()
+            .copied()
+            .filter(|suite| suite.tls13().is_none())
+            .collect(),
+        None => provider
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|suite| suite.tls13().is_none())
+            .collect(),
+    };
+    let tls13: Vec<_> = match &context.tls13_cipher_suites {
+        Some(selected) => selected.clone(),
+        None => provider
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|suite| suite.tls13().is_some())
+            .collect(),
+    };
+    provider.cipher_suites = tls13.into_iter().chain(tls12).collect();
+    if let Some(groups) = &context.kx_groups {
+        provider.kx_groups = groups.clone();
     }
     Arc::new(provider)
+}
+
+#[derive(Debug)]
+struct RestrictedSigningKey {
+    inner: Arc<dyn rustls::sign::SigningKey>,
+    schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl rustls::sign::SigningKey for RestrictedSigningKey {
+    fn choose_scheme(
+        &self,
+        offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
+        let filtered: Vec<_> = offered
+            .iter()
+            .copied()
+            .filter(|scheme| self.schemes.contains(scheme))
+            .collect();
+        self.inner.choose_scheme(&filtered)
+    }
+
+    fn public_key(&self) -> Option<rustls::pki_types::SubjectPublicKeyInfoDer<'_>> {
+        self.inner.public_key()
+    }
+
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        self.inner.algorithm()
+    }
+}
+
+#[derive(Debug)]
+struct RestrictedVerifySchemes {
+    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl RestrictedVerifySchemes {
+    fn scheme_allowed(&self, signature: &rustls::DigitallySignedStruct) -> bool {
+        self.schemes.contains(&signature.scheme)
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for RestrictedVerifySchemes {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        if !self.scheme_allowed(signature) {
+            return Err(rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
+        self.inner.verify_tls12_signature(message, cert, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        if !self.scheme_allowed(signature) {
+            return Err(rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
+        self.inner.verify_tls13_signature(message, cert, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner
+            .supported_verify_schemes()
+            .into_iter()
+            .filter(|scheme| self.schemes.contains(scheme))
+            .collect()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
+        self.inner.root_hint_subjects()
+    }
+}
+
+fn restrict_server_verifier(
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    schemes: Option<&[rustls::SignatureScheme]>,
+) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
+    match schemes {
+        Some(schemes) => Arc::new(RestrictedVerifySchemes {
+            inner: verifier,
+            schemes: schemes.to_vec(),
+        }),
+        None => verifier,
+    }
+}
+
+fn restrict_certified_keys(
+    keys: Vec<Arc<CertifiedKey>>,
+    schemes: Option<&[rustls::SignatureScheme]>,
+) -> Vec<Arc<CertifiedKey>> {
+    let Some(schemes) = schemes else {
+        return keys;
+    };
+    keys.into_iter()
+        .map(|key| {
+            let mut wrapped = CertifiedKey::new(
+                key.cert.clone(),
+                Arc::new(RestrictedSigningKey {
+                    inner: key.key.clone(),
+                    schemes: schemes.to_vec(),
+                }),
+            );
+            wrapped.ocsp = key.ocsp.clone();
+            Arc::new(wrapped)
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2645,9 +2955,14 @@ fn client_config(
         supported,
     );
     let wants_client_cert = if context.verify_mode == CERT_NONE {
+        let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+            Arc::new(NoCertificateVerification);
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_custom_certificate_verifier(restrict_server_verifier(
+                verifier,
+                context.server_sigalgs.as_deref(),
+            ))
     } else if !roots.is_empty() {
         let mut verifier_builder = rustls::client::WebPkiServerVerifier::builder(roots);
         if !context.crls.is_empty() {
@@ -2682,7 +2997,10 @@ fn client_config(
         }
         builder
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
+            .with_custom_certificate_verifier(restrict_server_verifier(
+                verifier,
+                context.server_sigalgs.as_deref(),
+            ))
     } else {
         builder.with_root_certificates((*roots).clone())
     };
@@ -2712,12 +3030,15 @@ fn server_config(
         .with_protocol_versions(enabled_versions(context)?)
         .map_err(|error| (0, format!("[SSL] invalid TLS configuration: {error}")))?;
     let (roots, root_der, deferred_roots) = verification_roots(context);
-    let certified_keys = completed_certified_keys(
-        context,
-        CertificatePurpose::ServerAuth,
-        roots.clone(),
-        root_der.clone(),
-        supported,
+    let certified_keys = restrict_certified_keys(
+        completed_certified_keys(
+            context,
+            CertificatePurpose::ServerAuth,
+            roots.clone(),
+            root_der.clone(),
+            supported,
+        ),
+        context.server_sigalgs.as_deref(),
     );
     let (wants_server_cert, chain_builder) = if context.verify_mode == CERT_NONE {
         (builder.with_no_client_auth(), None)
@@ -4238,6 +4559,197 @@ mod tests {
             context_free(server_ctx);
             assert_eq!(client_unique, server_unique);
             assert_eq!(client_unique.as_ref().map(Vec::len), Some(12));
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    unsafe fn handshake_pair(
+        client: *mut TlsConnection,
+        server: *mut TlsConnection,
+        server_ctx: *mut Context,
+    ) -> Result<(), String> {
+        unsafe {
+            for _ in 0..32 {
+                let c2s = connection_take_tls(client).map_err(|error| format!("{error:?}"))?;
+                if !c2s.is_empty() {
+                    connection_receive_tls(server, &c2s).map_err(|error| format!("{error:?}"))?;
+                }
+                if connection_waiting_for_server_config(server) {
+                    connection_accept_server(server, server_ctx)
+                        .map_err(|error| format!("{error:?}"))?;
+                }
+                let s2c = connection_take_tls(server).map_err(|error| format!("{error:?}"))?;
+                if !s2c.is_empty() {
+                    connection_receive_tls(client, &s2c).map_err(|error| format!("{error:?}"))?;
+                }
+                if !connection_is_handshaking(client) && !connection_is_handshaking(server) {
+                    return Ok(());
+                }
+                if c2s.is_empty() && s2c.is_empty() {
+                    return Err("handshake stalled".into());
+                }
+            }
+            Err("handshake did not finish".into())
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    unsafe fn tls13_pair(
+        configure: impl Fn(*mut Context, *mut Context),
+    ) -> (
+        *mut Context,
+        *mut Context,
+        *mut TlsConnection,
+        *mut TlsConnection,
+    ) {
+        unsafe {
+            let cert_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../lib-python/3/test/certdata/keycert3.pem");
+            let client_ctx = context_new(PROTOCOL_TLS_CLIENT).unwrap();
+            let server_ctx = context_new(PROTOCOL_TLS_SERVER).unwrap();
+            context_set_verify_mode(client_ctx, CERT_NONE);
+            context_set_check_hostname(client_ctx, false);
+            context_load_cert_chain(server_ctx, &cert_path, &cert_path, None).unwrap();
+            configure(client_ctx, server_ctx);
+            let client =
+                connection_new(client_ctx, false, Some("localhost"), std::ptr::null()).unwrap();
+            let server = connection_new(server_ctx, true, None, std::ptr::null()).unwrap();
+            (client_ctx, server_ctx, client, server)
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    unsafe fn free_pair(
+        client_ctx: *mut Context,
+        server_ctx: *mut Context,
+        client: *mut TlsConnection,
+        server: *mut TlsConnection,
+    ) {
+        unsafe {
+            connection_free(client);
+            connection_free(server);
+            context_free(client_ctx);
+            context_free(server_ctx);
+        }
+    }
+
+    #[test]
+    fn set_ciphersuites_rejects_unknown_only_lists() {
+        let ctx = context_new(PROTOCOL_TLS_CLIENT).unwrap();
+        unsafe {
+            assert_eq!(
+                context_set_ciphersuites(ctx, "XXX").unwrap_err(),
+                "No cipher suite can be selected."
+            );
+            assert_eq!(
+                context_set_ciphersuites(ctx, ":").unwrap_err(),
+                "No cipher suite can be selected."
+            );
+            assert!(context_set_ciphersuites(ctx, "").is_ok());
+            assert!(context_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:XXX").is_ok());
+            assert!(context_cipher_enabled(ctx, 0));
+            context_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256").unwrap();
+            assert!(context_cipher_enabled(ctx, 0));
+            assert!(!context_cipher_enabled(ctx, 1));
+            context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn set_groups_parses_openssl_names() {
+        let ctx = context_new(PROTOCOL_TLS_CLIENT).unwrap();
+        unsafe {
+            assert!(context_set_groups(ctx, "P-256:P-384").is_ok());
+            assert!(context_set_groups(ctx, "secp384r1").is_ok());
+            assert!(context_set_groups(ctx, "prime256v1").is_ok());
+            assert!(context_set_groups(ctx, "").is_ok());
+            assert_eq!(
+                context_set_groups(ctx, "P-256:foo").unwrap_err(),
+                "unrecognized group"
+            );
+            assert_eq!(
+                context_set_groups(ctx, ":").unwrap_err(),
+                "unrecognized group"
+            );
+            context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn set_server_sigalgs_parses_openssl_names() {
+        let ctx = context_new(PROTOCOL_TLS_CLIENT).unwrap();
+        unsafe {
+            assert!(context_set_server_sigalgs(ctx, "rsa_pss_rsae_sha256").is_ok());
+            assert!(context_set_server_sigalgs(ctx, "rsa_pss_rsae_sha384").is_ok());
+            assert_eq!(
+                context_set_server_sigalgs(ctx, "rsa_pss_rsae_sha256:foo").unwrap_err(),
+                "unrecognized signature algorithm"
+            );
+            assert_eq!(
+                context_set_server_sigalgs(ctx, "").unwrap_err(),
+                "unrecognized signature algorithm"
+            );
+            context_free(ctx);
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    #[test]
+    fn ciphersuites_constrain_tls13_handshake() {
+        unsafe {
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                context_set_ciphersuites(client, "TLS_AES_128_GCM_SHA256").unwrap();
+                context_set_ciphersuites(server, "TLS_AES_128_GCM_SHA256").unwrap();
+            });
+            handshake_pair(client, server, server_ctx).unwrap();
+            let (name, _) = connection_cipher(client).expect("negotiated cipher");
+            assert_eq!(name, "TLS_AES_128_GCM_SHA256");
+            free_pair(client_ctx, server_ctx, client, server);
+
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                context_set_ciphersuites(client, "TLS_AES_128_GCM_SHA256").unwrap();
+                context_set_ciphersuites(server, "TLS_AES_256_GCM_SHA384").unwrap();
+            });
+            assert!(handshake_pair(client, server, server_ctx).is_err());
+            free_pair(client_ctx, server_ctx, client, server);
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    #[test]
+    fn groups_constrain_tls13_handshake() {
+        unsafe {
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|_client, server| {
+                context_set_groups(server, "secp384r1").unwrap();
+            });
+            handshake_pair(client, server, server_ctx).unwrap();
+            free_pair(client_ctx, server_ctx, client, server);
+
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                context_set_groups(client, "prime256v1").unwrap();
+                context_set_groups(server, "secp384r1").unwrap();
+            });
+            assert!(handshake_pair(client, server, server_ctx).is_err());
+            free_pair(client_ctx, server_ctx, client, server);
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    #[test]
+    fn server_sigalgs_constrain_tls13_handshake() {
+        unsafe {
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|_client, server| {
+                context_set_server_sigalgs(server, "rsa_pss_rsae_sha384").unwrap();
+            });
+            handshake_pair(client, server, server_ctx).unwrap();
+            free_pair(client_ctx, server_ctx, client, server);
+
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                context_set_server_sigalgs(client, "rsa_pss_rsae_sha256").unwrap();
+                context_set_server_sigalgs(server, "rsa_pss_rsae_sha384").unwrap();
+            });
+            assert!(handshake_pair(client, server, server_ctx).is_err());
+            free_pair(client_ctx, server_ctx, client, server);
         }
     }
 

@@ -1823,7 +1823,7 @@ unsafe fn untraced_mixed_module_function(value: PyObjectRef) -> bool {
 ///
 /// `Ok(None)` is "no builtin by that name", which upstream raises as a
 /// `SystemError`: pyre's importers screen the name against the registry
-/// first, and `_imp.create_builtin` reports it as `None`.
+/// first, and `_imp.create_builtin` reports it as ModuleNotFoundError.
 pub fn getbuiltinmodule(
     name: &str,
     force_init: bool,

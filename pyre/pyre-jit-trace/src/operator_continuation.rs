@@ -127,7 +127,7 @@ impl OperatorTail {
                 'i',
             ),
             OperatorTail::Format => (
-                pyre_interpreter::residual_word_addr!(1, bh_format_tail) as i64,
+                pyre_interpreter::residual_word_addr!(2, bh_format_tail) as i64,
                 'r',
             ),
         }
@@ -139,6 +139,11 @@ impl OperatorTail {
 /// it so a post-return guard can carry the result already in this slot.
 const DUNDER_RESULT_REG: u16 = 0;
 
+/// The formatted value. Format's resume `-live-` names it next to the
+/// dunder result so `descroperation.py format` can build
+/// `%T.__format__() must return a str, not %T`.
+const RECEIVER_REG: u16 = 1;
+
 /// The operator's finished answer, in whichever bank [`OperatorTail::tail_call`]
 /// names.
 const ANSWER_REG: u16 = 0;
@@ -146,6 +151,14 @@ const ANSWER_REG: u16 = 0;
 /// Callee operand of the never-decoded `inline_call`.  See the module doc:
 /// `_setup_return_value_r` only reads the last operand as the dest register.
 const PLACEHOLDER_CALLEE: u16 = 0;
+
+/// Live ref colors at the resume `-live-`, in the order `boxes` stores them.
+fn resume_live_r(tail: OperatorTail) -> &'static [u8] {
+    match tail {
+        OperatorTail::Format => &[DUNDER_RESULT_REG as u8, RECEIVER_REG as u8],
+        _ => &[DUNDER_RESULT_REG as u8],
+    }
+}
 
 /// `operation.py len` after `_len`: `space.index` on what `__len__` returned,
 /// then `_check_len_result` on that, and the machine length re-boxed.
@@ -189,11 +202,15 @@ pub extern "C" fn bh_truth_bool_tail(w_res: pyre_object::PyObjectRef) -> i64 {
 /// other box is the TypeError `call_format_dispatch_w` builds. A guard
 /// inside the inlined `__format__` resumes here so that check, not the raw
 /// dunder return, is what the FORMAT_WITH_SPEC result register receives.
-pub extern "C" fn bh_format_tail(w_res: pyre_object::PyObjectRef) -> i64 {
+/// `receiver` is the formatted value, the `self` of the inlined `__format__`.
+pub extern "C" fn bh_format_tail(
+    w_res: pyre_object::PyObjectRef,
+    receiver: pyre_object::PyObjectRef,
+) -> i64 {
     if !w_res.is_null() && unsafe { pyre_object::is_str(w_res) } {
         return w_res as i64;
     }
-    let err = pyre_interpreter::type_methods::format_must_return_str(w_res);
+    let err = pyre_interpreter::type_methods::format_must_return_str(receiver, w_res);
     use majit_ir::helper_fnaddr::ResidualError;
     err.publish_residual();
     0
@@ -251,7 +268,14 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
 
     // Never decoded; present so `_setup_return_value_r` can read
     // `code[position-1]` as the dest register. See the module doc.
-    builder.inline_call_r_r(PLACEHOLDER_CALLEE, &[], Some(DUNDER_RESULT_REG));
+    // Format also names caller r1, the formatted receiver, as an argument
+    // so the shared jitcode allocates that register; the instruction never
+    // runs. The callee slot is positional 0 (`bhimpl_inline_call_*`).
+    let inline_args: &[(u16, u16)] = match tail {
+        OperatorTail::Format => &[(RECEIVER_REG, 0)],
+        _ => &[],
+    };
+    builder.inline_call_r_r(PLACEHOLDER_CALLEE, inline_args, Some(DUNDER_RESULT_REG));
 
     let resume_pc = builder.current_pos();
     // `-live-` operands are 2-byte offsets into the ONE shared
@@ -260,27 +284,47 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
     //
     // A post-return guard (`GuardClass` / nonnegative `GuardTrue`) resumes
     // HERE with the dunder result already in r0, so that register is live
-    // at the resume `-live-`. An in-dunder abort still fills the slot
-    // through `_setup_return_value_r` (`blackhole.py`); the residual's own
-    // `-live-` stays empty: a failing `GUARD_NO_EXCEPTION` carries the
-    // exception.
+    // at the resume `-live-`. Format also keeps r1 live, the formatted
+    // value `descroperation.py format` names in the TypeError. An in-dunder
+    // abort still fills r0 through `_setup_return_value_r` (`blackhole.py`);
+    // the residual's own `-live-` stays empty: a failing `GUARD_NO_EXCEPTION`
+    // carries the exception.
     let live_empty = crate::state::intern_liveness(&[], &[], &[])?;
-    let live_at_resume = crate::state::intern_liveness(&[], &[DUNDER_RESULT_REG as u8], &[])?;
+    let live_at_resume = crate::state::intern_liveness(&[], resume_live_r(tail), &[])?;
     let live_patch = builder.live_placeholder();
     builder.patch_live_offset(live_patch, live_at_resume);
 
     let (funcptr, result_type) = tail.tail_call();
+    let (arg_classes, args) = match tail {
+        OperatorTail::Format => (
+            "rr",
+            vec![
+                JitCallArg {
+                    kind: majit_metainterp::jitcode::JitArgKind::Ref,
+                    reg: DUNDER_RESULT_REG,
+                },
+                JitCallArg {
+                    kind: majit_metainterp::jitcode::JitArgKind::Ref,
+                    reg: RECEIVER_REG,
+                },
+            ],
+        ),
+        _ => (
+            "r",
+            vec![JitCallArg {
+                kind: majit_metainterp::jitcode::JitArgKind::Ref,
+                reg: DUNDER_RESULT_REG,
+            }],
+        ),
+    };
     let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
-        // One `Ref` argument — the box the dunder returned — and the result
-        // bank the caller's own call-result register lives in.
-        arg_classes: "r".to_string(),
+        // Len / Truth: one `Ref` argument, the box the dunder returned.
+        // Format: that box and the formatted receiver (`descroperation.py
+        // format`). The result bank is the caller's own call-result register.
+        arg_classes: arg_classes.to_string(),
         result_type,
         ..Default::default()
     };
-    let args = [JitCallArg {
-        kind: majit_metainterp::jitcode::JitArgKind::Ref,
-        reg: DUNDER_RESULT_REG,
-    }];
     match result_type {
         'r' => {
             builder.residual_call_ref_canonical_typed_args(funcptr, &args, calldescr, ANSWER_REG);
@@ -391,13 +435,14 @@ mod tests {
     }
 
     /// Every tail's resume `-live-` names r0 so a post-return guard can
-    /// carry the dunder result. An in-dunder abort still fills that slot
-    /// through `_setup_return_value_r`.
+    /// carry the dunder result. Format also names r1, the formatted
+    /// receiver. An in-dunder abort still fills r0 through
+    /// `_setup_return_value_r`.
     #[test]
     fn every_resume_pc_liveness_names_the_dunder_result() {
-        let with_r0 = crate::state::intern_liveness(&[], &[DUNDER_RESULT_REG as u8], &[])
-            .expect("r0 liveness interned") as usize;
         for tail in OperatorTail::ALL {
+            let expected = crate::state::intern_liveness(&[], resume_live_r(tail), &[])
+                .expect("resume liveness interned") as usize;
             let Some((index, resume_pc)) = level(tail) else {
                 continue;
             };
@@ -406,7 +451,10 @@ mod tests {
             let offset = payload
                 .jitcode
                 .get_live_vars_info(resume_pc, crate::state::op_live());
-            assert_eq!(offset, with_r0, "{tail:?}: resume-pc liveness must name r0",);
+            assert_eq!(
+                offset, expected,
+                "{tail:?}: resume-pc liveness must match the tail's live refs",
+            );
         }
     }
 
@@ -466,7 +514,8 @@ mod tests {
     fn the_format_tail_requires_a_str() {
         let cell = &majit_metainterp::blackhole::BH_LAST_EXC_VALUE;
         cell.with(|c| c.set(0));
-        let answer = bh_format_tail(pyre_object::w_str_new("s"));
+        let receiver = pyre_object::w_int_new(0);
+        let answer = bh_format_tail(pyre_object::w_str_new("s"), receiver);
         assert_eq!(cell.with(|c| c.get()), 0, "a str must not raise");
         let answer = answer as pyre_object::PyObjectRef;
         assert!(
@@ -474,7 +523,7 @@ mod tests {
             "`format` hands the str box on, so a subclass keeps its type",
         );
 
-        assert_eq!(bh_format_tail(pyre_object::w_int_new(42)), 0);
+        assert_eq!(bh_format_tail(pyre_object::w_int_new(42), receiver), 0);
         assert_ne!(
             cell.with(|c| c.get()),
             0,

@@ -1124,6 +1124,9 @@ impl FreshMallocs {
                     | OpKind::NewWithVtable { .. }
                     | OpKind::NewArray { .. }
                     | OpKind::NewArrayClear { .. } => continue,
+                    // The allocator Call is that `malloc` before
+                    // `jtransform.py rewrite_op_malloc` lowers it to `new`.
+                    OpKind::Call { target, .. } if is_lltype_malloc_target(target) => continue,
                     // `cast_pointer` / `same_as`.
                     OpKind::UnaryOp { op, operand, .. }
                         if (op == "cast_pointer" || op == "same_as")
@@ -10504,6 +10507,11 @@ impl CallControl {
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
                                 self, target,
                             ) => {}
+                        // `malloc` is a simple operation
+                        // (`RandomEffectsAnalyzer.analyze_simple_operation`
+                        // is False). Walking the GC helper would publish
+                        // its body as random effects of the allocator.
+                        OpKind::Call { target, .. } if is_lltype_malloc_target(target) => {}
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
                                 Some(p) => p,
@@ -11485,6 +11493,26 @@ fn is_rposix_errno_helper(path: &CallPath) -> bool {
     )
 }
 
+/// `lltype.malloc` / `malloc_typed` / `malloc_typed_managed` /
+/// `malloc_typed_stable` is the `malloc` operation `FreshMallocs.__init__`
+/// and `WriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`) key
+/// on. The Call spelling is that allocator before `rewrite_op_malloc`
+/// (`jtransform.py`) lowers it to `new` / `new_with_vtable`.
+fn is_lltype_malloc_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
+        return false;
+    }
+    let leaf = crate::front::clause_spec::unspecialized_leaf(&segments[segments.len() - 1]);
+    let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+    matches!(
+        leaf,
+        "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+    )
+}
+
 pub(crate) fn is_dont_look_inside_residual_helper(path: &CallPath) -> bool {
     matches!(
         path.last_segment(),
@@ -11610,6 +11638,13 @@ impl CallControl {
                             self, target,
                         ) =>
                     {
+                        ReadWriteEffects::bottom_result()
+                    }
+                    // `WriteAnalyzer.analyze_simple_operation`
+                    // (`writeanalyze.py`) answers `empty_set` for `malloc`.
+                    // Recursing into the GC helper would union its field
+                    // writes into the allocating function.
+                    OpKind::Call { target, .. } if is_lltype_malloc_target(target) => {
                         ReadWriteEffects::bottom_result()
                     }
                     OpKind::Call { target, .. } => match self.target_to_path(target) {
@@ -24126,6 +24161,101 @@ mod tests {
         let (key, operand) = set.first().unwrap();
         assert_eq!(key.tag, RwTag::Struct);
         assert!(matches!(operand, RwOperand::Field { name, .. } if name == "c"));
+    }
+
+    /// `FreshMallocs.__init__` / `WriteAnalyzer.analyze_simple_operation`
+    /// (`writeanalyze.py`): a `malloc` Call is the allocation operation,
+    /// not a graph to recurse into. Walking the allocator would publish
+    /// its internal writes as the caller's (`effectinfo_from_writeanalyze`).
+    #[test]
+    fn readwrite_skips_writes_into_malloc_typed_managed_call() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+
+        let mut malloc_graph = FunctionGraph::new("malloc_typed_managed");
+        let malloc_entry = malloc_graph.startblock;
+        let malloc_arg = malloc_graph.alloc_value_var();
+        malloc_graph.push_inputarg_var(malloc_entry, malloc_arg.clone());
+        malloc_graph.push_op_var(
+            malloc_entry,
+            OpKind::FieldWrite {
+                base: malloc_arg.clone(),
+                field: crate::model::FieldDescriptor::new("leaked", Some("Nursery".to_string())),
+                value: LinkArg::Value(malloc_arg.clone()),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        malloc_graph.set_return(malloc_entry, Some(malloc_arg));
+        cc.register_function_graph(
+            CallPath::from_segments(["pyre_object", "lltype", "malloc_typed_managed"]),
+            malloc_graph,
+        );
+
+        let mut graph = FunctionGraph::new("make_carrier");
+        let entry = graph.startblock;
+        let fresh = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_object",
+                        "lltype",
+                        "malloc_typed_managed",
+                    ]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: fresh.clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "kind",
+                    Some("PyErrorObject".to_string()),
+                ),
+                value: LinkArg::Value(fresh.clone()),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(entry, Some(fresh));
+        cc.register_function_graph(CallPath::from_segments(["make_carrier"]), graph);
+        cc.find_all_graphs_for_tests();
+
+        let effects = rw_of(&cc, &mut cache, "make_carrier");
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("malloc-call writes are not top");
+        };
+        assert!(
+            set.is_empty(),
+            "allocator writes must not leak into the malloc caller: {set:?}"
+        );
+
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["make_carrier"])),
+            Vec::new(),
+            Type::Ref,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_ne!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::RandomEffects
+        );
+        assert!(!descriptor.extra_info.has_random_effects());
+        assert!(
+            descriptor
+                .extra_info
+                ._write_descrs_fields
+                .as_ref()
+                .is_some_and(|v| v.is_empty())
+        );
     }
 
     /// Two structs spelled with one owner name are two `T`s: each keeps its

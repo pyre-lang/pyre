@@ -84,7 +84,7 @@ assert refusal(lambda: reconstruct(array.array, "i", 0, 1)) == (
     "fourth argument should be bytes, not int"
 )
 assert refusal(lambda: reconstruct(array.array, b"i", 0, b"")) == (
-    "_array_reconstructor() argument 2 must be a unicode character, not bytes"
+    "_array_reconstructor() argument 2 must be str, not bytes"
 )
 assert refusal(lambda: reconstruct(int, "i", 0, b"")) == "int is not a subtype of array.array"
 assert reconstruct(array.array, "b", 1, b"\x01\x02").tolist() == [1, 2]

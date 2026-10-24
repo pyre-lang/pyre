@@ -500,11 +500,12 @@ fn scanner_parse_array(
         .get(byte_index)
         == Some(&b']')
     {
-        return Ok((
+        return apply_array_hook(
+            gc_roots::shadow_stack_get(slot),
             gc_roots::shadow_stack_get(slot + 3),
             char_index + 1,
             byte_index + 1,
-        ));
+        );
     }
 
     loop {
@@ -576,7 +577,31 @@ fn scanner_parse_array(
             }
         }
     }
-    Ok((gc_roots::shadow_stack_get(slot + 3), char_index, byte_index))
+    apply_array_hook(
+        gc_roots::shadow_stack_get(slot),
+        gc_roots::shadow_stack_get(slot + 3),
+        char_index,
+        byte_index,
+    )
+}
+
+fn apply_array_hook(
+    self_obj: PyObjectRef,
+    mut result: PyObjectRef,
+    char_index: usize,
+    byte_index: usize,
+) -> Result<(PyObjectRef, usize, usize), PyError> {
+    let hook = W_Scanner::from_obj(self_obj)
+        .expect("Scanner payload")
+        .array_hook;
+    if unsafe { pyre_object::is_none(hook) } {
+        Ok((result, char_index, byte_index))
+    } else {
+        let hooked = pyre_object::with_roots!(result => {
+            pyre_interpreter::call::call_function_impl_result(hook, &[result])
+        })?;
+        Ok((hooked, char_index, byte_index))
+    }
 }
 
 fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyResult {
@@ -624,6 +649,7 @@ pub struct W_Scanner {
     parse_constant: PyObjectRef,
     object_hook: PyObjectRef,
     object_pairs_hook: PyObjectRef,
+    array_hook: PyObjectRef,
 }
 
 mod scanner_class {
@@ -658,6 +684,10 @@ mod scanner_class {
         #[getter]
         fn object_pairs_hook(&self) -> PyObjectRef {
             self.object_pairs_hook
+        }
+        #[getter]
+        fn array_hook(&self) -> PyObjectRef {
+            self.array_hook
         }
     }
 }
@@ -954,7 +984,9 @@ fn encode_value(
             return with_marker(self_obj, obj, |self_obj, obj| {
                 encode_sequence(self_obj, obj, level)
             });
-        } else if is_instance(obj, &pyre_object::DICT_TYPE) {
+        } else if is_instance(obj, &pyre_object::DICT_TYPE)
+            || is_instance(obj, &pyre_object::FROZENDICT_TYPE)
+        {
             return with_marker(self_obj, obj, |self_obj, obj| {
                 encode_dict(self_obj, obj, level)
             });
@@ -1333,6 +1365,7 @@ fn make_scanner_impl(context: PyObjectRef) -> PyResult {
         "parse_constant",
         "object_hook",
         "object_pairs_hook",
+        "array_hook",
     ] {
         let value =
             pyre_interpreter::baseobjspace::getattr_str(gc_roots::shadow_stack_get(slot), name)?;
@@ -1350,6 +1383,7 @@ fn make_scanner_impl(context: PyObjectRef) -> PyResult {
         parse_constant: gc_roots::shadow_stack_get(slot + 4),
         object_hook: gc_roots::shadow_stack_get(slot + 5),
         object_pairs_hook: gc_roots::shadow_stack_get(slot + 6),
+        array_hook: gc_roots::shadow_stack_get(slot + 7),
     }))
 }
 

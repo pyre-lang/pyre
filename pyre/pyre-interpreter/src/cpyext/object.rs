@@ -408,7 +408,7 @@ pub unsafe extern "C" fn PyObject_Bytes(object: *mut CPyObject) -> *mut CPyObjec
 
 /// `object.py:197-202` — the exact-`bytes` identity, then `invoke_bytes_method`,
 /// then `PyBytes_FromObject`.
-fn bytes_of_object(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+fn bytes_of_object(mut object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     if unsafe {
         pyre_object::pyobject::is_exact_type(object, &pyre_object::bytesobject::BYTES_TYPE)
     } {
@@ -418,13 +418,13 @@ fn bytes_of_object(object: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     // returned unmodified, a `bytes` subclass included.
     if let Some(method) = unsafe { crate::baseobjspace::lookup(object, "__bytes__") } {
         let w_type = crate::typedef::r#type(object).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
-        let answer =
-            unsafe { crate::baseobjspace::get_and_call_function(method, object, w_type, &[]) }?;
+        let answer = unsafe {
+            pyre_object::with_roots!(object => crate::baseobjspace::get_and_call_function(method, object, w_type, &[]))
+        }?;
         if !unsafe { pyre_object::bytesobject::is_bytes(answer) } {
-            return Err(crate::PyError::type_error(format!(
-                "__bytes__ returned non-bytes (type {})",
-                crate::type_methods::arg_type_name(answer)
-            )));
+            return Err(unsafe {
+                crate::display::dunder_must_return(object, "__bytes__", answer, "bytes")
+            });
         }
         return Ok(answer);
     }

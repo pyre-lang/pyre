@@ -63,7 +63,9 @@ class defaultdict(dict):
     __copy__ = copy
 
     def __or__(self, other):
-        if not isinstance(other, dict):
+        # `defdict_or` admits the other operand through `PyAnyDict_Check`
+        # (a `dict` or a `frozendict`).
+        if not isinstance(other, (dict, frozendict)):
             return NotImplemented
         new = type(self)(self.default_factory)
         new.update(self)
@@ -71,7 +73,7 @@ class defaultdict(dict):
         return new
 
     def __ror__(self, other):
-        if not isinstance(other, dict):
+        if not isinstance(other, (dict, frozendict)):
             return NotImplemented
         new = type(self)(self.default_factory)
         new.update(other)

@@ -1135,7 +1135,7 @@ pub(crate) fn helper_resume_reaches_blocker(
             jitcode.code.as_slice(),
             jitcode.num_regs_i(),
             jitcode.constants_i.as_slice(),
-            |descr_index, _caller_effect| {
+            |descr_index, _caller_effect, _entry_lens| {
                 descrs
                     .at(descr_index)
                     .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
@@ -1316,7 +1316,7 @@ fn collect_descent_effect_aware_blockers(
         jitcode.code.as_slice(),
         jitcode.num_regs_i(),
         jitcode.constants_i.as_slice(),
-        |descr_index, caller_effect| {
+        |descr_index, caller_effect, _entry_lens| {
             let callee = descrs
                 .at(descr_index)
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
@@ -1510,7 +1510,9 @@ struct DescentPoint {
 
 /// True when a funcbox constant names a residual
 /// `do_residual_call`'s `provably_side_effect_free` already spares by
-/// address: a re-runnable bookkeeping helper or a root-bracket one.
+/// address: a re-runnable bookkeeping helper, a root-bracket one, or a
+/// `PyError` materialisation (`pyerror_to_exc_object` and the fused
+/// `pyerror_*_to_exc_object` constructors).
 ///
 /// The scan asks this of a constant where the walk asks it of an executed
 /// call.  They have to agree — a body the scan calls effectful and the walk
@@ -1518,6 +1520,7 @@ struct DescentPoint {
 fn effect_free_residual_fnaddr(fnaddr: i64) -> bool {
     pyre_interpreter::is_rewindable_root_bracket_residual_i64(fnaddr)
         || pyre_interpreter::is_rerunnable_bookkeeping_residual(fnaddr as usize)
+        || residual_call::is_rewindable_exc_materialize_residual(fnaddr)
 }
 
 /// Whether stepping `opname` applies an effect the walk would have to undo.
@@ -1638,6 +1641,61 @@ fn write_set_is_known_empty<T>(raw: &Option<Vec<T>>, bits: &Option<Vec<u8>>) -> 
             .as_ref()
             .is_some_and(|b| b.iter().all(|&byte| byte == 0)),
     }
+}
+
+/// The `R` varlist of an `inline_call_*`, or `None` when the op carries none.
+///
+/// Generated `__majit_wrap_*` gateways are identity trampolines:
+/// `inline_call <body> R[0]`.  The wrapper's r0 is the call site's argument
+/// array, so a known length on that color is the callee's r0 length too.
+fn inline_call_ref_varlist<'a>(
+    code: &'a [u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+) -> Option<&'a [u8]> {
+    if !op.opname.starts_with("inline_call") {
+        return None;
+    }
+    let mut cursor = op.pc + 1;
+    let mut chars = op.argcodes.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'L' | 'd' | 'j' => cursor += 2,
+            'I' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
+            'R' => {
+                let n = *code.get(cursor)? as usize;
+                cursor += 1;
+                return code.get(cursor..cursor + n);
+            }
+            '>' => {
+                chars.next()?;
+                cursor += 1;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Entry array-length facts an identity trampoline forwards into its callee.
+///
+/// Only `R` varlist `[0]` maps the caller's r0 onto the callee's r0.  A
+/// `call_once` `R[3, 1]` or `iter` `R[3]` would lie if it inherited the
+/// wrapper's r0 length.
+fn identity_trampoline_entry_array_length(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    known_array_len_r: &[Option<usize>],
+) -> Option<(usize, usize)> {
+    let regs = inline_call_ref_varlist(code, op)?;
+    if !matches!(regs, [0]) {
+        return None;
+    }
+    known_array_len_r
+        .first()
+        .copied()
+        .flatten()
+        .map(|len| (0, len))
 }
 
 /// Whether `info` is the static form of a residual the walk would not have
@@ -1873,9 +1931,9 @@ fn summarize_descent_blockers_cached(
 }
 
 /// [`summarize_descent_blockers`] with concrete facts known at the entry of
-/// the top body.  Callee facts are not guessed: without mapping an
-/// `inline_call_*` varlist into the callee banks, recursive bodies use their
-/// ordinary conservative summaries.
+/// the top body.  An identity trampoline (`inline_call_*` whose R varlist is
+/// exactly `[0]`) forwards a known r0 array length into the callee; every
+/// other callee keeps the fact-free summary.
 fn summarize_descent_blockers_with_entry(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
@@ -1930,11 +1988,19 @@ fn summarize_descent_blockers_with_entry_inner(
         jitcode.code.as_slice(),
         jitcode.num_regs_i(),
         jitcode.constants_i.as_slice(),
-        |descr_index, _caller_effect| {
-            descrs
+        |descr_index, _caller_effect, entry_lens| {
+            let callee = descrs
                 .at(descr_index)
-                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                .map(|callee| summarize_descent_blockers_cached(callee, seen, cycle_hits))
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
+            match entry_lens {
+                [] => Some(summarize_descent_blockers_cached(callee, seen, cycle_hits)),
+                // Nested identity-trampoline facts stay on this `seen` path.
+                // The entry-length OnceLock starts an empty `seen`, so an
+                // A → B → A trampoline would reenter A's in-progress slot.
+                other => Some(summarize_descent_blockers_with_entry_inner(
+                    callee, seen, other, cycle_hits,
+                )),
+            }
         },
         &mut |_blocker, _effect| true,
         &mut residual_call_is_effect_free,
@@ -1966,7 +2032,7 @@ pub(crate) fn summarize_body_blockers(
         code,
         num_regs_i,
         constants_i,
-        |descr_index, _caller_effect| callee_summary(descr_index),
+        |descr_index, _caller_effect, _entry_lens| callee_summary(descr_index),
         &mut |_blocker, _effect| true,
         &mut |_descr_index| false,
         &mut |_descr_index| None,
@@ -1987,6 +2053,10 @@ pub(crate) fn summarize_body_blockers(
 /// `inline_call`, which the summary itself does not need — it folds the two
 /// cases through `blocker_after_effect.or(blocker_effect_free)` — but which a
 /// walk descending into the callee needs to classify what it finds there.
+/// The third argument is the entry array-length facts an identity trampoline
+/// forwards (`R` varlist exactly `[0]` with a known r0 length); production
+/// uses those to scan the callee path-sensitively, and a fact-free callee
+/// receives an empty slice.
 ///
 /// `call_effect_free` answers a `residual_call_*` op's descr index with
 /// whether that call is exempt from the effectful reading
@@ -2004,7 +2074,7 @@ pub(crate) fn summarize_body_blockers_with(
     code: &[u8],
     num_regs_i: usize,
     constants_i: &[i64],
-    callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
+    callee_summary: impl FnMut(usize, bool, &[(usize, usize)]) -> Option<DescentBlockerSummary>,
     on_blocker: &mut dyn FnMut(i64, bool) -> bool,
     call_effect_free: &mut dyn FnMut(usize) -> bool,
     switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
@@ -2034,7 +2104,7 @@ fn summarize_body_blockers_from(
     code: &[u8],
     num_regs_i: usize,
     constants_i: &[i64],
-    mut callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
+    mut callee_summary: impl FnMut(usize, bool, &[(usize, usize)]) -> Option<DescentBlockerSummary>,
     on_blocker: &mut dyn FnMut(i64, bool) -> bool,
     call_effect_free: &mut dyn FnMut(usize) -> bool,
     switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
@@ -2196,16 +2266,22 @@ fn summarize_body_blockers_from(
             // index into the descriptor pool, naming the callee JitCode.
             let descr_index = code.get(d.pc + 1).copied().unwrap_or(0) as usize
                 | ((code.get(d.pc + 2).copied().unwrap_or(0) as usize) << 8);
+            let trampoline_one =
+                identity_trampoline_entry_array_length(code, &d, &known_array_len_r);
+            let trampoline_entry: &[(usize, usize)] = match &trampoline_one {
+                Some(pair) => std::slice::from_ref(pair),
+                None => &[],
+            };
             if !resumed {
                 // A callee entered before the resume point already ran in the
                 // trace; its section, if any, is counted on its own.
-                if callee_summary(descr_index, effect)
+                if callee_summary(descr_index, effect, trampoline_entry)
                     .is_some_and(|callee| callee.may_execute_effect)
                 {
                     effect = true;
                     summary.first_effect_pc.get_or_insert(d.pc);
                 }
-            } else if let Some(callee) = callee_summary(descr_index, effect) {
+            } else if let Some(callee) = callee_summary(descr_index, effect, trampoline_entry) {
                 // Entering with an effect behind us turns every blocker the
                 // callee holds into one that cannot be rewound.
                 let after = if effect {
@@ -8788,11 +8864,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Every reason `latch_operator_tail_return` can refuse (mirror, paused
     // parents, this caller, the tail parent, blackhole preflight) is known
     // here. Decline to the residual CALL before the dunder body runs.
+    // Format threads the formatted value — `__format__`'s `self` — so the
+    // tail can raise `descroperation.py format`'s `%T.__format__()` TypeError.
+    let format_receiver = match operator_tail {
+        Some(crate::operator_continuation::OperatorTail::Format) => callee_args.first().copied(),
+        _ => None,
+    };
     if let Some(tail) = operator_tail
         && !super::residual_call::can_latch_operator_tail_return(
             ctx,
             &precomputed_parent_frame,
             tail,
+            format_receiver,
         )
     {
         return resolved_inline_decline(op.pc, line!());
@@ -10384,7 +10467,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if let Some(operator_tail) = operator_tail
             && callee_frame_materialized_has_resume
         {
-            let Some(tail) = super::operator_continuation_parent_frame(operator_tail) else {
+            let Some(tail) =
+                super::operator_continuation_parent_frame(operator_tail, format_receiver)
+            else {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             };
             parents.push(tail);
@@ -11053,6 +11138,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             operator_tail_caller.as_ref(),
                             tail,
                             value,
+                            format_receiver,
                         );
                     }
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11097,6 +11183,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 operator_tail_caller.as_ref(),
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
+                                format_receiver,
                             );
                         }
                     };
@@ -11110,6 +11197,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 None,
                                 crate::operator_continuation::OperatorTail::Format,
                                 value,
+                                format_receiver,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11122,6 +11210,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         value,
                         OpCode::GuardClass,
                         &[value, result_type_const],
+                        format_receiver,
                     )?;
                 }
                 if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
@@ -11163,6 +11252,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 None,
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
+                                format_receiver,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11175,6 +11265,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 Some(caller),
                                 crate::operator_continuation::OperatorTail::Len,
                                 value,
+                                format_receiver,
                             );
                         }
                         return resolved_inline_decline(op.pc, line!());
@@ -11209,6 +11300,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 value,
                                 opcode,
                                 args,
+                                format_receiver,
                             )
                         },
                     )?;
@@ -11224,6 +11316,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         value,
                         OpCode::GuardTrue,
                         &[nonnegative],
+                        format_receiver,
                     )?;
                 }
                 // `descr_call` discards `__init__`'s result after checking it is
@@ -11262,6 +11355,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 None,
                                 crate::operator_continuation::OperatorTail::Truth,
                                 value,
+                                format_receiver,
                             );
                         }
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -11276,6 +11370,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                     Some(caller),
                                     crate::operator_continuation::OperatorTail::Truth,
                                     value,
+                                    format_receiver,
                                 );
                             }
                             return resolved_inline_decline(op.pc, line!());
@@ -14517,6 +14612,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     if !super::residual_call::operator_tail_resume_image_capturable(
         ctx,
         crate::operator_continuation::OperatorTail::Len,
+        None,
     ) {
         return Ok(None);
     }
@@ -14593,6 +14689,7 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     caller: Option<&InlineParentFrame>,
     tail: crate::operator_continuation::OperatorTail,
     result: OpRef,
+    receiver: Option<OpRef>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     // The dunder has already run. `callee_inline_unsupported` is the
     // residual-not-abort class for a CALL that was never entered;
@@ -14600,7 +14697,7 @@ fn abort_operator_tail_after_return<Sym: WalkSym>(
     // latch can convert through `convert_and_run_from_pyjitpl`
     // (`blackhole.py`).
     if let Some(caller) = caller
-        && super::residual_call::latch_operator_tail_return(ctx, caller, tail, result)
+        && super::residual_call::latch_operator_tail_return(ctx, caller, tail, result, receiver)
     {
         return Err(DispatchError::callee_inline_abort(op_pc, true));
     }
@@ -14653,6 +14750,7 @@ fn truth_bool_result_int<Sym: WalkSym>(
                 value,
                 opcode,
                 args,
+                None,
             )
         },
     )?;
@@ -14752,6 +14850,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     if !super::residual_call::operator_tail_resume_image_capturable(
         ctx,
         crate::operator_continuation::OperatorTail::Truth,
+        None,
     ) {
         decline!("operator-tail resume image not capturable");
     }
@@ -17511,6 +17610,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
     if !super::residual_call::operator_tail_resume_image_capturable(
         ctx,
         crate::operator_continuation::OperatorTail::Format,
+        Some(value),
     ) {
         decline!("operator-tail resume image not capturable");
     }

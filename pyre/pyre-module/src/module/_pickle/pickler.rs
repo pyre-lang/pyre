@@ -9,7 +9,8 @@ use pyre_interpreter::PyError;
 
 use super::{
     BATCHSIZE, DEFAULT_PROTOCOL, FRAME_SIZE_MIN, FRAME_SIZE_TARGET, HIGHEST_PROTOCOL, call_fn,
-    call_meth, encode_long, getattribute_dotted, import_module, op, pickling_error,
+    call_meth, encode_long, getattribute_dotted, import_module, mangle_dotted_path, op,
+    pickling_error,
 };
 
 /// Clear `running` on the relocated live pickler, not an interior pointer into
@@ -3066,6 +3067,16 @@ fn save_global(
     else {
         return save_global_surrogate_name(ctx, buf, obj_slot, name_slot);
     };
+    // `save_global` / `mangle_dotted_path`: a private component of
+    // `__qualname__` is mangled before `whichmodule` verifies the reference.
+    let mangled = mangle_dotted_path(&name);
+    let name_slot = if mangled != name {
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&mangled));
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    } else {
+        name_slot
+    };
+    let name = mangled;
     let module_name = whichmodule(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?;
     let module_name = match module_name {
         ModuleName::Utf8(module_name) => module_name,

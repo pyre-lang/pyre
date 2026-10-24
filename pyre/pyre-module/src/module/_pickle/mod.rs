@@ -415,6 +415,21 @@ pub(crate) fn compat_map(
     Ok((module.to_string(), name.to_string()))
 }
 
+/// `mangle_dotted_path`: walk a dotted qualname backwards and mangle each
+/// private component against its parent (`PrivateNestedClasses.__Nested`
+/// becomes `PrivateNestedClasses._PrivateNestedClasses__Nested`).
+pub(crate) fn mangle_dotted_path(name: &str) -> String {
+    if !name.contains(".__") {
+        return name.to_string();
+    }
+    let mut parts: Vec<String> = name.split('.').map(str::to_string).collect();
+    let n = parts.len();
+    for i in (1..n).rev() {
+        parts[i] = pyre_interpreter::call::mangle(&parts[i], &parts[i - 1]);
+    }
+    parts.join(".")
+}
+
 /// `interp_pickle.py _getattribute` — walk a dotted `qualname` from `obj`,
 /// returning `(resolved, parent)`.
 pub(crate) fn getattribute_dotted(
@@ -615,12 +630,24 @@ pub(crate) fn parse_int_text(s: &str) -> Result<PyObjectRef, PyError> {
     pyre_interpreter::builtins::parse_int_from_str(pyre_object::w_str_new_managed(s), s, 10)
 }
 
-pub(crate) fn read_int_le(data: &[u8]) -> i64 {
-    let mut v: i64 = 0;
+/// `calc_binsize`: unsigned little-endian size used by FRAME / BIN*8.
+/// `None` when the value exceeds `isize::MAX` (`PY_SSIZE_T_MAX`).
+pub(crate) fn calc_binsize(data: &[u8]) -> Option<usize> {
+    let mut x: u64 = 0;
     for (i, &b) in data.iter().enumerate() {
-        v |= (b as i64) << (8 * i);
+        if i >= std::mem::size_of::<usize>() {
+            if b != 0 {
+                return None;
+            }
+            continue;
+        }
+        x |= (b as u64) << (8 * i);
     }
-    v
+    if x > isize::MAX as u64 {
+        None
+    } else {
+        Some(x as usize)
+    }
 }
 
 pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {

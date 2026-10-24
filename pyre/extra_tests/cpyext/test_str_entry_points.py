@@ -5,8 +5,10 @@
 #
 # Every expectation was taken from CPython 3.14.6 running this same script
 # against this same fixture, except where noted: `%p` answers with the
-# platform's own spelling of a pointer, and two entry points read an argument
-# CPython never checks, which is not behaviour to match.
+# platform's own spelling of a pointer, two entry points read an argument
+# CPython never checks, which is not behaviour to match, and the `%d`
+# operand TypeError uses the 3.15 `format argument:` prefix. Too-few
+# operands use the 3.15 `(got N)` suffix.
 
 import cpyext_str as m
 
@@ -27,9 +29,9 @@ eq('format mapping', m.str_format('%(a)s', {'a': 1}), '1')
 eq('format non-str format', m.str_format(3, ()),
    ('TypeError', 'must be str, not int'))
 eq('format wrong operand', m.str_format('%d', 'x'),
-   ('TypeError', '%d format: a real number is required, not str'))
+   ('TypeError', 'format argument: %d requires a real number, not str'))
 eq('format too few', m.str_format('%s %s', ('one',)),
-   ('TypeError', 'not enough arguments for format string'))
+   ('TypeError', 'not enough arguments for format string (got 1)'))
 
 eq('append', m.str_append('ab', 'cd'), 'abcd')
 eq('append_and_del', m.str_append_and_del('ab', 'cd'), 'abcd')

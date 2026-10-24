@@ -275,6 +275,21 @@ pub unsafe fn context_set_ecdh_curve(
 ) -> Result<(), &'static str> {
     Err(UNAVAILABLE)
 }
+pub unsafe fn context_set_ciphersuites(
+    _context: *mut Context,
+    _list: &str,
+) -> Result<(), &'static str> {
+    Err(UNAVAILABLE)
+}
+pub unsafe fn context_set_groups(_context: *mut Context, _list: &str) -> Result<(), &'static str> {
+    Err(UNAVAILABLE)
+}
+pub unsafe fn context_set_server_sigalgs(
+    _context: *mut Context,
+    _list: &str,
+) -> Result<(), &'static str> {
+    Err(UNAVAILABLE)
+}
 
 pub struct DecodedCertificate;
 

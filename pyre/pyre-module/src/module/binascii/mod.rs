@@ -138,7 +138,8 @@ fn base64_decode_message(e: common_binascii::Base64DecodeError) -> String {
         E::InvalidLastSymbol { index: length } => format!(
             "Invalid base64-encoded string: number of data characters ({length}) cannot be 1 more than a multiple of 4"
         ),
-        E::IncorrectPadding | E::PaddingNotAllowed => "Incorrect padding".to_owned(),
+        E::IncorrectPadding => "Incorrect padding".to_owned(),
+        E::PaddingNotAllowed => "Padding not allowed".to_owned(),
         E::NonZeroPaddingBits => "Non-zero padding bits".to_owned(),
     }
 }

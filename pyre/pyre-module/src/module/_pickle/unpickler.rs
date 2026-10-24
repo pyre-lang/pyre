@@ -5,8 +5,8 @@ use pyre_object::PyObjectRef;
 use pyre_interpreter::PyError;
 
 use super::{
-    HIGHEST_PROTOCOL, call_fn, call_meth, decode_long, import_module, op, parse_int_text,
-    read_int_le, str_from_utf8, unpickling_error,
+    HIGHEST_PROTOCOL, calc_binsize, call_fn, call_meth, decode_long, import_module, op,
+    parse_int_text, str_from_utf8, unpickling_error,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1055,6 +1055,53 @@ fn read(slot: usize, n: usize) -> Result<Vec<u8>, PyError> {
     read_exact(slot, n, ShortRead::Payload)
 }
 
+/// `_Unpickler_ReadFromFile`: the first file read is capped here, then the
+/// buffer grows geometrically so a truncated stream cannot force one
+/// allocation of the declared size (`MIN_READ_BUF_SIZE`).
+const MIN_READ_BUF_SIZE: usize = 1 << 20;
+
+fn short_read_error(short_read: ShortRead) -> PyError {
+    match short_read {
+        ShortRead::Opcode => eof_error("Ran out of input"),
+        ShortRead::Payload => unpickling_error("pickle data was truncated"),
+    }
+}
+
+fn file_read_n(slot: usize, n: usize) -> Result<Vec<u8>, PyError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let w_n = pyre_object::w_int_new(n as i64);
+    let read_fn = cur(slot).w_file_read;
+    let w_res = call_fn(read_fn, &[w_n])?;
+    Ok(unsafe { pyre_object::bytesobject::w_bytes_data(w_res) }.to_vec())
+}
+
+/// `_Unpickler_ReadFromFile` for a positive `n`: read `min(n, MIN_READ_BUF_SIZE)`
+/// first, then double until `n` or a short read.
+fn read_from_file(slot: usize, n: usize, short_read: ShortRead) -> Result<Vec<u8>, PyError> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let first = n.min(MIN_READ_BUF_SIZE);
+    let mut data = file_read_n(slot, first)?;
+    if data.len() < first {
+        return Err(short_read_error(short_read));
+    }
+    data.truncate(first);
+    let mut cursize = first;
+    while cursize < n {
+        let add = cursize.min(n - cursize);
+        let more = file_read_n(slot, add)?;
+        if more.len() < add {
+            return Err(unpickling_error("pickle data was truncated"));
+        }
+        data.extend_from_slice(&more[..add]);
+        cursize += add;
+    }
+    Ok(data)
+}
+
 fn read_exact(slot: usize, n: usize, short_read: ShortRead) -> Result<Vec<u8>, PyError> {
     let me = cur(slot);
     if !unsafe { pyre_object::is_none(me.w_frame) } {
@@ -1065,21 +1112,22 @@ fn read_exact(slot: usize, n: usize, short_read: ShortRead) -> Result<Vec<u8>, P
             me.frame_index += n as i64;
             return Ok(out);
         }
-        // Frame exhausted — fall through to the file.
+        // `_Unpickler_LeaveFrame`: remaining frame bytes that cannot satisfy
+        // this read straddle the frame boundary.
+        if idx < frame.len() {
+            return Err(unpickling_error("pickle exhausted before end of frame"));
+        }
         me.w_frame = pyre_object::w_none();
         me.frame_index = 0;
     }
-    let w_n = pyre_object::w_int_new(n as i64);
-    let read_fn = cur(slot).w_file_read;
-    let w_res = call_fn(read_fn, &[w_n])?;
-    let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_res) };
-    if data.len() < n {
-        return Err(match short_read {
-            ShortRead::Opcode => eof_error("Ran out of input"),
-            ShortRead::Payload => unpickling_error("pickle data was truncated"),
-        });
-    }
-    Ok(data[..n].to_vec())
+    read_from_file(slot, n, short_read)
+}
+
+fn binsize_overflow(what: &str) -> PyError {
+    PyError::overflow_error(format!(
+        "{what} exceeds system's maximum size of {} bytes",
+        isize::MAX
+    ))
 }
 
 fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
@@ -1093,16 +1141,33 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::FRAME => {
             let sz = read(slot, 8)?;
-            let frame_size = read_int_le(&sz) as usize;
-            // Load the frame body from the file.
-            let w_n = pyre_object::w_int_new(frame_size as i64);
-            let read_fn = cur(slot).w_file_read;
-            let w_res = call_fn(read_fn, &[w_n])?;
-            let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_res) };
-            if data.len() < frame_size {
-                return Err(unpickling_error("pickle data was truncated"));
+            // `load_frame`: a new frame must not begin before the current
+            // one ends. Its header may lie at the tail of the current frame
+            // if it drains it.
+            let me = cur(slot);
+            if !unsafe { pyre_object::is_none(me.w_frame) } {
+                let remaining = {
+                    let frame = unsafe { pyre_object::bytesobject::w_bytes_data(me.w_frame) };
+                    frame.len().saturating_sub(me.frame_index as usize)
+                };
+                if remaining > 0 {
+                    return Err(unpickling_error(
+                        "beginning of a new frame before end of current frame",
+                    ));
+                }
+                me.w_frame = pyre_object::w_none();
+                me.frame_index = 0;
             }
-            let w_frame = pyre_object::w_bytes_from_bytes(&data[..frame_size]);
+            let frame_size = calc_binsize(&sz).ok_or_else(|| {
+                PyError::overflow_error(format!(
+                    "FRAME length exceeds system's maximum of {} bytes",
+                    isize::MAX
+                ))
+            })?;
+            // `load_frame`: the body is a `_Unpickler_Read` of `frame_len`
+            // after `_Unpickler_EndFrame`.
+            let data = read(slot, frame_size)?;
+            let w_frame = pyre_object::w_bytes_from_bytes(&data);
             let me = cur(slot);
             me.w_frame = w_frame;
             me.frame_index = 0;
@@ -1196,7 +1261,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::BINUNICODE8 => {
             let nb = read(slot, 8)?;
-            let n = read_int_le(&nb) as usize;
+            let n = calc_binsize(&nb).ok_or_else(|| binsize_overflow("BINUNICODE"))?;
             let d = read(slot, n)?;
             push(slot, str_from_utf8(&d)?);
         }
@@ -1213,7 +1278,7 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
         }
         x if x == op::BINBYTES8 => {
             let nb = read(slot, 8)?;
-            let n = read_int_le(&nb) as usize;
+            let n = calc_binsize(&nb).ok_or_else(|| binsize_overflow("BINBYTES"))?;
             let d = read(slot, n)?;
             push(slot, pyre_object::w_bytes_from_bytes(&d));
         }
@@ -1311,15 +1376,18 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
                     )?;
                 }
                 _ => {
-                    // PEP 307 requires extend(); fall back to append() for
-                    // objects lacking it (backward compatibility).
+                    // `do_append`: GetAttr `append` even when the item list
+                    // is empty (`b'N(e.'` must raise AttributeError).
+                    let w_list = top(slot, "APPENDS")?;
+                    let append = pyre_interpreter::baseobjspace::getattr_str(w_list, "append")?;
+                    let _ = pyre_object::gc_roots::pin_root(append);
+                    let append_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                     let n = unsafe {
                         pyre_object::listobject::w_list_len(
                             pyre_object::gc_roots::shadow_stack_get(items_slot),
                         )
                     };
                     for i in 0..n {
-                        let w_list = top(slot, "APPENDS")?;
                         let item = unsafe {
                             pyre_object::listobject::w_list_getitem(
                                 pyre_object::gc_roots::shadow_stack_get(items_slot),
@@ -1327,7 +1395,10 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
                             )
                             .unwrap()
                         };
-                        call_meth(w_list, "append", &[item])?;
+                        call_fn(
+                            pyre_object::gc_roots::shadow_stack_get(append_slot),
+                            &[item],
+                        )?;
                     }
                 }
             }
@@ -1375,13 +1446,18 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
                     &[pyre_object::gc_roots::shadow_stack_get(items_slot)],
                 )?;
             } else {
+                // `load_additems`: GetAttr `add` even when the item list is
+                // empty (`b'N(\x90.'` must raise AttributeError).
+                let w_set = top(slot, "ADDITEMS")?;
+                let add = pyre_interpreter::baseobjspace::getattr_str(w_set, "add")?;
+                let _ = pyre_object::gc_roots::pin_root(add);
+                let add_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 let n = unsafe {
                     pyre_object::listobject::w_list_len(pyre_object::gc_roots::shadow_stack_get(
                         items_slot,
                     ))
                 };
                 for i in 0..n {
-                    let w_set = top(slot, "ADDITEMS")?;
                     let item = unsafe {
                         pyre_object::listobject::w_list_getitem(
                             pyre_object::gc_roots::shadow_stack_get(items_slot),
@@ -1389,14 +1465,14 @@ fn dispatch(slot: usize, opcode: u8) -> Result<(), PyError> {
                         )
                         .unwrap()
                     };
-                    call_meth(w_set, "add", &[item])?;
+                    call_fn(pyre_object::gc_roots::shadow_stack_get(add_slot), &[item])?;
                 }
             }
         }
         // ── bytearray ─────────────────────────────────────────────────
         x if x == op::BYTEARRAY8 => {
             let nb = read(slot, 8)?;
-            let n = read_int_le(&nb) as usize;
+            let n = calc_binsize(&nb).ok_or_else(|| binsize_overflow("BYTEARRAY8"))?;
             let d = read(slot, n)?;
             push(
                 slot,
@@ -1805,7 +1881,35 @@ fn dict_update_from_pairs(w_dict: PyObjectRef, items: PyObjectRef) -> Result<PyO
 }
 
 /// Read a newline-terminated line (without the trailing newline).
+/// `_Unpickler_Readline`: a line that starts inside a frame must find its
+/// newline before the frame ends; otherwise `_Unpickler_LeaveFrame` reports
+/// a straddle.
 fn read_line_bytes(slot: usize) -> Result<Vec<u8>, PyError> {
+    let me = cur(slot);
+    if !unsafe { pyre_object::is_none(me.w_frame) } {
+        let (found, straddle) = {
+            let frame = unsafe { pyre_object::bytesobject::w_bytes_data(me.w_frame) };
+            let idx = me.frame_index as usize;
+            if idx < frame.len() {
+                if let Some(rel) = frame[idx..].iter().position(|&b| b == b'\n') {
+                    (Some((frame[idx..idx + rel].to_vec(), rel + 1)), false)
+                } else {
+                    (None, true)
+                }
+            } else {
+                (None, false)
+            }
+        };
+        if straddle {
+            return Err(unpickling_error("pickle exhausted before end of frame"));
+        }
+        if let Some((out, consumed)) = found {
+            me.frame_index += consumed as i64;
+            return Ok(out);
+        }
+        me.w_frame = pyre_object::w_none();
+        me.frame_index = 0;
+    }
     let mut bytes: Vec<u8> = Vec::new();
     loop {
         let b = read1(slot)?;

@@ -16,8 +16,8 @@ use pyre_object::interp_array as arr;
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
-/// A fixed inline byte buffer for one packed element (≤ 8 bytes).
-type Bytes = [u8; 8];
+/// A fixed inline byte buffer for one packed element (≤ 16 bytes, `Zd`).
+type Bytes = [u8; 16];
 
 // ──────────────────────────────────────────────────────────────────────
 // Packing: Python object → native-order element bytes (range-checked).
@@ -143,6 +143,25 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
             out[..8].copy_from_slice(&v.to_ne_bytes());
             8
         }
+        b'e' => {
+            let v = float_w(w)?;
+            let bits = pyre_interpreter::module::r#struct::pack_half(v)?;
+            out[..2].copy_from_slice(&bits.to_ne_bytes());
+            2
+        }
+        b'F' | b'D' => {
+            // `cf_setitem` / `cd_setitem`: `PyArg_Parse(v, "D")`.
+            let (re, im) = pyre_interpreter::builtins::complex_as_ccomplex(w)?;
+            if typecode == b'F' {
+                out[..4].copy_from_slice(&(re as f32).to_ne_bytes());
+                out[4..8].copy_from_slice(&(im as f32).to_ne_bytes());
+                8
+            } else {
+                out[..8].copy_from_slice(&re.to_ne_bytes());
+                out[8..16].copy_from_slice(&im.to_ne_bytes());
+                16
+            }
+        }
         b'u' | b'w' => {
             let cp = unicode_char_w(w)?;
             out[..4].copy_from_slice(&cp.to_ne_bytes());
@@ -242,7 +261,7 @@ fn array_append_value(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyEr
     let itemsize = unsafe { arr::w_array_itemsize(obj) };
     let typecode = unsafe { arr::w_array_typecode(obj) };
 
-    let mut validated: Bytes = [0; 8];
+    let mut validated: Bytes = [0; 16];
     pack_into(
         typecode,
         pyre_object::gc_roots::shadow_stack_get(base + 1),
@@ -262,7 +281,7 @@ fn array_append_value(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyEr
     }
     vec.resize(new_len, 0);
 
-    let mut packed: Bytes = [0; 8];
+    let mut packed: Bytes = [0; 16];
     let packed_len = pack_into(
         typecode,
         pyre_object::gc_roots::shadow_stack_get(base + 1),
@@ -429,30 +448,21 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
     let canonical_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(canonical);
     let w_typecode = pyre_object::gc_roots::shadow_stack_get(pos_base + 1);
-    // typecode must be a 1-character str.
+    // `array_new` parses `"s|O:array"`: any-length str, then a descriptor
+    // lookup (`descriptors[].typecode`).
     if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
-            "array() argument 1 must be a unicode character, not {}",
+            "array() argument 1 must be str, not {}",
             pyre_interpreter::baseobjspace::object_functionstr_type_name(w_typecode)
         )));
     }
-    // Measured in code points on the raw buffer: a lone surrogate is one
-    // character with no `&str` spelling, so it reaches the typecode check
-    // below rather than counting as three.
     let tc = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_typecode) };
-    let mut points = tc.code_points();
-    let Some(first) = points.next().filter(|_| points.next().is_none()) else {
-        return Err(PyError::type_error(format!(
-            "array() argument 1 must be a unicode character, not a string of length {}",
-            tc.code_points().count()
-        )));
-    };
-    // Every typecode is ASCII, so a wider code point takes the same
-    // "bad typecode" rejection as an unrecognised ASCII one.
-    let typecode = u8::try_from(first.to_u32()).unwrap_or(0xff);
-    let itemsize = arr::typecode_itemsize(typecode).ok_or_else(|| {
-        PyError::value_error("bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)")
+    let typecode = arr::parse_typecode(tc.as_bytes()).ok_or_else(|| {
+        PyError::value_error(
+            "bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, e, f, d, Zf or Zd)",
+        )
     })?;
+    let itemsize = arr::typecode_itemsize(typecode).expect("parse_typecode is a valid descriptor");
     if typecode == b'u' {
         pyre_interpreter::warn::warn_deprecation(
             "The 'u' type code is deprecated and will be removed in Python 3.16",
@@ -487,7 +497,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             } else {
                 return Err(PyError::type_error(format!(
                     "cannot use a str to initialize an array with typecode '{}'",
-                    typecode as char
+                    arr::typecode_str(typecode)
                 )));
             }
         } else if unsafe { pyre_object::bytesobject::is_bytes_like(w_init) } {
@@ -500,7 +510,7 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
             {
                 return Err(PyError::type_error(format!(
                     "cannot use a unicode array to initialize an array with typecode '{}'",
-                    typecode as char
+                    arr::typecode_str(typecode)
                 )));
             }
             array_extend_iterable(obj, w_init, false)?;
@@ -732,7 +742,7 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let tc = unsafe { arr::w_array_typecode(obj) };
     let isz = unsafe { arr::w_array_itemsize(obj) };
-    let mut buf: Bytes = [0u8; 8];
+    let mut buf: Bytes = [0u8; 16];
     // pack_into may run user code (`__index__`/`__int__`/`__float__`) that
     // resizes the array mid-assignment (gh-142555); re-validate the slot
     // against the current length before writing.
@@ -974,7 +984,7 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
     // the resize still targets the length captured before it ran.
     let tc = unsafe { arr::w_array_typecode(obj) };
     let itemsize = unsafe { arr::w_array_itemsize(obj) };
-    let mut validated: Bytes = [0u8; 8];
+    let mut validated: Bytes = [0u8; 16];
     pack_into(
         tc,
         pyre_object::gc_roots::shadow_stack_get(base + 2),
@@ -999,7 +1009,7 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
         vec.copy_within(start..end, start + itemsize);
     }
 
-    let mut packed: Bytes = [0u8; 8];
+    let mut packed: Bytes = [0u8; 16];
     let packed_len = pack_into(
         tc,
         pyre_object::gc_roots::shadow_stack_get(base + 2),
@@ -1357,7 +1367,7 @@ fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
             .checked_sub(n)
             .and_then(|base| base.checked_add(i));
         let typecode = unsafe { arr::w_array_typecode(obj) };
-        let mut packed: Bytes = [0; 8];
+        let mut packed: Bytes = [0; 16];
         let packed_len = match pack_into(
             typecode,
             pyre_object::gc_roots::shadow_stack_get(item_slot),
@@ -1610,15 +1620,27 @@ fn array_byteswap_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.byteswap")?;
     let obj = args[0];
     let isz = unsafe { arr::w_array_itemsize(obj) };
-    if !matches!(isz, 1 | 2 | 4 | 8) {
+    if !matches!(isz, 1 | 2 | 4 | 8 | 16) {
         return Err(PyError::runtime_error(
             "don't know how to byteswap this array type",
         ));
     }
+    let tc = unsafe { arr::w_array_typecode(obj) };
     let len = unsafe { arr::w_array_len(obj) };
     let vec = unsafe { arr::w_array_vec_mut(obj) };
+    // `array_array_byteswap_impl`: for `Zf`/`Zd` reverse each component
+    // independently so the real/imag order is preserved.
+    let half = match (isz, tc) {
+        (8, b'F') => 4,
+        (16, b'D') => 8,
+        _ => isz,
+    };
     for i in 0..len {
-        vec[i * isz..i * isz + isz].reverse();
+        let base = i * isz;
+        vec[base..base + half].reverse();
+        if half != isz {
+            vec[base + half..base + isz].reverse();
+        }
     }
     Ok(pyre_object::w_none())
 }
@@ -1654,7 +1676,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
         ))?
         .to_string()
     };
-    let tc = unsafe { arr::w_array_typecode(current_obj()) } as char;
+    let tc = arr::typecode_str(unsafe { arr::w_array_typecode(current_obj()) });
     let len = unsafe { arr::w_array_len(current_obj()) };
     if len == 0 {
         return Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
@@ -1663,7 +1685,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
     }
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     out.push_str(&format!("{class_name}('{tc}', "));
-    if matches!(tc, 'u' | 'w') {
+    if matches!(tc, "u" | "w") {
         // [3.14-spec] PyPy `descr_repr` catches this ValueError and prints a
         // `<character ...>` placeholder. v3.14.6 `array_repr` propagates any
         // failure from `array_array_tounicode_impl`, including the structured
@@ -1693,9 +1715,9 @@ fn array_repr_method(args: &[PyObjectRef]) -> PyResult {
     )?))
 }
 
-// `interp_array.py compare_arrays`: compare each element with the requested
-// operation.  In particular, an unordered pair such as NaN is neither less
-// nor greater; treating every non-equal/non-less pair as greater is wrong.
+// `compare_arrays` walks EQ/NE with those operators. Ordering uses
+// `array_richcompare`'s first-unequal-pair loop so equal `Zf` items do not
+// raise TypeError.
 fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult {
     if !unsafe { arr::is_array(a) } || !unsafe { arr::is_array(b) } {
         return Ok(pyre_object::w_not_implemented());
@@ -1716,58 +1738,61 @@ fn array_richcompare(mut a: PyObjectRef, mut b: PyObjectRef, op: u8) -> PyResult
     // comparison only when both descriptors match; differing typecodes take
     // `getarrayitem` and can therefore raise while boxing an invalid scalar.
     let integer_instead_of_char = typecode_a == typecode_b && matches!(typecode_a, b'u' | b'w');
+    if op == 0 || op == 1 {
+        // `compare_arrays` EQ/NE: walk with the operator itself.
+        let item_op = if op == 0 {
+            CompareOp::Eq
+        } else {
+            CompareOp::Ne
+        };
+        for i in 0..n {
+            let mut ea = pyre_object::with_roots!(a, b => {
+                array_w_getitem(a, i, integer_instead_of_char)
+            })?;
+            let mut eb = pyre_object::with_roots!(a, b, ea => {
+                array_w_getitem(b, i, integer_instead_of_char)
+            })?;
+            let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, item_op))?;
+            let truth = pyre_object::with_roots!(a, b => {
+                pyre_interpreter::baseobjspace::is_true(r)
+            })?;
+            if op == 0 {
+                if !truth {
+                    return Ok(pyre_object::w_bool_from(false));
+                }
+            } else if truth {
+                return Ok(pyre_object::w_bool_from(true));
+            }
+        }
+        return Ok(pyre_object::w_bool_from(op == 0));
+    }
+    // `array_richcompare` finds the first pair that is not EQ, then applies
+    // the operator. `compare_arrays` mixes the operator with EQ per item;
+    // equal `Zf` items must not raise TypeError under ordering.
     for i in 0..n {
         let mut ea =
             pyre_object::with_roots!(a, b => array_w_getitem(a, i, integer_instead_of_char))?;
         let mut eb =
             pyre_object::with_roots!(a, b, ea => array_w_getitem(b, i, integer_instead_of_char))?;
-        match op {
-            0 => {
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
-            }
-            1 => {
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Ne))?;
-                if pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
-            }
-            2 | 4 => {
-                let cmp = if op == 2 {
-                    CompareOp::Lt
-                } else {
-                    CompareOp::Gt
+        let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, CompareOp::Eq))?;
+        if pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))? {
+            continue;
+        }
+        let result = match op {
+            2 | 3 | 4 | 5 => {
+                let cmp = match op {
+                    2 => CompareOp::Lt,
+                    3 => CompareOp::Le,
+                    4 => CompareOp::Gt,
+                    5 => CompareOp::Ge,
+                    _ => unreachable!(),
                 };
                 let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
-                if pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))?
-                {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
-            }
-            3 | 5 => {
-                let cmp = if op == 3 {
-                    CompareOp::Le
-                } else {
-                    CompareOp::Ge
-                };
-                let r = pyre_object::with_roots!(a, b, ea, eb => compare(ea, eb, cmp))?;
-                if !pyre_object::with_roots!(a, b, ea, eb => pyre_interpreter::baseobjspace::is_true(r))?
-                {
-                    return Ok(pyre_object::w_bool_from(false));
-                }
-                let r = pyre_object::with_roots!(a, b => compare(ea, eb, CompareOp::Eq))?;
-                if !pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))? {
-                    return Ok(pyre_object::w_bool_from(true));
-                }
+                pyre_object::with_roots!(a, b => pyre_interpreter::baseobjspace::is_true(r))?
             }
             _ => unreachable!(),
-        }
+        };
+        return Ok(pyre_object::w_bool_from(result));
     }
     let result = match op {
         0 => true,
@@ -1968,6 +1993,9 @@ fn array_machine_format_code(typecode: u8, itemsize: usize) -> i64 {
         },
         b'f' => 14 + big_endian,
         b'd' => 16 + big_endian,
+        b'F' => 22 + big_endian,
+        b'D' => 24 + big_endian,
+        b'e' => 26 + big_endian,
         b'u' | b'w' => match itemsize {
             2 => 18 + big_endian,
             4 => 20 + big_endian,
@@ -1994,9 +2022,8 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
         pyre_interpreter::typedef::r#type(obj()).map_or(PY_NULL, |p| p.as_ptr()),
     );
     let typecode = unsafe { arr::w_array_typecode(obj()) };
-    let tc = typecode as char;
     let typecode_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&tc.to_string()));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(arr::typecode_str(typecode)));
     let w_dict = pyre_interpreter::baseobjspace::findattr_result(obj(), "__dict__")?
         .unwrap_or_else(pyre_object::w_none);
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2059,15 +2086,19 @@ fn decode_uint(bytes: &[u8], big_endian: bool) -> u64 {
 }
 
 fn reconstructor_descriptor(mformat: i64) -> (usize, bool, bool) {
-    let big_endian = matches!(mformat, 3 | 5 | 7 | 9 | 11 | 13 | 15 | 17 | 19 | 21);
+    let big_endian = matches!(
+        mformat,
+        3 | 5 | 7 | 9 | 11 | 13 | 15 | 17 | 19 | 21 | 23 | 25 | 27
+    );
     let signed = matches!(mformat, 1 | 4 | 5 | 8 | 9 | 12 | 13);
     let size = match mformat {
         0 | 1 => 1,
-        2..=5 => 2,
+        2..=5 | 26 | 27 => 2,
         6..=9 | 14 | 15 => 4,
-        10..=13 | 16 | 17 => 8,
+        10..=13 | 16 | 17 | 22 | 23 => 8,
         18 | 19 => 2,
         20 | 21 => 4,
+        24 | 25 => 16,
         _ => 0,
     };
     (size, signed, big_endian)
@@ -2121,16 +2152,14 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     }
     if !unsafe { pyre_object::is_str(w_typecode) } {
         return Err(PyError::type_error(format!(
-            "_array_reconstructor() argument 2 must be a unicode character, not {}",
+            "_array_reconstructor() argument 2 must be str, not {}",
             pyre_interpreter::type_methods::clinic_arg_type_name(w_typecode)
         )));
     }
     let typecode_bytes =
         unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_typecode) }.as_bytes();
-    if typecode_bytes.len() != 1 || arr::typecode_itemsize(typecode_bytes[0]).is_none() {
-        return Err(PyError::value_error("invalid type code"));
-    }
-    let typecode = typecode_bytes[0];
+    let typecode = arr::parse_typecode(typecode_bytes)
+        .ok_or_else(|| PyError::value_error("second argument must be a valid type code"))?;
     let itemsize = arr::typecode_itemsize(typecode).unwrap() as usize;
     // mformat_code: int in [MACHINE_FORMAT_CODE_MIN, MACHINE_FORMAT_CODE_MAX].
     // The `int` converter takes `PyNumber_Index`, which names the type it
@@ -2139,7 +2168,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
         pyre_interpreter::baseobjspace::space_index(w_mformat_arg))?;
     let mformat = pyre_object::with_roots!(w_cls, w_typecode, w_bytes =>
         pyre_interpreter::baseobjspace::int_w(w_mformat))?;
-    if !(0..=21).contains(&mformat) {
+    if !(0..=27).contains(&mformat) {
         return Err(PyError::value_error(
             "third argument must be a valid machine format code.",
         ));
@@ -2184,9 +2213,9 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     } else {
         typecode
     };
-    let output_typecode_text = (output_typecode as char).to_string();
-    let w_output_typecode =
-        pyre_object::with_roots!(w_cls => pyre_object::w_str_new_managed(&output_typecode_text));
+    let w_output_typecode = pyre_object::with_roots!(w_cls => {
+        pyre_object::w_str_new(arr::typecode_str(output_typecode))
+    });
     let mut obj = array_descr_new(&[w_cls, w_output_typecode])?;
     for chunk in bytes.chunks_exact(source_size) {
         let w_item = if matches!(mformat, 14 | 15) {
@@ -2205,6 +2234,40 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
                 f64::from_le_bytes(raw)
             };
             pyre_object::w_float_new(value)
+        } else if matches!(mformat, 22 | 23) {
+            let (re_b, im_b) = if big_endian {
+                (
+                    f32::from_be_bytes(chunk[0..4].try_into().unwrap()),
+                    f32::from_be_bytes(chunk[4..8].try_into().unwrap()),
+                )
+            } else {
+                (
+                    f32::from_le_bytes(chunk[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(chunk[4..8].try_into().unwrap()),
+                )
+            };
+            pyre_object::w_complex_new(re_b as f64, im_b as f64)
+        } else if matches!(mformat, 24 | 25) {
+            let (re_b, im_b) = if big_endian {
+                (
+                    f64::from_be_bytes(chunk[0..8].try_into().unwrap()),
+                    f64::from_be_bytes(chunk[8..16].try_into().unwrap()),
+                )
+            } else {
+                (
+                    f64::from_le_bytes(chunk[0..8].try_into().unwrap()),
+                    f64::from_le_bytes(chunk[8..16].try_into().unwrap()),
+                )
+            };
+            pyre_object::w_complex_new(re_b, im_b)
+        } else if matches!(mformat, 26 | 27) {
+            let raw: [u8; 2] = chunk.try_into().unwrap();
+            let bits = if big_endian {
+                u16::from_be_bytes(raw)
+            } else {
+                u16::from_le_bytes(raw)
+            };
+            pyre_object::w_float_new(pyre_interpreter::module::r#struct::unpack_half(bits))
         } else {
             let raw = decode_uint(chunk, big_endian);
             if signed {
@@ -2240,7 +2303,7 @@ const ARRAY_TYPE_DOC: &str = concat!(
     "\n",
     "Arrays represent basic values and behave very much like lists, except\n",
     "the type of objects stored in them is constrained. The type is specified\n",
-    "at object creation time by using a type code, which is a single character.\n",
+    "at object creation time by using a type code, which is a string.\n",
     "The following type codes are defined:\n",
     "\n",
     "    Type code   C Type             Minimum size in bytes\n",
@@ -2255,8 +2318,11 @@ const ARRAY_TYPE_DOC: &str = concat!(
     "    'L'         unsigned integer   4\n",
     "    'q'         signed integer     8 (see note)\n",
     "    'Q'         unsigned integer   8 (see note)\n",
+    "    'e'         16-bit IEEE floats 2\n",
     "    'f'         floating-point     4\n",
     "    'd'         floating-point     8\n",
+    "    'Zf'        float complex      8\n",
+    "    'Zd'        double complex     16\n",
     "\n",
     "NOTE: The 'u' typecode corresponds to Python's unicode character. On\n",
     "narrow builds this is 2-bytes on wide builds this is 4-bytes.\n",
@@ -2416,8 +2482,9 @@ pub fn init_array_type(ns: PyObjectRef) {
                     "typecode",
                     |args| {
                         let obj = require_array_receiver(args, "typecode", true)?;
-                        let tc = arr::w_array_typecode(obj) as char;
-                        Ok(pyre_object::w_str_new_managed(&tc.to_string()))
+                        Ok(pyre_object::w_str_new(arr::typecode_str(
+                            arr::w_array_typecode(obj),
+                        )))
                     },
                     1,
                 ),
@@ -2482,7 +2549,13 @@ pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interp
             )
         };
     };
-    pyre_interpreter::__pyre_put_new!(ns_slot, "typecodes", pyre_object::w_str_new(arr::TYPECODES));
+    {
+        let names: Vec<PyObjectRef> = arr::TYPECODE_NAMES
+            .iter()
+            .map(|name| pyre_object::w_str_new(name))
+            .collect();
+        pyre_interpreter::__pyre_put_new!(ns_slot, "typecodes", pyre_object::w_tuple_new(names));
+    }
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "_array_reconstructor",

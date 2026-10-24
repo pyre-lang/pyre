@@ -10354,6 +10354,14 @@ pub(crate) fn object_getattr_miss(
                     return Ok(crate::function::function_get_doc(obj));
                 }
                 "__module__" => {
+                    // `method_descriptor` (`PyMethodDescr_Type`) has no
+                    // `__module__` getset, so `int.to_bytes.__module__`
+                    // raises AttributeError.  `is_function` includes that
+                    // type, and this arm would otherwise answer through
+                    // `fget___module__`.
+                    if crate::function::is_method_descriptor(obj) {
+                        return Err(raiseattrerror(obj, name, None, AttrErrorSite::Get));
+                    }
                     // `pypy/interpreter/function.py fget___module__`
                     // lazy-resolves from `w_func_globals['__name__']` on
                     // first read and caches into `self.w_module`.  Pyre's
@@ -18490,7 +18498,7 @@ pub fn view_as_kwargs(w_dict: PyObjectRef) -> (Option<Vec<PyObjectRef>>, Option<
 ///
 /// `text_w` gave way to `display::py_str_wtf8`, which IS `PyObject_Str`: it
 /// tries `__str__` and falls back to `__repr__`, and reports a non-string
-/// return as `__str__ returned non-string (type X)` rather than reading it as
+/// return as `X.__str__() must return a str, not Y` rather than reading it as
 /// "no name".
 ///
 /// `function.py` initialises `self.qualname = qualname or self.name`,
@@ -18550,12 +18558,10 @@ pub fn object_functionstr(mut w_function: PyObjectRef) -> Result<Wtf8Buf, crate:
     //
     // Upstream wraps the second lookup and both text conversions in a
     // `try/except OperationError: pass` that falls through to the
-    // `str(w_function)` answer; there is no such block here, because 3.14
-    // propagates every one of those faults.  Measured, a callable whose
-    // `__qualname__` descriptor raises `TypeError('boom')` and is then called
-    // as `f(*1)` reports `TypeError: boom` on 3.14.2 and the
-    // "argument after * must be an iterable" message on PyPy 7.3.20 —
-    // `functionstr_propagates.py` pins that and the six other faults.
+    // `str(w_function)` answer; there is no such block here, so a raising
+    // `__qualname__` descriptor still propagates from `raise_type_error`
+    // sites (duplicate keywords, non-string keywords). `_Py_Check_ArgsIterable`
+    // does not call FunctionStr, so `f(*1)` no longer reaches this helper.
     //
     // The lookups are `findattr`, which is `PyObject_GetOptionalAttr`: only a
     // missing name reads as absent.
@@ -23519,6 +23525,13 @@ pub fn generatorentry_portal(
 
 /// C ABI of [`generatorentry_portal`]. `CALL_ASSEMBLER` and
 /// `ll_portal_runner` both enter here.
+///
+/// `warmspot.py` `ll_portal_runner` lets a portal `OperationError`
+/// propagate to the caller. The word ABI publishes into the backend
+/// exception cells so the caller's `GUARD_NO_EXCEPTION` fires
+/// (`ll_generatorentry_portal_runner_shim`). Parking only in the
+/// interpreter pending slot leaves that guard green and the null result
+/// fails the following `GuardTrue`.
 pub extern "C" fn generatorentry_portal_c(
     pycode: PyObjectRef,
     w_gen: PyObjectRef,
@@ -23526,10 +23539,7 @@ pub extern "C" fn generatorentry_portal_c(
 ) -> PyObjectRef {
     match generatorentry_portal(pycode, w_gen, w_arg) {
         Ok(result) => result,
-        Err(mut err) => {
-            crate::stack_check::park_jit_pending_error(err);
-            PY_NULL
-        }
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
     }
 }
 
@@ -26633,12 +26643,12 @@ mod tests {
         assert!(result.is_null());
         let error = crate::call::take_call_error().expect("non-iterable *args error");
         assert_eq!(error.kind, PyErrorKind::TypeError);
-        // Not the bare `argument after *`, which is a prefix of the `**`
+        // Not the bare `Value after *`, which is a prefix of the `**`
         // message and would pass on either error.
         assert!(
             error
                 .message_text()
-                .contains("argument after * must be an iterable")
+                .contains("Value after * must be an iterable")
         );
 
         crate::call::clear_call_error();
@@ -26646,7 +26656,7 @@ mod tests {
         assert!(result.is_null());
         let error = crate::call::take_call_error().expect("non-mapping **kwargs error");
         assert_eq!(error.kind, PyErrorKind::TypeError);
-        assert!(error.message_text().contains("argument after **"));
+        assert!(error.message_text().contains("Value after **"));
 
         // A mapping whose keys are not strings is rejected while `**` is
         // expanded, before any of them reaches `call_args`; the identical

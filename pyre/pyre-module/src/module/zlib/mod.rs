@@ -208,6 +208,107 @@ fn adler32_compute(buf: &[u8], start: u32) -> u32 {
     (b << 16) | a
 }
 
+const CRC32_POLY: u32 = 0xEDB8_8320;
+const ADLER32_BASE: u32 = 65521;
+const GF2_DIM: usize = 32;
+
+fn gf2_matrix_times(mat: &[u32; GF2_DIM], mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while vec != 0 {
+        if vec & 1 != 0 {
+            sum ^= mat[i];
+        }
+        vec >>= 1;
+        i += 1;
+    }
+    sum
+}
+
+fn gf2_matrix_square(square: &mut [u32; GF2_DIM], mat: &[u32; GF2_DIM]) {
+    for n in 0..GF2_DIM {
+        square[n] = gf2_matrix_times(mat, mat[n]);
+    }
+}
+
+/// `crc32_combine64` — CRC of A||B from crc(A), crc(B), and len(B).
+fn crc32_combine(crc1: u32, crc2: u32, len2: i64) -> u32 {
+    if len2 <= 0 {
+        return crc1;
+    }
+    let mut odd = [0u32; GF2_DIM];
+    let mut even = [0u32; GF2_DIM];
+    odd[0] = CRC32_POLY;
+    let mut row = 1u32;
+    for n in 1..GF2_DIM {
+        odd[n] = row;
+        row <<= 1;
+    }
+    gf2_matrix_square(&mut even, &odd);
+    gf2_matrix_square(&mut odd, &even);
+    let mut crc1 = crc1;
+    let mut len2 = len2 as u64;
+    loop {
+        gf2_matrix_square(&mut even, &odd);
+        if len2 & 1 != 0 {
+            crc1 = gf2_matrix_times(&even, crc1);
+        }
+        len2 >>= 1;
+        if len2 == 0 {
+            break;
+        }
+        gf2_matrix_square(&mut odd, &even);
+        if len2 & 1 != 0 {
+            crc1 = gf2_matrix_times(&odd, crc1);
+        }
+        len2 >>= 1;
+        if len2 == 0 {
+            break;
+        }
+    }
+    crc1 ^ crc2
+}
+
+/// `adler32_combine_` — Adler-32 of A||B from adler(A), adler(B), and len(B).
+fn adler32_combine(adler1: u32, adler2: u32, len2: i64) -> u32 {
+    if len2 < 0 {
+        return 1;
+    }
+    let rem = (len2 % ADLER32_BASE as i64) as u32;
+    let mut sum1 = adler1 & 0xffff;
+    let mut sum2 = rem.wrapping_mul(sum1);
+    sum2 %= ADLER32_BASE;
+    sum1 += (adler2 & 0xffff) + ADLER32_BASE - 1;
+    sum2 += ((adler1 >> 16) & 0xffff) + ((adler2 >> 16) & 0xffff) + ADLER32_BASE - rem;
+    if sum1 >= ADLER32_BASE {
+        sum1 -= ADLER32_BASE;
+    }
+    if sum1 >= ADLER32_BASE {
+        sum1 -= ADLER32_BASE;
+    }
+    if sum2 >= (ADLER32_BASE << 1) {
+        sum2 -= ADLER32_BASE << 1;
+    }
+    if sum2 >= ADLER32_BASE {
+        sum2 -= ADLER32_BASE;
+    }
+    sum1 | (sum2 << 16)
+}
+
+fn bitwise_u32(obj: PyObjectRef) -> Result<u32, pyre_interpreter::PyError> {
+    Ok(pyre_interpreter::baseobjspace::truncatedint_w(obj)? as u32)
+}
+
+fn combine_len2(obj: PyObjectRef, func: &str) -> Result<i64, pyre_interpreter::PyError> {
+    if !unsafe { pyre_object::is_int_or_long(obj) } {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "{func}() argument 3 must be int, not {}",
+            pyre_interpreter::type_methods::clinic_arg_type_name(obj)
+        )));
+    }
+    pyre_interpreter::baseobjspace::int_w(obj)
+}
+
 // ── Compress (compressobj) ──────────────────────────────────────────────
 
 static COMPRESS_RUNTIME_TYPE: pyre_object::gc_roots::RootedOnceRef =
@@ -1088,21 +1189,56 @@ pyre_interpreter::py_module! {
             let wbits = to_wbits(pyre_object::with_roots!(zdict => int_or_default(wbits, backend::MAX_WBITS as i64))?);
             make_decompress(wbits, zdict_or_none(zdict)?)
         }
+        fn __getattr__(name: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            if unsafe { pyre_object::is_str(name) }
+                && unsafe { pyre_object::unicodeobject::w_str_get_wtf8(name) }.as_bytes()
+                    == b"__version__"
+            {
+                pyre_interpreter::warn::warn_category(
+                    "'__version__' is deprecated and slated for removal in Python 3.20",
+                    "DeprecationWarning",
+                    1,
+                )?;
+                return Ok(w_str_new("1.0"));
+            }
+            let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(name) }?;
+            Err(pyre_interpreter::PyError::attribute_error(format!(
+                "module 'zlib' has no attribute {repr}"
+            )))
+        }
     },
     functions: {
         "crc32" / * = |args| {
             let w_data = args.first().copied().unwrap_or(w_none());
             let mut w_start = args.get(1).copied().unwrap_or(PY_NULL);
             let data = pyre_object::with_roots!(w_start => as_bytes(w_data))?;
-            let start = if w_start.is_null() { 0 } else { unsafe { w_int_get_value(w_start) as u32 } };
+            let start = if w_start.is_null() { 0 } else { bitwise_u32(w_start)? };
             Ok(w_int_new(crc32_compute(&data, start) as i64))
         },
         "adler32" / * = |args| {
             let w_data = args.first().copied().unwrap_or(w_none());
             let mut w_start = args.get(1).copied().unwrap_or(PY_NULL);
             let data = pyre_object::with_roots!(w_start => as_bytes(w_data))?;
-            let start = if w_start.is_null() { 1 } else { unsafe { w_int_get_value(w_start) as u32 } };
+            let start = if w_start.is_null() { 1 } else { bitwise_u32(w_start)? };
             Ok(w_int_new(adler32_compute(&data, start) as i64))
+        },
+        "crc32_combine" / 3 = |args| {
+            let crc1_obj = args[0];
+            let mut crc2_obj = args[1];
+            let mut len2_obj = args[2];
+            let crc1 = pyre_object::with_roots!(crc2_obj, len2_obj => bitwise_u32(crc1_obj))?;
+            let crc2 = pyre_object::with_roots!(len2_obj => bitwise_u32(crc2_obj))?;
+            let len2 = combine_len2(len2_obj, "crc32_combine")?;
+            Ok(w_int_new(crc32_combine(crc1, crc2, len2) as i64))
+        },
+        "adler32_combine" / 3 = |args| {
+            let adler1_obj = args[0];
+            let mut adler2_obj = args[1];
+            let mut len2_obj = args[2];
+            let adler1 = pyre_object::with_roots!(adler2_obj, len2_obj => bitwise_u32(adler1_obj))?;
+            let adler2 = pyre_object::with_roots!(len2_obj => bitwise_u32(adler2_obj))?;
+            let len2 = combine_len2(len2_obj, "adler32_combine")?;
+            Ok(w_int_new(adler32_combine(adler1, adler2, len2) as i64))
         },
     },
 }
@@ -1142,6 +1278,28 @@ mod tests {
             );
             assert!(!unsafe { pyre_object::w_type_is_heaptype(ty) });
         }
+    }
+
+    #[test]
+    fn crc32_combine_matches_concatenated_crc32() {
+        let a = b"hello ";
+        let b = b"world";
+        let crc_a = crc32_compute(a, 0);
+        let crc_b = crc32_compute(b, 0);
+        let combined = crc32_combine(crc_a, crc_b, b.len() as i64);
+        assert_eq!(combined, crc32_compute(b"hello world", 0));
+        assert_eq!(crc32_combine(crc_a, crc_b, 0), crc_a);
+    }
+
+    #[test]
+    fn adler32_combine_matches_concatenated_adler32() {
+        let a = b"hello ";
+        let b = b"world";
+        let adler_a = adler32_compute(a, 1);
+        let adler_b = adler32_compute(b, 1);
+        let combined = adler32_combine(adler_a, adler_b, b.len() as i64);
+        assert_eq!(combined, adler32_compute(b"hello world", 1));
+        assert_eq!(adler32_combine(adler_a, adler_b, -1), 1);
     }
 }
 

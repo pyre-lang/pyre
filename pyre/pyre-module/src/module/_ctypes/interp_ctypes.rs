@@ -340,7 +340,38 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
     pyre_interpreter::__pyre_store!(ns, "_unpickle", super::cdata::unpickle_function());
 
     // ── import-time constants ──
-    pyre_interpreter::__pyre_store!(ns, "__version__", pyre_object::w_str_new("1.1.0"));
+    // `_ctypes_getattr`: `__version__` is not stored; the module
+    // `__getattr__` warns and returns `"1.1.0"`.
+    pyre_interpreter::__pyre_store!(
+        ns,
+        "__getattr__",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "__getattr__",
+            |args| {
+                let Some(&name) = args.first() else {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "__getattr__() missing 1 required positional argument: 'name'",
+                    ));
+                };
+                if unsafe { pyre_object::is_str(name) }
+                    && unsafe { pyre_object::unicodeobject::w_str_get_wtf8(name) }.as_bytes()
+                        == b"__version__"
+                {
+                    pyre_interpreter::warn::warn_category(
+                        "'__version__' is deprecated and slated for removal in Python 3.20",
+                        "DeprecationWarning",
+                        1,
+                    )?;
+                    return Ok(pyre_object::w_str_new("1.1.0"));
+                }
+                let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(name) }?;
+                Err(pyre_interpreter::PyError::attribute_error(format!(
+                    "module '_ctypes' has no attribute {repr}"
+                )))
+            },
+            1,
+        )
+    );
     pyre_interpreter::__pyre_store!(
         ns,
         "FUNCFLAG_CDECL",

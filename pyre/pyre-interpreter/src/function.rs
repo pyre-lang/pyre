@@ -3923,6 +3923,42 @@ pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, cr
     )?;
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(name);
+    // `method___reduce___impl`: a private `__name` is mangled with
+    // `_Py_IsPrivateName` + `_Py_Mangle` against `PyType_GetName(im_self)`
+    // when `im_self` is a type (classmethod) and `Py_TYPE(im_self)` otherwise.
+    let ident = unsafe {
+        pyre_object::unicodeobject::w_str_get_value_opt(pyre_object::gc_roots::shadow_stack_get(
+            name_slot,
+        ))
+    }
+    .map(str::to_string);
+    let name_slot = match ident.as_deref() {
+        Some(ident) => {
+            let instance = pyre_object::gc_roots::shadow_stack_get(pair + 1);
+            let type_obj = if unsafe { pyre_object::is_type(instance) } {
+                instance
+            } else {
+                crate::typedef::r#type(instance)
+                    .map(|tp| tp.as_ptr())
+                    .unwrap_or(pyre_object::PY_NULL)
+            };
+            let mangled = if type_obj.is_null() {
+                None
+            } else {
+                let classname = unsafe { pyre_object::w_type_get_name(type_obj) };
+                Some(crate::call::mangle(ident, classname)).filter(|m| m != ident)
+            };
+            match mangled {
+                Some(mangled) => {
+                    let _ =
+                        pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&mangled));
+                    pyre_object::gc_roots::shadow_stack_len() - 1
+                }
+                None => name_slot,
+            }
+        }
+        None => name_slot,
+    };
     let args = pyre_object::w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(pair + 1),
         pyre_object::gc_roots::shadow_stack_get(name_slot),

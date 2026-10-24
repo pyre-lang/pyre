@@ -653,7 +653,11 @@ pub fn ll_stringslice_startstop(
     if s1.is_null() {
         return std::ptr::null_mut();
     }
-    let n = bh_lowlevel_string_len(s1 as i64) as i64;
+    // `len(s1.chars)` (`LLHelpers.ll_stringslice_startstop`). Keep the
+    // payload a `Ptr(STR)` so the rtyper emits STRLEN (`ll_strlen`)
+    // rather than `cast_ptr_to_int` of `bh_lowlevel_string_len(s1 as i64)`.
+    // `bhimpl_cast_ptr_to_int` rejects that untagged GCREF.
+    let n = unsafe { (*s1).length as i64 };
     let stop = if majit_rlib::jit::we_are_jitted() {
         if stop > n { n } else { stop }
     } else if stop >= n {

@@ -29,13 +29,13 @@ impl DeferredPercentError {
         }
     }
 
-    fn after_parts(self, is_mapping: bool) -> Result<(), PyError> {
+    fn after_parts(self, args: PyObjectRef, is_mapping: bool) -> Result<(), PyError> {
         let error = match self {
             Self::Incomplete(_) | Self::Quantity(_) => {
                 unreachable!("the recovered spec raises before conversion acquisition")
             }
             Self::IncompleteMappingKey(_) if !is_mapping => {
-                return Err(PyError::type_error("format requires a mapping"));
+                return Err(unsafe { mapping_required_error(args) });
             }
             Self::IncompleteMappingKey(error) => error,
         };
@@ -47,14 +47,88 @@ fn is_format_char(codepoint: CodePoint, expected: char) -> bool {
     codepoint.to_u32() == expected as u32
 }
 
-/// rustpython-common renamed `IncompleteFormat` to `StrayModulo` and its
-/// Display to `stray % at position N`.  The 3.14 message is still
-/// `incomplete format` (`formatting.py`).
+/// `unicode_format_arg_parse` / `_PyBytes_FormatEx` parse-error text.
 fn percent_error_message(error: CFormatError) -> String {
     match error.typ {
-        CFormatErrorType::StrayModulo => "incomplete format".to_string(),
+        CFormatErrorType::StrayModulo => format!("stray % at position {}", error.index),
+        CFormatErrorType::UnmatchedKeyParentheses => format!(
+            "stray % or incomplete format key at position {}",
+            error.index.saturating_sub(1)
+        ),
+        CFormatErrorType::WidthTooBig => format!("width too big at position {}", error.index),
+        CFormatErrorType::PrecisionTooBig => {
+            format!("precision too big at position {}", error.index)
+        }
         _ => error.to_string(),
     }
+}
+
+unsafe fn type_t(obj: PyObjectRef) -> Wtf8Buf {
+    crate::display::type_fully_qualified_name_of(obj)
+}
+
+unsafe fn mapping_required_error(args: PyObjectRef) -> PyError {
+    PyError::type_error(crate::display::wtf8_format!(
+        "format requires a mapping, not ",
+        type_t(args)
+    ))
+}
+
+fn not_enough_args(is_tuple: bool, arglen: usize) -> PyError {
+    let got = if is_tuple { arglen } else { 1 };
+    PyError::type_error(format!(
+        "not enough arguments for format string (got {got})"
+    ))
+}
+
+fn leftover_args(kind: &str, is_tuple: bool, consumed: usize, arglen: usize) -> PyError {
+    let required = if is_tuple { consumed } else { 0 };
+    let got = if is_tuple { arglen } else { 1 };
+    PyError::type_error(format!(
+        "not all arguments converted during {kind} formatting (required {required}, got {got})"
+    ))
+}
+
+fn spec_has_star(spec: &CFormatSpec) -> bool {
+    matches!(spec.min_field_width, Some(CFormatQuantity::FromValuesTuple))
+        || matches!(
+            spec.precision,
+            Some(CFormatPrecision::Quantity(CFormatQuantity::FromValuesTuple))
+        )
+}
+
+fn mapping_star_error(fmtstart: usize) -> PyError {
+    PyError::value_error(format!(
+        "* cannot be used with a parenthesised mapping key at position {fmtstart}"
+    ))
+}
+
+fn parenthesised_key_error(fmtstart: usize) -> PyError {
+    PyError::value_error(format!(
+        "format requires a parenthesised mapping key at position {fmtstart}"
+    ))
+}
+
+/// `FORMAT_ERROR` prefix: mapping key repr, 1-based tuple index, or bare.
+/// `key` is the mapping key, or null when the operand is positional.
+unsafe fn format_site_error(
+    key: PyObjectRef,
+    tuple_idx: Option<usize>,
+    kind: PyErrorKind,
+    body: impl Into<Wtf8Buf>,
+) -> PyError {
+    let mut msg = if !key.is_null() {
+        match crate::py_repr_wtf8(key) {
+            Ok(repr) => crate::display::wtf8_format!("format argument ", repr, ": "),
+            Err(err) => return err,
+        }
+    } else if let Some(idx) = tuple_idx {
+        Wtf8Buf::from(format!("format argument {idx}: "))
+    } else {
+        Wtf8Buf::from("format argument: ")
+    };
+    msg.push_wtf8(&body.into());
+    PyError::new(kind, msg)
 }
 
 fn wtf8_prefix(fmt: &Wtf8, codepoints: usize) -> Wtf8Buf {
@@ -70,7 +144,7 @@ fn wtf8_acquisition_prefix(
     error: CFormatError,
     search_end: usize,
     include_precision_star: bool,
-) -> Wtf8Buf {
+) -> (Wtf8Buf, usize) {
     let codepoints: Vec<_> = fmt.code_points().collect();
     // rustpython-common reports `StrayModulo` at the `%` itself
     // (`CFormatStrOrBytes::parse` remaps that type onto the `%` index).
@@ -143,7 +217,7 @@ fn wtf8_acquisition_prefix(
         recovered.push_char('*');
     }
     recovered.push_char('s');
-    recovered
+    (recovered, spec_start)
 }
 
 fn bytes_acquisition_prefix(
@@ -151,7 +225,7 @@ fn bytes_acquisition_prefix(
     error: CFormatError,
     search_end: usize,
     include_precision_star: bool,
-) -> Vec<u8> {
+) -> (Vec<u8>, usize) {
     let spec_start = (0..search_end)
         .filter(|&index| fmt[index] == b'%')
         .rfind(|&index| {
@@ -199,7 +273,7 @@ fn bytes_acquisition_prefix(
         recovered.extend_from_slice(b".*");
     }
     recovered.push(b's');
-    recovered
+    (recovered, spec_start)
 }
 
 /// Parse a unicode percent format, retaining the first deferred parser error.
@@ -226,23 +300,18 @@ fn parse_wtf8_incremental(
                 error.typ,
                 CFormatErrorType::WidthTooBig | CFormatErrorType::PrecisionTooBig
             ) {
-                let recovered = CFormatWtf8::parse_from_wtf8(&wtf8_acquisition_prefix(
-                    fmt,
-                    error,
-                    error.index,
-                    false,
-                ))
-                .expect("the acquisition prefix of a deferred quantity error must parse");
+                let (prefix, spec_start) = wtf8_acquisition_prefix(fmt, error, error.index, false);
+                let recovered = CFormatWtf8::parse_from_wtf8(&prefix)
+                    .expect("the acquisition prefix of a deferred quantity error must parse");
+                let mut error = error;
+                error.index = spec_start;
                 return Ok((recovered, Some(DeferredPercentError::Quantity(error))));
             }
             if matches!(error.typ, CFormatErrorType::StrayModulo) {
-                let recovered = CFormatWtf8::parse_from_wtf8(&wtf8_acquisition_prefix(
-                    fmt,
-                    error,
-                    fmt.code_points().count(),
-                    true,
-                ))
-                .expect("the acquisition prefix of an incomplete format must parse");
+                let (prefix, _) =
+                    wtf8_acquisition_prefix(fmt, error, fmt.code_points().count(), true);
+                let recovered = CFormatWtf8::parse_from_wtf8(&prefix)
+                    .expect("the acquisition prefix of an incomplete format must parse");
                 return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
             if !matches!(error.typ, CFormatErrorType::UnmatchedKeyParentheses) {
@@ -273,23 +342,17 @@ fn parse_bytes_incremental(
                 error.typ,
                 CFormatErrorType::WidthTooBig | CFormatErrorType::PrecisionTooBig
             ) {
-                let recovered = CFormatBytes::parse_from_bytes(&bytes_acquisition_prefix(
-                    fmt,
-                    error,
-                    error.index,
-                    false,
-                ))
-                .expect("the acquisition prefix of a deferred quantity error must parse");
+                let (prefix, spec_start) = bytes_acquisition_prefix(fmt, error, error.index, false);
+                let recovered = CFormatBytes::parse_from_bytes(&prefix)
+                    .expect("the acquisition prefix of a deferred quantity error must parse");
+                let mut error = error;
+                error.index = spec_start;
                 return Ok((recovered, Some(DeferredPercentError::Quantity(error))));
             }
             if matches!(error.typ, CFormatErrorType::StrayModulo) {
-                let recovered = CFormatBytes::parse_from_bytes(&bytes_acquisition_prefix(
-                    fmt,
-                    error,
-                    fmt.len(),
-                    true,
-                ))
-                .expect("the acquisition prefix of an incomplete format must parse");
+                let (prefix, _) = bytes_acquisition_prefix(fmt, error, fmt.len(), true);
+                let recovered = CFormatBytes::parse_from_bytes(&prefix)
+                    .expect("the acquisition prefix of an incomplete format must parse");
                 return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
             if !matches!(error.typ, CFormatErrorType::UnmatchedKeyParentheses) {
@@ -316,11 +379,11 @@ fn parse_bytes_incremental(
 /// glue (fetching arguments from the tuple / mapping and coercing each
 /// `W_Root` to the number/float/str the spec's formatter consumes).
 ///
-/// Argument dispatch mirrors CPython's `getnextarg`: a non-tuple right
-/// operand provides a single positional value, a keyed spec (`%(k)s`)
-/// looks the value up in the operand as a mapping and consumes one
-/// positional slot if any remains, and surplus positional values are an
-/// error only when the operand is not itself a mapping.
+/// Argument dispatch follows `unicode_format_getnextarg`: a non-tuple
+/// right operand provides a single positional value; a keyed spec
+/// (`%(k)s`) looks the value up in the operand as a mapping and does not
+/// consume a positional slot; surplus positional values are an error
+/// only when the operand is not itself a mapping.
 pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> PyResult {
     // The conversions below run Python, and `BINARY_OP %` popped both operands
     // before dispatching here, so neither the format string nor the operand
@@ -355,13 +418,17 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
         base: pyre_object::gc_roots::pin_roots(&items),
         len: items.len(),
         cursor: 0,
+        is_tuple: args_is_tuple,
     };
 
     let mut result = Wtf8Buf::new();
     let mut saw_specifier = false;
+    let mut mapping_key_used = false;
+    let mut site_key = pyre_object::PY_NULL;
+    let mut site_idx = None;
 
     let mut parts = format.into_iter().peekable();
-    while let Some((_, part)) = parts.next() {
+    while let Some((fmtstart, part)) = parts.next() {
         match part {
             CFormatPart::Literal(literal) => result.push_wtf8(&literal),
             CFormatPart::Spec(CFormatSpecKeyed {
@@ -372,7 +439,9 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                 let current_deferred = deferred_error.filter(|_| parts.peek().is_none());
                 let value = if let Some(key) = mapping_key {
                     let Some(dict_slot) = dict else {
-                        return Err(PyError::type_error("format requires a mapping"));
+                        return Err(mapping_required_error(
+                            pyre_object::gc_roots::shadow_stack_get(args_slot),
+                        ));
                     };
                     let key_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(w_str_from_wtf8_managed(key));
@@ -380,20 +449,14 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                         pyre_object::gc_roots::shadow_stack_get(dict_slot),
                         pyre_object::gc_roots::shadow_stack_get(key_slot),
                     )?;
-                    // A keyed spec still consumes a positional slot when one
-                    // is available (`%(k)s %s` leaves nothing for the `%s`).
-                    let _ = pos.next();
-                    // `mapping_star_operands` pins the mapped value when a
-                    // `*` field reads it. The conversion uses that slot.
+                    mapping_key_used = true;
+                    site_key = pyre_object::gc_roots::shadow_stack_get(key_slot);
+                    site_idx = None;
+                    if spec_has_star(&spec) {
+                        return Err(mapping_star_error(fmtstart));
+                    }
                     let value_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(w_value);
-                    mapping_star_operands(
-                        &mut spec,
-                        pyre_object::gc_roots::shadow_stack_get(value_slot),
-                        current_deferred
-                            .and_then(DeferredPercentError::before_conversion)
-                            .is_none(),
-                    )?;
                     if let Some(error) =
                         current_deferred.and_then(DeferredPercentError::before_conversion)
                     {
@@ -401,31 +464,44 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                     }
                     pyre_object::gc_roots::shadow_stack_get(value_slot)
                 } else {
-                    update_quantity_from_tuple(
+                    if mapping_key_used {
+                        return Err(parenthesised_key_error(fmtstart));
+                    }
+                    site_key = pyre_object::PY_NULL;
+                    pyre_object::with_roots!(site_key => update_quantity_from_tuple(
                         &mut pos,
                         &mut spec.min_field_width,
                         &mut spec.flags,
-                    )?;
-                    update_precision_from_tuple(&mut pos, &mut spec.precision)?;
+                        &mut site_idx,
+                    ))?;
+                    pyre_object::with_roots!(site_key => update_precision_from_tuple(
+                        &mut pos,
+                        &mut spec.precision,
+                        &mut site_idx,
+                    ))?;
                     if let Some(error) =
                         current_deferred.and_then(DeferredPercentError::before_conversion)
                     {
                         return Err(PyError::value_error(percent_error_message(error)));
                     }
                     let Some(v) = pos.next() else {
-                        return Err(PyError::type_error(
-                            "not enough arguments for format string",
-                        ));
+                        return Err(not_enough_args(pos.is_tuple, pos.len));
                     };
+                    site_idx = pos.tuple_idx();
                     v
                 };
-                result.push_wtf8(&spec_format_string(&spec, value)?);
+                result.push_wtf8(&spec_format_string(
+                    &spec, value, site_key, site_idx, fmtstart,
+                )?);
             }
         }
     }
 
     if let Some(error) = deferred_error {
-        error.after_parts(dict.is_some())?;
+        error.after_parts(
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+            dict.is_some(),
+        )?;
     }
 
     // `checkconsumed` — surplus positional values are converted to an error
@@ -438,9 +514,7 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
         !(args_is_tuple && w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot)) == 0)
     };
     if dict.is_none() && surplus {
-        return Err(PyError::type_error(
-            "not all arguments converted during string formatting",
-        ));
+        return Err(leftover_args("string", args_is_tuple, pos.cursor, pos.len));
     }
 
     // `str % args` printf formatting is a dominant dynamic-churn producer.
@@ -501,83 +575,10 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
     let args = pyre_object::gc_roots::pin_root(args);
     let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt).to_vec();
     let (format, deferred_error) = parse_bytes_incremental(&fmt_bytes)?;
-    let (num_specifiers, mapping_required) = format
-        .check_specifiers()
-        .ok_or_else(|| PyError::type_error("format requires a mapping"))?;
-    let mut parts = format.into_iter().peekable();
+    let args_is_tuple = pyre_object::is_tuple(args);
     let is_mapping = bytes_format_is_mapping(args);
-    let mut result = Vec::new();
-
-    if num_specifiers == 0 && deferred_error.is_none() {
-        if !is_mapping && !bytes_format_empty_tuple(args) {
-            return Err(PyError::type_error(
-                "not all arguments converted during bytes formatting",
-            ));
-        }
-        for (_, part) in parts {
-            match part {
-                CFormatPart::Literal(literal) => result.extend(literal),
-                CFormatPart::Spec(_) => unreachable!(),
-            }
-        }
-        return Ok(bytes_format_result(
-            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
-            &result,
-        ));
-    }
-
-    if mapping_required {
-        if !is_mapping {
-            return Err(PyError::type_error("format requires a mapping"));
-        }
-        while let Some((_, part)) = parts.next() {
-            match part {
-                CFormatPart::Literal(literal) => result.extend(literal),
-                CFormatPart::Spec(CFormatSpecKeyed {
-                    mapping_key,
-                    mut spec,
-                }) => {
-                    let current_deferred = deferred_error.filter(|_| parts.peek().is_none());
-                    let key = mapping_key.expect("mapping spec carries a key");
-                    let key_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_bytes_from_bytes(&key));
-                    let value = crate::baseobjspace::getitem(
-                        pyre_object::gc_roots::shadow_stack_get(args_slot),
-                        pyre_object::gc_roots::shadow_stack_get(key_slot),
-                    )?;
-                    // `mapping_star_operands` pins the mapped value when a
-                    // `*` field reads it. The conversion uses that slot.
-                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(value);
-                    mapping_star_operands(
-                        &mut spec,
-                        pyre_object::gc_roots::shadow_stack_get(value_slot),
-                        current_deferred
-                            .and_then(DeferredPercentError::before_conversion)
-                            .is_none(),
-                    )?;
-                    if let Some(error) =
-                        current_deferred.and_then(DeferredPercentError::before_conversion)
-                    {
-                        return Err(PyError::value_error(percent_error_message(error)));
-                    }
-                    result.extend(spec_format_bytes(
-                        &spec,
-                        pyre_object::gc_roots::shadow_stack_get(value_slot),
-                    )?);
-                }
-            }
-        }
-        if let Some(error) = deferred_error {
-            error.after_parts(is_mapping)?;
-        }
-        return Ok(bytes_format_result(
-            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
-            &result,
-        ));
-    }
-
-    let items: Vec<PyObjectRef> = if pyre_object::is_tuple(args) {
+    let dict = is_mapping.then_some(args_slot);
+    let items: Vec<PyObjectRef> = if args_is_tuple {
         let n = pyre_object::w_tuple_len(args);
         (0..n)
             .filter_map(|i| pyre_object::w_tuple_getitem(args, i as i64))
@@ -589,44 +590,103 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
         base: pyre_object::gc_roots::pin_roots(&items),
         len: items.len(),
         cursor: 0,
+        is_tuple: args_is_tuple,
     };
+    let mut parts = format.into_iter().peekable();
+    let mut result = Vec::new();
+    let mut saw_specifier = false;
+    let mut mapping_key_used = false;
+    let mut site_key = pyre_object::PY_NULL;
+    let mut site_idx = None;
 
-    while let Some((_, part)) = parts.next() {
+    while let Some((fmtstart, part)) = parts.next() {
         match part {
             CFormatPart::Literal(literal) => result.extend(literal),
-            CFormatPart::Spec(CFormatSpecKeyed { mut spec, .. }) => {
+            CFormatPart::Spec(CFormatSpecKeyed {
+                mapping_key,
+                mut spec,
+            }) => {
+                saw_specifier = true;
                 let current_deferred = deferred_error.filter(|_| parts.peek().is_none());
-                update_quantity_from_tuple(&mut pos, &mut spec.min_field_width, &mut spec.flags)?;
-                update_precision_from_tuple(&mut pos, &mut spec.precision)?;
-                if let Some(error) =
-                    current_deferred.and_then(DeferredPercentError::before_conversion)
-                {
-                    return Err(PyError::value_error(percent_error_message(error)));
-                }
-                let Some(value) = pos.next() else {
-                    return Err(PyError::type_error(
-                        "not enough arguments for format string",
-                    ));
+                let value = if let Some(key) = mapping_key {
+                    let Some(dict_slot) = dict else {
+                        return Err(mapping_required_error(
+                            pyre_object::gc_roots::shadow_stack_get(args_slot),
+                        ));
+                    };
+                    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_bytes_from_bytes(&key));
+                    let w_value = crate::baseobjspace::getitem(
+                        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                        pyre_object::gc_roots::shadow_stack_get(key_slot),
+                    )?;
+                    mapping_key_used = true;
+                    site_key = pyre_object::gc_roots::shadow_stack_get(key_slot);
+                    site_idx = None;
+                    if spec_has_star(&spec) {
+                        return Err(mapping_star_error(fmtstart));
+                    }
+                    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(w_value);
+                    if let Some(error) =
+                        current_deferred.and_then(DeferredPercentError::before_conversion)
+                    {
+                        return Err(PyError::value_error(percent_error_message(error)));
+                    }
+                    pyre_object::gc_roots::shadow_stack_get(value_slot)
+                } else {
+                    if mapping_key_used {
+                        return Err(parenthesised_key_error(fmtstart));
+                    }
+                    site_key = pyre_object::PY_NULL;
+                    pyre_object::with_roots!(site_key => update_quantity_from_tuple(
+                        &mut pos,
+                        &mut spec.min_field_width,
+                        &mut spec.flags,
+                        &mut site_idx,
+                    ))?;
+                    pyre_object::with_roots!(site_key => update_precision_from_tuple(
+                        &mut pos,
+                        &mut spec.precision,
+                        &mut site_idx,
+                    ))?;
+                    if let Some(error) =
+                        current_deferred.and_then(DeferredPercentError::before_conversion)
+                    {
+                        return Err(PyError::value_error(percent_error_message(error)));
+                    }
+                    let Some(v) = pos.next() else {
+                        return Err(not_enough_args(pos.is_tuple, pos.len));
+                    };
+                    site_idx = pos.tuple_idx();
+                    v
                 };
-                result.extend(spec_format_bytes(&spec, value)?);
+                result.extend(spec_format_bytes(
+                    &spec, value, site_key, site_idx, fmtstart,
+                )?);
             }
         }
     }
 
     if let Some(error) = deferred_error {
-        error.after_parts(is_mapping)?;
+        error.after_parts(
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+            is_mapping,
+        )?;
     }
 
-    if pos.has_next() {
-        Err(PyError::type_error(
-            "not all arguments converted during bytes formatting",
-        ))
+    let surplus = if saw_specifier {
+        pos.has_next()
     } else {
-        Ok(bytes_format_result(
-            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
-            &result,
-        ))
+        !is_mapping && !bytes_format_empty_tuple(pyre_object::gc_roots::shadow_stack_get(args_slot))
+    };
+    if dict.is_none() && surplus {
+        return Err(leftover_args("bytes", args_is_tuple, pos.cursor, pos.len));
     }
+    Ok(bytes_format_result(
+        pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+        &result,
+    ))
 }
 
 unsafe fn bytes_format_result(fmt: PyObjectRef, data: &[u8]) -> PyObjectRef {
@@ -774,9 +834,15 @@ fn check_min_field_width(spec: &CFormatSpec) -> Result<(), PyError> {
     Ok(())
 }
 
-unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
+unsafe fn spec_format_bytes(
+    spec: &CFormatSpec,
+    mut obj: PyObjectRef,
+    mut site_key: PyObjectRef,
+    site_idx: Option<usize>,
+    fmtstart: usize,
+) -> Result<Vec<u8>, PyError> {
     if let CFormatType::Unsupported { ch, index } = spec.format_type {
-        return Err(unsupported_format_error(ch.to_u32(), index, true));
+        return Err(unsupported_format_error(ch, fmtstart, index, true));
     }
     check_min_field_width(spec)?;
     match &spec.format_type {
@@ -792,44 +858,58 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
                 return Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(src)));
             }
             let Some(method) = crate::baseobjspace::lookup(obj, "__bytes__") else {
-                return Err(PyError::type_error(format!(
-                    "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
-                    crate::baseobjspace::object_functionstr_type_name(obj)
-                )));
+                return Err(format_site_error(
+                    site_key,
+                    site_idx,
+                    PyErrorKind::TypeError,
+                    crate::display::wtf8_format!(
+                        "%b requires a bytes-like object, or an object that implements __bytes__, not ",
+                        type_t(obj)
+                    ),
+                ));
             };
             // bytesobject.py `invoke_bytes_method`:
             // `space.get_and_call_function(w_bytes_method, w_source)`.
             let w_type =
                 crate::typedef::r#type(obj).map_or(pyre_object::PY_NULL, |w_type| w_type.as_ptr());
-            let bytes = crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])?;
+            let mut method = method;
+            let bytes = pyre_object::with_roots!(obj, method, site_key => crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]))?;
             if !pyre_object::is_bytes(bytes) {
-                return Err(PyError::type_error(format!(
-                    "__bytes__ returned non-bytes (type {})",
-                    crate::baseobjspace::object_functionstr_type_name(bytes)
-                )));
+                return Err(crate::display::dunder_must_return(
+                    obj,
+                    "__bytes__",
+                    bytes,
+                    "bytes",
+                ));
             }
             Ok(spec.format_bytes(pyre_object::bytesobject::bytes_like_data(bytes)))
         }
         CFormatType::Number(number_type) => {
             let value = match number_type {
                 CNumberType::DecimalD | CNumberType::DecimalI | CNumberType::DecimalU => {
-                    number_arg_decimal(spec, obj)?
+                    number_arg_decimal(spec, obj, site_key, site_idx)?
                 }
-                _ => number_arg_integer(spec, obj)?,
+                _ => number_arg_integer(spec, obj, site_key, site_idx)?,
             };
             Ok(cformat_rbigint(spec, &value)?.into_bytes())
         }
         CFormatType::Float(_) => {
-            // `float_w` collects (`__float__`, a long's `tofloat`); the error
-            // names the operand read back from its slot.
             let roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = roots.pin_roots(&[obj]);
+            let obj_slot = roots.pin_roots(&[obj, site_key]);
             let value = crate::baseobjspace::float_w(obj).map_err(|e| {
                 if e.kind == PyErrorKind::TypeError {
-                    PyError::type_error(format!(
-                        "float argument required, not {}",
-                        crate::baseobjspace::object_functionstr_type_name(roots.get(obj_slot))
-                    ))
+                    format_site_error(
+                        roots.get(obj_slot + 1),
+                        site_idx,
+                        PyErrorKind::TypeError,
+                        crate::display::wtf8_format!(
+                            format!(
+                                "%{} requires a real number, not ",
+                                spec.format_type.to_char()
+                            ),
+                            type_t(roots.get(obj_slot))
+                        ),
+                    )
                 } else {
                     e
                 }
@@ -837,29 +917,74 @@ unsafe fn spec_format_bytes(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Vec<
             Ok(spec.format_float(value).into_bytes())
         }
         CFormatType::Character(CCharacterType::Character) => {
-            Ok(spec.format_char(bytes_char_arg(obj)?))
+            Ok(spec.format_char(bytes_char_arg(obj, site_key, site_idx)?))
         }
     }
 }
 
-/// A bytes conversion at or above 0x80 raises `OverflowError`. A string
-/// conversion in `0x1f..0x7f` is printed as itself; every other string
-/// conversion is printed as `?`. The hex keeps the code point.
-fn unsupported_format_error(cp: u32, index: usize, bytes: bool) -> PyError {
-    if bytes && cp > 0x7f {
-        return PyError::overflow_error("character argument not in range(0x110000)");
+/// `unicode_format_arg_format` / `_PyBytes_FormatEx` default conversion.
+fn unsupported_format_error(
+    ch: CodePoint,
+    fmtstart: usize,
+    conv_index: usize,
+    bytes: bool,
+) -> PyError {
+    let cp = ch.to_u32();
+    if bytes {
+        if cp < 128 && (cp as u8).is_ascii_alphabetic() {
+            return PyError::value_error(format!(
+                "unsupported format %{} at position {fmtstart}",
+                ch.to_char_lossy()
+            ));
+        }
+        if cp == b'\'' as u32 {
+            return PyError::value_error(format!(
+                "stray % at position {fmtstart} or unexpected format character \"'\" at position {conv_index}"
+            ));
+        }
+        if (32..127).contains(&cp) {
+            return PyError::value_error(format!(
+                "stray % at position {fmtstart} or unexpected format character '{}' at position {conv_index}",
+                char::from_u32(cp).unwrap()
+            ));
+        }
+        return PyError::value_error(format!(
+            "stray % at position {fmtstart} or unexpected format character with code 0x{cp:02x} at position {conv_index}"
+        ));
     }
-    let shown = if bytes || (0x1f..0x7f).contains(&cp) {
-        char::from_u32(cp).unwrap_or('?')
-    } else {
-        '?'
-    };
+    if cp < 128 && (cp as u8).is_ascii_alphabetic() {
+        return PyError::value_error(format!(
+            "unsupported format %{} at position {fmtstart}",
+            ch.to_char_lossy()
+        ));
+    }
+    if cp == b'\'' as u32 {
+        return PyError::value_error(format!(
+            "stray % at position {fmtstart} or unexpected format character \"'\" at position {conv_index}"
+        ));
+    }
+    if (32..127).contains(&cp) {
+        return PyError::value_error(format!(
+            "stray % at position {fmtstart} or unexpected format character '{}' at position {conv_index}",
+            char::from_u32(cp).unwrap()
+        ));
+    }
+    if char::from_u32(cp).is_some_and(rustpython_unicode::classify::is_printable) {
+        return PyError::value_error(format!(
+            "stray % at position {fmtstart} or unexpected format character '{}' (U+{cp:04X}) at position {conv_index}",
+            char::from_u32(cp).unwrap()
+        ));
+    }
     PyError::value_error(format!(
-        "unsupported format character '{shown}' ({cp:#x}) at index {index}",
+        "stray % at position {fmtstart} or unexpected format character U+{cp:04X} at position {conv_index}"
     ))
 }
 
-unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
+unsafe fn bytes_char_arg(
+    obj: PyObjectRef,
+    mut site_key: PyObjectRef,
+    site_idx: Option<usize>,
+) -> Result<u8, PyError> {
     if pyre_object::bytesobject::is_bytes(obj) || pyre_object::bytearrayobject::is_bytearray(obj) {
         let data = pyre_object::bytesobject::bytes_like_data(obj);
         if data.len() == 1 {
@@ -870,28 +995,41 @@ unsafe fn bytes_char_arg(obj: PyObjectRef) -> Result<u8, PyError> {
         } else {
             "bytearray"
         };
-        return Err(PyError::type_error(format!(
-            "%c requires an integer in range(256) or a single byte, not a {kind} object of length {}",
-            data.len()
-        )));
+        return Err(format_site_error(
+            site_key,
+            site_idx,
+            PyErrorKind::TypeError,
+            format!(
+                "%c requires an integer in range(256) or a single byte, not a {kind} object of length {}",
+                data.len()
+            ),
+        ));
     }
     let value = if pyre_object::pyobject::is_int_or_long(obj) {
         arg_to_bigint(obj)
     } else if has_dunder(obj, "__index__") {
-        crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
+        crate::builtins::obj_to_bigint(
+            pyre_object::with_roots!(site_key => crate::baseobjspace::space_index(obj))?,
+        )
     } else {
-        let type_name = match crate::typedef::r#type(obj) {
-            Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
-            None => rustpython_wtf8::Wtf8Buf::from(
-                crate::baseobjspace::object_functionstr_type_name(obj),
+        return Err(format_site_error(
+            site_key,
+            site_idx,
+            PyErrorKind::TypeError,
+            crate::display::wtf8_format!(
+                "%c requires an integer in range(256) or a single byte, not ",
+                type_t(obj)
             ),
-        };
-        return Err(PyError::type_error(crate::display::wtf8_format!(
-            "%c requires an integer in range(256) or a single byte, not ",
-            type_name
-        )));
+        ));
     };
-    let overflow = || PyError::new(PyErrorKind::OverflowError, "%c arg not in range(256)");
+    let overflow = || {
+        format_site_error(
+            site_key,
+            site_idx,
+            PyErrorKind::OverflowError,
+            "%c argument not in range(256)",
+        )
+    };
     if pyre_object::jit_bigint_to_i64_fits(&value) == 0 {
         return Err(overflow());
     }
@@ -914,9 +1052,15 @@ unsafe fn has_getitem(obj: PyObjectRef) -> bool {
 /// Apply a parsed spec to one argument, producing the formatted fragment.
 /// `formatting.py fmt_s / fmt_d / fmt_f / ...` — the per-conversion value
 /// coercion and formatting.
-unsafe fn spec_format_string(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Wtf8Buf, PyError> {
+unsafe fn spec_format_string(
+    spec: &CFormatSpec,
+    obj: PyObjectRef,
+    site_key: PyObjectRef,
+    site_idx: Option<usize>,
+    fmtstart: usize,
+) -> Result<Wtf8Buf, PyError> {
     if let CFormatType::Unsupported { ch, index } = spec.format_type {
-        return Err(unsupported_format_error(ch.to_u32(), index, false));
+        return Err(unsupported_format_error(ch, fmtstart, index, false));
     }
     check_min_field_width(spec)?;
     match &spec.format_type {
@@ -937,17 +1081,36 @@ unsafe fn spec_format_string(spec: &CFormatSpec, obj: PyObjectRef) -> Result<Wtf
         CFormatType::Number(number_type) => {
             let value = match number_type {
                 CNumberType::DecimalD | CNumberType::DecimalI | CNumberType::DecimalU => {
-                    number_arg_decimal(spec, obj)?
+                    number_arg_decimal(spec, obj, site_key, site_idx)?
                 }
-                _ => number_arg_integer(spec, obj)?,
+                _ => number_arg_integer(spec, obj, site_key, site_idx)?,
             };
             Ok(Wtf8Buf::from_string(cformat_rbigint(spec, &value)?))
         }
         CFormatType::Float(_) => {
-            let value = crate::baseobjspace::float_w(obj)?;
+            let roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = roots.pin_roots(&[obj, site_key]);
+            let value = crate::baseobjspace::float_w(obj).map_err(|e| {
+                if e.kind == PyErrorKind::TypeError {
+                    format_site_error(
+                        roots.get(obj_slot + 1),
+                        site_idx,
+                        PyErrorKind::TypeError,
+                        crate::display::wtf8_format!(
+                            format!(
+                                "%{} requires a real number, not ",
+                                spec.format_type.to_char()
+                            ),
+                            type_t(roots.get(obj_slot))
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })?;
             Ok(Wtf8Buf::from_string(spec.format_float(value)))
         }
-        CFormatType::Character(_) => Ok(spec.format_char(char_arg(obj)?)),
+        CFormatType::Character(_) => Ok(spec.format_char(char_arg(obj, site_key, site_idx)?)),
     }
 }
 
@@ -965,7 +1128,12 @@ unsafe fn arg_to_bigint(obj: PyObjectRef) -> BigInt {
 
 /// `fmt_d / fmt_i / fmt_u` argument coercion — `%d`/`%i`/`%u` accept any
 /// integer, a float (truncated), or an object with `__index__` / `__int__`.
-unsafe fn number_arg_decimal(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result<BigInt, PyError> {
+unsafe fn number_arg_decimal(
+    spec: &CFormatSpec,
+    mut obj: PyObjectRef,
+    mut site_key: PyObjectRef,
+    site_idx: Option<usize>,
+) -> Result<BigInt, PyError> {
     if is_int_like(obj) || is_long(obj) {
         return Ok(arg_to_bigint(obj));
     }
@@ -977,7 +1145,7 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result
         return Ok(arg_to_bigint(pyint));
     }
     if let Some(method) = crate::baseobjspace::lookup(obj, "__int__") {
-        let r = pyre_object::with_roots!(obj => crate::builtins::call_and_check(method, &[obj]))?;
+        let r = pyre_object::with_roots!(obj, site_key => crate::builtins::call_and_check(method, &[obj]))?;
         if is_int_like(r) || is_long(r) {
             return Ok(arg_to_bigint(r));
         }
@@ -986,49 +1154,90 @@ unsafe fn number_arg_decimal(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result
         // `format_num_helper`: a TypeError from the numeric decoder (a non-int
         // `__index__` return included) is reported as the operand-type error,
         // naming the original argument, not the coerced result.
-        return match pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj)) {
+        return match pyre_object::with_roots!(obj, site_key => crate::baseobjspace::space_index(obj))
+        {
             Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
-            Err(e) if e.kind == crate::PyErrorKind::TypeError => {
-                Err(number_type_error(spec, obj, "a real number is required"))
-            }
+            Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(number_type_error(
+                spec,
+                obj,
+                site_key,
+                site_idx,
+                "a real number",
+            )),
             Err(e) => Err(e),
         };
     }
-    Err(number_type_error(spec, obj, "a real number is required"))
+    Err(number_type_error(
+        spec,
+        obj,
+        site_key,
+        site_idx,
+        "a real number",
+    ))
 }
 
 /// `fmt_x / fmt_X / fmt_o` argument coercion — the radix conversions accept
 /// an integer or an `__index__` object, but not a float.
-unsafe fn number_arg_integer(spec: &CFormatSpec, mut obj: PyObjectRef) -> Result<BigInt, PyError> {
+unsafe fn number_arg_integer(
+    spec: &CFormatSpec,
+    mut obj: PyObjectRef,
+    mut site_key: PyObjectRef,
+    site_idx: Option<usize>,
+) -> Result<BigInt, PyError> {
     if is_int_like(obj) || is_long(obj) {
         return Ok(arg_to_bigint(obj));
     }
     if has_dunder(obj, "__index__") {
         // `format_num_helper` (maybe_index): a TypeError from `space.index`
         // is reported as the operand-type error naming the original argument.
-        return match pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj)) {
+        return match pyre_object::with_roots!(obj, site_key => crate::baseobjspace::space_index(obj))
+        {
             Ok(w) => Ok(crate::builtins::obj_to_bigint(w)),
-            Err(e) if e.kind == crate::PyErrorKind::TypeError => {
-                Err(number_type_error(spec, obj, "an integer is required"))
-            }
+            Err(e) if e.kind == crate::PyErrorKind::TypeError => Err(number_type_error(
+                spec,
+                obj,
+                site_key,
+                site_idx,
+                "an integer",
+            )),
             Err(e) => Err(e),
         };
     }
-    Err(number_type_error(spec, obj, "an integer is required"))
+    Err(number_type_error(
+        spec,
+        obj,
+        site_key,
+        site_idx,
+        "an integer",
+    ))
 }
 
-/// `%{c} format: {what}, not {type}` for a non-numeric argument.
-unsafe fn number_type_error(spec: &CFormatSpec, obj: PyObjectRef, what: &str) -> PyError {
-    PyError::type_error(format!(
-        "%{} format: {what}, not {}",
-        spec.format_type.to_char(),
-        crate::baseobjspace::object_functionstr_type_name(obj),
-    ))
+/// `FORMAT_ERROR` `%{c} requires {what}, not %T`.
+unsafe fn number_type_error(
+    spec: &CFormatSpec,
+    obj: PyObjectRef,
+    site_key: PyObjectRef,
+    site_idx: Option<usize>,
+    what: &str,
+) -> PyError {
+    format_site_error(
+        site_key,
+        site_idx,
+        PyErrorKind::TypeError,
+        crate::display::wtf8_format!(
+            format!("%{} requires {what}, not ", spec.format_type.to_char()),
+            type_t(obj)
+        ),
+    )
 }
 
 /// `fmt_c` argument coercion — a single-character str, or an integer /
 /// `__index__` in `range(0x110000)`.
-unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
+unsafe fn char_arg(
+    obj: PyObjectRef,
+    mut site_key: PyObjectRef,
+    site_idx: Option<usize>,
+) -> Result<CodePoint, PyError> {
     if is_str(obj) {
         let s = w_str_get_wtf8(obj);
         let mut cps = s.code_points();
@@ -1038,30 +1247,36 @@ unsafe fn char_arg(obj: PyObjectRef) -> Result<CodePoint, PyError> {
             return Ok(cp);
         }
         let n = s.code_points().count();
-        return Err(PyError::type_error(format!(
-            "%c requires an int or a unicode character, not a string of length {n}"
-        )));
+        return Err(format_site_error(
+            site_key,
+            site_idx,
+            PyErrorKind::TypeError,
+            format!("%c requires an integer or a unicode character, not a string of length {n}"),
+        ));
     }
     let value = if is_int_like(obj) || is_long(obj) {
         arg_to_bigint(obj)
     } else if has_dunder(obj, "__index__") {
-        crate::builtins::obj_to_bigint(crate::baseobjspace::space_index(obj)?)
+        crate::builtins::obj_to_bigint(
+            pyre_object::with_roots!(site_key => crate::baseobjspace::space_index(obj))?,
+        )
     } else {
-        let tn = match crate::typedef::r#type(obj) {
-            Some(w_type) => crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
-            None => rustpython_wtf8::Wtf8Buf::from(
-                crate::baseobjspace::object_functionstr_type_name(obj),
+        return Err(format_site_error(
+            site_key,
+            site_idx,
+            PyErrorKind::TypeError,
+            crate::display::wtf8_format!(
+                "%c requires an integer or a unicode character, not ",
+                type_t(obj)
             ),
-        };
-        return Err(PyError::type_error(crate::display::wtf8_format!(
-            "%c requires an int or a unicode character, not ",
-            tn
-        )));
+        ));
     };
     let overflow = || {
-        PyError::new(
+        format_site_error(
+            site_key,
+            site_idx,
             PyErrorKind::OverflowError,
-            "%c arg not in range(0x110000)".to_string(),
+            "%c argument not in range(0x110000)",
         )
     };
     let n = u32::try_from(&value).map_err(|_| overflow())?;
@@ -1091,6 +1306,7 @@ struct OperandColumn {
     base: usize,
     len: usize,
     cursor: usize,
+    is_tuple: bool,
 }
 
 impl OperandColumn {
@@ -1103,6 +1319,11 @@ impl OperandColumn {
         Some(operand)
     }
 
+    /// 1-based tuple index after `getnextarg`, or `None` for a non-tuple.
+    fn tuple_idx(&self) -> Option<usize> {
+        self.is_tuple.then_some(self.cursor)
+    }
+
     /// Whether any operand is still unconsumed — the `checkconsumed` test.
     fn has_next(&self) -> bool {
         self.cursor < self.len
@@ -1113,11 +1334,19 @@ unsafe fn update_quantity_from_tuple(
     pos: &mut OperandColumn,
     quantity: &mut Option<CFormatQuantity>,
     flags: &mut CConversionFlags,
+    site_idx: &mut Option<usize>,
 ) -> Result<(), PyError> {
     if !matches!(quantity, Some(CFormatQuantity::FromValuesTuple)) {
         return Ok(());
     }
-    let v = star_int(pos.next(), StarField::Width)?;
+    // `unicode_format_getnextarg(ctx, allowone=0)`: a non-tuple operand
+    // (`arglen < 0`) is not consumed for `*`.
+    if !pos.is_tuple {
+        return Err(not_enough_args(false, pos.len));
+    }
+    let arg = pos.next();
+    *site_idx = pos.tuple_idx();
+    let v = star_int(arg, StarField::Width, *site_idx, pos)?;
     if v < 0 {
         flags.insert(CConversionFlags::LEFT_ADJUST);
     }
@@ -1130,6 +1359,7 @@ unsafe fn update_quantity_from_tuple(
 unsafe fn update_precision_from_tuple(
     pos: &mut OperandColumn,
     precision: &mut Option<CFormatPrecision>,
+    site_idx: &mut Option<usize>,
 ) -> Result<(), PyError> {
     if !matches!(
         precision,
@@ -1137,56 +1367,18 @@ unsafe fn update_precision_from_tuple(
     ) {
         return Ok(());
     }
-    let v = star_int(pos.next(), StarField::Precision)?;
+    // `unicode_format_getnextarg(ctx, allowone=0)`: a non-tuple operand
+    // (`arglen < 0`) is not consumed for `*`.
+    if !pos.is_tuple {
+        return Err(not_enough_args(false, pos.len));
+    }
+    let arg = pos.next();
+    *site_idx = pos.tuple_idx();
+    let v = star_int(arg, StarField::Precision, *site_idx, pos)?;
     *precision = Some(CFormatPrecision::Quantity(CFormatQuantity::Amount(
         v.max(0) as usize,
     )));
     Ok(())
-}
-
-/// Consume `*` fields on a keyed conversion in CPython 3.14 order.
-///
-/// PyPy `StringFormatter.parse_fmt` obtains `w_value` from
-/// `getmappingvalue`, then `peel_num` asks `nextinputvalue` for each star.
-/// CPython 3.14's `PyUnicode_Format` observably uses the mapped value as that
-/// first star operand: `'%(x)*s' % {'x': 'a'}` raises `* wants int`, while an
-/// integer mapped value is consumed and the conversion then raises `not enough
-/// arguments for format string`. Keep PyPy's lookup-then-star control-flow,
-/// with the 3.14 operand source at this spec-deviation site.
-unsafe fn mapping_star_operands(
-    spec: &mut CFormatSpec,
-    mapped_value: PyObjectRef,
-    conversion_follows: bool,
-) -> Result<(), PyError> {
-    let has_width_star = matches!(spec.min_field_width, Some(CFormatQuantity::FromValuesTuple));
-    let has_precision_star = matches!(
-        spec.precision,
-        Some(CFormatPrecision::Quantity(CFormatQuantity::FromValuesTuple))
-    );
-    if !has_width_star && !has_precision_star {
-        return Ok(());
-    }
-
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(mapped_value);
-    let mut mapped = OperandColumn {
-        base,
-        len: 1,
-        cursor: 0,
-    };
-    update_quantity_from_tuple(&mut mapped, &mut spec.min_field_width, &mut spec.flags)?;
-    update_precision_from_tuple(&mut mapped, &mut spec.precision)?;
-
-    if !conversion_follows {
-        return Ok(());
-    }
-
-    // At least one star consumed the sole mapped value. The conversion still
-    // requires its own operand, exactly like BaseStringFormatter.format's
-    // `nextinputvalue` after conversion-character validation.
-    Err(PyError::type_error(
-        "not enough arguments for format string",
-    ))
 }
 
 #[derive(Clone, Copy)]
@@ -1195,15 +1387,24 @@ enum StarField {
     Precision,
 }
 
-/// The `*` argument must be an int; consume it, matching `nextinputvalue`.
-unsafe fn star_int(arg: Option<PyObjectRef>, field: StarField) -> Result<i64, PyError> {
+/// The `*` argument must be an int; consume it, matching
+/// `unicode_format_getnextarg` with `allowone=0`.
+unsafe fn star_int(
+    arg: Option<PyObjectRef>,
+    field: StarField,
+    site_idx: Option<usize>,
+    pos: &OperandColumn,
+) -> Result<i64, PyError> {
     let Some(arg) = arg else {
-        return Err(PyError::type_error(
-            "not enough arguments for format string",
-        ));
+        return Err(not_enough_args(pos.is_tuple, pos.len));
     };
     if !pyre_object::pyobject::is_int_or_long(arg) {
-        return Err(PyError::type_error("* wants int"));
+        return Err(format_site_error(
+            pyre_object::PY_NULL,
+            site_idx,
+            PyErrorKind::TypeError,
+            crate::display::wtf8_format!("* requires int, not ", type_t(arg)),
+        ));
     }
     let big = crate::builtins::obj_to_bigint(arg);
     match field {
@@ -1211,8 +1412,11 @@ unsafe fn star_int(arg: Option<PyObjectRef>, field: StarField) -> Result<i64, Py
             if pyre_object::jit_bigint_to_i64_fits(&big) != 0 {
                 Ok(pyre_object::jit_bigint_to_i64_value(&big))
             } else {
-                Err(PyError::overflow_error(
-                    "Python int too large to convert to C ssize_t",
+                Err(format_site_error(
+                    pyre_object::PY_NULL,
+                    site_idx,
+                    PyErrorKind::OverflowError,
+                    "too big for width",
                 ))
             }
         }
@@ -1223,8 +1427,11 @@ unsafe fn star_int(arg: Option<PyObjectRef>, field: StarField) -> Result<i64, Py
                     return Ok(value);
                 }
             }
-            Err(PyError::overflow_error(
-                "Python int too large to convert to C int",
+            Err(format_site_error(
+                pyre_object::PY_NULL,
+                site_idx,
+                PyErrorKind::OverflowError,
+                "too big for precision",
             ))
         }
     }
@@ -1240,18 +1447,18 @@ mod tests {
     }
 
     #[test]
-    fn percent_unknown_conversion_observes_python314_operand_order() {
+    fn percent_unknown_conversion_acquires_operand_before_character() {
         crate::typedef::init_typeobjects();
 
-        // PyPy `StringFormatter.format` validates the conversion before its
-        // final `nextinputvalue`; CPython 3.14 `PyUnicode_Format` first proves
-        // that operand exists. This is the observable 3.14-spec departure.
+        // `unicode_format_arg_format` consumes the conversion operand before
+        // classifying the specifier, so an empty tuple fails as not-enough
+        // rather than as an unsupported character.
         let error =
             unsafe { str_format_percent(w_str_new("%z"), w_tuple_new(Vec::new())).unwrap_err() };
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 0)",
         );
 
         let error = unsafe {
@@ -1260,7 +1467,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::ValueError,
-            "unsupported format character 'z' (0x7a) at index 1",
+            "unsupported format %z at position 0",
         );
 
         let error = unsafe {
@@ -1269,7 +1476,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::ValueError,
-            "unsupported format character '?' (0xe9) at index 1",
+            "stray % at position 0 or unexpected format character '\u{e9}' (U+00E9) at position 1",
         );
         let error = unsafe {
             str_format_percent(w_str_new("%\u{1f}"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
@@ -1277,7 +1484,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::ValueError,
-            "unsupported format character '\u{1f}' (0x1f) at index 1",
+            "stray % at position 0 or unexpected format character U+001F at position 1",
         );
         let error = unsafe {
             str_format_percent(w_str_new("%\u{7f}"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
@@ -1285,7 +1492,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::ValueError,
-            "unsupported format character '?' (0x7f) at index 1",
+            "stray % at position 0 or unexpected format character U+007F at position 1",
         );
 
         let error = unsafe {
@@ -1297,8 +1504,8 @@ mod tests {
         };
         assert_error(
             error,
-            PyErrorKind::OverflowError,
-            "character argument not in range(0x110000)",
+            PyErrorKind::ValueError,
+            "stray % at position 0 or unexpected format character with code 0x80 at position 1",
         );
         let error = unsafe {
             bytes_format_percent(w_bytes_from_bytes(b"%q"), w_tuple_new(vec![w_int_new(1)]))
@@ -1307,7 +1514,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::ValueError,
-            "unsupported format character 'q' (0x71) at index 1",
+            "unsupported format %q at position 0",
         );
 
         let error = unsafe {
@@ -1317,21 +1524,46 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 1)",
+        );
+
+        // `unicode_format_getnextarg(..., allowone=0)` for `*`: a non-tuple
+        // operand is not consumed as the width, so the count error fires
+        // before `* requires int`.
+        let error = unsafe {
+            str_format_percent(w_str_new("%*r"), floatobject::w_float_new(3.14)).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string (got 1)",
+        );
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"%*r"), floatobject::w_float_new(3.14))
+                .unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string (got 1)",
         );
 
         let mapping = w_dict_new();
         unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_str_new("not an int")) };
         let error = unsafe { str_format_percent(w_str_new("%(x)*s"), mapping).unwrap_err() };
-        assert_error(error, PyErrorKind::TypeError, "* wants int");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "* cannot be used with a parenthesised mapping key at position 0",
+        );
 
         let mapping = w_dict_new();
         unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_int_new(2)) };
         let error = unsafe { str_format_percent(w_str_new("%(x)*s"), mapping).unwrap_err() };
         assert_error(
             error,
-            PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            PyErrorKind::ValueError,
+            "* cannot be used with a parenthesised mapping key at position 0",
         );
     }
 
@@ -1344,22 +1576,30 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 0)",
         );
 
         let error = unsafe {
             str_format_percent(w_str_new("%s %"), w_tuple_new(vec![w_str_new("done")])).unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+        assert_error(error, PyErrorKind::ValueError, "stray % at position 3");
 
         let error = unsafe {
             str_format_percent(w_str_new("%(x"), w_tuple_new(vec![w_int_new(1)])).unwrap_err()
         };
-        assert_error(error, PyErrorKind::TypeError, "format requires a mapping");
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "format requires a mapping, not tuple",
+        );
 
         let mapping = w_dict_new();
         let error = unsafe { str_format_percent(w_str_new("%(x"), mapping).unwrap_err() };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format key");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "stray % or incomplete format key at position 0",
+        );
 
         let error = unsafe {
             bytes_format_percent(
@@ -1368,18 +1608,26 @@ mod tests {
             )
             .unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+        assert_error(error, PyErrorKind::ValueError, "stray % at position 3");
 
         let error = unsafe {
             bytes_format_percent(w_bytes_from_bytes(b"%(x"), w_tuple_new(vec![w_int_new(1)]))
                 .unwrap_err()
         };
-        assert_error(error, PyErrorKind::TypeError, "format requires a mapping");
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "format requires a mapping, not tuple",
+        );
 
         let mapping = w_dict_new();
         let error =
             unsafe { bytes_format_percent(w_bytes_from_bytes(b"%(x"), mapping).unwrap_err() };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format key");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "stray % or incomplete format key at position 0",
+        );
 
         let error = unsafe {
             str_format_percent(w_str_new("%s %10"), w_tuple_new(Vec::new())).unwrap_err()
@@ -1387,43 +1635,51 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 0)",
         );
 
         let error = unsafe {
             str_format_percent(w_str_new("%s %10"), w_tuple_new(vec![w_str_new("done")]))
                 .unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+        assert_error(error, PyErrorKind::ValueError, "stray % at position 3");
 
         let error =
             unsafe { str_format_percent(w_str_new("%*"), w_tuple_new(Vec::new())).unwrap_err() };
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 0)",
         );
 
         let error = unsafe {
             str_format_percent(w_str_new("%*"), w_tuple_new(vec![w_int_new(2)])).unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+        assert_error(error, PyErrorKind::ValueError, "stray % at position 0");
 
         let mapping = w_dict_new();
         unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_str_new("not an int")) };
         let error = unsafe { str_format_percent(w_str_new("%(x).*"), mapping).unwrap_err() };
-        assert_error(error, PyErrorKind::TypeError, "* wants int");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "* cannot be used with a parenthesised mapping key at position 0",
+        );
 
         let mapping = w_dict_new();
         unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_int_new(2)) };
         let error = unsafe { str_format_percent(w_str_new("%(x).*"), mapping).unwrap_err() };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "* cannot be used with a parenthesised mapping key at position 0",
+        );
 
         let error = unsafe {
             bytes_format_percent(w_bytes_from_bytes(b"%.*"), w_tuple_new(vec![w_int_new(2)]))
                 .unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+        assert_error(error, PyErrorKind::ValueError, "stray % at position 0");
     }
 
     #[test]
@@ -1438,7 +1694,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 0)",
         );
 
         let error = unsafe {
@@ -1448,7 +1704,11 @@ mod tests {
             )
             .unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "width too big");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "width too big at position 3",
+        );
 
         let precision_after_star = format!("%*.{huge}s");
         let error = unsafe {
@@ -1458,7 +1718,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 0)",
         );
 
         let error = unsafe {
@@ -1468,20 +1728,32 @@ mod tests {
             )
             .unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "precision too big");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "precision too big at position 0",
+        );
 
         let mapping_precision = format!("%(x)*.{huge}s");
         let mapping = w_dict_new();
         unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_str_new("not an int")) };
         let error =
             unsafe { str_format_percent(w_str_new(&mapping_precision), mapping).unwrap_err() };
-        assert_error(error, PyErrorKind::TypeError, "* wants int");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "* cannot be used with a parenthesised mapping key at position 0",
+        );
 
         let mapping = w_dict_new();
         unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_int_new(2)) };
         let error =
             unsafe { str_format_percent(w_str_new(&mapping_precision), mapping).unwrap_err() };
-        assert_error(error, PyErrorKind::ValueError, "precision too big");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "* cannot be used with a parenthesised mapping key at position 0",
+        );
 
         let bytes_width = format!("%s %{huge}s").into_bytes();
         let error = unsafe {
@@ -1491,23 +1763,25 @@ mod tests {
             )
             .unwrap_err()
         };
-        assert_error(error, PyErrorKind::ValueError, "width too big");
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "width too big at position 3",
+        );
     }
 
     #[test]
     fn percent_b_is_parsed_in_bytes_only() {
         crate::typedef::init_typeobjects();
 
-        // `%b` never reaches `spec_format_string`; it fails as the generic
-        // unsupported conversion instead.  `fmt_b` exists, so PyPy acquires the
-        // operand before rejecting the character and agrees with 3.14 here --
-        // unlike `%z` above, where only 3.14 asks for the operand first.
+        // `%b` is a bytes-only conversion: a str format consumes the operand
+        // then rejects the character the same way `%z` does.
         let error =
             unsafe { str_format_percent(w_str_new("%b"), w_tuple_new(Vec::new())).unwrap_err() };
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "not enough arguments for format string",
+            "not enough arguments for format string (got 0)",
         );
 
         let error = unsafe {
@@ -1516,7 +1790,7 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::ValueError,
-            "unsupported format character 'b' (0x62) at index 1",
+            "unsupported format %b at position 0",
         );
 
         // In bytes formatting `%b` carries the same padding and coercion rules
@@ -1540,7 +1814,42 @@ mod tests {
         assert_error(
             error,
             PyErrorKind::TypeError,
-            "%b requires a bytes-like object, or an object that implements __bytes__, not 'int'",
+            "format argument 1: %b requires a bytes-like object, or an object that implements __bytes__, not int",
+        );
+
+        let error =
+            unsafe { str_format_percent(w_str_new("abc %"), w_tuple_new(Vec::new())).unwrap_err() };
+        assert_error(error, PyErrorKind::ValueError, "stray % at position 4");
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%x"), floatobject::w_float_new(1.0)).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "format argument: %x requires an integer, not float",
+        );
+
+        let error = unsafe {
+            str_format_percent(
+                w_str_new("%r"),
+                w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
+            )
+            .unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not all arguments converted during string formatting (required 1, got 2)",
+        );
+
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"abc %\nd"), w_int_new(1)).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::ValueError,
+            "stray % at position 4 or unexpected format character with code 0x0a at position 5",
         );
     }
 }

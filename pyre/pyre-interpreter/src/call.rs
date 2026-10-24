@@ -1875,7 +1875,7 @@ fn call_function_ex_impl(
     // Merge the `**` mapping into the call.  argument.py:106-150
     // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
     // path or an arbitrary object via `keys()` / `__getitem__` — raising
-    // "argument after ** must be a mapping" for a non-mapping and
+    // "Value after ** must be a mapping" for a non-mapping and
     // "keywords must be strings" for a non-str key.
     if !kwargs_or_null().is_null() {
         let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
@@ -7498,7 +7498,7 @@ fn valid_slot_name(name: &str) -> bool {
 ///   if name.endswith('__') or '.' in name: return name
 ///   strip leading underscores from klass
 ///   return "_%s%s" % (klass[i:], name)
-fn mangle(name: &str, klass: &str) -> String {
+pub fn mangle(name: &str, klass: &str) -> String {
     if !name.starts_with("__") {
         return name.to_string();
     }

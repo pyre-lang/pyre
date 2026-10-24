@@ -15,5 +15,5 @@ field_pos_spec_misplaced=0
 guard_failures=184
 internal_compile_panics=0
 loops_aborted=5
-loops_compiled=23
+loops_compiled=24
 retraces_compiled=0

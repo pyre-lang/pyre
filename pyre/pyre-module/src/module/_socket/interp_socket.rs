@@ -380,9 +380,25 @@ fn socket_writebuf(
         }
         return Ok((&mut full[off..off + len], owner));
     }
-    Err(pyre_interpreter::PyError::type_error(
-        "a writable bytes-like object is required",
-    ))
+    // `PyObject_GetBuffer` with `PyBUF_WRITABLE` (`w*` / `acquire_writebuf`):
+    // a Python `__buffer__` exporter receives the writable flag.
+    const PYBUF_WRITABLE: i32 = 0x0001;
+    let writable_required = || {
+        pyre_interpreter::PyError::type_error("a writable bytes-like object is required")
+    };
+    match pyre_interpreter::builtins::w_memoryview_new_with_flags(obj, PYBUF_WRITABLE) {
+        Ok(view) => {
+            let _ = pyre_object::gc_roots::pin_root(view);
+            let view = pyre_object::gc_roots::shadow_stack_get(
+                pyre_object::gc_roots::shadow_stack_len() - 1,
+            );
+            if unsafe { pyre_object::memoryview::w_memoryview_readonly(view) } {
+                return Err(writable_required());
+            }
+            socket_writebuf(view)
+        }
+        Err(_) => Err(writable_required()),
+    }
 }
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {

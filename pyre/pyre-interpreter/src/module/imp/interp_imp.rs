@@ -1315,6 +1315,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         type_name(w_name)
                     )));
                 }
+                // [3.15-spec] `_imp_create_builtin` rejects an empty name and
+                // `create_builtin` raises ModuleNotFoundError for a name with
+                // no inittab entry (gh-142029); `interp_imp.py create_builtin`
+                // reaches `getbuiltinmodule`'s SystemError for both.
+                if unsafe { pyre_object::w_str_len(w_name) } == 0 {
+                    return Err(crate::PyError::value_error("name must not be empty"));
+                }
                 let name = ascii_module_name(w_name)?;
                 if name.as_bytes().contains(&0) {
                     return Err(crate::PyError::value_error("embedded null character"));
@@ -1323,17 +1330,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // reload, so we want to reuse (and reinitialize) the existing
                 // module object
                 let reuse = crate::importing::sys_modules_entry(&name).is_some();
-                // A name that is spelled correctly but names no builtin is
-                // reported by returning None, leaving the diagnostic to
-                // `BuiltinImporter.create_module`, which has already screened
-                // the name against `sys.builtin_module_names`.
-                Ok(crate::importing::getbuiltinmodule(
+                crate::importing::getbuiltinmodule(
                     &name,
                     true,
                     reuse,
                     crate::call::getexecutioncontext(),
                 )?
-                .unwrap_or_else(pyre_object::w_none))
+                .ok_or_else(|| {
+                    crate::PyError::module_not_found_with_name_obj(
+                        format!("{name} module not found"),
+                        pyre_object::w_str_new(&name),
+                    )
+                })
             },
             1,
         ));

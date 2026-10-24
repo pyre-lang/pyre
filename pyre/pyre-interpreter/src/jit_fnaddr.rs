@@ -4705,6 +4705,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pyerror_to_exc_object",
         crate::error::__majit_call_target_pyerror_to_exc_object,
     );
+    // `error_carrier_edges` `land_from_exc_object` / `PyError::from_exc_object`.
+    // The blackhole's `bhimpl_inline_call_*` calls `cpu.bh_call_*(jitcode.fnaddr)`
+    // (`blackhole.py`); without this binding the jitcode stays a symbolic
+    // hash and interpreting it residual-calls unbound `make_pyerror`.
+    cpa1!(
+        &mut entries,
+        "pyre_interpreter::error::pyerror_from_exc_object",
+        "pyre_interpreter::pyerror_from_exc_object",
+        crate::error::__majit_call_target_pyerror_from_exc_object,
+    );
+    cpa1!(
+        &mut entries,
+        "pyre_interpreter::error::PyError::from_exc_object",
+        "pyre_interpreter::PyError::from_exc_object",
+        crate::error::from_exc_object_method_jit_abi,
+    );
     // The same materialisation with the `type_error` constructor folded in, so
     // the raise site carries neither body. The typed local spells the
     // trampoline's signature at the call site; `cpa1` checks the same thing
@@ -8203,6 +8219,29 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::pyerror_to_exc_object"],
             materialise
+        );
+
+        let from_exc: extern "C" fn(i64) -> i64 =
+            crate::error::__majit_call_target_pyerror_from_exc_object;
+        let from_exc = from_exc as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::pyerror_from_exc_object"],
+            from_exc
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::pyerror_from_exc_object"],
+            from_exc
+        );
+        let from_exc_method: extern "C" fn(i64) -> i64 =
+            crate::error::from_exc_object_method_jit_abi;
+        let from_exc_method = from_exc_method as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::error::PyError::from_exc_object"],
+            from_exc_method
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::PyError::from_exc_object"],
+            from_exc_method
         );
 
         let fused: extern "C" fn(i64) -> i64 =

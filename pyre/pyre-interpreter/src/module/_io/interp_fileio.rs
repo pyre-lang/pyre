@@ -9,6 +9,8 @@ pub struct W_FileIO {
     writable: bool,
     created: bool,
     appending: bool,
+    /// `mode_string`: `'w'`/`'w+'` truncate the file, so `wb+` rather than `rb+`.
+    truncate: bool,
     /// `-1` until `seekable_w` probes; then `0` or `1`.
     seekable: i32,
     closefd: bool,
@@ -27,6 +29,7 @@ impl Default for W_FileIO {
             writable: false,
             created: false,
             appending: false,
+            truncate: false,
             seekable: -1,
             closefd: true,
             w_name: PY_NULL,
@@ -77,11 +80,13 @@ impl W_FileIO {
         writable: bool,
         created: bool,
         appending: bool,
+        truncate: bool,
     ) {
         self.readable = readable;
         self.writable = writable;
         self.created = created;
         self.appending = appending;
+        self.truncate = truncate;
     }
 
     /// `W_FileIO.readable`.
@@ -99,14 +104,18 @@ impl W_FileIO {
         self.appending
     }
 
-    /// `W_FileIO._mode`.
+    /// `mode_string`.
     pub(crate) fn mode_str(&self) -> &'static str {
         if self.created {
             if self.readable { "xb+" } else { "xb" }
         } else if self.appending {
             if self.readable { "ab+" } else { "ab" }
         } else if self.readable {
-            if self.writable { "rb+" } else { "rb" }
+            if self.writable {
+                if self.truncate { "wb+" } else { "rb+" }
+            } else {
+                "rb"
+            }
         } else {
             "wb"
         }

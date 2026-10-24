@@ -402,6 +402,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     code: &pyre_interpreter::CodeObject,
     new_pypc: u32,
     new_depth: usize,
+    after_residual_call: bool,
 ) {
     if !ctx.vstack_valid {
         return;
@@ -623,6 +624,13 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     } else {
         class
     };
+    // GET_ITER / LOAD_SPECIAL after-residual: the residual's result is the
+    // first pushed value (`make_result_of_lastop`), and neither push has
+    // run yet. Fill from `vstack_last_ref` after the hole-fill below, and
+    // only while the slot is still NONE, so a looked-inside GET_ITER that
+    // already wrote the iterator through `setarrayitem_vable_r` is not
+    // overwritten by a previous opcode's residual.
+    let mut fill_first_push_from_residual = false;
     match effective_class {
         // The saved boxes ARE the reconcile for this boundary; the previous
         // opcode's effect belongs to the excursion, not to the arm point.  The
@@ -795,6 +803,8 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                     ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = null;
                 }
             }
+            fill_first_push_from_residual =
+                after_residual_call && trailing_null.is_some() && new_depth >= 2;
         }
         VstackOpClass::Unmodeled => {
             ctx.vstack_valid = false;
@@ -843,6 +853,19 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             } else {
                 let _ = reseed_vstack_from_shadow(ctx, new_depth);
             }
+        }
+    }
+    if fill_first_push_from_residual && ctx.vstack_valid && new_depth >= 2 {
+        let result = ctx.frame_state.borrow().vstack_last_ref;
+        let hole = ctx
+            .frame_state
+            .borrow()
+            .vstack_boxes
+            .get(new_depth - 2)
+            .copied()
+            == Some(OpRef::NONE);
+        if hole && result != OpRef::NONE {
+            ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 2] = result;
         }
     }
     if ctx.vstack_valid {
@@ -1093,6 +1116,68 @@ fn exact_segmentation_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var_os("PYRE_VSTACK_NO_EXACT").is_some())
 }
 
+/// GET_ITER / method-form LOAD_SPECIAL: pop one, push two (iterator or
+/// special method, then index-or-NULL / self_or_null). The backward
+/// `-live-` skip below only applies to these opcodes; CHECK_EXC_MATCH and
+/// other after-residual captures still take the reorder reseed.
+fn two_push_get_iter_or_load_special(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
+    let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+        return false;
+    };
+    classify_vstack_opcode(&instr, op_arg) == VstackOpClass::LoadSpecialMethod
+}
+
+/// True when the operand-stack shadow already holds a non-null box in
+/// `first_slot..depth`. After-residual GET_ITER / LOAD_SPECIAL pop before
+/// their two pushes land; an empty pair is the `jit_next(NULL)` reseed,
+/// while a populated pair is the later marker that should ShadowReseed a
+/// stale capture image. Outer operand slots are ignored so a nested
+/// GET_ITER is not treated as complete just because an enclosing iterator
+/// already occupies a lower slot.
+fn vstack_operand_shadow_occupied<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code: &pyre_interpreter::CodeObject,
+    first_slot: usize,
+    depth: usize,
+) -> bool {
+    if first_slot >= depth {
+        return false;
+    }
+    if ctx.fbw_mode.inline_subwalk {
+        let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+        let state = ctx.frame_state.borrow();
+        let Some(shadow) = state.callee_shadow.as_ref() else {
+            return false;
+        };
+        (first_slot..depth).any(
+            |s| match shadow.opref.get(&((stack_base + s) as i64)).copied() {
+                Some(value) if value != OpRef::NONE && !opref_is_null_const_ptr(value) => true,
+                _ => false,
+            },
+        )
+    } else {
+        if ctx.fbw_mode.snapshot_sym.is_null() {
+            return false;
+        }
+        let nlocals = unsafe { (*ctx.fbw_mode.snapshot_sym).nlocals() };
+        let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        (first_slot..depth).any(
+            |s| match ctx.trace_ctx.virtualizable_box_at(nvs + nlocals + s) {
+                Some(b)
+                    if b != OpRef::NONE
+                        && (!opref_is_null_const_ptr(b)
+                            || ctx
+                                .trace_ctx
+                                .virtualizable_slot_stored_live_null(nvs + nlocals + s)) =>
+                {
+                    true
+                }
+                _ => false,
+            },
+        )
+    }
+}
+
 /// #73: step the walk-level operand-stack box mirror at
 /// the top of every jitcode `step`.  Detects a Python-opcode boundary by
 /// mapping the current `jit_pc` back to its containing Python opcode; when
@@ -1181,6 +1266,27 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         ctx.vstack_handler_landing_py = None;
         return;
     }
+    // After-residual capture already applied this opcode's stack effect and
+    // advanced `vstack_cur_pypc` to the resume py_pc. A later `-live-` still
+    // owned by the retired opcode reports that earlier py_pc, which looks
+    // like a backward layout switch. GET_ITER / LOAD_SPECIAL have popped
+    // but not yet pushed: reseeding from that empty pair leaves the
+    // iterator NULL (`jit_next(NULL)`). Keep the capture boxes until the
+    // two pushed slots appear in the shadow; then fall through so the
+    // reorder reseed can replace a stale image. Other opcodes, including
+    // CHECK_EXC_MATCH, take the reorder reseed on this marker so a stale
+    // capture box is not published as live.
+    if new_pypc < ctx.vstack_cur_pypc {
+        let code = unsafe { &*code_ptr };
+        let depth = ctx.vstack_depth;
+        if crate::pyjitpl::semantic_fallthrough_pc(code, new_pypc as usize)
+            == ctx.vstack_cur_pypc as usize
+            && two_push_get_iter_or_load_special(code, new_pypc as usize)
+            && !vstack_operand_shadow_occupied(ctx, code, depth.saturating_sub(2), depth)
+        {
+            return;
+        }
+    }
     // Still inside the landing block a catch target opened: these bytes belong
     // to no Python opcode, so hold the handler-entry coordinate rather than
     // treating the segment they were laid out in as a boundary.  Any other
@@ -1202,7 +1308,7 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         fbw_note_opcode_entry_effects(new_pypc as usize);
     }
     let code = unsafe { &*code_ptr };
-    reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth);
+    reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth, false);
 }
 
 /// Advance the operand-stack mirror to the post-step resume coordinate.
@@ -1251,7 +1357,7 @@ pub(crate) fn reconcile_vstack_to_resume_pc<Sym: WalkSym>(
     if !ctx.fbw_mode.inline_subwalk {
         fbw_note_opcode_entry_effects(dest_py as usize);
     }
-    reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth);
+    reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth, false);
 }
 
 pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(

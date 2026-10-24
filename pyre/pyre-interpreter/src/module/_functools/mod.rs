@@ -394,20 +394,25 @@ class partial:
         object.__delattr__(self, name)
 
     def __call__(self, /, *args, **keywords):
+        # `partial_vectorcall` / `partial_call` snapshot `fn`, `args`, and
+        # `kw` before merging or calling, so a reentrant `__setstate__`
+        # cannot replace them mid-call.
+        func = self.func
+        pto_args = self.args
+        pto_keywords = self.keywords
         phcount = self._phcount
+        merger = self._merger
         if phcount:
             try:
-                pto_args = self._merger(self.args + args)
+                pto_args = merger(pto_args + args)
                 args = args[phcount:]
             except IndexError:
                 raise TypeError(
                     "missing positional arguments in 'partial' call; "
                     f"expected at least {phcount}, got {len(args)}"
                 )
-        else:
-            pto_args = self.args
-        keywords = {**self.keywords, **keywords}
-        return self.func(*pto_args, *args, **keywords)
+        keywords = {**pto_keywords, **keywords}
+        return func(*pto_args, *args, **keywords)
 
     def __get__(self, obj, objtype=None):
         if obj is None:

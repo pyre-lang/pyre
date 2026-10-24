@@ -4311,13 +4311,16 @@ macro_rules! make_maketrans_descr {
         fn maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             ($func)(args)
         }
-        let function = make_builtin_function("maketrans", maketrans);
-        $(unsafe {
-            crate::function::fset_func_text_signature(
-                function,
-                w_str_new($text_signature),
-            )
-        };)?
+        let mut function = make_builtin_function("maketrans", maketrans);
+        // The string is allocated before `function` is read as an argument,
+        // so the call sees the forwarded pointer.
+        let w_module =
+            pyre_object::with_roots!(function => pyre_object::intern_str_value("builtins"));
+        unsafe { crate::function::builtin_function_set_module(function, w_module) };
+        $(
+            let w_signature = pyre_object::with_roots!(function => w_str_new($text_signature));
+            unsafe { crate::function::fset_func_text_signature(function, w_signature) };
+        )?
         pyre_object::w_staticmethod_new(function)
     }};
 }
@@ -9115,7 +9118,7 @@ fn init_str_type(ns: PyObjectRef) {
                             }
                         }
                     } else {
-                        if !unsafe { pyre_object::is_dict(args[0]) } {
+                        if !unsafe { pyre_object::is_exact_any_dict(args[0]) } {
                             return Err(crate::PyError::type_error(
                                 "if you give only one argument to maketrans it must be a dict",
                             ));
@@ -13588,6 +13591,21 @@ fn init_slice_type(ns: PyObjectRef) {
             ns_slot,
             "indices",
             wrap_method("indices", slice_method_indices, 2, "($self, object, /)")
+        )
+    };
+    // `sliceobject.c` `__class_getitem__` is `Py_GenericAlias`.
+    unsafe {
+        crate::__pyre_put_new!(
+            ns_slot,
+            "__class_getitem__",
+            pyre_object::function::w_classmethod_new(
+                crate::gateway::make_builtin_function_with_arity_and_text_signature(
+                    "__class_getitem__",
+                    crate::_pypy_generic_alias::generic_alias_class_getitem,
+                    2,
+                    "($type, object, /)",
+                ),
+            )
         )
     };
 }
@@ -29200,7 +29218,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // (`PY_NULL` omitted).
     let bound = |i: usize| args.get(i).copied().filter(|value| !value.is_null());
     let mut cls = bound(0).unwrap_or(pyre_object::PY_NULL);
-    let data_obj = bound(1).ok_or_else(|| {
+    let mut data_obj = bound(1).ok_or_else(|| {
         crate::PyError::type_error("from_bytes() missing required argument 'bytes' (pos 1)")
     })?;
     // The clinic `str byteorder` converter runs before `PyBytes_FromObject`
@@ -29238,13 +29256,12 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let bytes: Vec<u8> = if let Some(method) = bytes_method {
         let w_type = crate::typedef::r#type(data_obj).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
         let w_bytes = unsafe {
-            pyre_object::with_roots!(cls => crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[]))?
+            pyre_object::with_roots!(cls, data_obj => crate::baseobjspace::get_and_call_function(method, data_obj, w_type, &[]))?
         };
         if !unsafe { pyre_object::bytesobject::is_bytes(w_bytes) } {
-            return Err(crate::PyError::type_error(format!(
-                "__bytes__ returned non-bytes (type '{}')",
-                crate::error::type_name_of(w_bytes)
-            )));
+            return Err(unsafe {
+                crate::display::dunder_must_return(data_obj, "__bytes__", w_bytes, "bytes")
+            });
         }
         unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes).to_vec() }
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(data_obj) } {
@@ -30348,12 +30365,11 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         // __bytes__.)
         if let Some(method) = crate::baseobjspace::lookup(arg, "__bytes__") {
             let w_type = crate::typedef::r#type(arg).map_or(pyre_object::PY_NULL, |t| t.as_ptr());
-            let w_bytes = crate::baseobjspace::get_and_call_function(method, arg, w_type, &[])?;
+            let w_bytes = pyre_object::with_roots!(arg => crate::baseobjspace::get_and_call_function(method, arg, w_type, &[]))?;
             if !pyre_object::bytesobject::is_bytes(w_bytes) {
-                return Err(crate::PyError::type_error(format!(
-                    "__bytes__ returned non-bytes (type {})",
-                    type_name_of(w_bytes)
-                )));
+                return Err(unsafe {
+                    crate::display::dunder_must_return(arg, "__bytes__", w_bytes, "bytes")
+                });
             }
             return Ok(w_bytes);
         }

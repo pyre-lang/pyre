@@ -1052,6 +1052,14 @@ fn make_hash(
              keyword parameter is slated for removal in a future version.",
         ));
     }
+    if data_slot.is_none() && string_slot.is_some() {
+        pyre_interpreter::warn::warn_deprecation(
+            "the 'string' keyword parameter is deprecated since \
+             Python 3.15 and slated for removal in Python 3.19; \
+             use the 'data' keyword parameter or pass the data \
+             to hash as a positional argument instead",
+        )?;
+    }
     let data_bytes = match data_slot.or(string_slot) {
         Some(slot) => read_hash_buffer(pyre_object::gc_roots::shadow_stack_get(slot))?,
         None => Vec::new(),

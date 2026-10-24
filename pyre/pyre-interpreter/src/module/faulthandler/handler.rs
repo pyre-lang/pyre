@@ -427,17 +427,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // NotImplementedError does not run them first.
                     #[cfg(all(any(unix, windows), feature = "host_env"))]
                     {
-                        let all_threads = int_arg(args, 1, 1)?;
+                        let mut w_file_arg = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                        let w_all_threads = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                        let mut w_c_stack = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                        let mut w_max_threads = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+                        let all_threads = if w_all_threads.is_null() {
+                            1
+                        } else {
+                            pyre_object::with_roots!(w_file_arg, w_c_stack, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_all_threads))?
+                        };
                         // [3.15-spec] `c_stack: bool = True` is not
                         // upstream's; see `cintf::FatalError::c_stack`.
-                        let c_stack = match args.get(2).copied().filter(|a| !a.is_null()) {
-                            Some(w_c_stack) => pyre_interpreter::baseobjspace::is_true(w_c_stack)?,
-                            None => true,
+                        let c_stack = if w_c_stack.is_null() {
+                            true
+                        } else {
+                            pyre_object::with_roots!(w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::is_true(w_c_stack))?
                         };
-                        let max_threads = int_arg(args, 3, 100)?;
-                        let (fd, w_file) = faulthandler_get_fileno_and_file(
-                            args.first().copied().unwrap_or(pyre_object::PY_NULL),
-                        )?;
+                        let max_threads = if w_max_threads.is_null() {
+                            100
+                        } else {
+                            pyre_object::with_roots!(w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
+                        };
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(w_file_arg)?;
                         // Nothing else names the resolved file between here and the
                         // owner store below, so keep it rooted across the install.
                         let _roots = pyre_object::gc_roots::push_roots();
@@ -651,11 +662,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "dump_traceback_later() missing required argument 'timeout' (pos 1)",
                         ));
                     };
+                    let mut w_timeout = w_timeout;
+                    let mut w_repeat = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                    let mut w_file_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                    let mut w_exit = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+                    let mut w_max_threads = args.get(4).copied().unwrap_or(pyre_object::PY_NULL);
                     // `handler.py Handler.dump_traceback_later`.
-                    let timeout = pyre_interpreter::baseobjspace::float_w(w_timeout)? * 1e6;
-                    let repeat = int_arg(args, 1, 0)?;
-                    let exit = int_arg(args, 3, 0)?;
-                    let max_threads = int_arg(args, 4, 100)?;
+                    let timeout = pyre_object::with_roots!(w_timeout, w_repeat, w_file_arg, w_exit, w_max_threads => pyre_interpreter::baseobjspace::float_w(w_timeout))? * 1e6;
+                    let repeat = if w_repeat.is_null() {
+                        0
+                    } else {
+                        pyre_object::with_roots!(w_file_arg, w_exit, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_repeat))?
+                    };
+                    let exit = if w_exit.is_null() {
+                        0
+                    } else {
+                        pyre_object::with_roots!(w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_exit))?
+                    };
+                    let max_threads = if w_max_threads.is_null() {
+                        100
+                    } else {
+                        pyre_object::with_roots!(w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
+                    };
                     // `ovfcheck_float_to_longlong`: in range or OverflowError,
                     // NaN included; the conversion truncates.
                     if !(-9.223372036854776e18..9.223372036854776e18).contains(&timeout) {
@@ -671,9 +699,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                     #[cfg(all(any(unix, windows), feature = "host_env"))]
                     {
-                        let (fd, w_file) = faulthandler_get_fileno_and_file(
-                            args.get(2).copied().unwrap_or(pyre_object::PY_NULL),
-                        )?;
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(w_file_arg)?;
                         let _roots = pyre_object::gc_roots::push_roots();
                         let file_slot = (!w_file.is_null()).then(|| {
                             let _ = pyre_object::gc_roots::pin_root(w_file);
@@ -696,7 +722,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     }
                     #[cfg(not(all(any(unix, windows), feature = "host_env")))]
                     {
-                        let _ = (microseconds, repeat, exit, max_threads);
+                        let _ = (microseconds, repeat, exit, max_threads, w_file_arg);
                         Err(pyre_interpreter::PyError::not_implemented(
                             "faulthandler.dump_traceback_later requires host_env feature",
                         ))

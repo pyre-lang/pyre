@@ -950,11 +950,55 @@ fn traceback_frame_names_module(co_filename: &str, module_names: &[&str]) -> boo
 /// reads word-sized arguments and cannot see through a reference or the
 /// `PyObjectRef` alias.
 ///
+/// Residual ABI: the argument is the `PyError` GCREF (`PyErrorObject *`),
+/// the same ref-banked word `error_carrier_edges` `lower_carrier_raises`
+/// passes and `jtransform` retypes onto the parameter. Reconstruct the
+/// handle; the word is not a pointer to a handle.
+///
 /// # Safety
-/// `err` must point to a live `PyError` no other borrow aliases.
+/// `err` must be a live `PyErrorObject`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn pyerror_to_exc_object(err: *mut PyError) -> *mut pyre_object::PyObject {
-    unsafe { (*err).to_exc_object() }
+    unsafe { PyError(err as *mut PyErrorObject as PyObjectRef).to_exc_object() }
+}
+
+/// [`PyError::from_exc_object`] behind the residual-call ABI:
+/// one pointer in, one pointer out, and a body the codewriter does not
+/// look inside.
+///
+/// `error_carrier_edges` `land_from_exc_object` rebuilds the carrier from
+/// `last_exc_value` the way `exceptiontransform.py` rewrites
+/// `except OperationError as e`. Interpreting that body residual-calls
+/// `make_pyerror` (`dont_look_inside`) at a symbolic fnaddr, so the
+/// blackhole's `bhimpl_inline_call_*` must `cpu.bh_call_*(jitcode.fnaddr)`
+/// instead. The pointer spellings are load-bearing: the call-target
+/// trampoline reads word-sized arguments and cannot see through a
+/// reference or the `PyObjectRef` alias.
+///
+/// # Safety
+/// `obj` must point to a live `W_BaseException`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn pyerror_from_exc_object(obj: *mut pyre_object::PyObject) -> *mut PyErrorObject {
+    unsafe {
+        let kind = pyre_object::interp_exceptions::w_exception_get_kind(obj);
+        // The display string is derived lazily from `exc_object`
+        // (`message_text`), never here: conversion runs on every
+        // raise propagation, and stringifying the args eagerly would
+        // execute their `__str__` at raise time instead of at
+        // display time.
+        make_pyerror(
+            PyError::kind_from_exc(kind),
+            DisplayMessage::FromExcObject,
+            obj,
+            true,
+            false,
+            -1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            crate::baseobjspace::exception_getclass(obj),
+        )
+        .raw()
+    }
 }
 
 /// [`PyError::type_error`] and [`PyError::to_exc_object`] fused into one
@@ -3465,30 +3509,30 @@ fn kind_to_exc_kind(kind: PyErrorKind) -> ExcKind {
 impl PyError {
     /// Create a PyError from a W_BaseException.
     ///
+    /// The conversion body is [`pyerror_from_exc_object`]: catching
+    /// `OperationError` rebuilds the carrier from `last_exc_value`
+    /// (`error_carrier_edges` `land_from_exc_object`), and that helper
+    /// is the residual the blackhole native-calls.
+    ///
     /// # Safety
     /// `obj` must point to a valid `W_BaseException`.
     pub unsafe fn from_exc_object(obj: PyObjectRef) -> Self {
-        unsafe {
-            let kind = pyre_object::interp_exceptions::w_exception_get_kind(obj);
-            // The display string is derived lazily from `exc_object`
-            // (`message_text`), never here: conversion runs on every
-            // raise propagation, and stringifying the args eagerly would
-            // execute their `__str__` at raise time instead of at
-            // display time.
-            make_pyerror(
-                Self::kind_from_exc(kind),
-                DisplayMessage::FromExcObject,
-                obj,
-                true,
-                false,
-                -1,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                crate::baseobjspace::exception_getclass(obj),
-            )
-        }
+        unsafe { PyError(pyerror_from_exc_object(obj) as PyObjectRef) }
     }
+}
 
+/// One-word residual-call ABI for [`PyError::from_exc_object`].
+///
+/// Distinct from [`pyerror_from_exc_object`]'s trampoline: each jitcode's
+/// fnaddr is its own function (`bhimpl_inline_call_*` →
+/// `cpu.bh_call_*(jitcode.fnaddr)`). [`majit_ir::icf_identity`] keeps
+/// MergeFunctions from folding this bridge onto that trampoline.
+pub extern "C" fn from_exc_object_method_jit_abi(obj: i64) -> i64 {
+    majit_ir::icf_identity!("error::from_exc_object_method_jit_abi");
+    unsafe { PyError::from_exc_object(obj as PyObjectRef).raw() as i64 }
+}
+
+impl PyError {
     pub fn kind_from_exc(kind: ExcKind) -> PyErrorKind {
         match kind {
             ExcKind::TypeError => PyErrorKind::TypeError,

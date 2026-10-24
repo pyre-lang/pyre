@@ -408,11 +408,15 @@ fn every_continuation_parent_carries_the_pending_result_placeholder() {
         crate::operator_continuation::OperatorTail::Len,
         crate::operator_continuation::OperatorTail::Truth,
     ] {
-        let parent = operator_continuation_parent_frame(tail).expect("tail installs");
+        let parent = operator_continuation_parent_frame(tail, None).expect("tail installs");
+        let expected = match tail {
+            crate::operator_continuation::OperatorTail::Format => 2,
+            _ => 1,
+        };
         assert_eq!(
             parent.boxes.len(),
-            1,
-            "{tail:?}: resume-pc liveness names r0, so the parent snapshot needs a matching box",
+            expected,
+            "{tail:?}: resume-pc liveness names the parent snapshot's boxes",
         );
     }
 }
@@ -475,6 +479,7 @@ fn operator_tail_latch_without_a_mirror_declines_before_inline() {
         !operator_tail_resume_image_capturable(
             &wc,
             crate::operator_continuation::OperatorTail::Len,
+            None,
         ),
         "a missing vstack mirror must refuse the resume image before inline",
     );
@@ -483,6 +488,7 @@ fn operator_tail_latch_without_a_mirror_declines_before_inline() {
             &wc,
             &caller,
             crate::operator_continuation::OperatorTail::Len,
+            None,
         ),
         "a missing vstack mirror must refuse the latch before inline",
     );
@@ -542,6 +548,7 @@ fn operator_tail_known_class_result_records_no_guard_class() {
         result,
         majit_ir::OpCode::GuardClass,
         &[result, type_const],
+        None,
     )
     .expect("a known-class GuardClass is a no-op");
     drop(wc);
@@ -583,6 +590,15 @@ fn inline_call_with_descr(descr: u16) -> Vec<u8> {
         .get("inline_call_r_v/dR")
         .expect("`inline_call_r_v/dR` must be in insns table");
     vec![byte, descr as u8, (descr >> 8) as u8, 0]
+}
+
+/// One `inline_call_r_r/dR>r` whose R varlist is exactly `[0]`, the generated
+/// `__majit_wrap_*` identity trampoline shape.
+fn inline_call_r_r_with_r0(descr: u16, dest: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("inline_call_r_r/dR>r")
+        .expect("`inline_call_r_r/dR>r` must be in insns table");
+    vec![byte, descr as u8, (descr >> 8) as u8, 1, 0, dest]
 }
 
 fn void_return() -> Vec<u8> {
@@ -721,7 +737,7 @@ fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
             &code,
             1,
             &[real, symbolic],
-            |_, _| None,
+            |_, _, _| None,
             &mut |_, _| true,
             &mut |_| false,
             &mut |_| None,
@@ -735,6 +751,50 @@ fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
     let nonempty = scan(1);
     assert_eq!(nonempty.blocker_after_effect, Some(symbolic));
     assert!(nonempty.may_execute_effect);
+}
+
+/// Generated `__majit_wrap_*` gateways are `inline_call <body> R[0]`.  The
+/// wrapper's known r0 length is the call site's argument count, and that
+/// fact has to reach the wrapped body so a 2-arg `iter(f, 0)` does not join
+/// the 1-arg list-iter arm.
+#[test]
+fn an_identity_trampoline_forwards_r0_array_length_into_the_callee() {
+    let mut trampoline = inline_call_r_r_with_r0(7, 1);
+    trampoline.extend(void_return());
+
+    let mut forwarded = None;
+    super::inline_call::summarize_body_blockers_with(
+        &trampoline,
+        1,
+        &[],
+        |descr, _effect, entry_lens| {
+            forwarded = Some((descr, entry_lens.to_vec()));
+            None
+        },
+        &mut |_, _| true,
+        &mut |_| false,
+        &mut |_| None,
+        &[(0, 2)],
+    );
+    assert_eq!(forwarded, Some((7, vec![(0, 2)])));
+
+    let mut empty_r = inline_call_with_descr(7);
+    empty_r.extend(void_return());
+    let mut empty_forwarded = None;
+    super::inline_call::summarize_body_blockers_with(
+        &empty_r,
+        1,
+        &[],
+        |descr, _effect, entry_lens| {
+            empty_forwarded = Some((descr, entry_lens.to_vec()));
+            None
+        },
+        &mut |_, _| true,
+        &mut |_| false,
+        &mut |_| None,
+        &[(0, 2)],
+    );
+    assert_eq!(empty_forwarded, Some((7, Vec::new())));
 }
 
 /// An executed residual call the effectinfo names effect-free -- elidable,
@@ -756,7 +816,7 @@ fn a_blocker_behind_an_effect_free_call_is_not_a_decline() {
         &code,
         1,
         &[real, symbolic],
-        |_, _| None,
+        |_, _, _| None,
         &mut |_, _| true,
         &mut |descr_index| {
             asked.push(descr_index);
@@ -834,7 +894,7 @@ fn a_switch_with_a_known_table_does_not_leak_its_state_to_every_start() {
         &code,
         1,
         &[real, symbolic],
-        |_, _| None,
+        |_, _, _| None,
         &mut |_, _| true,
         &mut |_| false,
         &mut |_| Some(vec![10]),
@@ -13481,6 +13541,29 @@ fn extra_info_rewindable_allocation_absent_raw_write_set_is_not_empty() {
     info._write_descrs_interiorfields = Some(Vec::new());
     assert!(super::inline_call::extra_info_is_rewindable_allocation(
         &info
+    ));
+}
+
+#[test]
+fn rewindable_exc_materialize_paths_match_the_published_leaves() {
+    use super::residual_call::is_rewindable_exc_materialize_path;
+    assert!(is_rewindable_exc_materialize_path(
+        "pyre_interpreter::error::pyerror_to_exc_object"
+    ));
+    assert!(is_rewindable_exc_materialize_path(
+        "pyre_interpreter::pyerror_from_exc_object"
+    ));
+    assert!(is_rewindable_exc_materialize_path(
+        "__majit_call_target_pyerror_type_error_to_exc_object"
+    ));
+    assert!(is_rewindable_exc_materialize_path(
+        "pyre_interpreter::error::pyerror_index_error_to_exc_object"
+    ));
+    assert!(!is_rewindable_exc_materialize_path(
+        "pyre_interpreter::error::make_pyerror"
+    ));
+    assert!(!is_rewindable_exc_materialize_path(
+        "pyre_interpreter::error::PyError::from_exc_object"
     ));
 }
 

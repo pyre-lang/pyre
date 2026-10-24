@@ -2400,13 +2400,18 @@ unsafe fn code_objects_equal(
     let left_name = unsafe { w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(root_base)) };
     let right_name =
         unsafe { w_code_name_obj(pyre_object::gc_roots::shadow_stack_get(root_base + 1)) };
+    let name_base = pyre_object::gc_roots::pin_roots(&[left_name, right_name]);
+    let left_name = pyre_object::gc_roots::shadow_stack_get(name_base);
+    let right_name = pyre_object::gc_roots::shadow_stack_get(name_base + 1);
     let this = pyre_object::gc_roots::shadow_stack_get(root_base);
     let other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     // [3.14-spec] code equality ignores co_qualname ↔ `descr_code__eq__`
     // compares `self.co_qualname`. A qualname-only `replace` still compares equal.
+    // `code_richcompare` uses `PyObject_RichCompareBool` on `co_name`, so a
+    // subclass whose `__eq__` raises is observed rather than skipped.
     if left_name.is_null()
         || right_name.is_null()
-        || !unsafe { pyre_object::w_str_eq_w(left_name, right_name) }
+        || !crate::baseobjspace::eq_w(left_name, right_name)?
         || unsafe { (*(this as *const PyCode)).co_firstlineno_raw }
             != unsafe { (*(other as *const PyCode)).co_firstlineno_raw }
         || unsafe { code_bytes(this) } != unsafe { code_bytes(other) }

@@ -1647,22 +1647,28 @@ fn ignore_result_conversion_error(
     if !is_python_exception(&mut error) {
         return Err(error);
     }
-    // [3.15-spec] measured python3.15t (v3.15.1, free-threaded): restype
-    // conversion failure -> unraisable (lib-python/3/test/test_ctypes/
-    // test_callbacks.py test_convert_result_error: "don't test the result"),
-    // so the value follows PyPy CFuncPtr.__call__ (falls through to a bare
-    // return).  The err_msg follows that test's assertion.
+    // [3.15-spec] restype conversion failure is unraisable
+    // (`test_callbacks.Callbacks.test_convert_result_error`); the value
+    // follows PyPy `CFuncPtr.__call__` (bare return). `err_msg` is the
+    // `PyErr_FormatUnraisable` text from `_CallPythonObject`, reported
+    // verbatim (`write_unraisable_first_line`, the cpyext
+    // `format_unraisable_v` sibling). PyPy `function.py` uses
+    // `__pypy__.write_unraisable("on converting result of ctypes callback
+    // function", e, self.callable)` (`interp_magic.write_unraisable`
+    // `with_traceback=True`), which prefixes `"Exception ignored "` onto
+    // that where-string and names the callable as `object`.
     let roots = pyre_object::gc_roots::push_roots();
     let error_slot = error.pin(&roots);
     let rendered = callback_callable_repr(callable);
     error.reload(&roots, error_slot);
-    error.write_unraisable(
+    error.write_unraisable_first_line(
         pyre_object::w_none(),
-        &pyre_interpreter::display::wtf8_format!(
+        Some(pyre_interpreter::display::wtf8_format!(
             "Exception ignored while converting result of ctypes callback function ",
             rendered
-        ),
+        )),
         pyre_object::PY_NULL,
+        rustpython_wtf8::Wtf8::new(""),
     );
     Ok(pyre_object::w_none())
 }
@@ -1693,17 +1699,26 @@ fn ignore_python_callback_exception(
     mut error: pyre_interpreter::PyError,
     callable: PyObjectRef,
 ) -> PyObjectRef {
+    // [3.15-spec] `CallbackTracbackTestCase.expect_unraisable` wants
+    // `err_msg == "Exception ignored while calling ctypes callback
+    // function {callback!r}"` and `object is None`. `_CallPythonObject`
+    // reports that through `PyErr_FormatUnraisable`. PyPy `function.py`
+    // uses `__pypy__.write_unraisable('in calling ctypes callback
+    // function', e, self.callable)` (`interp_magic.write_unraisable`
+    // `with_traceback=True`). `write_unraisable()` would prefix
+    // `"Exception ignored in: "` onto the already-complete first line.
     let roots = pyre_object::gc_roots::push_roots();
     let error_slot = error.pin(&roots);
     let rendered = callback_callable_repr(callable);
     error.reload(&roots, error_slot);
-    error.write_unraisable(
+    error.write_unraisable_first_line(
         pyre_object::w_none(),
-        &pyre_interpreter::display::wtf8_format!(
+        Some(pyre_interpreter::display::wtf8_format!(
             "Exception ignored while calling ctypes callback function ",
             rendered
-        ),
+        )),
         pyre_object::PY_NULL,
+        rustpython_wtf8::Wtf8::new(""),
     );
     pyre_object::w_int_new(0)
 }

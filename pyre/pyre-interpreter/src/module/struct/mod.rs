@@ -5,7 +5,7 @@
 //! (`standardfmttable.py`, `nativefmttable.py`): byte-order/size/alignment
 //! decoding from the leading char, repetition counts, `needcount` codes
 //! (`x`/`s`/`p`), per-code range checks, and the `s`/`c`/`x`/`p`/`?`/`e`/
-//! `F`/`D` string, char, pad, pascal, bool, half-float and complex codes.
+//! `F`/`D`/`Zf`/`Zd` string, char, pad, pascal, bool, half-float and complex codes.
 //! `struct.error`
 //! is `space.new_exception_class("struct.error", space.w_Exception)`
 //! (`interp_struct.py Cache`).
@@ -42,27 +42,356 @@ fn struct_overflow(msg: &str) -> crate::PyError {
     crate::PyError::new(crate::PyErrorKind::OverflowError, msg.to_string())
 }
 
-/// Accept a str or bytes-like format spec (`interp_struct.py:38
-/// text_or_bytes_w`).  CPython's `_struct` boundary encodes text formats as
-/// strict ASCII, so non-ASCII text (including lone surrogates) raises
-/// `UnicodeEncodeError`; bytes are preserved byte-for-byte and rejected later
-/// as `struct.error` when they are not format codes.
+/// Accept a str or bytes format spec (`set_format` / `prepare_s`).
+/// Non-ASCII text or bytes raise `ValueError`; anything else is TypeError
+/// with the operand's type name (`%T`).
 fn format_to_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
     unsafe {
         if is_str(obj) {
-            let bytes = crate::type_methods::encode_object(obj, "ascii", "strict")?;
-            Ok(String::from_utf8(bytes).expect("ASCII encoding is valid UTF-8"))
-        } else if bytesobject::is_bytes_like(obj) {
-            Ok(bytesobject::bytes_like_data(obj)
-                .iter()
-                .map(|byte| char::from(*byte))
-                .collect())
+            if !w_str_is_ascii(obj) {
+                return Err(crate::PyError::value_error(
+                    "non-ASCII character in struct format",
+                ));
+            }
+            Ok(w_str_get_value_opt(obj)
+                .expect("ASCII str is valid UTF-8")
+                .to_owned())
+        } else if bytesobject::is_bytes(obj) {
+            let data = bytesobject::bytes_like_data(obj);
+            if !data.is_ascii() {
+                return Err(crate::PyError::value_error(
+                    "non-ASCII character in struct format",
+                ));
+            }
+            Ok(std::str::from_utf8(data)
+                .expect("ASCII bytes are valid UTF-8")
+                .to_owned())
         } else {
-            Err(crate::PyError::type_error(
-                "Struct() argument 1 must be str or bytes, not object",
-            ))
+            Err(crate::PyError::type_error(format!(
+                "Struct() argument 1 must be a str or bytes object, not {}",
+                crate::error::type_name_of(obj)
+            )))
         }
     }
+}
+
+fn keyword_name_is(w_key: PyObjectRef, name: &str) -> bool {
+    unsafe { is_str(w_key) && w_str_get_value_opt(w_key) == Some(name) }
+}
+
+/// Identity of two MRO lookups (`same_inherited_slot`).
+fn struct_slot_is_custom(cls: PyObjectRef, name: &str) -> bool {
+    let struct_type = type_object();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[cls, struct_type]);
+    unsafe {
+        let found = crate::baseobjspace::lookup_in_type(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            name,
+        );
+        let inherited = crate::baseobjspace::lookup_in_type(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            name,
+        );
+        match (found, inherited) {
+            (Some(a), Some(b)) => !std::ptr::eq(a, b),
+            (None, None) => false,
+            _ => true,
+        }
+    }
+}
+
+fn same_format(stored: PyObjectRef, incoming: PyObjectRef) -> bool {
+    if stored.is_null() {
+        return false;
+    }
+    unsafe {
+        if is_str(incoming) {
+            w_str_is_ascii(incoming) && w_str_eq_w(stored, incoming)
+        } else if bytesobject::is_bytes(incoming) {
+            let stored_bytes = w_str_get_wtf8(stored).as_bytes();
+            stored_bytes == bytesobject::bytes_like_data(incoming)
+        } else {
+            false
+        }
+    }
+}
+
+fn alloc_uninitialized_struct(cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    crate::typedef::check_user_subclass(
+        type_object(),
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+    )?;
+    Ok(W_Struct::allocate_instance(
+        W_Struct {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            format: PY_NULL,
+            size: -1,
+            init_called: false,
+            w_weakreflifeline: PY_NULL,
+        },
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+    ))
+}
+
+fn set_format(obj: PyObjectRef, w_format: PyObjectRef) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, w_format]);
+    let fmt_slot = obj_slot + 1;
+    let format = format_to_string(pyre_object::gc_roots::shadow_stack_get(fmt_slot))?;
+    let size = parse_format(&format)?.calcsize()?;
+    let w_fmt = w_str_new_managed(&format);
+    let this = W_Struct::from_obj(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        .expect("set_format on a Struct");
+    this.size = size;
+    this.format = w_fmt;
+    pyre_object::gc_hook::try_gc_write_barrier(
+        this as *mut W_Struct as pyre_object::gc_hook::GCREF,
+    );
+    Ok(())
+}
+
+fn parse_struct_new_format(
+    pos_base: usize,
+    npos: usize,
+    names_base: usize,
+    values_base: usize,
+    nkw: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `_PyArg_UnpackKeywords` with one optional-by-keyword `format`.
+    let total = npos + nkw;
+    if total > 1 {
+        let what = if npos == 0 {
+            "keyword argument"
+        } else {
+            "argument"
+        };
+        return Err(crate::PyError::type_error(format!(
+            "Struct() takes at most 1 {what} ({total} given)"
+        )));
+    }
+    if npos == 1 {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(pos_base));
+    }
+    if nkw == 1
+        && keyword_name_is(
+            pyre_object::gc_roots::shadow_stack_get(names_base),
+            "format",
+        )
+    {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(values_base));
+    }
+    Err(crate::PyError::type_error(
+        "Struct() missing required argument 'format' (pos 1)",
+    ))
+}
+
+fn extract_s_new_format(
+    pos_base: usize,
+    npos: usize,
+    names_base: usize,
+    values_base: usize,
+    nkw: usize,
+) -> PyObjectRef {
+    if npos == 1 && nkw == 0 {
+        return pyre_object::gc_roots::shadow_stack_get(pos_base);
+    }
+    if npos == 0 && nkw == 1 {
+        let name = pyre_object::gc_roots::shadow_stack_get(names_base);
+        if keyword_name_is(name, "format") {
+            return pyre_object::gc_roots::shadow_stack_get(values_base);
+        }
+    }
+    PY_NULL
+}
+
+fn struct_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    struct_new_impl(cls, args.get(1..).unwrap_or(&[]), &[], &[])
+}
+
+fn struct_descr_new_args(
+    w_type: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    struct_new_impl(
+        w_type,
+        &args.arguments_w,
+        args.keyword_names_w.as_deref().unwrap_or(&[]),
+        args.keywords_w.as_deref().unwrap_or(&[]),
+    )
+}
+
+/// `s_init` — short-circuit an implicit type-call when `__new__` already
+/// compiled the format; otherwise bind `format` and run `Struct___init___impl`.
+fn struct_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args.first().copied().unwrap_or(PY_NULL);
+    struct_s_init(self_obj, args.get(1..).unwrap_or(&[]), &[], &[])?;
+    Ok(w_none())
+}
+
+fn struct_descr_init_args(
+    w_self: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    struct_s_init(
+        w_self,
+        &args.arguments_w,
+        args.keyword_names_w.as_deref().unwrap_or(&[]),
+        args.keywords_w.as_deref().unwrap_or(&[]),
+    )?;
+    Ok(w_none())
+}
+
+fn struct_s_init(
+    self_obj: PyObjectRef,
+    pos: &[PyObjectRef],
+    kw_names: &[PyObjectRef],
+    kw_values: &[PyObjectRef],
+) -> Result<(), crate::PyError> {
+    debug_assert_eq!(kw_names.len(), kw_values.len());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
+    let pos_base = pyre_object::gc_roots::pin_roots(pos);
+    let names_base = pyre_object::gc_roots::pin_roots(kw_names);
+    let values_base = pyre_object::gc_roots::pin_roots(kw_values);
+    let npos = pos.len();
+    let nkw = kw_names.len();
+    let cls = crate::typedef::r#type(pyre_object::gc_roots::shadow_stack_get(self_slot))
+        .map(|tp| tp.as_ptr())
+        .unwrap_or_else(type_object);
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    let custom_init = struct_slot_is_custom(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        "__init__",
+    );
+    {
+        let this = W_Struct::from_obj(pyre_object::gc_roots::shadow_stack_get(self_slot))
+            .ok_or_else(|| {
+                crate::PyError::type_error(
+                    "descriptor '__init__' for 'Struct' objects doesn't apply to a 'object' object",
+                )
+            })?;
+        if !this.init_called && !custom_init && !this.format.is_null() {
+            this.init_called = true;
+            return Ok(());
+        }
+    }
+    let format = parse_struct_new_format(pos_base, npos, names_base, values_base, nkw)?;
+    let fmt_slot = pyre_object::gc_roots::pin_roots(&[format]);
+    struct_init_apply(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+    )
+}
+
+/// `Struct___init___impl`.
+fn struct_init_apply(self_obj: PyObjectRef, w_format: PyObjectRef) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj, w_format]);
+    let fmt_slot = self_slot + 1;
+    let (format_is_null, already_init, formats_match) = {
+        let this = W_Struct::from_obj(pyre_object::gc_roots::shadow_stack_get(self_slot))
+            .expect("Struct.__init__");
+        let format_is_null = this.format.is_null();
+        (
+            format_is_null,
+            this.init_called,
+            !format_is_null
+                && same_format(
+                    this.format,
+                    pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+                ),
+        )
+    };
+    if format_is_null {
+        set_format(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+        )?;
+    } else if !formats_match {
+        let msg = if already_init {
+            "Re-initialization of Struct by calling the __init__() method \
+             will not work in future Python versions"
+        } else {
+            "Different format arguments for __new__() and __init__() methods of Struct"
+        };
+        crate::warn::warn_category(msg, "FutureWarning", 1)?;
+        set_format(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            pyre_object::gc_roots::shadow_stack_get(fmt_slot),
+        )?;
+    }
+    let this = W_Struct::from_obj(pyre_object::gc_roots::shadow_stack_get(self_slot))
+        .expect("Struct.__init__");
+    this.init_called = true;
+    Ok(())
+}
+
+fn struct_new_impl(
+    cls: PyObjectRef,
+    pos: &[PyObjectRef],
+    kw_names: &[PyObjectRef],
+    kw_values: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    debug_assert_eq!(kw_names.len(), kw_values.len());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
+    let pos_base = pyre_object::gc_roots::pin_roots(pos);
+    let names_base = pyre_object::gc_roots::pin_roots(kw_names);
+    let values_base = pyre_object::gc_roots::pin_roots(kw_values);
+    let npos = pos.len();
+    let nkw = kw_names.len();
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let custom_new = struct_slot_is_custom(cls, "__new__");
+    let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
+    let custom_init = struct_slot_is_custom(cls, "__init__");
+    let format = if custom_new {
+        parse_struct_new_format(pos_base, npos, names_base, values_base, nkw)?
+    } else {
+        extract_s_new_format(pos_base, npos, names_base, values_base, nkw)
+    };
+    let format_slot = pyre_object::gc_roots::pin_roots(&[format]);
+    if format.is_null() && custom_init {
+        let nargs = npos + nkw;
+        if nargs > 1 {
+            crate::warn::warn_category(
+                &format!("Struct() takes at most 1 argument ({nargs} given)"),
+                "DeprecationWarning",
+                1,
+            )?;
+        } else {
+            crate::warn::warn_category(
+                "Struct() missing required argument 'format' (pos 1)",
+                "DeprecationWarning",
+                1,
+            )?;
+        }
+    }
+    let obj = alloc_uninitialized_struct(pyre_object::gc_roots::shadow_stack_get(cls_slot))?;
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let format = pyre_object::gc_roots::shadow_stack_get(format_slot);
+    if !format.is_null() {
+        if let Err(err) = set_format(pyre_object::gc_roots::shadow_stack_get(obj_slot), format) {
+            if custom_new || !custom_init {
+                return Err(err);
+            }
+            crate::warn::warn_category(
+                &format!(
+                    "Invalid 'format' argument for Struct.__new__(): {}",
+                    err.message_text()
+                ),
+                "DeprecationWarning",
+                1,
+            )?;
+        }
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
 // ── format table ─────────────────────────────────────────────────────
@@ -162,9 +491,9 @@ fn lookup_fmt(c: char, native: bool) -> Option<Fmt> {
             'e' => (Code::HalfFloat, 2),
             'f' => (Code::Float, 4),
             'd' => (Code::Double, 8),
-            // CPython 3.14 native_table: complex storage is two adjacent
-            // component values, aligned like one component rather than like
-            // the full 8/16-byte field.
+            // native_table: complex storage is two adjacent component values,
+            // aligned like one component rather than like the full 8/16-byte
+            // field (`nu_float_complex` / `nu_double_complex`).
             'F' => (Code::FloatComplex, 8),
             'D' => (Code::DoubleComplex, 16),
             _ => return None,
@@ -322,7 +651,24 @@ fn parse_format(format: &str) -> Result<Parsed, crate::PyError> {
             1
         };
 
-        let fmt = match lookup_fmt(c as char, native) {
+        // `getentry` / `format_equal`: `Zf` / `Zd` are two-character codes
+        // sharing the `F` / `D` rows (`nu_float_complex` / `nu_double_complex`).
+        let fmt = if c == b'Z' {
+            match bytes.get(index).copied() {
+                Some(b'f') => {
+                    index += 1;
+                    lookup_fmt('F', native)
+                }
+                Some(b'd') => {
+                    index += 1;
+                    lookup_fmt('D', native)
+                }
+                _ => None,
+            }
+        } else {
+            lookup_fmt(c as char, native)
+        };
+        let fmt = match fmt {
             Some(f) => f,
             None => {
                 if c == 0 {
@@ -1268,7 +1614,7 @@ fn ldexp(x: f64, e: i32) -> f64 {
 
 /// `_PyFloat_Pack2` — round `x` to IEEE binary16, raising `OverflowError`
 /// for a finite value too large to represent.
-pub(crate) fn pack_half(x: f64) -> Result<u16, crate::PyError> {
+pub fn pack_half(x: f64) -> Result<u16, crate::PyError> {
     let sign: u16;
     let e: i32;
     let bits: u16;
@@ -1326,7 +1672,7 @@ pub(crate) fn pack_half(x: f64) -> Result<u16, crate::PyError> {
 }
 
 /// `_PyFloat_Unpack2` — decode an IEEE binary16 to a double.
-pub(crate) fn unpack_half(bits: u16) -> f64 {
+pub fn unpack_half(bits: u16) -> f64 {
     let sign = (bits >> 15) & 1 == 1;
     let e = ((bits >> 10) & 0x1f) as i32;
     let f = (bits & 0x3ff) as u32;
@@ -1355,18 +1701,20 @@ pub(crate) fn unpack_half(bits: u16) -> f64 {
 pub struct W_Struct {
     /// Format string object (`text_or_bytes_w` of the constructor arg),
     /// promoted by value before each pack/unpack.  `_immutable_fields_ =
-    /// ["format", "size"]`.
+    /// ["format", "size"]`.  `PY_NULL` until `set_format` succeeds
+    /// (`s_format` / `Py_T_OBJECT_EX`).
     format: PyObjectRef,
     size: i64,
+    /// `PyStructObject.init_called` — set once `__init__` has run.
+    init_called: bool,
     /// `typedef.make_weakref_descr(W_Struct)` injects `_lifeline_` directly
     /// onto the wrapped object; keep that edge on the typed payload too.
     w_weakreflifeline: PyObjectRef,
 }
 
 impl W_Struct {
-    /// CPython 3.14 `ENSURE_STRUCT_IS_READY` — every operation other than the
-    /// `size` getter rejects an object allocated with `Struct.__new__` but not
-    /// initialized yet.
+    /// `ENSURE_STRUCT_IS_READY` — pack/unpack/repr/sizeof reject a Struct
+    /// whose `s_size` is still -1.
     fn ensure_ready(&self) -> Result<(), crate::PyError> {
         if self.size < 0 {
             Err(crate::PyError::runtime_error(
@@ -1405,61 +1753,20 @@ impl W_Struct {
 
 #[crate::pyre_methods(doc = "Struct(fmt) --> compiled struct object")]
 impl W_Struct {
-    /// `interp_struct.py descr__new__` — the format string is consumed by
-    /// `__init__`, so the allocator accepts and discards the trailing
-    /// `__args__` instead of failing the gateway arity check.
+    /// `s_new` / `Struct_impl`. Keywords stay on `Arguments`; extra_init
+    /// replaces this descriptor with a passthrough that sees them.
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        // Construction arguments are consumed/validated by `__init__`; accept
-        // (and ignore) any positional or keyword args here via the whole-slice
-        // catch-all so a subclass with its own `__init__` keyword parameters
-        // does not trip an unknown-keyword error in `__new__`.
-        let _ = _args;
-        // `objspace.py` `allocate_instance` validates the requested subtype.
-        // The builtin is the base layout; a subclass is `typedef.py`
-        // `_getusercls` (`interp_struct.py` `W_Struct.descr__new__`).
-        // `check_user_subclass` can collect. The slot is the live word;
-        // this pin's argument is not read again.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(cls);
-        crate::typedef::check_user_subclass(
-            type_object(),
-            pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        )?;
-        // `w_str_new` builds an immortal exact `str`. The requested class
-        // stays rooted across that allocation.
-        let format = w_str_new("");
-        Ok(W_Struct::allocate_instance(
-            W_Struct {
-                ob: pyre_object::PyObject {
-                    ob_type: std::ptr::null(),
-                    w_class: std::ptr::null_mut(),
-                },
-                format,
-                size: -1,
-                w_weakreflifeline: PY_NULL,
-            },
-            pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        ))
-    }
-
-    /// `interp_struct.py descr__init__` — store the (normalized)
-    /// format string and its `_calcsize`.
-    fn __init__(&mut self, w_format: PyObjectRef) -> Result<(), crate::PyError> {
-        let format = format_to_string(w_format)?;
-        self.size = parse_format(&format)?.calcsize()?;
-        self.format = w_str_new_managed(&format);
-        pyre_object::gc_hook::try_gc_write_barrier(
-            self as *mut Self as pyre_object::gc_hook::GCREF,
-        );
-        Ok(())
+    fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        struct_new_impl(cls, args, &[], &[])
     }
 
     #[getter]
     fn format(&self) -> Result<PyObjectRef, crate::PyError> {
-        self.ensure_ready()?;
-        Ok(self.format)
+        if self.format.is_null() {
+            Err(crate::PyError::attribute_error("format"))
+        } else {
+            Ok(self.format)
+        }
     }
 
     #[getter]
@@ -2050,6 +2357,20 @@ crate::py_module! {
                 true,
             );
         }
+        crate::__pyre_put_new!(
+            struct_dict_slot,
+            "__new__",
+            crate::typedef::make_new_descr_passthrough1(struct_descr_new, struct_descr_new_args)
+        );
+        crate::__pyre_put_new!(
+            struct_dict_slot,
+            "__init__",
+            crate::gateway::make_builtin_function_passthrough1(
+                "__init__",
+                struct_descr_init,
+                struct_descr_init_args,
+            )
+        );
         crate::__pyre_put_new!(
             struct_dict_slot,
             "pack",

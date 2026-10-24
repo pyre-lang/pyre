@@ -7185,7 +7185,7 @@ result = (
         let err = crate::runtime_ops::convert_value(bad, 0).expect_err("non-str __str__");
         assert_eq!(err.kind, PyErrorKind::TypeError);
         assert!(
-            err.message_text().contains("__str__ returned non-string"),
+            err.message_text().contains("must return a str"),
             "{}",
             err.message_text()
         );

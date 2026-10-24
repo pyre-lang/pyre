@@ -518,11 +518,8 @@ class ParamSpec(
         object.__setattr__(self, "__infer_variance__", bool(infer_variance))
         object.__setattr__(self, "_default_value", default)
         object.__setattr__(self, "_evaluate_default", None)
-        # `paramspec_new_impl` has no `None` shortcut: `bound` defaults to
-        # `None` and reaches `type_check` either way, so an omitted bound is
-        # `type(None)` here, unlike `TypeVar`, which drops `None` first.
-        import typing
-        bound = typing._type_check(bound, "Bound must be a type.")
+        # `paramspec_new_impl` stores `bound` through `paramspec_alloc` /
+        # `Py_XNewRef` with no type check, so an omitted bound stays `None`.
         object.__setattr__(self, "__bound__", bound)
         object.__setattr__(self, "__module__", _caller_module())
 
@@ -677,19 +674,33 @@ class TypeVarTuple(
 ):
     """Type variable tuple — PEP 646."""
 
-    _readonly_members = frozenset(("__name__",))
+    _readonly_members = frozenset((
+        "__name__", "__bound__", "__covariant__", "__contravariant__",
+        "__infer_variance__",
+    ))
     _readonly_attrs = frozenset((
         "__default__", "evaluate_default", "_default_value",
         "_evaluate_default",
     ))
 
-    def __init__(self, name, *, default=NoDefault):
+    def __init__(self, name, *, bound=None, covariant=False,
+                 contravariant=False, infer_variance=False, default=NoDefault):
         if not isinstance(name, str):
             raise TypeError(
                 f"typevartuple() argument 'name' must be str, not "
                 f"{type(name).__name__}"
             )
         object.__setattr__(self, "__name__", name)
+        if covariant and contravariant:
+            raise ValueError("Bivariant types are not supported.")
+        if infer_variance and (covariant or contravariant):
+            raise ValueError("Variance cannot be specified with infer_variance.")
+        object.__setattr__(self, "__covariant__", bool(covariant))
+        object.__setattr__(self, "__contravariant__", bool(contravariant))
+        object.__setattr__(self, "__infer_variance__", bool(infer_variance))
+        # `typevartuple_impl` stores `bound` through `typevartuple_alloc` /
+        # `Py_XNewRef` with no type check, so an omitted bound stays `None`.
+        object.__setattr__(self, "__bound__", bound)
         object.__setattr__(self, "_default_value", default)
         object.__setattr__(self, "_evaluate_default", None)
         object.__setattr__(self, "__module__", _caller_module())
@@ -697,9 +708,13 @@ class TypeVarTuple(
     @classmethod
     def _make(cls, name):
         # `_Py_make_typevartuple` leaves `default_value` NULL, which `_MISSING`
-        # stands for.
+        # stands for, and infers variance.
         self = cls.__new__(cls)
         object.__setattr__(self, "__name__", name)
+        object.__setattr__(self, "__covariant__", False)
+        object.__setattr__(self, "__contravariant__", False)
+        object.__setattr__(self, "__infer_variance__", True)
+        object.__setattr__(self, "__bound__", None)
         object.__setattr__(self, "_default_value", _MISSING)
         object.__setattr__(self, "_evaluate_default", None)
         # `typevartuple_alloc` takes no module here, so `__module__` stays the
@@ -746,7 +761,8 @@ class TypeVarTuple(
         raise TypeError("Cannot subclass an instance of TypeVarTuple")
 
     def __repr__(self):
-        return self.__name__
+        return _variance_prefix(self.__infer_variance__, self.__covariant__,
+                                self.__contravariant__) + self.__name__
 
     def __init_subclass__(cls, **kwargs):
         raise TypeError("type 'typing.TypeVarTuple' is not an acceptable base type")

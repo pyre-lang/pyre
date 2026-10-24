@@ -340,16 +340,10 @@ fn fcntl(
         // integer arm first, on `PyIndex_Check`.
         if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
             let data = arg_readbuf(w_arg, "fcntl")?;
-            if data.len() > ARG_BUFSZ {
-                return Err(pyre_interpreter::PyError::value_error(
-                    "fcntl argument 3 is too long",
-                ));
-            }
-            // `scoped_str2charp` owns the copy. The call sees that
-            // copy followed by the overflow guard, in a block from
-            // `scoped_alloc_buffer`; `charpsize2str` is the result.
+            // `fcntl_fcntl_impl` stages a heap copy at the argument's
+            // own length when it exceeds the 1024-byte floor.
             let src = majit_rlib::rffi::scoped_str2charp::new(Some(data));
-            let total = ARG_BUFSZ + ARG_GUARD.len();
+            let total = ARG_BUFSZ.max(data.len()) + ARG_GUARD.len();
             let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total);
             unsafe { fill_guarded(staged.raw, src.buf, data.len(), total) };
             loop {
@@ -617,10 +611,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     Ok(())
 }
 
-/// [3.14-spec] `ARG_BUFSZ` 1024 ↔ interp_fcntl.py `fcntl`
-/// (`scoped_str2charp`, no limit) — "fcntl argument 3 is too long" /
-/// "ioctl argument 3 is too long"; evidence: fcntlmodule.c `fcntl_fcntl_impl`
-/// `FCNTL_BUFSZ`.
+/// Staging floor for the fcntl/ioctl string-buffer path (`fcntl_fcntl_impl`).
+/// A longer argument is staged at its own length plus the overflow guard.
 #[cfg(all(unix, feature = "host_env"))]
 const ARG_BUFSZ: usize = 1024;
 

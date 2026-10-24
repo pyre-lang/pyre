@@ -116,26 +116,20 @@ pub(crate) fn walk_codec_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     }
 }
 
-// PyPy `interp_codecs.py normalize`.
-/// `interp_codecs.py normalize` is `@jit.elidable`.
+/// `normalizestring`: spaces become hyphens and ASCII letters are lowercased;
+/// hyphens, underscores, and every other byte are kept. `@jit.elidable`.
 #[majit_macros::elidable]
 fn normalize(encoding: &str) -> String {
-    let mut chars = String::new();
-    let mut punct = false;
-    for c in encoding.chars() {
-        if c.is_alphanumeric() || c == '.' {
-            if punct && !chars.is_empty() {
-                chars.push('_');
-            }
-            if c.is_ascii() {
-                chars.push(c.to_ascii_lowercase());
-            }
-            punct = false;
+    let mut out = encoding.as_bytes().to_vec();
+    for b in &mut out {
+        if *b == b' ' {
+            *b = b'-';
         } else {
-            punct = true;
+            *b = b.to_ascii_lowercase();
         }
     }
-    chars
+    String::from_utf8(out)
+        .unwrap_or_else(|err| String::from_utf8_lossy(&err.into_bytes()).into_owned())
 }
 
 /// `_Py_normalize_encoding` with `to_lower=0`: collapse runs of non-ASCII-

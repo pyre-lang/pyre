@@ -82,7 +82,19 @@ def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
                     "a future version."
                 )
             if data is _MISSING:
-                data = b"" if string is _MISSING else string
+                if string is not _MISSING:
+                    import warnings
+                    warnings.warn(
+                        "the 'string' keyword parameter is deprecated since "
+                        "Python 3.15 and slated for removal in Python 3.19; "
+                        "use the 'data' keyword parameter or pass the data "
+                        "to hash as a positional argument instead",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                    data = string
+                else:
+                    data = b""
 
             digest_size = kwargs.get("digest_size", _digest_size)
             key = kwargs.get("key", b"")

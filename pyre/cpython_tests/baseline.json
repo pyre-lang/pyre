@@ -29,7 +29,7 @@
     },
     "test.test_abc": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_abstract_numbers": {
       "cranelift": "PASS",
@@ -41,7 +41,8 @@
     },
     "test.test_annotationlib": {
       "cranelift": "IMPORTERROR",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: t-string repr keeps the closing brace layout (test_type_repr)"
     },
     "test.test_apple": {
       "cranelift": "PASS",
@@ -51,14 +52,15 @@
       "dynasm": "PASS"
     },
     "test.test_array": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_asdl_parser": {
       "dynasm": "SKIP",
       "reason": "CPython Parser/asdl internals"
     },
     "test.test_ast": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 AST node and position changes"
     },
     "test.test_asyncgen": {
       "dynasm": "PASS"
@@ -69,7 +71,7 @@
       "reason": "stalls in about one arm in four, at a test that wanders"
     },
     "test.test_atexit": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_audit": {
       "dynasm": "FAIL"
@@ -79,7 +81,7 @@
       "dynasm": "PASS"
     },
     "test.test_base64": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_baseexception": {
       "dynasm": "PASS"
@@ -95,7 +97,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_binascii": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_binop": {
       "cranelift": "PASS",
@@ -179,7 +181,8 @@
     },
     "test.test_code": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_code_richcompare_raise_exception needs a str-subclass co_name; PyPy keeps co_name an immutable str"
     },
     "test.test_code_module": {
       "cranelift": "PASS",
@@ -222,7 +225,7 @@
       "dynasm": "PASS"
     },
     "test.test_codecs": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_codeop": {
       "dynasm": "FAIL"
@@ -240,7 +243,8 @@
       "dynasm": "PASS"
     },
     "test.test_compile": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: compile() syntax warnings filtered by module (test_filter_syntax_warnings_by_module)"
     },
     "test.test_compileall": {
       "dynasm": "PASS"
@@ -254,7 +258,7 @@
       "dynasm": "SKIP"
     },
     "test.test_complex": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_concurrent_futures": {
       "dynasm": "FAIL"
@@ -304,14 +308,15 @@
       "dynasm": "PASS"
     },
     "test.test_ctypes": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_curses": {
       "dynasm": "IMPORTERROR"
     },
     "test.test_dataclasses": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_original_class_is_gced needs the replaced slots class collected at once; the PyPy GC keeps it until a later collection"
     },
     "test.test_datetime": {
       "cranelift": "PASS",
@@ -342,7 +347,7 @@
     },
     "test.test_defaultdict": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_deque": {
       "dynasm": "PASS"
@@ -358,7 +363,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dict": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_reversed_dict_after_clear_and_restore: RDict reversed iteration after clear"
     },
     "test.test_dict_version": {
       "dynasm": "SKIP",
@@ -399,7 +405,7 @@
       "dynasm": "PASS"
     },
     "test.test_email": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_embed": {
       "dynasm": "SKIP",
@@ -432,7 +438,7 @@
     },
     "test.test_exception_group": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_exception_hierarchy": {
       "dynasm": "PASS"
@@ -442,7 +448,8 @@
       "dynasm": "PASS"
     },
     "test.test_exceptions": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 SyntaxError offsets for mapping patterns and encodings"
     },
     "test.test_extcall": {
       "dynasm": "FAIL"
@@ -455,7 +462,7 @@
       "dynasm": "FAIL"
     },
     "test.test_fcntl": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_file": {
       "dynasm": "PASS"
@@ -494,7 +501,7 @@
       "dynasm": "PASS"
     },
     "test.test_format": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_fractions": {
       "dynasm": "PASS"
@@ -517,11 +524,12 @@
       "dynasm": "PASS"
     },
     "test.test_funcattrs": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_functools": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "partial reentrant mutation needs the 3.15 partial_vectorcall key-hashing order; the PyPy kwargs dict strategy hashes earlier (pypy3 fails it too); singledispatch positional-only is compiler-side"
     },
     "test.test_future_stmt": {
       "dynasm": "FAIL"
@@ -546,7 +554,7 @@
       "dynasm": "FAIL"
     },
     "test.test_genericalias": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_genericclass": {
       "cranelift": "PASS",
@@ -588,13 +596,13 @@
       "dynasm": "FAIL"
     },
     "test.test_gzip": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_hash": {
       "dynasm": "PASS"
     },
     "test.test_hashlib": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_heapq": {
       "cranelift": "PASS",
@@ -631,7 +639,8 @@
     },
     "test.test_import": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "ModexportTests and test_testmultiphase_exec_multiple need the 3.15 _testmultiphase entry points and PEP 793 PyModExport in cpyext; lib_pypy/_testmultiphase.c predates them"
     },
     "test.test_importlib": {
       "cranelift": "FAIL",
@@ -643,7 +652,8 @@
     },
     "test.test_inspect": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "TestModuleCLI extension-module cases need a CPython C extension module"
     },
     "test.test_int": {
       "dynasm": "PASS"
@@ -682,7 +692,7 @@
       "dynasm": "PASS"
     },
     "test.test_json": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_keyword": {
       "cranelift": "PASS",
@@ -707,7 +717,8 @@
       "dynasm": "PASS"
     },
     "test.test_list": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_deopt_from_append_list and test_list_overwrite_local assert CPython specializer and refcount behaviour"
     },
     "test.test_listcomps": {
       "dynasm": "PASS"
@@ -749,7 +760,7 @@
       "dynasm": "PASS"
     },
     "test.test_memoryview": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_metaclass": {
       "dynasm": "FAIL"
@@ -762,7 +773,7 @@
     },
     "test.test_mmap": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_module": {
       "dynasm": "FAIL"
@@ -833,7 +844,7 @@
       "dynasm": "CRASH"
     },
     "test.test_os": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_ossaudiodev": {
       "dynasm": "SKIP",
@@ -847,7 +858,8 @@
       "dynasm": "FAIL"
     },
     "test.test_patma": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "IMPORTERROR",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 pattern syntax (\"patterns may only match literals and attribute lookups\")"
     },
     "test.test_pdb": {
       "dynasm": "IMPORTERROR"
@@ -872,7 +884,7 @@
       "reason": "CPython perf map hooks"
     },
     "test.test_pickle": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_picklebuffer": {
       "cranelift": "PASS",
@@ -880,7 +892,7 @@
     },
     "test.test_pickletools": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_pkg": {
       "cranelift": "PASS",
@@ -908,7 +920,8 @@
     },
     "test.test_positional_only_arg": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 \"duplicate parameter\" SyntaxError wording"
     },
     "test.test_posix": {
       "dynasm": "FAIL"
@@ -1072,7 +1085,7 @@
     },
     "test.test_socket": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_socketserver": {
       "dynasm": "PASS"
@@ -1088,7 +1101,8 @@
     },
     "test.test_ssl": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_server_side_bad_params: rustls TLS 1.3 session snapshot gap"
     },
     "test.test_stable_abi_ctypes": {
       "dynasm": "SKIP",
@@ -1101,7 +1115,7 @@
       "dynasm": "PASS"
     },
     "test.test_str": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_strftime": {
       "cranelift": "PASS",
@@ -1124,7 +1138,7 @@
       "dynasm": "PASS"
     },
     "test.test_struct": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_structseq": {
       "dynasm": "PASS"
@@ -1147,7 +1161,8 @@
       "dynasm": "FAIL"
     },
     "test.test_symtable": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 symtable scopes"
     },
     "test.test_syntax": {
       "dynasm": "FAIL"
@@ -1181,7 +1196,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_tempfile": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_termios": {
       "dynasm": "FAIL"
@@ -1202,7 +1217,7 @@
       "dynasm": "SKIP"
     },
     "test.test_threading": {
-      "dynasm": "TIMEOUT"
+      "dynasm": "PASS"
     },
     "test.test_threading_local": {
       "dynasm": "PASS"
@@ -1212,7 +1227,7 @@
     },
     "test.test_time": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_timeit": {
       "cranelift": "PASS",
@@ -1249,7 +1264,8 @@
       "dynasm": "FAIL"
     },
     "test.test_tstring": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 t-string compilation"
     },
     "test.test_ttk": {
       "dynasm": "SKIP",
@@ -1294,7 +1310,8 @@
       "reason": "imports `_datetime`, an extension module PyPy does not provide"
     },
     "test.test_typing": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 __annotate__ parameter order (test_get_type_hints_order)"
     },
     "test.test_ucn": {
       "dynasm": "FAIL"
@@ -1329,7 +1346,8 @@
       "dynasm": "FAIL"
     },
     "test.test_unparse": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 AST unparse changes"
     },
     "test.test_urllib": {
       "dynasm": "PASS"
@@ -1391,7 +1409,8 @@
       "dynasm": "PASS"
     },
     "test.test_weakref": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_clearing_weakrefs_in_gc asserts CPython gc weakref clearing order; the PyPy GC clears them differently"
     },
     "test.test_weakset": {
       "dynasm": "PASS"
@@ -1409,7 +1428,8 @@
     },
     "test.test_with": {
       "cranelift": "IMPORTERROR",
-      "dynasm": "IMPORTERROR"
+      "dynasm": "IMPORTERROR",
+      "reason": "imports CPython-only test helpers"
     },
     "test.test_wsgiref": {
       "dynasm": "PASS"
@@ -1450,7 +1470,8 @@
       "dynasm": "PASS"
     },
     "test.test_zipfile": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "3.15 parser/compiler change in the external RustPython compiler: compile() syntax warnings filtered by module (test_write_filtered_python_package)"
     },
     "test.test_zipfile64": {
       "dynasm": "SKIP",
@@ -1461,10 +1482,10 @@
       "dynasm": "PASS"
     },
     "test.test_zipimport_support": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_zlib": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_zoneinfo": {
       "cranelift": "FAIL",

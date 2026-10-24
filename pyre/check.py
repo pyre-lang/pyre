@@ -2059,6 +2059,20 @@ def synth_rss_gate(path):
     return _positive_float(*found, path, "synthetic memory gate")
 
 
+def synth_timeout(path):
+    """Optional wall-clock seconds for this fixture:
+        # pyre-check: timeout=40
+
+    Absent means the suite default (`--synthetic-timeout`). A header below
+    that default is ignored, so a fixture cannot quietly shrink the suite
+    budget.
+    """
+    found = _header_directive(path, "# pyre-check: timeout=")
+    if found is None:
+        return None
+    return _positive_float(*found, path, "synthetic timeout")
+
+
 def synth_skip_platforms(path):
     """Read an optional host exemption:
         # pyre-check: skip-platforms=win32
@@ -2638,6 +2652,7 @@ def synth_fixture_headers(path):
         "skip_platforms": synth_skip_platforms(path),
         "spec_folds": synth_spec_folds(path),
         "trace_shapes": synth_trace_shapes(path),
+        "timeout": synth_timeout(path),
     }
     if selfcheck:
         interpreted = synth_selfcheck_interpreted(path)
@@ -6190,11 +6205,14 @@ class Check:
 
         for path in paths:
             header = headers[path]
+            timeout = self.args.synthetic_timeout
+            if header["timeout"] is not None:
+                timeout = max(timeout, header["timeout"])
             if header["selfcheck"]:
                 self.run_selfcheck(
                     f"synth/{path.stem}",
                     str(path),
-                    self.args.synthetic_timeout,
+                    timeout,
                     skip_backends=self._fixture_skips(header),
                     require_jit=not header["interpreted"],
                     spec_folds=header["spec_folds"],
@@ -6203,7 +6221,7 @@ class Check:
                 )
             else:
                 self.run_synthetic_bench(
-                    str(path), self.args.synthetic_timeout, header,
+                    str(path), timeout, header,
                 )
         # A fixture that loses its cpython reference also loses the
         # cpython/pypy output cross-check, so the count belongs in the summary

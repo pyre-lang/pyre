@@ -440,9 +440,10 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(res)
 }
 
-/// `tuple.index(item)` resolved through `eq_w`; `Ok(None)` plays the Python
-/// `ValueError` raised when the item is absent.  A raising `__eq__`
-/// propagates (`tuple.index` does not swallow comparison errors).
+/// `tuple.index(item)` resolved through `eq_w`; `Ok(None)` when the item is
+/// absent.  A raising `__eq__` propagates (`tuple.index` does not swallow
+/// comparison errors). `_Py_subs_parameters` turns that miss into a
+/// TypeError when the argument has `__typing_subst__`.
 fn tuple_index(t: PyObjectRef, item: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
     // `__eq__` is user code and both operands are nursery-allocated, so the
     // tuple is re-read for every element rather than indexed from the word
@@ -786,11 +787,26 @@ pub(crate) fn subs_parameters(
         let arg = if !unsafe { pyre_object::is_none(meth) } {
             let _ = pyre_object::gc_roots::pin_root(meth);
             let meth_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let iparam = tuple_index(
+            // `_Py_subs_parameters`: `__parameters__` may be stale if an
+            // argument gained `__typing_subst__` after the tuple was computed.
+            let iparam = match tuple_index(
                 pyre_object::gc_roots::shadow_stack_get(params_slot),
                 pyre_object::gc_roots::shadow_stack_get(old_arg_slot),
-            )?
-            .ok_or_else(|| crate::PyError::value_error("tuple.index(x): x not in tuple"))?;
+            )? {
+                Some(i) => i,
+                None => {
+                    let repr = unsafe {
+                        crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                            old_arg_slot,
+                        ))?
+                    };
+                    return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                        "argument ",
+                        repr,
+                        " with __typing_subst__ was not found in __parameters__"
+                    )));
+                }
+            };
             let item = unsafe {
                 w_tuple_getitem(
                     pyre_object::gc_roots::shadow_stack_get(argitems_slot),

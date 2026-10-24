@@ -19,9 +19,8 @@ fn run_threading_shutdown() {
     }
 }
 
-/// `baseobjspace.py:finish` — after joining non-daemon threads, import the
-/// builtin atexit module and run its app-level callback stack.  Any escaping
-/// error is unraisable and must not prevent the remaining shutdown phases.
+/// The app-level atexit callback stack. Any escaping error is unraisable and
+/// must not prevent the remaining shutdown phases.
 fn run_atexit_callbacks(
     canonical: pyre_object::PyObjectRef,
     ec_ptr: *const crate::executioncontext::PyExecutionContext,
@@ -42,6 +41,25 @@ fn run_atexit_callbacks(
             pyre_object::w_none(),
         );
     }
+}
+
+/// `interp_has_atexit_callbacks`: whether `atexit._ncallbacks()` is nonzero.
+/// A failed lookup or call reads as no callbacks, so shutdown proceeds.
+fn has_atexit_callbacks(
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const crate::executioncontext::PyExecutionContext,
+) -> bool {
+    crate::importing::importhook(
+        rustpython_wtf8::Wtf8::new("atexit"),
+        canonical,
+        pyre_object::PY_NULL,
+        0,
+        ec_ptr,
+    )
+    .and_then(|module| crate::getattr(module, pyre_object::w_str_new("_ncallbacks")))
+    .and_then(|count| crate::call::call_function_impl_result(count, &[]))
+    .and_then(crate::baseobjspace::int_w)
+    .is_ok_and(|n| n != 0)
 }
 
 /// Sweep the whole heap and run whatever that made finalizable, reporting
@@ -412,8 +430,19 @@ pub fn finalize_runtime(
     mut canonical: pyre_object::PyObjectRef,
     ec_ptr: *const crate::executioncontext::PyExecutionContext,
 ) {
-    pyre_object::with_roots!(canonical => run_threading_shutdown());
-    pyre_object::with_roots!(canonical => run_atexit_callbacks(canonical, ec_ptr));
+    // `make_pre_finalization_calls`: join the non-daemon threads, then run the
+    // atexit callbacks, and repeat while a callback or a thread it started
+    // left either a non-daemon thread (`interp_has_threads`) or another
+    // callback (`interp_has_atexit_callbacks`).
+    loop {
+        pyre_object::with_roots!(canonical => run_threading_shutdown());
+        pyre_object::with_roots!(canonical => run_atexit_callbacks(canonical, ec_ptr));
+        if !crate::module::thread::has_shutdown_handles()
+            && !pyre_object::with_roots!(canonical => has_atexit_callbacks(canonical, ec_ptr))
+        {
+            break;
+        }
+    }
     // PyPy sets `sys.finalizing` only after atexit callbacks.  Those callbacks
     // may still start threads; reject new starts only when module/finalizer
     // teardown is actually about to begin.

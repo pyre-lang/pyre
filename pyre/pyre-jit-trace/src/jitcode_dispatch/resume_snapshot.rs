@@ -325,6 +325,17 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     inline_snapshot_has_complete_parent_chain(n_parents, session.inline_depth())
 }
 
+/// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
+/// the MIFrame registers as they stand after the residual call.  The
+/// capture below advances the operand-stack mirror to that same post-call
+/// boundary so the guard's virtualizable image sees the residual result;
+/// that is the transition the following walk step would make.  The walk
+/// may still emit `-live-` markers owned by the retired opcode; those
+/// report the earlier py_pc and would look like a backward layout switch.
+/// `step_vstack_mirror` ignores that marker for GET_ITER / LOAD_SPECIAL
+/// while their two pushed slots are still empty in the shadow, so the
+/// residual result stays in the live mirror. After those pushes fill the
+/// shadow, the same marker reseeds from it. Other retired opcodes reseed.
 pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -630,7 +641,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // same post-call boundary before it supplies the vable snapshot.
             // This is the same transition the following walk step would make;
             // it merely makes the guard's resume image observe it at the
-            // required point.
+            // required point.  The live walk keeps that post-call mirror so a
+            // later FOR_ITER snapshot still sees GET_ITER's iterator.
             //
             // `py_pc == vstack_cur_pypc` is not that transition: the walk has
             // not left the opcode the mirror already holds, so the following
@@ -653,7 +665,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             .unwrap_or(0) as usize,
                     };
                     let code = unsafe { &*code_ptr };
-                    reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth);
+                    reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth, true);
                 }
             }
             // Publish `last_instr = py_pc - 1` to the vable static shadow
@@ -3553,6 +3565,7 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     result: OpRef,
     opcode: OpCode,
     args: &[OpRef],
+    receiver: Option<OpRef>,
 ) -> Result<(), DispatchError> {
     let subject = args.first().copied();
     if subject.is_some_and(|arg| arg.is_constant()) {
@@ -3589,9 +3602,10 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     }
     let mut caller = caller.clone();
     refresh_paused_parent_blackhole(&mut caller);
-    let mut tail_frame = super::operator_continuation_parent_frame(tail)
+    let mut tail_frame = super::operator_continuation_parent_frame(tail, receiver)
         .ok_or(DispatchError::callee_inline_abort(op_pc, true))?;
-    tail_frame.boxes = vec![result];
+    // r0 is the dunder result. Format keeps the receiver in boxes[1].
+    tail_frame.boxes[0] = result;
     // `capture_resumedata` walks every `MetaInterp.framestack` entry.
     // `walker_capture_transparent_helper_snapshot` takes the same
     // outermost-first chain: enclosing paused parents, then the immediate

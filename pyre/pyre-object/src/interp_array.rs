@@ -82,23 +82,81 @@ impl crate::lltype::GcType for W_ArrayUser {
     const SIZE: usize = W_ARRAY_USER_OBJECT_SIZE;
 }
 
-/// The supported typecodes, in Python 3.14's `array.typecodes` order.
-/// PyPy 3.11 lacks `w`; Python 3.14 defines it as a 4-byte Py_UCS4 item.
-pub const TYPECODES: &str = "bBuwhHiIlLqQfd";
+/// One-character typecodes, in `descriptors[]` order with `e` inserted
+/// before `f`.  Integer reconstructor walks this and filters to
+/// `bBhHiIlLqQ`.  The public `array.typecodes` tuple is [`TYPECODE_NAMES`].
+pub const TYPECODES: &str = "bBuwhHiIlLqQefd";
+
+/// Public `array.typecodes` entries, in `descriptors[]` order
+/// (`descriptors`: `b`/`B`/`u`/`w`/`h`/`H`/`i`/`I`/`l`/`L`/`q`/`Q`/`e`/`f`/`d`/`Zf`/`Zd`).
+/// Internal storage still uses a `u8`: `'F'` for `Zf`, `'D'` for `Zd`.
+pub const TYPECODE_NAMES: &[&str] = &[
+    "b", "B", "u", "w", "h", "H", "i", "I", "l", "L", "q", "Q", "e", "f", "d", "Zf", "Zd",
+];
+
+/// Map a constructor / reconstructor typecode string onto the internal `u8`.
+pub fn parse_typecode(s: &[u8]) -> Option<u8> {
+    match s {
+        b"b" => Some(b'b'),
+        b"B" => Some(b'B'),
+        b"u" => Some(b'u'),
+        b"w" => Some(b'w'),
+        b"h" => Some(b'h'),
+        b"H" => Some(b'H'),
+        b"i" => Some(b'i'),
+        b"I" => Some(b'I'),
+        b"l" => Some(b'l'),
+        b"L" => Some(b'L'),
+        b"q" => Some(b'q'),
+        b"Q" => Some(b'Q'),
+        b"e" => Some(b'e'),
+        b"f" => Some(b'f'),
+        b"d" => Some(b'd'),
+        b"Zf" => Some(b'F'),
+        b"Zd" => Some(b'D'),
+        _ => None,
+    }
+}
+
+/// Python-visible typecode for an internal `u8` (`array_get_typecode`).
+pub fn typecode_str(tc: u8) -> &'static str {
+    match tc {
+        b'b' => "b",
+        b'B' => "B",
+        b'u' => "u",
+        b'w' => "w",
+        b'h' => "h",
+        b'H' => "H",
+        b'i' => "i",
+        b'I' => "I",
+        b'l' => "l",
+        b'L' => "L",
+        b'q' => "q",
+        b'Q' => "Q",
+        b'e' => "e",
+        b'f' => "f",
+        b'd' => "d",
+        b'F' => "Zf",
+        b'D' => "Zd",
+        _ => "?",
+    }
+}
 
 /// `itemsize` (bytes per element) for a typecode, or `None` if the code is
-/// not one of the supported `bBuwhHiIlLqQfd` (`interp_array.py` `types`;
-/// `l`/`L` are `rffi.LONG`/`rffi.ULONG`, so 4 bytes on Windows).
+/// not one of the supported `bBuwhHiIlLqQefd` / `Zf` / `Zd` (`interp_array.py`
+/// `types`; `l`/`L` are `rffi.LONG`/`rffi.ULONG`, so 4 bytes on Windows).
 pub fn typecode_itemsize(tc: u8) -> Option<u8> {
     Some(match tc {
         b'b' | b'B' => 1,
         b'u' | b'w' => 4,
-        b'h' | b'H' => 2,
+        b'h' | b'H' | b'e' => 2,
         b'i' | b'I' => 4,
         b'l' | b'L' => std::mem::size_of::<std::ffi::c_long>() as u8,
         b'q' | b'Q' => 8,
         b'f' => 4,
         b'd' => 8,
+        b'F' => 8,
+        b'D' => 16,
         _ => return None,
     })
 }
@@ -333,6 +391,20 @@ fn unpack_exact(typecode: u8, buf: &[u8]) -> Option<PyObjectRef> {
         b'Q' => w_unsigned_new(u64::from_ne_bytes(buf.try_into().ok()?)),
         b'f' => crate::floatobject::w_float_new(f32::from_ne_bytes(buf.try_into().ok()?) as f64),
         b'd' => crate::floatobject::w_float_new(f64::from_ne_bytes(buf.try_into().ok()?)),
+        b'e' => {
+            let bits = u16::from_ne_bytes(buf.try_into().ok()?);
+            crate::floatobject::w_float_new(unpack_ieee_binary16(bits))
+        }
+        b'F' => {
+            let re = f32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as f64;
+            let im = f32::from_ne_bytes(buf.get(4..8)?.try_into().ok()?) as f64;
+            crate::complexobject::w_complex_new(re, im)
+        }
+        b'D' => {
+            let re = f64::from_ne_bytes(buf.get(..8)?.try_into().ok()?);
+            let im = f64::from_ne_bytes(buf.get(8..16)?.try_into().ok()?);
+            crate::complexobject::w_complex_new(re, im)
+        }
         b'u' | b'w' => {
             let cp = u32::from_ne_bytes(buf.try_into().ok()?);
             match char::from_u32(cp) {
@@ -350,6 +422,26 @@ fn unpack_exact(typecode: u8, buf: &[u8]) -> Option<PyObjectRef> {
         }
         _ => return None,
     })
+}
+
+/// `_PyFloat_Unpack2` — decode IEEE binary16 bits stored in native order.
+fn unpack_ieee_binary16(bits: u16) -> f64 {
+    let sign = (bits >> 15) & 1 == 1;
+    let e = ((bits >> 10) & 0x1f) as i32;
+    let f = (bits & 0x3ff) as u32;
+    let val = if e == 0x1f {
+        if f == 0 { f64::INFINITY } else { f64::NAN }
+    } else {
+        let mut x = f as f64 / 1024.0;
+        let ee = if e == 0 {
+            -14
+        } else {
+            x += 1.0;
+            e - 15
+        };
+        x * (2.0f64).powi(ee)
+    };
+    if sign { -val } else { val }
 }
 
 fn w_unsigned_new(v: u64) -> PyObjectRef {
@@ -430,11 +522,22 @@ mod tests {
             (b'Q', 8),
             (b'f', 4),
             (b'd', 8),
+            (b'e', 2),
+            (b'F', 8),
+            (b'D', 16),
         ] {
             assert_eq!(typecode_itemsize(tc), Some(sz));
         }
         assert_eq!(typecode_itemsize(b'x'), None);
         assert_eq!(typecode_itemsize(b'c'), None);
+        assert_eq!(parse_typecode(b"e"), Some(b'e'));
+        assert_eq!(parse_typecode(b"Zf"), Some(b'F'));
+        assert_eq!(parse_typecode(b"Zd"), Some(b'D'));
+        assert_eq!(parse_typecode(b"xx"), None);
+        assert_eq!(parse_typecode(b"Z"), None);
+        assert_eq!(typecode_str(b'F'), "Zf");
+        assert_eq!(typecode_str(b'D'), "Zd");
+        assert_eq!(typecode_str(b'e'), "e");
     }
 
     #[test]
@@ -452,5 +555,25 @@ mod tests {
         let v: u64 = u64::MAX;
         let w = unpack_value(b'Q', &v.to_ne_bytes());
         assert!(unsafe { crate::pyobject::is_long(w) });
+    }
+
+    #[test]
+    fn unpack_half_and_complex_typecodes() {
+        let bits: u16 = 0x3c00; // 1.0 in binary16
+        let w = unpack_value(b'e', &bits.to_ne_bytes());
+        assert!(unsafe { crate::pyobject::is_float(w) });
+        assert_eq!(unsafe { crate::floatobject::w_float_get_value(w) }, 1.0);
+
+        let mut zf = [0u8; 8];
+        zf[..4].copy_from_slice(&1.0f32.to_ne_bytes());
+        zf[4..].copy_from_slice(&2.0f32.to_ne_bytes());
+        let w = unpack_value(b'F', &zf);
+        assert!(unsafe { crate::pyobject::is_complex(w) });
+
+        let mut zd = [0u8; 16];
+        zd[..8].copy_from_slice(&1.0f64.to_ne_bytes());
+        zd[8..].copy_from_slice(&2.0f64.to_ne_bytes());
+        let w = unpack_value(b'D', &zd);
+        assert!(unsafe { crate::pyobject::is_complex(w) });
     }
 }

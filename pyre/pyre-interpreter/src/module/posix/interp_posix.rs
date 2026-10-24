@@ -2184,6 +2184,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // binding here is counted a second time through the star-import.
         // Neither `posix` nor `nt` carries them; the other SEEK_* values are
         // the module's to publish.
+        // [3.15-spec] `posixmodule.c` publishes `NODEV` when the host
+        // header defines it (`test_posix.test_nodev`). `interp_posix.py`
+        // does not. The sentinel is -1; `major`/`minor`/`makedev` pass
+        // that one value through. musl does not define it.
+        #[cfg(all(unix, not(target_env = "musl")))]
+        ("NODEV", -1i64),
     ] {
         crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(val));
     }
@@ -2663,6 +2669,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `moduledef.py:152-157` registers each only where the host has it.
     #[cfg(all(unix, not(feature = "sandbox")))]
     {
+        #[cfg(target_env = "musl")]
         fn device_u64_w(value: PyObjectRef) -> Result<u64, crate::PyError> {
             let value = if unsafe {
                 pyre_object::is_bool(value)
@@ -2676,15 +2683,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::baseobjspace::uint_w(value)
         }
         fn device_value_w(value: PyObjectRef) -> Result<libc::dev_t, crate::PyError> {
-            #[cfg_attr(
-                not(all(target_os = "linux", not(target_env = "musl"))),
-                allow(unused_mut)
-            )]
+            #[cfg_attr(not(all(unix, not(target_env = "musl"))), allow(unused_mut))]
             let mut indexed = crate::baseobjspace::space_index(value)?;
             // Reading the sentinel must not be fallible: a device number above
             // `i64::MAX` has no machine-word form, so propagating `int_w`'s
             // overflow here would refuse a value `uint_w` below accepts.
-            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            #[cfg(all(unix, not(target_env = "musl")))]
             if matches!(
                 pyre_object::with_roots!(indexed => crate::baseobjspace::int_w(indexed)),
                 Ok(-1)
@@ -2709,7 +2713,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             device_value_w(value)
         }
         fn major_minor_result(value: i64) -> PyObjectRef {
-            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            #[cfg(all(unix, not(target_env = "musl")))]
             if value == -1 || value == libc::c_uint::MAX as i64 {
                 return pyre_object::w_int_new(-1);
             }
@@ -2718,7 +2722,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fn major_minor_arg(value: PyObjectRef) -> Result<libc::dev_t, crate::PyError> {
             // Where `NODEV` is spelled -1 that one value passes through, rather
             // than being rejected as out of range for an unsigned field.
-            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+            #[cfg(all(unix, not(target_env = "musl")))]
             let value = {
                 let mut indexed = crate::baseobjspace::space_index(value)?;
                 if pyre_object::with_roots!(indexed => crate::baseobjspace::int_w(indexed))? == -1 {
@@ -2726,7 +2730,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 crate::baseobjspace::uint_w(indexed)?
             };
-            #[cfg(not(all(target_os = "linux", not(target_env = "musl"))))]
+            #[cfg(not(all(unix, not(target_env = "musl"))))]
             let value = device_u64_w(value).map_err(|err| {
                 if err.kind == crate::PyErrorKind::OverflowError {
                     crate::PyError::overflow_error(
@@ -11364,40 +11368,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     kwargs = reload_bound_kwonly(kw_base, kw_n);
                     drop(roots);
                     let dst_dir_fd = dst_dir_fd?;
-                    // `os_link_impl` follows the final symlink of `src` by
-                    // default, which is `AT_SYMLINK_FOLLOW`.
+                    // [3.15-spec] Linux `link()` does not follow the last
+                    // symlink of `src`; `linkat` with `AT_SYMLINK_FOLLOW`
+                    // does (`os_link_impl`). `interp_posix.link` still calls
+                    // `rposix.link` when both directory descriptors are the
+                    // process cwd and `follow_symlinks` stays true. Always
+                    // take the `linkat` path so omitted / True follow the
+                    // symlink (`test_posix.test_link_follow_symlinks`).
                     let follow = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
                         Some(w) => crate::baseobjspace::is_true(w)?,
                         None => true,
                     };
-                    // `interp_posix.link` calls `rposix.link` when both directory
-                    // descriptors are absent and `follow_symlinks` stays true.
-                    // Anything else is `rposix.linkat`.
-                    let plain =
-                        follow && src_dir_fd == libc::AT_FDCWD && dst_dir_fd == libc::AT_FDCWD;
-                    let (ret, err) = if plain {
-                        let ret =
-                            unsafe { majit_rlib::rposix::c_link(c_src.as_ptr(), c_dst.as_ptr()) };
-                        (
-                            ret,
-                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
-                        )
-                    } else {
-                        let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
-                        let ret = unsafe {
-                            majit_rlib::rposix::c_linkat(
-                                src_dir_fd,
-                                c_src.as_ptr(),
-                                dst_dir_fd,
-                                c_dst.as_ptr(),
-                                flags,
-                            )
-                        };
-                        (
-                            ret,
-                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+                    let ret = unsafe {
+                        majit_rlib::rposix::c_linkat(
+                            src_dir_fd,
+                            c_src.as_ptr(),
+                            dst_dir_fd,
+                            c_dst.as_ptr(),
+                            flags,
                         )
                     };
+                    let err =
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno());
                     if ret < 0 {
                         return Err(fs_err_with_filename2(err, 0, src.w_path(), dst.w_path()));
                     }
@@ -12325,6 +12318,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         w_out_fd, w_in_fd, w_offset, w_count, w_headers, w_trailers, w_flags => {
                         crate::baseobjspace::int_w(w_count)
                     })?;
+                    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+                    if count_raw < 0 {
+                        return Err(crate::PyError::value_error("count cannot be negative"));
+                    }
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     let in_fd = pyre_object::with_roots!(w_out_fd, w_in_fd, w_offset, w_count => {
                         crate::baseobjspace::c_int_w(w_in_fd)

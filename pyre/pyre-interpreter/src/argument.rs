@@ -18,9 +18,11 @@ use pyre_object::PyObjectRef;
 use rustpython_wtf8::Wtf8Buf;
 
 /// The `%T` conversion `oefmt` applies, for the `*args` / `**kwargs` parity
-/// messages below ("argument after * must be an iterable, not %T", "argument
-/// after ** must be a mapping, not %T", "keywords must be strings, not '%T'")
-/// — which are `oefmt(..., "%T", w_obj)` upstream.
+/// messages below. Duplicate-keyword and non-string-keyword text still uses
+/// `raise_type_error` / `object_functionstr`. The iterable/mapping rejects
+/// use `_Py_Check_ArgsIterable` / `_PyEval_FormatKwargsError`:
+/// "Value after * must be an iterable, not %T" and
+/// "Value after ** must be a mapping, not %T", with no function-name prefix.
 use crate::error::type_name_of;
 
 /// pypy/interpreter/argument.py `raise_type_error`.
@@ -356,7 +358,6 @@ pub fn combine_starargs_wrapped(
     let star_slot = pyre_object::gc_roots::publish_roots(&[w_stararg, w_function]);
     pyre_object::gc_roots::normalize_roots(args_base, arguments_w.len() + 2);
     let w_stararg = || pyre_object::gc_roots::shadow_stack_get(star_slot);
-    let w_function = || pyre_object::gc_roots::shadow_stack_get(star_slot + 1);
     match crate::baseobjspace::fixedview(w_stararg(), -1) {
         Ok(args_w) => {
             pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut arguments_w[..]);
@@ -365,17 +366,19 @@ pub fn combine_starargs_wrapped(
             Ok(())
         }
         Err(e) => {
-            // argument.py:97-103 — TypeError + non-iterable surfaces
-            // `"argument after * must be an iterable, not %T"`; other
-            // errors propagate.
+            // [3.15-spec] `_Py_Check_ArgsIterable` formats
+            // "Value after * must be an iterable, not %.200s" with no
+            // `object_functionstr` prefix. `raise_type_error` in
+            // `argument.py` prefixes `"%s " + msg`. Evidence:
+            // `lib-python/3/test/pickletester.py` `test_bad_newobj_ex_args`.
+            // `raise_type_error` has `@specialize.arg(2)` and no `@jit.*`.
             if e.kind == crate::PyErrorKind::TypeError
                 && !crate::baseobjspace::is_iterable(w_stararg())
             {
                 let tp = type_name_of(w_stararg());
-                Err(raise_type_error(
-                    w_function(),
-                    format!("argument after * must be an iterable, not {tp}"),
-                ))
+                Err(crate::PyError::type_error(format!(
+                    "Value after * must be an iterable, not {tp}"
+                )))
             } else {
                 Err(e)
             }
@@ -550,11 +553,15 @@ pub fn combine_starstarargs_wrapped(
         let w_keys_meth = match crate::baseobjspace::getattr_str(w_starstararg(), "keys") {
             Ok(m) => m,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                // [3.15-spec] `_PyEval_FormatKwargsError` formats
+                // "Value after ** must be a mapping, not %T" with no
+                // function-name prefix. `raise_type_error` in
+                // `argument.py` prefixes `"%s " + msg`. Evidence:
+                // `lib-python/3/test/pickletester.py` `test_bad_newobj_ex_args`.
                 let tp = type_name_of(w_starstararg());
-                return Err(raise_type_error(
-                    w_function(),
-                    format!("argument after ** must be a mapping, not {tp}"),
-                ));
+                return Err(crate::PyError::type_error(format!(
+                    "Value after ** must be a mapping, not {tp}"
+                )));
             }
             Err(e) => return Err(e),
         };
@@ -562,10 +569,9 @@ pub fn combine_starstarargs_wrapped(
             Ok(w) => w,
             Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
                 let tp = type_name_of(w_starstararg());
-                return Err(raise_type_error(
-                    w_function(),
-                    format!("argument after ** must be a mapping, not {tp}"),
-                ));
+                return Err(crate::PyError::type_error(format!(
+                    "Value after ** must be a mapping, not {tp}"
+                )));
             }
             Err(e) => return Err(e),
         };
@@ -2232,8 +2238,8 @@ mod tests {
         }
     }
 
-    /// pypy/interpreter/argument.py:97-103 — non-iterable star arg
-    /// surfaces "argument after * must be an iterable".
+    /// `_Py_Check_ArgsIterable` — non-iterable star arg surfaces
+    /// "Value after * must be an iterable".
     ///
     /// Rejecting the operand runs `space.iter`, whose `__iter__` probe is a
     /// type-MRO `lookup`; that lookup needs `init_typeobjects()` to have
@@ -2250,7 +2256,7 @@ mod tests {
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert!(
             err.message_text()
-                .contains("argument after * must be an iterable")
+                .contains("Value after * must be an iterable")
         );
     }
 

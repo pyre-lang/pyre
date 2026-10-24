@@ -986,9 +986,22 @@ fn instancecheck(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::
     let cls_slot = roots.publish(&[args[0]]);
     let instance_slot = roots.publish(&[args[1]]);
 
-    // `app_abc.py _abc_instancecheck subclass = instance.__class__`.
+    // `_abc__abc_instancecheck_impl` reads `__class__` through
+    // `PyObject_GetOptionalAttr` and, when that attribute is absent, uses
+    // `Py_TYPE(instance)`. Only AttributeError is absence; a NameError from
+    // the property must propagate.
     let subclass =
-        pyre_interpreter::baseobjspace::getattr_str(roots.get(instance_slot), "__class__")?;
+        match pyre_interpreter::baseobjspace::getattr_str(roots.get(instance_slot), "__class__") {
+            Ok(cls) => cls,
+            Err(err) if err.kind == pyre_interpreter::PyErrorKind::AttributeError => {
+                pyre_interpreter::typedef::r#type(roots.get(instance_slot))
+                    .map_or(std::ptr::null_mut(), |p| p.as_ptr())
+            }
+            Err(err) => return Err(err),
+        };
+    if subclass.is_null() {
+        return Ok(w_bool_from(false));
+    }
     let subclass_slot = roots.publish(&[subclass]);
     if weak_cache_contains(roots.get(cls_slot), "_abc_cache", roots.get(subclass_slot))? {
         return Ok(w_bool_from(true));

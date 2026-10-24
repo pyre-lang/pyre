@@ -350,7 +350,7 @@ pub fn unary_not_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
 /// iterable); the compiler only ever emits INTRINSIC_LIST_TO_TUPLE right
 /// after a `BUILD_LIST` + `LIST_EXTEND` chain, so the operand is always an
 /// exact list.  A non-iterable `*arg` is already rejected upstream by
-/// LIST_EXTEND ("argument after * must be an iterable"), so the non-list
+/// LIST_EXTEND ("Value after * must be an iterable"), so the non-list
 /// TypeError below is an unreachable defensive guard.
 pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     unsafe {
@@ -1033,14 +1033,15 @@ pub fn dict_merge_value(
     let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source(), w_dict_type()) };
     if !source_is_dict {
         unroll_safe = false;
-        // `if not space.ismapping_w(w_item): raise oefmt(... "%s argument
-        // after ** must be a mapping, not %T")`.
+        // [3.15-spec] `_PyEval_FormatKwargsError` / DICT_MERGE formats
+        // "Value after ** must be a mapping, not %T" with no function-name
+        // prefix. pyopcode.py `_dict_merge` uses `raise_type_error` /
+        // `"%s argument after ** must be a mapping, not %T"`.
         if !crate::baseobjspace::ismapping_w(source()) {
             let type_name = crate::error::type_name_of(source());
-            return Err(crate::argument::raise_type_error(
-                w_callable(),
-                format!("argument after ** must be a mapping, not {type_name}"),
-            ));
+            return Err(PyError::type_error(format!(
+                "Value after ** must be a mapping, not {type_name}"
+            )));
         }
     } else {
         // `pyopcode.py _dict_merge`: an empty target calls `update1`
@@ -1091,10 +1092,9 @@ fn _dict_merge_loop(
         Ok(m) => m,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
             let type_name = crate::error::type_name_of(source());
-            return Err(crate::argument::raise_type_error(
-                w_callable(),
-                format!("argument after ** must be a mapping, not {type_name}"),
-            ));
+            return Err(PyError::type_error(format!(
+                "Value after ** must be a mapping, not {type_name}"
+            )));
         }
         Err(e) => return Err(e),
     };

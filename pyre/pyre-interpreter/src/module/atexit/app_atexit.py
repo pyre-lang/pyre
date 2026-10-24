@@ -41,7 +41,7 @@ def _run_exitfuncs():
             # CPython 3.14 reports atexit failures without attaching the
             # callback object, but includes its repr in err_msg.
             __pypy__.write_unraisable(
-                f"Exception ignored in atexit callback {func!r}", e, None)
+                f"in atexit callback {func!r}", e, None)
 
     _clear()
 

@@ -8468,15 +8468,24 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
 ///
 /// Resume-pc liveness names r0 so a post-return guard can carry the
 /// result; in-dunder snapshots still need a matching placeholder that
-/// `_setup_return_value_r` (`blackhole.py`) overwrites. `blackhole` is
-/// `None` because the level owns no register banks to force, and
+/// `_setup_return_value_r` (`blackhole.py`) overwrites. Format also names
+/// r1, the formatted receiver, so `descroperation.py format` can build
+/// `%T.__format__() must return a str, not %T`. `blackhole` is `None`
+/// because the level owns no register banks to force, and
 /// `call_stack_overrides` is empty because it has no operand stack.
 pub(crate) fn operator_continuation_parent_frame(
     tail: crate::operator_continuation::OperatorTail,
+    receiver: Option<OpRef>,
 ) -> Option<InlineParentFrame> {
     let jitcode_index = crate::operator_continuation::jitcode_index(tail)?;
     let resume_pc = crate::operator_continuation::resume_pc(tail)?;
-    let boxes = vec![OpRef::const_ptr(majit_ir::GcRef::NULL)];
+    let pending = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let boxes = match tail {
+        crate::operator_continuation::OperatorTail::Format => {
+            vec![pending, receiver.unwrap_or(pending)]
+        }
+        _ => vec![pending],
+    };
     let result_slot = call_result_slot(jitcode_index as u32, resume_pc, boxes.len());
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,

@@ -766,13 +766,25 @@ _RESOURCE_MODULE_DRIVER = (
 # test_runpy's file as __main__ does not run test_runpy at all — it starts
 # libregrtest over the whole suite (measured: 491 modules on CPython 3.14,
 # 492 here), so script mode can only ever time out on it.
+#
+# Two 3.15 tests fail as __main__ on CPython 3.15.0 too and pass when imported
+# as `test.<name>` (measured): test_complex's `test_constructor` re-emits a
+# caught warning with `__main__`'s globals, and `warnings.warn_explicit` then
+# asks the frozen-only loader of `importlib._bootstrap_external` for its
+# source; test_zipimport_support's
+# `test_import_filter_syntax_warnings_by_module` fails its
+# `import test_pkg.test_mod` with "'test_pkg' is not a package" when the
+# file's own directory is on `sys.path`, where `test/test_pkg.py` shadows the
+# zip's package.
 DOTTED_IDENTITY_MODULES = {
+    "test.test_complex",
     "test.test_descr",
     "test.test_enum",
     "test.test_regrtest",
     "test.test_runpy",
     "test.test_thread",
     "test.test_threading",
+    "test.test_zipimport_support",
 }
 
 # These suites create child interpreters or threads of their own.  Running them

@@ -113,6 +113,10 @@ pub struct W_SSLSocket {
     pub shutdown_started: bool,
     pub record: RecordCursor,
     pub requested_session: *mut pyre_native::ssl::NativeSession,
+    /// `PySSLSocket.got_eof_error`: after the first `SSLEOFError`,
+    /// `read` / `write` / `do_handshake` raise `SSLEOFError` again instead of
+    /// a later generic protocol error.
+    pub got_eof_error: bool,
 }
 
 // `_ssl_exec` creates the immutable Certificate module heap type.
@@ -608,6 +612,7 @@ fn allocate_ssl_socket(
         shutdown_started: false,
         record: RecordCursor::default(),
         requested_session,
+        got_eof_error: false,
     })
 }
 
@@ -978,48 +983,65 @@ mod context_methods {
                 keyfile.unwrap_or(pyre_object::PY_NULL),
                 password.unwrap_or(pyre_object::PY_NULL),
             ]);
-            let cert_path = fs_path(roots.get(base));
-            let w = roots.get(base + 1);
-            let key = if w.is_null() { None } else { Some(w) };
-            let w = roots.get(base + 2);
-            let mut password = if w.is_null() { None } else { Some(w) };
-            drop(roots);
-            let cert_path = cert_path?;
-            let key_path = match key {
-                Some(value) if !unsafe { is_none(value) } => {
-                    let roots = pyre_object::gc_roots::push_roots();
-                    let base = roots.pin_roots(&[password.unwrap_or(pyre_object::PY_NULL)]);
-                    let key_path = fs_path(value);
-                    let w = roots.get(base);
-                    password = if w.is_null() { None } else { Some(w) };
-                    drop(roots);
-                    key_path?
-                }
-                _ => cert_path.clone(),
+            let cert_path = fs_path(roots.get(base))?;
+            let key = roots.get(base + 1);
+            let key_path = if key.is_null() || unsafe { is_none(key) } {
+                cert_path.clone()
+            } else {
+                fs_path(key)?
+            };
+            let password = {
+                let w = roots.get(base + 2);
+                if w.is_null() { None } else { Some(w) }
             };
             // OpenSSL asks its callback only after parsing discovers an
             // encrypted key. Preserve that observable ordering: an irrelevant
             // callback must not run for an unencrypted key file.  The backend
             // reports which case it hit, so the container decides this rather
             // than a scan of the file for header text.
-            let loaded = native_result(unsafe {
+            let loaded = match unsafe {
                 pyre_native::ssl::context_load_cert_chain(self.backend, &cert_path, &key_path, None)
-            })?;
+            } {
+                Ok(loaded) => loaded,
+                Err((errno, _message)) if errno != 0 => {
+                    // `os_error_syscall` puts the missing path on `.filename`.
+                    // ENOENT names whichever of cert/key is absent.
+                    let key = roots.get(base + 1);
+                    let filename = if errno == libc::ENOENT {
+                        if !cert_path.exists() {
+                            roots.get(base)
+                        } else if !key.is_null() && !unsafe { is_none(key) } && !key_path.exists() {
+                            roots.get(base + 1)
+                        } else {
+                            roots.get(base)
+                        }
+                    } else {
+                        roots.get(base)
+                    };
+                    return Err(pyre_interpreter::PyError::os_error_syscall(errno, filename));
+                }
+                Err((_, message)) => return Err(ssl_error(message)),
+            };
             if loaded {
                 return Ok(());
             }
             let Some(password) = password_bytes(password.unwrap_or_else(w_none))? else {
                 return Err(ssl_error("[SSL] PEM routines: bad password read"));
             };
-            native_result(unsafe {
+            match unsafe {
                 pyre_native::ssl::context_load_cert_chain(
                     self.backend,
                     &cert_path,
                     &key_path,
                     Some(&password),
                 )
-            })
-            .map(|_| ())
+            } {
+                Ok(_) => Ok(()),
+                Err((errno, _message)) if errno != 0 => Err(
+                    pyre_interpreter::PyError::os_error_syscall(errno, roots.get(base)),
+                ),
+                Err((_, message)) => Err(ssl_error(message)),
+            }
         }
 
         fn load_verify_locations(
@@ -1193,6 +1215,45 @@ mod context_methods {
             }
             let cipherlist = pyre_interpreter::baseobjspace::str_utf8_w(cipherlist)?;
             unsafe { pyre_native::ssl::context_set_cipher_list(self.backend, cipherlist) }
+                .map_err(ssl_error)
+        }
+
+        fn set_ciphersuites(
+            &mut self,
+            ciphersuites: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
+            if !unsafe { is_str(ciphersuites) } {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "ciphersuites must be a string",
+                ));
+            }
+            let ciphersuites = pyre_interpreter::baseobjspace::str_utf8_w(ciphersuites)?;
+            unsafe { pyre_native::ssl::context_set_ciphersuites(self.backend, ciphersuites) }
+                .map_err(ssl_error)
+        }
+
+        fn set_groups(&mut self, grouplist: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+            if !unsafe { is_str(grouplist) } {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "grouplist must be a string",
+                ));
+            }
+            let grouplist = pyre_interpreter::baseobjspace::str_utf8_w(grouplist)?;
+            unsafe { pyre_native::ssl::context_set_groups(self.backend, grouplist) }
+                .map_err(ssl_error)
+        }
+
+        fn set_server_sigalgs(
+            &mut self,
+            sigalgslist: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
+            if !unsafe { is_str(sigalgslist) } {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "sigalgslist must be a string",
+                ));
+            }
+            let sigalgslist = pyre_interpreter::baseobjspace::str_utf8_w(sigalgslist)?;
+            unsafe { pyre_native::ssl::context_set_server_sigalgs(self.backend, sigalgslist) }
                 .map_err(ssl_error)
         }
 
@@ -1624,6 +1685,7 @@ mod ssl_socket_methods {
                 // protocol error. Send it before unwinding the Python call so
                 // the peer cannot remain blocked in its handshake.
                 let _ = flush_transport(socket);
+                latch_eof_code(socket, error.0);
                 return tls_result(Err(error));
             }
         };
@@ -1733,7 +1795,7 @@ mod ssl_socket_methods {
                     }
                     PumpExit::Failed { write, code }
                         if wait_for_transport(transport(), fd, write, code)? => {}
-                    exit => return Err(pump_error(transport(), exit)),
+                    exit => return Err(pump_error(socket, transport(), exit)),
                 }
             }
         }
@@ -1932,11 +1994,36 @@ mod ssl_socket_methods {
         crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, write)
     }
 
+    fn reject_if_got_eof(socket: &W_SSLSocket) -> Result<(), pyre_interpreter::PyError> {
+        if socket.got_eof_error {
+            return Err(tls_error(
+                pyre_native::ssl::TLS_ERROR_EOF,
+                "EOF occurred in violation of protocol".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn latch_eof_code(socket: &mut W_SSLSocket, code: i32) {
+        if code == pyre_native::ssl::TLS_ERROR_EOF {
+            socket.got_eof_error = true;
+        }
+    }
+
     /// The exception a released run's transport failure raises, once the
     /// interpreter is back.  Every caller answers the exits that are not
     /// failures - and `Rejected`, whose alert has to go out first - before
     /// reaching here.
-    fn pump_error(transport: PyObjectRef, exit: PumpExit) -> pyre_interpreter::PyError {
+    fn pump_error(
+        socket: &mut W_SSLSocket,
+        transport: PyObjectRef,
+        exit: PumpExit,
+    ) -> pyre_interpreter::PyError {
+        match &exit {
+            PumpExit::Eof => socket.got_eof_error = true,
+            PumpExit::Rejected((code, _)) => latch_eof_code(socket, *code),
+            _ => {}
+        }
         match exit {
             PumpExit::Eof => tls_error(
                 pyre_native::ssl::TLS_ERROR_EOF,
@@ -2006,6 +2093,7 @@ mod ssl_socket_methods {
             if pending == 0 {
                 if unsafe { pyre_native::ssl::memory_bio_eof(incoming.backend) } {
                     let _ = receive_tls(socket, &[]);
+                    socket.got_eof_error = true;
                     return Err(tls_error(
                         pyre_native::ssl::TLS_ERROR_EOF,
                         "EOF occurred in violation of protocol".to_string(),
@@ -2046,6 +2134,7 @@ mod ssl_socket_methods {
             Err(error) => return Err(error),
         };
         if read == 0 {
+            socket.got_eof_error = true;
             return Err(tls_error(
                 pyre_native::ssl::TLS_ERROR_EOF,
                 "EOF occurred in violation of protocol".to_string(),
@@ -2160,6 +2249,7 @@ mod ssl_socket_methods {
                 // Accepted::into_connection returns the alert bytes alongside
                 // the error. Deliver those bytes before reporting failure.
                 let _ = flush_transport(unsafe { &mut *socket });
+                latch_eof_code(unsafe { &mut *socket }, error.0);
                 tls_result(Err(error))
             }
         }
@@ -2258,6 +2348,7 @@ mod ssl_socket_methods {
         }
 
         fn do_handshake(&mut self) -> Result<(), pyre_interpreter::PyError> {
+            reject_if_got_eof(self)?;
             ensure_connection(self)?;
             if self.server_side {
                 let context =
@@ -2320,9 +2411,10 @@ mod ssl_socket_methods {
                             // this protocol error. Send it before unwinding so
                             // the peer cannot remain blocked in its handshake.
                             let _ = flush_transport(self);
+                            latch_eof_code(self, error.0);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport(), exit)),
+                        exit => return Err(pump_error(self, transport(), exit)),
                     }
                 }
                 flush_transport(self)?;
@@ -2345,6 +2437,7 @@ mod ssl_socket_methods {
         }
 
         fn write(&mut self, mut data: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
+            pyre_object::with_roots!(data => reject_if_got_eof(self))?;
             if self.shutdown_started {
                 return Err(ssl_error("TLS/SSL connection has been closed"));
             }
@@ -2353,9 +2446,13 @@ mod ssl_socket_methods {
                 pyre_interpreter::baseobjspace::simple_buffer_bytes(data)?.ok_or_else(|| {
                     pyre_interpreter::PyError::type_error("a bytes-like object is required")
                 })?;
-            let written_or_err = tls_result(unsafe {
+            let result = unsafe {
                 pyre_native::ssl::connection_write_plain(self.backend, buffer.as_bytes())
-            });
+            };
+            if let Err((code, _)) = &result {
+                latch_eof_code(self, *code);
+            }
+            let written_or_err = tls_result(result);
             let mut failure = None;
             let written = match written_or_err {
                 Ok(n) => Some(n),
@@ -2395,12 +2492,13 @@ mod ssl_socket_methods {
             } else {
                 pyre_object::with_roots!(w_buffer => pyre_interpreter::baseobjspace::int_w(w_size))?
             };
-            let output_buffer = (!w_buffer.is_null()).then_some(w_buffer);
-            if requested < 0 && output_buffer.is_none() {
+            if requested < 0 && w_buffer.is_null() {
                 return Err(pyre_interpreter::PyError::value_error(
                     "size should not be negative",
                 ));
             }
+            pyre_object::with_roots!(w_buffer => reject_if_got_eof(self))?;
+            let output_buffer = (!w_buffer.is_null()).then_some(w_buffer);
             if requested == 0 && output_buffer.is_none() {
                 return Ok(w_bytes_from_bytes(&[]));
             }
@@ -2479,9 +2577,10 @@ mod ssl_socket_methods {
                             // this protocol error. Send it before unwinding so
                             // the peer cannot remain blocked.
                             let _ = flush_transport(self);
+                            latch_eof_code(self, error.0);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport(), exit)),
+                        exit => return Err(pump_error(self, transport(), exit)),
                     }
                 }
             } else {
@@ -2492,7 +2591,10 @@ mod ssl_socket_methods {
                             receive_transport(self)?;
                             flush_transport(self)?;
                         }
-                        Err((code, message)) => return Err(tls_error(code, message)),
+                        Err((code, message)) => {
+                            latch_eof_code(self, code);
+                            return Err(tls_error(code, message));
+                        }
                     }
                 }
             };
@@ -2525,6 +2627,16 @@ mod ssl_socket_methods {
             } else {
                 unsafe { pyre_native::ssl::connection_pending_plaintext(self.backend) }
             }
+        }
+
+        /// `BIO_get_ktls_send` / `BIO_get_ktls_recv` are unavailable here, so
+        /// both report false (`_ssl__SSLSocket_uses_ktls_for_send_impl`).
+        fn uses_ktls_for_send(&self) -> bool {
+            false
+        }
+
+        fn uses_ktls_for_recv(&self) -> bool {
+            false
         }
 
         fn selected_alpn_protocol(&self) -> PyObjectRef {
@@ -2749,9 +2861,10 @@ mod ssl_socket_methods {
                             if wait_for_transport(transport(), fd, write, code)? => {}
                         PumpExit::Rejected(error) => {
                             let _ = flush_transport(self);
+                            latch_eof_code(self, error.0);
                             return tls_result(Err(error));
                         }
-                        exit => return Err(pump_error(transport(), exit)),
+                        exit => return Err(pump_error(self, transport(), exit)),
                     }
                 }
             } else if unsafe { is_none(self.incoming) } {

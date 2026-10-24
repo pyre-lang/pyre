@@ -257,8 +257,8 @@ struct NativeMMap {
     /// `mode` cannot stand in for it: a `MAP_PRIVATE` mapping that is not
     /// writable resolves to the same `AccessMode::Read` as a shared one.
     /// `resize` needs the bit to reject expanding a shared anonymous mapping.
+    /// `set_name` reads `MAP_ANONYMOUS` from the same word.
     #[cfg(unix)]
-    #[allow(dead_code)]
     flags: libc::c_int,
     /// `rmmap.py:953-970` — the file handle the object duplicated at
     /// construction, or `INVALID_HANDLE` for a mapping backed by no file of
@@ -506,7 +506,8 @@ pub fn __majit_wrap_mmap_flush(
     // object, which `int_w` accepts; the conversion follows 3.15.0 as
     // `write_byte` and `move` do.  No JIT hint covers `flush`.
     let size = if n_args > 2 {
-        let w_index = pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::space_index(w_size))?;
+        let w_index =
+            pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::space_index(w_size))?;
         pyre_object::with_roots!(obj => pyre_interpreter::baseobjspace::int_w(w_index))?
     } else {
         -1
@@ -639,6 +640,75 @@ fn mmap_check_valid(obj: pyre_object::PyObjectRef) -> Result<(), pyre_interprete
     mmap_ptr(obj).map(|_| ())
 }
 
+/// [3.15-spec] `mmap_mmap_set_name_impl`: annotate an anonymous mapping.
+/// `interp_mmap.py W_MMap` has no `set_name`. Linux names the VMA through
+/// `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)`. The prefix `cpython:mmap:`
+/// plus the name plus NUL must fit in 80 bytes. A file-backed mapping is
+/// refused; other platforms raise NotImplementedError.
+#[cfg(any(unix, windows))]
+fn mmap_set_name(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() < 2 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "set_name() missing 1 required positional argument: 'name'",
+        ));
+    }
+    let mut obj = args[0];
+    let mut name_obj = args[1];
+    mmap_check_valid(obj)?;
+    let name = pyre_object::with_roots!(obj, name_obj => {
+        pyre_interpreter::baseobjspace::text_w(name_obj).map(str::to_owned)
+    })?;
+    #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+    {
+        const PREFIX: &str = "cpython:mmap:";
+        if name.len() + PREFIX.len() > 79 {
+            return Err(pyre_interpreter::PyError::value_error("name is too long"));
+        }
+        let flags = mmap_native(obj)?.flags;
+        if flags & rmmap::MAP_ANONYMOUS == 0 {
+            return Err(pyre_interpreter::PyError::value_error(
+                "Cannot set annotation on non-anonymous mappings",
+            ));
+        }
+        let (ptr, len) = mmap_ptr(obj)?;
+        let mut tagged = String::with_capacity(PREFIX.len() + name.len());
+        tagged.push_str(PREFIX);
+        tagged.push_str(&name);
+        let c_name = std::ffi::CString::new(tagged)
+            .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?;
+        // `PR_SET_VMA_ANON_NAME` is 0 in linux/prctl.h; rust libc may not
+        // export the name on every version.
+        const PR_SET_VMA_ANON_NAME: libc::c_ulong = 0;
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_SET_VMA,
+                PR_SET_VMA_ANON_NAME,
+                ptr as libc::c_ulong,
+                len as libc::c_ulong,
+                c_name.as_ptr() as libc::c_ulong,
+            )
+        };
+        if rc < 0 {
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EINVAL);
+            return Err(pyre_interpreter::PyError::os_error_with_errno(
+                errno, "prctl",
+            ));
+        }
+        return Ok(pyre_object::w_none());
+    }
+    #[cfg(not(all(unix, any(target_os = "linux", target_os = "android"))))]
+    {
+        let _ = (obj, name);
+        Err(pyre_interpreter::PyError::not_implemented(
+            "Annotation of mmap is not supported on this platform",
+        ))
+    }
+}
+
 /// `rmmap.py MMap.check_writeable`.
 #[cfg(any(unix, windows))]
 fn mmap_check_writeable(obj: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
@@ -684,39 +754,43 @@ fn mmap_handle(obj: pyre_object::PyObjectRef) -> Option<host_mmap::Handle> {
     Some(handle as host_mmap::Handle)
 }
 
-/// `rmmap.py MMap.file_size` — the backing file's current size, which
-/// diverges from the mapped length after `resize()`.  An anonymous map has no
-/// file to stat, and fstat on the `-1` descriptor is the OSError that reports
-/// it.
+/// `mmap_mmap_size_impl` — a live fd is `fstat`; otherwise `trackfd`
+/// reports the mapped length and `trackfd=False` raises ValueError.
 #[cfg(unix)]
 fn mmap_file_size(mut obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
     let fd = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_fd")) as libc::c_int;
-    if fd < 0 {
-        return Err(pyre_interpreter::PyError::os_error_with_errno(
-            libc::EBADF,
-            "mmap: cannot find file size for anonymous map",
-        ));
+    if fd >= 0 {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // `os.fstat` via `c_fstat`. Failure is the saved errno, not a live one:
+        // the wrapper clears errno before the call and releases the GIL.
+        let rc = pyre_object::with_roots!(obj => unsafe { rmmap::c_fstat(fd, &mut st) });
+        if rc < 0 {
+            return Err(pyre_interpreter::PyError::os_error_with_errno(
+                majit_rlib::rposix::get_saved_errno(),
+                "mmap.size: fstat failed",
+            ));
+        }
+        return Ok(st.st_size as i64);
     }
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // `os.fstat` via `c_fstat`. Failure is the saved errno, not a live one:
-    // the wrapper clears errno before the call and releases the GIL.
-    let rc = pyre_object::with_roots!(obj => unsafe { rmmap::c_fstat(fd, &mut st) });
-    if rc < 0 {
-        return Err(pyre_interpreter::PyError::os_error_with_errno(
-            majit_rlib::rposix::get_saved_errno(),
-            "mmap.size: fstat failed",
-        ));
+    if mmap_native(obj)?.trackfd {
+        Ok(mmap_get_attr_i64(obj, "_len"))
+    } else {
+        Err(pyre_interpreter::PyError::value_error(
+            "can't get size with trackfd=False",
+        ))
     }
-    Ok(st.st_size as i64)
 }
 
-/// `rmmap.py:511-520` — `GetFileSize` on the handle the map owns.  An
-/// anonymous map has no handle and reports the mapped length instead.
+/// `GetFileSize` on the handle the map owns.  An anonymous map has no handle
+/// and reports the mapped length; `trackfd=False` raises ValueError.
 #[cfg(windows)]
 fn mmap_file_size(obj: pyre_object::PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
     match mmap_handle(obj) {
         Some(handle) => host_mmap::get_file_len(handle).map_err(|e| mmap_io_err(e, "GetFileSize")),
-        None => Ok(mmap_get_attr_i64(obj, "_len")),
+        None if mmap_native(obj)?.trackfd => Ok(mmap_get_attr_i64(obj, "_len")),
+        None => Err(pyre_interpreter::PyError::value_error(
+            "can't get size with trackfd=False",
+        )),
     }
 }
 
@@ -933,6 +1007,8 @@ fn mmap_gfind(
     if start > end {
         return Ok(pyre_object::w_int_new(-1));
     }
+    let start = start as usize;
+    let end = end as usize;
     let needle = unsafe { pattern.data() }?;
     if needle.is_empty() {
         let empty = if reverse { end } else { start };
@@ -1227,10 +1303,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         )
     );
 
-    // `interp_mmap.py descr_size` returns `mmap.file_size()` —
-    // the underlying file's current size via fstat, not the mapped
-    // length.  The two diverge after `resize()`, and an anonymous mmap
-    // (no fd) raises ValueError per rmmap.py:MMap.file_size.
+    // `mmap_mmap_size_impl`: fstat on a live fd, else the mapped length
+    // when `trackfd` is set.  `trackfd=False` raises ValueError.
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "size",
@@ -1259,6 +1333,14 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             |_args| Ok(pyre_object::w_bool_from(true)),
             1,
         )
+    );
+
+    // `mmap_mmap_set_name_impl` — name an anonymous mapping (Linux VMA
+    // annotation). Other hosts raise NotImplementedError.
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "set_name",
+        pyre_interpreter::make_builtin_function_with_arity("set_name", mmap_set_name, 2)
     );
 
     unsafe {
@@ -1693,8 +1775,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 
                     if step == 0 {
                         // index only
-                        let value =
-                            pyre_interpreter::baseobjspace::int_w(roots.get(value_slot))?;
+                        let value = pyre_interpreter::baseobjspace::int_w(roots.get(value_slot))?;
                         if !(0..256).contains(&value) {
                             return Err(pyre_interpreter::PyError::value_error(
                                 "mmap item value must be in range(0, 256)",
@@ -1926,12 +2007,9 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         )
     };
 
-    // `interp_mmap.py resize` → `rmmap.py`.  POSIX path:
-    // ftruncate the backing fd (if any) to `offset + newsize`, then
-    // mremap(MREMAP_MAYMOVE).  Platforms without mremap (e.g. macOS)
-    // raise SystemError to match PyPy's RValueError→SystemError
-    // translation at `interp_mmap.py`.  Read-only / copy
-    // mappings reject with TypeError.
+    // `mmap_mmap_resize_impl` is compiled only where `mremap` exists or on
+    // Windows.  Elsewhere the method is absent (`HAVE_MREMAP`).
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
     pyre_interpreter::__pyre_put_new!(
         ns_slot,
         "resize",
@@ -2253,21 +2331,6 @@ fn mmap_remake_anon(
     let mut mapped = host_mmap::map_anon(newsize).map_err(|e| mmap_io_err(e, "mmap"))?;
     mapped.as_mut_slice()[..keep].copy_from_slice(&old);
     Ok(mapped)
-}
-
-/// Platforms without mremap raise SystemError, matching PyPy's
-/// RValueError→SystemError translation at `interp_mmap.py:155-157`.
-#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
-fn mmap_resize_mapping(
-    _obj: pyre_object::PyObjectRef,
-    _p: *mut u8,
-    _old_len: usize,
-    _newsize: usize,
-) -> Result<(), pyre_interpreter::PyError> {
-    Err(pyre_interpreter::PyError::new(
-        pyre_interpreter::error::PyErrorKind::SystemError,
-        "mmap: resizing not available--no mremap()",
-    ))
 }
 
 /// The mapping mode an `ACCESS_*` argument asks for. Windows expresses a
