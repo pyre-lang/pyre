@@ -1263,6 +1263,18 @@ impl ListRepr {
         // element type is never a gc container.
         let (external_item_repr, internal) =
             crate::translator::rtyper::rclass::externalvsinternal(rtyper, item_repr, true)?;
+        Ok(Self::from_item_reprs(external_item_repr, internal))
+    }
+
+    /// `ListRepr._setup_repr` after identity `externalvsinternal`
+    /// (`rclass.py`): primitive items such as Signed skip gcref wrapping,
+    /// so rlib helper-graph builders that hold `&RPythonTyper` (no
+    /// `self_rc`) can still mint the resized list layout.
+    pub(crate) fn from_primitive_item_repr(item_repr: Arc<dyn Repr>) -> Self {
+        Self::from_item_reprs(item_repr.clone(), item_repr)
+    }
+
+    fn from_item_reprs(external_item_repr: Arc<dyn Repr>, internal: Arc<dyn Repr>) -> Self {
         let item_lltype = internal.lowleveltype().clone();
         // upstream `get_itemarray_lowleveltype()` — `GcArray(ITEM)` (the
         // `ADTIFixedList` adtmeths it carries are unused until the array
@@ -1284,12 +1296,12 @@ impl ListRepr {
         let lltype = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Struct(list_struct),
         }));
-        Ok(ListRepr {
+        ListRepr {
             state: ReprState::new(),
             lltype,
             item_repr: internal,
             external_item_repr,
-        })
+        }
     }
 
     pub(crate) fn item_lowleveltype(&self) -> LowLevelType {
@@ -2583,7 +2595,7 @@ pub(crate) fn build_ll_reverse_resized_helper_graph(
 /// Build the `Ptr(GcArray(ITEM))` low-level type of the resized list's
 /// `items` field — must match [`ListRepr::new`]'s `Array::gc(item_lltype)`
 /// exactly so the `malloc_varsize` result and the `items` field unify.
-fn items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
+pub(crate) fn items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Array(Array::gc(item_lltype.clone())),
     }))
@@ -2691,7 +2703,7 @@ fn none_void_const() -> Hlvalue {
 /// first append into an empty list) makes `int_lt(0, 0)` false, so the
 /// copy is a no-op — this is why the resize caller can drop upstream's
 /// `if before_len:` guard against copying the prebuilt-empty array.
-fn build_ll_arraycopy_helper_graph(
+pub(crate) fn build_ll_arraycopy_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -3366,7 +3378,7 @@ pub(crate) fn build_ll_arraymove_helper_graph(
 /// CFG: start (capacity check) -> grow (overallocation `some` branch) ->
 /// alloc (malloc + arraycopy + `l.items = newitems`) -> tail
 /// (`l.length = newsize`); the no-grow start edge skips straight to tail.
-fn build_ll_list_resize_ge_helper_graph(
+pub(crate) fn build_ll_list_resize_ge_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
@@ -3639,7 +3651,7 @@ fn build_ll_list_resize_ge_helper_graph(
 /// Single block: read `length`, `direct_call` the resize helper (which sets
 /// `l.length = length + 1` and ensures capacity), then `direct_call` the
 /// resized `ll_setitem_fast` to write `items[length] = newitem`.
-fn build_ll_append_helper_graph(
+pub(crate) fn build_ll_append_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,

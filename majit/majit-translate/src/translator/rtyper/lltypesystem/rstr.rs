@@ -44,6 +44,7 @@
 
 use std::sync::LazyLock;
 
+#[cfg(test)]
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, GraphKey,
@@ -9396,6 +9397,11 @@ fn emit_record_exact_value_and_return(
 /// (`HighLevelOp.gendirectcall`), so `funcobj.graph` is set. Callers
 /// that keep `rtyper` alive (`build_ll_find_helper_graph_on`) can look
 /// those graphs up on `translator.graphs`.
+///
+/// Test-only: a throwaway annotator/rtyper. Production must call
+/// [`build_ll_find_helper_graph_on`] so callees stay on the caller's
+/// translator (`RPythonTyper.annotate_helper`).
+#[cfg(test)]
 pub(crate) fn build_ll_find_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
@@ -9835,6 +9841,11 @@ pub(crate) fn build_ll_find_helper_graph_on(
 /// `hlstr` / `hlunicode` are identity on the low-level pointer. `_search`
 /// dispatches on `isinstance(value, str)` at translation time: STR is
 /// `direct_call _search_elidable`; UNICODE is `direct_call _search_normal`.
+///
+/// Test-only: a throwaway annotator/rtyper. Production must call
+/// [`build_ll_search_helper_graph_on`] so the `_search_*` callee stays
+/// on the caller's translator (`RPythonTyper.annotate_helper`).
+#[cfg(test)]
 pub(crate) fn build_ll_search_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
@@ -9842,6 +9853,60 @@ pub(crate) fn build_ll_search_helper_graph(
     let ann = RPythonAnnotator::new(None, None, None, false);
     let rtyper = RPythonTyper::new(&ann);
     build_ll_search_helper_graph_on(&rtyper, name, ptr_lltype)
+}
+
+/// `assert p is not None` on a `Ptr(STR)` / `Ptr(UNICODE)`:
+/// `ptr_nonzero` then the False arm raises AssertionError
+/// (`LLHelpers.ll_search`; flowspace `assert` lowering).
+fn close_assert_ptr_not_none(
+    block: &BlockRef,
+    ptr: &Variable,
+    continue_args: Vec<Hlvalue>,
+    continue_block: BlockRef,
+    exceptblock: BlockRef,
+    exc_args: Vec<Hlvalue>,
+) {
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let nz = variable_with_lltype("nz", LowLevelType::Bool);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(ptr.clone())],
+        Hlvalue::Variable(nz.clone()),
+    ));
+    block.borrow_mut().exitswitch = Some(Hlvalue::Variable(nz));
+    block.closeblock(vec![
+        Link::new(continue_args, Some(continue_block), Some(bool_true())).into_ref(),
+        Link::new(exc_args, Some(exceptblock), Some(bool_false())).into_ref(),
+    ]);
+}
+
+fn search_arg_vars(
+    ptr_lltype: &LowLevelType,
+) -> (Variable, Variable, Variable, Variable, Variable) {
+    (
+        variable_with_lltype("s1", ptr_lltype.clone()),
+        variable_with_lltype("s2", ptr_lltype.clone()),
+        variable_with_lltype("start", LowLevelType::Signed),
+        variable_with_lltype("end", LowLevelType::Signed),
+        variable_with_lltype("mode", LowLevelType::Signed),
+    )
+}
+
+fn search_carry(
+    s1: &Variable,
+    s2: &Variable,
+    start: &Variable,
+    end: &Variable,
+    mode: &Variable,
+) -> Vec<Hlvalue> {
+    vec![
+        Hlvalue::Variable(s1.clone()),
+        Hlvalue::Variable(s2.clone()),
+        Hlvalue::Variable(start.clone()),
+        Hlvalue::Variable(end.clone()),
+        Hlvalue::Variable(mode.clone()),
+    ]
 }
 
 /// [`build_ll_search_helper_graph`] against a live rtyper so the
@@ -9854,18 +9919,8 @@ pub(crate) fn build_ll_search_helper_graph_on(
     require_str_ptr(&ptr_lltype, "ll_search")?;
     let kind = crate::rlib::rstring::StringKind::from_ptr(ptr_lltype.clone())?;
 
-    let s1 = variable_with_lltype("s1", ptr_lltype.clone());
-    let s2 = variable_with_lltype("s2", ptr_lltype.clone());
-    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
-    let end_arg = variable_with_lltype("end", LowLevelType::Signed);
-    let mode_arg = variable_with_lltype("mode", LowLevelType::Signed);
-    let startblock = Block::shared(vec![
-        Hlvalue::Variable(s1.clone()),
-        Hlvalue::Variable(s2.clone()),
-        Hlvalue::Variable(start_arg.clone()),
-        Hlvalue::Variable(end_arg.clone()),
-        Hlvalue::Variable(mode_arg.clone()),
-    ]);
+    let (s1, s2, start_arg, end_arg, mode_arg) = search_arg_vars(&ptr_lltype);
+    let startblock = Block::shared(search_carry(&s1, &s2, &start_arg, &end_arg, &mode_arg));
     let return_var = variable_with_lltype("result", LowLevelType::Signed);
     let mut graph = FunctionGraph::with_return_var(
         name.to_string(),
@@ -9873,19 +9928,37 @@ pub(crate) fn build_ll_search_helper_graph_on(
         Hlvalue::Variable(return_var),
     );
 
+    let (s1_other, s2_other, start_other, end_other, mode_other) = search_arg_vars(&ptr_lltype);
+    let block_check_other = Block::shared(search_carry(
+        &s1_other,
+        &s2_other,
+        &start_other,
+        &end_other,
+        &mode_other,
+    ));
+    let (s1_call, s2_call, start_call, end_call, mode_call) = search_arg_vars(&ptr_lltype);
+    let block_search = Block::shared(search_carry(
+        &s1_call,
+        &s2_call,
+        &start_call,
+        &end_call,
+        &mode_call,
+    ));
+
+    let search_args = vec![
+        ptr_lltype.clone(),
+        ptr_lltype.clone(),
+        LowLevelType::Signed,
+        LowLevelType::Signed,
+        LowLevelType::Signed,
+    ];
     let (callee_name, callee_ptr) = if kind.is_unicode() {
         (
             "_search_normal",
             cached_helper_funcptr(
                 rtyper,
                 "_search_normal",
-                vec![
-                    ptr_lltype.clone(),
-                    ptr_lltype.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
+                search_args.clone(),
                 LowLevelType::Signed,
                 {
                     let ptr = ptr_lltype;
@@ -9905,13 +9978,7 @@ pub(crate) fn build_ll_search_helper_graph_on(
             cached_helper_funcptr(
                 rtyper,
                 "_search_elidable",
-                vec![
-                    ptr_lltype.clone(),
-                    ptr_lltype.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
+                search_args,
                 LowLevelType::Signed,
                 {
                     let ptr = ptr_lltype;
@@ -9927,20 +9994,44 @@ pub(crate) fn build_ll_search_helper_graph_on(
         )
     };
     let _ = callee_name;
+
+    // `LLHelpers.ll_search`: after `hlstr` / `hlunicode`,
+    // `assert value is not None` / `assert other is not None`.
+    let exc_args = exception_args("AssertionError")?;
+    close_assert_ptr_not_none(
+        &startblock,
+        &s1,
+        search_carry(&s1, &s2, &start_arg, &end_arg, &mode_arg),
+        block_check_other.clone(),
+        graph.exceptblock.clone(),
+        exc_args.clone(),
+    );
+    close_assert_ptr_not_none(
+        &block_check_other,
+        &s2_other,
+        search_carry(&s1_other, &s2_other, &start_other, &end_other, &mode_other),
+        block_search.clone(),
+        graph.exceptblock.clone(),
+        exc_args,
+    );
+
     let res = variable_with_lltype("res", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            callee_ptr,
-            Hlvalue::Variable(s1),
-            Hlvalue::Variable(s2),
-            Hlvalue::Variable(start_arg),
-            Hlvalue::Variable(end_arg),
-            Hlvalue::Variable(mode_arg),
-        ],
-        Hlvalue::Variable(res.clone()),
-    ));
-    startblock.closeblock(vec![
+    block_search
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                callee_ptr,
+                Hlvalue::Variable(s1_call),
+                Hlvalue::Variable(s2_call),
+                Hlvalue::Variable(start_call),
+                Hlvalue::Variable(end_call),
+                Hlvalue::Variable(mode_call),
+            ],
+            Hlvalue::Variable(res.clone()),
+        ));
+    block_search.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(res)],
             Some(graph.returnblock.clone()),
@@ -15780,36 +15871,158 @@ mod tests {
         );
     }
 
+    fn search_call_block(graph: &FunctionGraph) -> crate::flowspace::model::BlockRef {
+        let check_other = pick_bool_exit(&graph.startblock, true);
+        pick_bool_exit(&check_other, true)
+    }
+
+    fn host_qualname(hlv: &Hlvalue) -> Option<&str> {
+        match hlv {
+            Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(obj),
+                ..
+            }) => Some(obj.qualname()),
+            _ => None,
+        }
+    }
+
     /// `LLHelpers.ll_search` (`rstr.py`) STR arm: `hlstr` is identity,
-    /// `_search` picks `_search_elidable` at translation time.
+    /// `_search` picks `_search_elidable` at translation time. The
+    /// `direct_call` sits after the two `assert … is not None` branches.
     #[test]
     fn build_ll_search_calls_search_elidable_for_str() {
         let helper = build_ll_search_helper_graph("ll_search", STRPTR.clone())
             .expect("build_ll_search_helper_graph for STR");
         let inner = helper.graph.borrow();
-        assert_eq!(opnames(&inner.startblock), vec!["direct_call"]);
-        let startblock = inner.startblock.borrow();
-        let func = funcobj_from_funcptr_constant(&startblock.operations[0].args[0])
+        let call = search_call_block(&inner);
+        assert_eq!(opnames(&call), vec!["direct_call"]);
+        let call_borrow = call.borrow();
+        let func = funcobj_from_funcptr_constant(&call_borrow.operations[0].args[0])
             .expect("_search_elidable funcptr");
         assert_eq!(func._name, "_search_elidable");
         assert!(
             func.graph.is_some(),
             "HighLevelOp.gendirectcall funcptr carries graph"
         );
-        drop(startblock);
+        drop(call_borrow);
         drop(inner);
         let helper = build_ll_search_helper_graph("ll_unicode_search", UNICODEPTR.clone())
             .expect("build_ll_search_helper_graph for UNICODE");
         let inner = helper.graph.borrow();
-        assert_eq!(opnames(&inner.startblock), vec!["direct_call"]);
-        let startblock = inner.startblock.borrow();
-        let func = funcobj_from_funcptr_constant(&startblock.operations[0].args[0])
+        let call = search_call_block(&inner);
+        assert_eq!(opnames(&call), vec!["direct_call"]);
+        let call_borrow = call.borrow();
+        let func = funcobj_from_funcptr_constant(&call_borrow.operations[0].args[0])
             .expect("_search_normal funcptr");
         assert_eq!(func._name, "_search_normal");
         assert!(
             func.graph.is_some(),
             "HighLevelOp.gendirectcall funcptr carries graph"
         );
+    }
+
+    /// `LLHelpers.ll_search`: `assert value is not None` /
+    /// `assert other is not None` lower as two `ptr_nonzero` branches
+    /// whose False arms raise AssertionError.
+    #[test]
+    fn build_ll_search_asserts_converted_strings_not_none() {
+        let helper = build_ll_search_helper_graph("ll_search", STRPTR.clone())
+            .expect("build_ll_search_helper_graph for STR");
+        let inner = helper.graph.borrow();
+        let check_value = inner.startblock.clone();
+        let check_other = pick_bool_exit(&check_value, true);
+        assert_eq!(opnames(&check_value), vec!["ptr_nonzero"]);
+        assert_eq!(opnames(&check_other), vec!["ptr_nonzero"]);
+        let mut assertionerror_exits = 0;
+        for block in [&check_value, &check_other] {
+            let borrowed = block.borrow();
+            let false_link = borrowed
+                .exits
+                .iter()
+                .find(|link| {
+                    matches!(
+                        link.borrow().exitcase,
+                        Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)
+                    )
+                })
+                .expect("null arm of assert");
+            let link = false_link.borrow();
+            let target = link.target.as_ref().expect("exceptblock target");
+            assert!(
+                std::rc::Rc::ptr_eq(target, &inner.exceptblock),
+                "null arm raises via exceptblock"
+            );
+            let class = link
+                .args
+                .first()
+                .and_then(|arg| arg.as_ref())
+                .expect("exception class");
+            assert_eq!(host_qualname(class), Some("AssertionError"));
+            assertionerror_exits += 1;
+        }
+        assert_eq!(assertionerror_exits, 2);
+    }
+
+    /// `lowlevel_helper_function_with_builder` on one rtyper leaves
+    /// every `ll_find` family callee (`ll_search`, `ll_find_char`,
+    /// `_search_elidable`, `_search_normal`) on that same rtyper's
+    /// translator (`RPythonTyper.annotate_helper`).
+    #[test]
+    fn ll_find_family_callees_live_on_same_rtyper_translator() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_find".to_string(),
+                vec![
+                    STRPTR.clone(),
+                    STRPTR.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Signed,
+                |rtyper, _args, _result| {
+                    build_ll_find_helper_graph_on(rtyper, "ll_find", STRPTR.clone())
+                },
+            )
+            .expect("ll_find helper");
+        let py = helper.graph.expect("builder registered the outer graph");
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        fn walk(
+            rtyper: &RPythonTyper,
+            graph: &FunctionGraph,
+            seen: &mut std::collections::HashSet<usize>,
+            names: &mut Vec<String>,
+        ) {
+            for func in direct_call_funcobjs(graph) {
+                let graph_id = func
+                    .graph
+                    .expect("HighLevelOp.gendirectcall funcptr carries graph");
+                names.push(func._name.clone());
+                let callee = graph_ref_for_funcptr_id(rtyper, graph_id).unwrap_or_else(|| {
+                    panic!(
+                        "{} graph id {graph_id} missing from translator.graphs",
+                        func._name
+                    )
+                });
+                if seen.insert(graph_id) {
+                    walk(rtyper, &callee.borrow(), seen, names);
+                }
+            }
+        }
+        walk(&rtyper, &py.graph.borrow(), &mut seen, &mut names);
+        for expected in [
+            "ll_search",
+            "ll_find_char",
+            "_search_elidable",
+            "_search_normal",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected} in {names:?}"
+            );
+        }
     }
 
     /// UNICODE variants substitute `unichar_eq` for the comparison op

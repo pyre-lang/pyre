@@ -50,7 +50,7 @@ use crate::translator::rtyper::lltypesystem::rbytearray::{
 use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
-    build_ll_find_char_helper_graph, build_ll_find_helper_graph, build_ll_int_helper_graph,
+    build_ll_find_char_helper_graph, build_ll_find_helper_graph_on, build_ll_int_helper_graph,
     build_ll_join_chars_helper_graph, build_ll_join_chars_isvirtual_helper_graph,
     build_ll_join_chars_look_inside_iff_helper_graph, build_ll_join_chars_trampoline_helper_graph,
     build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
@@ -2106,7 +2106,12 @@ fn pair_same_string_rtype_contains(
             LowLevelType::Signed,
         ],
         LowLevelType::Signed,
-        move |_rtyper, _args, _result| build_ll_find_helper_graph(&find_name_owned, ptr_for_find),
+        // `RPythonTyper.annotate_helper` annotates helpers with
+        // `self.annotator`, so callee graphs live on this rtyper's
+        // translator (`getannmixlevel` / `cachedgraph`).
+        move |rtyper, _args, _result| {
+            build_ll_find_helper_graph_on(rtyper, &find_name_owned, ptr_for_find)
+        },
     )?;
     let zero = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
     let vres = hop

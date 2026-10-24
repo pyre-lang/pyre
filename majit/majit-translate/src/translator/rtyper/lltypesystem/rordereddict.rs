@@ -7,6 +7,8 @@
 //! lookup/resizing/helper family remains a follow-up line-by-line port.
 #![allow(non_camel_case_types, non_snake_case)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
@@ -18,7 +20,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    Array, GCREF, LowLevelType, Ptr, PtrTarget, Struct,
+    _ptr, Array, GCREF, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct, malloc,
 };
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
@@ -984,6 +986,10 @@ pub struct OrderedDictRepr {
     /// RPython `GcStruct("dicttable", ...)`.
     pub DICT: Struct,
     lowleveltype: LowLevelType,
+    /// `OrderedDictRepr.convert_const` (`rordereddict.py`): cache keyed by
+    /// `id(dictobj)`. Host `dict` is unhashable, so `Constant(dictobj)`
+    /// falls back to identity (`tool.uid.Hashable`).
+    dict_cache: RefCell<HashMap<usize, _ptr>>,
 }
 
 impl OrderedDictRepr {
@@ -1081,6 +1087,7 @@ impl OrderedDictRepr {
             DICTENTRYARRAY: dictentryarray,
             DICT: dict,
             lowleveltype,
+            dict_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -2047,6 +2054,56 @@ impl Repr for OrderedDictRepr {
         self.base.compact_repr()
     }
 
+    /// RPython `OrderedDictRepr.convert_const(self, dictobj)`
+    /// (`rordereddict.py`): `None` → `nullptr(self.DICT)`; a host `dict`
+    /// is `ll_newdict_size` + `ll_no_initial_index` then
+    /// `_ll_dict_insert_no_index` per item, cached by `id(dictobj)`.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        match value {
+            ConstValue::None => {
+                let LowLevelType::Ptr(ptr_t) = &self.lowleveltype else {
+                    return Err(TyperError::message(
+                        "OrderedDictRepr.lowleveltype is not a Ptr",
+                    ));
+                };
+                Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(ptr_t._defl())),
+                    self.lowleveltype.clone(),
+                ))
+            }
+            ConstValue::Dict(items) => {
+                let cache_key = items as *const HashMap<ConstValue, ConstValue> as usize;
+                if let Some(cached) = self.dict_cache.borrow().get(&cache_key) {
+                    return Ok(Constant::with_concretetype(
+                        ConstValue::LLPtr(Box::new(cached.clone())),
+                        self.lowleveltype.clone(),
+                    ));
+                }
+                self.setup()?;
+                self.setup_final()?;
+                if matches!(self.base.key_repr.lowleveltype(), LowLevelType::Address) {
+                    return Err(TyperError::message("No prebuilt dicts of address keys"));
+                }
+                let mut l_dict = ll_newdict_size(&self.DICT, items.len())?;
+                ll_no_initial_index(&mut l_dict)?;
+                self.dict_cache
+                    .borrow_mut()
+                    .insert(cache_key, l_dict.clone());
+                for (dictkey, dictvalue) in items {
+                    let llkey = convert_dict_item_const(self.base.key_repr.as_ref(), dictkey)?;
+                    let llvalue =
+                        convert_dict_item_const(self.base.value_repr.as_ref(), dictvalue)?;
+                    _ll_dict_insert_no_index(&mut l_dict, llkey, llvalue)?;
+                }
+                Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(l_dict)),
+                    self.lowleveltype.clone(),
+                ))
+            }
+            other => Err(TyperError::message(format!("expected a dict: {other:?}"))),
+        }
+    }
+
     /// RPython `OrderedDictRepr.rtype_len(self, hop)`
     /// (`rordereddict.py`): `hop.gendirectcall(ll_dict_len, v_dict)`.
     /// `ll_dict_len(d)` (`rordereddict.py`) returns the
@@ -2670,10 +2727,50 @@ pub(crate) fn build_ll_dict_newdict_helper_graph(
     Ok(helper_pygraph_from_graph(graph, vec![], func))
 }
 
-pub fn ll_newdict_size(_dict: &Struct, _length_estimate: usize) -> Result<(), TyperError> {
-    Err(TyperError::missing_rtype_operation(
-        "lltypesystem.rordereddict.ll_newdict_size — ordered hash table allocation deferred",
-    ))
+/// RPython `ll_newdict_size(DICT, orig_length_estimate)` (`rordereddict.py`).
+/// Host-side (`convert_const`): malloc the DICT struct and the entries
+/// array. `ll_no_initial_index` immediately drops the index, so this
+/// path does not allocate `indexes`. Prebuilt containers are immortal
+/// (`llstr` / `empty` BYTEARRAY).
+pub fn ll_newdict_size(DICT: &Struct, orig_length_estimate: usize) -> Result<_ptr, TyperError> {
+    let length_estimate = (orig_length_estimate / 2) * 3;
+    let mut n = DICT_INITSIZE as usize;
+    while n < length_estimate {
+        n *= 2;
+    }
+    let mut d = malloc(
+        LowLevelType::Struct(Box::new(DICT.clone())),
+        None,
+        MallocFlavor::Gc,
+        true,
+    )
+    .map_err(TyperError::message)?;
+    let entries_ty = DICT
+        .getattr_field_type("entries")
+        .ok_or_else(|| TyperError::message("ll_newdict_size: DICT has no entries field"))?;
+    let LowLevelType::Ptr(entries_ptr_t) = entries_ty else {
+        return Err(TyperError::message(
+            "ll_newdict_size: DICT.entries is not a Ptr",
+        ));
+    };
+    let PtrTarget::Array(array_t) = entries_ptr_t.TO else {
+        return Err(TyperError::message(
+            "ll_newdict_size: DICT.entries.TO is not an Array",
+        ));
+    };
+    let entries = malloc(
+        LowLevelType::Array(Box::new(array_t)),
+        Some(orig_length_estimate),
+        MallocFlavor::Gc,
+        true,
+    )
+    .map_err(TyperError::message)?;
+    d.setattr("entries", LowLevelValue::Ptr(Box::new(entries)))
+        .map_err(TyperError::message)?;
+    set_dict_signed_field(&mut d, "num_live_items", 0)?;
+    set_dict_signed_field(&mut d, "num_ever_used_items", 0)?;
+    set_dict_signed_field(&mut d, "resize_counter", (n as i64) * 2)?;
+    Ok(d)
 }
 
 fn ordered_dict_runtime_deferred(name: &str) -> TyperError {
@@ -2686,8 +2783,20 @@ pub fn get_ll_dict() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("get_ll_dict"))
 }
 
-pub fn ll_no_initial_index() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("ll_no_initial_index"))
+/// RPython `ll_no_initial_index(d)` (`rordereddict.py`):
+/// `lookup_function_no = FUNC_MUST_REINDEX`, `indexes = nullptr(GCREF.TO)`.
+pub fn ll_no_initial_index(d: &mut _ptr) -> Result<(), TyperError> {
+    d.setattr(
+        "lookup_function_no",
+        LowLevelValue::Signed(FUNC_MUST_REINDEX),
+    )
+    .map_err(TyperError::message)?;
+    let LowLevelType::Ptr(gcref_ptr) = &*GCREF else {
+        return Err(TyperError::message("GCREF is not a Ptr"));
+    };
+    d.setattr("indexes", LowLevelValue::Ptr(Box::new(gcref_ptr._defl())))
+        .map_err(TyperError::message)?;
+    Ok(())
 }
 
 pub fn ll_clear_indexes() -> Result<(), TyperError> {
@@ -9621,8 +9730,106 @@ pub fn _ll_dict_rescue() -> Result<(), TyperError> {
     Err(ordered_dict_runtime_deferred("_ll_dict_rescue"))
 }
 
-pub fn _ll_dict_insert_no_index() -> Result<(), TyperError> {
-    Err(ordered_dict_runtime_deferred("_ll_dict_insert_no_index"))
+/// RPython `_ll_dict_insert_no_index(d, key, value)` (`rordereddict.py`):
+/// never translated. Writes `entries[num_ever_used_items]`, sets
+/// `f_valid`, leaves `f_hash` uninitialized, then bumps live/ever-used
+/// and `resize_counter -= 3`.
+pub fn _ll_dict_insert_no_index(
+    d: &mut _ptr,
+    key: LowLevelValue,
+    value: LowLevelValue,
+) -> Result<(), TyperError> {
+    let entries_val = d.getattr("entries").map_err(TyperError::message)?;
+    let LowLevelValue::Ptr(entries) = entries_val else {
+        return Err(TyperError::message(
+            "_ll_dict_insert_no_index: entries is not a pointer",
+        ));
+    };
+    let ever_used = dict_signed_field(d, "num_ever_used_items")?;
+    let entry = entries
+        .getitem(ever_used as usize)
+        .map_err(TyperError::message)?;
+    let set_valid = dict_entry_has_field(d, "f_valid");
+    write_dict_entry_fields(entry, key, value, set_valid)?;
+    set_dict_signed_field(d, "num_ever_used_items", ever_used + 1)?;
+    let live = dict_signed_field(d, "num_live_items")?;
+    set_dict_signed_field(d, "num_live_items", live + 1)?;
+    let rc = dict_signed_field(d, "resize_counter")?;
+    set_dict_signed_field(d, "resize_counter", rc - 3)?;
+    Ok(())
+}
+
+fn convert_dict_item_const(
+    repr: &dyn Repr,
+    value: &ConstValue,
+) -> Result<LowLevelValue, TyperError> {
+    let prepared = match (repr.lowleveltype(), value) {
+        (LowLevelType::Ptr(ptr_t), ConstValue::None) => ConstValue::LLPtr(Box::new(ptr_t._defl())),
+        _ => value.clone(),
+    };
+    let c = repr.convert_const(&prepared)?;
+    crate::translator::rtyper::rclass::constant_to_lowlevel_value(&c)
+}
+
+fn dict_signed_field(d: &_ptr, name: &str) -> Result<i64, TyperError> {
+    match d.getattr(name).map_err(TyperError::message)? {
+        LowLevelValue::Signed(n) => Ok(n),
+        other => Err(TyperError::message(format!(
+            "{name} is not Signed: {other:?}"
+        ))),
+    }
+}
+
+fn set_dict_signed_field(d: &mut _ptr, name: &str, n: i64) -> Result<(), TyperError> {
+    d.setattr(name, LowLevelValue::Signed(n))
+        .map_err(TyperError::message)
+}
+
+fn dict_entry_has_field(d: &_ptr, field: &str) -> bool {
+    let Ok(entries_val) = d.getattr("entries") else {
+        return false;
+    };
+    let LowLevelValue::Ptr(entries) = entries_val else {
+        return false;
+    };
+    match &entries._TYPE.TO {
+        PtrTarget::Array(array_t) => matches!(
+            &array_t.OF,
+            LowLevelType::Struct(s) if s.getattr_field_type(field).is_some()
+        ),
+        _ => false,
+    }
+}
+
+fn write_dict_entry_fields(
+    entry: LowLevelValue,
+    key: LowLevelValue,
+    value: LowLevelValue,
+    set_valid: bool,
+) -> Result<(), TyperError> {
+    match entry {
+        LowLevelValue::InteriorPtr(mut ip) => {
+            ip.setattr("key", key).map_err(TyperError::message)?;
+            ip.setattr("value", value).map_err(TyperError::message)?;
+            if set_valid {
+                ip.setattr("f_valid", LowLevelValue::Bool(true))
+                    .map_err(TyperError::message)?;
+            }
+            Ok(())
+        }
+        LowLevelValue::Ptr(mut p) => {
+            p.setattr("key", key).map_err(TyperError::message)?;
+            p.setattr("value", value).map_err(TyperError::message)?;
+            if set_valid {
+                p.setattr("f_valid", LowLevelValue::Bool(true))
+                    .map_err(TyperError::message)?;
+            }
+            Ok(())
+        }
+        other => Err(TyperError::message(format!(
+            "dict entry is not a struct pointer: {other:?}"
+        ))),
+    }
 }
 
 pub fn ll_len_of_d_indexes() -> Result<(), TyperError> {
@@ -13599,5 +13806,167 @@ mod tests {
         .expect("arraycopy without f_hash");
         let inner = arraycopy.graph.borrow();
         assert!(!graph_mentions_field(&inner.startblock, "f_hash"));
+    }
+
+    fn as_dict_ptr(c: &Constant) -> &_ptr {
+        match &c.value {
+            ConstValue::LLPtr(ptr) => ptr,
+            other => panic!("convert_const must yield LLPtr, got {other:?}"),
+        }
+    }
+
+    fn signed_ccharp_ordered_dict_repr() -> OrderedDictRepr {
+        use crate::translator::rtyper::lltypesystem::lltype::SomePtr;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let ccharp_ptr = match &*CCHARP {
+            LowLevelType::Ptr(ptr) => (**ptr).clone(),
+            other => panic!("CCHARP is not a Ptr: {other:?}"),
+        };
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Ptr(SomePtr::new(ccharp_ptr.clone())),
+            false,
+            false,
+            false,
+        );
+        OrderedDictRepr::new(
+            rtyper,
+            signed_repr() as Arc<dyn Repr>,
+            Arc::new(PtrRepr::new(ccharp_ptr)) as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("signed CCHARP ordered dict repr")
+    }
+
+    /// `OrderedDictRepr.convert_const(Dict({}))` (`rordereddict.py`):
+    /// immortal `ll_newdict_size(DICT, 0)` + `ll_no_initial_index`.
+    #[test]
+    fn convert_const_empty_dict_is_immortal_dicttable_ptr() {
+        let repr = sample_ordered_dict_repr();
+        let c = repr
+            .convert_const(&ConstValue::Dict(Default::default()))
+            .expect("empty dict convert_const");
+        let ptr = as_dict_ptr(&c);
+        assert!(ptr._solid, "prebuilt dict is immortal");
+        match &ptr._TYPE.TO {
+            PtrTarget::Struct(s) => assert_eq!(s._name, "dicttable"),
+            other => panic!("DICT pointer must target dicttable, got {other:?}"),
+        }
+        assert_eq!(
+            dict_signed_field(ptr, "num_live_items").expect("num_live_items"),
+            0
+        );
+        assert_eq!(
+            dict_signed_field(ptr, "num_ever_used_items").expect("num_ever_used_items"),
+            0
+        );
+        assert_eq!(
+            dict_signed_field(ptr, "lookup_function_no").expect("lookup_function_no"),
+            FUNC_MUST_REINDEX
+        );
+        let entries = ptr.getattr("entries").expect("entries");
+        let LowLevelValue::Ptr(entries) = entries else {
+            panic!("entries must be a pointer, got {entries:?}");
+        };
+        assert_eq!(entries.len().expect("entries length"), 0);
+        let indexes = ptr.getattr("indexes").expect("indexes");
+        let LowLevelValue::Ptr(indexes) = indexes else {
+            panic!("indexes must be a pointer, got {indexes:?}");
+        };
+        assert!(
+            matches!(indexes._obj0_value(), Ok(None)),
+            "ll_no_initial_index leaves indexes null"
+        );
+        let none = repr.convert_const(&ConstValue::None).expect("None");
+        let none_ptr = as_dict_ptr(&none);
+        assert!(
+            matches!(none_ptr._obj0_value(), Ok(None)),
+            "None converts to nullptr(DICT)"
+        );
+    }
+
+    /// Small `{int: CCHARP-null}` prebuilt: one `_ll_dict_insert_no_index`.
+    #[test]
+    fn convert_const_int_to_ccharp_null_inserts_one_entry() {
+        use std::collections::HashMap;
+        let repr = signed_ccharp_ordered_dict_repr();
+        let mut items = HashMap::new();
+        items.insert(ConstValue::Int(7), ConstValue::None);
+        let c = repr
+            .convert_const(&ConstValue::Dict(items))
+            .expect("non-empty dict convert_const");
+        let ptr = as_dict_ptr(&c);
+        assert!(ptr._solid, "prebuilt dict is immortal");
+        assert_eq!(
+            dict_signed_field(ptr, "num_live_items").expect("num_live_items"),
+            1
+        );
+        let entries = ptr.getattr("entries").expect("entries");
+        let LowLevelValue::Ptr(entries) = entries else {
+            panic!("entries must be a pointer, got {entries:?}");
+        };
+        assert_eq!(entries.len().expect("entries length"), 1);
+        let entry = entries.getitem(0).expect("entries[0]");
+        let (key, value, valid) = match entry {
+            LowLevelValue::InteriorPtr(ip) => (
+                ip.getattr("key").expect("key"),
+                ip.getattr("value").expect("value"),
+                ip.getattr("f_valid").expect("f_valid"),
+            ),
+            LowLevelValue::Ptr(p) => (
+                p.getattr("key").expect("key"),
+                p.getattr("value").expect("value"),
+                p.getattr("f_valid").expect("f_valid"),
+            ),
+            other => panic!("entry must be a struct pointer, got {other:?}"),
+        };
+        assert!(
+            matches!(key, LowLevelValue::Signed(7)),
+            "key must be 7, got {key:?}"
+        );
+        let LowLevelValue::Ptr(value_ptr) = value else {
+            panic!("CCHARP value must be a pointer, got {value:?}");
+        };
+        assert!(
+            matches!(value_ptr._obj0_value(), Ok(None)),
+            "CCHARP-null value"
+        );
+        assert!(
+            matches!(valid, LowLevelValue::Bool(true)),
+            "f_valid must be True, got {valid:?}"
+        );
+    }
+
+    /// `dict_cache` keys by `id(dictobj)`: the same host dict object
+    /// reuses the prebuilt pointer; a distinct empty dict does not.
+    #[test]
+    fn convert_const_caches_by_host_dict_identity() {
+        let repr = sample_ordered_dict_repr();
+        let host = ConstValue::Dict(Default::default());
+        let c1 = repr.convert_const(&host).expect("first");
+        let c2 = repr.convert_const(&host).expect("second");
+        let p1 = as_dict_ptr(&c1);
+        let p2 = as_dict_ptr(&c2);
+        assert_eq!(
+            p1._hashable_identity(),
+            p2._hashable_identity(),
+            "same host dict identity shares the prebuilt pointer"
+        );
+        let other = ConstValue::Dict(Default::default());
+        let c3 = repr.convert_const(&other).expect("other");
+        let p3 = as_dict_ptr(&c3);
+        assert_ne!(
+            p1._hashable_identity(),
+            p3._hashable_identity(),
+            "a distinct host dict mints a fresh prebuilt pointer"
+        );
     }
 }

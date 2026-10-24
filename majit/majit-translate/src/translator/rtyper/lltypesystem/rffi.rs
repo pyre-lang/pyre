@@ -9,24 +9,32 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::rc::Rc;
+use std::sync::{Arc, LazyLock};
 
+use crate::annotator::annrpython::RPythonAnnotator;
+use crate::annotator::dictdef::DictDef;
+use crate::annotator::model::{SomeInteger, SomeValue};
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
-    SpaceOperation, Variable,
+    SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, Array, FixedSizeArray, FuncType, LowLevelType, LowLevelValue, MallocFlavor, OpaqueType,
-    Ptr, PtrTarget, Struct, functionptr_with_external_name, malloc, typeOf,
+    _ptr, Array, FixedSizeArray, FuncType, GCREF, LowLevelType, LowLevelValue, MallocFlavor,
+    OpaqueType, Ptr, PtrTarget, SomePtr, Struct, functionptr_with_external_name, malloc, typeOf,
 };
+use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
 use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, chars_array_ptr_lltype_from_strptr, struct_lltype_from_strptr,
 };
+use crate::translator::rtyper::rint::signed_repr;
+use crate::translator::rtyper::rmodel::{PtrRepr, Repr, lowlevel_type_const};
 use crate::translator::rtyper::rtyper::{
-    constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
+    HighLevelOp, RPythonTyper, constant_with_lltype, exception_args, helper_pygraph_from_graph,
+    variable_with_lltype,
 };
 
 pub use majit_jitcode::rffi::{
@@ -779,6 +787,465 @@ pub(crate) fn build_ll_get_raw_address_of_string_helper_graph(
     ))
 }
 
+fn funcptr_const(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> Hlvalue {
+    let ptr =
+        functionptr_with_external_name(FuncType { args, result }, name, Some(name.to_string()));
+    let lltype = LowLevelType::Ptr(Box::new(typeOf(&ptr)));
+    constant_with_lltype(ConstValue::LLPtr(Box::new(ptr)), lltype)
+}
+
+fn ccharp_array_lltype() -> Result<LowLevelType, TyperError> {
+    match &*CCHARP {
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) => Ok(LowLevelType::Array(Box::new(arr.clone()))),
+            other => Err(TyperError::message(format!(
+                "CCHARP.TO is not Array: {other:?}"
+            ))),
+        },
+        other => Err(TyperError::message(format!(
+            "CCHARP is not a Ptr: {other:?}"
+        ))),
+    }
+}
+
+fn raw_flavor_no_track_const() -> Result<Hlvalue, TyperError> {
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
+    let flags = HashMap::from([
+        (ConstValue::byte_str("flavor"), ConstValue::byte_str("raw")),
+        (
+            ConstValue::byte_str("track_allocation"),
+            ConstValue::Bool(false),
+        ),
+    ]);
+    HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags)).map(Hlvalue::Constant)
+}
+
+fn signed_ccharp_dict_repr(rtyper: Rc<RPythonTyper>) -> Result<OrderedDictRepr, TyperError> {
+    let ccharp_ptr = match &*CCHARP {
+        LowLevelType::Ptr(ptr) => (**ptr).clone(),
+        other => {
+            return Err(TyperError::message(format!(
+                "CCHARP is not a Ptr: {other:?}"
+            )));
+        }
+    };
+    let dictdef = DictDef::new(
+        None,
+        SomeValue::Integer(SomeInteger::default()),
+        SomeValue::Ptr(SomePtr::new(ccharp_ptr.clone())),
+        false,
+        false,
+        false,
+    );
+    OrderedDictRepr::new(
+        rtyper,
+        signed_repr() as Arc<dyn Repr>,
+        Arc::new(PtrRepr::new(ccharp_ptr)) as Arc<dyn Repr>,
+        dictdef,
+        None,
+        false,
+        false,
+    )
+}
+
+/// Convert `_fq_addr_from_string.raw_copies` (`rffi.py`) to the rtyped
+/// `{Signed: CCHARP}` dict constant. `OrderedDictRepr.convert_const` of a
+/// host `Dict` is the rtyper path (`rordereddict.py convert_const`); an
+/// empty table is the immortal `ll_newdict_size(DICT, 0)` /
+/// `ll_no_initial_index` container.
+fn convert_fq_raw_copies_const(repr: &OrderedDictRepr) -> Result<Hlvalue, TyperError> {
+    let host = {
+        let fq = _fq_addr_from_string.lock();
+        let mut items = HashMap::new();
+        for (k, _) in fq.raw_copies.iter() {
+            items.insert(ConstValue::Int(*k as i64), ConstValue::None);
+        }
+        ConstValue::Dict(items)
+    };
+    Ok(Hlvalue::Constant(repr.convert_const(&host)?))
+}
+
+/// Synthesise `str2charp(s, track_allocation=False)` (`rffi.py`):
+///
+/// ```python
+/// array = lltype.malloc(CCHARP.TO, len(s) + 1, flavor='raw',
+///                       track_allocation=False)
+/// i = len(s)
+/// copy_string_to_raw(llstr(s), array, 0, i)
+/// array[i] = '\x00'
+/// return array
+/// ```
+///
+/// `copy_string_to_raw` (`rstr.py`) with `must_split_gc_address_space`
+/// is the character copy loop; MiniMark is False so upstream uses
+/// `raw_memcopy`, but the loop is the same observable store sequence.
+fn build_str2charp_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
+    let chars_ptr_ty = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
+    let array_ty = ccharp_array_lltype()?;
+    let raw_flags = raw_flavor_no_track_const()?;
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let push = |block: &BlockRef, op: &str, args: Vec<Hlvalue>, result: Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            op,
+            args,
+            Hlvalue::Variable(result),
+        ));
+    };
+
+    let s = variable_with_lltype("s", STRPTR.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(s.clone())]);
+    let return_var = variable_with_lltype("result", (*CCHARP).clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let chars = variable_with_lltype("chars", chars_ptr_ty.clone());
+    push(
+        &startblock,
+        "getsubstruct",
+        vec![
+            Hlvalue::Variable(s),
+            constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void),
+        ],
+        chars.clone(),
+    );
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    push(
+        &startblock,
+        "getarraysize",
+        vec![Hlvalue::Variable(chars.clone())],
+        length.clone(),
+    );
+    let size = variable_with_lltype("size", LowLevelType::Signed);
+    push(
+        &startblock,
+        "int_add",
+        vec![Hlvalue::Variable(length.clone()), signed_const(1)],
+        size.clone(),
+    );
+    let array = variable_with_lltype("array", (*CCHARP).clone());
+    push(
+        &startblock,
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(array_ty),
+            raw_flags,
+            Hlvalue::Variable(size),
+        ],
+        array.clone(),
+    );
+
+    let chars_cond = variable_with_lltype("chars", chars_ptr_ty.clone());
+    let array_cond = variable_with_lltype("array", (*CCHARP).clone());
+    let length_cond = variable_with_lltype("length", LowLevelType::Signed);
+    let i_cond = variable_with_lltype("i", LowLevelType::Signed);
+    let loop_cond = Block::shared(vec![
+        Hlvalue::Variable(chars_cond.clone()),
+        Hlvalue::Variable(array_cond.clone()),
+        Hlvalue::Variable(length_cond.clone()),
+        Hlvalue::Variable(i_cond.clone()),
+    ]);
+
+    let chars_body = variable_with_lltype("chars", chars_ptr_ty);
+    let array_body = variable_with_lltype("array", (*CCHARP).clone());
+    let length_body = variable_with_lltype("length", LowLevelType::Signed);
+    let i_body = variable_with_lltype("i", LowLevelType::Signed);
+    let loop_body = Block::shared(vec![
+        Hlvalue::Variable(chars_body.clone()),
+        Hlvalue::Variable(array_body.clone()),
+        Hlvalue::Variable(length_body.clone()),
+        Hlvalue::Variable(i_body.clone()),
+    ]);
+
+    let array_after = variable_with_lltype("array", (*CCHARP).clone());
+    let length_after = variable_with_lltype("length", LowLevelType::Signed);
+    let after = Block::shared(vec![
+        Hlvalue::Variable(array_after.clone()),
+        Hlvalue::Variable(length_after.clone()),
+    ]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(chars),
+                Hlvalue::Variable(array),
+                Hlvalue::Variable(length),
+                signed_const(0),
+            ],
+            Some(loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let still = variable_with_lltype("still", LowLevelType::Bool);
+    push(
+        &loop_cond,
+        "int_lt",
+        vec![
+            Hlvalue::Variable(i_cond.clone()),
+            Hlvalue::Variable(length_cond.clone()),
+        ],
+        still.clone(),
+    );
+    loop_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(still));
+    loop_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(chars_cond.clone()),
+                Hlvalue::Variable(array_cond.clone()),
+                Hlvalue::Variable(length_cond.clone()),
+                Hlvalue::Variable(i_cond.clone()),
+            ],
+            Some(loop_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(array_cond),
+                Hlvalue::Variable(length_cond),
+            ],
+            Some(after.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let ch = variable_with_lltype("ch", LowLevelType::Char);
+    push(
+        &loop_body,
+        "getarrayitem",
+        vec![
+            Hlvalue::Variable(chars_body.clone()),
+            Hlvalue::Variable(i_body.clone()),
+        ],
+        ch.clone(),
+    );
+    let set_ch = variable_with_lltype("set_ch", LowLevelType::Void);
+    push(
+        &loop_body,
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(array_body.clone()),
+            Hlvalue::Variable(i_body.clone()),
+            Hlvalue::Variable(ch),
+        ],
+        set_ch,
+    );
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    push(
+        &loop_body,
+        "int_add",
+        vec![Hlvalue::Variable(i_body), signed_const(1)],
+        i_next.clone(),
+    );
+    loop_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(chars_body),
+                Hlvalue::Variable(array_body),
+                Hlvalue::Variable(length_body),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(loop_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let set_nul = variable_with_lltype("set_nul", LowLevelType::Void);
+    push(
+        &after,
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(array_after.clone()),
+            Hlvalue::Variable(length_after),
+            constant_with_lltype(ConstValue::ByteStr(vec![0]), LowLevelType::Char),
+        ],
+        set_nul,
+    );
+    after.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(array_after)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["s".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `_get_raw_address_buf_from_string` (`rffi.py`):
+///
+/// ```python
+/// key = objectmodel.compute_unique_id(string)
+/// try:
+///     ptr = _fq_addr_from_string.raw_copies[key]
+/// except KeyError:
+///     ptr = str2charp(string, track_allocation=False)
+///     _fq_addr_from_string.raw_copies[key] = ptr
+///     ll_string = llstr(string)
+///     gcptr = lltype.cast_opaque_ptr(llmemory.GCREF, ll_string)
+///     _fq_addr_from_string.register_finalizer(gcptr)
+/// return ptr
+/// ```
+///
+/// `compute_unique_id` is llop `gc_id`. The dict getitem is
+/// `ll_dict_getitem` with the `c_last_exception` KeyError catch
+/// `rtype_getitem` records (`has_implicit_exception(KeyError)` /
+/// `exception_is_here`). `register_finalizer` is llop `gc_fq_register`
+/// (`rgc.py FinalizerQueue.register_finalizer`); the tag is the Signed
+/// constant `FqTagEntry.specialize_call` yields.
+pub(crate) fn build_get_raw_address_buf_from_string_helper_graph(
+    name: &str,
+) -> Result<PyGraph, TyperError> {
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let rtyper = Rc::new(RPythonTyper::new(&ann));
+    rtyper.initialize_exceptiondata()?;
+    let repr = signed_ccharp_dict_repr(Rc::clone(&rtyper))?;
+    let raw_copies = convert_fq_raw_copies_const(&repr)?;
+    let dict_lltype = repr.lowleveltype().clone();
+    let getitem = funcptr_const(
+        "ll_dict_getitem",
+        vec![dict_lltype.clone(), LowLevelType::Signed],
+        (*CCHARP).clone(),
+    );
+    let setitem = funcptr_const(
+        "ll_dict_setitem",
+        vec![dict_lltype, LowLevelType::Signed, (*CCHARP).clone()],
+        LowLevelType::Void,
+    );
+    let _str2charp_graph = build_str2charp_helper_graph("str2charp")?;
+    let str2charp = funcptr_const("str2charp", vec![STRPTR.clone()], (*CCHARP).clone());
+    let keyerror = exception_args("KeyError")?;
+    let fq_tag = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+
+    let push = |block: &BlockRef, op: &str, args: Vec<Hlvalue>, result: Variable| {
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            op,
+            args,
+            Hlvalue::Variable(result),
+        ));
+    };
+
+    let s = variable_with_lltype("s", STRPTR.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(s.clone())]);
+    let return_var = variable_with_lltype("result", (*CCHARP).clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let s_miss = variable_with_lltype("s", STRPTR.clone());
+    let key_miss = variable_with_lltype("key", LowLevelType::Signed);
+    let missblock = Block::shared(vec![
+        Hlvalue::Variable(s_miss.clone()),
+        Hlvalue::Variable(key_miss.clone()),
+    ]);
+
+    let key = variable_with_lltype("key", LowLevelType::Signed);
+    push(
+        &startblock,
+        "gc_id",
+        vec![Hlvalue::Variable(s.clone())],
+        key.clone(),
+    );
+    let ptr_hit = variable_with_lltype("ptr", (*CCHARP).clone());
+    push(
+        &startblock,
+        "direct_call",
+        vec![getitem, raw_copies.clone(), Hlvalue::Variable(key.clone())],
+        ptr_hit.clone(),
+    );
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
+    let hit_link = Link::new(
+        vec![Hlvalue::Variable(ptr_hit)],
+        Some(graph.returnblock.clone()),
+        None,
+    )
+    .into_ref();
+    let mut miss_link = Link::new(
+        vec![Hlvalue::Variable(s), Hlvalue::Variable(key)],
+        Some(missblock.clone()),
+        Some(keyerror[0].clone()),
+    );
+    miss_link.extravars(Some(keyerror[0].clone()), Some(keyerror[1].clone()));
+    startblock.closeblock(vec![hit_link, miss_link.into_ref()]);
+
+    let ptr_miss = variable_with_lltype("ptr", (*CCHARP).clone());
+    push(
+        &missblock,
+        "direct_call",
+        vec![str2charp, Hlvalue::Variable(s_miss.clone())],
+        ptr_miss.clone(),
+    );
+    let set_void = variable_with_lltype("v", LowLevelType::Void);
+    push(
+        &missblock,
+        "direct_call",
+        vec![
+            setitem,
+            raw_copies,
+            Hlvalue::Variable(key_miss),
+            Hlvalue::Variable(ptr_miss.clone()),
+        ],
+        set_void,
+    );
+    let gcptr = variable_with_lltype("gcptr", (*GCREF).clone());
+    push(
+        &missblock,
+        "cast_opaque_ptr",
+        vec![Hlvalue::Variable(s_miss)],
+        gcptr.clone(),
+    );
+    let fq_void = variable_with_lltype("v", LowLevelType::Void);
+    push(
+        &missblock,
+        "gc_fq_register",
+        vec![fq_tag, Hlvalue::Variable(gcptr)],
+        fq_void,
+    );
+    missblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(ptr_miss)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    let _keep_ann = ann;
+    let _keep_rtyper = rtyper;
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["s".to_string()],
+        func,
+    ))
+}
+
 /// RPython `_StrFinalizerQueue(rgc.FinalizerQueue)` (`rffi.py`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct _StrFinalizerQueue {
@@ -1156,5 +1623,78 @@ mod tests {
         };
         assert_eq!(func_t.args, vec![LowLevelType::Signed]);
         assert_eq!(func_t.result, LowLevelType::Void);
+    }
+
+    #[test]
+    fn build_get_raw_address_buf_from_string_emits_cache_and_finalizer_ops() {
+        let helper =
+            build_get_raw_address_buf_from_string_helper_graph("_get_raw_address_buf_from_string")
+                .expect("build_get_raw_address_buf_from_string_helper_graph");
+        assert_eq!(helper.func.name, "_get_raw_address_buf_from_string");
+        assert_eq!(helper.func._jit_look_inside_, None);
+        let inner = helper.graph.borrow();
+        let mut opnames = Vec::new();
+        let mut saw_getitem_keyerror = false;
+        for block in inner.iterblocks() {
+            let block = block.borrow();
+            for op in &block.operations {
+                opnames.push(op.opname.clone());
+                if op.opname == "direct_call" {
+                    let callee = match &op.args[0] {
+                        Hlvalue::Constant(c) => format!("{:?}", c.value),
+                        other => format!("{other:?}"),
+                    };
+                    if callee.contains("ll_dict_getitem") && block.canraise() {
+                        saw_getitem_keyerror = block.exits.iter().any(|link| {
+                            matches!(
+                                &link.borrow().exitcase,
+                                Some(Hlvalue::Constant(c))
+                                    if format!("{:?}", c.value).contains("KeyError")
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        assert!(
+            opnames.iter().any(|n| n == "gc_id"),
+            "gc_id (compute_unique_id): {opnames:?}"
+        );
+        assert!(
+            opnames.iter().any(|n| n == "gc_fq_register"),
+            "gc_fq_register: {opnames:?}"
+        );
+        assert!(
+            saw_getitem_keyerror,
+            "ll_dict_getitem direct_call with KeyError exit: {opnames:?}"
+        );
+        assert!(
+            opnames.iter().any(|n| n == "direct_call"),
+            "str2charp / dict helpers are direct_call: {opnames:?}"
+        );
+        let saw_str2charp = inner.iterblocks().iter().any(|block| {
+            block.borrow().operations.iter().any(|op| {
+                op.opname == "direct_call"
+                    && matches!(
+                        &op.args[0],
+                        Hlvalue::Constant(c) if format!("{:?}", c.value).contains("str2charp")
+                    )
+            })
+        });
+        assert!(saw_str2charp, "direct_call str2charp: {opnames:?}");
+        let saw_setitem = inner.iterblocks().iter().any(|block| {
+            block.borrow().operations.iter().any(|op| {
+                op.opname == "direct_call"
+                    && matches!(
+                        &op.args[0],
+                        Hlvalue::Constant(c) if format!("{:?}", c.value).contains("ll_dict_setitem")
+                    )
+            })
+        });
+        assert!(saw_setitem, "direct_call ll_dict_setitem: {opnames:?}");
+        assert!(
+            opnames.iter().any(|n| n == "cast_opaque_ptr"),
+            "cast_opaque_ptr(GCREF, llstr): {opnames:?}"
+        );
     }
 }
