@@ -1444,6 +1444,25 @@ fn is_python_exception(error: &mut pyre_interpreter::PyError) -> bool {
     error_matches_class(error, "Exception")
 }
 
+fn is_callback_ignored_error(error: &mut pyre_interpreter::PyError) -> bool {
+    is_python_exception(error)
+        || error_matches_class(error, "SystemExit")
+        || error.kind == pyre_interpreter::PyErrorKind::SystemExit
+}
+
+fn write_callback_unraisable(
+    error: &mut pyre_interpreter::PyError,
+    where_desc: &rustpython_wtf8::Wtf8,
+) {
+    error.write_unraisable_with_traceback(
+        pyre_object::w_none(),
+        where_desc,
+        pyre_object::PY_NULL,
+        true,
+        rustpython_wtf8::Wtf8::new(""),
+    );
+}
+
 fn callback_error_type_name(error: &pyre_interpreter::PyError) -> String {
     if !error.w_type.is_null() && unsafe { pyre_object::is_type(error.w_type) } {
         return unsafe { pyre_object::w_type_get_name(error.w_type) }.to_string();
@@ -1469,13 +1488,13 @@ fn wrap_callback_argument_error(
     mut error: pyre_interpreter::PyError,
 ) -> pyre_interpreter::PyError {
     // [3.15-spec] measured python3.15t (v3.15.1, free-threaded): callback
-    // from_param raising KeyError -> ArgumentError wrapping it; __context__
-    // is None.  `_ctypes_callproc` calls `_ctypes_extend_error` for any
-    // failure (`v3.15.1` `Modules/_ctypes/callproc.c` `_ctypes_callproc` /
-    // `_ctypes_extend_error`).  Message is "argument {i}: " + PyType_GetName
-    // + ": " + str(exc), or "???" if str(exc) raises.  PyPy CFuncPtr.__call__
-    // catches (UnicodeError, TypeError, ValueError) and raises
-    // ArgumentError(str(e)).
+    // from_param raising KeyError -> ArgumentError wrapping it; `__context__`
+    // is None. `_ctypes_callproc` wraps a conversion failure with
+    // `_ctypes_extend_error`: "argument {i}: " + type name + ": " + str(exc),
+    // or "???" if str(exc) raises; `__context__` is unset
+    // (`set_context_recorded`).  `CFuncPtr.__call__` catches
+    // `(UnicodeError, TypeError, ValueError)` and raises `ArgumentError(str(e))`.
+    // Evidence: v3.15.1 `Modules/_ctypes/callproc.c` `_ctypes_extend_error`.
     let msg = {
         let roots = pyre_object::gc_roots::push_roots();
         let error_slot = error.pin(&roots);
@@ -1500,16 +1519,26 @@ fn wrap_callback_argument_error(
 
 fn copy_struct_or_union(param: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // CFuncPtr._convert_args_for_callback: `StructOrUnion.__new__(type(param))`
-    // then `param._copy_to(newparam._buffer.buffer)`.
+    // then `param._copy_to(newparam._buffer.buffer)`.  Base `__new__` only:
+    // a subclass `__new__` / `__init__` is not run.
     let _roots = pyre_object::gc_roots::push_roots();
     let param_slot = pyre_object::gc_roots::pin_roots(&[param]);
     let cls = unsafe {
         pyre_object::w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(param_slot))
     };
     let cls_slot = pyre_object::gc_roots::pin_roots(&[cls]);
-    let bytes = cdata::cdata_buffer_copy(pyre_object::gc_roots::shadow_stack_get(param_slot))
-        .unwrap_or_default();
-    make_aggregate_instance(pyre_object::gc_roots::shadow_stack_get(cls_slot), &bytes)
+    let newparam =
+        super::metaclass::struct_or_union_new(pyre_object::gc_roots::shadow_stack_get(cls_slot))?;
+    let new_slot = pyre_object::gc_roots::pin_roots(&[newparam]);
+    let addr = cdata::cdata_addr(pyre_object::gc_roots::shadow_stack_get(new_slot))
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("ctypes instance has no buffer"))?;
+    let addr_slot = pyre_object::gc_roots::pin_roots(&[pyre_object::w_int_new(addr as i64)]);
+    pyre_interpreter::baseobjspace::call_method_result(
+        pyre_object::gc_roots::shadow_stack_get(param_slot),
+        "_copy_to",
+        &[pyre_object::gc_roots::shadow_stack_get(addr_slot)],
+    )?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(new_slot))
 }
 
 fn convert_one_callback_arg_inner(
@@ -1525,15 +1554,18 @@ fn convert_one_callback_arg_inner(
     )?;
     let param_slot = pyre_object::gc_roots::pin_roots(&[param]);
     // [3.15-spec] measured python3.15t (v3.15.1, free-threaded):
-    // type(c_int.from_param(5)).__name__ -> 'CArgObject'.  PyPy
-    // CFuncPtr._convert_args_for_callback receives the c_int instance, so the
-    // callback path unwraps it before _convert_args_for_callback's branches.
+    // type(c_int.from_param(5)).__name__ -> 'CArgObject'.
+    // `SimpleType.from_param` returns a same-typed instance; a converted
+    // value is a `CArgObject`.  Unwrap the carrier before the branches
+    // `CFuncPtr._convert_args_for_callback` runs on `param`.
     let cdata = unwrap_simple_param(pyre_object::gc_roots::shadow_stack_get(param_slot));
     let cdata_slot = pyre_object::gc_roots::pin_roots(&[cdata]);
     if argtype_is_void_p(pyre_object::gc_roots::shadow_stack_get(base)) {
         // CFuncPtr._convert_args_for_callback: `_type_ == 'P'` passes
-        // `param._get_buffer_value()` (the pointer word).  A null word is int 0
-        // there; `P_get` answers None, which is the 3.15 observable.
+        // `param._get_buffer_value()` (the pointer word).  A null word is
+        // int 0 there.
+        // [3.15-spec] `P_get` answers None for a null pointer.
+        // Evidence: v3.15.1 `Modules/_ctypes/cfield.c` `P_get`.
         let bytes = cdata::cdata_buffer_copy(pyre_object::gc_roots::shadow_stack_get(cdata_slot))
             .unwrap_or_default();
         return Ok(cdata::decode_slot("P", &bytes));
@@ -1560,10 +1592,10 @@ fn convert_one_callback_arg(
         Err(mut error) => {
             // [3.15-spec] measured python3.15t (v3.15.1, free-threaded):
             // callback from_param raising KeyError -> ArgumentError wrapping
-            // it.  `_ctypes_callproc` calls `_ctypes_extend_error` for any
-            // failure (`v3.15.1` `Modules/_ctypes/callproc.c`
-            // `_ctypes_callproc` / `_ctypes_extend_error`).  PyPy
-            // CFuncPtr.__call__ catches (UnicodeError, TypeError, ValueError).
+            // it. `_ctypes_callproc` wraps any conversion `Exception`
+            // with `_ctypes_extend_error`.  `CFuncPtr.__call__` catches
+            // `(UnicodeError, TypeError, ValueError)`.
+            // Evidence: v3.15.1 `Modules/_ctypes/callproc.c` `_ctypes_extend_error`.
             if is_python_exception(&mut error) {
                 Err(wrap_callback_argument_error(index + 1, error))
             } else {
@@ -1601,7 +1633,8 @@ fn convert_python_callback_result(
     {
         return Ok(pyre_object::gc_roots::shadow_stack_get(base + 1));
     }
-    let converted = match pyre_interpreter::call::type_call_instantiate(
+    // CFuncPtr.__call__: `self._restype_(res).value`.
+    let converted = match pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(restype_slot),
         &[pyre_object::gc_roots::shadow_stack_get(base + 1)],
     ) {
@@ -1644,55 +1677,32 @@ fn ignore_result_conversion_error(
     mut error: pyre_interpreter::PyError,
     callable: PyObjectRef,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    if !is_python_exception(&mut error) {
+    if !is_callback_ignored_error(&mut error) {
         return Err(error);
     }
     // [3.15-spec] restype conversion failure is unraisable
     // (`test_callbacks.Callbacks.test_convert_result_error`); the value
-    // follows PyPy `CFuncPtr.__call__` (bare return). `err_msg` is the
-    // `PyErr_FormatUnraisable` text from `_CallPythonObject`, reported
-    // verbatim (`write_unraisable_first_line`, the cpyext
-    // `format_unraisable_v` sibling). PyPy `function.py` uses
-    // `__pypy__.write_unraisable("on converting result of ctypes callback
-    // function", e, self.callable)` (`interp_magic.write_unraisable`
-    // `with_traceback=True`), which prefixes `"Exception ignored "` onto
-    // that where-string and names the callable as `object`.
+    // follows PyPy `CFuncPtr.__call__` (bare return). The where-string
+    // goes through `write_callback_unraisable` ->
+    // `write_unraisable_with_traceback(.., true, ..)`, i.e.
+    // `interp_magic.write_unraisable`, which prefixes `"Exception ignored "`;
+    // the object is None (3.15: `PyErr_FormatUnraisable` in
+    // `_CallPythonObject`) where PyPy passes `self.callable`. PyPy
+    // `function.py` uses `__pypy__.write_unraisable("on converting result of
+    // ctypes callback function", e, self.callable)`
+    // (`interp_magic.write_unraisable` `with_traceback=True`).
     let roots = pyre_object::gc_roots::push_roots();
     let error_slot = error.pin(&roots);
     let rendered = callback_callable_repr(callable);
     error.reload(&roots, error_slot);
-    error.write_unraisable_first_line(
-        pyre_object::w_none(),
-        Some(pyre_interpreter::display::wtf8_format!(
-            "Exception ignored while converting result of ctypes callback function ",
+    write_callback_unraisable(
+        &mut error,
+        &pyre_interpreter::display::wtf8_format!(
+            "while converting result of ctypes callback function ",
             rendered
-        )),
-        pyre_object::PY_NULL,
-        rustpython_wtf8::Wtf8::new(""),
+        ),
     );
     Ok(pyre_object::w_none())
-}
-
-fn handle_python_callback_system_exit(
-    mut error: pyre_interpreter::PyError,
-) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    // CFuncPtr.__call__ `except SystemExit` + `handle_system_exit`.
-    if pyre_interpreter::importing::inspect_flag() {
-        return Err(error);
-    }
-    let roots = pyre_object::gc_roots::push_roots();
-    let error_slot = error.pin(&roots);
-    error.reload(&roots, error_slot);
-    let code = pyre_interpreter::error::system_exit_code(&error);
-    error.reload(&roots, error_slot);
-    #[cfg(unix)]
-    unsafe {
-        majit_rlib::rposix::c_exit(code);
-    }
-    #[cfg(not(unix))]
-    std::process::exit(code);
-    #[allow(unreachable_code)]
-    Err(error)
 }
 
 fn ignore_python_callback_exception(
@@ -1701,24 +1711,30 @@ fn ignore_python_callback_exception(
 ) -> PyObjectRef {
     // [3.15-spec] `CallbackTracbackTestCase.expect_unraisable` wants
     // `err_msg == "Exception ignored while calling ctypes callback
-    // function {callback!r}"` and `object is None`. `_CallPythonObject`
-    // reports that through `PyErr_FormatUnraisable`. PyPy `function.py`
-    // uses `__pypy__.write_unraisable('in calling ctypes callback
+    // function {callback!r}"` and `object is None`. The where-string
+    // goes through `write_callback_unraisable` ->
+    // `write_unraisable_with_traceback(.., true, ..)`, i.e.
+    // `interp_magic.write_unraisable`, which prefixes `"Exception ignored "`;
+    // the object is None (3.15: `PyErr_FormatUnraisable` in
+    // `_CallPythonObject`) where PyPy passes `self.callable`. PyPy
+    // `function.py` uses `__pypy__.write_unraisable('in calling ctypes callback
     // function', e, self.callable)` (`interp_magic.write_unraisable`
-    // `with_traceback=True`). `write_unraisable()` would prefix
-    // `"Exception ignored in: "` onto the already-complete first line.
+    // `with_traceback=True`). `_CallPythonObject` reports the exception with
+    // `PyErr_FormatUnraisable` and continues; `SystemExit` does not exit.
+    // `CFuncPtr.__call__` `except SystemExit` + `handle_system_exit` calls
+    // `_rawffi.exit`.  Evidence: v3.15.1 `Modules/_ctypes/callbacks.c`
+    // `_CallPythonObject`; `lib-python/3/test/test_ctypes/test_random_things.py`
+    // `expect_unraisable`.
     let roots = pyre_object::gc_roots::push_roots();
     let error_slot = error.pin(&roots);
     let rendered = callback_callable_repr(callable);
     error.reload(&roots, error_slot);
-    error.write_unraisable_first_line(
-        pyre_object::w_none(),
-        Some(pyre_interpreter::display::wtf8_format!(
-            "Exception ignored while calling ctypes callback function ",
+    write_callback_unraisable(
+        &mut error,
+        &pyre_interpreter::display::wtf8_format!(
+            "while calling ctypes callback function ",
             rendered
-        )),
-        pyre_object::PY_NULL,
-        rustpython_wtf8::Wtf8::new(""),
+        ),
     );
     pyre_object::w_int_new(0)
 }
@@ -1846,12 +1862,7 @@ fn call_python_callback(
             pyre_object::gc_roots::shadow_stack_get(callable_slot),
         ),
         Err(mut error) => {
-            if error_matches_class(&mut error, "SystemExit")
-                || error.kind == pyre_interpreter::PyErrorKind::SystemExit
-            {
-                return handle_python_callback_system_exit(error);
-            }
-            if is_python_exception(&mut error) {
+            if is_callback_ignored_error(&mut error) {
                 return Ok(ignore_python_callback_exception(
                     error,
                     pyre_object::gc_roots::shadow_stack_get(callable_slot),
@@ -2276,9 +2287,9 @@ fn call_settled(
             None => marshal_default_arg(arg, &mut keepalive)?,
         });
     }
-    // CFuncPtr._get_address is the live word.  A plan that captured an older
-    // `_buffer[0]` does not describe this call; invoke through the buffer
-    // when it is present.
+    // [3.15-spec] `PyCFuncPtr_call` reads `pProc = *(void **)self->b_ptr` on
+    // every call.  `CFuncPtr._getfuncptr` caches `self._ptr`.
+    // Evidence: v3.15.1 `Modules/_ctypes/_ctypes.c` `PyCFuncPtr_call`.
     let live = funcptr_addr(_roots.get(self_slot));
     let addr = if live != 0 { live } else { plan.addr };
     let result = invoke(

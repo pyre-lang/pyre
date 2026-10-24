@@ -207,6 +207,14 @@ fn init_cdata_type(ns: PyObjectRef) {
         "__setstate__",
         pyre_interpreter::make_builtin_function_with_arity("__setstate__", cdata_setstate, 3)
     );
+    // `_CData._copy_to` / `StructOrUnion._copy_to`: copy the view bytes to
+    // `addr`.  `CFuncPtr._convert_args_for_callback` dispatches this so a
+    // subclass override is honoured.
+    pyre_interpreter::__pyre_store!(
+        ns,
+        "_copy_to",
+        pyre_interpreter::make_builtin_function_with_arity("_copy_to", cdata_copy_to, 2)
+    );
 }
 
 /// `_CData.__reduce__` -- `PyCData_reduce`.
@@ -677,10 +685,9 @@ fn init_simplecdata_type(ns: PyObjectRef) {
             "value",
         )
     );
-    // `from_param` — a classmethod the metaclass provides in CPython; the
-    // package's `_reset_cache` reads `c_wchar_p.from_param` at import.  The
-    // slice marshals arguments directly (§5.2) rather than via `from_param`,
-    // so this is an identity stub that only has to exist and be gettable.
+    // `from_param` — `SimpleType.from_param`.  Native marshal does not go
+    // through it (`marshal_simple_arg`); the package's `_reset_cache` still
+    // reads `c_wchar_p.from_param` at import.
     pyre_interpreter::__pyre_store!(
         ns,
         "from_param",
@@ -725,13 +732,13 @@ fn simplecdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
     ))
 }
 
-/// `_SimpleCData.from_param(cls, value)` — identity stub (see caller note).
+/// `_SimpleCData.from_param(cls, value)` — `SimpleType.from_param`.
 fn simplecdata_from_param(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     simple_from_param(args)
 }
 
-/// PyCSimpleType.from_param: convert to a same-typed temporary when needed,
-/// then return the same `CArgObject` carrier family as `byref()`.
+/// `SimpleType.from_param` / `PyCSimpleType_from_param_impl`: an instance of
+/// `cls` is returned as-is; anything else is converted into a `CArgObject`.
 pub(super) fn simple_from_param(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
@@ -742,13 +749,12 @@ pub(super) fn simple_from_param(
     }
     let cls = args[0];
     let value = args[1];
-    let converted = if unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, cls) } {
-        value
-    } else {
-        let tc = type_code_of(cls)
-            .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-        new_simplecdata_obj(cls, &tc, Some(value))?
-    };
+    if unsafe { pyre_interpreter::baseobjspace::isinstance_w(value, cls) } {
+        return Ok(value);
+    }
+    let tc =
+        type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
+    let converted = new_simplecdata_obj(cls, &tc, Some(value))?;
     // A converted temporary is reachable only from here, and both the address
     // lookup and the carrier allocate — the address is into its buffer, so the
     // instance has to outlive them.  It does not move, so one pin is enough.
@@ -775,14 +781,13 @@ fn simplecdata_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
     new_simplecdata_obj(cls, &tc, None)
 }
 
-/// Keyword path: pyre does not read `args` or `args.keywords` (`let _ = args`)
-/// and returns a zeroed instance.  That matches `GenericPyCData_new` /
-/// `generic_pycdata_new`, which take `args` and `kwds` and leave both unread
-/// (`v3.15.1` `Modules/_ctypes/_ctypes.c`).  The stored value is decided in
-/// `Simple_init`.  PyPy `_SimpleCData.__init__(self, value=DEFAULT_VALUE)` is
-/// the binder for `value=`; no `@jit`/`_immutable_` on `_SimpleCData.__init__`.
+/// Keyword path: extras belong to `Simple_init`.  `generic_pycdata_new`
+/// takes `args` and `kwds` and leaves both unread.
+/// `_SimpleCData.__init__(self, value=DEFAULT_VALUE)` is the binder for
+/// `value=`.  No `@jit`/`_immutable_` on `_SimpleCData.__init__`.
 /// [3.15-spec] measured python3.15t (v3.15.1, free-threaded): ctypes.c_int(value=3).value
 /// -> 0; ctypes.c_int(bogus=3).value -> 0
+/// Evidence: v3.15.1 `Modules/_ctypes/_ctypes.c` `generic_pycdata_new`.
 fn simplecdata_new_args(
     w_type: PyObjectRef,
     args: &pyre_interpreter::argument::Arguments,
@@ -821,18 +826,17 @@ fn simplecdata_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
     Ok(pyre_object::w_none())
 }
 
-/// Keyword path: pyre forwards only positionals into `simplecdata_init` and
-/// leaves `args.keywords` unused, matching `Simple_init` (`PyArg_UnpackTuple`
-/// on the positional tuple; the `kw` parameter is unread; `v3.15.1`
-/// `Modules/_ctypes/_ctypes.c`).  `c_int(1, value=3)` therefore stores the
-/// positional 1, and `x.__init__(value=5)` stores nothing.  PyPy
-/// `_SimpleCData.__init__(self, value=DEFAULT_VALUE)` binds `value=`
-/// (`c_int(1, value=3)` TypeError "got multiple values for argument 'value'";
-/// `c_int(bogus=3)` TypeError "unexpected keyword argument 'bogus'";
-/// `__init__(value=5)` stores 5).  No `@jit`/`_immutable_` on
-/// `_SimpleCData.__init__`.
+/// Keyword path: only positionals reach `simplecdata_init`; `args.keywords`
+/// are unread, matching `Simple_init` (`PyArg_UnpackTuple` on the positional
+/// tuple; `kw` is unread).  `c_int(1, value=3)` stores 1, and
+/// `x.__init__(value=5)` stores nothing.  `_SimpleCData.__init__(self,
+/// value=DEFAULT_VALUE)` binds `value=` (`c_int(1, value=3)` TypeError
+/// "got multiple values for argument 'value'"; `c_int(bogus=3)` TypeError
+/// "unexpected keyword argument 'bogus'"; `__init__(value=5)` stores 5).
+/// No `@jit`/`_immutable_` on `_SimpleCData.__init__`.
 /// [3.15-spec] measured python3.15t (v3.15.1, free-threaded): ctypes.c_int(1, value=3).value
 /// -> 1; x = c_int(); x.__init__(value=5); x.value -> 0
+/// Evidence: v3.15.1 `Modules/_ctypes/_ctypes.c` `Simple_init`.
 fn simplecdata_init_args(
     self_: PyObjectRef,
     args: &pyre_interpreter::argument::Arguments,
@@ -1336,6 +1340,31 @@ pub(super) fn cdata_buffer_copy(obj: PyObjectRef) -> Option<Vec<u8>> {
     cdata_bytes(obj).map(|b| b.to_vec())
 }
 
+/// `_CData._copy_to(self, addr)` / `StructOrUnion._copy_to`: memmove the view
+/// bytes to `addr`.  Primitive `_copy_to` writes one ffi slot via
+/// `from_address`; Structure `memmove`s `_fficompositesize_`.  The view size
+/// is both.
+fn cdata_copy_to(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() < 2 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "_copy_to() missing address",
+        ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let addr =
+        pyre_interpreter::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?
+            as usize;
+    let bytes = cdata_bytes(pyre_object::gc_roots::shadow_stack_get(base))
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("ctypes instance has no buffer"))?
+        .to_vec();
+    // StructOrUnion._copy_to uses memmove.
+    unsafe {
+        std::ptr::copy(bytes.as_ptr(), addr as *mut u8, bytes.len());
+    }
+    Ok(pyre_object::w_none())
+}
+
 /// Overwrite `bytes` at view-relative offset `off`.
 pub(super) fn cdata_write(mut obj: PyObjectRef, off: usize, bytes: &[u8]) {
     if let Some(mut ba) = pyre_object::with_roots!(obj => cdata_buffer(obj)) {
@@ -1590,13 +1619,7 @@ pub(super) fn value_for_keep(
     if is_simplecdata_instance(value) {
         return peek_objects(pyre_object::gc_roots::shadow_stack_get(slot));
     }
-    let value = pyre_object::gc_roots::shadow_stack_get(slot);
-    if has_b_base(value) {
-        return peek_objects(pyre_object::gc_roots::shadow_stack_get(slot));
-    }
-    Some(objects_for_keep(pyre_object::gc_roots::shadow_stack_get(
-        slot,
-    )))
+    objects_for_keep(pyre_object::gc_roots::shadow_stack_get(slot))
 }
 
 /// Existing `"_objects_"` entry, or `None` when absent.  Never creates one.
@@ -1712,29 +1735,32 @@ pub(super) fn keep_ref(anchor: PyObjectRef, key: &str, obj: PyObjectRef) {
     };
 }
 
-/// `ensure_objects(value)`: composite assignments retain the child's
-/// keepalive dictionary, creating the empty dictionary that represents a
-/// CData value with no inner references yet.
-pub(super) fn objects_for_keep(value: PyObjectRef) -> PyObjectRef {
+/// `_CData._ensure_objects`: existing `"_objects_"` entry, or `None` for a
+/// sub-view (`_b_base_` set, PyPy `'_index' in __dict__`) that has none yet.
+/// A root without an entry gets the empty dictionary `Field.__set__` /
+/// `Array.__setitem__` keep via `ensure_objects`.
+pub(super) fn objects_for_keep(value: PyObjectRef) -> Option<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     let value = pyre_object::gc_roots::pin_root(value);
     let value_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    if let Some(objects) = peek_objects(value) {
+        return Some(objects);
+    }
+    let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+    if has_b_base(value) {
+        return None;
+    }
     let mut d = pyre_interpreter::baseobjspace::getdict_native(value);
     if d.is_null() {
-        return pyre_object::gc_roots::shadow_stack_get(value_slot);
+        return Some(pyre_object::gc_roots::shadow_stack_get(value_slot));
     }
-    match unsafe { pyre_object::w_dict_getitem_str(d, OBJECTS_KEY) } {
-        Some(objects) if !objects.is_null() && !unsafe { pyre_object::is_none(objects) } => objects,
-        _ => {
-            let objects_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
-            let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
-            d = pyre_interpreter::baseobjspace::getdict_native(value);
-            let objects = pyre_object::gc_roots::shadow_stack_get(objects_slot);
-            unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, objects) };
-            pyre_object::gc_roots::shadow_stack_get(objects_slot)
-        }
-    }
+    let objects_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+    d = pyre_interpreter::baseobjspace::getdict_native(value);
+    let objects = pyre_object::gc_roots::shadow_stack_get(objects_slot);
+    unsafe { pyre_object::w_dict_setitem_str(d, OBJECTS_KEY, objects) };
+    Some(pyre_object::gc_roots::shadow_stack_get(objects_slot))
 }
 
 /// Keep an implementation-owned holder alive without exposing it through

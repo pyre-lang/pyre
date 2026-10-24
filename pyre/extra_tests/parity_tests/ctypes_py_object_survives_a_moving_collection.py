@@ -201,6 +201,8 @@ for i in range(50):
 
 print(ctypes.c_int(5).value)
 print(ctypes.c_int(value=3).value)
+_from_param_a = ctypes.c_char_p(b"123")
+print(ctypes.c_char_p.from_param(_from_param_a) is _from_param_a)
 _kw = ctypes.c_int()
 _kw.__init__(value=3)
 print(_kw.value)

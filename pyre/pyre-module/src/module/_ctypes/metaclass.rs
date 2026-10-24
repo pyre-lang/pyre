@@ -1900,9 +1900,11 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                         .unwrap_or(&[])
                         .to_vec();
                     pyre_object::with_roots!(array_value, obj => cdata::cdata_write(obj, offset, &source[..source.len().min(size)]));
-                    let keep =
-                        pyre_object::with_roots!(obj => cdata::objects_for_keep(array_value));
-                    cdata::keep_ref(obj, &index.to_string(), keep);
+                    if let Some(keep) =
+                        pyre_object::with_roots!(obj => cdata::objects_for_keep(array_value))
+                    {
+                        cdata::keep_ref(obj, &index.to_string(), keep);
+                    }
                     Ok(pyre_object::w_none())
                 }
             }
@@ -1919,8 +1921,9 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
                 .to_vec();
             let n = size.min(src.len());
             pyre_object::with_roots!(obj, value => cdata::cdata_write(obj, offset, &src[..n]));
-            let keep = pyre_object::with_roots!(obj => cdata::objects_for_keep(value));
-            cdata::keep_ref(obj, &index.to_string(), keep);
+            if let Some(keep) = pyre_object::with_roots!(obj => cdata::objects_for_keep(value)) {
+                cdata::keep_ref(obj, &index.to_string(), keep);
+            }
             Ok(pyre_object::w_none())
         }
         _ => Err(pyre_interpreter::PyError::type_error(
@@ -2100,6 +2103,12 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
     let buffer = pyre_object::w_bytearray_new(size);
     unsafe { pyre_object::w_dict_setitem_str(roots.get(d_slot), "_b_", buffer) };
     Ok(obj)
+}
+
+/// `StructOrUnion.__new__(cls)` — the base `__new__`, not a subclass
+/// override, and not `type.__call__` (that would run `__init__`).
+pub(super) fn struct_or_union_new(cls: PyObjectRef) -> PyResult {
+    structure_new(&[cls])
 }
 
 /// Keyword path: extras belong to `structure_init_args`.
@@ -2598,8 +2607,9 @@ fn array_set_index(
                 .to_vec();
             let n = meta.element_size.min(src.len());
             pyre_object::with_roots!(obj, value => cdata::cdata_write(obj, offset, &src[..n]));
-            let keep = pyre_object::with_roots!(obj => cdata::objects_for_keep(value));
-            cdata::keep_ref(obj, &idx.to_string(), keep);
+            if let Some(keep) = pyre_object::with_roots!(obj => cdata::objects_for_keep(value)) {
+                cdata::keep_ref(obj, &idx.to_string(), keep);
+            }
             Ok(pyre_object::w_none())
         }
         _ => Err(pyre_interpreter::PyError::type_error(
