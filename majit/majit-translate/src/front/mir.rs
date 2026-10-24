@@ -29736,10 +29736,18 @@ impl<'a> Lowering<'a> {
                 // `rtype_eq` / `rtype_ne` lower the comparison to `ptr_eq`
                 // / `ptr_ne`.
                 if args.len() == 2
-                    && (fmt_path_ends_with(&segments, &["non_null", "NonNull", "eq"])
-                        || fmt_path_ends_with(&segments, &["non_null", "NonNull", "ne"]))
+                    && (fmt_path_ends_with_owner_method(&segments, &["non_null", "NonNull"], "eq")
+                        || fmt_path_ends_with_owner_method(
+                            &segments,
+                            &["non_null", "NonNull"],
+                            "ne",
+                        ))
                 {
-                    let leaf = if fmt_path_ends_with(&segments, &["non_null", "NonNull", "ne"]) {
+                    let leaf = if fmt_path_ends_with_owner_method(
+                        &segments,
+                        &["non_null", "NonNull"],
+                        "ne",
+                    ) {
                         "ne"
                     } else {
                         "eq"
@@ -42175,9 +42183,9 @@ impl<'a> Lowering<'a> {
         if args.len() != 2 {
             return Ok(false);
         }
-        let from_path = if fmt_path_ends_with(segments, &["option", "Option", "eq"]) {
+        let from_path = if fmt_path_ends_with_owner_method(segments, &["option", "Option"], "eq") {
             Some("eq")
-        } else if fmt_path_ends_with(segments, &["option", "Option", "ne"]) {
+        } else if fmt_path_ends_with_owner_method(segments, &["option", "Option"], "ne") {
             Some("ne")
         } else {
             None
@@ -57160,19 +57168,20 @@ fn impl_atomic_alias_leaf(llbc: &Llbc, impl_payload: &serde_json::Value) -> Opti
 
 /// Path segments used to *call* a function named by a `FnDef` constant or
 /// type — the same spelling `decode_constant` stores in a function-item
-/// value and `call_target_segments` emits for a direct call.  Impl-owned
-/// callees use [`spec_segments`] (inherent `for_impl_method`, trait-impl
-/// identity path); free functions keep `name_path()` split on `::`.
+/// value and `call_target_segments` emits for a direct call.  Always
+/// [`spec_segments`]: inherent `for_impl_method`, ADT-owned and primitive
+/// trait-impl identity paths, free functions the stripped `name_path`.
 fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
-    match impl_method_owner_for_fundecl(llbc, fd) {
-        Some((_, leaf)) => spec_segments(llbc, fd, &leaf),
-        None => fd
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(|s| s.to_string())
-            .collect(),
-    }
+    let path = fd.item_meta.name_path();
+    let leaf = impl_method_owner_for_fundecl(llbc, fd)
+        .map(|(_, leaf)| leaf)
+        .unwrap_or_else(|| {
+            path.rsplit("::")
+                .next()
+                .unwrap_or(path.as_str())
+                .to_string()
+        });
+    spec_segments(llbc, fd, &leaf)
 }
 
 /// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
@@ -74154,6 +74163,33 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
             })
 }
 
+fn is_trait_impl_path_segment(segment: &str) -> bool {
+    segment == "<Impl>" || segment.starts_with("<impl ") || segment.starts_with("<Impl#")
+}
+
+/// `for_impl_method` (`[..., Owner, leaf]`) or a trait-impl identity
+/// (`[..., Owner, <impl …>, leaf]`). `spec_segments` emits the latter for
+/// an ADT-owned trait method (`CallControl.graphs_from` keys on the
+/// function object).
+fn fmt_path_ends_with_owner_method(segments: &[String], owner: &[&str], leaf: &str) -> bool {
+    let n = segments.len();
+    if n == 0 || crate::front::clause_spec::unspecialized_leaf(&segments[n - 1]) != leaf {
+        return false;
+    }
+    let owner_end = if n >= 2 && is_trait_impl_path_segment(&segments[n - 2]) {
+        n - 2
+    } else {
+        n - 1
+    };
+    if owner_end < owner.len() {
+        return false;
+    }
+    segments[owner_end - owner.len()..owner_end]
+        .iter()
+        .map(String::as_str)
+        .eq(owner.iter().copied())
+}
+
 /// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
 ///
 /// The leaf name `map_err` is not enough: an extension trait can publish
@@ -81710,6 +81746,46 @@ mod tests {
         assert!(!fmt_path_ends_with(&spec, &["lltype", "malloc"]));
         let inner = segs(&["malloc_typed__spec_X_0123456789abcdef", "new"]);
         assert!(!fmt_path_ends_with(&inner, &["malloc_typed", "new"]));
+    }
+
+    #[test]
+    fn owner_method_path_accepts_trait_impl_identity() {
+        use crate::front::mir::fmt_path_ends_with_owner_method;
+        let segs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let inherent = segs(&["ptr", "non_null", "NonNull", "eq"]);
+        let identity = segs(&[
+            "ptr",
+            "non_null",
+            "NonNull",
+            "<impl core::cmp::PartialEq<core::ptr::non_null::NonNull<T>>>",
+            "eq",
+        ]);
+        let charon_impl = segs(&["ptr", "non_null", "NonNull", "<Impl>", "ne"]);
+        assert!(fmt_path_ends_with_owner_method(
+            &inherent,
+            &["non_null", "NonNull"],
+            "eq"
+        ));
+        assert!(fmt_path_ends_with_owner_method(
+            &identity,
+            &["non_null", "NonNull"],
+            "eq"
+        ));
+        assert!(fmt_path_ends_with_owner_method(
+            &charon_impl,
+            &["non_null", "NonNull"],
+            "ne"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &identity,
+            &["non_null", "NonNull"],
+            "ne"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &segs(&["option", "Option", "eq"]),
+            &["non_null", "NonNull"],
+            "eq"
+        ));
     }
 
     /// A Ref pointee is `{"Deduplicated": id}` of the Scalar
@@ -91732,6 +91808,8 @@ mod tests {
             super::trait_impl_identity_path("cmp::impls::<Impl>", &i64_identity, "le")
         );
         assert_ne!(char_path, i64_path);
+        assert_eq!(super::fundecl_fn_item_segments(&llbc, char_le), char_path);
+        assert_eq!(super::fundecl_fn_item_segments(&llbc, i64_le), i64_path);
         assert_eq!(
             super::registered_path_for_fun_decl(&llbc, char_le).segments,
             char_path
@@ -108753,7 +108831,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                    } => super::fmt_path_ends_with_owner_method(segments, &["Option"], "ne"),
                     _ => false,
                 })
                 .count(),
@@ -109298,7 +109376,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } => super::fmt_path_ends_with(segments, &["NonNull", "ne"]),
+                    } => super::fmt_path_ends_with_owner_method(segments, &["NonNull"], "ne"),
                     _ => false,
                 })
                 .count(),
@@ -110014,7 +110092,7 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                    } => super::fmt_path_ends_with_owner_method(segments, &["Option"], "ne"),
                     _ => false,
                 })
                 .count(),
@@ -110044,7 +110122,7 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                } => super::fmt_path_ends_with_owner_method(segments, &["Option"], "ne"),
                 _ => false,
             }),
             "`Option<&u8>` inequality stays a residual `Option::ne` call"

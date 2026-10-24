@@ -2094,8 +2094,13 @@ enum StorePass {
     ReplaceForceVirtualizable,
 }
 
-/// `(trait_root, method_name) -> impl owner roots`.
-type TraitMethodImpls = HashMap<(String, String), Vec<String>>;
+/// `(trait_root, method_name) -> concrete callee paths`.
+///
+/// Each member is the function object's registry key
+/// (`CallControl.graphs_from` / `row_of_graphs.values()`), not the owner
+/// root reconstructed through `for_impl_method`. An inherent of the same
+/// leaf occupies that two-segment spelling.
+type TraitMethodImpls = HashMap<(String, String), Vec<CallPath>>;
 
 impl GraphSlot {
     fn built(graph: std::rc::Rc<FunctionGraph>) -> Self {
@@ -3327,7 +3332,7 @@ pub struct CallControl {
     /// the graph itself (`graph.func`); see [`Self::func_effects`].
     external_funcobjs: HashMap<CallPath, crate::model::FuncEffects>,
 
-    /// Trait bindings: `(trait_root, method_name)` → `Vec<impl_type>`.
+    /// Trait bindings: `(trait_root, method_name)` → concrete callee paths.
     ///
     /// Keyed by the *declaring trait* (impl's `TraitImplInfo::trait_name`),
     /// so two traits exposing the same method name do
@@ -3335,7 +3340,7 @@ pub struct CallControl {
     /// `op.args[-1].value` = exact candidate graph list, not a
     /// method-name global).  Inherent impls do not populate this map;
     /// they use `function_graphs` directly via `[impl_type, method_name]`.
-    trait_method_impls: HashMap<(String, String), Vec<String>>,
+    trait_method_impls: HashMap<(String, String), Vec<CallPath>>,
 
     /// O(1) index over `trait_method_impls` keyed by method name alone:
     /// `method_name → [impl_type, …]` across every declaring trait.
@@ -5932,12 +5937,8 @@ impl CallControl {
                 };
                 let family = trait_method_impls
                     .get(&(trait_root.clone(), method_name.clone()))
-                    .into_iter()
-                    .flatten()
-                    .map(|impl_type| {
-                        CallPath::for_impl_method(impl_type.as_str(), method_name.as_str())
-                    })
-                    .collect::<Vec<_>>();
+                    .cloned()
+                    .unwrap_or_default();
                 if !family.is_empty() {
                     *graphs = Some(family);
                 }
@@ -6262,12 +6263,31 @@ impl CallControl {
         trait_root: &str,
         impl_type: &str,
     ) {
+        self.register_trait_family_path(
+            method_name,
+            trait_root,
+            CallPath::for_impl_method(impl_type, method_name),
+        );
+    }
+
+    /// Record one concrete callee in the PBC row for an indirect trait call.
+    ///
+    /// `path` is the function object's registry key: a trait-impl identity
+    /// path when the impl has one, otherwise `for_impl_method`. Reconstructing
+    /// the latter from the owner alone would pick an inherent of the same
+    /// leaf (`Bookkeeper.getdesc`).
+    pub fn register_trait_family_path(
+        &mut self,
+        method_name: &str,
+        trait_root: &str,
+        path: CallPath,
+    ) {
         let members = self
             .trait_method_impls
             .entry((trait_root.to_string(), method_name.to_string()))
             .or_default();
-        if !members.iter().any(|member| member == impl_type) {
-            members.push(impl_type.to_string());
+        if !members.iter().any(|member| member == &path) {
+            members.push(path);
         }
     }
 
@@ -8428,10 +8448,8 @@ fn impls_for_indirect(
 ) -> Vec<CallPath> {
     trait_method_impls
         .get(&(trait_root.to_string(), method_name.to_string()))
-        .into_iter()
-        .flatten()
-        .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name))
-        .collect()
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The result type every registered member of an indirect-call family
@@ -8487,10 +8505,8 @@ fn materialize_indirect_families(graph: &mut FunctionGraph, trait_method_impls: 
         };
         let family = trait_method_impls
             .get(&(trait_root.clone(), method_name.clone()))
-            .into_iter()
-            .flatten()
-            .map(|impl_type| CallPath::for_impl_method(impl_type.as_str(), method_name.as_str()))
-            .collect::<Vec<_>>();
+            .cloned()
+            .unwrap_or_default();
         *graphs = (!family.is_empty()).then_some(family);
     }
 }
@@ -22189,6 +22205,29 @@ mod tests {
             Some(2),
             "the registered source graph must carry the complete PBC family"
         );
+    }
+
+    /// An inherent `Owner::setitem` occupies `for_impl_method`. The
+    /// `dyn Store::setitem` family must name the trait-impl identity, not
+    /// that two-segment spelling (`FunctionReprBase.call` /
+    /// `row_of_graphs.values()`).
+    #[test]
+    fn indirect_family_keeps_trait_impl_identity_when_inherent_collides() {
+        let inherent = CallPath::for_impl_method("Owner", "setitem");
+        let identity = CallPath::from_segments(["Owner", "<impl Store<Owner>>", "setitem"]);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(inherent.clone(), FunctionGraph::new("Owner::setitem"));
+        cc.register_function_graph(identity.clone(), FunctionGraph::new("Store::setitem"));
+        cc.register_trait_family_path("setitem", "Store", identity.clone());
+
+        let family = cc.all_impls_for_indirect("Store", "setitem");
+        assert_eq!(family, vec![identity.clone()]);
+        assert_ne!(family[0], inherent);
+        let graph = cc
+            .function_graphs
+            .get(&family[0])
+            .expect("family member is registered");
+        assert_eq!(graph.name, "Store::setitem");
     }
 
     fn deferred_family_caller(name: &str) -> FunctionGraph {
