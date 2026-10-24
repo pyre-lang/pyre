@@ -5336,7 +5336,12 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
 /// [`opimpl_getfield_gc_i`] does. A cache hit counts and returns. The
 /// following getfield owns the ordinary field cache
 /// (`_opimpl_getfield_gc_any_pureornot`).
-pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) {
+pub(crate) fn record_quasiimmut_field(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    descr: DescrRef,
+    mutatefielddescr: Option<&DescrRef>,
+) {
     let field_index = descr.index();
     if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
         ctx.profiler().count_ops(
@@ -5360,7 +5365,7 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
     // installed, so nothing invalidates and nothing bumps the force counter,
     // and the trace keeps a value that is already stale.  Without a GIL that
     // window is a real interleaving, not a theoretical one.
-    let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
+    let qmutdescr = resolve_quasi_immut_descr(ctx, obj, &descr, mutatefielddescr);
     // `quasiimmut.py QuasiImmutDescr.__init__` captures
     // `constantfieldbox` on the descr; `pyjitpl.py
     // opimpl_record_quasiimmut_field` then `record1(QUASIIMMUT_FIELD,
@@ -5474,6 +5479,101 @@ fn is_type_version_tag_descr(descr: &DescrRef) -> bool {
     }
     let name = field.field_name();
     name == "version_tag" || name.ends_with(".version_tag")
+}
+
+/// `mutate_<name>` or a display name ending `.mutate_<name>`.
+///
+/// The `_lock` leaf is the second word of `QuasiImmutField`, not the mutate
+/// field `get_current_qmut_instance` reads. An index of `u32::MAX` is the
+/// unassigned sentinel (`Descr::index` default / ALIAS SENTINEL).
+///
+/// `SimpleFieldDescr::index` may replace that sentinel on first read, so the
+/// name plus a parent listing of the same mutate slot is what marks the descr
+/// resolved. Assembler `fielddescrof` for a missing `mutate_<name>` (PyCode
+/// `mutate_w_globals`) leaves offset 0 and no parent slot; treating that as
+/// resolved would pass the object header to `get_current_qmut_instance`.
+fn is_resolved_mutate_field_descr(mutate: &DescrRef) -> bool {
+    if mutate.index() == u32::MAX {
+        return false;
+    }
+    let Some(fd) = mutate.as_field_descr() else {
+        return false;
+    };
+    is_mutate_field_name(fd.field_name()) && mutate_slot_is_listed_on_parent(fd)
+}
+
+/// True when the parent SizeDescr lists a `mutate_<name>` (not `_lock`) at
+/// this descr's offset. Upstream `QuasiImmutDescr.__init__` /
+/// `get_current_qmut_instance` always read that hidden field; a mint whose
+/// parent does not name it is the Step B gap.
+fn mutate_slot_is_listed_on_parent(fd: &dyn majit_ir::descr::FieldDescr) -> bool {
+    let Some(parent) = fd.get_parent_descr() else {
+        return false;
+    };
+    let Some(size) = parent.as_size_descr() else {
+        return false;
+    };
+    let offset = fd.offset();
+    size.all_fielddescrs()
+        .iter()
+        .any(|sib| sib.offset() == offset && is_mutate_field_name(sib.field_name()))
+}
+
+fn is_mutate_field_name(name: &str) -> bool {
+    let leaf = match name.rsplit_once('.') {
+        Some((_, leaf)) => leaf,
+        None => name,
+    };
+    let Some(rest) = leaf.strip_prefix("mutate_") else {
+        return false;
+    };
+    !rest.is_empty() && !rest.ends_with("_lock")
+}
+
+/// Watcher from the mutate descr: `QuasiImmutDescr.__init__` /
+/// `get_current_qmut_instance`.
+fn quasi_immut_descr_from_mutate(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    field_descr: &DescrRef,
+    mutate_fd: &dyn majit_ir::descr::FieldDescr,
+) -> Option<DescrRef> {
+    let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) else {
+        return None;
+    };
+    let struct_ptr = struct_ref.0 as i64;
+    if struct_ptr == 0 || struct_ptr == usize::MAX as i64 {
+        return None;
+    }
+    let bh = majit_jitcode::jitcode::BhDescr::from_field_descr(mutate_fd);
+    let handle = majit_metainterp::quasiimmut::get_current_qmut_instance(struct_ptr, &bh);
+    Some(std::sync::Arc::new(majit_ir::QuasiImmutDescr::new(
+        field_descr.clone(),
+        struct_ptr as u64,
+        handle,
+        None,
+    )))
+}
+
+fn resolve_quasi_immut_descr(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    descr: &DescrRef,
+    mutatefielddescr: Option<&DescrRef>,
+) -> Option<DescrRef> {
+    if let Some(mutate) = mutatefielddescr {
+        if is_resolved_mutate_field_descr(mutate) {
+            if let Some(fd) = mutate.as_field_descr() {
+                return quasi_immut_descr_from_mutate(ctx, obj, descr, fd);
+            }
+        }
+        // Step B gap: `Some(mutate)` that is not a resolved mutate field
+        // descr falls back to the field-descr-index ladder. Upstream
+        // `QuasiImmutDescr.__init__` / `get_current_qmut_instance` always
+        // reads the watcher from the mutate descr; there is no per-field
+        // lookup table.
+    }
+    quasi_immut_descr(ctx, obj, descr)
 }
 
 /// `pyjitpl.py:1081 QuasiImmutDescr(cpu, structbox.getref_base(), fielddescr,
@@ -13003,6 +13103,114 @@ mod tests {
     use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{Mode, compile_exec, compile_source};
     use pyre_object::pyobject::{INT_TYPE, PyType};
+
+    /// Process-global `HOST_HOOKS` is one slot; save and restore it so this
+    /// test cannot overwrite a sibling.
+    static QMUT_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    struct QmutHookGuard {
+        saved: majit_metainterp::HostHooks,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl QmutHookGuard {
+        fn install() -> Self {
+            let lock = QMUT_HOOK_TEST_LOCK.lock();
+            let saved = majit_metainterp::host_hooks();
+            majit_metainterp::publish_host_hooks(majit_metainterp::HostHooks {
+                get_current_qmut_instance: Some(test_get_current_qmut_instance),
+                ..saved
+            });
+            Self { saved, _lock: lock }
+        }
+    }
+
+    impl Drop for QmutHookGuard {
+        fn drop(&mut self) {
+            majit_metainterp::publish_host_hooks(self.saved);
+        }
+    }
+
+    /// Same body as `pyre_jit::call_jit::get_current_qmut_instance`, wrapping
+    /// the inner `QuasiImmut` so `instance_identity` is `Arc::as_ptr`.
+    fn test_get_current_qmut_instance(
+        field_addr: i64,
+    ) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle> {
+        assert_ne!(field_addr, 0);
+        let field = unsafe { &*(field_addr as *const pyre_object::quasiimmut::QuasiImmutField) };
+        std::sync::Arc::new(RecordedQuasiImmut(field.get_current_qmut_instance()))
+    }
+
+    #[test]
+    fn function_code_quasiimmut_instance_identity_agrees_between_ladder_and_mutate_descr() {
+        pyre_interpreter::test_hooks::install_hash_hook();
+        let _hook_guard = QmutHookGuard::install();
+
+        let raw_code = 0xDEAD_BEEF as *const ();
+        let w_code = pyre_interpreter::w_code_new(raw_code);
+        let w_globals = pyre_object::w_module_dict_new();
+        let func =
+            pyre_interpreter::function_new(w_code as *const (), "myfunc".to_string(), w_globals);
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let obj = ctx.const_ref(func as i64);
+        let field = crate::descr::function_code_descr();
+        let mutate = majit_ir::descr::field_descr_from_parent_by_offset(
+            &crate::descr::w_function_size_descr(),
+            pyre_interpreter::function::FUNCTION_MUTATE_CODE_OFFSET,
+        );
+        assert!(
+            is_resolved_mutate_field_descr(&mutate),
+            "Function.mutate_code must be a resolved mutate field descr"
+        );
+
+        let ladder =
+            quasi_immut_descr(&mut ctx, obj, &field).expect("ladder resolves Function.code");
+        let generic = quasi_immut_descr_from_mutate(
+            &mut ctx,
+            obj,
+            &field,
+            mutate
+                .as_field_descr()
+                .expect("mutate_code is a field descr"),
+        )
+        .expect("generic route resolves Function.mutate_code");
+
+        let ladder_id = ladder
+            .as_quasi_immut_descr()
+            .expect("ladder QuasiImmutDescr")
+            .qmut()
+            .instance_identity();
+        let generic_id = generic
+            .as_quasi_immut_descr()
+            .expect("generic QuasiImmutDescr")
+            .qmut()
+            .instance_identity();
+        assert_eq!(ladder_id, generic_id);
+        assert_ne!(ladder_id, 0);
+    }
+
+    #[test]
+    fn mutate_w_globals_without_parent_slot_is_not_a_resolved_quasi_mutate_descr() {
+        // Assembler `fielddescrof` for PyCode `mutate_w_globals` mints offset 0
+        // with no parent listing. Name matches `mutate_<name>` and `index()` is
+        // assigned, but `QuasiImmutDescr.__init__` still has no mutate field.
+        let descr: DescrRef =
+            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0x1234,
+                0,
+                8,
+                Type::Ref,
+                false,
+                majit_ir::descr::ArrayFlag::Pointer,
+                "PyCode.mutate_w_globals".to_string(),
+                "mutate_w_globals".to_string(),
+            ));
+        assert!(
+            !is_resolved_mutate_field_descr(&descr),
+            "offset-0 mutate_w_globals without a parent slot must fall back to the ladder"
+        );
+    }
 
     #[test]
     fn reconstructed_ref_slot_does_not_invent_color_in_mapped_frame() {

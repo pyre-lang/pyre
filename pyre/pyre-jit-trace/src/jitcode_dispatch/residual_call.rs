@@ -7858,6 +7858,7 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::cell_family_ever_mutated_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
@@ -7969,6 +7970,7 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::cell_family_ever_mutated_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     let value = crate::state::opimpl_getfield_gc_r(
@@ -8007,6 +8009,7 @@ pub(crate) fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::plain_attribute_ever_mutated_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }

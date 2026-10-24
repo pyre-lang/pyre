@@ -3186,7 +3186,12 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if r_args[0].is_constant() {
             let callable_const = ctx.trace_ctx.const_ref(callable as i64);
-            crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, kw_defs_descr);
+            crate::state::record_quasiimmut_field(
+                ctx.trace_ctx,
+                callable_const,
+                kw_defs_descr,
+                None,
+            );
         } else {
             walker_guard_function_field(
                 ctx,
@@ -3201,6 +3206,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             ctx.trace_ctx,
             strategy_const,
             crate::descr::module_dict_version_descr(),
+            None,
         );
         walker_flush_guard_not_invalidated(ctx, op.pc)?;
         for kwonly in &resolved.values {
@@ -9354,6 +9360,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ctx.trace_ctx,
                 callable_guard_op,
                 crate::descr::function_defs_w_descr(),
+                None,
             );
         }
         let defaults_op = ctx.trace_ctx.record_op_with_descr(
@@ -9554,7 +9561,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if callable_guard_op.is_constant() {
             let callable_const = ctx.trace_ctx.const_ref(live_callable() as i64);
-            crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, kw_defs_descr);
+            crate::state::record_quasiimmut_field(
+                ctx.trace_ctx,
+                callable_const,
+                kw_defs_descr,
+                None,
+            );
         } else {
             walker_guard_function_field(
                 ctx,
@@ -9573,6 +9585,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             ctx.trace_ctx,
             strategy_const,
             crate::descr::module_dict_version_descr(),
+            None,
         );
         // One guard drains both markers: it asks whether anything recorded
         // this epoch was invalidated, not which.

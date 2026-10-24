@@ -1986,6 +1986,7 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::cell_family_ever_mutated_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op.pc)?;
     let cls_op = crate::state::opimpl_getfield_gc_r(
@@ -3350,6 +3351,7 @@ fn walker_fold_type_name<Sym: WalkSym>(
         ctx.trace_ctx,
         w_type_const,
         crate::descr::type_name_obj_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     // `record_quasiimmut_field` installs the watcher before it captures

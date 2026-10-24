@@ -12181,6 +12181,7 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
         ctx.trace_ctx,
         w_type_const,
         crate::descr::type_version_tag_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -12251,7 +12252,7 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     // There is no `can_move` gate on this pin (`rpython/jit` uses
     // `can_move` only in backend `convert_to_imm`).
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field, None);
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12322,11 +12323,13 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
                 ctx.trace_ctx,
                 type_const,
                 crate::descr::type_version_tag_descr(),
+                None,
             );
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 value_const,
                 crate::descr::w_class_descr(),
+                None,
             );
             walker_flush_guard_not_invalidated(ctx, op_pc)
         }
@@ -12400,7 +12403,7 @@ fn walker_pin_function_quasi_field<Sym: WalkSym>(
     descr: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
     let callable_const = ctx.trace_ctx.const_ref(callable as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr, None);
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12431,6 +12434,7 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
         ctx.trace_ctx,
         strategy_const,
         crate::descr::module_dict_version_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     Ok(true)
@@ -12461,6 +12465,7 @@ fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::terminator_allow_unboxing_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -12490,6 +12495,7 @@ fn walker_pin_audit_hooks<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::audit_holder_hooks_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -12503,7 +12509,12 @@ fn walker_pin_holder_attr<Sym: WalkSym>(
         return Ok(());
     }
     let owner = ctx.trace_ctx.const_ref(holder as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, crate::descr::holder_attr_descr());
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::holder_attr_descr(),
+        None,
+    );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12516,7 +12527,12 @@ fn walker_pin_holder_typ<Sym: WalkSym>(
         return Ok(());
     }
     let owner = ctx.trace_ctx.const_ref(holder as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, crate::descr::holder_typ_descr());
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::holder_typ_descr(),
+        None,
+    );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -13855,7 +13871,7 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     // `jit.promote(self.w_tracefunc)`.  The `?` is the invalidation
     // half — `settrace` notifies, `GUARD_NOT_INVALIDATED` fails, and
     // the loop is not re-entered with the folded NULL.
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), None);
     if already {
         return Ok(());
     }
@@ -13905,6 +13921,7 @@ fn record_portal_profilefunc_guard<Sym: WalkSym>(
         ctx.trace_ctx,
         ec_box,
         crate::descr::ec_profilefunc_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -14830,15 +14847,30 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx.gen_store_back_in_vable(vable);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
-        // `jtransform.py rewrite_op_getfield` emits this ahead of a
-        // quasi-immutable getfield. Operand layout `rdd`: the struct, the
-        // field descr, and the mutate descr. The mutate descr is unused;
-        // `quasi_immut_descr` resolves the watcher from the field descr.
-        // The opcode has no result register.
+        // pyjitpl.py `opimpl_record_quasiimmut_field`:
+        //
+        // ```text
+        // if self.metainterp.heapcache.is_quasi_immut_known(fielddescr, box):
+        //     count; return
+        // descr = QuasiImmutDescr(cpu, box.getref_base(), fielddescr,
+        //                         mutatefielddescr)
+        // self.metainterp.heapcache.quasi_immut_now_known(fielddescr, box)
+        // self.metainterp.history.record1(rop.QUASIIMMUT_FIELD, box, None,
+        //                                 descr=descr)
+        // if self.metainterp.heapcache.need_guard_not_invalidated:
+        //     generate_guard(GUARD_NOT_INVALIDATED)
+        // self.metainterp.heapcache.need_guard_not_invalidated = False
+        // ```
+        //
+        // Operand layout `rdd`: the struct (1B at offset 0), the field
+        // descr (2B at offset 1), and the mutate descr (2B at offset 3).
+        // Operand 2 is the mutate descr the watcher comes from
+        // (`QuasiImmutDescr.__init__` / `get_current_qmut_instance`).
         "record_quasiimmut_field/rdd" => {
             let obj = read_ref_reg(code, op, 0, ctx)?;
             let descr = read_descr(code, op, 1, ctx)?;
-            let _ = crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr);
+            let mutate = read_descr(code, op, 3, ctx)?;
+            crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr, Some(&mutate));
             walker_flush_guard_not_invalidated(ctx, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
