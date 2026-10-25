@@ -3703,6 +3703,21 @@ fn is_box_new_uninit_path(segments: &[String], args: &[LinkArg]) -> bool {
     args.is_empty() && function_path_ends_with(segments, &["boxed", "Box", "new_uninit"])
 }
 
+/// Runtime `get_instantiate` — the CallPath [`runtime_names::modules::GET_INSTANTIATE`]
+/// holds, plus the corpus twin the translator fixtures emit. Exact segments,
+/// not a `pyobject|object_model` suffix: a colliding leaf under another owner
+/// is not this helper (`Transformer.rewrite_op_malloc` takes the vtable from
+/// the typed malloc's STRUCT, not a call-name match).
+fn is_get_instantiate_path(segments: &[String], args: &[LinkArg]) -> bool {
+    if args.len() != 1 {
+        return false;
+    }
+    let segs = segments.iter().map(String::as_str);
+    segs.clone()
+        .eq(crate::runtime_names::modules::GET_INSTANTIATE.split('.'))
+        || segs.eq(crate::runtime_names::modules::GET_INSTANTIATE_CORPUS.split('.'))
+}
+
 /// Fresh-aggregate producer: a `SyntheticTransparentCtor` stack construct
 /// or a no-arg `boxed::Box::new_uninit` heap box.  `remove_dead_aggregates`
 /// uses this as the `remove_simple_mallocs` predicate — a `FieldWrite` into
@@ -4877,13 +4892,10 @@ pub(crate) fn fuse_boxing_alloc_with(
         field_name: &str,
         site: (usize, usize),
     ) -> Option<Variable> {
-        let store = unique_store(graph, base, field_name)?;
-        store
-            .locations
-            .iter()
-            .any(|&(block, op)| store_dominates_site(graph, base, (block, op), site))
-            .then(|| store.value.as_variable().cloned())
-            .flatten()
+        unique_store(graph, base, field_name, site)?
+            .value
+            .as_variable()
+            .cloned()
     }
     /// Whether the graph writes `base.field_name` at all, however many times.
     /// [`unique_store`] collapses "never written" and "written inconsistently"
@@ -4896,25 +4908,95 @@ pub(crate) fn fuse_boxing_alloc_with(
                 if b == base && field.name.as_str() == field_name)
         })
     }
-    /// The unique graph-wide value stored to `base.field_name`, or `None` if
-    /// absent or conflicting. Without reaching-definition analysis, choosing
-    /// among disagreeing stores would depend on block order, so the pass
-    /// declines. This matches `BaseMallocRemover.compute_lifetimes`, which
-    /// disables malloc optimization for multiple creation points ("aliasing
-    /// problems"). Identical redundant writes retain all their locations so
-    /// the dominance check can accept whichever one reaches the allocation.
+    fn is_synthetic_ctor_result(graph: &FunctionGraph, var: &Variable) -> bool {
+        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            op.result.as_ref() == Some(var)
+                && matches!(
+                    op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    }
+                )
+        })
+    }
+    /// The reaching store of `base.field_name` at `site`, or `None` if
+    /// absent, uninitialized on some path, or conflicting across paths.
+    /// Sequential overwrites keep the latest value (`BaseMallocRemover.flowin`
+    /// assigns `newvarsmap[key] = op.args[2]`). Two disagreeing stores that
+    /// both reach `site` decline. `compute_lifetimes` disables malloc removal
+    /// for a pointer with several creation points ("aliasing problems"); it is
+    /// not a unique-value check on repeated stores of one field.
     struct UniqueStore<'g> {
         field: &'g FieldDescriptor,
         value: &'g LinkArg,
         ty: &'g ValueType,
-        locations: Vec<(usize, usize)>,
+    }
+    /// Forward walk from just after `start` looking for `goal`. A path dies
+    /// when it executes a `barriers` op. True when some unkilled path hits
+    /// `goal`.
+    fn reaches_avoiding_barriers(
+        graph: &FunctionGraph,
+        start: (usize, usize),
+        goal: (usize, usize),
+        barriers: &[(usize, usize)],
+    ) -> bool {
+        let n = graph.blocks.len();
+        let mut seen_from_zero = vec![false; n];
+        let mut pending = vec![(start.0, start.1.saturating_add(1))];
+        while let Some((block, first)) = pending.pop() {
+            if block >= n {
+                continue;
+            }
+            if first == 0 {
+                if seen_from_zero[block] {
+                    continue;
+                }
+                seen_from_zero[block] = true;
+            }
+            let ops_len = graph.blocks[block].operations.len();
+            let mut killed = false;
+            for op in first..ops_len {
+                if (block, op) == goal {
+                    return true;
+                }
+                if barriers.iter().any(|&b| b == (block, op)) {
+                    killed = true;
+                    break;
+                }
+            }
+            if killed {
+                continue;
+            }
+            pending.extend(
+                graph.blocks[block]
+                    .exits
+                    .iter()
+                    .map(|link| (link.target.0, 0)),
+            );
+        }
+        false
     }
     fn unique_store<'g>(
         graph: &'g FunctionGraph,
         base: &Variable,
         field_name: &str,
+        site: (usize, usize),
     ) -> Option<UniqueStore<'g>> {
-        let mut found: Option<UniqueStore<'g>> = None;
+        struct FieldStore<'g> {
+            field: &'g FieldDescriptor,
+            value: &'g LinkArg,
+            ty: &'g ValueType,
+            location: (usize, usize),
+        }
+        let definition = graph.blocks.iter().enumerate().find_map(|(bi, block)| {
+            block
+                .operations
+                .iter()
+                .position(|op| op.result.as_ref() == Some(base))
+                .map(|oi| (bi, oi))
+        })?;
+        let mut stores = Vec::new();
         for (block_idx, block) in graph.blocks.iter().enumerate() {
             for (op_idx, op) in block.operations.iter().enumerate() {
                 let OpKind::FieldWrite {
@@ -4929,76 +5011,42 @@ pub(crate) fn fuse_boxing_alloc_with(
                 if b != base || field.name.as_str() != field_name {
                     continue;
                 }
-                match &mut found {
-                    None => {
-                        found = Some(UniqueStore {
-                            field,
-                            value,
-                            ty,
-                            locations: vec![(block_idx, op_idx)],
-                        })
-                    }
-                    Some(store) if store.value == value => {
-                        store.locations.push((block_idx, op_idx));
-                    }
-                    Some(_) => return None,
-                }
-            }
-        }
-        found
-    }
-    /// Whether this write must execute between `base`'s construction and the
-    /// allocation site.  A graph-wide unique write is not enough: when the
-    /// same aggregate crosses both arms of a branch, a write on only one arm
-    /// does not initialize the allocation reached at the join.
-    ///
-    /// Compute dominance relative to the producer of `base`, rather than the
-    /// function entry.  That preserves the valid sibling shape where each arm
-    /// constructs and initializes its own header before the two header values
-    /// merge: the other arm is not reachable from that producer and therefore
-    /// is not a path along which that particular header can arrive uninitialized.
-    fn store_dominates_site(
-        graph: &FunctionGraph,
-        base: &Variable,
-        store: (usize, usize),
-        site: (usize, usize),
-    ) -> bool {
-        let Some(definition) = graph.blocks.iter().enumerate().find_map(|(bi, block)| {
-            block
-                .operations
-                .iter()
-                .position(|op| op.result.as_ref() == Some(base))
-                .map(|oi| (bi, oi))
-        }) else {
-            return false;
-        };
-        if store.0 == definition.0 && store.1 <= definition.1 {
-            return false;
-        }
-
-        let reaches = |from: usize, to: usize, avoid: Option<usize>| {
-            let mut seen = vec![false; graph.blocks.len()];
-            let mut pending = vec![from];
-            while let Some(block) = pending.pop() {
-                if seen[block] || (avoid == Some(block) && block != from) {
+                if block_idx == definition.0 && op_idx <= definition.1 {
                     continue;
                 }
-                if block == to {
-                    return true;
-                }
-                seen[block] = true;
-                pending.extend(graph.blocks[block].exits.iter().map(|link| link.target.0));
+                stores.push(FieldStore {
+                    field,
+                    value,
+                    ty,
+                    location: (block_idx, op_idx),
+                });
             }
-            false
-        };
-
-        if store.0 == site.0 {
-            return store.1 < site.1 && reaches(definition.0, store.0, None);
         }
-        if !reaches(definition.0, store.0, None) || !reaches(store.0, site.0, None) {
-            return false;
+        let locations: Vec<(usize, usize)> = stores.iter().map(|s| s.location).collect();
+        let reaching: Vec<&FieldStore<'_>> = stores
+            .iter()
+            .filter(|s| {
+                let killers: Vec<(usize, usize)> = locations
+                    .iter()
+                    .copied()
+                    .filter(|&loc| loc != s.location)
+                    .collect();
+                reaches_avoiding_barriers(graph, s.location, site, &killers)
+            })
+            .collect();
+        let first = reaching.first()?;
+        if reaching.iter().any(|s| s.value != first.value) {
+            return None;
         }
-        store.0 == definition.0 || !reaches(definition.0, site.0, Some(store.0))
+        let covering: Vec<(usize, usize)> = reaching.iter().map(|s| s.location).collect();
+        if reaches_avoiding_barriers(graph, definition, site, &covering) {
+            return None;
+        }
+        Some(UniqueStore {
+            field: first.field,
+            value: first.value,
+            ty: first.ty,
+        })
     }
     /// Resolve `var` to producer variables through `Block.inputargs` phis.
     /// Stores name producers rather than phis, and every incoming root must
@@ -5240,23 +5288,16 @@ pub(crate) fn fuse_boxing_alloc_with(
     }
     /// The `&T` a runtime `get_instantiate(&T)` call was handed.
     ///
-    /// The helper is accepted only under the external runtime owner or the
-    /// generic corpus owner. The caller separately proves that its sole
-    /// argument is the exact class address stored in the header.
+    /// Identity is the CallPath [`crate::runtime_names::modules::GET_INSTANTIATE`]
+    /// holds (and the corpus twin). The caller separately proves that its
+    /// sole argument is the exact class address stored in the header.
     fn get_instantiate_arg_addr(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<i64> {
         resolve_addr(graph, var, depth, &|graph, kind, depth| match kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
-            } if args.len() == 1
-                && matches!(
-                    segments.as_slice(),
-                    [.., owner, leaf]
-                        if matches!(owner.as_str(), "pyobject" | "object_model")
-                            && leaf == "get_instantiate"
-                ) =>
-            {
+            } if is_get_instantiate_path(segments, args) => {
                 const_ref_addr(graph, &args[0], depth - 1)
             }
             _ => None,
@@ -5434,14 +5475,17 @@ pub(crate) fn fuse_boxing_alloc_with(
                 );
                 return None;
             };
-            let type_store = unique_store(graph, root, "ob_type");
+            if any_store(graph, root, "ob_type") && !declares_type_word {
+                crate::decline::record(
+                    VTABLE_GATE,
+                    "ob_type-store-contradicts-layout",
+                    format_args!("{}", graph.name),
+                );
+                return None;
+            }
+            let type_store = unique_store(graph, root, "ob_type", site);
             let root_vtable = match type_store {
-                Some(store)
-                    if declares_type_word
-                        && store.locations.iter().any(|&(block, op)| {
-                            store_dominates_site(graph, root, (block, op), site)
-                        }) =>
-                {
+                Some(store) if declares_type_word => {
                     let Some(vtable) = store
                         .value
                         .as_variable()
@@ -5474,19 +5518,11 @@ pub(crate) fn fuse_boxing_alloc_with(
                     };
                     Some(vtable)
                 }
-                Some(_) if !declares_type_word => {
-                    crate::decline::record(
-                        VTABLE_GATE,
-                        "ob_type-store-contradicts-layout",
-                        format_args!("{}", graph.name),
-                    );
-                    return None;
-                }
                 // A declared type word must have one reaching constant store.
                 // Absence, conflicting writes, or a write that does not
-                // dominate the allocation are all incomplete initialization,
-                // never evidence for upstream's plain `new` arm.
-                _ if declares_type_word => {
+                // cover every path to the allocation are all incomplete
+                // initialization, never evidence for upstream's plain `new` arm.
+                None if declares_type_word => {
                     crate::decline::record(
                         VTABLE_GATE,
                         if any_store(graph, root, "ob_type") {
@@ -5506,23 +5542,16 @@ pub(crate) fn fuse_boxing_alloc_with(
             else {
                 return None;
             };
-            let store = match unique_store(graph, root, "w_class") {
-                // A store to a field absent from the registered layout makes
-                // the layout evidence self-contradictory, so keep the original
-                // allocation rather than guessing which source is correct.
-                Some(_) if !declares_class_word => {
-                    crate::decline::record(
-                        VTABLE_GATE,
-                        "w_class-store-contradicts-layout",
-                        format_args!("{}", graph.name),
-                    );
-                    return None;
-                }
-                Some(store)
-                    if store.locations.iter().any(|&(block, op)| {
-                        store_dominates_site(graph, root, (block, op), site)
-                    }) =>
-                {
+            if any_store(graph, root, "w_class") && !declares_class_word {
+                crate::decline::record(
+                    VTABLE_GATE,
+                    "w_class-store-contradicts-layout",
+                    format_args!("{}", graph.name),
+                );
+                return None;
+            }
+            let store = match unique_store(graph, root, "w_class", site) {
+                Some(store) => {
                     // With no vtable on the allocation there is nothing the
                     // class store could fold into, so it is always kept.
                     let folds = root_vtable.is_some_and(|root_vtable| {
@@ -5544,7 +5573,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                 None if !declares_class_word => None,
                 // A layout that declares `w_class` still needs a unique store
                 // proving that the vtable stands for that per-instance class.
-                Some(_) | None => {
+                None => {
                     crate::decline::record(
                         VTABLE_GATE,
                         "no-unique-w_class-store",
@@ -5783,30 +5812,71 @@ pub(crate) fn fuse_boxing_alloc_with(
                 let skip = usize::from(depth + 1 != chain.len());
                 for (field_name, payload_ty) in fields.iter().skip(skip) {
                     // Inlined nested structs (`W_ListObject.int_items: IntArray`)
-                    // are not payload setfields of the boxing cluster.
-                    // `NewWithVtable` zero-fills them (`clear_gc_fields`); the
-                    // owner then stores dotted leaves (`int_items.block`)
-                    // through `list.int_set_items` / `heaptracker.py
-                    // all_fielddescrs`. A by-value store of the nested struct
-                    // would apply the inner offsets to the outer object and
-                    // overlay `ob_header`.
-                    if expand_inline_struct(level_owner, field_name).is_some() {
+                    // flatten to the same leaves `expand_inline_struct` returns
+                    // (`zero_contents` recurses into an inlined STRUCT;
+                    // `heaptracker.all_fielddescrs` numbers those leaves on
+                    // the GC owner as dotted `int_items.block`). A missing or
+                    // conflicting by-value store, or a value that is not a
+                    // constructor of empty leaves, leaves `malloc_typed`
+                    // residual. Empty leaves stay zero-filled
+                    // (`clear_gc_fields`); live inner stores become payload
+                    // setfields of the fused object.
+                    let site = (rewrite_bi, rewrite_oi);
+                    if let Some(leaves) = expand_inline_struct(level_owner, field_name) {
+                        let Some(store) = unique_store(graph, level, field_name.as_str(), site)
+                        else {
+                            complete = false;
+                            break 'levels;
+                        };
+                        let Some(nested) = store.value.as_variable() else {
+                            complete = false;
+                            break 'levels;
+                        };
+                        let nested_is_ctor = is_synthetic_ctor_result(graph, nested);
+                        let mut saw_leaf = false;
+                        for (leaf, leaf_ty) in leaves {
+                            let inner_name = leaf
+                                .name
+                                .strip_prefix(field_name.as_str())
+                                .and_then(|rest| rest.strip_prefix('.'))
+                                .unwrap_or(leaf.name.as_str())
+                                .to_string();
+                            match unique_store(graph, nested, &inner_name, site) {
+                                Some(inner) => {
+                                    let field = if leaf.name.starts_with(&format!("{field_name}."))
+                                    {
+                                        leaf
+                                    } else {
+                                        FieldDescriptor::new(
+                                            format!("{field_name}.{}", leaf.name),
+                                            Some(level_owner.clone()),
+                                        )
+                                        .with_owner_id(
+                                            majit_ir::descr::struct_id_for_name(level_owner),
+                                        )
+                                    };
+                                    payloads.push(Payload {
+                                        field,
+                                        value: inner.value.clone(),
+                                        ty: leaf_ty,
+                                    });
+                                    saw_leaf = true;
+                                }
+                                None if any_store(graph, nested, &inner_name) => {
+                                    complete = false;
+                                    break 'levels;
+                                }
+                                None => {}
+                            }
+                        }
+                        if !saw_leaf && !nested_is_ctor {
+                            complete = false;
+                            break 'levels;
+                        }
                         continue;
                     }
-                    let found = unique_store(graph, level, field_name.as_str()).and_then(|store| {
-                        store
-                            .locations
-                            .iter()
-                            .any(|&(block, op)| {
-                                store_dominates_site(
-                                    graph,
-                                    level,
-                                    (block, op),
-                                    (rewrite_bi, rewrite_oi),
-                                )
-                            })
-                            .then(|| (store.field.clone(), store.value.clone()))
-                    });
+                    let found = unique_store(graph, level, field_name.as_str(), site)
+                        .map(|store| (store.field.clone(), store.value.clone()));
                     match found {
                         Some((field, value)) => payloads.push(Payload {
                             field,
@@ -6361,15 +6431,10 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
                     && args.len() == 2;
                 // The same single-argument runtime helper recognized by
                 // `get_instantiate_arg_addr`; its result feeds only the class word
-                // removed with the dead header. Restrict the owner so an unrelated
-                // function with the same leaf is never classified as removable.
-                let is_get_instantiate = args.len() == 1
-                    && matches!(
-                        segments.as_slice(),
-                        [.., owner, leaf]
-                            if matches!(owner.as_str(), "pyobject" | "object_model")
-                                && leaf == "get_instantiate"
-                    );
+                // removed with the dead header. Identity is the CallPath
+                // `runtime_names` holds, so an unrelated function with the same
+                // leaf is never classified as removable.
+                let is_get_instantiate = is_get_instantiate_path(segments, args);
                 is_cast || is_get_instantiate
             }
             _ => false,
@@ -13470,10 +13535,22 @@ mod tests {
         };
         // Every row fuses; they differ in whether the `w_class` store survives
         // the rewrite as a `FieldWrite` of its own.
-        let rows: [(&str, &dyn Fn(&mut FunctionGraph, BlockId) -> Var, bool); 3] = [
+        let colliding = |graph: &mut FunctionGraph, blk| {
+            let arg = graph
+                .push_op_var(blk, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
+                .unwrap();
+            call(
+                graph,
+                blk,
+                &["unrelated", "pyobject", "get_instantiate"],
+                vec![arg],
+            )
+        };
+        let rows: [(&str, &dyn Fn(&mut FunctionGraph, BlockId) -> Var, bool); 4] = [
             ("get_instantiate of the type ob_type names", &same, false),
             ("get_instantiate of another type", &other, true),
             ("a w_class read off the shadow stack", &shadow_stack, true),
+            ("get_instantiate under an unrelated owner", &colliding, true),
         ];
         for (feed, build, keeps_store) in rows {
             let mut graph = cluster(build);
@@ -13825,9 +13902,9 @@ mod tests {
 
     #[test]
     fn fuse_boxing_alloc_declines_a_field_written_twice_over() {
-        // A cluster built before a branch may be rewritten on one arm. Without
-        // reaching definitions, conflicting payload or header stores must
-        // decline; redundant stores of the same value may still fuse.
+        // A cluster built before a branch may be rewritten on one arm. Reaching
+        // stores that disagree across paths must decline (`BaseMallocRemover.flowin`
+        // keeps one value per path); redundant stores of the same value may still fuse.
         type Var = crate::flowspace::model::Variable;
         const FLOAT_TYPE_ADDR: i64 = 4357049520;
         const OTHER_TYPE_ADDR: i64 = 4357049600;
@@ -14088,6 +14165,107 @@ mod tests {
                     if segments.last().map(String::as_str) == Some("malloc_typed")
             )
         }));
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_keeps_the_latest_sequential_store() {
+        // `x.f = a; x.f = b; malloc_typed(x)`: `BaseMallocRemover.flowin`
+        // keeps the latest value per path. Fusion must carry `b`, not decline
+        // because two graph-wide stores disagree.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let first = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let second = graph
+            .push_op_var(entry, OpKind::ConstFloat(1.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(entry, field(&agg, "floatval", LinkArg::Value(first)), false);
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", LinkArg::Value(second.clone())),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "sequential overwrite must still fuse"
+        );
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+            })
+            .expect("NewWithVtable must be emitted");
+        match &ops[nwv_pos + 1].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ..
+            } => {
+                assert_eq!(base, &ret);
+                assert_eq!(field.name, "floatval");
+                assert_eq!(value, &second, "the fused payload must be the later store");
+            }
+            other => panic!("expected floatval FieldWrite, got {other:?}"),
+        }
     }
 
     #[test]
@@ -14803,11 +14981,11 @@ mod tests {
     #[test]
     fn fuse_boxing_alloc_skips_inlined_nested_struct_payload() {
         // `w_list_adopt_int_items` builds `W_ListObject` with a by-value
-        // `int_items: IntArray` store. Copying that store onto the fused
-        // `NewWithVtable` result would apply `IntArray.block`'s offset 0
-        // to the list and overlay `ob_header`. Production
-        // `simplify_lowered_graph_expanding` skips those fields; this
-        // fixture is that skip.
+        // empty `int_items: IntArray` constructor. Empty leaves have no
+        // inner stores, so `NewWithVtable` zero-fills them (`clear_gc_fields`)
+        // and the fused object carries no nested payload setfield. Live
+        // inner stores are copied as dotted leaves — see
+        // `fuse_boxing_alloc_carries_inlined_nested_struct_payload`.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
@@ -14979,6 +15157,211 @@ mod tests {
                 "strategy".to_string(),
             ],
             "inlined nested int_items must not become a payload store on the fused result"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_carries_inlined_nested_struct_payload() {
+        // A by-value `IntArray` whose `block` is live, with no later dotted
+        // write: `zero_contents` / `all_fielddescrs` copy that leaf onto the
+        // fused object as `int_items.block`.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested_block = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x2000), true)
+            .unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("IntArray"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: nested.clone(),
+                field: FieldDescriptor {
+                    name: "block".into(),
+                    owner_root: Some("IntArray".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(nested_block.clone()),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some(vec![(
+                FieldDescriptor {
+                    name: "int_items.block".into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                ValueType::Ref(None),
+            )])
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(fused, 1, "the list boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut got: Vec<(String, Option<crate::flowspace::model::Variable>)> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            match &op.kind {
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } if base == &ret => {
+                    got.push((field.name.clone(), value.as_variable().cloned()));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["allocated", "items", "strategy", "int_items.block"],
+            "live nested int_items.block must become a payload store on the fused result"
+        );
+        assert_eq!(
+            got[3].1.as_ref(),
+            Some(&nested_block),
+            "the fused int_items.block must be the nested store's block"
         );
     }
 
