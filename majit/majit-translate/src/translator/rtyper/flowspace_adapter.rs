@@ -9801,6 +9801,187 @@ mod tests {
         );
     }
 
+    /// A nullable `PyObjectRef` field (`p is None`) must keep the True
+    /// arm live so CAST + `jit_force_quasi_immutable` rtype.  When the
+    /// field projects `can_be_None=False`, `binaryop.py is__default`
+    /// const-folds the compare and `annrpython.py flowin` never follows
+    /// that arm (`rtyper.py specialize_block` then never types the CAST).
+    #[test]
+    fn nullable_raw_ptr_field_is_null_path_rtypes_cast_and_force() {
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::{BlockKey, ConstValue, Constant, GraphFunc};
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        fields.fields.insert(
+            "PyObject".to_string(),
+            fields.fields["pyobject::PyObject"].clone(),
+        );
+        fields.fields.insert(
+            "Function".to_string(),
+            vec![
+                ("ob".to_string(), "pyobject::PyObject".to_string()),
+                ("w_qualname".to_string(), "PyObjectRef".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+
+        let path = crate::parse::CallPath::for_impl_method("Function", "jit_force_quasi_immutable");
+        let mut func = GraphFunc::new(
+            "jit_force_quasi_immutable",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func._jit_llop_ = Some("jit_force_quasi_immutable".into());
+        registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(path.segments.iter().cloned()),
+            Signature::new(vec!["self".into(), "mutatefieldname".into()], None, None),
+            func,
+        );
+
+        let mut graph = LegacyGraph::new("nullable_field_is_null_then_cast_force");
+        let entry = graph.startblock;
+        let obj = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(Some("Function".to_string())),
+                    class_root: Some("Function".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, obj.clone());
+        let field = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: obj.clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        "w_qualname",
+                        Some("Function".into()),
+                    ),
+                    ty: ValueType::Ref(Some("pyobject::PyObject".into())),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        let none = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        let is_null = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: field.clone(),
+                    rhs: none,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (b_hit, hit_args) = graph.create_block_with_arg_vars(1);
+        let (b_pin, pin_args) = graph.create_block_with_arg_vars(1);
+        graph.set_branch(
+            entry,
+            is_null,
+            b_pin,
+            vec![obj.clone()],
+            b_hit,
+            vec![obj.clone()],
+        );
+        graph.set_return(b_hit, Some(hit_args[0].clone()));
+
+        let cast_dest = graph
+            .push_op_var(
+                b_pin,
+                crate::model::cast_instance_call("Function", pin_args[0].clone()),
+                true,
+            )
+            .unwrap();
+        graph
+            .push_op_var(
+                b_pin,
+                OpKind::Call {
+                    target: crate::model::CallTarget::Method {
+                        name: "jit_force_quasi_immutable".to_string(),
+                        receiver_root: Some("Function".to_string()),
+                        resolved_path: Some(path),
+                        fun_decl_id: None,
+                        branch_payloads: None,
+                    },
+                    args: vec![
+                        crate::model::LinkArg::from(cast_dest.clone()),
+                        crate::model::LinkArg::from(ConstValue::byte_str("mutate_w_qualname")),
+                    ],
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(b_pin, Some(cast_dest.clone()));
+
+        let (value_to_var, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                .expect("nullable is-None arm must annotate and rtype CAST + force");
+        let cast_twin = value_to_var
+            .get(&cast_dest)
+            .expect("CAST dest must project");
+        let ct = cast_twin
+            .concretetype()
+            .expect("rtype_cast_instance_intrinsic must type the CAST dest");
+        let dbg = format!("{ct:?}");
+        assert!(
+            matches!(&ct, LowLevelType::Ptr(_)),
+            "CAST dest must be Ptr, got {dbg}"
+        );
+        assert!(
+            dbg.contains("Function"),
+            "CAST dest must name Function, got {dbg}"
+        );
+        assert!(
+            !dbg.contains("GCREF") && !dbg.contains("Opaque"),
+            "CAST dest must not be GCREF, got {dbg}"
+        );
+
+        let (ann, rtyper) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let already_seen = rtyper.already_seen.borrow();
+        let mut saw_force = false;
+        for block in graph_ref.borrow().iterblocks() {
+            if !already_seen.contains_key(&BlockKey::of(&block)) {
+                continue;
+            }
+            let block_b = block.borrow();
+            if block_b
+                .operations
+                .iter()
+                .any(|op| op.opname == "jit_force_quasi_immutable")
+            {
+                saw_force = true;
+            }
+        }
+        assert!(
+            saw_force,
+            "rtype_jit_force_quasi_immutable must dispatch on the is-None arm"
+        );
+    }
+
     /// The frontend cannot see the adapter's expansion: `lower_function`
     /// still contains the raw `alloc::vec::from_elem` call, while the
     /// flowspace graph must carry `newlist` + `mul` instead.  This real-LLBC
