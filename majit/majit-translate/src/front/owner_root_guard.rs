@@ -318,8 +318,10 @@ fn callee_stays_residual(
     dont_look_inside.contains(&path)
 }
 
-/// `is_some` / `is_none` on `Option<OwnerRootGuard>` are the nullable-pointer
-/// predicate (`front::option_is_none`), not a call into `core`.
+/// `is_some` / `is_none` on `Option<OwnerRootGuard>` call the core
+/// predicate bodies. Those bodies' `Discriminant` fold is a
+/// nullable-pointer test, not an escape of the guard into a residual
+/// callee.
 fn niche_option_predicate(call: &CallPayload, llbc: &Llbc) -> bool {
     let CallFunc::Regular(reg) = &call.func else {
         return false;

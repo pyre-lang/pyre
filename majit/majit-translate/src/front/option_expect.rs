@@ -43,7 +43,7 @@
 //! keeps the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::expect(opt, msg)` call site captured during body

@@ -21,9 +21,8 @@
 
 use crate::model::CallTarget;
 
-/// `None` = 0, `Some` = 1 — the tag `front::option_is_none`,
-/// `front::checked_arith_uint` and `front::slice_first` all read and write
-/// for this enum.
+/// `None` = 0, `Some` = 1 — the tag `Rvalue::Discriminant` reads and
+/// `front::checked_arith_uint` / `front::slice_first` write for this enum.
 const NONE_TAG: i64 = 0;
 const SOME_TAG: i64 = 1;
 

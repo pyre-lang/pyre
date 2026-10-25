@@ -3910,9 +3910,10 @@ impl Repr for InstanceRepr {
         // `UnsignedLongLong`, and `cast_bool_to_int` otherwise, rather than a
         // class field (which does not exist and rtypes to Void).  Mirrors the
         // `CanBeNull.rtype_bool` `ptr_nonzero` lowering (rmodel.py) and the
-        // front-end `Discriminant` niche fold's in-place null test; the
-        // `option_is_none` post-pass emits this `__discriminant` FieldRead for
-        // both niche and aggregate `is_some`/`is_none` receivers.
+        // front-end `Discriminant` niche fold's in-place null test. A tagged
+        // Option's core `is_none`/`is_some` body reads `__discriminant` as
+        // this FieldRead; a niche Option's body folds the same Discriminant
+        // to a pointer-null test, so it does not reach this arm.
         //
         // Gate on the receiver being a genuinely nullable instance
         // (`SomeInstance.can_be_none`): only a niche `Option<&T>` reads its

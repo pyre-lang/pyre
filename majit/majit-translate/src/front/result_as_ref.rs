@@ -6,7 +6,7 @@
 //! Keep distinct source/destination enum owners, as rclass.InstanceRepr does.
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{
+use crate::front::option_variant::{
     close_goto_mixed, emit_sum_variant, map_source, reproduce_exit_args,
 };
 use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};

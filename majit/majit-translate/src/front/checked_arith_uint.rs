@@ -48,7 +48,7 @@
 //! skipped).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::emit_option_variant_dynamic;
+use crate::front::option_variant::emit_option_variant_dynamic;
 use crate::model::{FunctionGraph, OpKind, SpaceOperation, ValueType};
 
 /// A recorded unsigned `checked_{add,sub,mul}` call whose result is an
@@ -404,7 +404,7 @@ fn rewire_one_checked_arith_uint_site(
         }
     };
 
-    crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[a].id)?;
+    crate::front::option_variant::validate_dynamic_option_exit(graph, graph.blocks[a].id)?;
 
     // All structural validation passed; mutate the graph.
 

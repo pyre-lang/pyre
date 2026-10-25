@@ -4391,8 +4391,26 @@ impl Bookkeeper {
             if matches!(s_inner, SomeValue::Ptr(_)) {
                 return s_inner;
             }
+            // The Option is the one-word nullable payload exactly when
+            // `union(payload, s_None)` succeeds (`model.py`
+            // `SomeObject.noneify` raising `UnionError` for annotations
+            // that cannot hold None); otherwise it is the split tagged
+            // enum instance.
             let s_none = super::model::s_none();
-            return super::model::unionof([&s_inner, &s_none]).unwrap_or(SomeValue::Impossible);
+            match super::model::unionof([&s_inner, &s_none]) {
+                Ok(s) => return s,
+                Err(_) => {
+                    let root = majit_ir::descr::canonical_struct_name(stripped);
+                    return match self.getuniqueclassdef_for_struct_root(&root) {
+                        Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
+                            Some(classdef),
+                            false,
+                            std::collections::BTreeMap::new(),
+                        )),
+                        Err(_) => SomeValue::Impossible,
+                    };
+                }
+            }
         }
         if let Some(inner) = strip_generic_one(stripped, "Result<") {
             let parts = split_generic_args(inner);
@@ -7150,6 +7168,149 @@ mod tests {
         assert!(
             matches!(bk.project_struct_field_type("[u8]"), SomeValue::List(_)),
             "bare [u8] stays a list of unsigned"
+        );
+    }
+
+    #[test]
+    fn tagged_option_of_scalar_projects_instantiation_classdef() {
+        // `Option<usize>` is a tagged enum instance, not `uint ∪ None`.
+        // The interned class is the same object `getuniqueclassdef`
+        // returns for the instantiation root (`bookkeeper.py`).
+        use crate::front::StructFieldRegistry;
+
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        for (root, payload) in [
+            ("Option<usize>", "usize"),
+            ("Option<i64>", "i64"),
+            ("Option<bool>", "bool"),
+        ] {
+            reg.fields.insert(
+                root.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+            reg.fields.insert(
+                format!("{root}::Some"),
+                vec![("__pos_0".to_string(), payload.to_string())],
+            );
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        for (row, root) in [
+            ("Option<usize>", "Option<usize>"),
+            ("Option<i64>", "Option<i64>"),
+            ("Option<bool>", "Option<bool>"),
+        ] {
+            assert_eq!(
+                majit_ir::descr::canonical_struct_name(row),
+                root,
+                "intern_class_by_qualname / canonical_struct_name of {row}"
+            );
+            let projected = bk.project_struct_field_type(row);
+            let SomeValue::Instance(inst) = &projected else {
+                panic!("{row} must project to SomeInstance, got {projected:?}");
+            };
+            let classdef = inst
+                .classdef
+                .as_ref()
+                .expect("tagged Option must carry a classdef")
+                .clone();
+            let expected = bk
+                .getuniqueclassdef_for_struct_root(root)
+                .unwrap_or_else(|_| panic!("{root} classdef"));
+            assert!(
+                Rc::ptr_eq(&classdef, &expected),
+                "{row} classdef must be the {root} instantiation, got {}",
+                classdef.borrow().name
+            );
+            assert_eq!(classdef.borrow().name, root);
+        }
+    }
+
+    #[test]
+    fn niche_option_payloads_keep_nullable_projection() {
+        // Pointer-niche / noneable-instance Option rows keep the
+        // nullable-payload model: a window stays a window, a Ptr stays
+        // a Ptr, a classed instance stays that instance (`can_be_None`).
+        use crate::annotator::model::{s_none, unionof};
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Option<&[u8]>"),
+                SomeValue::Tuple(_)
+            ),
+            "Option<&[u8]> stays a nullable window"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Option<*mut GCREFOpaque>"),
+                SomeValue::Ptr(_)
+            ),
+            "Option<*mut GCREFOpaque> stays the inner Ptr"
+        );
+
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "HostFrame".to_string(),
+            vec![("depth".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let inner = bk.project_struct_field_type("HostFrame");
+        let via_noneify = inner.noneify().expect("a classed instance admits None");
+        let via_union = unionof([&inner, &s_none()]).expect("Instance ∪ None_ is noneify");
+        assert_eq!(
+            via_noneify, via_union,
+            "noneify of a noneable payload equals unionof(_, s_none)"
+        );
+        let projected = bk.project_struct_field_type("Option<HostFrame>");
+        let SomeValue::Instance(inner_inst) = &inner else {
+            panic!("HostFrame projects to SomeInstance, got {inner:?}");
+        };
+        let SomeValue::Instance(opt_inst) = &projected else {
+            panic!("Option<HostFrame> stays a nullable instance, got {projected:?}");
+        };
+        assert!(
+            opt_inst.can_be_none,
+            "Option of a classed instance is the noneable instance"
+        );
+        match (&inner_inst.classdef, &opt_inst.classdef) {
+            (Some(a), Some(b)) => assert!(
+                Rc::ptr_eq(a, b),
+                "Option<HostFrame> keeps the HostFrame classdef, not an Option shell"
+            ),
+            other => panic!("both projections carry the HostFrame classdef, got {other:?}"),
+        }
+
+        // Unregistered payload: `Impossible ∪ s_None` is `s_None`
+        // (`pairtype(SomeImpossibleValue, SomeObject).union` returns
+        // the other side). `Impossible.noneify()` is Err, so a
+        // noneify predicate would mint a tagged Option instance.
+        let unregistered = bk.project_struct_field_type("UnregisteredPayload");
+        assert!(
+            matches!(unregistered, SomeValue::Impossible),
+            "unregistered named struct projects Impossible"
+        );
+        assert_eq!(
+            unionof([&unregistered, &s_none()]).expect("Impossible ∪ None_ is s_None"),
+            s_none()
+        );
+        assert!(
+            unregistered.noneify().is_err(),
+            "Impossible.noneify is UnionError"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("Option<UnregisteredPayload>"),
+            s_none(),
+            "Option of an unregistered payload is s_None, not a tagged instance"
         );
     }
 

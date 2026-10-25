@@ -905,49 +905,26 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
     );
 }
 
-/// `bool::then` and `bool::then_some` both lift to the short-circuit
-/// `Option` diamond. `then` calls the closure's `call_once`; `then_some`
-/// wraps an already-evaluated value and emits no `call_once`.
+/// `bool::then_some` stays an ordinary call to the extracted core body;
+/// the Some/None diamond lives in that graph. `bool::then` still rewrites
+/// at the caller: its closure `call_once` is not a function-item unpack.
 #[test]
 fn bool_then_lifts_to_short_circuit_diamond() {
-    use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
-    let cases = [
-        (
-            "closure",
-            "bool_then_closure",
-            "then",
-            1usize,
-            "the residual `core::bool::then` call must be replaced by the diamond",
-            "the then arm calls the closure's `call_once`",
-            "the then arm builds `Some(payload)`",
-            "the else arm builds `None`",
-        ),
-        (
-            "some",
-            "bool_then_some",
-            "then_some",
-            0usize,
-            "the residual `core::bool::then_some` call must be replaced by the diamond",
-            "the then_some arm wraps the eager value directly — no `call_once`",
-            "the then arm builds `Some(value)`",
-            "the else arm builds `None`",
-        ),
-    ];
-    for (
-        name,
-        fn_name,
-        residual_name,
-        want_call_once,
-        residual_msg,
-        call_once_msg,
-        some_msg,
-        none_msg,
-    ) in cases
-    {
-        let llbc = load_corpus();
-        let graph = lower_function(llbc, fn_name).expect("lowering");
-        let reachable = reachable_blocks(&graph);
-        let mut residual = 0usize;
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{CallTarget, ExitSwitch, FunctionGraph, OpKind};
+
+    fn is_call_once(target: &CallTarget) -> bool {
+        match target {
+            CallTarget::Method { name, .. } => name == "call_once",
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().map(String::as_str) == Some("call_once")
+            }
+            _ => false,
+        }
+    }
+
+    fn diamond_counts(graph: &FunctionGraph) -> (usize, usize, usize, usize) {
+        let reachable = reachable_blocks(graph);
         let mut call_once = 0usize;
         let mut bool_branches = 0usize;
         let mut some_ctor = 0usize;
@@ -959,42 +936,115 @@ fn bool_then_lifts_to_short_circuit_diamond() {
             if matches!(b.exitswitch, Some(ExitSwitch::Value(_))) {
                 bool_branches += 1;
             }
-            let mut last_disc: Option<i64> = None;
             for op in &b.operations {
                 match &op.kind {
+                    OpKind::Call { target, .. } if is_call_once(target) => call_once += 1,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
+                        target: CallTarget::SyntheticTransparentCtor { name, .. },
                         ..
-                    } if segments.last().map(String::as_str) == Some(residual_name)
-                        && segments.iter().any(|s| s == "bool") =>
-                    {
-                        residual += 1
-                    }
+                    } if name == "Some" => some_ctor += 1,
                     OpKind::Call {
-                        target: CallTarget::Method { name: method, .. },
+                        target: CallTarget::SyntheticTransparentCtor { name, .. },
                         ..
-                    } if method == "call_once" => call_once += 1,
-                    OpKind::ConstInt(d) => last_disc = Some(*d),
-                    OpKind::FieldWrite { field, .. } if field.name == "__discriminant" => {
-                        match last_disc {
-                            Some(1) => some_ctor += 1,
-                            Some(0) => none_ctor += 1,
-                            _ => {}
-                        }
-                    }
+                    } if name == "None" => none_ctor += 1,
                     _ => {}
                 }
             }
         }
-        assert_eq!(residual, 0, "case {name}: {residual_msg}");
-        assert_eq!(call_once, want_call_once, "case {name}: {call_once_msg}");
-        assert_eq!(
-            bool_branches, 1,
-            "case {name}: the call block closes with a single `bool(cond)` branch"
-        );
-        assert_eq!(some_ctor, 1, "case {name}: {some_msg}");
-        assert_eq!(none_ctor, 1, "case {name}: {none_msg}");
+        (call_once, bool_branches, some_ctor, none_ctor)
     }
+
+    fn residual_bool_calls(graph: &FunctionGraph, leaf: &str) -> usize {
+        let reachable = reachable_blocks(graph);
+        let mut residual = 0usize;
+        for b in &graph.blocks {
+            if !reachable.contains(&b.id) {
+                continue;
+            }
+            for op in &b.operations {
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } = &op.kind
+                    && segments.last().map(String::as_str) == Some(leaf)
+                    && segments.iter().any(|s| s == "bool")
+                {
+                    residual += 1;
+                }
+            }
+        }
+        residual
+    }
+
+    let llbc = load_corpus();
+
+    let then_graph = lower_function(llbc, "bool_then_closure").expect("lowering");
+    let (call_once, bool_branches, _some_ctor, _none_ctor) = diamond_counts(&then_graph);
+    assert_eq!(
+        residual_bool_calls(&then_graph, "then"),
+        0,
+        "then: the caller rewrite consumes the residual call"
+    );
+    assert!(
+        call_once >= 1,
+        "then: the rewrite arm invokes the closure (call_once={call_once})"
+    );
+    assert!(
+        bool_branches >= 1,
+        "then: the caller hosts the short-circuit branch (branches={bool_branches})"
+    );
+
+    let some_graph = lower_function(llbc, "bool_then_some").expect("lowering");
+    let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&some_graph);
+    assert_eq!(
+        residual_bool_calls(&some_graph, "then_some"),
+        1,
+        "then_some: caller keeps a regular call to the core body"
+    );
+    assert_eq!(call_once, 0, "then_some: the core body wraps the value");
+    assert_eq!(
+        bool_branches, 0,
+        "then_some: the caller does not host the Some/None diamond"
+    );
+    assert_eq!(some_ctor, 0, "then_some: Some is built in the core body");
+    assert_eq!(none_ctor, 0, "then_some: None is built in the core body");
+
+    let mut lowered_core_bodies = 0usize;
+    for artefact in [llbc, load_llbc(INTERPRETER_LLBC)] {
+        let ctx = LowerContext::new(artefact);
+        for fd in artefact.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let path = fd.item_meta.name_path();
+            if !path.ends_with("::bool::<Impl>::then_some") {
+                continue;
+            }
+            let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+            let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
+            assert!(
+                bool_branches >= 1,
+                "{path}: core body branches on self (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+            );
+            assert!(
+                some_ctor >= 1,
+                "{path}: then arm builds Some (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+            );
+            assert!(
+                none_ctor >= 1,
+                "{path}: else arm builds None (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+            );
+            assert_eq!(
+                call_once, 0,
+                "{path}: then_some wraps the value, no call_once"
+            );
+            lowered_core_bodies += 1;
+        }
+    }
+    let _ = lowered_core_bodies;
 }
 
 /// `option_question_mark`'s `let v = opt?` lifts the residual
@@ -3560,13 +3610,9 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
         );
         assert!(
             !calls.iter().any(|call| {
-                call.ends_with("::is_some")
-                    || call.ends_with("::is_none")
-                    || call.ends_with("::take")
-                    || call.ends_with("::drop")
-                    || call.contains("DropGlue")
+                call.ends_with("::take") || call.ends_with("::drop") || call.contains("DropGlue")
             }),
-            "{source} still calls an option/drop of the guard: {calls:?}"
+            "{source} still calls take/drop of the guard: {calls:?}"
         );
     }
 }

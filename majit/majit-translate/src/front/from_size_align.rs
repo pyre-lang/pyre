@@ -51,11 +51,11 @@
 //! census Skip (no regression).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{
+use crate::front::checked_arith_uint::{push_binop, push_const_int};
+use crate::front::option_variant::{
     close_goto_mixed, emit_option_variant, emit_sum_variant_dynamic, map_source,
     reproduce_exit_args,
 };
-use crate::front::checked_arith_uint::{push_binop, push_const_int};
 use crate::model::{
     BlockId, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
 };
@@ -562,10 +562,10 @@ fn rewire_one_from_size_align_call_site(
     let (size, align_arg) = from_size_align_operands(&graph.blocks[a].operations[call_idx].kind)
         .expect("gated on from_size_align_operands");
 
-    crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[a].id)?;
-    // `emit_sum_variant_dynamic` keys the Ok payload on `{result_owner}::Ok`
-    // (`bool_then::emit_sum_variant_dynamic`); decline before truncating so a
-    // mismatched owner leaves the residual Call (census Skip).
+    crate::front::option_variant::validate_dynamic_option_exit(graph, graph.blocks[a].id)?;
+    // `emit_sum_variant_dynamic` keys the Ok payload on `{result_owner}::Ok`;
+    // decline before truncating so a mismatched owner leaves the residual
+    // Call (census Skip).
     let expected_ok = format!("{}::Ok", site.result_owner);
     if site.ok_owner != expected_ok {
         return Err(format!(
@@ -739,7 +739,7 @@ fn rewire_one_from_size_align_site(
 
     // All structural validation passed; mutate the graph.
 
-    crate::front::bool_then::validate_dynamic_option_exit(graph, graph.blocks[p].id)?;
+    crate::front::option_variant::validate_dynamic_option_exit(graph, graph.blocks[p].id)?;
     // The rewritten .ok() forwards Q's own input, not the now-removed P
     // result. RPython Link.args -> Block.inputargs is the value boundary.
     // Extra Q operations reading a legacy cross-block alias need their own

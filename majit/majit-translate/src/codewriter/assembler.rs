@@ -13368,43 +13368,63 @@ mod tests {
 
     /// `Option<fn>` is-none is `int_eq` of two int-bank addresses
     /// (`jtransform.py` `rewrite_op_ptr_eq` / `_rewrite_nongc_ptrs`).
-    /// The null arm is `null_fn` (`ValueType::Int`), same bank as the
-    /// function pointer, so the compare is `ii`, never `int_is_/ri`.
+    /// The caller keeps the call to the core `is_none` body. That body
+    /// is `matches!(*self, None)`; for an int-banked niche the
+    /// `Discriminant` fold emits `is_` against `null_fn`
+    /// (`ValueType::Int`), same bank as the function pointer, so the
+    /// compare is `ii`, never `int_is_/ri`.
     #[test]
     fn option_fn_is_none_lowers_to_int_eq() {
         use crate::flatten::flatten_graph;
-        use crate::front::option_is_none::{IsNoneSite, rewire_is_none_call_sites};
-        use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+        use crate::model::{CallTarget, FunctionGraph, NicheIntNull, OpKind, ValueType};
+
+        let mut caller = FunctionGraph::new("option_fn_is_none_caller");
+        let caller_opt = push_input_var(&mut caller, "opt", ValueType::Int);
+        let caller_result = caller
+            .push_op_var(
+                caller.startblock,
+                OpKind::Call {
+                    target: CallTarget::method("is_none", Some("core::option::Option".into())),
+                    args: crate::model::call_args(vec![caller_opt.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        caller.set_return(caller.startblock, Some(caller_result.clone()));
+        let caller_keeps_is_none = caller.blocks.iter().flat_map(|block| &block.operations).any(
+            |op| matches!(&op.kind, OpKind::Call { target, .. } if target.to_string().contains("is_none")),
+        );
+        assert!(
+            caller_keeps_is_none,
+            "caller keeps the core is_none call, got {:?}",
+            caller
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .map(|op| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
 
         let mut graph = FunctionGraph::new("option_fn_is_none");
         let opt = push_input_var(&mut graph, "opt", ValueType::Int);
+        let start = graph.startblock;
+        let null = NicheIntNull::FnPtr(None).push(&mut graph, start);
         let result = graph
             .push_op_var(
                 graph.startblock,
-                OpKind::Call {
-                    target: CallTarget::method("is_none", Some("core::option::Option".into())),
-                    args: crate::model::call_args(vec![opt.clone()]),
+                OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: opt.clone(),
+                    rhs: null.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
             )
             .unwrap();
         graph.set_return(graph.startblock, Some(result.clone()));
-        let rewritten = rewire_is_none_call_sites(
-            &mut graph,
-            &[IsNoneSite {
-                result_var: result.clone(),
-                option_owner: "core::option::Option".into(),
-                is_some: false,
-                niche: true,
-                niche_null_cast: None,
-                int_null: Some(crate::model::NicheIntNull::FnPtr(None)),
-                scalar_niche: false,
-            }],
-        );
-        assert_eq!(rewritten, 1);
 
-        let null = graph
+        let null_call = graph
             .blocks
             .iter()
             .flat_map(|block| &block.operations)
@@ -13423,6 +13443,7 @@ mod tests {
                 _ => None,
             })
             .expect("null_fn Int");
+        assert_eq!(null_call, null);
         let is_none = graph
             .blocks
             .iter()

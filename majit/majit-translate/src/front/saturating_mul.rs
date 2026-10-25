@@ -37,7 +37,7 @@
 //! is left untouched.
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 pub(crate) fn rewire_saturating_mul_call_sites(

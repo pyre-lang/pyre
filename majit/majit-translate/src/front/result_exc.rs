@@ -3400,7 +3400,7 @@ fn rewire_one_option_ok_or_else_try_site(
     site: &OptionOkOrElseTrySite,
     enclosing_scoped: bool,
 ) -> Result<(), String> {
-    use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+    use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 
     let name = graph.name.clone();
     let a = graph

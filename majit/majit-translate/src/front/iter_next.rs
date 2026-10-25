@@ -674,10 +674,10 @@ fn is_recast_narrow(kind: &OpKind) -> bool {
 /// or a list element that needs no narrow) the chain is length 0 and this
 /// returns `opt` unchanged.  Any other shape declines (fail-safe).
 ///
-/// Shared with `front::bool_then`: a residual `then`/`then_some` produces the
-/// same opaque `Ref` narrowed to the concrete `Option<T>` by a
-/// `__cast_instance_intrinsic` recast tail, so it peels the identical chain (the
-/// caller passes its own `op_label` for the decline messages).
+/// Other residual combinators produce the same opaque `Ref` narrowed to the
+/// concrete `Option<T>` by a `__cast_instance_intrinsic` recast tail, so they
+/// peel the identical chain (the caller passes its own `op_label` for the
+/// decline messages).
 pub(crate) fn peel_recast_chain(
     graph: &FunctionGraph,
     a: usize,

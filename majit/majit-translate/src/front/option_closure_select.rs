@@ -39,10 +39,10 @@
 //! census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{
+use crate::front::option_map_or::emit_narrow;
+use crate::front::option_variant::{
     close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
 };
-use crate::front::option_map_or::emit_narrow;
 use crate::model::{
     BlockId, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
 };

@@ -33,7 +33,7 @@
 //! existing rtyper Skip / legacy-walker fallback.
 
 use crate::flowspace::model::{ConstValue, Constant, Variable};
-use crate::front::bool_then::{emit_option_variant, map_source};
+use crate::front::option_variant::{emit_option_variant, map_source};
 use crate::front::result_exc::{
     assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
     follow_single_exit, op_operand_vars, split_diamond_exits,
