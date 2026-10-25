@@ -532,14 +532,18 @@ impl CallRegistry {
     /// Seed each struct-root class `HostObject`'s dict with its
     /// registered impl-method function hosts.
     ///
-    /// classdesc.py:606-618 — a class's methods live in its class
-    /// `__dict__`, so `SomeInstance.getattr(method)` resolves through
+    /// A class's methods live in its class `__dict__`, so
+    /// `SomeInstance.getattr(method)` resolves through
     /// `check_missing_attribute_update` → `find_source_for` →
     /// `s_get_value` (Constant function arm) → `bind_callables_under`
     /// to a bound-`MethodDesc` `SomePBC`.  Pyre's struct-root classes
     /// are interned from the field registry with an empty dict, so a
     /// method getattr found no source and the block stayed blocked
-    /// forever.  Walk the registered entries: every path
+    /// forever.  Method membership follows each spelling's owner
+    /// (`classdesc.py ClassDesc.find_source_for`); one FunctionDesc
+    /// may be reachable under several spellings
+    /// (`bookkeeper.py Bookkeeper.getdesc`).  Walk every registered
+    /// spelling (canonical `entries` keys and `aliases`): every path
     /// `[.., Owner, method]` whose `Owner` is a struct-field-registry
     /// root names a method of that class — install the entry's
     /// function `HostObject` (Arc-identical to the one
@@ -589,7 +593,15 @@ impl CallRegistry {
             }
         }
         let entries = self.entries.borrow();
-        let mut sorted_entries: Vec<_> = entries.iter().collect();
+        let aliases = self.aliases.borrow();
+        let mut sorted_entries: Vec<(&FunctionPathKey, &Rc<FunctionEntry>)> =
+            Vec::with_capacity(entries.len() + aliases.len());
+        sorted_entries.extend(entries.iter());
+        for (alias_key, canonical_key) in aliases.iter() {
+            if let Some(entry) = entries.get(canonical_key) {
+                sorted_entries.push((alias_key, entry));
+            }
+        }
         // Pin HashMap order because class_set preserves member insertion order.
         sorted_entries.sort_by_cached_key(|(key, _)| key.segments().join("::"));
         for (key, entry) in sorted_entries {

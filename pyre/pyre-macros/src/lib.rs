@@ -2081,7 +2081,12 @@ fn expand_pyre_class(
             /// A birth in the old generation instead kept every such object,
             /// and everything it pointed at, alive until the next major: a
             /// `copy_for_type` descriptor held its class that long.
+            /// The allocation is nonmovable, which `jtransform.py
+            /// rewrite_op_malloc` refuses (`UnsupportedMallocFlags`), so the
+            /// function is `dont_look_inside` and its calls are residual
+            /// (`policy.py look_inside_graph`).
             #[allow(dead_code)]
+            #[::majit_macros::dont_look_inside]
             pub fn allocate(payload: Self) -> ::pyre_object::PyObjectRef {
                 let _roots = ::pyre_object::gc_roots::push_roots();
                 let full = Self {
@@ -2099,7 +2104,12 @@ fn expand_pyre_class(
             /// relocates.  Required for a self-mutating payload whose methods
             /// re-derive `self` from a raw `PyObjectRef` across an allocating
             /// call — a movable object would leave that raw pointer stale.
+            /// The allocation is nonmovable, which `jtransform.py
+            /// rewrite_op_malloc` refuses (`UnsupportedMallocFlags`), so the
+            /// function is `dont_look_inside` and its calls are residual
+            /// (`policy.py look_inside_graph`).
             #[allow(dead_code)]
+            #[::majit_macros::dont_look_inside]
             pub fn allocate_stable(payload: Self) -> ::pyre_object::PyObjectRef {
                 let _roots = ::pyre_object::gc_roots::push_roots();
                 let full = Self {

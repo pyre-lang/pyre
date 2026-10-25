@@ -38,8 +38,7 @@
 //! `front/` that named none would not be doing its job.
 //!
 //! **Diagnostic text.** The error and panic messages that spell a shim or a
-//! crate, plus two skip labels (`callee-pyre-class-ctor`,
-//! `skip-pyre-class-allocate-ctor`). These are not the failure this module
+//! crate. These are not the failure this module
 //! exists to prevent. The lookup sites moved because a lookup that misses is
 //! SILENT — the operation falls back and nothing counts it. A message is read
 //! by whoever hits it, so a stale one announces itself; routing it through a

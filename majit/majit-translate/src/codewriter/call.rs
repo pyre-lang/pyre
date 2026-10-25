@@ -111,8 +111,38 @@ pub(crate) fn access_directly_identity_origin(origin: &CallPath, aliases: &[Call
 /// True when `kind` is an identity whose result is the value it reloads or
 /// casts: the predicates `jtransform` folds to `same_as`, plus a GC-root
 /// reload (`is_gc_root_reload`). The reloaded value is the call's first
-/// argument, the way `peel_recast_to_source` identifies it.
+/// argument, the way `peel_recast_to_source` identifies it. An AccessDirect
+/// retarget of that callee is still identity: `jtransform.py
+/// rewrite_op_same_as` folds the origin call, and `annrpython.py
+/// setbinding` keeps one Variable.
 fn call_is_access_directly_identity(kind: &OpKind) -> bool {
+    if call_kind_is_access_directly_identity(kind) {
+        return true;
+    }
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    let Some(origin_last) = segments
+        .last()
+        .and_then(|leaf| leaf.strip_suffix(ACCESS_DIRECT_ALT_SUFFIX))
+    else {
+        return false;
+    };
+    let mut origin_segments = segments.clone();
+    *origin_segments.last_mut().unwrap() = origin_last.to_string();
+    let origin_kind = OpKind::Call {
+        target: CallTarget::function_path(origin_segments.iter().map(String::as_str)),
+        args: Vec::new(),
+        result_ty: crate::model::ValueType::Void,
+    };
+    call_kind_is_access_directly_identity(&origin_kind)
+}
+
+fn call_kind_is_access_directly_identity(kind: &OpKind) -> bool {
     if crate::front::result_exc::is_recast_narrow(kind)
         || crate::front::result_exc::is_gc_root_reload(kind)
     {
@@ -3675,9 +3705,8 @@ pub struct CallControl {
     pub immutable_array_types: HashSet<String>,
     /// Metadata-only registration carrier — `(name_path segments,
     /// Signature, return token)`.  Populated in `lib.rs` from
-    /// `program.unsafe_fn_stubs`, which chains unsafe path aliases,
-    /// `dont_look_inside` declarations, and `#[pyre_class]`
-    /// `<Owner>::allocate[_stable]` constructors whose return projects to a
+    /// `program.unsafe_fn_stubs`, which chains unsafe path aliases and
+    /// `dont_look_inside` declarations whose return projects to a
     /// token `translator::rtyper::cutover::residual_return_shell` can model.
     /// The contents are therefore wider than the historical field name says.
     /// `CodeWriter::dual_gate_registry` hands the carrier to
@@ -7033,10 +7062,11 @@ impl CallControl {
     /// the `deref` reborrow) forward the flag. A GC-root reload
     /// (`is_gc_root_reload`) forwards it from the value it reloads — the
     /// call's first argument, the way `peel_recast_to_source` identifies
-    /// it. Stored `call_result_flags` are the
-    /// `annrpython.py recursivecall` return binding; a callee that is an
-    /// identity (`FrameView::reload` → `reload_top_root`) flags its
-    /// return through that binding, not a second callee-shape walk.
+    /// it. An identity callee's `recursivecall` return does not bind
+    /// the caller's result; `identity_forward` carries the flag so
+    /// `annrpython.py setbinding` still sees one Variable. Stored
+    /// `call_result_flags` are the `annrpython.py recursivecall`
+    /// return binding of a non-identity call.
     pub(crate) fn access_directly_result_ids(graph: &FunctionGraph) -> HashSet<u64> {
         let unknown = HashSet::new();
         let hinted = Self::access_directly_hinted_ids(graph, &unknown);
@@ -7541,29 +7571,6 @@ impl CallControl {
                         );
                         return Vec::new();
                     }
-                    // `#[pyre_class]`'s `allocate`/`allocate_stable`
-                    // constructors build the object then call the
-                    // non-numeric `lltype::malloc_typed[_stable]`, which
-                    // has no ported general `malloc->new` lowering.  The
-                    // caller resolves them to the
-                    // `collect_marked_class_ctor_stubs_from_llbc` residual
-                    // stub, so — like a builtin — the BFS must not follow
-                    // the constructor body: otherwise the two-phase census
-                    // annotates its unliftable body (and its transitive
-                    // `malloc_typed_stable`) standalone and reports a
-                    // spurious Phase-A failure for a graph no caller ever
-                    // traces into.
-                    if matches!(
-                        callee_path.last_segment(),
-                        Some("allocate") | Some("allocate_stable")
-                    ) {
-                        crate::decline::record(
-                            BFS_GATE,
-                            "callee-pyre-class-ctor",
-                            format_args!("{callee_path} in {caller}"),
-                        );
-                        return Vec::new();
-                    }
                 }
                 vec![callee_path]
             }
@@ -7820,6 +7827,17 @@ impl CallControl {
                     if !op_returns.is_empty()
                         && let Some(result) = &op.result
                     {
+                        // Identity ops fold to `same_as` in
+                        // `jtransform.py rewrite_op_same_as` /
+                        // `rewrite_op_cast_pointer`; `annrpython.py
+                        // setbinding` then has one Variable. The
+                        // result is decided only by `identity_forward`
+                        // (the same rule `close_carried_flag_ids`
+                        // applies). Callees are still entered above so
+                        // their bodies are walked.
+                        if call_is_access_directly_identity(&op.kind) {
+                            continue;
+                        }
                         let family = family_flag_return(&op_returns);
                         match family {
                             FlagReturn::Impossible => {
@@ -16563,6 +16581,77 @@ mod tests {
         let mut policy = crate::policy::DefaultJitPolicy::new();
         cc.find_helper_graphs(&mut policy, &[caller_path]);
         assert_loopy_callee_not_stamped(&cc, &inner_path);
+    }
+
+    /// A hinted frame that is GC-root reloaded (`is_gc_root_reload`)
+    /// keeps the flag through `identity_forward`. The registered
+    /// reload callee returns unflagged (it reads the shadow-stack
+    /// slot, not its argument); that return does not bind the
+    /// caller's result. The subsequent call to `q` is AccessDirect
+    /// (`jtransform.py rewrite_op_same_as`, `annrpython.py setbinding`).
+    #[test]
+    fn gc_root_reload_keeps_access_directly_for_the_next_call() {
+        let mut cc = CallControl::new();
+        let reload_path = CallPath::from_segments(["gc_roots", "reload_top_root_at"]);
+        let mut reload = graph_with_formals("reload_top_root_at", 2);
+        let other = reload.alloc_value_var();
+        reload.set_return(reload.startblock, Some(other));
+        reload.return_flags = FlagReturn::UNFLAGGED;
+        cc.register_function_graph(reload_path.clone(), reload);
+
+        let q_path = CallPath::from_segments(["q"]);
+        cc.register_function_graph(q_path.clone(), graph_with_formals("q", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        let slot = caller.alloc_value_var();
+        let reloaded = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Hint {
+                value: frame,
+                kind: crate::hints::HintKind::AccessDirectly,
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(reloaded.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["gc_roots", "reload_top_root_at"]),
+                args: crate::model::call_args([hinted, slot]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(q_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([reloaded]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path.clone()]);
+
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        match &caller.block(caller.startblock).operations[2].kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let target = CallPath::from_segments(segments.iter().map(String::as_str));
+                assert_eq!(
+                    target,
+                    access_directly_path(&q_path),
+                    "call to q must retarget to q's AccessDirect copy"
+                );
+            }
+            other => panic!("expected Call to q, got {other:?}"),
+        }
+        assert_access_directly_copy(&cc, &q_path, &[0]);
     }
 
     /// A self-loop whose only binding is itself has no seed, so the flag
