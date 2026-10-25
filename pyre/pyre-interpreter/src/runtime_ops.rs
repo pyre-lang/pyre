@@ -992,11 +992,10 @@ pub fn store_slice_values(
 
 /// BINARY_SLICE evaluation, shared by the interpreter (`binary_slice`)
 /// and the JIT residual (`bh_binary_slice_fn`): returns `obj[start:stop]`.
-/// Exact `list` / `str` / `tuple` slice on element (code-point for `str`)
-/// boundaries; subclasses and everything else (`bytes`, `bytearray`,
-/// instances with `__getitem__`) fall back to a `slice` object dispatched
-/// through `getitem` (`ObjSpace.getslice`). A `None` start/stop defaults
-/// to `0` / `len`.
+/// `list` / `str` / `tuple` slice on element (code-point for `str`)
+/// boundaries; everything else (`bytes`, `bytearray`, instances with
+/// `__getitem__`) falls back to a `slice` object dispatched through
+/// `getitem`. A `None` start/stop defaults to `0` / `len`.
 ///
 /// Residual wrapper around [`binary_slice_values_inner`]. The inner owns
 /// the operand-root bracket. This extra scope pins the three operands
@@ -1056,7 +1055,7 @@ pub(crate) fn binary_slice_values_inner(
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let start = pyre_object::gc_roots::shadow_stack_get(start_slot);
         let stop = pyre_object::gc_roots::shadow_stack_get(stop_slot);
-        if pyre_object::is_exact_list(obj) {
+        if pyre_object::is_list(obj) {
             let s = if pyre_object::is_none(start) {
                 0
             } else {
@@ -1090,7 +1089,7 @@ pub(crate) fn binary_slice_values_inner(
             }
             return Ok(pyre_object::listobject::ll_listslice_inner(obj, s, e));
         }
-        if pyre_object::is_exact_type(obj, &pyre_object::STR_TYPE) {
+        if pyre_object::is_str(obj) {
             // Slice on code-point boundaries over the WTF-8 view, so a
             // surrogate-bearing or multi-byte string slices correctly.  The
             // bounds convert through the object's own index storage
@@ -1135,7 +1134,7 @@ pub(crate) fn binary_slice_values_inner(
                 e - s,
             ));
         }
-        if pyre_object::is_exact_tuple(obj) {
+        if pyre_object::is_tuple(obj) {
             // A tuple's length is fixed, so it is read before the bounds
             // convert; the receiver word is not carried across one, because
             // `eval_slice_index` may run a user `__index__` whose allocation
