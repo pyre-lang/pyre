@@ -10371,6 +10371,11 @@ impl CallControl {
         analyzed: &mut AnalyzedCalls,
         ignore_memoryerror: bool,
     ) -> bool {
+        // `graphanalyze.py GraphAnalyzer.analyze` walks `funcobj.graph`
+        // (`callable_graph_path`); a harvested crate-prefixed spelling is
+        // that graph.
+        let resolved = self.callable_graph_path(path);
+        let path = resolved.as_ref().unwrap_or(path);
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
@@ -10463,6 +10468,11 @@ impl CallControl {
         seen: &mut CallTracker,
         analyzed: &mut AnalyzedCalls,
     ) -> bool {
+        // `graphanalyze.py GraphAnalyzer.analyze` walks `funcobj.graph`
+        // (`callable_graph_path`); a harvested crate-prefixed spelling is
+        // that graph.
+        let resolved = self.callable_graph_path(path);
+        let path = resolved.as_ref().unwrap_or(path);
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             // RPython: external call → analyze_external_call → bottom_result (False).
@@ -10562,6 +10572,11 @@ impl CallControl {
         seen: &mut CallTracker,
         analyzed: &mut AnalyzedCalls,
     ) -> bool {
+        // `graphanalyze.py GraphAnalyzer.analyze` walks `funcobj.graph`
+        // (`callable_graph_path`); a harvested crate-prefixed spelling is
+        // that graph.
+        let resolved = self.callable_graph_path(path);
+        let path = resolved.as_ref().unwrap_or(path);
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => {
@@ -10764,6 +10779,11 @@ impl CallControl {
         seen: &mut CallTracker,
         analyzed: &mut AnalyzedCalls,
     ) -> bool {
+        // `graphanalyze.py GraphAnalyzer.analyze` walks `funcobj.graph`
+        // (`callable_graph_path`); a harvested crate-prefixed spelling is
+        // that graph.
+        let resolved = self.callable_graph_path(path);
+        let path = resolved.as_ref().unwrap_or(path);
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => return false, // no graph → cannot invalidate (not conservative here)
@@ -10843,6 +10863,11 @@ impl CallControl {
         seen: &mut CallTracker,
         analyzed: &mut AnalyzedCalls,
     ) -> bool {
+        // `graphanalyze.py GraphAnalyzer.analyze` walks `funcobj.graph`
+        // (`callable_graph_path`); a harvested crate-prefixed spelling is
+        // that graph.
+        let resolved = self.callable_graph_path(path);
+        let path = resolved.as_ref().unwrap_or(path);
         // collectanalyze.py:15: _gctransformer_hint_cannot_collect_ → False
         if self.func_effects(path).is_some_and(|f| f.cannot_collect) {
             return false;
@@ -23841,6 +23866,20 @@ mod tests {
         let write = rw_write_field("Num", "flag");
         if let OpKind::FieldWrite { base, .. } = &write {
             callee.push_inputarg_var(callee.startblock, base.clone());
+            callee.push_op_with_result_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: "base".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                base.clone(),
+            );
+            callee.push_op_var(
+                callee.startblock,
+                OpKind::VableForce { base: base.clone() },
+                false,
+            );
         }
         callee.push_op_var(callee.startblock, write, false);
         cc.register_function_graph(registered.clone(), callee);
@@ -23883,6 +23922,105 @@ mod tests {
             "getcalldescr readwrite must walk the registered graph"
         );
         assert_eq!(write_fields(&spelled_effects).len(), 1);
+
+        let spelled_path = CallPath::from_segments(["core", "num", "<Impl>", "div_ceil"]);
+        let missing_path = CallPath::from_segments(["no", "such", "callee"]);
+        let spelled_raise = cc.analyze_can_raise_impl(
+            &spelled_path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            false,
+        );
+        let registered_raise = cc.analyze_can_raise_impl(
+            &registered,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            false,
+        );
+        let missing_raise = cc.analyze_can_raise_impl(
+            &missing_path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            false,
+        );
+        assert_eq!(spelled_raise, registered_raise);
+        assert_ne!(
+            spelled_raise, missing_raise,
+            "crate-prefixed can_raise must walk the body, not the missing-graph top"
+        );
+        let spelled_vable = cc.analyze_forces_virtualizable(
+            &spelled_path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+        );
+        let registered_vable = cc.analyze_forces_virtualizable(
+            &registered,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+        );
+        let missing_vable = cc.analyze_forces_virtualizable(
+            &missing_path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+        );
+        assert_eq!(spelled_vable, registered_vable);
+        assert_ne!(
+            spelled_vable, missing_vable,
+            "crate-prefixed forces_virtualizable must walk the body, not the missing-graph bottom"
+        );
+        assert!(spelled_vable);
+
+        let matching = cc.getcalldescr(
+            &direct_call_op(spelled.clone()),
+            vec![Type::Ref],
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            matching.extra_info.extraeffect,
+            ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+
+        let panic_message = |target: CallTarget| {
+            let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut cache = AnalysisCache::default();
+                let _ = cc.getcalldescr(
+                    &direct_call_op(target),
+                    Vec::new(),
+                    Type::Void,
+                    OopSpecIndex::None,
+                    None,
+                    &mut cache,
+                    None,
+                );
+            })) else {
+                panic!("getcalldescr signature mismatch panics");
+            };
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default()
+        };
+        let spelled_mismatch = panic_message(spelled.clone());
+        let registered_mismatch =
+            panic_message(CallTarget::function_path(["num", "<Impl>", "div_ceil"]));
+        assert!(
+            spelled_mismatch.contains("passing actual arguments (ignoring voids)"),
+            "crate-prefixed mismatch: {spelled_mismatch}"
+        );
+        assert_eq!(
+            spelled_mismatch
+                .split("calling a function with signature")
+                .nth(1),
+            registered_mismatch
+                .split("calling a function with signature")
+                .nth(1),
+            "crate-prefixed mismatch must be the same signature Exception as the registered spelling"
+        );
     }
 
     /// A FunctionPath whose leaf equals an impl method's leaf must not
