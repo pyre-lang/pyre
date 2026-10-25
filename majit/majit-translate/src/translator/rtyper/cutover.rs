@@ -364,11 +364,19 @@ pub(crate) fn dual_gate_check_with_registry(
     if let Err(payload) = baseline {
         let msg = crate::annotator::model::panic_payload_text(&*payload)
             .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
-        return Err(format!(
-            "dual-gate baseline panicked (legacy walker crashed before \
-             comparison could run — comparison cannot validate the real \
-             path's result): {msg}"
-        ));
+        // `resolve_types` panics on leftover Unknown
+        // (`rtyper.py setconcretetype` / `bindingrepr` has no default).
+        // The panic runs after every typed cell is already committed, so
+        // comparison can still see the kinds the legacy walker *did*
+        // resolve; leftover Unknown stays Unknown and is accepted as a
+        // real-path refinement below.
+        if !msg.contains("setconcretetype: no binding") {
+            return Err(format!(
+                "dual-gate baseline panicked (legacy walker crashed before \
+                 comparison could run — comparison cannot validate the real \
+                 path's result): {msg}"
+            ));
+        }
     }
     let followed_legacy = call_registry.session_if_started().map(|(annotator, _)| {
         annotator_followed_legacy_vars(&annotator, &graph, &real_value_to_var)
@@ -1393,9 +1401,9 @@ fn collect_divergences_on(
             }
         }
         let legacy_kind = LegacyGraph::concretetype_of(var);
-        // A kind the legacy walker resolved must match the real path;
-        // conversely the real path must not resolve a kind for a value
-        // the legacy walker left Unknown.
+        // A kind the legacy walker resolved must match the real path.
+        // Leftover Unknown is a typer gap (`rtyper.py setconcretetype`
+        // has no default); the real path's kind is authoritative.
         //
         // Exception: the real path refining a boxed-pointer (`GcRef`)
         // slot to `Void` is sound, not a divergence.  On a `Match` the
@@ -1438,10 +1446,9 @@ fn collect_divergences_on(
         // `BUILD_SLICE` discriminant read off an `Arg<T>` marker field, a
         // `JUMP_*` delta — all bare bytecode operands the rtyper types
         // `Signed` (matching upstream, where a bytecode oparg is a plain
-        // int).  The legacy walker's `GcRef` is the pyre-only conservative
-        // `Unknown → GcRef` backfill (`legacy_resolve.rs:374-378`), which has
-        // no RPython analogue (upstream's rtyper never leaves a value
-        // untyped, so it never defaults to ref); it is the divergent side.
+        // int).  The legacy walker's `GcRef` is a classdef-less `Ref`
+        // annotation; `setconcretetype` has no Unknown→GcRef default
+        // (`rtyper.py`). The real path is authoritative.
         //
         // This pair once appeared unacceptable because accepting it crashed
         // `emit_list_of_kind` (`assembler.rs:2169`).  That crash was a phase
@@ -1458,12 +1465,17 @@ fn collect_divergences_on(
             legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Signed;
         // Same conservative-legacy refinement for a genuine floating-point
         // value. `long_pow`'s negative-exponent arm extracts `f64` payloads
-        // from generic Result shells; Charon's erased legacy walk falls back
-        // Unknown→GcRef while the annotator/rtyper positively assigns Float.
+        // from generic Result shells; Charon's erased legacy walk keeps a
+        // classdef-less `Ref` while the annotator/rtyper positively assigns Float.
         // Like the Signed case, publish commits the real kind before
         // jtransform partitions registers, so the float bank is authoritative.
         let real_refines_gcref_to_float =
             legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Float;
+        // Leftover Unknown: the legacy walker did not type this Variable
+        // (`rtyper.py setconcretetype` / `bindingrepr`). Real is
+        // authoritative — the same refinement the old Unknown→GcRef
+        // backfill papered over as `legacy=GcRef` vs Signed/Float/Void.
+        let real_refines_unknown = legacy_kind == ConcreteType::Unknown && real_present.is_some();
         // A duplicate phi inputarg the real path's `remove_duplicate_inputargs`
         // merged away is untyped in the real graph (its column no longer
         // exists) while the legacy walker types the retained identity.  The
@@ -1517,6 +1529,7 @@ fn collect_divergences_on(
         let diverges = if real_refines_gcref_to_void
             || real_refines_gcref_to_signed
             || real_refines_gcref_to_float
+            || real_refines_unknown
             || real_dropped_duplicate_inputarg
             || real_dropped_dead_op_result
             || real_rebuilt_switch_discriminant
@@ -6145,7 +6158,7 @@ fn reconcile_elided_phi_inputargs(
 /// `real=Unknown` against the legacy walker's `GcRef` — the legacy
 /// walker types the same slot from this identical `result_ty` at
 /// `legacy_resolve::infer_concrete_from_op` (`OpKind::Call { result_ty }
-/// => valuetype_to_concrete(result_ty)`), plus its final GcRef backfill.
+/// => valuetype_to_concrete(result_ty)`).
 ///
 /// Mirror that single rule into the real path so the two converge: for a
 /// call result whose declared `result_ty` projects to `GcRef`, stamp the
@@ -6399,9 +6412,11 @@ pub(crate) fn dual_gate_outcome_from_cache(
     if let Err(payload) = baseline {
         let msg = crate::annotator::model::panic_payload_text(&*payload)
             .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
-        return Err(format!(
-            "two-phase baseline panicked (legacy walker crashed before comparison): {msg}"
-        ));
+        if !msg.contains("setconcretetype: no binding") {
+            return Err(format!(
+                "two-phase baseline panicked (legacy walker crashed before comparison): {msg}"
+            ));
+        }
     }
     let followed_legacy = call_registry
         .session_if_started()
@@ -10491,12 +10506,22 @@ mod tests {
     fn collect_divergences_accepts_gcref_refined_to_signed() {
         // A `(GcRef, Signed)` pair is an accepted refinement: the real path
         // resolved a genuine integer (an oparg-decoded index / discriminant /
-        // delta) where the legacy walker left the pyre-only conservative
-        // `Unknown → GcRef` backfill.  Real is authoritative, so the graph
-        // lifts via real rather than Skipping to legacy.
+        // delta) where the legacy walker kept a classdef-less `Ref`.
+        // Real is authoritative, so the graph lifts via real rather than
+        // Skipping to legacy.
         assert!(
             diff_single_var(ConcreteType::GcRef, ConcreteType::Signed).is_empty(),
             "legacy=GcRef, real=Signed is an accepted real refinement"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_accepts_unknown_refined_to_signed() {
+        // Leftover Unknown is a typer gap (`rtyper.py setconcretetype`);
+        // the real path's Signed is authoritative.
+        assert!(
+            diff_single_var(ConcreteType::Unknown, ConcreteType::Signed).is_empty(),
+            "legacy=Unknown, real=Signed is an accepted real refinement"
         );
     }
 

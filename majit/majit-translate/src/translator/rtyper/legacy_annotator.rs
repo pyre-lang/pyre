@@ -22,10 +22,12 @@
 use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
+use crate::annotator::description::DescEntry;
 use crate::annotator::model::{SomeInstance, SomeNone, SomeValue};
 use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
+use crate::translator::rtyper::error::TyperError;
 
 enum Incoming {
     Flat(ValueType),
@@ -51,6 +53,13 @@ pub fn annotate(graph: &FunctionGraph) {
 /// (`bookkeeper.py getuniqueclassdef`). `rclass.py getgcflavor` reads
 /// `_alloc_flavor_` off that classdef.
 pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bookkeeper>>) {
+    annotate_inner(graph, bookkeeper).unwrap_or_else(|e| panic!("{e}"));
+}
+
+fn annotate_inner(
+    graph: &FunctionGraph,
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+) -> Result<(), TyperError> {
     // RPython parity: `annrpython.py:RPythonAnnotator.complete()`
     // (`annrpython.py typeof([v_last_exc_value])`) writes
     // exceptblock annotations only when a `follow_raise_link` actually
@@ -76,6 +85,8 @@ pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bo
     // stage would collapse a real `Float`/`Int` return into
     // `union_type(Ref, Float|Int) == Unknown`.
 
+    let mut owned_bk: Option<Rc<Bookkeeper>> = None;
+
     // Process all blocks (simple single-pass for acyclic; loops need fixpoint)
     let mut changed = true;
     let mut iterations = 0;
@@ -100,9 +111,34 @@ pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bo
                         }
                         _ => infer_op_type(&op.kind),
                     };
-                    let incoming = typed_null_raw_incoming(bookkeeper, &op.kind)
-                        .unwrap_or(Incoming::Flat(inferred));
-                    if merge_op_result(result, incoming, bookkeeper) {
+                    // `SomeObject.hint` returns `self` (unaryop.py); `same_as`
+                    // likewise keeps the operand annotation.
+                    let pbc_keep = match &op.kind {
+                        OpKind::Hint { value, .. } => read_binding_some(value),
+                        OpKind::UnaryOp {
+                            op: opname,
+                            operand,
+                            result_ty,
+                        } if opname == "same_as" && result_ty == &ValueType::Unknown => {
+                            read_binding_some(operand)
+                        }
+                        _ => None,
+                    };
+                    let incoming = match pbc_keep {
+                        Some(rc) if matches!(rc.as_ref(), SomeValue::PBC(_)) => {
+                            Incoming::Annotation(rc)
+                        }
+                        _ => typed_null_raw_incoming(bookkeeper, &op.kind)
+                            .unwrap_or(Incoming::Flat(inferred)),
+                    };
+                    let op_changed = if let Incoming::Annotation(sv) = &incoming
+                        && matches!(sv.as_ref(), SomeValue::PBC(_))
+                    {
+                        merge_some_pbc(result, sv.as_ref())?
+                    } else {
+                        merge_op_result(result, incoming, bookkeeper)
+                    };
+                    if op_changed {
                         changed = true;
                     }
                 }
@@ -114,14 +150,15 @@ pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bo
             // `link.args[i]` annotation into `link.target.inputargs[i]`.
             for link in &block.exits {
                 let link_changed = if link_is_raise_like(link) {
-                    follow_raise_link(graph, link, bookkeeper)
+                    follow_raise_link(graph, link, bookkeeper, &mut owned_bk)?
                 } else {
-                    follow_link(graph, link, bookkeeper)
+                    follow_link(graph, link, bookkeeper, &mut owned_bk)?
                 };
                 changed |= link_changed;
             }
         }
     }
+    Ok(())
 }
 
 /// Read the legacy `ValueType` discriminator out of
@@ -132,7 +169,16 @@ fn read_binding(var: &Variable) -> ValueType {
     var.annotation
         .borrow()
         .as_ref()
-        .map(|s| somevalue_to_valuetype(s))
+        .map(|s| {
+            if is_single_frozen_pbc(s.as_ref()) {
+                // Register-kind prediction only: `getFrozenPBCRepr` →
+                // `SingleFrozenPBCRepr` (`lowleveltype = Void`). The
+                // annotation cell is still `SomePBC`, not BOTTOM.
+                ValueType::Void
+            } else {
+                somevalue_to_valuetype(s)
+            }
+        })
         .unwrap_or(ValueType::Unknown)
 }
 
@@ -224,20 +270,26 @@ fn link_is_raise_like(link: &Link) -> bool {
     link.last_exception.is_some() && link.last_exc_value.is_some()
 }
 
-fn follow_link(graph: &FunctionGraph, link: &Link, bookkeeper: Option<&Rc<Bookkeeper>>) -> bool {
+fn follow_link(
+    graph: &FunctionGraph,
+    link: &Link,
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+    owned_bk: &mut Option<Rc<Bookkeeper>>,
+) -> Result<bool, TyperError> {
     let mut changed = false;
     let target_block = graph.block(link.target);
     for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-        changed |= merge_binding(dst, incoming_from_link_arg(src), bookkeeper);
+        changed |= bind_link_arg(dst, src, bookkeeper, owned_bk)?;
     }
-    changed
+    Ok(changed)
 }
 
 fn follow_raise_link(
     graph: &FunctionGraph,
     link: &Link,
     bookkeeper: Option<&Rc<Bookkeeper>>,
-) -> bool {
+    owned_bk: &mut Option<Rc<Bookkeeper>>,
+) -> Result<bool, TyperError> {
     let mut changed = false;
     if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
         changed |= merge_value_type(value, ValueType::Ref(None), bookkeeper);
@@ -253,11 +305,63 @@ fn follow_raise_link(
         } else if Some(src) == link.last_exc_value.as_ref() {
             Incoming::Flat(ValueType::Ref(None))
         } else {
-            incoming_from_link_arg(src)
+            changed |= bind_link_arg(dst, src, bookkeeper, owned_bk)?;
+            continue;
         };
         changed |= merge_binding(dst, incoming, bookkeeper);
     }
-    changed
+    Ok(changed)
+}
+
+/// `annrpython.py follow_link` / `mergeinputargs`: a constant takes
+/// `bookkeeper.immutablevalue(v_out.value)` and a variable its own
+/// annotation, then the two are unioned. A bare `Repr` constant is a frozen
+/// PBC (`SomePBC`). A `SomePBC` on either side of a link (the variable's
+/// annotation, or a dest already `SomePBC`) unions through
+/// `merge_some_pbc`; a non-Repr constant arriving at a `SomePBC` dest is
+/// first `immutablevalue`'d. `getFrozenPBCRepr` must stay
+/// `SingleFrozenPBCRepr`. Every other source merges through
+/// `merge_binding`.
+fn bind_link_arg(
+    dst: &Variable,
+    src: &LinkArg,
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+    owned_bk: &mut Option<Rc<Bookkeeper>>,
+) -> Result<bool, TyperError> {
+    match src {
+        LinkArg::Const(c) if matches!(&c.value, ConstValue::Repr(_)) => {
+            let bk = match bookkeeper {
+                Some(bk) => bk,
+                None => owned_bk.get_or_insert_with(|| Rc::new(Bookkeeper::new())),
+            };
+            return merge_frozen_repr_annotation(dst, &c.value, bk);
+        }
+        LinkArg::Value(var) => {
+            let var_ann = read_binding_some(var);
+            let dst_is_pbc = matches!(read_binding_some(dst).as_deref(), Some(SomeValue::PBC(_)));
+            if var_ann.is_none() && dst_is_pbc {
+                return Ok(false);
+            }
+            if let Some(incoming) = var_ann
+                && (matches!(incoming.as_ref(), SomeValue::PBC(_)) || dst_is_pbc)
+            {
+                return merge_some_pbc(dst, incoming.as_ref());
+            }
+        }
+        LinkArg::Const(c) => {
+            if matches!(read_binding_some(dst).as_deref(), Some(SomeValue::PBC(_))) {
+                let bk = match bookkeeper {
+                    Some(bk) => bk,
+                    None => owned_bk.get_or_insert_with(|| Rc::new(Bookkeeper::new())),
+                };
+                let incoming = bk
+                    .immutablevalue(&c.value)
+                    .map_err(|e| TyperError::message(e.to_string()))?;
+                return merge_some_pbc(dst, &incoming);
+            }
+        }
+    }
+    Ok(merge_binding(dst, incoming_from_link_arg(src), bookkeeper))
 }
 
 /// `annrpython.py follow_link` / `mergeinputargs` union the source's
@@ -307,6 +411,211 @@ fn typed_null_raw_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -
     ) {
         Ok(sv @ SomeValue::Instance(_)) => Some(Incoming::Annotation(Rc::new(sv))),
         _ => None,
+    }
+}
+
+/// `getFrozenPBCRepr`: `follow_link` / `mergeinputargs` union incoming
+/// annotations (`bookkeeper.immutablevalue` for a constant, `annotation(v)`
+/// for a variable). A FrozenDesc union with more than one desc,
+/// `can_be_none`, or a union error would be `MultipleFrozenPBCRepr` (or
+/// `MultipleUnrelatedFrozenPBCRepr`). This skip-arm path cannot represent
+/// that Ptr/Address, so refuse. Function/method/class PBCs are not this
+/// repr (`FunctionsPBCRepr` / `MethodsPBCRepr` / `ClassesPBCRepr`).
+pub(crate) fn multiple_frozen_pbc_unsupported() -> TyperError {
+    TyperError::message("MultipleFrozenPBCRepr is unsupported on this path (getFrozenPBCRepr)")
+}
+
+/// `getFrozenPBCRepr` decides from the dest annotation after
+/// `follow_link` / `mergeinputargs` have unioned every incoming edge
+/// (`bookkeeper.immutablevalue` for a constant, `annotation(v)` for a
+/// variable). For each `(target block, inputarg index)` that receives
+/// at least one `LinkArg::Const(c)` with `ConstValue::Repr(_)`:
+///
+/// * Annotated dest: refuse `is_multiple_frozen_pbc` (`getFrozenPBCRepr`
+///   would pick `MultipleFrozenPBCRepr`). A single FrozenDesc `SomePBC`
+///   (`is_single_frozen_pbc`) is accepted. Other PBCs
+///   (functions/methods/classes) propagate; a non-PBC annotation is
+///   still `MultipleFrozenPBCRepr`.
+/// * Unannotated dest (`resolve_types` without `annotate`): keep the
+///   syntactic rule on that slot — distinct Repr constants, or a
+///   non-Repr link arg, are `MultipleFrozenPBCRepr`.
+pub(crate) fn refuse_merged_frozen_pbc_reprs(graph: &FunctionGraph) -> Result<(), TyperError> {
+    // `follow_link` / `complete_pending_blocks` only walk startblock-reachable exits.
+    let mut reachable = vec![false; graph.blocks.len()];
+    for block in graph.iterblocks() {
+        reachable[block.id.0] = true;
+    }
+    let mut slots: Vec<(usize, usize)> = Vec::new();
+    for block in &graph.blocks {
+        if !reachable[block.id.0] {
+            continue;
+        }
+        for link in &block.exits {
+            let n = graph
+                .block(link.target)
+                .inputargs
+                .len()
+                .min(link.args.len());
+            for i in 0..n {
+                if let LinkArg::Const(c) = &link.args[i]
+                    && matches!(&c.value, ConstValue::Repr(_))
+                    && !slots
+                        .iter()
+                        .any(|(t, idx)| *t == link.target.0 && *idx == i)
+                {
+                    slots.push((link.target.0, i));
+                }
+            }
+        }
+    }
+
+    let mut unannotated: Vec<(usize, usize)> = Vec::new();
+    for (target, index) in slots {
+        let var = &graph.blocks[target].inputargs[index];
+        match var.annotation.borrow().as_ref() {
+            Some(s) => {
+                if is_multiple_frozen_pbc(s.as_ref()) || !matches!(s.as_ref(), SomeValue::PBC(_)) {
+                    return Err(multiple_frozen_pbc_unsupported());
+                }
+            }
+            None => unannotated.push((target, index)),
+        }
+    }
+
+    let mut incoming: Vec<(usize, usize, ConstValue)> = Vec::new();
+    for block in &graph.blocks {
+        if !reachable[block.id.0] {
+            continue;
+        }
+        for link in &block.exits {
+            let n = graph
+                .block(link.target)
+                .inputargs
+                .len()
+                .min(link.args.len());
+            for i in 0..n {
+                if !unannotated
+                    .iter()
+                    .any(|(t, idx)| *t == link.target.0 && *idx == i)
+                {
+                    continue;
+                }
+                if let LinkArg::Const(c) = &link.args[i]
+                    && matches!(&c.value, ConstValue::Repr(_))
+                {
+                    if let Some((_, _, prev)) = incoming
+                        .iter()
+                        .find(|(t, idx, _)| *t == link.target.0 && *idx == i)
+                    {
+                        if prev != &c.value {
+                            return Err(multiple_frozen_pbc_unsupported());
+                        }
+                    } else {
+                        incoming.push((link.target.0, i, c.value.clone()));
+                    }
+                }
+            }
+        }
+    }
+    for block in &graph.blocks {
+        if !reachable[block.id.0] {
+            continue;
+        }
+        for link in &block.exits {
+            let n = graph
+                .block(link.target)
+                .inputargs
+                .len()
+                .min(link.args.len());
+            for i in 0..n {
+                if !unannotated
+                    .iter()
+                    .any(|(t, idx)| *t == link.target.0 && *idx == i)
+                {
+                    continue;
+                }
+                let is_repr = matches!(
+                    &link.args[i],
+                    LinkArg::Const(c) if matches!(&c.value, ConstValue::Repr(_))
+                );
+                if !is_repr
+                    && incoming
+                        .iter()
+                        .any(|(t, idx, _)| *t == link.target.0 && *idx == i)
+                {
+                    return Err(multiple_frozen_pbc_unsupported());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_single_frozen_pbc(s: &SomeValue) -> bool {
+    match s {
+        SomeValue::PBC(pbc) => {
+            pbc.descriptions.len() == 1
+                && !pbc.can_be_none
+                && pbc
+                    .descriptions
+                    .values()
+                    .all(|d| matches!(d, DescEntry::Frozen(_)))
+        }
+        _ => false,
+    }
+}
+
+/// `getFrozenPBCRepr` would pick MultipleFrozenPBCRepr for this PBC.
+fn is_multiple_frozen_pbc(s: &SomeValue) -> bool {
+    match s {
+        SomeValue::PBC(pbc) => {
+            pbc.descriptions
+                .values()
+                .any(|d| matches!(d, DescEntry::Frozen(_)))
+                && (pbc.descriptions.len() > 1 || pbc.can_be_none)
+        }
+        _ => false,
+    }
+}
+
+fn merge_frozen_repr_annotation(
+    dst: &Variable,
+    value: &ConstValue,
+    bookkeeper: &Rc<Bookkeeper>,
+) -> Result<bool, TyperError> {
+    // `bookkeeper.immutablevalue` `_freeze_` arm: `SomePBC([getdesc(x)])`.
+    let incoming = bookkeeper
+        .immutablevalue(value)
+        .map_err(|e| TyperError::message(e.to_string()))?;
+    merge_some_pbc(dst, &incoming)
+}
+
+/// `pairtype(SomePBC, SomePBC).union` unions description sets and
+/// nullability; `getFrozenPBCRepr` is FrozenDesc-only, so only a
+/// multiple/nullable Frozen PBC is refused here.
+fn merge_some_pbc(dst: &Variable, incoming: &SomeValue) -> Result<bool, TyperError> {
+    let mut slot = dst.annotation.borrow_mut();
+    match slot.as_ref() {
+        None => {
+            *slot = Some(Rc::new(incoming.clone()));
+            Ok(true)
+        }
+        Some(existing) => match crate::annotator::model::union(existing.as_ref(), incoming) {
+            Ok(merged) => {
+                if is_multiple_frozen_pbc(&merged) {
+                    return Err(multiple_frozen_pbc_unsupported());
+                }
+                if merged != **existing {
+                    *slot = Some(Rc::new(merged));
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(e) => Err(TyperError::message(format!(
+                "{e}; MultipleFrozenPBCRepr is unsupported on this path (getFrozenPBCRepr)"
+            ))),
+        },
     }
 }
 
@@ -483,8 +792,14 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_)
-        | ConstValue::Opaque(_)
-        | ConstValue::Repr(_) => ValueType::Ref(None),
+        | ConstValue::Opaque(_) => ValueType::Ref(None),
+        // Bare-constant repr selection after annotation: one FrozenDesc
+        // (`getFrozenPBCRepr` → `SingleFrozenPBCRepr`).
+        // `SingleFrozenPBCRepr.lowleveltype` is `Void`; `history.getkind(Void)`
+        // is `"void"`. `follow_link` does not build the annotation shell
+        // from this arm (`valuetype_to_someshell(Void)` is BOTTOM); it
+        // writes `bookkeeper.immutablevalue` (`SomePBC`).
+        ConstValue::Repr(_) => ValueType::Void,
     }
 }
 
@@ -584,7 +899,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // `result_ty` is still Unknown.  Without this, `-z` where `z:
         // f64` annotates to Int (the previous default), which then
         // poisons every downstream phi-merge inputarg via union(Int,
-        // Float) → Unknown → GcRef backfill.
+        // Float) → Unknown (`rtyper.py setconcretetype` has no default).
         OpKind::UnaryOp {
             op,
             operand,
@@ -760,6 +1075,296 @@ mod tests {
 
         annotate(&graph);
         assert_eq!(read_binding(&v_var), ValueType::Int);
+    }
+
+    #[test]
+    fn const_repr_predicts_single_frozen_pbc_void() {
+        // `SingleFrozenPBCRepr.lowleveltype` is `Void` (`rpbc.py`).
+        let repr = ConstValue::Repr(crate::flowspace::model::ReprConst::new(
+            crate::translator::rtyper::rint::signed_repr(),
+        ));
+        assert_eq!(const_value_type(&repr), ValueType::Void);
+    }
+
+    fn repr_const(
+        handle: &std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+    ) -> ConstValue {
+        ConstValue::Repr(crate::flowspace::model::ReprConst::new(
+            std::sync::Arc::clone(handle),
+        ))
+    }
+
+    fn branch_start_to_preds(
+        graph: &mut FunctionGraph,
+        pred1: crate::model::BlockId,
+        pred2: crate::model::BlockId,
+    ) {
+        let cond = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "switch".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(graph.startblock, cond, pred1, vec![], pred2, vec![]);
+    }
+
+    fn two_pred_const_phi(
+        left: ConstValue,
+        right: ConstValue,
+    ) -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("repr_phi");
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        branch_start_to_preds(&mut graph, pred1, pred2);
+        graph.set_goto_mixed(
+            pred1,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(left))],
+        );
+        graph.set_goto_mixed(
+            pred2,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(
+                right,
+            ))],
+        );
+        graph.set_return(join, Some(phi.clone()));
+        (graph, phi)
+    }
+
+    #[test]
+    fn same_repr_const_phi_is_void_some_pbc() {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let (graph, phi) = two_pred_const_phi(repr_const(&handle), repr_const(&handle));
+        annotate_inner(&graph, None).expect("same ReprConst is SingleFrozenPBCRepr");
+        match read_binding_some(&phi).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert_eq!(pbc.descriptions.len(), 1);
+                assert!(pbc.is_constant());
+            }
+            other => panic!("expected SomePBC, got {other:?}"),
+        }
+        assert_eq!(read_binding(&phi), ValueType::Void);
+        assert!(!matches!(
+            read_binding_some(&phi).as_deref(),
+            Some(SomeValue::Impossible)
+        ));
+    }
+
+    #[test]
+    fn distinct_repr_const_phi_is_typer_error() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle_a: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let handle_b: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let (graph, _phi) = two_pred_const_phi(repr_const(&handle_a), repr_const(&handle_b));
+        let err = annotate_inner(&graph, None).expect_err("distinct ReprConst merge");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultipleFrozenPBCRepr"),
+            "error should name MultipleFrozenPBCRepr, got {msg}"
+        );
+        assert!(
+            msg.contains("getFrozenPBCRepr"),
+            "error should cite getFrozenPBCRepr, got {msg}"
+        );
+    }
+
+    #[test]
+    fn repr_const_mixed_with_non_repr_is_typer_error() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let (graph, _phi) = two_pred_const_phi(repr_const(&handle), ConstValue::Int(1));
+        let err = annotate_inner(&graph, None).expect_err("Repr mixed with non-Repr");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultipleFrozenPBCRepr"),
+            "error should name MultipleFrozenPBCRepr, got {msg}"
+        );
+        assert!(
+            msg.contains("getFrozenPBCRepr"),
+            "error should cite getFrozenPBCRepr, got {msg}"
+        );
+    }
+
+    #[test]
+    fn unreachable_pred_distinct_repr_is_accepted() {
+        // `follow_link` / `complete_pending_blocks` never union a
+        // startblock-unreachable predecessor into the dest annotation.
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle_a: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let handle_b: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let mut graph = FunctionGraph::new("unreachable_repr_phi");
+        let entry = graph.startblock;
+        let pred2 = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        graph.set_goto_mixed(
+            entry,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(
+                repr_const(&handle_a),
+            ))],
+        );
+        graph.set_goto_mixed(
+            pred2,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(
+                repr_const(&handle_b),
+            ))],
+        );
+        graph.set_return(join, Some(phi_args[0].clone()));
+        refuse_merged_frozen_pbc_reprs(&graph).expect("unreachable distinct Repr does not join");
+    }
+
+    #[test]
+    fn repr_const_and_same_singleton_variable_merge() {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let c = repr_const(&handle);
+        let bk = Rc::new(Bookkeeper::new());
+        let s_pbc = bk
+            .immutablevalue(&c)
+            .expect("immutablevalue of Repr is SomePBC");
+
+        let mut graph = FunctionGraph::new("repr_const_and_var");
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+
+        let src_var = graph.alloc_value_var();
+        *src_var.annotation.borrow_mut() = Some(Rc::new(s_pbc));
+
+        branch_start_to_preds(&mut graph, pred1, pred2);
+        graph.set_goto_mixed(
+            pred1,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(c))],
+        );
+        graph.set_goto(pred2, join, vec![src_var]);
+        graph.set_return(join, Some(phi.clone()));
+
+        annotate_inner(&graph, Some(&bk)).expect("same singleton SomePBC merge");
+        match read_binding_some(&phi).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert_eq!(pbc.descriptions.len(), 1);
+                assert!(pbc.is_constant());
+            }
+            other => panic!("expected SomePBC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hint_keeps_single_frozen_pbc() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let bk = Rc::new(Bookkeeper::new());
+        let s_pbc = bk
+            .immutablevalue(&repr_const(&handle))
+            .expect("immutablevalue of Repr is SomePBC");
+
+        let mut graph = FunctionGraph::new("hint_pbc");
+        let entry = graph.startblock;
+        let value = graph.alloc_value_var();
+        *value.annotation.borrow_mut() = Some(Rc::new(s_pbc));
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Hint {
+                    value: value.clone(),
+                    kind: crate::hints::HintKind::Promote,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result.clone()));
+
+        annotate_inner(&graph, Some(&bk)).expect("hint keeps SomePBC");
+        match read_binding_some(&result).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert_eq!(pbc.descriptions.len(), 1);
+            }
+            other => panic!("expected SomePBC, got {other:?}"),
+        }
+        assert!(!matches!(
+            read_binding_some(&result).as_deref(),
+            Some(SomeValue::Impossible)
+        ));
+        assert_eq!(read_binding(&result), ValueType::Void);
+    }
+
+    #[test]
+    fn two_function_pbc_phi_merges_descriptions() {
+        // `pairtype(SomePBC, SomePBC).union` unions FunctionDesc sets;
+        // `getFrozenPBCRepr` is FrozenDesc-only (`FunctionsPBCRepr` later).
+        use crate::annotator::description::FunctionDesc;
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::argument::Signature;
+        use std::cell::RefCell;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let function_pbc = |name: &str| {
+            SomeValue::PBC(SomePBC::new(
+                vec![DescEntry::function(Rc::new(RefCell::new(
+                    FunctionDesc::new(
+                        bk.clone(),
+                        None,
+                        name,
+                        Signature::new(vec![], None, None),
+                        None,
+                        None,
+                    ),
+                )))],
+                false,
+            ))
+        };
+
+        let mut graph = FunctionGraph::new("fn_pbc_phi");
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+
+        let src_a = graph.alloc_value_var();
+        *src_a.annotation.borrow_mut() = Some(Rc::new(function_pbc("f1")));
+        let src_b = graph.alloc_value_var();
+        *src_b.annotation.borrow_mut() = Some(Rc::new(function_pbc("f2")));
+
+        branch_start_to_preds(&mut graph, pred1, pred2);
+        graph.set_goto(pred1, join, vec![src_a]);
+        graph.set_goto(pred2, join, vec![src_b]);
+        graph.set_return(join, Some(phi.clone()));
+
+        annotate_inner(&graph, Some(&bk)).expect("function PBC union must propagate");
+        match read_binding_some(&phi).as_deref() {
+            Some(SomeValue::PBC(pbc)) => {
+                assert_eq!(pbc.descriptions.len(), 2);
+            }
+            other => panic!("expected SomePBC, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1190,7 +1795,8 @@ mod tests {
             .classdef_for_known_struct_root("bytecode::CodeObject")
             .unwrap_or_else(|| ClassDef::new_standalone("bytecode::CodeObject", None));
         let mut graph = FunctionGraph::new("none_const_join");
-        let entry = graph.startblock;
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
         let inst = graph.alloc_value_var();
         *inst.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(SomeInstance::new(
             Some(classdef.clone()),
@@ -1198,11 +1804,11 @@ mod tests {
             Default::default(),
         ))));
         let (join, phi_args) = graph.create_block_with_arg_vars(1);
-        let (other, _) = graph.create_block_with_arg_vars(0);
         let phi_var = phi_args[0].clone();
-        graph.set_goto(entry, join, vec![inst]);
+        branch_start_to_preds(&mut graph, pred1, pred2);
+        graph.set_goto(pred1, join, vec![inst]);
         graph.set_goto_mixed(
-            other,
+            pred2,
             join,
             vec![LinkArg::Const(Constant::new(ConstValue::None))],
         );
@@ -1285,10 +1891,11 @@ mod tests {
             .getuniqueclassdef_for_struct_root("X")
             .expect("raw-flavor classdef");
         let mut graph = FunctionGraph::new("typed_null_raw_phi");
-        let entry = graph.startblock;
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
         let x_var = graph
             .push_op_var(
-                entry,
+                pred1,
                 OpKind::Input {
                     name: "x".into(),
                     ty: ValueType::Ref(Some("X".into())),
@@ -1297,12 +1904,12 @@ mod tests {
                 true,
             )
             .unwrap();
-        let (null_block, _) = graph.create_block_with_arg_vars(0);
-        let null_var = graph.push_null_raw_ptr_with_spelling(null_block, Some("X"));
+        let null_var = graph.push_null_raw_ptr_with_spelling(pred2, Some("X"));
         let (join, phi_args) = graph.create_block_with_arg_vars(1);
         let phi_var = phi_args[0].clone();
-        graph.set_goto(entry, join, vec![x_var]);
-        graph.set_goto(null_block, join, vec![null_var]);
+        branch_start_to_preds(&mut graph, pred1, pred2);
+        graph.set_goto(pred1, join, vec![x_var]);
+        graph.set_goto(pred2, join, vec![null_var]);
         graph.set_return(join, Some(phi_var.clone()));
         annotate_with_bookkeeper(&graph, Some(&bk));
         match read_binding_some(&phi_var).as_deref() {
