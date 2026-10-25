@@ -349,9 +349,10 @@ pub struct TraceCtx {
     /// Header PC at which this trace started (0 = function entry).
     pub header_pc: usize,
     /// When a cross-loop cut occurs (trace closes at inner loop header),
-    /// the green key for the inner loop. Used to register an alias
-    /// so can_enter_jit at the inner back-edge finds the outer key's entry.
-    pub cut_inner_green_key: Option<u64>,
+    /// the inner loop's typed greens. `compile.py` `compile_loop` finds that
+    /// merge point the same way `pyjitpl.py` `reached_loop_header` does:
+    /// `same_greenkey` / `Const.same_constant` on the live boxes.
+    pub cut_inner_green_key: Option<GreenKey>,
     /// Transient signal set when a back-edge is reached while an inline
     /// callee frame is active (opimpl_jit_merge_point portal_call_depth>0).
     /// Such a loop must not be unrolled as a root loop; the trace step
@@ -2606,8 +2607,8 @@ impl TraceCtx {
     }
 
     /// history.py `ConstPtr.value` — typed green keys hold copied Ref
-    /// addresses (`green_key_values`, `close_typed_key`, each
-    /// `current_merge_points[i].green_key_typed`).
+    /// addresses (`green_key_values`, `close_typed_key`,
+    /// `cut_inner_green_key`, each `current_merge_points[i].green_key_typed`).
     pub(crate) fn walk_stored_greenkey_refs(
         &mut self,
         visitor: &mut impl FnMut(&mut majit_ir::GcRef),
@@ -2616,6 +2617,9 @@ impl TraceCtx {
             gk.walk_refs(visitor);
         }
         if let Some(gk) = self.close_typed_key.as_mut() {
+            gk.walk_refs(visitor);
+        }
+        if let Some(gk) = self.cut_inner_green_key.as_mut() {
             gk.walk_refs(visitor);
         }
         for mp in &mut self.current_merge_points {

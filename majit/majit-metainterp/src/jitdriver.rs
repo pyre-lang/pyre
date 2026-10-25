@@ -5714,9 +5714,12 @@ impl<S: JitState> JitDriver<S> {
                 ctx.green_key_values().cloned(),
             )
         };
-        // The target is the installed cell named by `target_key`
-        // (`pyjitpl.py` `reached_loop_header` compares live green
-        // constants). A typed key whose raw hash equals a minted cell
+        // pyjitpl.py `reached_loop_header` compares and appends the LIVE
+        // boxes of this visit (`same_greenkey` /
+        // `current_merge_points.append((live_arg_boxes, start))`). Prefer
+        // a live close, then a live start, that resolves to `target_key`;
+        // the installed cell only names the target when no live key
+        // resolves to it. A typed key whose raw hash equals a minted cell
         // id is not that cell.
         let jd_no = self.index().unwrap_or(0);
         let types = self
@@ -5728,35 +5731,32 @@ impl<S: JitState> JitDriver<S> {
             .expect("the driver this trace runs on");
         let key_typed = {
             let warm = self.meta.warm_state_for_driver(jd_no);
-            if let Some(installed) = warm.installed_greenkey(target_key, &types) {
-                installed
-            } else {
-                // A minted id exists only for an installed cell, so a miss
-                // here is an uninstalled target. Prefer close/start when
-                // they resolve to `target_key`; otherwise they are still
-                // the live boxes `reached_loop_header` appends.
-                let matches_target = |key: &majit_ir::GreenKey| {
-                    warm.resolve_cell_key(key.get_uhash(), || key.clone()) == target_key
-                };
-                close
-                    .as_ref()
-                    .filter(|key| matches_target(key))
-                    .cloned()
-                    .or_else(|| start.as_ref().filter(|key| matches_target(key)).cloned())
-                    .or(close)
-                    .or(start)
-                    .expect(
-                        "keep_tracing_after_declined_jump: a merge point keeps its greens: \
-                         pyjitpl.py reached_loop_header live_arg_boxes",
-                    )
-            }
+            // `resolve_cell_key`, not a raw-hash compare. A miss still
+            // returns the arriving hash, so a typed key whose raw hash
+            // equals a minted id would otherwise match; the live key must
+            // have found a cell (`lookup_chain_with_key`).
+            let matches_target = |key: &majit_ir::GreenKey| {
+                warm.resolve_cell_key(key.get_uhash(), || key.clone()) == target_key
+                    && warm.lookup_chain_with_key(key).is_some()
+            };
+            close
+                .as_ref()
+                .filter(|key| matches_target(key))
+                .cloned()
+                .or_else(|| start.as_ref().filter(|key| matches_target(key)).cloned())
+                .or_else(|| warm.installed_greenkey(target_key, &types))
+                .or(close)
+                .or(start)
+                .expect(
+                    "keep_tracing_after_declined_jump: a merge point keeps its greens: \
+                     pyjitpl.py reached_loop_header live_arg_boxes",
+                )
         };
         let already = {
             let Some(ctx) = self.meta.trace_ctx() else {
                 return false;
             };
-            ctx.find_merge_point_same_greenkey(target_key, Some(&key_typed))
-                .is_some()
+            ctx.find_merge_point_same_greenkey(&key_typed).is_some()
         };
         if already {
             return false;
@@ -6094,7 +6094,12 @@ impl<S: JitState> JitDriver<S> {
         if self.has_runnable_compiled_loop(green_key) {
             let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
             let confirm_types = self.confirm_enter_jit_green_types(None);
-            if self.has_confirmed_runnable_compiled_loop(green_key, &confirm_types, &confirm_reds) {
+            if self.has_confirmed_runnable_compiled_loop(
+                green_key,
+                None,
+                &confirm_types,
+                &confirm_reds,
+            ) {
                 return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                     green_key,
                     state,
@@ -7026,7 +7031,9 @@ impl<S: JitState> JitDriver<S> {
             // (`warmstate.py maybe_compile_and_run` `confirm_enter_jit(*args)`
             // with greens then reds). The same buffers feed
             // `EnterJitAssembler` after the veto, so this is not a second
-            // extract. Virtualizable expansion stays below, after confirm.
+            // extract. The LABEL-ordered direct buffer is not the portal
+            // tuple; the hook gets `confirm_enter_jit_reds` there.
+            // Virtualizable expansion stays below, after confirm.
             let mut scratch = self.take_entry_scratch();
             let values_are_label_ordered = direct_live_values.is_some();
             if let Some(values) = direct_live_values {
@@ -7039,7 +7046,10 @@ impl<S: JitState> JitDriver<S> {
                     &mut scratch.types,
                 );
             }
-            let confirm_types = greenargs.map(|(_, types)| types).unwrap_or(&[]);
+            let confirm_types = self.confirm_enter_jit_green_types(greenargs);
+            let confirm_reds = values_are_label_ordered
+                .then(|| self.confirm_enter_jit_reds(state, env, target_pc));
+            let confirm_reds_slice = confirm_reds.as_deref().unwrap_or(&scratch.live_values);
             // warmstate.py `WarmEnterState.make_entry_point` /
             // `maybe_compile_and_run`: the confirmation veto sits between
             // finding the procedure token and `EnterJitAssembler`.
@@ -7049,8 +7059,9 @@ impl<S: JitState> JitDriver<S> {
                 .is_some_and(|warm| {
                     warm.confirm_compiled_entry_for_cell_key(
                         green_key,
-                        confirm_types,
-                        &scratch.live_values,
+                        greenargs.map(|(v, _)| v),
+                        &confirm_types,
+                        confirm_reds_slice,
                     )
                 })
             {
@@ -7110,12 +7121,17 @@ impl<S: JitState> JitDriver<S> {
                 self.entry_scratch_out(scratch);
                 return None;
             }
-            // Stage E2: each pass ENDS with the clears `take_entry_scratch`
-            // performs. Portal reds were already extracted for the confirm
-            // veto; refill them after the probe so the shipping pass does
-            // not extract a second time on a default build.
+            // Stage E2: scratch already holds the confirm-veto extract.
+            // Clear first so every probe pass and the post-loop refill
+            // start empty: the first pass would otherwise append a second
+            // tuple, and `marshal_in == 0` would duplicate at the refill.
             #[cfg(feature = "__back-edge-stage-probe")]
             if !values_are_label_ordered {
+                scratch.live_values.clear();
+                scratch.raw.clear();
+                scratch.types.clear();
+                scratch.vable_boxes.clear();
+                scratch.vable_lengths.clear();
                 count_back_edge_stage_passes(BackEdgeStage::MarshalIn, stage_repeats.marshal_in);
                 for _ in 0..stage_repeats.marshal_in {
                     let synced = self.sync_before(state, &compiled_meta, vable);
@@ -8536,7 +8552,12 @@ impl<S: JitState> JitDriver<S> {
         if self.has_runnable_compiled_loop(green_key) {
             let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
             let confirm_types = self.confirm_enter_jit_green_types(greenargs);
-            if self.has_confirmed_runnable_compiled_loop(green_key, &confirm_types, &confirm_reds) {
+            if self.has_confirmed_runnable_compiled_loop(
+                green_key,
+                greenargs.map(|(v, _)| v),
+                &confirm_types,
+                &confirm_reds,
+            ) {
                 return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                     green_key,
                     state,
@@ -10000,8 +10021,11 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Green types the packing wrapper uses when a hook is installed.
-    /// `greenargs` is the portal spec; without it the driver's
-    /// `_green_args_spec`. Empty when no hook is installed.
+    /// `greenargs` is the portal spec; without it `jitdriver_sd._green_args_spec`
+    /// from `MetaInterpStaticData.jitdrivers_sd` (`warmspot.py`
+    /// `make_args_specification`). Falls back to this driver's descriptor
+    /// when that table has no slot. Empty when no hook is installed, or
+    /// when both sources are missing.
     fn confirm_enter_jit_green_types(
         &self,
         greenargs: Option<(&[i64], &[GreenType])>,
@@ -10012,9 +10036,12 @@ impl<S: JitState> JitDriver<S> {
         if let Some((_, types)) = greenargs {
             return types.to_vec();
         }
-        self.descriptor
-            .as_ref()
-            .map(|d| d.green_args_spec())
+        self.meta
+            .staticdata
+            .jitdrivers_sd
+            .get(self.index().unwrap_or(0))
+            .map(|jd| jd.green_args_spec())
+            .or_else(|| self.descriptor.as_ref().map(|d| d.green_args_spec()))
             .unwrap_or_default()
     }
 
@@ -10025,6 +10052,7 @@ impl<S: JitState> JitDriver<S> {
     fn has_confirmed_runnable_compiled_loop(
         &self,
         green_key: u64,
+        live_greens: Option<&[i64]>,
         green_types: &[GreenType],
         reds: &[Value],
     ) -> bool {
@@ -10033,7 +10061,12 @@ impl<S: JitState> JitDriver<S> {
                 .meta
                 .warm_state_ref_for_driver(self.index().unwrap_or(0))
                 .is_some_and(|warm| {
-                    warm.confirm_compiled_entry_for_cell_key(green_key, green_types, reds)
+                    warm.confirm_compiled_entry_for_cell_key(
+                        green_key,
+                        live_greens,
+                        green_types,
+                        reds,
+                    )
                 })
     }
 
@@ -12566,6 +12599,11 @@ mod tests {
             vec![Type::Int, Type::Int, Type::Ref],
         );
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.declare_schema(
+            vec![("pc", Type::Int), ("zero", Type::Int), ("code", Type::Ref)],
+            vec![("y", Type::Int)],
+        );
+        driver.ensure_descriptor_registered();
         // A real frontend constructs its JitDriver before hashing any Ref
         // greens: WarmEnterState::new installs the GC-owned identity-hash
         // resolver.  Keep the fixture in that order too, otherwise `hash`
@@ -12708,21 +12746,16 @@ mod tests {
         );
     }
 
-    /// `test_ajit.py test_confirm_enter_jit`: greens `['x']`, reds `['y']`.
-    /// The hook sees both portal arguments and can refuse on the red.
-    #[test]
-    fn a_confirm_enter_jit_hook_sees_the_green_and_the_red() {
-        static SEEN_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-        static SEEN_RED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-        fn refuse_odd_red(args: &[Value]) -> bool {
-            SEEN_GREEN.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
-            SEEN_RED.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
-            args[1].as_int() % 2 == 0
-        }
-
-        let x = 10i64;
+    /// Compiled loop for `test_ajit.py test_confirm_enter_jit`: greens `['x']`,
+    /// reds `['y']`. Registers the driver so `jitdrivers_sd._green_args_spec`
+    /// is the portal spec a `greenargs = None` door still hands the hook.
+    fn confirm_enter_jit_hook_compiled_loop(
+        x: i64,
+    ) -> (JitDriver<TypedRestoreState>, u64, GreenKey) {
         let key = GreenKey::with_types(vec![x], vec![Type::Int]);
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.declare_schema(vec![("x", Type::Int)], vec![("y", Type::Int)]);
+        driver.ensure_descriptor_registered();
         let hash = key.get_uhash();
         let mut resume_asm = majit_jitcode::codewriter::assembler::Assembler::new();
         resume_asm.register_insn("live/", crate::jitcode::insns::BC_LIVE);
@@ -12760,7 +12793,23 @@ mod tests {
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(hash));
+        (driver, hash, key)
+    }
 
+    /// `test_ajit.py test_confirm_enter_jit`: greens `['x']`, reds `['y']`.
+    /// The hook sees both portal arguments and can refuse on the red.
+    #[test]
+    fn a_confirm_enter_jit_hook_sees_the_green_and_the_red() {
+        static SEEN_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SEEN_RED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn refuse_odd_red(args: &[Value]) -> bool {
+            SEEN_GREEN.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
+            SEEN_RED.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
+            args[1].as_int() % 2 == 0
+        }
+
+        let x = 10i64;
+        let (mut driver, hash, key) = confirm_enter_jit_hook_compiled_loop(x);
         driver
             .meta
             .warm_state_for_driver(0)
@@ -12799,6 +12848,54 @@ mod tests {
             &(),
             || even_pre_ran = true,
         );
+        assert!(
+            even_outcome.is_some(),
+            "an even red is the portal argument the hook accepted"
+        );
+        assert!(even_pre_ran);
+        assert_eq!(SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed), x);
+        assert_eq!(SEEN_RED.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    /// `back_edge_keyed` passes `greenargs = None` into `back_edge_internal`.
+    /// The compiled-entry hook still needs `jitdriver_sd._green_args_spec`
+    /// (`warmstate.py` `make_entry_point` / `confirm_enter_jit(*args)`).
+    #[test]
+    fn a_confirm_enter_jit_hook_on_a_keyed_back_edge_gets_the_driver_green_types() {
+        static SEEN_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SEEN_RED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn refuse_odd_red(args: &[Value]) -> bool {
+            SEEN_GREEN.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
+            SEEN_RED.store(args[1].as_int(), std::sync::atomic::Ordering::Relaxed);
+            args[1].as_int() % 2 == 0
+        }
+
+        let x = 10i64;
+        let (mut driver, hash, _key) = confirm_enter_jit_hook_compiled_loop(x);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_confirm_enter_jit(Some(refuse_odd_red));
+
+        let mut odd_state = TypedRestoreState {
+            live_values: vec![3],
+            ..Default::default()
+        };
+        let mut odd_pre_ran = false;
+        let odd_outcome =
+            driver.back_edge_keyed(hash, 19, &mut odd_state, &(), || odd_pre_ran = true);
+        assert_eq!(odd_outcome, None);
+        assert!(!odd_pre_ran, "an odd red is refused before compiled entry");
+        assert_eq!(SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed), x);
+        assert_eq!(SEEN_RED.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+        let mut even_state = TypedRestoreState {
+            live_values: vec![4],
+            ..Default::default()
+        };
+        let mut even_pre_ran = false;
+        let even_outcome =
+            driver.back_edge_keyed(hash, 19, &mut even_state, &(), || even_pre_ran = true);
         assert!(
             even_outcome.is_some(),
             "an even red is the portal argument the hook accepted"
@@ -16696,6 +16793,18 @@ mod cross_loop_cut_close_tests {
         driver
     }
 
+    /// One Float green: `equal_whatever(Float)` is `f64 ==`, so +0.0 and
+    /// -0.0 share a cell while `ConstFloat.same_constant` compares bits.
+    fn float_close_driver() -> JitDriver<CutCloseState> {
+        let mut driver = JitDriver::<CutCloseState>::new(2);
+        driver.register_descriptor(JitDriverStaticData::new(
+            vec![("g0", Type::Float)],
+            vec![("r0", Type::Int)],
+        ));
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver
+    }
+
     impl JitState for CutCloseState {
         type Meta = ();
         type Sym = ();
@@ -16753,7 +16862,7 @@ mod cross_loop_cut_close_tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
             if cut {
-                ctx.cut_inner_green_key = Some(key);
+                ctx.cut_inner_green_key = Some(typed.clone());
             }
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
@@ -17051,6 +17160,77 @@ mod cross_loop_cut_close_tests {
         assert!(
             mp.green_key_typed.same_constant(&parked),
             "the merge point stores B's greens, not A's hash-equal start key"
+        );
+    }
+
+    /// A live close key's constants win over the installed cell's stored
+    /// greens when both name the same cell (`pyjitpl.py`
+    /// `reached_loop_header` appends the live boxes).
+    ///
+    /// `equal_whatever(Float)` is `f64 ==` (`warmstate.py`), so +0.0 and
+    /// -0.0 share a JitCell; `ConstFloat.same_constant` compares longlong
+    /// bits, so they are different merge-point constants.
+    #[test]
+    fn declined_jump_appends_live_close_constants_not_the_cells_stored_greens() {
+        let mut driver = float_close_driver();
+        let pos =
+            majit_ir::GreenKey::with_types(vec![0.0f64.to_bits() as i64], vec![GreenType::Float]);
+        let neg = majit_ir::GreenKey::with_types(
+            vec![(-0.0f64).to_bits() as i64],
+            vec![GreenType::Float],
+        );
+        assert_ne!(pos.values[0], neg.values[0]);
+        assert_eq!(pos.get_uhash(), neg.get_uhash());
+        assert_eq!(
+            pos, neg,
+            "equal_whatever(Float) treats +0.0 and -0.0 as one cell"
+        );
+        assert!(!pos.same_constant(&neg));
+
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .ensure_cell_for_key(&pos);
+        let cell_key = driver
+            .meta
+            .warm_state_for_driver(0)
+            .cell_key_for(&pos)
+            .expect("installed +0.0 cell");
+        assert_eq!(
+            driver
+                .meta
+                .warm_state_for_driver(0)
+                .resolve_cell_key(neg.get_uhash(), || neg.clone()),
+            cell_key,
+            "live -0.0 resolves to the +0.0 cell"
+        );
+        let installed = driver
+            .meta
+            .warm_state_for_driver(0)
+            .installed_greenkey(cell_key, &[GreenType::Float])
+            .expect("cell stores +0.0");
+        assert!(installed.same_constant(&pos));
+        assert!(!installed.same_constant(&neg));
+
+        start_outer_trace(&mut driver, 8120);
+        {
+            let ctx = driver.meta.trace_ctx().expect("tracing");
+            ctx.set_close_typed_key(neg.clone());
+        }
+        assert!(
+            driver.keep_tracing_after_declined_jump(cell_key, &[OpRef::input_arg_int(0)]),
+            "first visit of the target appends and keeps tracing"
+        );
+        let mp = driver
+            .meta
+            .trace_ctx()
+            .expect("tracing")
+            .current_merge_points
+            .last()
+            .expect("declined jump registered a merge point");
+        assert!(
+            mp.green_key_typed.same_constant(&neg),
+            "the merge point stores the live close key's -0.0, not the cell's +0.0"
         );
     }
 }

@@ -5781,13 +5781,6 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 impl TraceCtx {
     /// pyjitpl.py reverse `same_greenkey` scan.
     ///
-    /// Pyre's typed `green_key: u64` already collapses the
-    /// `same_greenkey` element-wise compare into hash equality (the
-    /// hash incorporates every greenarg via `JitCell.get_uhash`), so
-    /// the per-element loop in upstream is folded into a single
-    /// `mp.green_key == key` test here — the `same_greenkey` semantics
-    /// survive the collapse.
-    ///
     /// `pyjitpl.py` `assert len(original_boxes) == len(live_arg_boxes)`.
     /// Primary traces seed the start boxes via
     /// [`Self::seed_compile_and_run_once_merge_point`]
@@ -5795,22 +5788,14 @@ impl TraceCtx {
     /// later header visits append the same jitdriver red+vable shape.
     /// `TraceCtx::new` does not seed; bridges stay empty.
     pub fn has_merge_point_with_shape_assert(&self, key: &GreenKey, live_args_len: usize) -> bool {
-        self.has_merge_point_same_greenkey(key.get_uhash(), Some(key), live_args_len)
+        self.has_merge_point_same_greenkey(key, live_args_len)
     }
 
     /// pyjitpl.py `same_greenkey(original_boxes, live_arg_boxes, num_green_args)`.
     ///
-    /// Typed greens compare with `GreenKey::same_constant` (`pyjitpl.py`
-    /// `same_greenkey` / `Const.same_constant`). Hash equality is only the
-    /// fallback when the live side has no typed key
-    /// (`MetaInterp::cross_loop_cut_info` names the cut by
-    /// `cut_inner_green_key`, a cell key).
-    pub fn has_merge_point_same_greenkey(
-        &self,
-        key: u64,
-        live_typed: Option<&GreenKey>,
-        live_args_len: usize,
-    ) -> bool {
+    /// Live greens compare with `GreenKey::same_constant` (`pyjitpl.py`
+    /// `same_greenkey` / `Const.same_constant`).
+    pub fn has_merge_point_same_greenkey(&self, live: &GreenKey, live_args_len: usize) -> bool {
         // pyjitpl.py reverse scan:
         //   for j in range(len(self.current_merge_points) - 1, -1, -1):
         //       original_boxes, start = self.current_merge_points[j]
@@ -5826,11 +5811,7 @@ impl TraceCtx {
                 live_args_len,
                 "same_greenkey: merge points in one trace share the jitdriver shape"
             );
-            let greens_match = match live_typed {
-                Some(live) => mp.green_key_typed.same_constant(live),
-                None => mp.green_key == key,
-            };
-            if greens_match {
+            if mp.green_key_typed.same_constant(live) {
                 return true;
             }
         }
@@ -5934,28 +5915,17 @@ impl TraceCtx {
 
     /// pyjitpl.py `same_greenkey`, most recent hit.
     ///
-    /// The green key is `JitCell.get_uhash` over the whole green tuple, pc
-    /// included (`pypyjit_greenkey_uhash`). A side `header_pc` is not part of
-    /// the compare: `same_greenkey` matches the boxes, and requiring the
-    /// trace-start `header_pc` missed a point recorded under the merge
+    /// Live greens compare with `GreenKey::same_constant` (`pyjitpl.py`
+    /// `same_greenkey` / `Const.same_constant`). A side `header_pc` is not
+    /// part of the compare: `same_greenkey` matches the boxes, and requiring
+    /// the trace-start `header_pc` missed a point recorded under the merge
     /// point's own pc (and the other way round). `header_pc` on
     /// [`MergePoint`] stays the guest pc of that visit, for the cut.
-    ///
-    /// Typed greens use `GreenKey::same_constant` (`pyjitpl.py`
-    /// `same_greenkey`). Hash equality is the fallback when the live side
-    /// has no typed key (`MetaInterp::cross_loop_cut_info`).
-    pub fn find_merge_point_same_greenkey(
-        &self,
-        key: u64,
-        live_typed: Option<&GreenKey>,
-    ) -> Option<&MergePoint> {
+    pub fn find_merge_point_same_greenkey(&self, live: &GreenKey) -> Option<&MergePoint> {
         self.current_merge_points
             .iter()
             .rev()
-            .find(|mp| match live_typed {
-                Some(live) => mp.green_key_typed.same_constant(live),
-                None => mp.green_key == key,
-            })
+            .find(|mp| mp.green_key_typed.same_constant(live))
     }
 
     /// See [`TraceCtx::merge_point_resumed`] — pyjitpl.py:1570/1577
@@ -5987,8 +5957,7 @@ impl TraceCtx {
     /// the trace-start pc must not have that pc reject a point recorded
     /// under the loop's own pc.
     pub fn has_merge_point_at(&self, key: &GreenKey, _header_pc: usize) -> bool {
-        self.find_merge_point_same_greenkey(key.get_uhash(), Some(key))
-            .is_some()
+        self.find_merge_point_same_greenkey(key).is_some()
     }
 
     /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),
@@ -6137,6 +6106,30 @@ impl TraceCtx {
     /// Pop an inline frame (returning from a callee).
     pub(crate) fn pop_inline_frame(&mut self) {
         self.inline_frames.pop();
+    }
+}
+
+#[cfg(test)]
+mod same_greenkey_tests {
+    use super::*;
+    use majit_ir::GreenType;
+
+    /// pyjitpl.py `same_greenkey` / history.py `ConstFloat.same_constant`:
+    /// bit identity, so Float(+0.0) does not match Float(-0.0).
+    #[test]
+    fn find_merge_point_same_greenkey_uses_const_float_bit_identity() {
+        let mut ctx = TraceCtx::for_test_types(&[]);
+        let pos = GreenKey::with_types(vec![0.0f64.to_bits() as i64], vec![GreenType::Float]);
+        let neg = GreenKey::with_types(vec![(-0.0f64).to_bits() as i64], vec![GreenType::Float]);
+        ctx.add_merge_point_with_key(pos.get_uhash(), pos.clone(), Vec::new(), 0);
+        assert!(
+            ctx.find_merge_point_same_greenkey(&pos).is_some(),
+            "same_greenkey matches ConstFloat(+0.0) against itself"
+        );
+        assert!(
+            ctx.find_merge_point_same_greenkey(&neg).is_none(),
+            "ConstFloat.same_constant distinguishes +0.0 from -0.0"
+        );
     }
 }
 

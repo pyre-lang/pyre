@@ -5321,7 +5321,7 @@ impl<M: Clone> MetaInterp<M> {
     fn resolve_closing_green_key(
         &mut self,
         closed: Option<majit_ir::GreenKey>,
-        cut_inner_green_key: Option<u64>,
+        cut_inner_green_key: Option<&majit_ir::GreenKey>,
         outer_green_key: u64,
     ) -> u64 {
         let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
@@ -5329,9 +5329,10 @@ impl<M: Clone> MetaInterp<M> {
             Some(key) => self.cell_key_for_typed(compiling_jd, &key),
             None => cut_inner_green_key
                 .map(|inner| {
+                    let hash = inner.get_uhash();
                     self.warm_state_for_driver(compiling_jd)
-                        .sole_cell_key(inner)
-                        .unwrap_or(inner)
+                        .sole_cell_key(hash)
+                        .unwrap_or(hash)
                 })
                 .unwrap_or(outer_green_key),
         }
@@ -6058,10 +6059,11 @@ impl<M: Clone> MetaInterp<M> {
     /// closes at a different loop header than where it started.
     pub fn cross_loop_cut_info(&self) -> Option<(usize, Vec<crate::trace_ctx::GreenBox>)> {
         let ctx = self.tracing.as_ref()?;
-        let inner_key = ctx.cut_inner_green_key?;
-        // compile.py:269: cross-loop cut uses the inner loop's merge point.
-        // Lookup by inner_key (not ctx.green_key which is the outer loop).
-        ctx.find_merge_point_same_greenkey(inner_key, None)
+        let inner = ctx.cut_inner_green_key.as_ref()?;
+        // compile.py compile_loop: cross-loop cut uses the inner loop's merge
+        // point, found the same way `pyjitpl.py` `reached_loop_header` does
+        // (`same_greenkey` / `Const.same_constant`).
+        ctx.find_merge_point_same_greenkey(inner)
             .filter(|mp| mp.position.has_prefix_ops(ctx.num_inputargs()))
             .map(|mp| (mp.header_pc, mp.green_boxes.clone()))
     }
@@ -8873,13 +8875,12 @@ impl<M: Clone> MetaInterp<M> {
             // — the greens of the merge point just reached, not the trace-start
             // key, and not a side header_pc.
             let merge_position = self.tracing.as_ref().and_then(|ctx| {
-                let typed = ctx.close_green_key();
-                let key = typed
-                    .as_ref()
-                    .map(|k| k.get_uhash())
-                    .unwrap_or(ctx.green_key);
-                ctx.find_merge_point_same_greenkey(key, typed.as_ref())
-                    .map(|mp| mp.position)
+                let closed = ctx.close_green_key();
+                let live = closed.as_ref().or_else(|| ctx.green_key_values());
+                live.and_then(|key| {
+                    ctx.find_merge_point_same_greenkey(key)
+                        .map(|mp| mp.position)
+                })
             });
             if merge_position.is_none() {
                 self.register_retrace_merge_point(jump_args);
@@ -8966,7 +8967,7 @@ impl<M: Clone> MetaInterp<M> {
                 .as_ref()
                 .expect("compile_loop: no active trace ctx");
             let outer = ctx.green_key;
-            let cut_inner = ctx.cut_inner_green_key;
+            let cut_inner = ctx.cut_inner_green_key.clone();
             // pyjitpl.py:3005 / :3183-3189: the key is
             // `original_boxes[:num_green_args]`, i.e. the greens of the
             // merge point that closed the trace.  A bridge may start from a
@@ -8986,7 +8987,7 @@ impl<M: Clone> MetaInterp<M> {
         // that cell's greens; ensure the typed cell first so the token
         // and the entry share it.
         let green_key =
-            self.resolve_closing_green_key(closed, cut_inner_green_key, outer_green_key);
+            self.resolve_closing_green_key(closed, cut_inner_green_key.as_ref(), outer_green_key);
 
         // pyjitpl.py: has_compiled_targets(ptoken) →
         // raise SwitchToBlackhole(ABORT_BAD_LOOP).  The key is the one the
@@ -9048,10 +9049,11 @@ impl<M: Clone> MetaInterp<M> {
         // the way in rather than on success so a retried compile at the same
         // key cannot leave the mark behind; `forget_loop_side_tables` retires
         // it with the loop.
-        if let Some(cut_key) = cut_inner_green_key {
-            let key = self.compiled_loop_key(cut_key);
+        if let Some(cut_key) = cut_inner_green_key.as_ref() {
+            let hash = cut_key.get_uhash();
+            let key = self.compiled_loop_key(hash);
             self.cut_compiled_keys.insert(key);
-            self.speculative_cut_owned_key = Some(cut_key);
+            self.speculative_cut_owned_key = Some(hash);
         }
         self.force_finish_trace = false;
         // Park the recorder where `walk_active_trace_refs` still sees it.
@@ -9118,9 +9120,13 @@ impl<M: Clone> MetaInterp<M> {
             let ctx = self.compile_tracing.as_ref().unwrap();
             let n_inputargs = ctx.num_inputargs();
             // `reached_loop_header` `same_greenkey`: typed greens, not a
-            // side `header_pc`. The cell hash is only the untyped fallback.
-            let cut_merge_point = ctx
-                .find_merge_point_same_greenkey(green_key, closed_for_scan.as_ref())
+            // side `header_pc`.
+            let scan_key = closed_for_scan
+                .as_ref()
+                .or(cut_inner_green_key.as_ref())
+                .or_else(|| ctx.green_key_values());
+            let cut_merge_point = scan_key
+                .and_then(|live| ctx.find_merge_point_same_greenkey(live))
                 .filter(|mp| mp.position.has_prefix_ops(n_inputargs));
             let orig_vable_loop =
                 self.orig_vable_for_cut(cut_merge_point, ctx, driver_descriptor.as_ref());

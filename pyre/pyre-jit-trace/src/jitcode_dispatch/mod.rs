@@ -17443,7 +17443,7 @@ fn handle<Sym: WalkSym>(
                 crate::driver::make_green_key_typed(code_ptr, next_instr, is_being_profiled);
             if ctx
                 .trace_ctx
-                .has_merge_point_same_greenkey(key, Some(&live_typed), live_args.len())
+                .has_merge_point_same_greenkey(&live_typed, live_args.len())
             {
                 // The matched merge point need not be the one tracing started
                 // from: `reached_loop_header` scans every registered merge
