@@ -1536,6 +1536,9 @@ impl GcRewriterImpl {
         for fd in descr.gc_fielddescrs() {
             entries.insert(fd.offset() as i64);
         }
+        for ofs in descr.extra_clear_field_offsets() {
+            entries.insert(*ofs as i64);
+        }
     }
 
     // ────────────────────────────────────────────────────────

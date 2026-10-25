@@ -2310,9 +2310,10 @@ impl RPythonTyper {
                     GenopResult::LLType(LowLevelType::Bool),
                 ))
             }
-            // `_LLOpEntry.specialize_call` (`lloperation.py`) re-emits the
-            // same-named llop with `hop.inputarg(hop.args_r[i], i)` for each
-            // operand. `rewrite_op_raw_load` reads
+            // `_LLOpEntry.specialize_call` (`lloperation.py`) skips
+            // RESULTTYPE (`hop.args_s[1:]`) and re-emits the same-named
+            // llop. High-level `raw_load` is `(TYPE, addr, ofs)`; the
+            // llop keeps `[addr, offs]`. `rewrite_op_raw_load` reads
             // `T = op.result.concretetype`; `raw_store` takes T from the
             // value. A raw `Ptr` (`CCHARP` / `CArrayPtr`) `getkind`s as
             // `'int'` (`history.py` `TYPE.TO._gckind == 'raw'`), so the
@@ -2325,8 +2326,13 @@ impl RPythonTyper {
             // int-address contract) so a classdef-less Instance is not
             // relabelled as a pointer.
             "raw_load" => {
-                let v_addr = hop.inputarg_llop_intkind_or_signed(0)?;
-                let v_offs = hop.inputarg_llop_intkind_or_signed(1)?;
+                if hop.nb_args() != 3 {
+                    return Err(TyperError::message(
+                        "raw_load: llop.raw_load(TYPE, addr, ofs) needs 3 args",
+                    ));
+                }
+                let v_addr = hop.inputarg_llop_intkind_or_signed(1)?;
+                let v_offs = hop.inputarg_llop_intkind_or_signed(2)?;
                 hop.exception_cannot_occur()?;
                 let result_lltype = hop
                     .r_result

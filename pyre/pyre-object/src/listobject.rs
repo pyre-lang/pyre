@@ -166,7 +166,7 @@ pub unsafe fn w_list_lock_acquire(obj: PyObjectRef) -> usize {
     // A nursery list can move while its guard is held.  Stripe on its stable
     // class identity, not the movable instance address, so every operation on
     // one list continues to acquire the same lock after collection.
-    let w_class = (*obj).w_class;
+    let w_class = crate::mapdict::instance_getclass(obj);
     let lock = LIST_LOCKS[(w_class as usize >> 4) & (LIST_LOCKS.len() - 1)].get();
     acquire_list_lock_handle(lock)
 }
@@ -1196,7 +1196,7 @@ pub unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     }
     if is_long(item) {
         let int_typeobj = get_instantiate(&INT_TYPE);
-        let w_class = (*item).w_class;
+        let w_class = crate::mapdict::instance_getclass(item);
         if int_typeobj.is_null() {
             return w_class.is_null() && w_long_fits_int(item);
         }
@@ -2736,8 +2736,8 @@ unsafe fn snapshot_range_storage(obj: PyObjectRef) -> Vec<i64> {
 }
 
 unsafe fn lock_lists(a: PyObjectRef, b: PyObjectRef) -> (ListGuard, ListGuard) {
-    let class_a = (*a).w_class as usize;
-    let class_b = (*b).w_class as usize;
+    let class_a = crate::mapdict::instance_getclass(a) as usize;
+    let class_b = crate::mapdict::instance_getclass(b) as usize;
     if class_a <= class_b {
         (w_list_lock(a), w_list_lock(b))
     } else {

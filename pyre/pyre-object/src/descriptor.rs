@@ -444,16 +444,19 @@ pub unsafe fn is_property(obj: PyObjectRef) -> bool {
 /// the MRO — so calling `fget` in place of `__get__` is licensed only when the
 /// descriptor's type is `property` itself and cannot have overridden it.
 ///
-/// `allocate_instance` (`objspace.py`) stamps `PROPERTY_TYPE` and the builtin
-/// `property` class on an exact instance. A subclass is `PROPERTY_USER_TYPE`
-/// (`typedef.py` `_getusercls`) with `w_class` set to that subtype, so
-/// [`is_property`] accepts both layouts and this check stays on `w_class`.
+/// Interp-level exactness is the RPython class: `type(w_obj) is
+/// W_PropertyObject`. A `_getusercls` subclass instance carries
+/// `PROPERTY_USER_TYPE` (`typedef.py`). The Python class is
+/// `map.terminator.w_cls` (`BaseUserClassMapdict.getclass`); after
+/// `layout_header_class` the header word is `gettypefor(typeptr)` and
+/// is not this predicate. Same `user_subclass` test as
+/// [`typeptr_is_exact_builtin`].
 ///
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_property(obj: PyObjectRef) -> bool {
-    unsafe { is_property(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&PROPERTY_TYPE)) }
+    unsafe { std::ptr::eq((*obj).ob_type, &PROPERTY_TYPE) }
 }
 
 #[cfg(test)]

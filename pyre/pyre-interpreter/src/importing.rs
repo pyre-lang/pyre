@@ -6288,7 +6288,7 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if !unsafe { pyre_object::is_module(w_module) } {
         return None;
     }
-    let w_type = unsafe { (*w_module).w_class };
+    let w_type = unsafe { crate::objspace::std::mapdict::instance_getclass(w_module) };
     // Attribute-mode probes box the name while jitted (`lookup_in_type_where`
     // → `box_str_constant`). The module, its type, and later the spec stay
     // on the shadow stack and are reloaded after each probe.
@@ -6340,7 +6340,7 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
         }
         Some(spec) => spec,
     };
-    let spec_type = unsafe { (*w_spec).w_class };
+    let spec_type = unsafe { crate::objspace::std::mapdict::instance_getclass(w_spec) };
     let spec_base = pyre_object::gc_roots::pin_roots(&[w_spec, spec_type]);
     if unsafe {
         crate::baseobjspace::getattribute_if_not_from_object(
@@ -6423,7 +6423,7 @@ fn dict_getitem_str_no_callback(dict: PyObjectRef, key: &str) -> Option<Option<P
 /// `None`: `findattr` then returns `w_None`, which is not RPython `None`,
 /// so `_handle_fromlist` still runs.
 pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
-    let w_type = unsafe { (*w_module).w_class };
+    let w_type = unsafe { crate::objspace::std::mapdict::instance_getclass(w_module) };
     if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_some() {
         return None;
     }
@@ -6610,7 +6610,7 @@ unsafe fn bootstrap_handle_fromlist_lookup() -> PyObjectRef {
     if w_bootstrap.is_null() || !pyre_object::is_module(w_bootstrap) {
         return pyre_object::PY_NULL;
     }
-    let mut w_type = (*w_bootstrap).w_class;
+    let mut w_type = crate::objspace::std::mapdict::instance_getclass(w_bootstrap);
     if w_type.is_null()
         || pyre_object::with_roots!(w_bootstrap, w_type => {
             crate::baseobjspace::module_getattribute_if_not_from_default(w_type)
@@ -7051,7 +7051,7 @@ unsafe fn spec_has_object_getattribute(w_type: PyObjectRef) -> bool {
 }
 
 unsafe fn module_spec_initializing_state(mut w_spec: PyObjectRef) -> i64 {
-    let mut w_type = unsafe { (*w_spec).w_class };
+    let mut w_type = unsafe { crate::objspace::std::mapdict::instance_getclass(w_spec) };
     if !pyre_object::with_roots!(w_spec, w_type => unsafe {
         spec_has_object_getattribute(w_type)
     }) {
@@ -8375,7 +8375,7 @@ fn is_exact_stdlib_module_spec(mut w_spec: PyObjectRef) -> bool {
     if spec_type.is_null() {
         return false;
     }
-    unsafe { (*w_spec).w_class == spec_type }
+    unsafe { crate::objspace::std::mapdict::instance_getclass(w_spec) == spec_type }
 }
 
 /// `_PyModuleSpec_GetFileOrigin` — the spec's file origin: its `origin` string
@@ -8504,7 +8504,7 @@ pub fn import_from(mut module: PyObjectRef, name: &str) -> Result<PyObjectRef, c
     // after-effect.  A custom `__getattribute__`, a data descriptor, or a
     // dict miss stays on import_from_slow (full getattr + sys.modules).
     if unsafe { pyre_object::is_module(module) } {
-        let w_type = unsafe { (*module).w_class };
+        let w_type = unsafe { crate::objspace::std::mapdict::instance_getclass(module) };
         if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_none()
             && !unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, name) }
         {
@@ -9136,7 +9136,7 @@ mod tests {
         let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
         unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };
         set_sys_module("import_cache_probe_mod", module);
-        let w_type = unsafe { (*module).w_class };
+        let w_type = unsafe { crate::objspace::std::mapdict::instance_getclass(module) };
         assert!(
             unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }
                 .is_none(),

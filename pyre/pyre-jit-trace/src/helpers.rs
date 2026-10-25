@@ -768,11 +768,13 @@ pub fn emit_box_long_inline(
 ///
 /// Mirrors `allocate_instance`: `user` selects the realbase layout or its
 /// `_getusercls` layout. `NewWithVtable` writes that layout's vtable.
-/// `w_class` is the Python class. `descr_init` stores `args_w`.
+/// `w_class` is the Python class stored on `terminator.w_cls` for a USER
+/// layout; the header word is `gettypefor(typeptr)`. `descr_init` stores
+/// `args_w`.
 /// GC pointer fields such as `w_cause` and `w_context` are cleared by the GC
 /// rewriter; the plain `suppress_context` byte is stored explicitly.
 ///
-/// `_mapdict_init_empty` leaves the user layout's `map` as None and `storage`
+/// `_mapdict_init_empty` stores `w_subtype.terminator` and leaves `storage`
 /// null. `map` is a plain word, so the rewriter does not clear it, and a
 /// virtual force would otherwise publish whatever bits the nursery held.
 /// `storage` is stored too: a virtual read of an unwritten field reloads the
@@ -788,29 +790,14 @@ pub fn emit_exception_new_inline(
         crate::descr::w_exception_descrs_for(kind, user);
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
-    let kind_const = ctx.const_int(kind as u8 as i64);
-    let kind_idx = kind_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, kind_const], kind_descr);
-    ctx.heapcache_setfield_cached(new_op, kind_idx, kind_const);
-    let w_class_idx = w_class_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_class], w_class_descr);
-    ctx.heapcache_setfield_cached(new_op, w_class_idx, w_class);
-    let args_w_idx = args_w_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
-    ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);
-    let suppress_context = ctx.const_int(0);
-    let suppress_context_descr = crate::descr::w_exception_suppress_context_descr_for(kind, user);
-    let suppress_context_idx = suppress_context_descr.index();
-    ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, suppress_context],
-        suppress_context_descr,
-    );
-    ctx.heapcache_setfield_cached(new_op, suppress_context_idx, suppress_context);
     if user {
         // `allocate_exception` writes both words. The offsets differ between
         // the slim and extended user structs; the field descr is the one on
-        // this kind's user SizeDescr.
+        // this kind's user SizeDescr. Store `map` before any later collecting
+        // record: `instance_walk_boxed_storage` loads it, and
+        // `clear_gc_fields` does not reach a Type::Int intern_node word
+        // (`MapdictStorageMixin.map` is a GCREF upstream). The SizeDescr
+        // extra-clear offset is the rewrite-time sibling of this store.
         let (map_offset, storage_offset) =
             if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
                 (
@@ -825,10 +812,23 @@ pub fn emit_exception_new_inline(
             };
         let map_descr = crate::descr::w_exception_slot_descr_for(kind, map_offset, true)
             .expect("user exception layout has a map field");
-        let map_zero = ctx.const_int(0);
+        // `user_setup` / `_mapdict_init_empty` copies `w_subtype.terminator`.
+        // `allocate_exception` stamps the same interned terminator, so a
+        // compiled NewWithVtable must store that word: storing 0 fails
+        // `GuardValue` of the live map against the terminator the interpreter
+        // instance already holds.
+        let map_word = match ctx.box_value(w_class) {
+            Some(Value::Ref(GcRef(p))) => {
+                let term = unsafe {
+                    pyre_object::typeobject::w_type_get_terminator(p as pyre_object::PyObjectRef)
+                };
+                ctx.const_int(term as i64)
+            }
+            _ => ctx.const_int(0),
+        };
         let map_idx = map_descr.index();
-        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, map_zero], map_descr);
-        ctx.heapcache_setfield_cached(new_op, map_idx, map_zero);
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, map_word], map_descr);
+        ctx.heapcache_setfield_cached(new_op, map_idx, map_word);
         let storage_descr = crate::descr::w_exception_slot_descr_for(kind, storage_offset, true)
             .expect("user exception layout has a storage field");
         let storage_null = ctx.const_ref(pyre_object::PY_NULL as i64);
@@ -836,6 +836,43 @@ pub fn emit_exception_new_inline(
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage_null], storage_descr);
         ctx.heapcache_setfield_cached(new_op, storage_idx, storage_null);
     }
+    let kind_const = ctx.const_int(kind as u8 as i64);
+    let kind_idx = kind_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, kind_const], kind_descr);
+    ctx.heapcache_setfield_cached(new_op, kind_idx, kind_const);
+    let w_class_idx = w_class_descr.index();
+    // USER layouts keep the Python class on `terminator.w_cls`. The header
+    // is `gettypefor(typeptr)` (`allocate_exception` / `layout_header_class`).
+    let header_class = if user {
+        let layout: *const pyre_object::PyType =
+            if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
+                &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE
+            } else {
+                &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE
+            };
+        let stamped = unsafe { pyre_object::layout_header_class(layout, std::ptr::null_mut(), 1) };
+        if stamped.is_null() {
+            w_class
+        } else {
+            ctx.const_ref(stamped as i64)
+        }
+    } else {
+        w_class
+    };
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, header_class], w_class_descr);
+    ctx.heapcache_setfield_cached(new_op, w_class_idx, header_class);
+    let args_w_idx = args_w_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
+    ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);
+    let suppress_context = ctx.const_int(0);
+    let suppress_context_descr = crate::descr::w_exception_suppress_context_descr_for(kind, user);
+    let suppress_context_idx = suppress_context_descr.index();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, suppress_context],
+        suppress_context_descr,
+    );
+    ctx.heapcache_setfield_cached(new_op, suppress_context_idx, suppress_context);
     new_op
 }
 
@@ -998,10 +1035,13 @@ pub fn emit_make_function_inline(
 /// on the next iteration's fresh instance naming a map the instance does not
 /// have yet.
 ///
-/// Emitting the instantiation as New+SetField instead of the opaque
-/// `bh_call_fn` residual lets the optimizer virtualize the instance away when
-/// it never escapes the loop — the shape PyPy gets by tracing through
-/// `typeobject.py descr_call` → `space.allocate_instance`.
+/// `header_w_class` is the Python class argument of `w_instance_new`.
+/// A live terminator stamps `gettypefor(typeptr)` in the header instead
+/// (`W_Root.getclass`); the Python class lives on `terminator.w_cls`.
+/// Emitting the instantiation as New+SetField instead of the
+/// opaque `bh_call_fn` residual lets the optimizer virtualize the instance
+/// away when it never escapes the loop — the shape PyPy gets by tracing
+/// through `typeobject.py descr_call` → `space.allocate_instance`.
 pub fn emit_instance_inline(
     ctx: &mut TraceCtx,
     header_w_class: OpRef,
@@ -1014,8 +1054,30 @@ pub fn emit_instance_inline(
         crate::descr::w_object_object_size_descr()
     };
     let new_op = ctx.execute_new_with_vtable(size_descr, None);
+    // Header `w_class` is `gettypefor(typeptr)` (`W_Root.getclass`) once a
+    // live map holds the Python class on `terminator.w_cls`
+    // (`user_setup` / `_mapdict_init_empty`). `map == 0` keeps the Python
+    // class argument so `getclass` still answers until the map exists.
+    let header_stamp = match ctx.box_value(map) {
+        Some(Value::Int(0)) => header_w_class,
+        Some(Value::Int(_)) => {
+            let layout = if user {
+                &pyre_object::pyobject::INSTANCE_USER_TYPE
+            } else {
+                &pyre_object::pyobject::INSTANCE_TYPE
+            };
+            let base = unsafe { pyre_object::pyobject::layout_base(layout as *const _) };
+            let stamped = pyre_object::get_instantiate(unsafe { &*base });
+            if stamped.is_null() {
+                header_w_class
+            } else {
+                ctx.const_ref(stamped as i64)
+            }
+        }
+        _ => header_w_class,
+    };
     for (descr, value) in [
-        (crate::descr::object_header_w_class_descr(), header_w_class),
+        (crate::descr::object_header_w_class_descr(), header_stamp),
         (crate::descr::object_map_descr(), map),
     ] {
         let index = descr.index();

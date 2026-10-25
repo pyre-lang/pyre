@@ -312,6 +312,38 @@ pub unsafe fn layout_base(tp: *const PyType) -> *const PyType {
     if base.is_null() { tp } else { base }
 }
 
+/// Header `w_class` analog of `W_Root.getclass` / `gettypefor(typeptr)`.
+///
+/// A live map already holds the Python class on `terminator.w_cls`
+/// (`user_setup` / `_mapdict_init_empty`). `map == 0` is an incomplete
+/// type (`w_type_new` before terminator install, or a non-type sentinel);
+/// keep `python_class` so `getclass` still answers until the map exists.
+/// Generated `_getusercls` allocators stamp `map: 0` in their own
+/// constructors, then the interpreter copies `w_subtype.terminator`.
+///
+/// # Safety
+/// `layout` must be null or a live `PyType`.
+#[inline]
+pub unsafe fn layout_header_class(
+    layout: *const PyType,
+    python_class: PyObjectRef,
+    map: usize,
+) -> PyObjectRef {
+    if map == 0 || layout.is_null() {
+        return python_class;
+    }
+    let base = unsafe { layout_base(layout) };
+    if base.is_null() {
+        return python_class;
+    }
+    let stamped = get_instantiate(unsafe { &*base });
+    if stamped.is_null() {
+        python_class
+    } else {
+        stamped
+    }
+}
+
 /// rclass.py:739-743 parity — cache the W_TypeObject on the PyType
 /// so allocators can set `w_class` at allocation time.
 ///
@@ -386,6 +418,13 @@ pub unsafe fn is_exact_builtin_instance(obj: PyObjectRef) -> bool {
     if unsafe { typeptr_is_exact_builtin(obj) } {
         return true;
     }
+    // Mapdict mixin layouts keep the Python class on `terminator.w_cls`
+    // (`mapdict.py` `BaseUserClassMapdict.getclass`). The header word is
+    // `gettypefor(typeptr)` (`W_Root.getclass`), so the class-word test
+    // would treat every user instance as exact.
+    if unsafe { pytype_has_mapdict_mixin(obj) } {
+        return false;
+    }
     unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
 }
 
@@ -402,6 +441,9 @@ pub unsafe fn is_exact_builtin_instance_nonnull(obj: PyObjectRef) -> bool {
     }
     if unsafe { typeptr_is_exact_builtin(obj) } {
         return true;
+    }
+    if unsafe { pytype_has_mapdict_mixin(obj) } {
+        return false;
     }
     unsafe { class_word_is_exact_builtin(obj, (*obj).w_class) }
 }
@@ -477,6 +519,21 @@ pub unsafe fn is_exact_type(obj: PyObjectRef, tp: &PyType) -> bool {
         // exactness: every user subclass instance carries the user class.
         if !tp.user_subclass.is_null() && std::ptr::eq((*obj).ob_type, tp as *const PyType) {
             return true;
+        }
+        // Mapdict mixin layouts keep the Python class on `terminator.w_cls`
+        // (`mapdict.py` `BaseUserClassMapdict.getclass`). Allocation stamps
+        // `gettypefor(typeptr)` in the header (`W_Root.getclass`), so the
+        // header word is the typedef type of the typeptr. A null class or
+        // instantiate (bootstrap / `_getusercls` alloc before `user_setup`)
+        // is not exactness: `null == null` would treat every untagged
+        // subclass instance as exact.
+        if pytype_has_mapdict_mixin(obj) {
+            let w_class = crate::mapdict::instance_getclass(obj);
+            let canonical = get_instantiate(tp);
+            if w_class.is_null() || canonical.is_null() {
+                return std::ptr::eq((*obj).ob_type, tp as *const PyType);
+            }
+            return std::ptr::eq(w_class, canonical);
         }
         let w_class = (*obj).w_class;
         if w_class.is_null() {
@@ -634,6 +691,12 @@ static OBJECT_LAYOUT: ObjectLayout = ObjectLayout {
     w_class_watchers: crate::quasiimmut::QuasiImmutField::new(),
 };
 
+/// Host identity of the process-wide `ObjectLayout` prebuilt
+/// (`rclass.py` space-owned watcher set).
+pub fn object_layout_static_addr() -> *const () {
+    &OBJECT_LAYOUT as *const ObjectLayout as *const ()
+}
+
 /// `quasiimmut.py get_current_qmut_instance` for `PyObject.w_class`.
 pub fn w_class_current_qmut() -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
     OBJECT_LAYOUT.w_class_watchers.get_current_qmut_instance()
@@ -648,11 +711,22 @@ pub fn notify_w_class_mutated() {
     }
 }
 
-/// Unlink the `w_class` watcher and publish `store` under the same lock
+/// Unlink the `w_class` watcher and publish `w_class` under the same lock
 /// so a tracer cannot fold the old class onto a freshly installed watcher.
+///
+/// `rclass.py hook_setfield` plus the store (`publish_quasi_immut_ptr`).
+///
+/// # Safety
+/// `obj` is live. `w_class` is the header class word being published.
 #[inline]
-pub fn notify_w_class_mutated_then(store: impl FnOnce()) {
-    OBJECT_LAYOUT.w_class_watchers.invalidate_then_store(store);
+pub unsafe fn notify_w_class_mutated_then(obj: PyObjectRef, w_class: PyObjectRef) {
+    unsafe {
+        crate::quasiimmut::publish_quasi_immut_ptr(
+            std::ptr::addr_of!(OBJECT_LAYOUT.w_class_watchers),
+            std::ptr::addr_of_mut!((*obj).w_class),
+            w_class,
+        );
+    }
 }
 
 /// Field offset of `subclassrange_min` within PyType (OBJECT_VTABLE).
@@ -1969,7 +2043,13 @@ pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_tuple(obj: PyObjectRef) -> bool {
-    unsafe { is_tuple(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&TUPLE_TYPE)) }
+    unsafe {
+        is_tuple(obj)
+            && std::ptr::eq(
+                crate::mapdict::instance_getclass(obj),
+                get_instantiate(&TUPLE_TYPE),
+            )
+    }
 }
 
 /// `PyList_CheckExact` — an exact `list`, excluding list subclasses.
@@ -1978,7 +2058,13 @@ pub unsafe fn is_exact_tuple(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_list(obj: PyObjectRef) -> bool {
-    unsafe { is_list(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&LIST_TYPE)) }
+    unsafe {
+        is_list(obj)
+            && std::ptr::eq(
+                crate::mapdict::instance_getclass(obj),
+                get_instantiate(&LIST_TYPE),
+            )
+    }
 }
 
 /// `pypy/objspace/std/dictmultiobject.py` makes both `W_DictObject` and

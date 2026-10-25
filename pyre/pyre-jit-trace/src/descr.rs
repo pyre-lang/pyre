@@ -5103,6 +5103,16 @@ pub fn property_fset_descr() -> DescrRef {
     PROPERTY_FSET_FIELD_DESCR.clone()
 }
 
+/// `MapdictStorageMixin.map` is a GCREF (`mapdict.py`), so
+/// `rewrite.py clear_gc_fields` delayed-zeros it. pyre stores a
+/// `malloc_raw` intern_node address (`intern_node`) in a `Type::Int` word
+/// that MiniMark must not scan; stamp the offset so the birth zero still
+/// happens. `instance_walk_boxed_storage` loads the word, and recycled
+/// nursery bytes are a non-null pointer.
+fn stamp_mapdict_map_birth_zero(size_descr: &majit_ir::descr::SimpleSizeDescr, map_offset: usize) {
+    size_descr.set_extra_clear_field_offsets(vec![map_offset]);
+}
+
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs`) — the instance
 /// layout `[ob_type | w_class | map | storage]`.  Built with a parent SizeDescr
 /// (unlike a bare [`make_field_descr`]) so a `getfield_gc` on `map` / `storage`
@@ -5176,6 +5186,10 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     // (`rewrite.rs` `handle_new_fixedsize` / `SizeDescr.non_moving`), matching
     // HEAD's descr flag.
     group.size_descr.set_non_moving(true);
+    stamp_mapdict_map_birth_zero(
+        &group.size_descr,
+        core::mem::offset_of!(pyre_object::W_ObjectObject, map),
+    );
     group
 });
 
@@ -5207,6 +5221,7 @@ static W_OBJECT_OBJECT_USER_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     sd.set_cache_key(cache_key);
     let sd = sd.with_all_fielddescrs(fields);
     sd.set_non_moving(true);
+    stamp_mapdict_map_birth_zero(&sd, core::mem::offset_of!(pyre_object::W_ObjectObject, map));
     let descr = Arc::new(sd) as DescrRef;
     majit_ir::descr_registry::register_keyed_size(
         majit_ir::descr::LLType::Struct(cache_key),
@@ -5307,6 +5322,87 @@ fn build_native_user_mapdict_group_with_parent(
     // cannot alias map and storage through that placeholder.
     map.set_index(tag);
     storage.set_index(tag | 1);
+    stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
+    PyreObjectDescrGroup {
+        size_descr: group.size_descr,
+        field_descrs: vec![map, storage],
+    }
+}
+
+/// [`build_native_user_mapdict_group`] whose realbase is another published
+/// object group. `inlined_parent` is that group's payload FieldDescr
+/// objects, in `all_fielddescrs` order after the inherited class word
+/// (`heaptracker.py` recurses with `get_field_descr(gccache, INNER, name)`
+/// so a derived layout keeps the parent's descrs at the parent's
+/// `get_fielddescr_index_in` slots). Map and storage then mint after that
+/// walk; an empty parent left them at slot 1, which is also
+/// `W_ListObject.length` / `W_UnicodeObject.value` on the inlined payload,
+/// and `OptHeap::field_slot_index` keyed both GETFIELDs onto one PtrInfo
+/// slot.
+fn build_native_user_mapdict_group_inlining(
+    size: usize,
+    type_id: u32,
+    vtable: usize,
+    map_offset: usize,
+    storage_offset: usize,
+    simple_name: &'static str,
+    def_path: &'static str,
+    tag: u32,
+    inlined_parent: &[Arc<majit_ir::descr::SimpleFieldDescr>],
+) -> PyreObjectDescrGroup {
+    debug_assert!(
+        inlined_parent
+            .iter()
+            .all(|fd| { fd.offset() != map_offset && fd.offset() != storage_offset })
+    );
+    let fields: [ObjectFieldSpec; 2] = [
+        (
+            "map",
+            map_offset,
+            core::mem::size_of::<usize>(),
+            Type::Int,
+            false,
+            false,
+            false,
+        ),
+        (
+            "storage",
+            storage_offset,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            false,
+        ),
+    ];
+    let group = build_object_descr_group_inlining_parent(
+        size,
+        type_id,
+        vtable,
+        &fields,
+        simple_name,
+        def_path,
+        &[],
+        &[],
+        "",
+        false,
+        inlined_parent,
+    );
+    let map = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "map")
+        .expect("native user mapdict group lists map")
+        .clone();
+    let storage = group
+        .field_descrs
+        .iter()
+        .find(|d| d.field_key() == "storage")
+        .expect("native user mapdict group lists storage")
+        .clone();
+    map.set_index(tag);
+    storage.set_index(tag | 1);
+    stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage],
@@ -5392,6 +5488,10 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     map.set_index(tag);
     storage.set_index(tag | 1);
     intval.set_index(tag | 2);
+    stamp_mapdict_map_birth_zero(
+        &group.size_descr,
+        std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
+    );
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage, intval],
@@ -5399,7 +5499,7 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 });
 
 static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
         pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID,
         &pyre_object::pyobject::STR_USER_TYPE as *const _ as usize,
@@ -5408,11 +5508,12 @@ static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
         "W_UnicodeObjectUser",
         "unicodeobject::W_UnicodeObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x10,
+        &W_UNICODE_DESCR_GROUP.field_descrs,
     )
 });
 
 static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
         pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID,
         &pyre_object::pyobject::TUPLE_USER_TYPE as *const _ as usize,
@@ -5421,6 +5522,7 @@ static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
         "W_TupleObjectUser",
         "tupleobject::W_TupleObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x20,
+        &W_TUPLE_DESCR_GROUP.field_descrs,
     )
 });
 
@@ -5515,6 +5617,10 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     map.set_index(tag);
     storage.set_index(tag | 1);
     floatval.set_index(tag | 2);
+    stamp_mapdict_map_birth_zero(
+        &group.size_descr,
+        std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
+    );
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage, floatval],
@@ -5555,7 +5661,7 @@ static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
 });
 
 static W_BYTES_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::bytesobject::W_BYTES_USER_OBJECT_SIZE,
         pyre_object::bytesobject::W_BYTES_USER_GC_TYPE_ID,
         &pyre_object::bytesobject::BYTES_USER_TYPE as *const _ as usize,
@@ -5564,11 +5670,12 @@ static W_BYTES_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
         "W_BytesObjectUser",
         "bytesobject::W_BytesObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x50,
+        &W_BYTES_DESCR_GROUP.field_descrs,
     )
 });
 
 static W_BYTEARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::bytearrayobject::W_BYTEARRAY_USER_OBJECT_SIZE,
         pyre_object::bytearrayobject::W_BYTEARRAY_USER_GC_TYPE_ID,
         &pyre_object::bytearrayobject::BYTEARRAY_USER_TYPE as *const _ as usize,
@@ -5577,11 +5684,12 @@ static W_BYTEARRAY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
         "W_BytearrayObjectUser",
         "bytearrayobject::W_BytearrayObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x60,
+        &W_BYTEARRAY_DESCR_GROUP.field_descrs,
     )
 });
 
 static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::listobject::W_LIST_USER_OBJECT_SIZE,
         pyre_object::listobject::W_LIST_USER_GC_TYPE_ID,
         &pyre_object::pyobject::LIST_USER_TYPE as *const _ as usize,
@@ -5590,6 +5698,7 @@ static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
         "W_ListObjectUser",
         "listobject::W_ListObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x70,
+        &W_LIST_DESCR_GROUP.field_descrs,
     )
 });
 
@@ -5598,7 +5707,7 @@ static W_LIST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
 /// `frozenset` subclass reads `map`/`storage` through the same field descrs,
 /// the same sharing [`W_SET_DESCR_GROUP`] gives the base payloads.
 static W_SET_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    build_native_user_mapdict_group_inlining(
         pyre_object::setobject::W_SET_USER_OBJECT_SIZE,
         pyre_object::setobject::W_SET_USER_GC_TYPE_ID,
         &pyre_object::setobject::SET_USER_TYPE as *const _ as usize,
@@ -5607,6 +5716,7 @@ static W_SET_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
         "W_SetObjectUser",
         "setobject::W_SetObjectUser",
         NATIVE_MAPDICT_DESCR_TAG | 0x80,
+        &W_SET_DESCR_GROUP.field_descrs,
     )
 });
 
@@ -8064,7 +8174,7 @@ fn finish_exception_descr_group(
         (true, true) => with_w_exception_group_for(ExcKind::OSError, false, exception_payload_rows),
     };
     fields.retain(|&(_, offset, ..)| inlined_parent.iter().all(|fd| fd.offset() != offset));
-    build_object_descr_group_inlining_parent(
+    let group = build_object_descr_group_inlining_parent(
         size,
         tid,
         vtable,
@@ -8080,7 +8190,16 @@ fn finish_exception_descr_group(
         },
         false,
         &inlined_parent,
-    )
+    );
+    if user {
+        let map_offset = if extended {
+            EXC_EXTENDED_USER_MAP_OFFSET
+        } else {
+            EXC_USER_MAP_OFFSET
+        };
+        stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
+    }
+    group
 }
 
 /// A group's positional rows without the trailing class-word row: what a
@@ -10229,6 +10348,16 @@ mod tests {
         user_expected.sort_unstable();
         user_expected.dedup();
         assert_eq!(user_actual, user_expected);
+        assert!(
+            !user_actual.contains(&EXC_USER_MAP_OFFSET),
+            "map is a malloc_raw intern_node address, not a MiniMark edge"
+        );
+        assert!(
+            user.extra_clear_field_offsets()
+                .contains(&EXC_USER_MAP_OFFSET),
+            "rewrite.py clear_gc_fields delayed-zeros MapdictStorageMixin.map; \
+             the Type::Int intern_node word still needs that birth zero"
+        );
     }
 
     /// `heaptracker.py all_fielddescrs` skips `typeptr` and recurses into the
@@ -11649,6 +11778,23 @@ mod tests {
             &(std::mem::offset_of!(W_ListObject, ascii_items)
                 + pyre_object::unicode_array::UNICODE_ARRAY_BLOCK_OFFSET)
         ));
+    }
+
+    #[test]
+    fn list_user_map_index_in_parent_follows_inlined_list_payload() {
+        // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`: the
+        // generated `_getusercls` layout keeps the realbase FieldDescr
+        // objects at the parent's slots. `W_ListObject.length` is slot 1;
+        // `W_ListObjectUser.map` must mint after that walk so
+        // `OptHeap::field_slot_index` does not alias GETFIELD map with
+        // GETFIELD length on one PtrInfo.
+        let map_iip = W_LIST_USER_DESCR_GROUP.field_descrs[0].index_in_parent();
+        let length_iip = list_length_descr()
+            .as_field_descr()
+            .expect("list length is a field descr")
+            .index_in_parent();
+        assert_ne!(map_iip, length_iip);
+        assert!(map_iip > length_iip);
     }
 
     #[test]

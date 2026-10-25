@@ -711,15 +711,10 @@ pub fn makespecialisedtuple2(w_arg1: PyObjectRef, w_arg2: PyObjectRef) -> PyObje
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_plain_float_strict(obj: PyObjectRef) -> bool {
-    if !py_type_check(obj, &FLOAT_TYPE) {
-        return false;
-    }
-    let float_typeobj = get_instantiate(&FLOAT_TYPE);
-    if float_typeobj.is_null() {
-        return (*obj).w_class.is_null();
-    }
-    let w_class = (*obj).w_class;
-    w_class.is_null() || std::ptr::eq(w_class, float_typeobj)
+    // `type(w) is W_FloatObject` (`specialisedtupleobject.py`): the
+    // typeptr, not header `w_class` (`layout_header_class` /
+    // `gettypefor(typeptr)`). A float subclass is `FLOAT_USER_TYPE`.
+    py_type_check(obj, &FLOAT_TYPE)
 }
 
 /// Get the item at the given index from a tuple — polymorphic over
@@ -1116,17 +1111,12 @@ mod tests {
     }
 
     /// `specialisedtupleobject.py:176` checks `type(w) is W_FloatObject`.
-    /// A float subclass keeps the W_FloatObject payload shape but has a
-    /// different Python-level `w_class`, so it must fall through to `Cls_oo`.
+    /// A float subclass instance is `W_FloatObjectUser` (`FLOAT_USER_TYPE`),
+    /// so it must fall through to `Cls_oo`.
     #[test]
     fn test_arity2_float_subclass_pair_falls_through_to_oo() {
-        let lhs = crate::floatobject::w_float_new(1.5);
-        let rhs = crate::floatobject::w_float_new(2.25);
-        let fake_subclass = &INSTANCE_TYPE as *const PyType as PyObjectRef;
-        unsafe {
-            (*lhs).w_class = fake_subclass;
-            (*rhs).w_class = fake_subclass;
-        }
+        let lhs = crate::floatobject::w_float_subclass_new(1.5);
+        let rhs = crate::floatobject::w_float_subclass_new(2.25);
 
         let tup = w_tuple_new(vec![lhs, rhs]);
         unsafe {
@@ -1138,16 +1128,25 @@ mod tests {
     }
 
     /// `listobject.py:2390` checks `type(w) is W_LongObject`, so a
-    /// W_LongObject carrying an app-level int subclass must not take the
-    /// int-int specialised tuple path.
+    /// `W_LongObjectUser` (`LONG_USER_TYPE`) carrying an app-level int
+    /// subclass must not take the int-int specialised tuple path.
     #[test]
     fn test_arity2_long_subclass_pair_falls_through_to_oo() {
-        let lhs = crate::longobject::w_long_from_i64(7);
-        let rhs = crate::longobject::w_long_from_i64(11);
-        let fake_subclass = &INSTANCE_TYPE as *const PyType as PyObjectRef;
+        let w_cls = crate::w_type_new("LongSub", PY_NULL, std::ptr::null_mut());
+        let lhs_exact = crate::longobject::w_long_from_i64(7);
+        let rhs_exact = crate::longobject::w_long_from_i64(11);
+        let lhs = crate::longobject::w_long_subclass_from_raw(unsafe {
+            crate::longobject::w_long_get_raw_value(lhs_exact)
+        });
+        let rhs = crate::longobject::w_long_subclass_from_raw(unsafe {
+            crate::longobject::w_long_get_raw_value(rhs_exact)
+        });
+        // `w_long_subclass_from_raw` is the `_getusercls` allocator; stamp
+        // the heap type the way `tag_subclass_instance` does before the map
+        // exists (`instance_getclass` falls back to the header).
         unsafe {
-            (*lhs).w_class = fake_subclass;
-            (*rhs).w_class = fake_subclass;
+            (*lhs).w_class = w_cls;
+            (*rhs).w_class = w_cls;
         }
 
         let tup = w_tuple_new(vec![lhs, rhs]);

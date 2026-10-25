@@ -2792,17 +2792,23 @@ impl RPythonAnnotator {
                         "int_between" if sp.args.len() == 3 => {
                             Some(SomeValue::Bool(super::model::SomeBool::new()))
                         }
-                        // `llop.raw_load` / `llop.raw_store`.  The adapter
-                        // seeds the result with `lltype_to_annotation` of
-                        // the item descr (`_LLOpEntry.compute_result_annotation`);
-                        // take ownership via `setbinding`.  `raw_store`
+                        // `llop.raw_load` / `llop.raw_store`.
+                        // `_LLOpEntry.compute_result_annotation`
+                        // (`lloperation.py`) is
+                        // `lltype_to_annotation(RESULTTYPE.const)`.
+                        // RESULTTYPE is args[0]; `from_opname` has no
+                        // `raw_load`, so bind it here. `raw_store`
                         // returns Void (`s_None`).
-                        "raw_load" if sp.args.len() == 2 => match &sp.result {
-                            Hlvalue::Variable(v) => {
-                                v.annotation.borrow().as_ref().map(|rc| (**rc).clone())
-                            }
-                            _ => None,
-                        },
+                        "raw_load" if sp.args.len() == 3 => {
+                            self.annotation(&sp.args[0]).and_then(|s| match s.const_() {
+                                Some(crate::flowspace::model::ConstValue::LowLevelType(ll)) => Some(
+                                    crate::translator::rtyper::llannotation::lltype_to_annotation(
+                                        (**ll).clone(),
+                                    ),
+                                ),
+                                _ => None,
+                            })
+                        }
                         "raw_store" if sp.args.len() == 3 => Some(
                             crate::translator::rtyper::llannotation::lltype_to_annotation(
                                 crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
@@ -3802,6 +3808,90 @@ mod tests {
                 .contains_key(&LinkKey::of(&drop_link)),
             "UInt(1) discriminant must drop Int(2) exit"
         );
+    }
+
+    #[test]
+    fn flowin_unseeded_raw_load_binds_signed_word() {
+        // `_LLOpEntry.compute_result_annotation` binds
+        // `lltype_to_annotation(RESULTTYPE.const)`. TYPE is args[0].
+        use super::super::super::flowspace::model::{ConstValue, Constant, SpaceOperation};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("raw_load_unseeded", 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::Integer(SomeInteger::new(false, false)));
+            }
+            let type_arg = Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(
+                LowLevelType::Signed,
+            ))));
+            let addr = blk.inputargs[0].clone();
+            let offset = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
+            let result = Hlvalue::Variable(Variable::named("loaded"));
+            blk.operations.push(SpaceOperation::new(
+                "raw_load",
+                vec![type_arg, addr, offset],
+                result,
+            ));
+        }
+        ann.processblock(&graph, &startblock)
+            .expect("3-arg raw_load must flowin");
+        let bound = {
+            let blk = startblock.borrow();
+            match &blk.operations[0].result {
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+                _ => None,
+            }
+        };
+        match bound {
+            Some(SomeValue::Integer(i)) => {
+                assert!(!i.unsigned, "Signed RESULTTYPE binds Signed");
+            }
+            other => panic!("raw_load must bind SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flowin_seeded_raw_load_keeps_unsigned_item() {
+        use super::super::super::flowspace::model::{ConstValue, Constant, SpaceOperation};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let graph = mk_graph("raw_load_seeded", 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            if let Hlvalue::Variable(v) = &mut blk.inputargs[0] {
+                ann.setbinding(v, SomeValue::Integer(SomeInteger::new(false, false)));
+            }
+            let type_arg = Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(
+                LowLevelType::Unsigned,
+            ))));
+            let addr = blk.inputargs[0].clone();
+            let offset = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
+            let loaded = Variable::named("loaded");
+            blk.operations.push(SpaceOperation::new(
+                "raw_load",
+                vec![type_arg, addr, offset],
+                Hlvalue::Variable(loaded),
+            ));
+        }
+        ann.processblock(&graph, &startblock)
+            .expect("3-arg raw_load must flowin");
+        let bound = {
+            let blk = startblock.borrow();
+            match &blk.operations[0].result {
+                Hlvalue::Variable(v) => v.annotation.borrow().as_ref().map(|rc| (**rc).clone()),
+                _ => None,
+            }
+        };
+        match bound {
+            Some(SomeValue::Integer(i)) => {
+                assert!(i.unsigned, "Unsigned RESULTTYPE binds unsigned");
+            }
+            other => panic!("raw_load must bind SomeInteger unsigned, got {other:?}"),
+        }
     }
 
     #[test]

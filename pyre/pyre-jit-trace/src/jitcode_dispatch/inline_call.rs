@@ -93,7 +93,10 @@ unsafe fn exact_builtin_len_shortcut_receiver(obj: pyre_object::PyObjectRef) -> 
     } else {
         return false;
     };
-    std::ptr::eq(unsafe { (*obj).w_class }, exact_w_class)
+    std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(obj) },
+        exact_w_class,
+    )
 }
 
 /// Where an element of a `defs_w` tuple lives, and therefore what the trace
@@ -4758,7 +4761,8 @@ unsafe fn fbw_bind_star_kwargs(
 ) -> Option<StarKwargsInline> {
     let exact_dict = unsafe {
         (*kwargs).ob_type == &pyre_object::pyobject::DICT_TYPE as *const _
-            && (*kwargs).w_class == pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE)
+            && pyre_interpreter::objspace::std::mapdict::instance_getclass(kwargs)
+                == pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE)
     };
     if !exact_dict {
         return None;
@@ -6599,7 +6603,8 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
                 unreachable!("resolve_type_call_builtin_new admits ref arguments only")
             };
             let concrete = pinned_obj(pin, concrete);
-            let w_class = unsafe { (*concrete).w_class };
+            let w_class =
+                unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) };
             let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
             walker_guard_exception_attr_slot(ctx, op.pc, arg, concrete, w_class, version_tag)?;
         }
@@ -9123,29 +9128,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // low-bit test, needed when `arg` may arrive as a tagged int.
         let physical_type = unsafe { (*concrete_arg).ob_type } as i64;
         walker_guard_class(ctx, op.pc, arg, physical_type)?;
+        // GuardClass can minor-collect. `concrete_arg` is a copy.
+        let concrete_arg = super::specialize::live_box_ref(ctx, arg, concrete_arg);
         // A builtin subclass / user instance shares its `ob_type` with the base
         // layout, so `ob_type` alone does not pin the class the reflected-op
-        // decline (`w_type_issubtype`) was computed against.  Guard the live
-        // `w_class` too so an arg of a distinct class deopts.  Singletons with a
-        // null `w_class` (`Ellipsis`/`NotImplemented`) are pinned exactly by
-        // `ob_type`, and guarding their null slot against `w_type` would itself
-        // be provably false — so guard `w_class` only when it is populated.
-        if !unsafe { (*concrete_arg).w_class }.is_null() {
-            let live_w_class = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                arg,
-                crate::descr::w_class_descr(),
-            );
-            let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op.pc,
-                OpCode::GuardValue,
-                &[live_w_class, w_class_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(live_w_class, w_class_const);
+        // decline (`w_type_issubtype`) was computed against. Mapdict getclass
+        // is `map.terminator.w_cls`; non-mapdict objects keep the header
+        // `w_class` pin. Singletons with a null class (`Ellipsis` /
+        // `NotImplemented`) are pinned exactly by `ob_type`.
+        let getclass =
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_arg) };
+        if !getclass.is_null() {
+            walker_guard_exact_w_class(ctx, op.pc, arg, w_type)?;
         }
     }
 
@@ -11638,7 +11632,10 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     // every `Fraction`, `Decimal` and `deque` construction — resolves to the
     // same `type.__call__` a plain class does.  Comparing the metatype's
     // identity refused all of them.
-    let w_metaclass = unsafe { (*w_type).w_class };
+    // Metaclass is `space.type(C)` (`BaseUserClassMapdict.getclass`),
+    // not header `w_class` (`layout_header_class` / `gettypefor(typeptr)`).
+    let w_metaclass =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(w_type) };
     let metaclass_to_pin = if std::ptr::eq(w_metaclass, w_metatype) {
         None
     } else {
@@ -12089,7 +12086,8 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let w_class = unsafe { (*concrete_receiver).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_receiver) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return Ok(None);
     }
@@ -12261,7 +12259,8 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     if !unsafe { pyre_object::is_instance(concrete_receiver) } {
         return Ok(None);
     }
-    let w_type = unsafe { pyre_object::w_instance_get_type(concrete_receiver) };
+    let w_type =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_receiver) };
     if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
         return Ok(None);
     }
@@ -13063,7 +13062,7 @@ fn diag_nondatadescr_miss(pc: usize, name: &str, obj: pyre_object::PyObjectRef) 
     let w_type = if is_type {
         obj
     } else {
-        unsafe { pyre_object::w_instance_get_type(obj) }
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(obj) }
     };
     let version = if w_type.is_null() {
         0
@@ -13555,6 +13554,8 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name.as_str()))
                 as pyre_object::PyObjectRef;
         let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+        // GuardClass / version-tag pin / `box_str_constant` can minor-collect.
+        let concrete_obj = super::specialize::live_box_ref(ctx, obj, concrete_obj);
         let leading_arg = match leading {
             HookLeading::Receiver => Some((obj, concrete_obj)),
             HookLeading::Class => Some((ctx.trace_ctx.const_ref(w_type as i64), w_type)),
@@ -14194,7 +14195,7 @@ pub(crate) fn walker_is_exact_machine_int_concrete(obj: pyre_object::PyObjectRef
     unsafe {
         std::ptr::eq((*obj).ob_type, &pyre_object::pyobject::INT_TYPE)
             && std::ptr::eq(
-                (*obj).w_class,
+                pyre_interpreter::objspace::std::mapdict::instance_getclass(obj),
                 pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
             )
     }
@@ -16761,7 +16762,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         decline!("tagged immediate operand");
     }
 
-    let w_class = unsafe { (*concrete_lhs).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_lhs) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         decline!("lhs w_class is not a type");
     }
@@ -17338,7 +17340,8 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let w_class = unsafe { (*concrete_lhs).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_lhs) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return Ok(None);
     }
@@ -17575,7 +17578,8 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         decline!("tagged immediate receiver");
     }
 
-    let w_class = unsafe { (*concrete_value).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_value) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         decline!("receiver w_class is not a type");
     }
@@ -17824,7 +17828,8 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
         decline!("tagged immediate operand");
     }
 
-    let w_class = unsafe { (*concrete_haystack).w_class };
+    let w_class =
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_haystack) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         decline!("haystack w_class is not a type");
     }
@@ -17967,11 +17972,7 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
         decline!("classinfo has no type");
     };
     let metaclass = meta.as_ptr();
-    let w_class = unsafe { (*concrete_classinfo).w_class };
-    if w_class.is_null()
-        || !std::ptr::eq(w_class, metaclass)
-        || !unsafe { pyre_object::is_type(metaclass) }
-    {
+    if metaclass.is_null() || !unsafe { pyre_object::is_type(metaclass) } {
         decline!("classinfo class is not its type");
     }
     let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(metaclass) };

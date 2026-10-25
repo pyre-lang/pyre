@@ -64,8 +64,13 @@ use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
     ErrorCarrierSpec, HostStaticAddrs,
+    call::CallControl,
+    codewriter::jtransform::{GraphTransformConfig, Transformer},
+    flowspace::model::ConstValue,
+    front::llbc_hints::harvest_immutable_fields_from_llbcs,
     front::mir::{lower_fun_decl, lower_function, lower_function_with_static_addrs},
     model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
+    translator::rtyper::lltypesystem::lltype::{GCREF, GcKind, LowLevelType, PtrTarget},
 };
 use serde_json::{Value, json};
 
@@ -394,6 +399,132 @@ fn call_returned_byte_pointer_stays_ref() {
         byte_calls.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
         "*mut u8 call result stays Ref, got {byte_calls:?} in {}",
         graph.name
+    );
+}
+
+/// Front-end: `p as *const RawStruct` + field read lowers through
+/// `ann_cast_int_to_ptr` as 2-arg `cast_int_to_ptr(PTRTYPE, addr)` with
+/// `SomePtr(Ptr(Struct ...))`, then `SomePtr.getattr` of `terminator` /
+/// `w_cls`. The unary-op test that constructs `SomePtr` directly does not
+/// count. A dest whose GC pointer field is not in `_immutable_fields_`
+/// stays off `SomePtr` (`dest_overlay_rejects_raw_struct_with_mutable_gc_pointer_field`).
+#[test]
+fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let context = lower_context_for(llbc);
+    let ranks = harvest_immutable_fields_from_llbcs(std::slice::from_ref(llbc));
+    assert!(
+        ranks.get("MapNodeTerminatorView").is_some_and(|fields| {
+            fields.iter().any(|(name, _)| name == "terminator")
+                && fields.iter().any(|(name, _)| name == "w_cls")
+        }),
+        "harvested _immutable_fields_ for MapNodeTerminatorView: {:?}",
+        ranks.get("MapNodeTerminatorView")
+    );
+    assert!(
+        ranks
+            .get("MapNodeAbstractAttribute")
+            .is_some_and(|fields| fields.iter().any(|(name, _)| name == "terminator")),
+        "harvested _immutable_fields_ for MapNodeAbstractAttribute: {:?}",
+        ranks.get("MapNodeAbstractAttribute")
+    );
+    let mut saw_dest_typed_struct = false;
+    let mut saw_terminator = false;
+    let mut saw_w_cls = false;
+    let mut saw_raw_overlay = false;
+    let mut saw_w_cls_gcref = false;
+    let mut saw_terminator_ptr = false;
+    let mut saw_overlay_hints = false;
+    let mut saw_pure_w_cls = false;
+    for leaf in ["map_terminator_w_cls", "instance_getclass"] {
+        let fns = mapdict_fns(&llbc, leaf);
+        assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
+        for fd in fns {
+            let graph = lower_fun_decl(&context, fd)
+                .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+            for op in ops(&graph) {
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } = &op.kind
+                    && segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                    && args.len() == 2
+                    && let LinkArg::Const(c) = &args[0]
+                    && let ConstValue::LowLevelType(ll) = &c.value
+                    && let LowLevelType::Ptr(ptr) = ll.as_ref()
+                    && let PtrTarget::Struct(st) = &ptr.TO
+                {
+                    saw_dest_typed_struct = true;
+                    if st._gckind == GcKind::Raw {
+                        saw_raw_overlay = true;
+                    }
+                    if let Some(w_cls_ty) = st._flds.get("w_cls")
+                        && w_cls_ty == &*GCREF
+                    {
+                        saw_w_cls_gcref = true;
+                    }
+                    if let Some(term_ty) = st._flds.get("terminator")
+                        && matches!(term_ty, LowLevelType::Ptr(_))
+                        && term_ty != &*GCREF
+                    {
+                        saw_terminator_ptr = true;
+                    }
+                    if let Some(ConstValue::Dict(fields)) = st._hints.get("immutable_fields") {
+                        let has_terminator =
+                            fields.contains_key(&ConstValue::byte_str("terminator"));
+                        let has_w_cls = fields.contains_key(&ConstValue::byte_str("w_cls"));
+                        if has_terminator && (st._flds.get("w_cls").is_none() || has_w_cls) {
+                            saw_overlay_hints = true;
+                        }
+                    }
+                }
+                if let OpKind::FieldRead { field, .. } = &op.kind {
+                    if field.name == "terminator" {
+                        saw_terminator = true;
+                    }
+                    if field.name == "w_cls" {
+                        saw_w_cls = true;
+                    }
+                }
+            }
+            let mut cc = CallControl::new();
+            cc.immutable_fields_by_struct = ranks.clone();
+            let out = Transformer::new(&GraphTransformConfig::default())
+                .with_callcontrol(&mut cc)
+                .transform(&graph);
+            for op in ops(&out.graph) {
+                if let OpKind::FieldRead { field, pure, .. } = &op.kind
+                    && field.name == "w_cls"
+                    && *pure
+                {
+                    saw_pure_w_cls = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_dest_typed_struct,
+        "overlay dest is 2-arg cast_int_to_ptr(Ptr(Struct ...), addr)"
+    );
+    assert!(saw_raw_overlay, "overlay Struct is GcKind::Raw");
+    assert!(saw_w_cls_gcref, "overlay w_cls field lltype is GCREF");
+    assert!(
+        saw_terminator_ptr,
+        "overlay terminator field is a raw Ptr, not Address"
+    );
+    assert!(
+        saw_overlay_hints,
+        "overlay Struct carries harvested immutable_fields hints"
+    );
+    assert!(
+        saw_terminator,
+        "overlay FieldRead terminator via SomePtr.getattr"
+    );
+    assert!(saw_w_cls, "overlay FieldRead w_cls via SomePtr.getattr");
+    assert!(
+        saw_pure_w_cls,
+        "jtransform rewrite_op_getfield marks w_cls as pure getfield_raw_r"
     );
 }
 

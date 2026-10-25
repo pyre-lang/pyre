@@ -676,43 +676,57 @@ impl StructFieldRegistry {
         })
     }
 
-    /// Whether `owner` itself, or one of its enum variants, declares
-    /// `field_name`.
+    /// Harvested type of `field_name` on `owner` itself, or on one of
+    /// its enum variants (`rclass.py` variant subclass under the
+    /// discriminant-only base).
     ///
     /// Rust keeps fields and methods in separate namespaces, while the
     /// RPython class model used by the annotator has one attribute namespace.
     /// A method on an enum base therefore also collides with a same-named
     /// payload field on a variant: seeding that method on the base would make
     /// the variant constructor inherit a function as the field's default.
-    pub fn owner_or_variant_has_field(&self, owner: &str, field_name: &str) -> bool {
-        if self.field_type(owner, field_name).is_some() {
-            return true;
+    /// Variant keys group by the parent path's last segment, the same
+    /// leaf `canonical_struct_name` keeps. The row check still reads
+    /// `fields`, so a replaced field list is visible.
+    pub fn owner_or_variant_field_type(&self, owner: &str, field_name: &str) -> Option<&str> {
+        if let Some(ty) = self.field_type(owner, field_name) {
+            return Some(ty);
         }
         if !self.is_enum_base(owner) {
-            return false;
+            return None;
         }
         let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
         let parent_leaf = canonical_owner
             .rsplit("::")
             .next()
             .unwrap_or(canonical_owner.as_str());
-        // Variant keys group by the parent path's last segment, the same
-        // leaf `canonical_struct_name` keeps. The row check still reads
-        // `fields`, so a replaced field list is visible.
         self.ensure_field_path_index();
         let index = self.field_path_index.borrow();
         let index = index.as_ref().expect("path index built");
-        index.by_parent_last.get(parent_leaf).is_some_and(|bucket| {
-            bucket.iter().any(|key| {
-                key.rsplit_once("::").is_some_and(|(parent, _variant)| {
-                    majit_ir::descr::canonical_struct_name(parent) == canonical_owner
-                        && self
-                            .fields
-                            .get(key)
-                            .is_some_and(|rows| rows.iter().any(|row| row.name == field_name))
-                })
-            })
-        })
+        let bucket = index.by_parent_last.get(parent_leaf)?;
+        for key in bucket {
+            let Some((parent, _variant)) = key.rsplit_once("::") else {
+                continue;
+            };
+            if majit_ir::descr::canonical_struct_name(parent) != canonical_owner {
+                continue;
+            }
+            if let Some(ty) = self.fields.get(key).and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.name == field_name)
+                    .map(|row| row.ty.as_str())
+            }) {
+                return Some(ty);
+            }
+        }
+        None
+    }
+
+    /// Whether `owner` itself, or one of its enum variants, declares
+    /// `field_name`.
+    pub fn owner_or_variant_has_field(&self, owner: &str, field_name: &str) -> bool {
+        self.owner_or_variant_field_type(owner, field_name)
+            .is_some()
     }
 
     /// Drop the suffix buckets. [`FieldRows`] also records a key-set
@@ -1397,7 +1411,19 @@ mod tests {
 
         assert!(reg.owner_or_variant_has_field("buffer::Buffer", "w_obj"));
         assert!(reg.owner_or_variant_has_field("Buffer", "w_obj"));
+        assert_eq!(
+            reg.owner_or_variant_field_type("buffer::Buffer", "w_obj"),
+            Some("PyObjectRef")
+        );
+        assert_eq!(
+            reg.owner_or_variant_field_type("Buffer", "w_obj"),
+            Some("PyObjectRef")
+        );
         assert!(!reg.owner_or_variant_has_field("buffer::Buffer", "readonly"));
+        assert!(
+            reg.owner_or_variant_field_type("buffer::Buffer", "readonly")
+                .is_none()
+        );
         assert!(reg.enum_base_has_payload("buffer::Buffer"));
         assert!(reg.enum_base_has_payload("Buffer"));
         reg.fields.insert(
@@ -1405,6 +1431,36 @@ mod tests {
             vec![("__discriminant".to_string(), "i64".to_string())],
         );
         assert!(!reg.enum_base_has_payload("plain::Color"));
+    }
+
+    #[test]
+    fn enum_base_variant_field_type_is_harvested_mapnode_terminator() {
+        let mut reg = StructFieldRegistry::default();
+        let disc = vec![("__discriminant".to_string(), "i64".to_string())];
+        let terminator = vec![("terminator".to_string(), "*const MapNode".to_string())];
+        reg.fields
+            .insert("mapdict::MapNode".to_string(), disc.clone());
+        reg.fields.insert("MapNode".to_string(), disc);
+        for key in [
+            "mapdict::MapNode::Terminator",
+            "MapNode::Terminator",
+            "mapdict::MapNode::Plain",
+            "MapNode::Plain",
+        ] {
+            reg.fields.insert(key.to_string(), terminator.clone());
+        }
+        assert_eq!(
+            reg.owner_or_variant_field_type("mapdict::MapNode", "terminator"),
+            Some("*const MapNode")
+        );
+        assert_eq!(
+            reg.owner_or_variant_field_type("MapNode", "terminator"),
+            Some("*const MapNode")
+        );
+        assert!(
+            reg.owner_or_variant_field_type("MapNode", "no_such")
+                .is_none()
+        );
     }
 
     #[test]

@@ -645,7 +645,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
         if pyre_object::is_exact_builtin_instance(obj) {
             return Ok(None);
         }
-        let w_class = (*obj).w_class;
+        let w_class = crate::objspace::std::mapdict::instance_getclass(obj);
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return Ok(None);
         }
@@ -817,7 +817,7 @@ pub(crate) unsafe fn exc_user_dunder_obj(
     name: &str,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
-        let w_class = (*obj).w_class;
+        let w_class = crate::objspace::std::mapdict::instance_getclass(obj);
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return Ok(None);
         }
@@ -870,7 +870,7 @@ unsafe fn module_user_dunder_obj(
     name: &str,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
-        let w_class = (*obj).w_class;
+        let w_class = crate::objspace::std::mapdict::instance_getclass(obj);
         if w_class.is_null() || !pyre_object::is_type(w_class) {
             return Ok(None);
         }
@@ -995,7 +995,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `'pwd.struct_passwd(pw_name=..., ...)'` instead of the
             // bare tuple form.  Plain `tuple()` keeps the fast path
             // because its `w_class` is the canonical tuple type.
-            let w_class = (*obj()).w_class;
+            let w_class = crate::objspace::std::mapdict::instance_getclass(obj());
             let tuple_class = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
             if !w_class.is_null() && !std::ptr::eq(w_class, tuple_class) {
                 // structseq instances are tuple subclasses with ob_type ==
@@ -1402,7 +1402,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // `_struct.Struct`) — dispatch it before the generic
             // `<name object at 0x...>` fallback.  Mirrors the tuple-subclass
             // path above.
-            let w_class = (*obj()).w_class;
+            let w_class = crate::objspace::std::mapdict::instance_getclass(obj());
             if !w_class.is_null()
                 && let Some((src, method)) =
                     crate::baseobjspace::lookup_where_with_method_cache(w_class, "__repr__")

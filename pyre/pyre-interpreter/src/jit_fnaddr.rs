@@ -6773,6 +6773,14 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "baseobjspace::OBJECT_SPACE",
             &crate::baseobjspace::OBJECT_SPACE as *const _ as i64,
         ),
+        // Process-wide layout owner for header quasi-immuts
+        // (`notify_w_class_mutated_then` / `rclass.py` space-owned
+        // watcher set). The Global is the prebuilt; a translated field
+        // load must not fold the initializer.
+        (
+            "pyobject::OBJECT_LAYOUT",
+            pyre_object::object_layout_static_addr() as i64,
+        ),
         // Address of the process-wide stack-check cache.  The Atomic
         // fields are written after startup; this row is the static's
         // identity so a translated field load is a memory access
@@ -7941,6 +7949,10 @@ mod tests {
         assert_eq!(
             bindings["stack_check::PYRE_STACKTOOBIG"],
             &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64
+        );
+        assert_eq!(
+            bindings["pyobject::OBJECT_LAYOUT"],
+            pyre_object::object_layout_static_addr() as i64
         );
     }
 

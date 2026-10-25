@@ -660,6 +660,27 @@ pub(crate) fn guard_value_record<Sym: WalkSym>(
         (GuardValueBank::Float, ConcreteValue::Float(f)) => {
             ctx.trace_ctx.const_float(f.to_bits() as i64)
         }
+        (GuardValueBank::Ref, _) => {
+            // `cast_int_to_ptr` publishes aligned bits on the box and
+            // leaves the register Null (`unop_cast_record` / `is_method`).
+            // `implement_guard_value` (`pyjitpl.py`) still needs the live
+            // pointer, so recover those bits the same way as
+            // `_establish_nullity`.
+            match ctx.trace_ctx.box_value(value) {
+                Some(majit_ir::Value::Ref(r)) => {
+                    let bits = r.as_usize();
+                    if r != majit_ir::GcRef::NO_CONCRETE
+                        && bits != 0
+                        && bits % std::mem::align_of::<usize>() == 0
+                    {
+                        ctx.trace_ctx.const_ref(bits as i64)
+                    } else {
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                }
+                _ => return Ok((DispatchOutcome::Continue, op.next_pc)),
+            }
+        }
         _ => return Ok((DispatchOutcome::Continue, op.next_pc)),
     };
     ctx.trace_ctx

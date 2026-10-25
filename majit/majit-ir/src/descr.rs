@@ -5744,6 +5744,20 @@ pub trait SizeDescr: Descr {
         &[]
     }
 
+    /// Extra payload offsets `rewrite.py clear_gc_fields` delayed-zeros
+    /// besides [`Self::gc_fielddescrs`].
+    ///
+    /// Upstream `MapdictStorageMixin.map` is a GCREF, so it sits in
+    /// `gc_fielddescrs` and the birth NULL is a GC store. pyre holds a
+    /// `malloc_raw` intern_node address in a `Type::Int` word
+    /// (`intern_node`); MiniMark must not scan it (`custom_trace`, empty
+    /// `gc_ptr_offsets`). The offset still has to be born 0:
+    /// `instance_walk_boxed_storage` loads the word, and recycled nursery
+    /// bytes are a non-null pointer (`malloc_zero_filled = False`).
+    fn extra_clear_field_offsets(&self) -> &[usize] {
+        &[]
+    }
+
     /// The class word's slot position within `all_fielddescrs()`, or `None`
     /// when this layout has no class word *in that list*.
     ///
@@ -7183,6 +7197,7 @@ pub struct SimpleSizeDescr {
     /// (`info.py _force_elements` walks `descr.get_all_fielddescrs()`).
     assigned_all_fielddescrs: OnceLock<Vec<Arc<dyn FieldDescr>>>,
     assigned_gc_fielddescrs: OnceLock<Vec<Arc<dyn FieldDescr>>>,
+    extra_clear_field_offsets: OnceLock<Vec<usize>>,
 }
 
 impl Clone for SimpleSizeDescr {
@@ -7215,6 +7230,13 @@ impl Clone for SimpleSizeDescr {
                 }
                 lock
             },
+            extra_clear_field_offsets: {
+                let lock = OnceLock::new();
+                if let Some(offsets) = self.extra_clear_field_offsets.get() {
+                    let _ = lock.set(offsets.clone());
+                }
+                lock
+            },
         }
     }
 }
@@ -7237,6 +7259,7 @@ impl SimpleSizeDescr {
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
             assigned_gc_fielddescrs: OnceLock::new(),
+            extra_clear_field_offsets: OnceLock::new(),
         }
     }
 
@@ -7257,6 +7280,7 @@ impl SimpleSizeDescr {
             gc_fielddescrs: Vec::new(),
             assigned_all_fielddescrs: OnceLock::new(),
             assigned_gc_fielddescrs: OnceLock::new(),
+            extra_clear_field_offsets: OnceLock::new(),
         }
     }
 
@@ -7356,6 +7380,12 @@ impl SimpleSizeDescr {
     pub fn set_type_id(&self, type_id: u32) {
         self.type_id.store(type_id, Ordering::Relaxed);
     }
+
+    /// Stamp the intern_node `map` word so `clear_gc_fields` delayed-zeros
+    /// it. See [`SizeDescr::extra_clear_field_offsets`].
+    pub fn set_extra_clear_field_offsets(&self, offsets: Vec<usize>) {
+        let _ = self.extra_clear_field_offsets.set(offsets);
+    }
 }
 
 impl Descr for SimpleSizeDescr {
@@ -7406,6 +7436,11 @@ impl SizeDescr for SimpleSizeDescr {
                 .get()
                 .map_or(&[], Vec::as_slice)
         }
+    }
+    fn extra_clear_field_offsets(&self) -> &[usize] {
+        self.extra_clear_field_offsets
+            .get()
+            .map_or(&[], Vec::as_slice)
     }
     fn is_object(&self) -> bool {
         self.vtable != 0

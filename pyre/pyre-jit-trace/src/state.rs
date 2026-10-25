@@ -2795,15 +2795,9 @@ unsafe fn is_trace_plain_int(obj: PyObjectRef) -> bool {
 
 #[inline]
 unsafe fn is_trace_plain_float(obj: PyObjectRef) -> bool {
-    if !unsafe { py_type_check(obj, &FLOAT_TYPE) } {
-        return false;
-    }
-    let float_typeobj = get_instantiate(&FLOAT_TYPE);
-    if float_typeobj.is_null() {
-        return unsafe { (*obj).w_class.is_null() };
-    }
-    let w_class = unsafe { (*obj).w_class };
-    w_class.is_null() || std::ptr::eq(w_class, float_typeobj)
+    // Exactness is the RPython class (`typedef.py _getusercls`):
+    // `FLOAT_TYPE` typeptr, not header `w_class`.
+    unsafe { py_type_check(obj, &FLOAT_TYPE) }
 }
 
 use crate::descr::{
@@ -13184,10 +13178,10 @@ mod tests {
     #[test]
     fn concrete_value_preserves_float_subclass_identity() {
         pyre_interpreter::typedef::init_typeobjects();
-        let obj = pyre_object::w_float_new(2.5);
-        unsafe {
-            (*obj).w_class = pyre_object::w_none();
-        }
+        // `float_descr_new_from` allocates with `w_float_subclass_new`
+        // (`FLOAT_USER_TYPE`). Exactness is the typeptr
+        // (`is_trace_plain_float` / `typedef.py _getusercls`).
+        let obj = pyre_object::floatobject::w_float_subclass_new(2.5);
 
         assert_eq!(ConcreteValue::from_pyobj(obj), ConcreteValue::Ref(obj));
     }

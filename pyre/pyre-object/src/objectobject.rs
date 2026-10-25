@@ -2,7 +2,9 @@
 //!
 //! PyPy equivalent: pypy/objspace/std/objectobject.py → W_ObjectObject
 //!
-//! An instance holds a pointer to its W_TypeObject (class) in `ob_header.w_class`.
+//! A mapdict instance's Python class is `map.terminator.w_cls`
+//! (`BaseUserClassMapdict.getclass`). The header `w_class` word is
+//! `gettypefor(typeptr)` (`W_Root.getclass`) once a live map is installed.
 //! Per-instance attributes live in the mapdict `map`+`storage` pair
 //! (`mapdict.py _set_mapdict_map`), matching PyPy's instance attribute layout.
 
@@ -17,22 +19,25 @@ use crate::pyobject::*;
 /// - `ob_type`: `&INSTANCE_TYPE` for exact `object()`, `&INSTANCE_USER_TYPE`
 ///   (`typedef.py` `_getusercls(W_ObjectObject)`,
 ///   `W_ObjectObjectUserDictWeakrefable`) for every other carrier
-/// - `w_class`: pointer to the W_TypeObject this is an instance of
+/// - `w_class`: pointer to the W_TypeObject this is an instance of.
+///   A mapdict instance's Python class is `map.terminator.w_cls`
+///   (`BaseUserClassMapdict.getclass`).
 /// - `map`: the attribute map (`AbstractAttribute` chain) — the
 ///   `self.map` of `MapdictStorageMixin` (`mapdict.py`)
 /// - `storage`: the per-instance attribute storage list — the
 ///   `self.storage` of `MapdictStorageMixin` (`mapdict.py`)
 ///
-/// The Python class is stored in `ob_header.w_class`, shared with all
-/// other object types. RPython stores this in `typeptr` (rclass.py).
+/// A mapdict instance's Python class is `map.terminator.w_cls`
+/// (`BaseUserClassMapdict.getclass`). The header word is
+/// `gettypefor(typeptr)` (`W_Root.getclass`) once a live map is
+/// installed. RPython stores the typeptr on the object (`rclass.py`).
 ///
-/// `map` is an erased `*const MapNode` (the objspace map node layer in
-/// `objspace::std::mapdict` lives in the `pyre-interpreter` crate, which
-/// `pyre-object` must not depend on; the interpreter side casts it back).
-/// This mirrors the `W_DictObject.dstorage: *mut u8` erasure. A null
-/// `map`/`storage` is the `_mapdict_init_empty` state with `storage =
-/// None` (`mapdict.py`); the real terminator is installed by the
-/// mapdict layer on first attribute access.
+/// `map` is an interned `MapNode` address held as a raw word. Node
+/// types live in this crate (`mapdict.rs`); intern/rewrite algorithms
+/// stay in the interpreter mapdict layer. A null `map`/`storage` is
+/// the `_mapdict_init_empty` state with `storage = None` (`mapdict.py`);
+/// the real terminator is installed by the mapdict layer on first
+/// attribute access.
 #[repr(C)]
 pub struct W_ObjectObject {
     pub ob_header: PyObject,
@@ -224,10 +229,15 @@ fn alloc_exact_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef 
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    let header_class =
+        unsafe { layout_header_class(&INSTANCE_TYPE as *const PyType, w_class, map) };
+    let header_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(header_class);
+    let header_class = crate::gc_roots::shadow_stack_get(header_slot);
     crate::lltype::malloc_typed_managed(W_ObjectObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE,
-            w_class,
+            w_class: header_class,
         },
         map,
         storage: std::ptr::null_mut(),
@@ -242,11 +252,16 @@ fn alloc_user_object_instance(w_class: PyObjectRef, map: usize) -> PyObjectRef {
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
     let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    let header_class =
+        unsafe { layout_header_class(&INSTANCE_USER_TYPE as *const PyType, w_class, map) };
+    let header_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(header_class);
+    let header_class = crate::gc_roots::shadow_stack_get(header_slot);
     crate::lltype::malloc_typed_managed(W_ObjectObjectUser {
         base: W_ObjectObject {
             ob_header: PyObject {
                 ob_type: &INSTANCE_USER_TYPE,
-                w_class,
+                w_class: header_class,
             },
             map,
             storage: std::ptr::null_mut(),
@@ -279,12 +294,15 @@ fn is_exact_object_class(w_class: PyObjectRef) -> bool {
     }
 }
 
-/// Get the class (W_TypeObject) of an instance.
+/// Python class of `obj` (`W_Root.getclass` / `BaseUserClassMapdict.getclass`).
+///
+/// A mapdict instance reads `map.terminator.w_cls`; every other object
+/// returns the header word (`gettypefor(typeptr)`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_instance_get_type(obj: PyObjectRef) -> PyObjectRef {
-    (*obj).w_class
+    crate::mapdict::instance_getclass(obj)
 }
 
 /// Check if an object is an instance of a user-defined class.

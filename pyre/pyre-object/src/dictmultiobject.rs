@@ -865,10 +865,10 @@ pub unsafe fn key_compares_by_identity(key: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(key) {
         return false;
     }
-    // `space.type`: a specialised `w_class` is the class. Read-only
-    // singletons leave that word null; `gettypefor(ob_type)` is
+    // `space.type` / `W_Root.getclass` / `BaseUserClassMapdict.getclass`.
+    // Read-only singletons leave that word null; `gettypefor(ob_type)` is
     // `get_instantiate`.
-    let mut w_type = (*key).w_class as PyObjectRef;
+    let mut w_type = crate::mapdict::instance_getclass(key) as PyObjectRef;
     if w_type.is_null() {
         let tp = (*key).ob_type;
         if tp.is_null() {

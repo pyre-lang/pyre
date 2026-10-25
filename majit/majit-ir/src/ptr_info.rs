@@ -1431,10 +1431,15 @@ impl PtrInfo {
         }
     }
 
-    /// info.py: setitem(index, value).
+    /// info.py: setitem(index, value) via `_setitem_index`.
     pub fn setitem(&mut self, index: usize, value: Operand) {
         match self {
             PtrInfo::Array(v) => {
+                // info.py `ArrayPtrInfo._setitem_index`:
+                // `if not reasonable_array_index(index): return`.
+                if !reasonable_array_index(index as i64) {
+                    return;
+                }
                 if index >= v.items.len() {
                     v.items.resize(index + 1, FieldEntry::Value(Operand::None));
                 }

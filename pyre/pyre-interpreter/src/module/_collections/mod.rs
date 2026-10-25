@@ -8,6 +8,7 @@
 //! mirroring PyPy (neither runtime can subclass the app-level `dict` from
 //! interp-level).
 
+use crate::objspace::std::mapdict::instance_getclass;
 use pyre_object::*;
 use std::cell::UnsafeCell;
 use std::sync::LazyLock;
@@ -333,7 +334,7 @@ pub use deque_rev_iter::W_DequeRevIter;
 // `W_DequeIter`: the iterator owns the deque, current position, number
 // of remaining entries, and a snapshot of the deque mutation lock.
 pub mod deque_iter {
-    use super::{BLOCKLEN, W_Deque, block, block_get, checklock, getlock};
+    use super::{BLOCKLEN, W_Deque, block, block_get, checklock, getlock, instance_getclass};
     use pyre_object::*;
 
     // `collections_exec` ADD_TYPEs dequeiter_spec as an immutable heap type.
@@ -413,7 +414,7 @@ pub mod deque_iter {
             let self_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(self_obj);
             let ty =
-                unsafe { w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
+                unsafe { instance_getclass(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
             let deque = unsafe {
                 (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeIter)).deque
             };
@@ -486,7 +487,7 @@ pub mod deque_iter {
 // PyPy `W_DequeRevIter`, with the same state shape and reverse indexing into
 // pyre's list-backed deque payload.
 pub mod deque_rev_iter {
-    use super::{BLOCKLEN, W_Deque, block, block_get, checklock, getlock};
+    use super::{BLOCKLEN, W_Deque, block, block_get, checklock, getlock, instance_getclass};
     use pyre_object::*;
 
     // `collections_exec` ADD_TYPEs dequereviter_spec as an immutable heap type.
@@ -558,7 +559,7 @@ pub mod deque_rev_iter {
             let self_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(self_obj);
             let ty =
-                unsafe { w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
+                unsafe { instance_getclass(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
             let deque = unsafe {
                 (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeRevIter))
                     .deque
@@ -994,7 +995,7 @@ pub(crate) fn deque_repeat(
     let m = maxlen_obj(pyre_object::gc_roots::shadow_stack_get(roots));
     // `w_list_new` and `maxlen_obj` allocate; the type is read off the
     // rooted receiver after them.
-    let ty = unsafe { w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(roots)) };
+    let ty = unsafe { instance_getclass(pyre_object::gc_roots::shadow_stack_get(roots)) };
     if unsafe { is_none(m) } {
         crate::call::call_function_impl_result(
             ty,
@@ -1392,7 +1393,7 @@ impl W_Deque {
     fn copy(&self) -> Result<PyObjectRef, crate::PyError> {
         let self_obj = self as *const W_Deque as PyObjectRef;
         // `type(self)(self)` or `type(self)(self, maxlen)`.
-        let ty = unsafe { w_instance_get_type(self_obj) };
+        let ty = unsafe { instance_getclass(self_obj) };
         let m = maxlen_obj(self_obj);
         if unsafe { is_none(m) } {
             crate::call::call_function_impl_result(ty, &[self_obj])
@@ -1423,7 +1424,7 @@ impl W_Deque {
         let _ = pyre_object::gc_roots::pin_root(self_obj);
         let self_obj = || pyre_object::gc_roots::shadow_stack_get(self_slot);
         let ty_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(unsafe { w_instance_get_type(self_obj()) });
+        let _ = pyre_object::gc_roots::pin_root(unsafe { instance_getclass(self_obj()) });
         let m = maxlen_obj(self_obj());
         let args_slot;
         if unsafe { is_none(m) } {
@@ -1637,7 +1638,7 @@ impl W_Deque {
         // The repr uses the short class name, so strip any dotted
         // module prefix from the builtin tp_name (`collections.deque`
         // → `deque`); a user subclass name has no dot.
-        let full = unsafe { w_type_get_name(w_instance_get_type(self_obj)) };
+        let full = unsafe { w_type_get_name(instance_getclass(self_obj)) };
         let name = full.rsplit('.').next().unwrap_or(full);
         let mut out = rustpython_wtf8::Wtf8Buf::new();
         out.push_str(name);

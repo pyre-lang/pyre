@@ -6,7 +6,9 @@
 //! class when `w_class` is that realbase's own type, and the realbase's
 //! `_getusercls` layout (`typedef.py`) otherwise. `_new_exception` classes
 //! (`W_ValueError`, `W_KeyError`, `W_Exception`, ...) are never the
-//! allocated layout. `w_class` is the Python class. `EXCEPTION_TYPE` is the
+//! allocated layout. The Python class of a USER layout is
+//! `map.terminator.w_cls`; the header `w_class` is `gettypefor(typeptr)`.
+//! `EXCEPTION_TYPE` is the
 //! BaseException root; `is_exception` is an `ll_isinstance` against it via
 //! the assigned `subclassrange_{min,max}`.
 
@@ -1315,14 +1317,35 @@ fn allocate_exception(
         _ if extended => exc_kind_to_pytype(kind),
         _ => &EXCEPTION_TYPE,
     };
-    let base = w_exception_base_defaults(kind, ob_type, w_class);
+    // `user_setup` → `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`):
+    // the USER map is the owning type's terminator from construction. Reading
+    // it before allocation is what makes `_get_mapdict_map`'s
+    // `jit.promote(self.map)` promotable. Heap types can sit in the nursery,
+    // so `w_class` is pinned around the terminator load and the malloc.
+    let _roots = crate::gc_roots::push_roots();
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    let map = if user && unsafe { crate::typeobject::is_type(w_class) } {
+        unsafe { crate::typeobject::w_type_get_terminator(w_class) as usize }
+    } else {
+        0
+    };
+    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+    // A live USER map already holds the Python class on
+    // `terminator.w_cls`. The header is `gettypefor(typeptr)`.
+    let header_class = unsafe { layout_header_class(ob_type, w_class, map) };
+    let header_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(header_class);
+    let header_class = crate::gc_roots::shadow_stack_get(header_slot);
+    let base = w_exception_base_defaults(kind, ob_type, header_class);
     let obj = if !extended && !user {
         alloc_typed(base, immortal)
     } else if !extended {
         alloc_typed(
             W_BaseExceptionUser {
                 base,
-                map: 0,
+                map,
                 storage: std::ptr::null_mut(),
             },
             immortal,
@@ -1333,7 +1356,7 @@ fn allocate_exception(
         alloc_typed(
             W_ExceptionExtendedUser {
                 base: extended_payload(base),
-                map: 0,
+                map,
                 storage: std::ptr::null_mut(),
             },
             immortal,

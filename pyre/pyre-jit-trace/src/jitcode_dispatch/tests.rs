@@ -4072,6 +4072,26 @@ fn goto_if_not_ptr_iszero_takes_the_branch_when_nonnull() {
 }
 
 #[test]
+fn goto_if_not_ptr_iszero_uses_aligned_cast_int_to_ptr_box_when_register_is_null() {
+    // `unop_cast_record` publishes aligned bits on the box and leaves the
+    // register Null (`is_method`). `_establish_nullity` still needs
+    // `box.nonnull()` (`pyjitpl.py`).
+    let byte = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_iszero/rL")
+        .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
+    let code = [byte, 0x00, 0x09, 0x00];
+    let mut tc = fresh_trace_ctx();
+    let operand = dummy_ptr_eq_box(&mut tc);
+    let aligned = 0x1000_usize;
+    tc.set_opref_concrete(operand, majit_ir::Value::Ref(majit_ir::GcRef(aligned)));
+    let mut regs_r = [operand];
+    let mut concrete_r = [ConcreteValue::Null];
+    let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect("aligned cast_int_to_ptr bits must decide ptr_iszero");
+    assert_eq!(next_pc, 9, "a non-null aligned box jumps the iszero branch");
+}
+
+#[test]
 fn goto_if_not_ptr_nonzero_guards_isnull_and_takes_the_branch() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")

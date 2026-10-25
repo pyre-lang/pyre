@@ -399,17 +399,18 @@ pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
 /// `descroperation.py get_and_call_function` takes its descriptor
 /// shortcut only on the exact type and routes every other one through
 /// `space.get`, so a subclass that overrides `__get__` binds differently.
-/// Compares the user-visible class object, as [`is_exact_tuple`] does.
-/// A subclass instance's `ob_type` is `STATICMETHOD_USER_TYPE`
-/// (`typedef.py` `_getusercls`) and its `w_class` is that subclass.
+/// Interp-level exactness is the RPython class (`type(w_obj) is
+/// W_StaticMethodObject`). A `_getusercls` subclass instance carries
+/// `STATICMETHOD_USER_TYPE` (`typedef.py`). The header word is
+/// `gettypefor(typeptr)` after `layout_header_class` and is not this
+/// predicate. Same `user_subclass` test as
+/// [`crate::pyobject::typeptr_is_exact_builtin`].
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_staticmethod(obj: PyObjectRef) -> bool {
-    unsafe {
-        is_staticmethod(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&STATICMETHOD_TYPE))
-    }
+    unsafe { std::ptr::eq((*obj).ob_type, &STATICMETHOD_TYPE) }
 }
 
 // ── ClassMethod ──────────────────────────────────────────────────────
@@ -593,9 +594,7 @@ pub unsafe fn is_classmethod(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_exact_classmethod(obj: PyObjectRef) -> bool {
-    unsafe {
-        is_classmethod(obj) && std::ptr::eq((*obj).w_class, get_instantiate(&CLASSMETHOD_TYPE))
-    }
+    unsafe { std::ptr::eq((*obj).ob_type, &CLASSMETHOD_TYPE) }
 }
 
 #[cfg(test)]

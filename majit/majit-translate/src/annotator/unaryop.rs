@@ -5492,6 +5492,63 @@ mod tests {
     }
 
     #[test]
+    fn consider_getattr_dest_typed_overlay_terminator_and_w_cls() {
+        // `ann_cast_int_to_ptr(PtrT, s_int)` returns `SomePtr(PTRTYPE)`.
+        // Overlay dest (`*const MapNodeAbstractAttribute` /
+        // `*const MapNodeTerminatorView`) carries the prefix fields;
+        // getattr terminator is the raw pointer word, getattr w_cls is
+        // GCREF.
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            GCREF, GcKind, LowLevelType, Ptr, SomePtr, Struct,
+        };
+
+        let ann = mk_ann();
+        let overlay = Struct::registry_fields(
+            "mapdict::MapNodeTerminatorView",
+            vec![
+                ("_discriminant".into(), LowLevelType::Signed),
+                ("terminator".into(), LowLevelType::Signed),
+                ("w_cls".into(), (*GCREF).clone()),
+            ],
+            GcKind::Raw,
+        );
+        let ptr_ty = Ptr::from_container_type(LowLevelType::Struct(Box::new(overlay)))
+            .expect("overlay struct yields Ptr");
+        let mut v = Variable::named("map");
+        ann.setbinding(&mut v, SomeValue::Ptr(SomePtr::new(ptr_ty)));
+        let term_hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("terminator"))),
+            ],
+        );
+        let term = term_hl
+            .consider(&ann)
+            .expect("overlay getattr terminator")
+            .unwrap();
+        match term {
+            SomeValue::Integer(i) => assert!(!i.unsigned, "terminator is Signed"),
+            other => panic!("overlay terminator is Signed, got {other:?}"),
+        }
+        let cls_hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("w_cls"))),
+            ],
+        );
+        let cls = cls_hl
+            .consider(&ann)
+            .expect("overlay getattr w_cls")
+            .unwrap();
+        assert!(
+            matches!(cls, SomeValue::Ptr(_)),
+            "overlay w_cls is GCREF SomePtr, got {cls:?}"
+        );
+    }
+
+    #[test]
     fn transform_len_someinstance_rewrites_to_getattr_plus_simple_call() {
         // unaryop.py — `op.len(v_ins)` → [getattr(v_ins, '__len__'), simple_call(r)].
         use super::super::classdesc::ClassDef;

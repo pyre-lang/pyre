@@ -406,6 +406,11 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 /// allocator (`insn_byte_opt` answers `None`), as the `StringBuilderRepr`
 /// helper graphs (`rbuilder.py ll_append` / `ll_grow_by` / `ll_build`) emit
 /// them.  No walked body builds through those graphs yet.
+///
+/// `getfield_raw_r/id>r` is numbered the same way. `jtransform.py
+/// rewrite_op_getfield` emits the pure form to load an immutable field off
+/// a raw struct (map terminator `w_cls`); `blackhole.py bhimpl_getfield_raw_r`
+/// / `wire_bhimpl_handlers` bind the handler. `insns.rs` has no `BC_*`.
 #[test]
 fn the_walker_answers_no_key_the_encoding_cannot_name() {
     let root = repo_root();
@@ -416,6 +421,7 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
         .collect();
     unnamed.sort();
     let mut expected: Vec<String> = [
+        "getfield_raw_r/id>r",
         "int_same_as/i>i",
         "newstr/i>r",
         "newstr/c>r",

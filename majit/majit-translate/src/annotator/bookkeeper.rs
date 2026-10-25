@@ -3934,10 +3934,18 @@ impl Bookkeeper {
     /// member never shadows a same-named instance field — a function source
     /// for a field attribute would union-conflict in `generalize_attr`.
     pub fn struct_root_has_field(&self, root: &str, name: &str) -> bool {
-        self.struct_fields
-            .borrow()
-            .as_ref()
-            .is_some_and(|reg| reg.owner_or_variant_has_field(root, name))
+        self.struct_root_field_type(root, name).is_some()
+    }
+
+    /// Harvested type of `name` on type-root `root` or on a variant of
+    /// it (`owner_or_variant_field_type`, `front/semantic.rs`). The
+    /// string is copied so the registry borrow can drop before
+    /// [`Self::project_struct_field_type`].
+    pub fn struct_root_field_type(&self, root: &str, name: &str) -> Option<String> {
+        self.struct_fields.borrow().as_ref().and_then(|reg| {
+            reg.owner_or_variant_field_type(root, name)
+                .map(str::to_string)
+        })
     }
 
     /// A Rust tuple of shape `Tuple<A,B>` is the RPython tuple `(A,B)`:

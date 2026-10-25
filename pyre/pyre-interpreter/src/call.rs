@@ -4993,8 +4993,13 @@ pub(crate) fn calculate_metaclass(
             continue;
         };
         let w_base_type = unsafe {
-            if pyre_object::is_type(base) && !(*base).w_class.is_null() {
-                Some((*base).w_class)
+            if pyre_object::is_type(base) {
+                let w_class = crate::objspace::std::mapdict::instance_getclass(base);
+                if !w_class.is_null() {
+                    Some(w_class)
+                } else {
+                    crate::typedef::r#type(base).map(|ty| ty.as_ptr())
+                }
             } else {
                 crate::typedef::r#type(base).map(|ty| ty.as_ptr())
             }

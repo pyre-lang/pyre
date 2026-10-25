@@ -10828,7 +10828,7 @@ unsafe fn lookup_instance_dunder_call(
     if unsafe { pyre_object::is_type(callable) } {
         return None;
     }
-    let w_class = unsafe { (*callable).w_class };
+    let w_class = unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(callable) };
     if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
         return None;
     }
@@ -10884,7 +10884,12 @@ unsafe fn resolve_type_call_builtin_new(
         return None;
     }
     // A metaclass may supply its own `__call__`; only `type`'s is this shape.
-    if !std::ptr::eq(unsafe { (*callable).w_class }, w_metatype) {
+    // Metaclass is `space.type(C)` (`BaseUserClassMapdict.getclass`),
+    // not header `w_class` (`layout_header_class`).
+    if !std::ptr::eq(
+        unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(callable) },
+        w_metatype,
+    ) {
         return None;
     }
     if unsafe { pyre_object::typeobject::w_type_get_version_tag(callable) } == 0 {
@@ -10932,7 +10937,7 @@ unsafe fn resolve_type_call_builtin_new(
         {
             return None;
         }
-        let w_class = unsafe { (**arg).w_class };
+        let w_class = unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(*arg) };
         if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
             return None;
         }
@@ -12107,24 +12112,57 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
+    // GuardClass can minor-collect. `concrete_obj` is a copy; the receiver
+    // box is `obj` (`ShadowStackFrameworkGCTransformer.push_roots` /
+    // `pop_roots`: a value live across a collection point is reloaded
+    // from its root).
+    let concrete_obj = specialize::live_box_ref(ctx, obj, concrete_obj);
+    let ob_type = unsafe { (*concrete_obj).ob_type };
     // The `GuardClass` above pins the payload, and for a receiver whose payload
     // determines its class there is nothing left for the `w_class` pin to
     // exclude.  It is not free: the pin does not dedupe the way `GuardClass`
     // does through `is_class_known`, so a traceback walk pays a load and a
     // guard on every hop of every node.
     if !unsafe { walker_payload_determines_w_class(ob_type, w_type) } {
-        let live_w_class =
-            crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, crate::descr::w_class_descr());
-        let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[live_w_class, w_class_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(live_w_class, w_class_const);
+        // Mapdict Python class is `map.terminator.w_cls` (`BaseUserClassMapdict.getclass`).
+        // Promote the map (`MapdictStorageMixin._get_mapdict_map`); do not getfield
+        // the header `w_class` word (`W_Root.getclass` / gettypefor analog).
+        let map = if unsafe {
+            pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete_obj)
+        } {
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(concrete_obj) }
+        } else {
+            std::ptr::null()
+        };
+        // `_getusercls` installs the mapdict mixins for exception USER too
+        // (`typedef.py`), so getclass is `map.terminator.w_cls` the same way
+        // as every other mapdict instance (`BaseUserClassMapdict.getclass`).
+        if !map.is_null()
+            && std::ptr::eq(
+                unsafe {
+                    pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete_obj)
+                },
+                w_type,
+            )
+        {
+            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map as usize)?;
+        } else {
+            let live_w_class = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                obj,
+                crate::descr::w_class_descr(),
+            );
+            let w_class_const = ctx.trace_ctx.const_ref(w_type as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[live_w_class, w_class_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(live_w_class, w_class_const);
+        }
     }
 
     let type_const = ctx.trace_ctx.const_ref(w_type as i64);
@@ -12305,9 +12343,12 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
             // `descr_getattribute` → `space.get` looks up `__get__` on
             // `type(w_value)`.  The payload type's `_version_tag?` is what
             // `mutated` moves when that class gains `__get__`.
-            // `descr_set___class__` writes `w_class?` through
-            // `notify_w_class_mutated_then` and leaves every type version
-            // alone, so the class word is pinned on the value itself.
+            // A mapdict payload's class is `map.terminator.w_cls`
+            // (`BaseUserClassMapdict.getclass`); `__class__=` re-roots the
+            // map and does not write the header word, so pin the map
+            // (`MapdictStorageMixin._get_mapdict_map`) rather than a
+            // `w_class?` quasi-immut. Non-mapdict payloads keep the header
+            // quasi-immut.
             // `type_attr_value_fast_path` only reports this arm when the
             // payload type exists and its version tag is nonzero.
             let Some(w_value) = walker_concrete_ref_object(ctx, value_const) else {
@@ -12323,6 +12364,23 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
                 type_const,
                 crate::descr::type_version_tag_descr(),
             );
+            let w_value = specialize::live_box_ref(ctx, value_const, w_value);
+            let mapdict =
+                unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(w_value) };
+            if mapdict {
+                let map =
+                    unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(w_value) };
+                if !map.is_null() {
+                    specialize::walker_promote_instance_map(
+                        ctx,
+                        op_pc,
+                        value_const,
+                        w_value,
+                        map as usize,
+                    )?;
+                    return walker_flush_guard_not_invalidated(ctx, op_pc);
+                }
+            }
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 value_const,
@@ -12608,7 +12666,7 @@ unsafe fn walker_exact_builtin_class(
     obj: pyre_object::PyObjectRef,
 ) -> Option<pyre_object::PyObjectRef> {
     unsafe {
-        let w_class = (*obj).w_class;
+        let w_class = pyre_interpreter::objspace::std::mapdict::instance_getclass(obj);
         if w_class.is_null() {
             return None;
         }
@@ -12674,6 +12732,30 @@ fn walker_pin_instance_w_class<Sym: WalkSym>(
     obj: OpRef,
     expected_typeobj: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
+    // Mapdict Python class is `map.terminator.w_cls` (`BaseUserClassMapdict.getclass`).
+    // Promote the map (`MapdictStorageMixin._get_mapdict_map`); do not getfield
+    // the header `w_class` word (`W_Root.getclass` / gettypefor analog).
+    if let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !concrete.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete) }
+    {
+        let map = unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(concrete) };
+        if !map.is_null()
+            && std::ptr::eq(
+                unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) },
+                expected_typeobj,
+            )
+        {
+            // Intern before `walker_promote_instance_map`: that records
+            // and can collect. The ConstPtr is what `push_roots` /
+            // `pop_roots` (`shadowstack.py`) forwards.
+            let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
+            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete, map as usize)?;
+            return Ok(expected);
+        }
+    }
     let descr = crate::descr::w_class_descr();
     // The getfield appends to `opencoder.py Trace._ops` and can minor-collect.
     // Box the class first: the `ConstPtr` is forwarded, the copy is not.
@@ -12722,13 +12804,23 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     // exact builtin. Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every
     // iteration doubled `list_ops` guard failures. Heap instances handed
     // through `inline_call` can have `__class__` reassigned; those are not
-    // `is_constant()` interned boxes with a matching live `w_class`.
+    // `is_constant()` interned boxes with a matching live getclass.
+    // A mapdict instance's class is `map.terminator.w_cls` and `self.map`
+    // is mutable (`MapdictStorageMixin._get_mapdict_map` =
+    // `jit.promote(self.map)`; `self.map` is not in `_immutable_fields_`).
+    // Restrict this early return to receivers without a mapdict layout
+    // (class is the typedef / typeptr, immutable). A constant mapdict
+    // receiver falls through to `walker_promote_instance_map`.
     if obj.is_constant()
         && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
         && !concrete.is_null()
         && !(pyre_object::tagged_int::CAN_BE_TAGGED
             && pyre_object::tagged_int::is_tagged_int(concrete))
-        && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+        && !unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete) }
+        && std::ptr::eq(
+            unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) },
+            expected_typeobj,
+        )
     {
         return Ok(());
     }
@@ -12749,6 +12841,34 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
             return walker_guard_class(ctx, op_pc, obj, ob_type as i64);
         }
     }
+    // Mapdict Python class is `map.terminator.w_cls` (`BaseUserClassMapdict.getclass`).
+    // Promote the map (`MapdictStorageMixin._get_mapdict_map`); do not getfield
+    // the header `w_class` word (`W_Root.getclass` / gettypefor analog).
+    if let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(concrete) }
+    {
+        let map = unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(concrete) };
+        if !map.is_null()
+            && std::ptr::eq(
+                unsafe { pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete) },
+                expected_typeobj,
+            )
+        {
+            // Intern before `walker_promote_instance_map`: that records
+            // and can collect. The ConstPtr is what `push_roots` /
+            // `pop_roots` (`shadowstack.py`) forwards.
+            let _expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
+            return specialize::walker_promote_instance_map(
+                ctx,
+                op_pc,
+                obj,
+                concrete,
+                map as usize,
+            );
+        }
+    }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
     // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a
     // second spelling of "exact builtin", while the guard below reads the slot and
@@ -12761,9 +12881,14 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         walker_concrete_ref_object(ctx, obj).is_none_or(|concrete| {
             (pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(concrete))
-                || std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+                || std::ptr::eq(
+                    unsafe {
+                        pyre_interpreter::objspace::std::mapdict::instance_getclass(concrete)
+                    },
+                    expected_typeobj,
+                )
         }),
-        "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
+        "guard_exact_w_class at pc={op_pc} would pin a class its recorded operand does not carry",
     );
     walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
     // Do not stamp `class_now_known` here. Exact `w_class` is a stronger
@@ -13966,13 +14091,33 @@ fn establish_nullity<Sym: WalkSym>(
     // walker knows it only through the concrete shadow, and an absent shadow
     // is not evidence of either nullity, so decline rather than guess the
     // branch direction.
-    let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) else {
+    //
+    // `cast_int_to_ptr` of an aligned word publishes the bits on the box
+    // (`unop_cast_record`) and leaves the register Null so `is_method`
+    // cannot load `ob_type` from a non-object (`inline_call.rs` callable-slot
+    // recovery). `_establish_nullity` (`pyjitpl.py`) only needs
+    // `box.nonnull()`, so recover those bits the same way.
+    let ptr_bits = match read_ref_reg_concrete(code, op, 0, ctx) {
+        ConcreteValue::Ref(ptr) => Some(ptr as usize),
+        _ => match ctx.trace_ctx.box_value(boxref) {
+            Some(majit_ir::Value::Ref(r)) => {
+                let bits = r.as_usize();
+                if r != majit_ir::GcRef::NO_CONCRETE && bits % std::mem::align_of::<usize>() == 0 {
+                    Some(bits)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+    };
+    let Some(bits) = ptr_bits else {
         return Err(DispatchError::UnsupportedOpname {
             pc: op.pc,
             key: op.key,
         });
     };
-    let value = !ptr.is_null();
+    let value = bits != 0;
     if value {
         // A known class already implies non-null, so the guard is redundant.
         if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
@@ -14665,6 +14810,89 @@ fn handle<Sym: WalkSym>(
                     bank: "f",
                 })?;
             ctx.registers_f.set(dst, result);
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // pyjitpl.py `opimpl_getfield_raw_r`: `execute_with_descr(
+        // GETFIELD_RAW_R, fielddescr, box)` — pure only. Operand layout
+        // `id>r`: 1B int base + 2B descr + 1B dest-ref. The base is a
+        // raw address in the int bank (`blackhole.py bhimpl_getfield_raw_r`).
+        "getfield_raw_r/id>r" => {
+            let base = read_int_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let dst = code[op.pc + 4] as usize;
+            // ConstPtr + always-pure (`pyjitpl.py` getfield_gc): a constant
+            // raw struct through an immutable field descr loads the slot
+            // now and substitutes a Const, recording no op. `heap.py`
+            // `optimize_getfield` does this for GetfieldGc*; GetfieldRawR
+            // is PassOn there, so the walker has to fold it.
+            // `MetaInterp.execute_and_record` (`pyjitpl.py`) counts OPS
+            // before execute/fold; only `RECORDED_OPS` is skipped for a
+            // folded op.
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::GetfieldRawR, majit_metainterp::counters::OPS);
+            if base.is_constant() && descr.is_always_pure() {
+                let folded = match (
+                    read_int_reg_concrete(code, op, 0, ctx),
+                    descr.as_field_descr(),
+                ) {
+                    (ConcreteValue::Int(ptr), Some(_)) if ptr != 0 => ctx
+                        .trace_ctx
+                        .field_sanity_load(ptr, &descr, majit_ir::Type::Ref)
+                        .and_then(|v| match v {
+                            majit_ir::Value::Ref(r) if r != majit_ir::GcRef::NO_CONCRETE => Some(r),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                if let Some(r) = folded {
+                    // `const_ref` appends to `Trace._ops` and can collect.
+                    // The loaded GCREF is a Rust local; intern through a
+                    // root (`intern_live_exc` / `shadowstack.py` pop_roots).
+                    let (result, concrete) = intern_live_exc(ctx.trace_ctx, r.0);
+                    write_ref_reg(ctx, op.pc, dst, result, concrete)?;
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+            let concrete = match (
+                read_int_reg_concrete(code, op, 0, ctx),
+                descr.as_field_descr(),
+            ) {
+                (ConcreteValue::Int(ptr), Some(_)) if ptr != 0 => ctx
+                    .trace_ctx
+                    .field_sanity_load(ptr, &descr, majit_ir::Type::Ref)
+                    .and_then(|v| match v {
+                        majit_ir::Value::Ref(r) if r != majit_ir::GcRef::NO_CONCRETE => {
+                            Some(ConcreteValue::Ref(r.0 as pyre_object::PyObjectRef))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(ConcreteValue::Null),
+                _ => ConcreteValue::Null,
+            };
+            // `execute_and_record` / `_record_helper` (`pyjitpl.py`): the
+            // loaded GCREF is live across recording. Pin the Rust-local
+            // copy; `record_op_with_descr` can collect.
+            let loaded_pin = match concrete {
+                ConcreteValue::Ref(value) => residual_call::owner_root_if_gc(value as usize),
+                _ => None,
+            };
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::GetfieldRawR,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            let result = ctx
+                .trace_ctx
+                .record_op_with_descr(OpCode::GetfieldRawR, &[base], descr);
+            let concrete = match loaded_pin.as_ref() {
+                Some(pin) => ConcreteValue::Ref(pin.get().0 as pyre_object::PyObjectRef),
+                None => concrete,
+            };
+            if let ConcreteValue::Ref(value) = concrete {
+                ctx.trace_ctx
+                    .set_opref_concrete(result, Value::Ref(majit_ir::GcRef(value as usize)));
+            }
+            write_ref_reg(ctx, op.pc, dst, result, concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // pyjitpl.py `_opimpl_setfield_raw_any` / `opimpl_setfield_raw_i`:

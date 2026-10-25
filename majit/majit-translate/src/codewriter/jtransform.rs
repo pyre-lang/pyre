@@ -8085,7 +8085,7 @@ impl<'a> Transformer<'a> {
             }
             if is_lltype_cast_path(segments, "cast_int_to_ptr")
                 && args.len() == 1
-                && matches!(result_ty, ValueType::Ref(_))
+                && matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
             {
                 let arg = resolve_alias(&args[0], &self.aliases);
                 if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
@@ -28552,32 +28552,34 @@ mod tests {
             "lltype",
             "cast_int_to_ptr",
         ]);
-        let op = SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![n.clone()]),
-                result_ty: ValueType::Ref(None),
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            std::slice::from_ref(&n),
-            &ValueType::Ref(None),
-            "cast_int_to_ptr_call",
-            &mut graph,
-        ) {
-            RewriteResult::Replace(ops) => {
-                assert!(matches!(
-                    ops.as_slice(),
-                    [SpaceOperation {
-                        kind: OpKind::UnaryOp { op, operand, .. },
-                        ..
-                    }] if op == "cast_int_to_ptr" && operand == &n
-                ));
+        for result_ty in [ValueType::Ref(None), ValueType::Str] {
+            let op = SpaceOperation {
+                result: Some(result.clone()),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![n.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            match transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&n),
+                &result_ty,
+                "cast_int_to_ptr_call",
+                &mut graph,
+            ) {
+                RewriteResult::Replace(ops) => {
+                    assert!(matches!(
+                        ops.as_slice(),
+                        [SpaceOperation {
+                            kind: OpKind::UnaryOp { op, operand, .. },
+                            ..
+                        }] if op == "cast_int_to_ptr" && operand == &n
+                    ));
+                }
+                _ => panic!("expected UnaryOp rewrite for {result_ty:?}"),
             }
-            _ => panic!("expected UnaryOp rewrite"),
         }
     }
 

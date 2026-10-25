@@ -2862,12 +2862,16 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // records the byte and a guard-failure resume panics here.
     // `build_inline_call_only_bh_builder` registers the four raw-array keys
     // at their canonical `BC_*` bytes.
+    // `getfield_raw_r/id>r` has no `BC_*` (`assembler.py setdefault`);
+    // `wire_bhimpl_handlers` binds `handler_getfield_raw_r`
+    // (`blackhole.py bhimpl_getfield_raw_r`).
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",
         "recursive_call_f/iIRFIRF>f",
         "recursive_call_v/iIRFIRF",
         "int_isvirtual/i>i",
+        "getfield_raw_r/id>r",
     ];
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()

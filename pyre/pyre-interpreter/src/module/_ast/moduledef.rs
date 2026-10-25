@@ -49,7 +49,9 @@ fn ast_instance_type_name(object: PyObjectRef) -> &'static str {
     // PyPy `W_AST_init` asks `space.type(self)`: every public AST node uses
     // the common `W_ObjectObject` payload, so its payload vtable only says
     // `object`; the heap class lives in `w_class`.
-    unsafe { pyre_object::w_type_get_name(pyre_object::w_instance_get_type(object)) }
+    unsafe {
+        pyre_object::w_type_get_name(crate::objspace::std::mapdict::instance_getclass(object))
+    }
 }
 
 fn ast_fields_owner_name(w_type: PyObjectRef) -> String {
@@ -353,7 +355,9 @@ fn call_type_with_raw_kwargs(
     if !unsafe { pyre_object::w_type_issubtype(w_type, ast_type()) } {
         return None;
     }
-    if unsafe { pyre_object::w_instance_get_type(w_type) } != crate::typedef::w_type() {
+    if unsafe { crate::objspace::std::mapdict::instance_getclass(w_type) }
+        != crate::typedef::w_type()
+    {
         return None;
     }
     let init_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") }?;
@@ -507,7 +511,7 @@ fn expr_context_type() -> PyObjectRef {
     // generated base beside the Load singleton.  Recover that same base from
     // the singleton instead of adding a second semantic side table.
     unsafe {
-        let load_type = pyre_object::w_instance_get_type(load_singleton());
+        let load_type = crate::objspace::std::mapdict::instance_getclass(load_singleton());
         let bases = pyre_object::w_type_get_bases(load_type);
         pyre_object::w_tuple_getitem(bases, 0).expect("Load has expr_context base")
     }
@@ -549,7 +553,7 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
     );
     let zelf = || roots.get(positional_base);
     let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(unsafe { pyre_object::w_instance_get_type(zelf()) });
+    let _ = roots.pin_root(unsafe { crate::objspace::std::mapdict::instance_getclass(zelf()) });
     let fields_obj = match crate::baseobjspace::findattr_result(roots.get(w_type_slot), "_fields")?
     {
         Some(fields_obj) => fields_obj,
@@ -747,7 +751,9 @@ fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::Py
         slot
     });
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(unsafe { pyre_object::w_instance_get_type(roots.get(zelf_slot)) });
+    let _ = roots.pin_root(unsafe {
+        crate::objspace::std::mapdict::instance_getclass(roots.get(zelf_slot))
+    });
 
     let fields = crate::baseobjspace::findattr_result(roots.get(type_slot), "_fields")?;
     let fields_slot = fields.map(|fields| {

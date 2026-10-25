@@ -2590,6 +2590,21 @@ mod tests {
     }
 
     #[test]
+    fn test_ptr_info_setitem_skips_unreasonable_index() {
+        // info.py `ArrayPtrInfo._setitem_index`:
+        // `if not reasonable_array_index(index): return`.
+        let descr: DescrRef = Arc::new(TestDescr);
+        let mut info = PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative());
+        info.setitem(150_001, field_op(Type::Int, 1));
+        assert!(info.getitem(150_001).is_none());
+        info.setitem(2, field_op(Type::Int, 30));
+        assert_eq!(
+            info.getitem(2).and_then(|e| e.as_opref()),
+            Some(OpRef::int_op(30))
+        );
+    }
+
+    #[test]
     fn test_preamble_item_keeps_regular_array_item_visible() {
         let descr: DescrRef = Arc::new(TestDescr);
         let mut info = PtrInfo::array(descr, crate::optimizeopt::intutils::IntBound::nonnegative());

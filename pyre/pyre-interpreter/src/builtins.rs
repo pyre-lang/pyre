@@ -6079,7 +6079,7 @@ pub fn builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// # Safety
 /// `obj` must point to a valid object whose header is readable.
 pub(crate) unsafe fn abs_uses_builtin(obj: PyObjectRef) -> bool {
-    let w_class = unsafe { (*obj).w_class };
+    let w_class = unsafe { crate::objspace::std::mapdict::instance_getclass(obj) };
     if w_class.is_null() {
         return true;
     }
@@ -21096,7 +21096,7 @@ pub fn try_hash_value(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             return crate::_pypy_generic_alias::union_hash_value(obj);
         }
         if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
+            let w_type = crate::objspace::std::mapdict::instance_getclass(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
                 if pyre_object::is_none(method) {
                     return Err(unhashable_type_error(obj));
@@ -21863,7 +21863,7 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             return hash_value(pyre_object::w_union_get_hashable_args(obj));
         }
         if pyre_object::is_instance(obj) {
-            let w_type = pyre_object::w_instance_get_type(obj);
+            let w_type = crate::objspace::std::mapdict::instance_getclass(obj);
             if let Some(method) = crate::baseobjspace::lookup_in_type(w_type, "__hash__") {
                 // `hash_value` is the infallible callback arm, so a failed or
                 // non-int `__hash__` falls through and reads `obj` again for
@@ -27295,7 +27295,7 @@ fn increment_decimal_digits(digits: &mut Vec<u8>) {
 /// # Safety
 /// `obj` must point to a valid object whose header is readable.
 unsafe fn round_uses_builtin(obj: PyObjectRef) -> bool {
-    let w_class = unsafe { (*obj).w_class };
+    let w_class = unsafe { crate::objspace::std::mapdict::instance_getclass(obj) };
     if w_class.is_null() {
         return true;
     }

@@ -1177,7 +1177,7 @@ pub fn is_classmethod_descriptor(obj: PyObjectRef) -> bool {
     !obj.is_null()
         && unsafe { pyre_object::function::is_classmethod(obj) }
         && std::ptr::eq(
-            unsafe { (*obj).w_class },
+            unsafe { crate::objspace::std::mapdict::instance_getclass(obj) },
             get_instantiate(&CLASSMETHOD_DESCRIPTOR_TYPE),
         )
 }

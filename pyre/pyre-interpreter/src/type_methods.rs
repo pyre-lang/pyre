@@ -599,7 +599,8 @@ pub(crate) fn list_extend_items(
         extend_from_tuple(list, other)?;
     } else if unsafe {
         pyre_object::is_set_or_frozenset(other)
-            && (*other).w_class == pyre_object::get_instantiate(&*(*other).ob_type)
+            && crate::objspace::std::mapdict::instance_getclass(other)
+                == pyre_object::get_instantiate(&*(*other).ob_type)
     } {
         extend_from_set(list, other)?;
     } else if unsafe { crate::pyframe::frame_locals_proxy::is_frame_locals_proxy(other) } {
@@ -792,7 +793,8 @@ fn extend_from_iterable(list: PyObjectRef, other: PyObjectRef) -> Result<(), cra
         }
         let exact_dict = unsafe {
             pyre_object::is_dict(source)
-                && (*source).w_class == pyre_object::get_instantiate(&*(*source).ob_type)
+                && crate::objspace::std::mapdict::instance_getclass(source)
+                    == pyre_object::get_instantiate(&*(*source).ob_type)
         };
         // Sibling `list_extend_dict{,items}` branches for the three exact
         // dict-view types; all use ordinary resize.

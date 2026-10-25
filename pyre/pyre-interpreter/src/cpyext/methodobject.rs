@@ -158,7 +158,9 @@ fn store_attribute(
     // `meth_members` gives `builtin_function_or_method` a settable member of
     // that name, while a descriptor carries no such attribute at all.
     if !(attribute == MODULE_KEY && is_carrier(carrier)) {
-        let type_name = unsafe { pyre_object::w_type_get_name((*carrier).w_class) };
+        let type_name = unsafe {
+            pyre_object::w_type_get_name(crate::objspace::std::mapdict::instance_getclass(carrier))
+        };
         let message = if RESERVED_KEYS.contains(&attribute.as_str()) {
             format!("attribute '{attribute}' of '{type_name}' objects is not writable")
         } else {
@@ -274,7 +276,12 @@ pub fn pycmethod_type() -> PyObjectRef {
 /// merely has the reserved keys in its namespace.
 fn is_carrier(carrier: PyObjectRef) -> bool {
     !carrier.is_null()
-        && unsafe { crate::baseobjspace::issubtype_w((*carrier).w_class, pycfunction_type()) }
+        && unsafe {
+            crate::baseobjspace::issubtype_w(
+                crate::objspace::std::mapdict::instance_getclass(carrier),
+                pycfunction_type(),
+            )
+        }
 }
 
 /// The `PyMethodDef` behind `object`, or NULL with a `SystemError` when
@@ -342,7 +349,7 @@ pub unsafe extern "C" fn PyMethodDescr_Check(object: *mut CPyObject) -> c_int {
     (!object.is_null()
         && unsafe {
             crate::baseobjspace::issubtype_w(
-                (*object).w_class,
+                crate::objspace::std::mapdict::instance_getclass(object),
                 super::typeobject::method_descriptor_type(),
             )
         }) as c_int
@@ -356,7 +363,8 @@ pub unsafe extern "C" fn PyMethodDescr_Check(object: *mut CPyObject) -> c_int {
 pub unsafe extern "C" fn PyMethodDescr_CheckExact(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
     (!object.is_null()
-        && unsafe { (*object).w_class } == super::typeobject::method_descriptor_type()) as c_int
+        && unsafe { crate::objspace::std::mapdict::instance_getclass(object) }
+            == super::typeobject::method_descriptor_type()) as c_int
 }
 
 /// `methodobject.py PyDescr_NewMethod(type, method)`.
@@ -759,7 +767,12 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     let carrier = built_carrier_type(&PYCFUNCTION_TYPE_OBJ);
     if w_obj.is_null()
         || carrier.is_null()
-        || !unsafe { crate::baseobjspace::issubtype_w((*w_obj).w_class, carrier) }
+        || !unsafe {
+            crate::baseobjspace::issubtype_w(
+                crate::objspace::std::mapdict::instance_getclass(w_obj),
+                carrier,
+            )
+        }
     {
         return;
     }

@@ -649,7 +649,7 @@ fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             "sched_param.__reduce__ missing self",
         ));
     };
-    let cls = unsafe { (*inst).w_class };
+    let cls = unsafe { crate::objspace::std::mapdict::instance_getclass(inst) };
     let priority =
         unsafe { pyre_object::w_tuple_getitem(inst, 0) }.unwrap_or_else(pyre_object::w_none);
     // Both tuple allocations can collect, so the class and the element are

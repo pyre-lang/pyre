@@ -47,6 +47,7 @@ pub mod listobject;
 pub mod lltype;
 pub mod longobject;
 pub mod lowlevel_string;
+pub mod mapdict;
 pub mod memoryview;
 pub mod module;
 pub mod nestedscope;

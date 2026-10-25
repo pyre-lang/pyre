@@ -4571,6 +4571,12 @@ unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
     if pyre_object::typeptr_is_exact_builtin(a) {
         return true;
     }
+    // Mapdict mixin: Python class is `terminator.w_cls`
+    // (`BaseUserClassMapdict.getclass`); the header word is
+    // `gettypefor(typeptr)` and is not the exactness pin.
+    if pyre_object::pytype_has_mapdict_mixin(a) {
+        return false;
+    }
     let w_class = majit_metainterp::jit::promote((*a).w_class);
     pyre_object::class_word_is_exact_builtin(a, w_class)
 }
