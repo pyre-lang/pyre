@@ -321,6 +321,15 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) -> JitframeDescrFacts {
     facts
 }
 
+/// `transform.py _ll_malloc_fixedsize` OOM: `jit_exc_raise` of the
+/// prebuilt MemoryError singleton, then the allocator returns NULL.
+fn raise_memory_error() {
+    let v = majit_backend::memory_error_singleton_ref();
+    if v != 0 {
+        jit_exc_raise(v);
+    }
+}
+
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
 /// cranelift trampolines. Shared by `install_gc_box` (thread-confined heap:
 /// also stores a box) and `install_gc_standalone` (shared heap: hooks only, no
@@ -367,6 +376,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     // untraced rather than fail loudly.
     majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
     majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
+    majit_gc::set_active_raise_memory_error(Some(raise_memory_error));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         alloc_nursery_headerless_no_collect_via_active_runtime,
     ));

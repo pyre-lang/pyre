@@ -336,6 +336,18 @@ pub struct Bookkeeper {
     /// family host-call error latch (see [`super::specialize::MemoFamily`]).
     /// Consumed by [`super::specialize::memo`].
     pub all_specializations: RefCell<HashMap<usize, super::specialize::MemoFamily>>,
+    /// `specialize.py MemoTable.table` for rtyping-time
+    /// `@specialize.memo()` helpers (`rlist.py _ll_prebuilt_empty_array`).
+    /// Upstream keeps that table on the bookkeeper
+    /// (`all_specializations` → `MemoTable`); this slot is that table
+    /// for the prebuilt empty-array helper — one immortal
+    /// `malloc(LISTITEM, 0)` per item lltype per translation.
+    pub memo_tables: RefCell<
+        Vec<(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+            crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        )>,
+    >,
     /// RPython `hasattr(self, 'position_key')` (bookkeeper.py:99).
     ///
     /// Upstream distinguishes "no position entered" (attribute absent)
@@ -1234,6 +1246,7 @@ impl Bookkeeper {
             immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
             all_specializations: RefCell::new(HashMap::new()),
+            memo_tables: RefCell::new(Vec::new()),
             position_entered: std::cell::Cell::new(false),
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             struct_fields: RefCell::new(None),
@@ -5033,7 +5046,7 @@ impl Bookkeeper {
         self: &Rc<Self>,
         key: Option<&Constant>,
         x: &ConstValue,
-        items: &HashMap<ConstValue, ConstValue>,
+        items: &IndexMap<ConstValue, ConstValue>,
     ) -> Result<SomeValue, AnnotatorError> {
         if let Some(key) = key
             && let Some(hit) = self
@@ -10194,9 +10207,9 @@ mod tests {
     #[test]
     fn immutableconstant_dict_distinguishes_equal_but_distinct_constants() {
         let bk = bk();
-        let mut a_items = HashMap::new();
+        let mut a_items = IndexMap::new();
         a_items.insert(ConstValue::Int(1), ConstValue::None);
-        let mut b_items = HashMap::new();
+        let mut b_items = IndexMap::new();
         b_items.insert(ConstValue::Int(1), ConstValue::None);
         let a_key = Constant::new(ConstValue::Dict(std::sync::Arc::new(a_items)));
         let b_key = Constant::new(ConstValue::Dict(std::sync::Arc::new(b_items)));
@@ -10225,7 +10238,7 @@ mod tests {
         r_dict
             .instance_set("key_hash", ConstValue::HostObject(key_hash))
             .expect("key_hash");
-        let mut inner = HashMap::new();
+        let mut inner = IndexMap::new();
         for &(k, v) in pairs {
             let dk = HO::new_instance(key_cls.clone(), vec![]);
             dk.instance_set("dic", ConstValue::HostObject(r_dict.clone()))

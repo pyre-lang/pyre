@@ -4,7 +4,9 @@
 //! together with the abstract `rpython/rtyper/rlist.py` pieces.  This
 //! module keeps the upstream lltypesystem import path available.
 
+use crate::annotator::bookkeeper::Bookkeeper;
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::lltype::{_ptr, LowLevelType, MallocFlavor, malloc};
 
 pub use crate::translator::rtyper::lltypesystem::lltype;
 pub use crate::translator::rtyper::rlist::{AbstractListIteratorRepr, FixedSizeListRepr, ListRepr};
@@ -80,12 +82,45 @@ pub fn ll_newlist_hint() -> Result<(), TyperError> {
     Err(lltypesystem_rlist_deferred("ll_newlist_hint"))
 }
 
-pub fn _ll_prebuilt_empty_array() -> Result<(), TyperError> {
-    Err(lltypesystem_rlist_deferred("_ll_prebuilt_empty_array"))
+/// `rlist.py _ll_prebuilt_empty_array`: `@specialize.memo()` so a
+/// constant `LISTITEM` folds to one immortal `malloc(LISTITEM, 0)`.
+/// The memo is `Bookkeeper.memo_tables` (`specialize.py MemoTable`).
+pub fn _ll_prebuilt_empty_array(
+    bookkeeper: &Bookkeeper,
+    listitem: &LowLevelType,
+) -> Result<_ptr, TyperError> {
+    {
+        let memo = bookkeeper.memo_tables.borrow();
+        if let Some((_, ptr)) = memo.iter().find(|(ty, _)| ty == listitem) {
+            return Ok(ptr.clone());
+        }
+    }
+    let ptr =
+        malloc(listitem.clone(), Some(0), MallocFlavor::Gc, true).map_err(TyperError::message)?;
+    let mut memo = bookkeeper.memo_tables.borrow_mut();
+    if let Some((_, existing)) = memo.iter().find(|(ty, _)| ty == listitem) {
+        return Ok(existing.clone());
+    }
+    memo.push((listitem.clone(), ptr.clone()));
+    Ok(ptr)
 }
 
-pub fn _ll_new_empty_item_array() -> Result<(), TyperError> {
-    Err(lltypesystem_rlist_deferred("_ll_new_empty_item_array"))
+/// `rlist.py _ll_new_empty_item_array`. `listitem` is `LIST.items.TO`.
+pub fn _ll_new_empty_item_array(
+    bookkeeper: &Bookkeeper,
+    listitem: &LowLevelType,
+) -> Result<_ptr, TyperError> {
+    if INITIAL_EMPTY_LIST_ALLOCATION > 0 {
+        malloc(
+            listitem.clone(),
+            Some(INITIAL_EMPTY_LIST_ALLOCATION as usize),
+            MallocFlavor::Gc,
+            false,
+        )
+        .map_err(TyperError::message)
+    } else {
+        _ll_prebuilt_empty_array(bookkeeper, listitem)
+    }
 }
 
 pub fn ll_newemptylist() -> Result<(), TyperError> {
@@ -191,5 +226,60 @@ mod tests {
         let err = ll_revlistnext().expect_err("runtime helper deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("ll_revlistnext"));
+    }
+
+    fn empty_array_identity(ptr: &_ptr) -> usize {
+        match &ptr._obj0 {
+            lltype::PtrObj::Strong(lltype::_ptr_obj::Array(arr)) => arr.identity(),
+            other => panic!("expected Array container, got {other:?}"),
+        }
+    }
+
+    /// `_ll_prebuilt_empty_array` is `@specialize.memo()`: one immortal
+    /// zero-length GcArray per `LISTITEM`.
+    #[test]
+    fn prebuilt_empty_array_is_memoized_per_item_lltype() {
+        let signed_items = LowLevelType::Array(Box::new(lltype::Array::gc(LowLevelType::Signed)));
+        let char_items = LowLevelType::Array(Box::new(lltype::Array::gc(LowLevelType::Char)));
+        let bookkeeper = Bookkeeper::new();
+        let a = _ll_prebuilt_empty_array(&bookkeeper, &signed_items).expect("prebuilt signed");
+        let b =
+            _ll_prebuilt_empty_array(&bookkeeper, &signed_items).expect("prebuilt signed again");
+        let c = _ll_new_empty_item_array(&bookkeeper, &signed_items).expect("new empty signed");
+        let d = _ll_prebuilt_empty_array(&bookkeeper, &char_items).expect("prebuilt char");
+        assert_eq!(empty_array_identity(&a), empty_array_identity(&b));
+        assert_eq!(empty_array_identity(&a), empty_array_identity(&c));
+        assert_ne!(empty_array_identity(&a), empty_array_identity(&d));
+    }
+
+    /// Memo is per translation (`specialize.py MemoTable` on the
+    /// bookkeeper): two rtypers allocate two arrays; one rtyper reuses.
+    #[test]
+    fn prebuilt_empty_array_memo_is_per_translation() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+
+        let signed_items = LowLevelType::Array(Box::new(lltype::Array::gc(LowLevelType::Signed)));
+        let ann1 = RPythonAnnotator::new(None, None, None, false);
+        let rtyper1 = RPythonTyper::new(&ann1);
+        let ann2 = RPythonAnnotator::new(None, None, None, false);
+        let rtyper2 = RPythonTyper::new(&ann2);
+        let bk1 = rtyper1
+            .annotator
+            .upgrade()
+            .expect("rtyper1 annotator")
+            .bookkeeper
+            .clone();
+        let bk2 = rtyper2
+            .annotator
+            .upgrade()
+            .expect("rtyper2 annotator")
+            .bookkeeper
+            .clone();
+        let a = _ll_prebuilt_empty_array(&bk1, &signed_items).expect("rtyper1 first");
+        let b = _ll_prebuilt_empty_array(&bk1, &signed_items).expect("rtyper1 reuse");
+        let c = _ll_prebuilt_empty_array(&bk2, &signed_items).expect("rtyper2");
+        assert_eq!(empty_array_identity(&a), empty_array_identity(&b));
+        assert_ne!(empty_array_identity(&a), empty_array_identity(&c));
     }
 }

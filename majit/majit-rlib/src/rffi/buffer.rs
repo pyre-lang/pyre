@@ -40,7 +40,10 @@ pub fn str2charp(s: &[u8], track_allocation: bool) -> CCHARP {
     let _ = track_allocation;
     let bytes = s.len().checked_add(1).expect("str2charp length overflow");
     unsafe {
-        let array = raw_malloc(bytes).cast::<super::CHAR>();
+        let array = raw_malloc_raise_null(bytes).cast::<super::CHAR>();
+        if array.is_null() {
+            return array;
+        }
         copy_bytes(s.as_ptr(), array.cast(), s.len());
         *array.add(s.len()) = 0;
         array
@@ -155,7 +158,10 @@ pub fn get_nonmovingbuffer_ll(data: &[u8]) -> (CCHARP, (), u8) {
         .checked_add(1)
         .expect("get_nonmovingbuffer_ll length overflow");
     unsafe {
-        let buf = raw_malloc(bytes).cast::<super::CHAR>();
+        let buf = raw_malloc_raise_null(bytes).cast::<super::CHAR>();
+        if buf.is_null() {
+            return (buf, (), FLAG_RAW_COPY);
+        }
         copy_bytes(data.as_ptr(), buf.cast(), count);
         (buf, (), FLAG_RAW_COPY)
     }
@@ -278,7 +284,10 @@ pub fn liststr2charpp(list: &[&[u8]]) -> super::CCHARPP {
         .and_then(|n| n.checked_mul(core::mem::size_of::<CCHARP>()))
         .expect("liststr2charpp length overflow");
     unsafe {
-        let array = raw_malloc(bytes).cast::<CCHARP>();
+        let array = raw_malloc_raise_null(bytes).cast::<CCHARP>();
+        if array.is_null() {
+            return array;
+        }
         for (i, item) in list.iter().enumerate() {
             *array.add(i) = str2charp(item, true);
         }
@@ -384,7 +393,10 @@ pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHA
         .checked_mul(core::mem::size_of::<Wchar>())
         .expect("utf82wcharp size overflow");
     unsafe {
-        let w = raw_malloc(bytes).cast::<Wchar>();
+        let w = raw_malloc_raise_null(bytes).cast::<Wchar>();
+        if w.is_null() {
+            return w;
+        }
         let mut index = 0;
         let mut pos = 0;
         while let Some(ch) = next_codepoint(utf8, &mut pos) {
@@ -416,7 +428,10 @@ pub fn utf82wcharp_ex(utf8: &[u8], unilen: usize, track_allocation: bool) -> CWC
         .and_then(|n| n.checked_mul(core::mem::size_of::<Wchar>()))
         .expect("utf82wcharp_ex size overflow");
     unsafe {
-        let w = raw_malloc(bytes).cast::<Wchar>();
+        let w = raw_malloc_raise_null(bytes).cast::<Wchar>();
+        if w.is_null() {
+            return w;
+        }
         let mut index = 0;
         let mut pos = 0;
         while let Some(ch) = next_codepoint(utf8, &mut pos) {
@@ -683,14 +698,19 @@ unsafe fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) {
 /// `lltype.malloc(..., flavor='raw')` / `lltype.free(..., flavor='raw')`:
 /// `malloc` / `free`. A zero-byte request still returns a unique block;
 /// `malloc(0)` is implementation-defined and a later `offset` on NULL is not.
+/// Allocation failure returns NULL; the caller raises MemoryError.
+fn raw_malloc_raise_null(size: usize) -> *mut u8 {
+    let p = unsafe { raw_malloc(size) };
+    if p.is_null() {
+        majit_gc::raise_memory_error();
+    }
+    p
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn raw_malloc(size: usize) -> *mut u8 {
     let request = size.max(1);
-    let p = unsafe { libc::malloc(request) };
-    if p.is_null() {
-        std::alloc::handle_alloc_error(std::alloc::Layout::from_size_align(request, 1).unwrap());
-    }
-    p.cast()
+    unsafe { libc::malloc(request) }.cast()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -711,23 +731,29 @@ const RAW_MALLOC_ALIGN: usize = 16;
 /// rejects a size that is not a multiple of the alignment, so the total is
 /// rounded up. [`raw_free`] rebuilds this same layout from the stored size.
 #[cfg(any(target_arch = "wasm32", test))]
-fn raw_malloc_layout(size: usize) -> std::alloc::Layout {
+fn try_raw_malloc_layout(size: usize) -> Option<std::alloc::Layout> {
     let payload = size.max(1);
     let total = RAW_MALLOC_ALIGN
         .checked_add(payload)
-        .and_then(|n| n.checked_next_multiple_of(RAW_MALLOC_ALIGN))
-        .expect("raw malloc size overflow");
-    std::alloc::Layout::from_size_align(total, RAW_MALLOC_ALIGN).unwrap()
+        .and_then(|n| n.checked_next_multiple_of(RAW_MALLOC_ALIGN))?;
+    std::alloc::Layout::from_size_align(total, RAW_MALLOC_ALIGN).ok()
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn raw_malloc_layout(size: usize) -> std::alloc::Layout {
+    try_raw_malloc_layout(size).expect("raw malloc size overflow")
 }
 
 /// wasm32-unknown-unknown does not link `libc`. The requested size sits in
 /// the header so [`raw_free`] can rebuild the [`raw_malloc_layout`].
 #[cfg(target_arch = "wasm32")]
 unsafe fn raw_malloc(size: usize) -> *mut u8 {
-    let layout = raw_malloc_layout(size);
+    let Some(layout) = try_raw_malloc_layout(size) else {
+        return core::ptr::null_mut();
+    };
     let base = unsafe { std::alloc::alloc(layout) };
     if base.is_null() {
-        std::alloc::handle_alloc_error(layout);
+        return core::ptr::null_mut();
     }
     unsafe {
         base.cast::<usize>().write(size);
@@ -757,7 +783,14 @@ unsafe fn raw_free(ptr: *mut u8) {
 /// is i32 on wasm32, and `call_indirect` requires this signature.
 #[inline(never)]
 pub extern "C" fn ll_raw_malloc_fixedsize(size: i64) -> i64 {
-    unsafe { raw_malloc(size as usize) as usize as i64 }
+    let Ok(bytes) = usize::try_from(size) else {
+        return raw_malloc_memory_error();
+    };
+    let ptr = unsafe { raw_malloc(bytes) };
+    if ptr.is_null() {
+        return raw_malloc_memory_error();
+    }
+    ptr as usize as i64
 }
 
 /// `zero=True` form of [`ll_raw_malloc_fixedsize`]. The block is cleared
@@ -765,8 +798,13 @@ pub extern "C" fn ll_raw_malloc_fixedsize(size: i64) -> i64 {
 /// and writes nothing. Same word ABI as [`ll_raw_malloc_fixedsize`].
 #[inline(never)]
 pub extern "C" fn ll_raw_malloc_fixedsize_zero(size: i64) -> i64 {
-    let bytes = size as usize;
+    let Ok(bytes) = usize::try_from(size) else {
+        return raw_malloc_memory_error();
+    };
     let ptr = unsafe { raw_malloc(bytes) };
+    if ptr.is_null() {
+        return raw_malloc_memory_error();
+    }
     if bytes > 0 {
         unsafe { ptr.write_bytes(0, bytes) };
     }
@@ -787,78 +825,344 @@ fn ll_compute_size(n: i64, basesize: i64, itemsize: i64) -> Option<usize> {
     Some(bytes)
 }
 
-/// MemoryError result of a raw malloc helper: NULL, the same false
-/// `allocate` result `_ll_malloc_fixedsize` raises MemoryError on.
+/// MemoryError result of a raw malloc helper: raise the prebuilt
+/// singleton (`llmodel.py pos_exception` / `pos_exc_value`) and return
+/// NULL, the same false `allocate` result `_ll_malloc_fixedsize` raises
+/// MemoryError on.
 fn raw_malloc_memory_error() -> i64 {
+    majit_gc::raise_memory_error();
     0
 }
 
-/// Variable-size `lltype.malloc(ARRAY, n, flavor='raw')`.
-///
-/// `support.py build_raw_malloc_varsize_builder` closes ARRAY into a
-/// one-argument `_ll_1_raw_malloc_varsize`. The size here is
-/// `basesize + n * itemsize`; `CArray` / `nolength` arrays have
-/// basesize 0. Alignment stays inside `raw_malloc`.
-///
-/// `n`, `basesize`, `itemsize`, and the address are `i64` words
-/// (`extern "C"`). A `usize` parameter is i32 on wasm32.
-#[inline(never)]
-pub extern "C" fn ll_raw_malloc_varsize(n: i64, basesize: i64, itemsize: i64) -> i64 {
-    let Some(bytes) = ll_compute_size(n, basesize, itemsize) else {
-        return raw_malloc_memory_error();
+/// `framework.py raw_malloc_memory_pressure_varsize`: charge
+/// `length * itemsize` when that product is positive, `adr=NULL`.
+fn raw_malloc_varsize_memory_pressure(n: i64, itemsize: i64) {
+    let Some(totalmem) = n.checked_mul(itemsize) else {
+        return;
     };
-    unsafe { raw_malloc(bytes) as usize as i64 }
+    if totalmem > 0 {
+        majit_gc::add_memory_pressure(totalmem as isize, majit_ir::GcRef::NULL);
+    }
 }
 
-/// `zero=True` form of [`ll_raw_malloc_varsize`]. The block is cleared
-/// for `basesize + n * itemsize` bytes. A zero-size request still
-/// returns a distinct block and writes nothing.
-#[inline(never)]
-pub extern "C" fn ll_raw_malloc_varsize_zero(n: i64, basesize: i64, itemsize: i64) -> i64 {
+/// `transform.py ll_malloc_varsize_no_length` / `ll_malloc_varsize`.
+/// `lengthoffset` is `Some` when the ARRAY is not `nolength`; the
+/// helper then stores `n` at that offset (`llop.raw_store`).
+fn raw_malloc_varsize_core(
+    n: i64,
+    basesize: i64,
+    itemsize: i64,
+    lengthoffset: Option<i64>,
+    zero: bool,
+    add_memory_pressure: bool,
+) -> i64 {
+    if add_memory_pressure {
+        raw_malloc_varsize_memory_pressure(n, itemsize);
+    }
     let Some(bytes) = ll_compute_size(n, basesize, itemsize) else {
         return raw_malloc_memory_error();
     };
     let ptr = unsafe { raw_malloc(bytes) };
-    if bytes > 0 {
+    if ptr.is_null() {
+        return raw_malloc_memory_error();
+    }
+    if zero && bytes > 0 {
         unsafe { ptr.write_bytes(0, bytes) };
+    }
+    if let Some(offset) = lengthoffset {
+        let off = usize::try_from(offset).expect("lengthoffset");
+        unsafe { ptr.add(off).cast::<isize>().write(n as isize) };
     }
     ptr as usize as i64
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
-#[linkme(crate = majit_ir::linkme)]
-#[allow(non_upper_case_globals)]
-static __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize: majit_ir::helper_fnaddr::HelperFnAddr =
-    majit_ir::helper_fnaddr::HelperFnAddr::new(
-        "majit_rlib::rffi::ll_raw_malloc_varsize",
-        ll_raw_malloc_varsize as *const (),
-        3,
-    );
+macro_rules! publish_raw_varsize {
+    ($static:ident, $name:ident, $arity:literal) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+        #[linkme(crate = majit_ir::linkme)]
+        #[allow(non_upper_case_globals)]
+        static $static: majit_ir::helper_fnaddr::HelperFnAddr =
+            majit_ir::helper_fnaddr::HelperFnAddr::new(
+                concat!("majit_rlib::rffi::", stringify!($name)),
+                $name as *const (),
+                $arity,
+            );
+    };
+}
 
-#[cfg(not(target_arch = "wasm32"))]
-#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
-#[linkme(crate = majit_ir::linkme)]
-#[allow(non_upper_case_globals)]
-static __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_zero: majit_ir::helper_fnaddr::HelperFnAddr =
-    majit_ir::helper_fnaddr::HelperFnAddr::new(
-        "majit_rlib::rffi::ll_raw_malloc_varsize_zero",
-        ll_raw_malloc_varsize_zero as *const (),
-        3,
-    );
+/// `transform.py ll_malloc_varsize_no_length`.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_varsize_no_length(n: i64, basesize: i64, itemsize: i64) -> i64 {
+    raw_malloc_varsize_core(n, basesize, itemsize, None, false, false)
+}
+
+/// `transform.py ll_malloc_varsize_no_length_zero`.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_varsize_no_length_zero(
+    n: i64,
+    basesize: i64,
+    itemsize: i64,
+) -> i64 {
+    raw_malloc_varsize_core(n, basesize, itemsize, None, true, false)
+}
+
+/// Variable-size `lltype.malloc(ARRAY, n, flavor='raw')` with no length
+/// header. Kept as the 3-arg ABI `blackhole.rs` / `jit_fnaddr.rs` bind.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_varsize(n: i64, basesize: i64, itemsize: i64) -> i64 {
+    ll_raw_malloc_varsize_no_length(n, basesize, itemsize)
+}
+
+/// `zero=True` form of [`ll_raw_malloc_varsize`].
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_varsize_zero(n: i64, basesize: i64, itemsize: i64) -> i64 {
+    ll_raw_malloc_varsize_no_length_zero(n, basesize, itemsize)
+}
+
+/// `transform.py ll_malloc_varsize` — stores `n` at `lengthoffset`.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_varsize_with_length(
+    n: i64,
+    basesize: i64,
+    itemsize: i64,
+    lengthoffset: i64,
+) -> i64 {
+    raw_malloc_varsize_core(n, basesize, itemsize, Some(lengthoffset), false, false)
+}
+
+macro_rules! raw_varsize_flag_wrappers {
+    () => {
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_no_length_add_memory_pressure(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+        ) -> i64 {
+            raw_malloc_varsize_core(n, basesize, itemsize, None, false, true)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_no_length_zero_add_memory_pressure(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+        ) -> i64 {
+            raw_malloc_varsize_core(n, basesize, itemsize, None, true, true)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_no_length_no_track_allocation(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+        ) -> i64 {
+            ll_raw_malloc_varsize_no_length(n, basesize, itemsize)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_no_length_zero_no_track_allocation(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+        ) -> i64 {
+            ll_raw_malloc_varsize_no_length_zero(n, basesize, itemsize)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_no_length_add_memory_pressure_no_track_allocation(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+        ) -> i64 {
+            ll_raw_malloc_varsize_no_length_add_memory_pressure(n, basesize, itemsize)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_no_length_zero_add_memory_pressure_no_track_allocation(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+        ) -> i64 {
+            ll_raw_malloc_varsize_no_length_zero_add_memory_pressure(n, basesize, itemsize)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_with_length_add_memory_pressure(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+            lengthoffset: i64,
+        ) -> i64 {
+            raw_malloc_varsize_core(n, basesize, itemsize, Some(lengthoffset), false, true)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_with_length_no_track_allocation(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+            lengthoffset: i64,
+        ) -> i64 {
+            ll_raw_malloc_varsize_with_length(n, basesize, itemsize, lengthoffset)
+        }
+        #[inline(never)]
+        pub extern "C" fn ll_raw_malloc_varsize_with_length_add_memory_pressure_no_track_allocation(
+            n: i64,
+            basesize: i64,
+            itemsize: i64,
+            lengthoffset: i64,
+        ) -> i64 {
+            ll_raw_malloc_varsize_with_length_add_memory_pressure(
+                n,
+                basesize,
+                itemsize,
+                lengthoffset,
+            )
+        }
+    };
+}
+raw_varsize_flag_wrappers!();
+
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize,
+    ll_raw_malloc_varsize,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_zero,
+    ll_raw_malloc_varsize_zero,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length,
+    ll_raw_malloc_varsize_no_length,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length_zero,
+    ll_raw_malloc_varsize_no_length_zero,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length_add_memory_pressure,
+    ll_raw_malloc_varsize_no_length_add_memory_pressure,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length_zero_add_memory_pressure,
+    ll_raw_malloc_varsize_no_length_zero_add_memory_pressure,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length_no_track_allocation,
+    ll_raw_malloc_varsize_no_length_no_track_allocation,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length_zero_no_track_allocation,
+    ll_raw_malloc_varsize_no_length_zero_no_track_allocation,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length_add_memory_pressure_no_track_allocation,
+    ll_raw_malloc_varsize_no_length_add_memory_pressure_no_track_allocation,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_no_length_zero_add_memory_pressure_no_track_allocation,
+    ll_raw_malloc_varsize_no_length_zero_add_memory_pressure_no_track_allocation,
+    3
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_with_length,
+    ll_raw_malloc_varsize_with_length,
+    4
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_with_length_add_memory_pressure,
+    ll_raw_malloc_varsize_with_length_add_memory_pressure,
+    4
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_with_length_no_track_allocation,
+    ll_raw_malloc_varsize_with_length_no_track_allocation,
+    4
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_with_length_add_memory_pressure_no_track_allocation,
+    ll_raw_malloc_varsize_with_length_add_memory_pressure_no_track_allocation,
+    4
+);
 
 #[cfg(target_arch = "wasm32")]
 #[ctor::ctor(unsafe)]
 fn __majit_register_helper_fnaddr_ll_raw_malloc_varsize() {
-    majit_ir::helper_fnaddr::register(
+    fn add(path: &'static str, addr: *const (), arity: u8) {
+        majit_ir::helper_fnaddr::register(path, addr, arity);
+    }
+    add(
         "majit_rlib::rffi::ll_raw_malloc_varsize",
         ll_raw_malloc_varsize as *const (),
         3,
     );
-    majit_ir::helper_fnaddr::register(
+    add(
         "majit_rlib::rffi::ll_raw_malloc_varsize_zero",
         ll_raw_malloc_varsize_zero as *const (),
         3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length",
+        ll_raw_malloc_varsize_no_length as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length_zero",
+        ll_raw_malloc_varsize_no_length_zero as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length_add_memory_pressure",
+        ll_raw_malloc_varsize_no_length_add_memory_pressure as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length_zero_add_memory_pressure",
+        ll_raw_malloc_varsize_no_length_zero_add_memory_pressure as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length_no_track_allocation",
+        ll_raw_malloc_varsize_no_length_no_track_allocation as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length_zero_no_track_allocation",
+        ll_raw_malloc_varsize_no_length_zero_no_track_allocation as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length_add_memory_pressure_no_track_allocation",
+        ll_raw_malloc_varsize_no_length_add_memory_pressure_no_track_allocation as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_no_length_zero_add_memory_pressure_no_track_allocation",
+        ll_raw_malloc_varsize_no_length_zero_add_memory_pressure_no_track_allocation as *const (),
+        3,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_with_length",
+        ll_raw_malloc_varsize_with_length as *const (),
+        4,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_with_length_add_memory_pressure",
+        ll_raw_malloc_varsize_with_length_add_memory_pressure as *const (),
+        4,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_with_length_no_track_allocation",
+        ll_raw_malloc_varsize_with_length_no_track_allocation as *const (),
+        4,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_with_length_add_memory_pressure_no_track_allocation",
+        ll_raw_malloc_varsize_with_length_add_memory_pressure_no_track_allocation as *const (),
+        4,
     );
 }
 
@@ -876,8 +1180,11 @@ pub extern "C" fn ll_raw_free(ptr: i64) {
 mod tests {
     use super::{
         ll_raw_free, ll_raw_malloc_fixedsize, ll_raw_malloc_fixedsize_zero, ll_raw_malloc_varsize,
-        ll_raw_malloc_varsize_zero,
+        ll_raw_malloc_varsize_no_length, ll_raw_malloc_varsize_no_length_zero,
+        ll_raw_malloc_varsize_with_length, ll_raw_malloc_varsize_zero,
     };
+
+    static RAISE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn fixedsize_roundtrip_zero_clears_and_free() {
@@ -944,10 +1251,56 @@ mod tests {
         assert_ne!(empty, 0);
         ll_raw_free(empty);
 
+        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(ll_raw_malloc_varsize(i64::MAX, 0, 2), 0);
         assert_eq!(ll_raw_malloc_varsize_zero(i64::MAX, 8, 8), 0);
         // n=-1, basesize=0, itemsize=8 → tot_size=-8, MemoryError.
         assert_eq!(ll_raw_malloc_varsize(-1, 0, 8), 0);
+        assert_eq!(ll_raw_malloc_varsize_no_length(i64::MAX, 0, 2), 0);
+        assert_eq!(ll_raw_malloc_varsize_with_length(i64::MAX, 8, 8, 0), 0);
+    }
+
+    /// Overflowing `ll_raw_malloc_varsize*` raises MemoryError through
+    /// the backend hook (`set_active_raise_memory_error`) and returns 0.
+    /// With no hook it still returns 0.
+    #[test]
+    fn raw_malloc_varsize_overflow_invokes_memory_error_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        HITS.store(0, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(None);
+        assert_eq!(ll_raw_malloc_varsize(i64::MAX, 0, 2), 0);
+        assert_eq!(HITS.load(Ordering::SeqCst), 0);
+
+        majit_gc::set_active_raise_memory_error(Some(hook));
+        let result = ll_raw_malloc_varsize(i64::MAX, 0, 2);
+        majit_gc::set_active_raise_memory_error(None);
+        assert_eq!(result, 0);
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+    }
+
+    /// `transform.py ll_malloc_varsize` stores `length` at `lengthoffset`.
+    /// The `_zero` helper clears `basesize + n * itemsize` bytes.
+    #[test]
+    fn raw_malloc_varsize_stores_length_and_zero_clears() {
+        let ptr = ll_raw_malloc_varsize_with_length(3, 8, 4, 0);
+        assert_ne!(ptr, 0);
+        unsafe {
+            assert_eq!((ptr as *const isize).read(), 3);
+        }
+        ll_raw_free(ptr);
+
+        let zeroed = ll_raw_malloc_varsize_no_length_zero(3, 8, 4);
+        assert_ne!(zeroed, 0);
+        unsafe {
+            let bytes = std::slice::from_raw_parts(zeroed as *const u8, 20);
+            assert!(bytes.iter().all(|b| *b == 0));
+        }
+        ll_raw_free(zeroed);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -955,7 +1308,12 @@ mod tests {
     fn raw_malloc_varsize_helpers_are_published() {
         let mut published = Vec::new();
         majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
-        for leaf in ["ll_raw_malloc_varsize", "ll_raw_malloc_varsize_zero"] {
+        for leaf in [
+            "ll_raw_malloc_varsize",
+            "ll_raw_malloc_varsize_zero",
+            "ll_raw_malloc_varsize_no_length",
+            "ll_raw_malloc_varsize_with_length",
+        ] {
             let path = format!("majit_rlib::rffi::{leaf}");
             assert!(
                 published.contains(&path.as_str()),

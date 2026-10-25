@@ -54,6 +54,13 @@ unsafe impl Sync for FrozenJitCodeSlice {}
 static JITCODE_CELLS: LazyLock<Vec<OnceLock<FrozenJitCode>>> =
     LazyLock::new(|| (0..jitcode_count()).map(|_| OnceLock::new()).collect());
 
+/// Intern table for this process's jitcode set (`assembler.py`
+/// `constants_dict` retained the container). The lazy per-index loader
+/// materializes one jitcode at a time, so the table must outlive each
+/// `load_jitcode` call.
+static ASSEMBLY_CONST_INTERN: LazyLock<Mutex<crate::runtime_fnaddr_patch::AssemblyConstIntern>> =
+    LazyLock::new(|| Mutex::new(crate::runtime_fnaddr_patch::AssemblyConstIntern::new()));
+
 /// Decoded names and byte offsets; loading this never decodes a body.
 static JITCODE_INDEX: LazyLock<JitCodeIndex> = LazyLock::new(load_jitcode_index);
 
@@ -111,7 +118,17 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
     // `constants_r`; materialize their immortal STR blocks and overwrite the
     // sentinels here, while refcount is still 1 — before any consumer can
     // observe a sentinel as a forged GCREF.
-    crate::runtime_fnaddr_patch::materialize_str_consts(std::slice::from_mut(&mut jitcode));
+    {
+        let mut intern = ASSEMBLY_CONST_INTERN.lock();
+        crate::runtime_fnaddr_patch::materialize_str_consts_in(
+            std::slice::from_mut(&mut jitcode),
+            &mut intern,
+        );
+        crate::runtime_fnaddr_patch::materialize_prebuilt_instance_consts_in(
+            std::slice::from_mut(&mut jitcode),
+            &mut intern,
+        );
+    }
     // Deferred unit-variant singleton constants follow the same contract:
     // materialize each variant's immortal discriminant cell and overwrite
     // the sentinel while refcount is still 1.
@@ -123,9 +140,6 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
     ));
     crate::runtime_fnaddr_patch::materialize_type_static_consts(std::slice::from_mut(&mut jitcode));
     crate::runtime_fnaddr_patch::materialize_empty_array_consts(std::slice::from_mut(&mut jitcode));
-    crate::runtime_fnaddr_patch::materialize_prebuilt_instance_consts(std::slice::from_mut(
-        &mut jitcode,
-    ));
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
     // Check per entry so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.

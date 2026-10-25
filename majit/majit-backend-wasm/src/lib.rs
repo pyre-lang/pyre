@@ -1319,6 +1319,15 @@ fn with_wasm_active_gc_mut<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Opti
     None
 }
 
+/// `transform.py _ll_malloc_fixedsize` OOM: `jit_exc_raise` of the
+/// prebuilt MemoryError singleton, then the allocator returns NULL.
+fn raise_memory_error() {
+    let v = majit_backend::memory_error_singleton_ref();
+    if v != 0 {
+        jit_exc_raise(v);
+    }
+}
+
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
 /// wasm trampolines. Shared by `install_gc_box` (test path: also stores a
 /// box in TLS) and `install_gc_standalone` (production: hooks only, no box
@@ -1340,6 +1349,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     });
     majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
     majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
+    majit_gc::set_active_raise_memory_error(Some(raise_memory_error));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         wasm_alloc_nursery_headerless_no_collect,
     ));

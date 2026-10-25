@@ -422,6 +422,15 @@ fn jitframe_is_gc_managed() -> bool {
 /// requiring a `DynasmBackend` instance.  This allows the GC subsystem
 /// to be installed at boot (via `init_gc_subsystem`) before the JIT
 /// driver is constructed.
+/// `transform.py _ll_malloc_fixedsize` OOM: `jit_exc_raise` of the
+/// prebuilt MemoryError singleton, then the allocator returns NULL.
+fn raise_memory_error() {
+    let v = majit_backend::memory_error_singleton_ref();
+    if v != 0 {
+        crate::jit_exc_raise(v);
+    }
+}
+
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
 /// dynasm trampolines. Shared by `install_gc_box` (thread-confined heap: also
 /// stores a box in TLS) and `install_gc_standalone` (shared heap: hooks only,
@@ -450,6 +459,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
     majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
+    majit_gc::set_active_raise_memory_error(Some(raise_memory_error));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         dynasm_alloc_nursery_headerless_no_collect,
     ));

@@ -5103,11 +5103,7 @@ mod tests {
             let p = graph
                 .push_op_var(
                     graph.startblock,
-                    OpKind::RawMalloc {
-                        owner: owner.into(),
-                        zero: false,
-                        length: None,
-                    },
+                    OpKind::raw_malloc(owner, false, None),
                     true,
                 )
                 .expect("raw malloc result");

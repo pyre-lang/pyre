@@ -3202,6 +3202,27 @@ pub fn current_thread_gc_available() -> bool {
     gc_sync::is_initialized() || ACTIVE_THREAD_HAS_GC_BOX.get().map(|f| f()).unwrap_or(false)
 }
 
+/// Backend-installed `raise MemoryError` for raw malloc OOM
+/// (`transform.py _ll_malloc_fixedsize` / `llmemory.raw_malloc`).
+/// Each backend's hook is `jit_exc_raise(memory_error_singleton_ref())`.
+pub type RaiseMemoryErrorFn = fn();
+
+global_hook!(static ACTIVE_RAISE_MEMORY_ERROR: RaiseMemoryErrorFn);
+
+/// Install the active backend's MemoryError raise. Pass `None` to clear.
+pub fn set_active_raise_memory_error(hook: Option<RaiseMemoryErrorFn>) {
+    ACTIVE_RAISE_MEMORY_ERROR.set(hook);
+}
+
+/// Store the prebuilt MemoryError singleton as the pending exception.
+/// No-op when no hook is installed, matching `memory_error_singleton_ref`
+/// with no provider.
+pub fn raise_memory_error() {
+    if let Some(hook) = ACTIVE_RAISE_MEMORY_ERROR.get() {
+        hook();
+    }
+}
+
 static MINOR_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bumped once at the end of each minor (`minor_collection_body`).

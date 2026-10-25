@@ -1258,7 +1258,7 @@ impl CallRegistry {
             // `description.py` test fixtures; pyre's synthetic
             // GraphFunc has no Python-runtime globals so we feed the
             // sentinel directly.
-            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         );
         self.get_or_register_with_func(key, signature, graph_func)
     }
@@ -1658,7 +1658,7 @@ mod tests {
         let template_sig = signature(&["self"]);
         let mut template_func = GraphFunc::new(
             "dispatch",
-            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         );
         template_func._jit_look_inside_ = Some(false);
         template_func._jit_unroll_safe_ = true;
@@ -1790,7 +1790,7 @@ mod tests {
             let registry = CallRegistry::new(ann.bookkeeper.clone());
             let mut func = GraphFunc::new(
                 "gc_alloc_young_storage_box",
-                Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+                Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
             );
             func.annspecialcase = Some("specialize:argtype(0)".into());
             func._jit_look_inside_ = Some(false);
@@ -1928,7 +1928,7 @@ mod tests {
             let registry = CallRegistry::new(ann.bookkeeper.clone());
             let mut func = GraphFunc::new(
                 "gc_alloc_young_storage_box",
-                Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+                Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
             );
             func.annspecialcase = Some("specialize:argtype(0)".into());
             func._jit_look_inside_ = Some(false);
@@ -2093,7 +2093,7 @@ mod tests {
         let called = count.clone();
         let mut func = GraphFunc::new(
             "memo_body",
-            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         );
         func.annspecialcase = Some("specialize:memo".into());
         func.host_call = Some(HostCall(Arc::new(move |args| {
@@ -2145,7 +2145,7 @@ mod tests {
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         let mut func = GraphFunc::new(
             "missing",
-            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         );
         func.annspecialcase = Some("specialize:memo".into());
         let entry = registry.get_or_register_with_func(

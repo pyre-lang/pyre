@@ -10387,24 +10387,6 @@ impl CallControl {
     // shared skeleton here — that would add a third analysis framework
     // duplicating `graphanalyze.rs` over the wrong graph model.
 
-    /// `call.py guess_call_kind`: `hasattr(func, 'oopspec')` → Builtin.
-    /// Harvested `recorded_oopspec` is the production mark. A graphless
-    /// HOST_ENV `rlib/jit.py` builtin (`ExtRegistryEntry`) is the same
-    /// funcobj when this CallControl has no harvest. `GraphAnalyzer.analyze`
-    /// follows a graph when the funcobj has one (`isconstant` returns
-    /// `NonConstant(False)`: cannot raise); without a graph the harvested
-    /// oopspec is that builtin, not `canraise.py analyze_external_call`'s
-    /// `getattr(fnobj, 'canraise', True)`.
-    fn is_oopspec_builtin_path(&self, path: &CallPath) -> bool {
-        if self
-            .func_effects_with_crate_alias(path)
-            .is_some_and(|f| f.recorded_oopspec().is_some())
-        {
-            return true;
-        }
-        jit_module_host_builtin(&path.segments)
-    }
-
     /// RPython: RaiseAnalyzer.analyze() — transitive can-raise analysis.
     ///
     /// canraise.py: RaiseAnalyzer(BoolGraphAnalyzer)
@@ -10414,6 +10396,12 @@ impl CallControl {
     ///
     /// Shared implementation for the two upstream RaiseAnalyzer instances:
     /// normal mode and `do_ignore_memory_error()` mode.
+    ///
+    /// `graphanalyze.py GraphAnalyzer.analyze`: a `direct_call` whose
+    /// funcobj has a graph is walked (`analyze_direct_call`); a
+    /// graphless funcobj is `analyze_external_call`. An oopspec is not
+    /// a cannot-raise guarantee — `rlib/jit.py isconstant` / `isvirtual`
+    /// cannot raise because their body is `return NonConstant(False)`.
     fn analyze_can_raise_impl(
         &self,
         path: &CallPath,
@@ -10429,9 +10417,6 @@ impl CallControl {
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
             None => {
-                if self.is_oopspec_builtin_path(path) {
-                    return false;
-                }
                 // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
                 return self
                     .external_funcobj(path)
@@ -11668,37 +11653,13 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
 /// Interpreter-facing `oopspec("jit.conditional_call")` Call
 /// (`is_jit_conditional_call_path`). Identity is the HOST_ENV
 /// `ConditionalCallEntry` path, never a residual body graph.
+/// `lloperation.py` `jit_conditional_call` is `LLOp()` (`canraise=()`),
+/// so this arm is only the Call itself, not a harvested residual body.
 fn is_jit_conditional_call_target(target: &CallTarget) -> bool {
     let CallTarget::FunctionPath { segments, .. } = target else {
         return false;
     };
     crate::flowspace::model::is_jit_conditional_call_path(segments)
-}
-
-/// HOST_ENV `rlib/jit.py` builtins (`ExtRegistryEntry` on `majit_rlib.jit`
-/// / crate-stripped `jit`). Production harvests `func.oopspec`; a
-/// unit-test CallControl has no harvest and still names the same
-/// funcobjs. `FunctionDesc.cachedgraph` alt_name is `name__<argtypes>`
-/// (`unspecialized_helper_name`); HOST_ENV keys the declaration.
-fn jit_module_host_builtin(segs: &[String]) -> bool {
-    if crate::flowspace::model::is_jit_conditional_call_path(segs) {
-        return true;
-    }
-    let leaf = match segs {
-        [crate_name, module, leaf] if crate_name == "majit_rlib" && module == "jit" => {
-            leaf.as_str()
-        }
-        [module, leaf] if module == "jit" => leaf.as_str(),
-        _ => return false,
-    };
-    let leaf = leaf.split("__").next().unwrap_or(leaf);
-    let leaf = crate::front::clause_spec::template_callable_leaf(leaf);
-    let host_segs = [
-        "majit_rlib".to_string(),
-        "jit".to_string(),
-        leaf.to_string(),
-    ];
-    crate::flowspace::model::host_env_callable(&host_segs).is_some()
 }
 
 /// `call.py` `guess_call_kind` rejects `rposix._get_errno` and
@@ -14557,18 +14518,46 @@ fn effect_malloc_flavor_is_raw(flags: &crate::flowspace::model::Hlvalue) -> bool
     }
 }
 
-fn effect_malloc_zero(flags: &crate::flowspace::model::Hlvalue) -> bool {
+/// `jtransform.py _rewrite_raw_malloc` `op.args[1].value`: `zero`,
+/// `track_allocation` (default true), `add_memory_pressure` (default
+/// false). Any other name besides `flavor` is a leftover the rewrite
+/// rejects (`UnsupportedMallocFlags`).
+fn effect_malloc_raw_flags(
+    flags: &crate::flowspace::model::Hlvalue,
+) -> (bool, bool, bool, Vec<String>) {
     use crate::flowspace::model::{ConstValue, Hlvalue};
+    let mut zero = false;
+    let mut track_allocation = true;
+    let mut add_memory_pressure = false;
+    let mut extra_flags = Vec::new();
     let Hlvalue::Constant(c) = flags else {
-        return false;
+        return (zero, track_allocation, add_memory_pressure, extra_flags);
     };
     let ConstValue::Dict(map) = &c.value else {
-        return false;
+        return (zero, track_allocation, add_memory_pressure, extra_flags);
     };
-    matches!(
-        map.get(&ConstValue::byte_str("zero")),
-        Some(ConstValue::Bool(true))
-    )
+    for (key, value) in map.iter() {
+        let name = match key {
+            ConstValue::ByteStr(b) => String::from_utf8_lossy(b).into_owned(),
+            ConstValue::UniStr(s) => s.clone(),
+            other => {
+                extra_flags.push(format!("{other:?}"));
+                continue;
+            }
+        };
+        match name.as_str() {
+            "flavor" => {}
+            "zero" => zero = matches!(value, ConstValue::Bool(true)),
+            "track_allocation" => {
+                track_allocation = !matches!(value, ConstValue::Bool(false));
+            }
+            "add_memory_pressure" => {
+                add_memory_pressure = matches!(value, ConstValue::Bool(true));
+            }
+            _ => extra_flags.push(name),
+        }
+    }
+    (zero, track_allocation, add_memory_pressure, extra_flags)
 }
 
 fn effect_transduce_op(
@@ -14754,11 +14743,16 @@ fn effect_transduce_op(
             let result = effect_expect_var(&op.result);
             let raw = op.args.get(1).is_some_and(effect_malloc_flavor_is_raw);
             let kind = if raw {
-                OpKind::RawMalloc {
+                let (zero, track_allocation, add_memory_pressure, extra_flags) =
+                    effect_malloc_raw_flags(&op.args[1]);
+                OpKind::raw_malloc_with_flags(
                     owner,
-                    zero: effect_malloc_zero(&op.args[1]),
-                    length: None,
-                }
+                    zero,
+                    track_allocation,
+                    add_memory_pressure,
+                    extra_flags,
+                    None,
+                )
             } else {
                 OpKind::New { owner }
             };
@@ -14768,13 +14762,18 @@ fn effect_transduce_op(
             let result = effect_expect_var(&op.result);
             let length = effect_materialize(out, block, &op.args[2]);
             if op.args.get(1).is_some_and(effect_malloc_flavor_is_raw) {
+                let (zero, track_allocation, add_memory_pressure, extra_flags) =
+                    effect_malloc_raw_flags(&op.args[1]);
                 out.push_op_with_result_var(
                     block,
-                    OpKind::RawMalloc {
-                        owner: effect_malloc_owner(&op.args[0]),
-                        zero: effect_malloc_zero(&op.args[1]),
-                        length: Some(length),
-                    },
+                    OpKind::raw_malloc_with_flags(
+                        effect_malloc_owner(&op.args[0]),
+                        zero,
+                        track_allocation,
+                        add_memory_pressure,
+                        extra_flags,
+                        Some(length),
+                    ),
                     result,
                 );
             } else {
@@ -21250,51 +21249,39 @@ mod tests {
         );
     }
 
-    /// Graphless HOST_ENV `rlib/jit.py` @oopspec builtins are Builtin,
-    /// not `analyze_external_call` default True. An unmarked graphless
-    /// path stays conservative.
+    /// `canraise.py analyze_external_call`: `getattr(fnobj, 'canraise', True)`.
+    /// An oopspec is not a cannot-raise guarantee.
     #[test]
-    fn graphless_oopspec_builtin_cannot_raise() {
-        let cc = CallControl::new();
-        let isconstant = CallPath::from_segments(["majit_rlib", "jit", "isconstant"]);
-        assert!(
-            !cc.analyze_can_raise_impl(
-                &isconstant,
-                &mut CallTracker::new(),
-                &mut new_analyzed_calls(),
-                false,
-            ),
-            "rlib/jit.py isconstant returns NonConstant(False)"
-        );
-        let specialized = CallPath::from_segments(["majit_rlib", "jit", "isconstant__Signed"]);
-        assert!(
-            !cc.analyze_can_raise_impl(
-                &specialized,
-                &mut CallTracker::new(),
-                &mut new_analyzed_calls(),
-                false,
-            ),
-            "cachedgraph name__<argtypes> is the same HOST_ENV builtin"
-        );
-        let cond = CallPath::from_segments(["majit_rlib", "jit", "conditional_call3"]);
-        assert!(
-            !cc.analyze_can_raise_impl(
-                &cond,
-                &mut CallTracker::new(),
-                &mut new_analyzed_calls(),
-                false,
-            ),
-            "lloperation.py jit_conditional_call has canraise=()"
-        );
-        let other = CallPath::from_segments(["some_external"]);
+    fn graphless_oopspec_without_canraise_can_raise() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["graphless_oopspec"]);
+        cc.mark_oopspec(path.clone(), "list.len".to_string());
         assert!(
             cc.analyze_can_raise_impl(
-                &other,
+                &path,
                 &mut CallTracker::new(),
                 &mut new_analyzed_calls(),
                 false,
             ),
-            "unmarked graphless stays analyze_external_call default True"
+            "graphless oopspec with no canraise attribute is analyze_external_call default True"
+        );
+    }
+
+    /// `rlib/jit.py isconstant` cannot raise because its body is
+    /// `return NonConstant(False)`, walked like any other graph.
+    #[test]
+    fn jit_isconstant_body_graph_cannot_raise() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["majit_rlib", "jit", "isconstant"]);
+        cc.register_function_graph(path.clone(), simple_graph("isconstant"));
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "isconstant body graph has no raising op and no exceptblock exit"
         );
     }
 
@@ -23041,7 +23028,7 @@ mod tests {
             },
             false,
         );
-        let mut flags = std::collections::HashMap::new();
+        let mut flags = indexmap::IndexMap::new();
         flags.insert(
             ConstValue::byte_str("access_directly"),
             ConstValue::Bool(true),
@@ -23069,7 +23056,7 @@ mod tests {
                     crate::model::LinkArg::from(frame_var),
                     crate::model::LinkArg::Const(Constant::new(ConstValue::byte_str("pycode"))),
                     crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(
-                        std::sync::Arc::new(std::collections::HashMap::new()),
+                        std::sync::Arc::new(indexmap::IndexMap::new()),
                     ))),
                 ],
                 result_ty: ValueType::Void,
@@ -25492,12 +25479,22 @@ mod tests {
     }
 
     fn malloc_flags(flavor: &str) -> crate::flowspace::model::Hlvalue {
+        malloc_flags_with(flavor, &[])
+    }
+
+    fn malloc_flags_with(
+        flavor: &str,
+        extra: &[(&str, crate::flowspace::model::ConstValue)],
+    ) -> crate::flowspace::model::Hlvalue {
         use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        let flags = std::collections::HashMap::from([(
+        let mut flags = indexmap::IndexMap::from([(
             ConstValue::byte_str("flavor"),
             ConstValue::byte_str(flavor),
         )]);
+        for (name, value) in extra {
+            flags.insert(ConstValue::byte_str(*name), value.clone());
+        }
         Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Dict(std::sync::Arc::new(flags)),
             LowLevelType::Void,
@@ -25690,6 +25687,60 @@ mod tests {
             kept.as_ref(),
             Some(&length),
             "raw malloc_varsize keeps length"
+        );
+    }
+
+    /// `_rewrite_raw_malloc` reads `track_allocation` / `add_memory_pressure`
+    /// from the malloc flags dict, not from a Transformer side channel.
+    #[test]
+    fn effect_graph_raw_malloc_carries_flags_from_dict() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rmodel::lowlevel_type_const;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let length = variable_with_lltype("n", LowLevelType::Signed);
+        let (array_ll, ptr_ll) = array_ptr_lltype(LowLevelType::Char);
+        let result = variable_with_lltype("buf", ptr_ll);
+        let graph = rtyped_one_op(
+            "raw_mv_flags",
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(array_ll),
+                malloc_flags_with(
+                    "raw",
+                    &[
+                        ("zero", ConstValue::Bool(true)),
+                        ("track_allocation", ConstValue::Bool(false)),
+                        ("add_memory_pressure", ConstValue::Bool(true)),
+                        ("immortal", ConstValue::Bool(true)),
+                    ],
+                ),
+                crate::flowspace::model::Hlvalue::Variable(length),
+            ],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let flags = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::RawMalloc {
+                    zero,
+                    track_allocation,
+                    add_memory_pressure,
+                    extra_flags,
+                    ..
+                } => Some((
+                    *zero,
+                    *track_allocation,
+                    *add_memory_pressure,
+                    extra_flags.clone(),
+                )),
+                _ => None,
+            });
+        assert_eq!(
+            flags,
+            Some((true, false, true, vec!["immortal".into()])),
+            "raw malloc_varsize copies flags off the dict"
         );
     }
 

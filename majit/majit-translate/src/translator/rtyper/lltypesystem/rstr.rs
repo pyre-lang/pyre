@@ -2344,23 +2344,11 @@ fn string2list_dst_items(
 /// Function pointer whose `_name` is the CallPath `lib.rs` marks
 /// `jit.isvirtual`. Spine B splits that name on `::` so
 /// `rewrite_op_direct_call` emits `ref_isvirtual`.
-fn isvirtual_intrinsic_funcptr(ptr_lltype: LowLevelType) -> Constant {
-    let ft = FuncType {
-        args: vec![ptr_lltype],
-        result: LowLevelType::Bool,
-    };
-    let ptr = functionptr(
-        ft.clone(),
-        "majit_rlib::jit::isvirtual",
-        None,
-        Some("majit_rlib::jit::isvirtual".to_string()),
-    );
-    Constant::with_concretetype(
-        ConstValue::LLPtr(Box::new(ptr)),
-        LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Func(ft),
-        })),
-    )
+fn isvirtual_intrinsic_funcptr(
+    rtyper: &RPythonTyper,
+    ptr_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    jit_isvirtual_intrinsic_funcptr(rtyper, ptr_lltype)
 }
 
 /// Synthesise `LLHelpers.ll_join_chars` (`lltypesystem/rstr.py`):
@@ -2664,6 +2652,7 @@ pub(crate) fn build_ll_join_chars_trampoline_helper_graph(
 /// argument is the chars array pointer (`LIST.ll_items`), matching
 /// `LLHelpers.ll_join_chars`.
 pub(crate) fn build_ll_join_chars_isvirtual_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
     items_ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -2679,7 +2668,7 @@ pub(crate) fn build_ll_join_chars_isvirtual_helper_graph(
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
         vec![
-            Hlvalue::Constant(isvirtual_intrinsic_funcptr(items_ptr_lltype)),
+            Hlvalue::Constant(isvirtual_intrinsic_funcptr(rtyper, items_ptr_lltype)?),
             Hlvalue::Variable(value),
         ],
         Hlvalue::Variable(result.clone()),
@@ -9345,16 +9334,103 @@ pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
         .collect()
 }
 
+/// `rlib/jit.py isconstant` / `isvirtual`: `return NonConstant(False)`.
+fn build_jit_intrinsic_false_body_graph(name: &str, arg_lltype: LowLevelType) -> GraphRef {
+    let value = variable_with_lltype("value", arg_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(value)]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func);
+    graph.into_ref()
+}
+
+/// `rlib/jit.py isconstant` / `isvirtual` body graph: ordinary
+/// annotated graph on `translator.graphs` (`TranslationContext.graphs`,
+/// `FunctionDesc.cachedgraph`). One graph per `specialize:call_location`
+/// site.
+fn jit_intrinsic_false_funcptr(
+    rtyper: &RPythonTyper,
+    name: &str,
+    arg_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    let graph = build_jit_intrinsic_false_body_graph(name, arg_lltype.clone());
+    let graph_id = GraphKey::of(&graph).as_usize();
+    let annotator = rtyper
+        .annotator
+        .upgrade()
+        .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
+    {
+        let mut graphs = annotator.translator.graphs.borrow_mut();
+        if !graphs
+            .iter()
+            .any(|existing| GraphKey::of(existing).as_usize() == graph_id)
+        {
+            graphs.push(graph);
+        }
+    }
+    let ft = FuncType {
+        args: vec![arg_lltype],
+        result: LowLevelType::Bool,
+    };
+    let ptr = functionptr(ft.clone(), name, Some(graph_id), Some(name.to_string()));
+    Ok(Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(ptr)),
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        })),
+    ))
+}
+
+/// Function pointer whose `_name` is the CallPath `lib.rs` marks
+/// `jit.isconstant`. The body graph is `return False`
+/// (`rlib/jit.py isconstant`).
+pub(crate) fn jit_isconstant_intrinsic_funcptr(
+    rtyper: &RPythonTyper,
+) -> Result<Constant, TyperError> {
+    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isconstant", LowLevelType::Signed)
+}
+
+/// Function pointer whose `_name` is the CallPath `lib.rs` marks
+/// `jit.isvirtual`. The body graph is `return False`
+/// (`rlib/jit.py isvirtual`).
+pub(crate) fn jit_isvirtual_intrinsic_funcptr(
+    rtyper: &RPythonTyper,
+    ptr_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isvirtual", ptr_lltype)
+}
+
 /// `record_extra_call_by_graph_id`: the live graph `funcobj.graph` names
 /// lives on `translator.graphs`.
 pub(crate) fn graph_ref_for_funcptr_id(rtyper: &RPythonTyper, graph_id: usize) -> Option<GraphRef> {
-    let ann = rtyper.annotator.upgrade()?;
-    ann.translator
-        .graphs
-        .borrow()
-        .iter()
-        .find(|graph| GraphKey::of(graph).as_usize() == graph_id)
-        .cloned()
+    rtyper.annotator.upgrade().and_then(|ann| {
+        ann.translator
+            .graphs
+            .borrow()
+            .iter()
+            .find(|graph| GraphKey::of(graph).as_usize() == graph_id)
+            .cloned()
+    })
 }
 
 fn require_str_ptr(ptr_lltype: &LowLevelType, helper: &str) -> Result<(), TyperError> {

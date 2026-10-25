@@ -20,16 +20,15 @@ use crate::flowspace::model::{
     HostObject, Link, ReprConst, SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, Array, GCREF, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct,
-    cast_opaque_ptr, malloc,
+    _address, _ptr, _ptr_obj, Array, FuncType, GCREF, LowLevelType, LowLevelValue, MallocFlavor,
+    Ptr, PtrTarget, Struct, cast_opaque_ptr, functionptr, malloc,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{
-    ll_strhash_value, prebuilt_str_bytes_and_hash, prebuilt_unicode_bytes_and_hash,
-    sub_helper_funcptr_constant,
+    ll_strhash_value, prebuilt_str_bytes_and_hash, sub_helper_funcptr_constant,
 };
-use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, gc_flavor_const, lowlevel_type_const,
@@ -982,7 +981,7 @@ fn close_keyeq_found_or_paranoia(
 /// `tool.uid.Hashable` cache key for `OrderedDictRepr.convert_const`
 /// (`rordereddict.py`): `self.dict_cache[Constant(dictobj)]`.
 ///
-/// `ConstValue::Dict` is `Arc<HashMap<..>>`; the key clones that handle
+/// `ConstValue::Dict` is `Arc<IndexMap<..>>`; the key clones that handle
 /// and hashes `Arc::as_ptr` (`uid.py` `id(dictobj)`). A prebuilt
 /// `objectmodel.r_dict` is a `HostObject` instance; `Hashable` falls
 /// back to `id(dictobj)` and `HostObject` Hash/Eq is `Arc::ptr_eq`.
@@ -991,7 +990,7 @@ fn close_keyeq_found_or_paranoia(
 #[derive(Clone, Debug)]
 enum DictCacheKey {
     Dict {
-        items: Arc<HashMap<ConstValue, ConstValue>>,
+        items: Arc<indexmap::IndexMap<ConstValue, ConstValue>>,
     },
     RDict {
         obj: HostObject,
@@ -1066,30 +1065,6 @@ fn host_instance_attr(obj: &HostObject, name: &str) -> Result<ConstValue, TyperE
             "objectmodel.r_dict missing attribute {name}: {err:?}"
         ))
     })
-}
-
-fn ll_keyhash_adt_name(key_repr: &dyn Repr) -> &'static str {
-    match key_repr.repr_class_id() {
-        ReprClassId::StringRepr | ReprClassId::AbstractStringRepr | ReprClassId::UnicodeRepr => {
-            "ll_strhash"
-        }
-        ReprClassId::InstanceRepr => "ll_inst_hash",
-        ReprClassId::PtrRepr => "ll_hash_identity",
-        ReprClassId::IntegerRepr | ReprClassId::BoolRepr => "ll_hash_int",
-        _ => match key_repr.lowleveltype() {
-            LowLevelType::Ptr(_) => "ll_hash_identity",
-            _ => "ll_hash_int",
-        },
-    }
-}
-
-fn ll_keyeq_adt_value(key_repr: &dyn Repr) -> ConstValue {
-    match key_repr.repr_class_id() {
-        ReprClassId::StringRepr | ReprClassId::AbstractStringRepr | ReprClassId::UnicodeRepr => {
-            ConstValue::byte_str("ll_streq")
-        }
-        _ => ConstValue::None,
-    }
 }
 
 /// RPython `class OrderedDictRepr(AbstractDictRepr)`
@@ -1181,11 +1156,20 @@ impl OrderedDictRepr {
             // get_ll_dict (`rordereddict.py`) plain-dict arm: staticAdtMethod
             // of the key repr's `get_ll_hash_function` / `get_ll_eq_function`
             // (the latter may be None), plus `paranoia = False`.
+            let hash_fn = key_repr.get_ll_hash_function(&rtyper)?.ok_or_else(|| {
+                TyperError::message(
+                    "OrderedDictRepr: key repr has no ll hash function — dict key hash not wired",
+                )
+            })?;
             adtmeths.push((
                 "keyhash".into(),
-                ConstValue::byte_str(ll_keyhash_adt_name(key_repr.as_ref())),
+                sub_helper_funcptr_constant(&rtyper, &hash_fn)?.value,
             ));
-            adtmeths.push(("keyeq".into(), ll_keyeq_adt_value(key_repr.as_ref())));
+            let eq_value = match key_repr.get_ll_eq_function(&rtyper)? {
+                Some(eq_fn) => sub_helper_funcptr_constant(&rtyper, &eq_fn)?.value,
+                None => ConstValue::None,
+            };
+            adtmeths.push(("keyeq".into(), eq_value));
             adtmeths.push(("paranoia".into(), ConstValue::Bool(false)));
         }
         adtmeths.push((
@@ -1618,22 +1602,12 @@ impl OrderedDictRepr {
         };
         let rehash_const = sub_helper_funcptr_constant(rtyper, &rehash_fn)?;
 
-        let create_initial_index_fn = {
-            let dict_ptr = dict_ptr.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "ll_dict_create_initial_index",
-                vec![dict_ptr.clone()],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_dict_create_initial_index_helper_graph(
-                        "ll_dict_create_initial_index",
-                        dict_ptr.clone(),
-                        malloc_choose_const.clone(),
-                        rehash_const.clone(),
-                    )
-                },
-            )?
-        };
+        let create_initial_index_fn = mint_ll_dict_create_initial_index_look_inside_iff(
+            rtyper,
+            dict_ptr.clone(),
+            malloc_choose_const.clone(),
+            rehash_const.clone(),
+        )?;
         let create_initial_index_const =
             sub_helper_funcptr_constant(rtyper, &create_initial_index_fn)?;
 
@@ -2451,9 +2425,10 @@ impl Repr for OrderedDictRepr {
     /// `ll_no_initial_index` then `_ll_dict_insert_no_index` per item,
     /// cached by `Constant(dictobj)`. The r_dict arm sets `fnkeyeq` /
     /// `fnkeyhash` (when those reprs are not Void) from `key_eq` /
-    /// `key_hash` and inserts via `dictkeycontainer.key`. Host llinterp
-    /// lookup helpers still return the deferred error for custom
-    /// `fnkeyhash` / `fnkeyeq`; they cannot call those funcptrs.
+    /// `key_hash` and inserts via `dictkeycontainer.key`. Host `d.keyhash`
+    /// / `d.keyeq` evaluate the stored funcptr by identity (`get_ll_hash_function`
+    /// / `get_ll_eq_function`); custom `ll_keyhash_custom` / `ll_keyeq_custom`
+    /// stay deferred because llinterp cannot run those graphs.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         match value {
             ConstValue::None => {
@@ -4939,6 +4914,244 @@ pub(crate) fn build_ll_dict_create_initial_index_helper_graph(
         Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `look_inside_iff` (`rlib/jit.py`): `unroll_safe(func)` then
+    // `func._annspecialcase_ = "specialize:call_location"`.
+    func._jit_unroll_safe_ = true;
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+/// Function pointer whose `_name` is the CallPath `lib.rs` marks
+/// `jit.isvirtual`. Spine B splits that name on `::` so
+/// `rewrite_op_direct_call` emits `ref_isvirtual`.
+fn isvirtual_intrinsic_funcptr(ptr_lltype: LowLevelType) -> Constant {
+    let ft = FuncType {
+        args: vec![ptr_lltype],
+        result: LowLevelType::Bool,
+    };
+    let ptr = functionptr(
+        ft.clone(),
+        "majit_rlib::jit::isvirtual",
+        None,
+        Some("majit_rlib::jit::isvirtual".to_string()),
+    );
+    Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(ptr)),
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        })),
+    )
+}
+
+/// `look_inside_iff`'s `@dont_look_inside` trampoline: one `direct_call`
+/// of the original `ll_dict_create_initial_index` (`rlib/jit.py`).
+fn build_ll_dict_create_initial_index_trampoline_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    orig_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(d.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(orig_fn), Hlvalue::Variable(d)],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            ))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    func._jit_look_inside_ = Some(false);
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["d".to_string()],
+        func,
+    ))
+}
+
+/// `rlib/jit.py isvirtual`: the interpreter fallback is
+/// `NonConstant(False)` inside the marked intrinsic; the traced path is
+/// the oopspec `jit.isvirtual`, rewritten to `ref_isvirtual`.
+fn build_ll_dict_create_initial_index_isvirtual_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let value = variable_with_lltype("value", dict_ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(value.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let result = variable_with_lltype("result", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isvirtual_intrinsic_funcptr(dict_ptr_lltype)),
+            Hlvalue::Variable(value),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["value".to_string()],
+        func,
+    ))
+}
+
+/// `rlib/jit.py look_inside_iff` wrapper around
+/// `ll_dict_create_initial_index`:
+///
+/// ```python
+/// def f(d):
+///     if not we_are_jitted() or isvirtual(d):
+///         return orig(d)
+///     else:
+///         return trampoline(d)
+/// ```
+///
+/// `we_are_jitted` is the `SpecTag` exitswitch (true link first).
+fn build_ll_dict_create_initial_index_look_inside_iff_helper_graph(
+    name: &str,
+    dict_ptr_lltype: LowLevelType,
+    orig_fn: Constant,
+    trampoline_fn: Constant,
+    isvirtual_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let d_arg = variable_with_lltype("d", dict_ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(d_arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let none_void = || {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ))
+    };
+
+    let orig_d = variable_with_lltype("d", dict_ptr_lltype.clone());
+    let block_orig = Block::shared(vec![Hlvalue::Variable(orig_d.clone())]);
+    block_orig.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(orig_fn), Hlvalue::Variable(orig_d)],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    block_orig.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let tr_d = variable_with_lltype("d", dict_ptr_lltype.clone());
+    let block_tramp = Block::shared(vec![Hlvalue::Variable(tr_d.clone())]);
+    block_tramp
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![Hlvalue::Constant(trampoline_fn), Hlvalue::Variable(tr_d)],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    block_tramp.closeblock(vec![
+        Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let virt_d = variable_with_lltype("d", dict_ptr_lltype);
+    let block_isvirtual = Block::shared(vec![Hlvalue::Variable(virt_d.clone())]);
+    let is_virt = variable_with_lltype("is_virtual", LowLevelType::Bool);
+    block_isvirtual
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(isvirtual_fn),
+                Hlvalue::Variable(virt_d.clone()),
+            ],
+            Hlvalue::Variable(is_virt.clone()),
+        ));
+    block_isvirtual.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_virt));
+    block_isvirtual.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(virt_d.clone())],
+            Some(block_orig.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(virt_d)],
+            Some(block_tramp.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(d_arg.clone())],
+            Some(block_isvirtual),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(d_arg)],
+            Some(block_orig),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
     let func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
@@ -4949,6 +5162,84 @@ pub(crate) fn build_ll_dict_create_initial_index_helper_graph(
         vec!["d".to_string()],
         func,
     ))
+}
+
+/// Mint `ll_dict_create_initial_index` through `look_inside_iff`
+/// (`rlib/jit.py`): original body, `dont_look_inside` trampoline,
+/// `isvirtual(d)` predicate, and the wrapper named
+/// `ll_dict_create_initial_index`. Returns the wrapper.
+fn mint_ll_dict_create_initial_index_look_inside_iff(
+    rtyper: &RPythonTyper,
+    dict_ptr: LowLevelType,
+    malloc_choose_fn: Constant,
+    rehash_fn: Constant,
+) -> Result<LowLevelFunction, TyperError> {
+    let orig_args = vec![dict_ptr.clone()];
+    let orig = {
+        let dict_ptr = dict_ptr.clone();
+        let malloc_choose_fn = malloc_choose_fn.clone();
+        let rehash_fn = rehash_fn.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_create_initial_index__orig".to_string(),
+            orig_args.clone(),
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_dict_create_initial_index_helper_graph(
+                    "ll_dict_create_initial_index__orig",
+                    dict_ptr.clone(),
+                    malloc_choose_fn.clone(),
+                    rehash_fn.clone(),
+                )
+            },
+        )?
+    };
+    let trampoline = {
+        let dict_ptr = dict_ptr.clone();
+        let orig_fn = sub_helper_funcptr_constant(rtyper, &orig)?;
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_create_initial_index_trampoline".to_string(),
+            orig_args.clone(),
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_dict_create_initial_index_trampoline_helper_graph(
+                    "ll_dict_create_initial_index_trampoline",
+                    dict_ptr.clone(),
+                    orig_fn.clone(),
+                )
+            },
+        )?
+    };
+    let isvirtual = {
+        let dict_ptr = dict_ptr.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_dict_create_initial_index_isvirtual".to_string(),
+            orig_args.clone(),
+            LowLevelType::Bool,
+            move |_r, _a, _res| {
+                build_ll_dict_create_initial_index_isvirtual_helper_graph(
+                    "ll_dict_create_initial_index_isvirtual",
+                    dict_ptr.clone(),
+                )
+            },
+        )?
+    };
+    let orig_fn = sub_helper_funcptr_constant(rtyper, &orig)?;
+    let trampoline_fn = sub_helper_funcptr_constant(rtyper, &trampoline)?;
+    let isvirtual_fn = sub_helper_funcptr_constant(rtyper, &isvirtual)?;
+    rtyper.lowlevel_helper_function_with_builder(
+        "ll_dict_create_initial_index".to_string(),
+        orig_args,
+        LowLevelType::Void,
+        move |_r, _a, _res| {
+            build_ll_dict_create_initial_index_look_inside_iff_helper_graph(
+                "ll_dict_create_initial_index",
+                dict_ptr.clone(),
+                orig_fn.clone(),
+                trampoline_fn.clone(),
+                isvirtual_fn.clone(),
+            )
+        },
+    )
 }
 
 /// Synthesise `ll_dict_rehash_after_translation(d)` (`rordereddict.py`):
@@ -5209,10 +5500,12 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
         Link::new(vec![none_void()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `@jit.dont_look_inside` (`ll_dict_rehash_after_translation`).
+    func._jit_look_inside_ = Some(false);
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -10625,60 +10918,297 @@ fn custom_keyeq_deferred() -> TyperError {
 }
 
 /// RPython `d.keyhash(key)` (`rordereddict.py`): the DICT adtmeth, either
-/// `ll_keyhash_custom` or the key repr's `get_ll_hash_function`.
+/// `ll_keyhash_custom` or the key repr's `get_ll_hash_function`. Host
+/// evaluation dispatches on the stored funcptr's `_name` (one evaluator
+/// per upstream function the port's reprs return). llinterp cannot run
+/// helper graphs here (`eval_graph` has no `getfield`/`direct_call`/float).
 fn ll_keyhash(d: &_ptr, key: &LowLevelValue) -> Result<i64, TyperError> {
-    if let Some(adt) = dict_adtmeth(d, "keyhash")
-        && adtmeth_is_byte_str(&adt, b"ll_keyhash_custom")
-    {
-        return Err(custom_keyhash_deferred());
+    match dict_adtmeth(d, "keyhash") {
+        Some(adt) if adtmeth_is_byte_str(&adt, b"ll_keyhash_custom") => {
+            Err(custom_keyhash_deferred())
+        }
+        Some(adt) => {
+            let name = adtmeth_func_name(&adt).ok_or_else(|| {
+                TyperError::message(format!(
+                    "d.keyhash: stored adtmeth is not a funcptr: {adt:?}"
+                ))
+            })?;
+            host_eval_stored_keyhash(&name, key)
+        }
+        None => Err(TyperError::message(
+            "d.keyhash: DICT has no keyhash adtmeth",
+        )),
     }
-    ll_keyhash_plain(key)
 }
 
-fn ll_keyhash_plain(key: &LowLevelValue) -> Result<i64, TyperError> {
+fn adtmeth_func_name(value: &ConstValue) -> Option<String> {
+    match value {
+        ConstValue::LLPtr(p) => match p._obj0_value().ok().flatten()? {
+            _ptr_obj::Func(f) => Some(f._name),
+            _ => None,
+        },
+        ConstValue::ByteStr(s) => String::from_utf8(s.clone()).ok(),
+        _ => None,
+    }
+}
+
+fn host_eval_stored_keyhash(fn_name: &str, key: &LowLevelValue) -> Result<i64, TyperError> {
+    if fn_name.starts_with("ll_hash_int") {
+        return host_hash_int(key);
+    }
+    if fn_name.starts_with("ll_tuple_hash_") {
+        return host_hash_tuple(key);
+    }
+    match fn_name {
+        "ll_strhash" => host_hash_str(key),
+        "ll_unicode_hash" => host_hash_unicode(key),
+        "_hash_float" => host_hash_float(key),
+        "ll_inst_hash" => host_hash_identity_ptr(key),
+        "ll_char_hash" | "ll_unichar_hash" => host_hash_int(key),
+        "ll_none_hash" | "ll_hash_void" => Ok(0),
+        "ll_addrhash" => host_hash_addr(key),
+        other => Err(TyperError::message(format!(
+            "d.keyhash: unknown stored hash function {other}"
+        ))),
+    }
+}
+
+fn host_hash_int(key: &LowLevelValue) -> Result<i64, TyperError> {
     match key {
         LowLevelValue::Signed(n) => Ok(*n),
         LowLevelValue::Unsigned(n) => Ok(*n as i64),
         LowLevelValue::Bool(b) => Ok(i64::from(*b)),
         LowLevelValue::Char(c) => Ok(*c as i64),
         LowLevelValue::UniChar(c) => Ok(*c as i64),
-        LowLevelValue::Ptr(p) => ll_keyhash_ptr(p),
         other => Err(TyperError::message(format!(
-            "d.keyhash: unsupported key {other:?}"
+            "ll_hash_int: unsupported key {other:?}"
         ))),
     }
 }
 
-fn ll_keyhash_ptr(p: &_ptr) -> Result<i64, TyperError> {
+fn host_hash_addr(key: &LowLevelValue) -> Result<i64, TyperError> {
+    match key {
+        LowLevelValue::Address(_address::Null) => Ok(0),
+        LowLevelValue::Address(_address::Fake(p)) => Ok(p._hashable_identity() as i64),
+        LowLevelValue::Address(_address::IntCast(n)) => Ok(*n),
+        other => Err(TyperError::message(format!(
+            "ll_addrhash: unsupported key {other:?}"
+        ))),
+    }
+}
+
+fn host_hash_identity_ptr(key: &LowLevelValue) -> Result<i64, TyperError> {
+    match key {
+        LowLevelValue::Ptr(p) => {
+            if !p.nonzero() {
+                Ok(0)
+            } else {
+                Ok(p._hashable_identity() as i64)
+            }
+        }
+        other => Err(TyperError::message(format!(
+            "ll_inst_hash: unsupported key {other:?}"
+        ))),
+    }
+}
+
+fn host_hash_str(key: &LowLevelValue) -> Result<i64, TyperError> {
+    let LowLevelValue::Ptr(p) = key else {
+        return Err(TyperError::message("ll_strhash: key is not a pointer"));
+    };
     if !p.nonzero() {
         return Ok(0);
     }
-    if let Some((bytes, stored)) = prebuilt_str_bytes_and_hash(p) {
-        if stored != 0 {
-            return Ok(stored);
-        }
-        let h = ll_strhash_value(&bytes);
-        let mut p = p.clone();
-        p.setattr("hash", LowLevelValue::Signed(h))
-            .map_err(TyperError::message)?;
-        return Ok(h);
+    let Some((bytes, stored)) = prebuilt_str_bytes_and_hash(p) else {
+        return Err(TyperError::message("ll_strhash: not a STR pointer"));
+    };
+    if stored != 0 {
+        return Ok(stored);
     }
-    if let Some((bytes, stored)) = prebuilt_unicode_bytes_and_hash(p) {
-        if stored != 0 {
-            return Ok(stored);
-        }
-        let h = ll_strhash_value(&bytes);
-        let mut p = p.clone();
-        p.setattr("hash", LowLevelValue::Signed(h))
-            .map_err(TyperError::message)?;
-        return Ok(h);
+    let h = ll_strhash_value(&bytes);
+    let mut p = p.clone();
+    p.setattr("hash", LowLevelValue::Signed(h))
+        .map_err(TyperError::message)?;
+    Ok(h)
+}
+
+/// `_hash_string` over UniChar ords, then `_ll_strhash`'s `0 → 29872897`
+/// fixup (`LLHelpers.ll_strhash` / `objectmodel._hash_string`). Siphash
+/// is a post-translation replacement and is not used here.
+fn hash_unichar_ords(chars: &[char]) -> i64 {
+    let Some(&first) = chars.first() else {
+        return -1;
+    };
+    let mut x = (first as i64) << 7;
+    for &c in chars {
+        x = 1000003i64.wrapping_mul(x) ^ (c as i64);
     }
-    Ok(p._hashable_identity() as i64)
+    x ^= chars.len() as i64;
+    if x == 0 { 29872897 } else { x }
+}
+
+fn unicode_chars_and_stored_hash(p: &_ptr) -> Option<(Vec<char>, i64)> {
+    if !p.nonzero() {
+        return None;
+    }
+    let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
+        return None;
+    };
+    if st.TYPE._name != "rpy_unicode" {
+        return None;
+    }
+    let fields = st._fields.lock();
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return None;
+    };
+    let mut text = Vec::with_capacity(chars.getlength());
+    for i in 0..chars.getlength() {
+        match chars.getitem(i) {
+            Some(LowLevelValue::UniChar(c)) => text.push(c),
+            _ => return None,
+        }
+    }
+    let hash = match fields.iter().find(|(n, _)| n == "hash") {
+        Some((_, LowLevelValue::Signed(h))) => *h,
+        _ => 0,
+    };
+    Some((text, hash))
+}
+
+fn host_hash_unicode(key: &LowLevelValue) -> Result<i64, TyperError> {
+    let LowLevelValue::Ptr(p) = key else {
+        return Err(TyperError::message("ll_unicode_hash: key is not a pointer"));
+    };
+    if !p.nonzero() {
+        return Ok(0);
+    }
+    let Some((chars, stored)) = unicode_chars_and_stored_hash(p) else {
+        return Err(TyperError::message(
+            "ll_unicode_hash: not a UNICODE pointer",
+        ));
+    };
+    if stored != 0 {
+        return Ok(stored);
+    }
+    let h = hash_unichar_ords(&chars);
+    let mut p = p.clone();
+    p.setattr("hash", LowLevelValue::Signed(h))
+        .map_err(TyperError::message)?;
+    Ok(h)
+}
+
+/// `objectmodel._hash_float` (`rlib/objectmodel.py`).
+fn host_hash_float(key: &LowLevelValue) -> Result<i64, TyperError> {
+    let LowLevelValue::Float(bits) = key else {
+        return Err(TyperError::message(format!(
+            "_hash_float: unsupported key {key:?}"
+        )));
+    };
+    Ok(hash_float_value(f64::from_bits(*bits)))
+}
+
+const TAKE_NEXT: f64 = 2147483648.0; // 2**31
+
+fn hash_float_value(f: f64) -> i64 {
+    if !f.is_finite() {
+        if f.is_infinite() {
+            if f < 0.0 { -271828 } else { 314159 }
+        } else {
+            0
+        }
+    } else if f == 0.0 {
+        0
+    } else {
+        let (mut v, expo) = python_frexp(f);
+        v *= TAKE_NEXT;
+        let hipart = v as i64;
+        v = (v - hipart as f64) * TAKE_NEXT;
+        hipart + (v as i64) + ((expo as i64) << 15)
+    }
+}
+
+/// `math.frexp` used by `_hash_float`: mantissa in `[0.5, 1)` (or
+/// `(-1, -0.5]`), exponent such that `f == mant * 2**exp`.
+fn python_frexp(f: f64) -> (f64, i32) {
+    if f == 0.0 {
+        return (f, 0);
+    }
+    let bits = f.to_bits();
+    let sign = bits & (1u64 << 63);
+    let exp_raw = ((bits >> 52) & 0x7ff) as i32;
+    let mut frac = bits & ((1u64 << 52) - 1);
+    if exp_raw == 0 {
+        if frac == 0 {
+            return (f64::from_bits(sign), 0);
+        }
+        let mut e = -1022;
+        while frac < (1u64 << 52) {
+            frac <<= 1;
+            e -= 1;
+        }
+        frac &= (1u64 << 52) - 1;
+        let mant = f64::from_bits(sign | (1022u64 << 52) | frac);
+        (mant, e)
+    } else {
+        let mant = f64::from_bits(sign | (1022u64 << 52) | frac);
+        (mant, exp_raw - 1022)
+    }
+}
+
+fn host_hash_tuple(key: &LowLevelValue) -> Result<i64, TyperError> {
+    let LowLevelValue::Ptr(p) = key else {
+        return Err(TyperError::message("ll_tuple_hash: key is not a pointer"));
+    };
+    if !p.nonzero() {
+        return Ok(0);
+    }
+    // `gen_hash_function` (`rtuple.py`): `x = 0x345678`; per item
+    // `x = intmask((1000003 * x) ^ hash_func(item))`.
+    let mut x: i64 = 0x345678;
+    let mut i = 0usize;
+    loop {
+        match p.getattr(&format!("item{i}")) {
+            Ok(item) => {
+                let y = host_hash_tuple_item(&item)?;
+                x = 1000003i64.wrapping_mul(x) ^ y;
+                i += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(x)
+}
+
+fn host_hash_tuple_item(item: &LowLevelValue) -> Result<i64, TyperError> {
+    match item {
+        LowLevelValue::Signed(_)
+        | LowLevelValue::Unsigned(_)
+        | LowLevelValue::Bool(_)
+        | LowLevelValue::Char(_)
+        | LowLevelValue::UniChar(_) => host_hash_int(item),
+        LowLevelValue::Float(_) => host_hash_float(item),
+        LowLevelValue::Address(_) => host_hash_addr(item),
+        LowLevelValue::Void => Ok(0),
+        LowLevelValue::Ptr(p) => {
+            if prebuilt_str_bytes_and_hash(p).is_some() {
+                host_hash_str(item)
+            } else if unicode_chars_and_stored_hash(p).is_some() {
+                host_hash_unicode(item)
+            } else if p.getattr("item0").is_ok() {
+                host_hash_tuple(item)
+            } else {
+                host_hash_identity_ptr(item)
+            }
+        }
+        other => Err(TyperError::message(format!(
+            "ll_tuple_hash: unsupported item {other:?}"
+        ))),
+    }
 }
 
 fn ll_streq_values(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
     let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
-        return Ok(a == b);
+        return Ok(ll_direct_compare(a, b));
     };
     if s1 == s2 {
         return Ok(true);
@@ -10686,26 +11216,121 @@ fn ll_streq_values(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperEr
     if !s1.nonzero() || !s2.nonzero() {
         return Ok(false);
     }
-    let bytes1 = prebuilt_str_bytes_and_hash(s1)
-        .map(|(b, _)| b)
-        .or_else(|| prebuilt_unicode_bytes_and_hash(s1).map(|(b, _)| b));
-    let bytes2 = prebuilt_str_bytes_and_hash(s2)
-        .map(|(b, _)| b)
-        .or_else(|| prebuilt_unicode_bytes_and_hash(s2).map(|(b, _)| b));
-    match (bytes1, bytes2) {
+    match (
+        prebuilt_str_bytes_and_hash(s1).map(|(b, _)| b),
+        prebuilt_str_bytes_and_hash(s2).map(|(b, _)| b),
+    ) {
+        (Some(a), Some(b)) => return Ok(a == b),
+        _ => {}
+    }
+    match (
+        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
+        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
+    ) {
         (Some(a), Some(b)) => Ok(a == b),
         _ => Ok(s1 == s2),
     }
 }
 
+fn ll_unicode_eq_values(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
+    let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
+        return Ok(false);
+    };
+    if s1 == s2 {
+        return Ok(true);
+    }
+    if !s1.nonzero() || !s2.nonzero() {
+        return Ok(false);
+    }
+    match (
+        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
+        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
+    ) {
+        (Some(a), Some(b)) => Ok(a == b),
+        _ => Ok(false),
+    }
+}
+
+fn ll_tuple_eq_values(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
+    let (LowLevelValue::Ptr(p1), LowLevelValue::Ptr(p2)) = (a, b) else {
+        return Ok(false);
+    };
+    if p1 == p2 {
+        return Ok(true);
+    }
+    if !p1.nonzero() || !p2.nonzero() {
+        return Ok(false);
+    }
+    let mut i = 0usize;
+    loop {
+        let name = format!("item{i}");
+        match (p1.getattr(&name), p2.getattr(&name)) {
+            (Ok(left), Ok(right)) => {
+                if !host_item_eq(&left, &right)? {
+                    return Ok(false);
+                }
+                i += 1;
+            }
+            (Err(_), Err(_)) => return Ok(true),
+            _ => return Ok(false),
+        }
+    }
+}
+
+fn host_item_eq(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
+    match (a, b) {
+        (LowLevelValue::Ptr(p1), LowLevelValue::Ptr(p2)) => {
+            if prebuilt_str_bytes_and_hash(p1).is_some()
+                || prebuilt_str_bytes_and_hash(p2).is_some()
+            {
+                ll_streq_values(a, b)
+            } else if unicode_chars_and_stored_hash(p1).is_some()
+                || unicode_chars_and_stored_hash(p2).is_some()
+            {
+                ll_unicode_eq_values(a, b)
+            } else if p1.getattr("item0").is_ok() || p2.getattr("item0").is_ok() {
+                ll_tuple_eq_values(a, b)
+            } else {
+                Ok(p1 == p2)
+            }
+        }
+        _ => Ok(ll_direct_compare(a, b)),
+    }
+}
+
+/// Primitive `==` used when `d.keyeq is None` (`rordereddict.py`
+/// `ll_dict_lookup`). Float keys use IEEE equality so `0.0 == -0.0`.
+fn ll_direct_compare(a: &LowLevelValue, b: &LowLevelValue) -> bool {
+    match (a, b) {
+        (LowLevelValue::Float(x), LowLevelValue::Float(y)) => {
+            f64::from_bits(*x) == f64::from_bits(*y)
+        }
+        _ => a == b,
+    }
+}
+
 /// RPython `d.keyeq(checkingkey, key)` (`rordereddict.py`). `None` for
-/// identity keys; `ll_streq` for STR/UNICODE; custom r_dict is deferred.
+/// identity keys; otherwise the stored `get_ll_eq_function` result.
 fn ll_keyeq(d: &_ptr, a: &LowLevelValue, b: &LowLevelValue) -> Result<Option<bool>, TyperError> {
     match dict_adtmeth(d, "keyeq") {
         Some(ConstValue::None) | None => Ok(None),
         Some(adt) if adtmeth_is_byte_str(&adt, b"ll_keyeq_custom") => Err(custom_keyeq_deferred()),
-        Some(adt) if adtmeth_is_byte_str(&adt, b"ll_streq") => Ok(Some(ll_streq_values(a, b)?)),
-        Some(_) => Ok(Some(a == b)),
+        Some(adt) => {
+            let name = adtmeth_func_name(&adt).ok_or_else(|| {
+                TyperError::message(format!("d.keyeq: stored adtmeth is not a funcptr: {adt:?}"))
+            })?;
+            if name == "ll_streq" {
+                Ok(Some(ll_streq_values(a, b)?))
+            } else if name == "ll_unicode_eq" {
+                Ok(Some(ll_unicode_eq_values(a, b)?))
+            } else if name.starts_with("ll_tuple_eq_") {
+                Ok(Some(ll_tuple_eq_values(a, b)?))
+            } else {
+                Err(TyperError::message(format!(
+                    "d.keyeq: unknown stored eq function {name}"
+                )))
+            }
+        }
     }
 }
 
@@ -10826,7 +11451,7 @@ fn ll_dict_lookup_t(
             .getitem(entry_i as usize)
             .map_err(TyperError::message)?;
         let checkingkey = dict_entry_getattr(&entry, "key")?;
-        if direct_compare && checkingkey == *key {
+        if direct_compare && ll_direct_compare(&checkingkey, key) {
             return Ok(entry_i);
         }
         match lookup_keyeq_match(d, &entries, &indexes, &checkingkey, key, hash, entry_i)? {
@@ -10867,7 +11492,7 @@ fn ll_dict_lookup_t(
                 .getitem(entry_i as usize)
                 .map_err(TyperError::message)?;
             let checkingkey = dict_entry_getattr(&entry, "key")?;
-            if direct_compare && checkingkey == *key {
+            if direct_compare && ll_direct_compare(&checkingkey, key) {
                 return Ok(entry_i);
             }
             match lookup_keyeq_match(d, &entries, &indexes, &checkingkey, key, hash, entry_i)? {
@@ -11108,11 +11733,10 @@ fn convert_dict_item_const(
     repr: &dyn Repr,
     value: &ConstValue,
 ) -> Result<LowLevelValue, TyperError> {
-    let prepared = match (repr.lowleveltype(), value) {
-        (LowLevelType::Ptr(ptr_t), ConstValue::None) => ConstValue::LLPtr(Box::new(ptr_t._defl())),
-        _ => value.clone(),
-    };
-    let c = repr.convert_const(&prepared)?;
+    // `r_key.convert_const(dictkey)` / `r_value.convert_const(dictvalue)`
+    // (`OrderedDictRepr.convert_const`). The original host value is passed
+    // through; `StringRepr.convert_const` accepts `None` as a null STR.
+    let c = repr.convert_const(value)?;
     crate::translator::rtyper::rclass::constant_to_lowlevel_value(&c)
 }
 
@@ -12044,12 +12668,14 @@ mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::dictdef::DictDef;
-    use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+    use crate::annotator::model::{SomeFloat, SomeInteger, SomeString, SomeTuple, SomeValue};
     use crate::translator::rtyper::lltypesystem::lltype::FuncType;
-    use crate::translator::rtyper::lltypesystem::rstr::llstr;
+    use crate::translator::rtyper::lltypesystem::rstr::{UNICODE, ll_strhash_value, llstr};
     use crate::translator::rtyper::pairtype::ReprClassId;
+    use crate::translator::rtyper::rfloat::float_repr;
     use crate::translator::rtyper::rint::signed_repr;
-    use crate::translator::rtyper::rstr::string_repr;
+    use crate::translator::rtyper::rstr::{string_repr, unicode_repr};
+    use crate::translator::rtyper::rtuple::TupleRepr;
     use crate::translator::rtyper::rtyper::LowLevelOpList;
     use std::cell::RefCell;
 
@@ -15023,7 +15649,7 @@ mod tests {
         let r_dict = HostObject::new_instance(cls, vec![]);
         r_dict.instance_set("key_eq", key_eq).expect("key_eq");
         r_dict.instance_set("key_hash", key_hash).expect("key_hash");
-        let mut inner = HashMap::new();
+        let mut inner = indexmap::IndexMap::new();
         for &(k, v) in pairs {
             let dk = HostObject::new_instance(key_cls.clone(), vec![]);
             dk.instance_set("dic", ConstValue::HostObject(r_dict.clone()))
@@ -15038,7 +15664,9 @@ mod tests {
         r_dict
     }
 
-    fn dict_cache_key_dict_items(key: &DictCacheKey) -> &Arc<HashMap<ConstValue, ConstValue>> {
+    fn dict_cache_key_dict_items(
+        key: &DictCacheKey,
+    ) -> &Arc<indexmap::IndexMap<ConstValue, ConstValue>> {
         match key {
             DictCacheKey::Dict { items } => items,
             DictCacheKey::RDict { .. } => panic!("expected Dict cache key"),
@@ -15765,6 +16393,28 @@ mod tests {
         }
     }
 
+    fn entry_signed_keys(ptr: &_ptr) -> Vec<i64> {
+        let entries = ptr.getattr("entries").expect("entries");
+        let LowLevelValue::Ptr(entries) = entries else {
+            panic!("entries must be a pointer, got {entries:?}");
+        };
+        let n = dict_signed_field(ptr, "num_ever_used_items").expect("ever") as usize;
+        let mut keys = Vec::with_capacity(n);
+        for i in 0..n {
+            let entry = entries.getitem(i).expect("entry");
+            let key = match entry {
+                LowLevelValue::InteriorPtr(ip) => ip.getattr("key").expect("key"),
+                LowLevelValue::Ptr(p) => p.getattr("key").expect("key"),
+                other => panic!("entry must be a struct pointer, got {other:?}"),
+            };
+            let LowLevelValue::Signed(k) = key else {
+                panic!("key must be Signed, got {key:?}");
+            };
+            keys.push(k);
+        }
+        keys
+    }
+
     fn signed_ccharp_ordered_dict_repr() -> OrderedDictRepr {
         use crate::translator::rtyper::lltypesystem::lltype::SomePtr;
         use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
@@ -15844,12 +16494,19 @@ mod tests {
     }
 
     /// Small `{int: CCHARP-null}` prebuilt: one `_ll_dict_insert_no_index`.
+    /// `PtrRepr.convert_const` accepts a typed null `LLPtr`, not host `None`.
     #[test]
     fn convert_const_int_to_ccharp_null_inserts_one_entry() {
-        use std::collections::HashMap;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
         let repr = signed_ccharp_ordered_dict_repr();
-        let mut items = HashMap::new();
-        items.insert(ConstValue::Int(7), ConstValue::None);
+        let mut items = indexmap::IndexMap::new();
+        let LowLevelType::Ptr(ptr_t) = &*CCHARP else {
+            panic!("CCHARP is not a Ptr");
+        };
+        items.insert(
+            ConstValue::Int(7),
+            ConstValue::LLPtr(Box::new(ptr_t._defl())),
+        );
         let c = repr
             .convert_const(&ConstValue::Dict(Arc::new(items)))
             .expect("non-empty dict convert_const");
@@ -16104,7 +16761,6 @@ mod tests {
             };
             kv.push((k, v));
         }
-        kv.sort_unstable();
         assert_eq!(kv, vec![(1, 10), (2, 20)]);
 
         let c2 = repr.convert_const(&host).expect("cached");
@@ -16224,9 +16880,8 @@ mod tests {
     /// and every key is found.
     #[test]
     fn convert_const_nonempty_prebuilt_getitem_after_rehash() {
-        use std::collections::HashMap;
         let repr = signed_signed_ordered_dict_repr();
-        let mut items = HashMap::new();
+        let mut items = indexmap::IndexMap::new();
         items.insert(ConstValue::Int(1), ConstValue::Int(10));
         items.insert(ConstValue::Int(2), ConstValue::Int(20));
         items.insert(ConstValue::Int(3), ConstValue::Int(30));
@@ -16249,6 +16904,52 @@ mod tests {
             dict_signed_field(&d, "lookup_function_no").expect("lookup after rehash"),
             FUNC_MUST_REINDEX
         );
+    }
+
+    /// `OrderedDictRepr.convert_const` (`rordereddict.py`) inserts from
+    /// `dictobj.items()`; `ConstValue::Dict` keeps that insertion order.
+    #[test]
+    fn convert_const_prebuilt_dict_preserves_insertion_order() {
+        let repr = signed_signed_ordered_dict_repr();
+        let mut items = indexmap::IndexMap::new();
+        items.insert(ConstValue::Int(3), ConstValue::Int(30));
+        items.insert(ConstValue::Int(1), ConstValue::Int(10));
+        items.insert(ConstValue::Int(2), ConstValue::Int(20));
+        let c = repr
+            .convert_const(&ConstValue::Dict(Arc::new(items)))
+            .expect("prebuilt dict");
+        let ptr = as_dict_ptr(&c);
+        assert_eq!(
+            dict_signed_field(ptr, "num_ever_used_items").expect("ever"),
+            3
+        );
+        assert_eq!(entry_signed_keys(ptr), vec![3, 1, 2]);
+    }
+
+    /// r_dict `_dict` arm of `OrderedDictRepr.convert_const`
+    /// (`rordereddict.py`): entries follow `_dict` insertion order.
+    #[test]
+    fn convert_const_prebuilt_r_dict_preserves_insertion_order() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let repr = make_custom_eq_hash_dict_repr(rtyper);
+        let key_eq = funcptr_const(
+            "key_eq",
+            vec![LowLevelType::Signed, LowLevelType::Signed],
+            LowLevelType::Bool,
+        );
+        let key_hash = funcptr_const("key_hash", vec![LowLevelType::Signed], LowLevelType::Signed);
+        let r_dict = make_prebuilt_r_dict(key_eq, key_hash, &[(3, 30), (1, 10), (2, 20)]);
+        let c = repr
+            .convert_const(&ConstValue::HostObject(r_dict))
+            .expect("prebuilt r_dict");
+        let ptr = as_dict_ptr(&c);
+        assert_eq!(
+            dict_signed_field(ptr, "num_ever_used_items").expect("ever"),
+            3
+        );
+        assert_eq!(entry_signed_keys(ptr), vec![3, 1, 2]);
     }
 
     /// Inserting `DICT_INITSIZE * 2` keys grows/resizes; every key is found.
@@ -16348,6 +17049,358 @@ mod tests {
         assert!(
             matches!(got, LowLevelValue::Signed(42)),
             "equal-but-distinct STR finds the entry, got {got:?}"
+        );
+    }
+
+    fn str_str_ordered_dict_repr() -> OrderedDictRepr {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::String(SomeString::new(false, false)),
+            SomeValue::String(SomeString::new(true, false)),
+            false,
+            false,
+            false,
+        );
+        OrderedDictRepr::new(
+            rtyper,
+            string_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("str str ordered dict repr")
+    }
+
+    /// `{ "a": None }` with a nullable StringRepr value: `convert_const`
+    /// passes host `None` through; the entry value is a null STR pointer.
+    #[test]
+    fn convert_const_str_none_value_is_null_str_pointer() {
+        let repr = str_str_ordered_dict_repr();
+        let mut items = indexmap::IndexMap::new();
+        items.insert(ConstValue::byte_str("a"), ConstValue::None);
+        let c = repr
+            .convert_const(&ConstValue::Dict(Arc::new(items)))
+            .expect("{a: None}");
+        let ptr = as_dict_ptr(&c);
+        let entries = ptr.getattr("entries").expect("entries");
+        let LowLevelValue::Ptr(entries) = entries else {
+            panic!("entries must be a pointer, got {entries:?}");
+        };
+        let entry = entries.getitem(0).expect("entries[0]");
+        let value = match entry {
+            LowLevelValue::InteriorPtr(ip) => ip.getattr("value").expect("value"),
+            LowLevelValue::Ptr(p) => p.getattr("value").expect("value"),
+            other => panic!("entry must be a struct pointer, got {other:?}"),
+        };
+        let LowLevelValue::Ptr(value_ptr) = value else {
+            panic!("STR value must be a pointer, got {value:?}");
+        };
+        assert!(
+            matches!(value_ptr._obj0_value(), Ok(None)),
+            "None value is a null STR pointer"
+        );
+    }
+
+    fn float_signed_ordered_dict_repr() -> OrderedDictRepr {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Float(SomeFloat::new()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        OrderedDictRepr::new(
+            rtyper,
+            float_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("float signed ordered dict repr")
+    }
+
+    /// Float keys use `_hash_float` (`objectmodel.py`). 1.5 hashes to
+    /// 1610645504; `0.0` and `-0.0` share hash 0 and find each other.
+    #[test]
+    fn convert_const_float_keys_hash_and_lookup() {
+        let repr = float_signed_ordered_dict_repr();
+        assert!(
+            matches!(
+                repr.DICT._adtmeths.get("keyhash"),
+                Some(ConstValue::LLPtr(_))
+            ),
+            "keyhash adtmeth is the stored _hash_float funcptr"
+        );
+        let mut items = indexmap::IndexMap::new();
+        items.insert(ConstValue::float(1.5), ConstValue::Int(10));
+        items.insert(ConstValue::float(0.0), ConstValue::Int(20));
+        let c = repr
+            .convert_const(&ConstValue::Dict(Arc::new(items)))
+            .expect("float dict");
+        let mut d = as_dict_ptr(&c).clone();
+        let h_15 = ll_keyhash(&d, &LowLevelValue::Float(1.5f64.to_bits())).expect("hash 1.5");
+        assert_eq!(h_15, 1610645504, "_hash_float(1.5)");
+        let h_pos0 = ll_keyhash(&d, &LowLevelValue::Float(0.0f64.to_bits())).expect("hash 0.0");
+        let h_neg0 = ll_keyhash(&d, &LowLevelValue::Float((-0.0f64).to_bits())).expect("hash -0.0");
+        assert_eq!(h_pos0, 0);
+        assert_eq!(h_neg0, 0);
+        let got = ll_dict_getitem(&mut d, &LowLevelValue::Float(1.5f64.to_bits())).expect("1.5");
+        assert!(
+            matches!(got, LowLevelValue::Signed(10)),
+            "lookup 1.5, {got:?}"
+        );
+        let got = ll_dict_getitem(&mut d, &LowLevelValue::Float((-0.0f64).to_bits()))
+            .expect("-0.0 finds 0.0");
+        assert!(
+            matches!(got, LowLevelValue::Signed(20)),
+            "0.0 == -0.0 lookup, {got:?}"
+        );
+    }
+
+    fn tuple_int_str_signed_ordered_dict_repr() -> (OrderedDictRepr, Arc<TupleRepr>) {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let tuple_repr = Arc::new(
+            TupleRepr::new(
+                &rtyper,
+                vec![
+                    signed_repr() as Arc<dyn Repr>,
+                    string_repr() as Arc<dyn Repr>,
+                ],
+            )
+            .expect("TupleRepr"),
+        );
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::String(SomeString::new(false, false)),
+            ])),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let dict_repr = OrderedDictRepr::new(
+            rtyper,
+            tuple_repr.clone() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("tuple keyed dict");
+        (dict_repr, tuple_repr)
+    }
+
+    /// Tuple keys `(1, "a")` hash structurally (`gen_hash_function`); two
+    /// equal tuples built separately find each other.
+    #[test]
+    fn convert_const_tuple_keys_hash_structurally() {
+        let (repr, tuple_repr) = tuple_int_str_signed_ordered_dict_repr();
+        let mut items = indexmap::IndexMap::new();
+        items.insert(
+            ConstValue::Tuple(vec![ConstValue::Int(1), ConstValue::byte_str("a")]),
+            ConstValue::Int(99),
+        );
+        let c = repr
+            .convert_const(&ConstValue::Dict(Arc::new(items)))
+            .expect("tuple dict");
+        let mut d = as_dict_ptr(&c).clone();
+        let mut t2 = tuple_repr.instantiate().expect("fresh tuple");
+        t2.setattr("item0", LowLevelValue::Signed(1))
+            .expect("item0");
+        let s = llstr(b"a").expect("fresh STR");
+        t2.setattr("item1", LowLevelValue::Ptr(Box::new(s)))
+            .expect("item1");
+        let got = ll_dict_getitem(&mut d, &LowLevelValue::Ptr(Box::new(t2)))
+            .expect("structural tuple lookup");
+        assert!(
+            matches!(got, LowLevelValue::Signed(99)),
+            "separately built (1, 'a') finds the entry, got {got:?}"
+        );
+    }
+
+    fn malloc_unicode(text: &str) -> _ptr {
+        let unicode_body = match UNICODE.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd
+                .resolved()
+                .expect("UNICODE ForwardReference is resolved"),
+            other => other,
+        };
+        let mut ptr = malloc(
+            unicode_body,
+            Some(text.chars().count()),
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("malloc UNICODE");
+        ptr.setattr("hash", LowLevelValue::Signed(0))
+            .expect("hash = 0");
+        let Some(_ptr_obj::Struct(s)) = ptr._obj0_value().expect("live UNICODE") else {
+            panic!("UNICODE pointer does not target a Struct");
+        };
+        let Some(LowLevelValue::Array(chars)) = s._getattr("chars") else {
+            panic!("UNICODE has no chars array");
+        };
+        for (i, ch) in text.chars().enumerate() {
+            chars.setitem(i, LowLevelValue::UniChar(ch));
+        }
+        ptr
+    }
+
+    fn unicode_signed_ordered_dict_repr() -> OrderedDictRepr {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::UnicodeString(crate::annotator::model::SomeUnicodeString::new(
+                false, false,
+            )),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        OrderedDictRepr::new(
+            rtyper,
+            unicode_repr() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("unicode signed ordered dict repr")
+    }
+
+    /// UNICODE keys hash UniChar code points (`_hash_string`), not UTF-8
+    /// bytes. U+0100 differs from the UTF-8-byte hash of C4 80.
+    #[test]
+    fn unicode_key_hash_uses_codepoints_not_utf8() {
+        let repr = unicode_signed_ordered_dict_repr();
+        let mut d = ll_newdict_size(&repr.DICT, 4).expect("ll_newdict_size");
+        let key = malloc_unicode("\u{0100}");
+        let codepoint_hash = hash_unichar_ords(&['\u{0100}']);
+        let utf8_hash = ll_strhash_value("\u{0100}".as_bytes());
+        assert_ne!(
+            codepoint_hash, utf8_hash,
+            "U+0100 code-point hash differs from UTF-8-byte hash ({codepoint_hash} vs {utf8_hash})"
+        );
+        let got = ll_keyhash(&d, &LowLevelValue::Ptr(Box::new(key.clone()))).expect("unicode hash");
+        assert_eq!(
+            got, codepoint_hash,
+            "UNICODE hash is the code-point formula"
+        );
+        ll_dict_setitem(
+            &mut d,
+            LowLevelValue::Ptr(Box::new(key)),
+            LowLevelValue::Signed(7),
+        )
+        .expect("setitem UNICODE");
+        let key2 = malloc_unicode("\u{0100}");
+        let looked =
+            ll_dict_getitem(&mut d, &LowLevelValue::Ptr(Box::new(key2))).expect("getitem UNICODE");
+        assert!(
+            matches!(looked, LowLevelValue::Signed(7)),
+            "equal UNICODE code points find the entry, got {looked:?}"
+        );
+    }
+
+    /// `@jit.dont_look_inside` on `ll_dict_rehash_after_translation`.
+    #[test]
+    fn ll_dict_rehash_after_translation_is_dont_look_inside() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let helper = build_ll_dict_rehash_after_translation_helper_graph(
+            "ll_dict_rehash_after_translation",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            false,
+        )
+        .expect("rehash helper");
+        assert_eq!(
+            helper.func._jit_look_inside_,
+            Some(false),
+            "ll_dict_rehash_after_translation is dont_look_inside"
+        );
+    }
+
+    /// `look_inside_iff(lambda d: jit.isvirtual(d))` split on
+    /// `ll_dict_create_initial_index`: orig is unroll_safe, trampoline is
+    /// dont_look_inside, wrapper branches on we_are_jitted then isvirtual.
+    #[test]
+    fn ll_dict_create_initial_index_look_inside_iff_split() {
+        let orig = build_ll_dict_create_initial_index_helper_graph(
+            "ll_dict_create_initial_index__orig",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("orig");
+        assert!(
+            orig.func._jit_unroll_safe_,
+            "look_inside_iff marks the original unroll_safe"
+        );
+        assert_eq!(
+            orig.func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+
+        let trampoline = build_ll_dict_create_initial_index_trampoline_helper_graph(
+            "ll_dict_create_initial_index_trampoline",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+        )
+        .expect("trampoline");
+        assert_eq!(
+            trampoline.func._jit_look_inside_,
+            Some(false),
+            "trampoline is dont_look_inside"
+        );
+
+        let wrapper = build_ll_dict_create_initial_index_look_inside_iff_helper_graph(
+            "ll_dict_create_initial_index",
+            sample_dict_ptr_lltype(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("wrapper");
+        assert_eq!(
+            wrapper.func.annspecialcase, None,
+            "look_inside_iff wrapper f does not get call_location"
+        );
+        let inner = wrapper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(startblock.operations.is_empty());
+        let Some(Hlvalue::Constant(c)) = &startblock.exitswitch else {
+            panic!("exitswitch must be the we_are_jitted SpecTag constant");
+        };
+        assert_eq!(c.value, ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID));
+        assert_eq!(startblock.exits.len(), 2);
+        let true_first = &startblock.exits[0].borrow().exitcase;
+        assert!(
+            matches!(true_first, Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(true)),
+            "we_are_jitted true link first"
         );
     }
 }

@@ -922,8 +922,8 @@ pub(crate) fn ll_join_chars_helper(
         "_ll_alloc_and_set_isconstant".to_string(),
         vec![LowLevelType::Signed],
         LowLevelType::Bool,
-        |_r, _a, _res| {
-            build_ll_alloc_and_set_isconstant_helper_graph("_ll_alloc_and_set_isconstant")
+        |rtyper, _a, _res| {
+            build_ll_alloc_and_set_isconstant_helper_graph(rtyper, "_ll_alloc_and_set_isconstant")
         },
     )?;
     let isvirtual = {
@@ -932,8 +932,8 @@ pub(crate) fn ll_join_chars_helper(
             "ll_join_chars_isvirtual".to_string(),
             vec![items_ptr_lltype.clone()],
             LowLevelType::Bool,
-            move |_r, _a, _res| {
-                build_ll_join_chars_isvirtual_helper_graph("ll_join_chars_isvirtual", items)
+            move |rtyper, _a, _res| {
+                build_ll_join_chars_isvirtual_helper_graph(rtyper, "ll_join_chars_isvirtual", items)
             },
         )?
     };

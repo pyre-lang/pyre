@@ -28,7 +28,9 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
-use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
+use crate::translator::rtyper::lltypesystem::rstr::{
+    jit_isconstant_intrinsic_funcptr, jit_isvirtual_intrinsic_funcptr, sub_helper_funcptr_constant,
+};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, inputconst_from_lltype};
 use crate::translator::rtyper::rrustvec::{RUST_VEC_HINT, vec_item_kind_of};
 use crate::translator::rtyper::rtyper::{
@@ -870,8 +872,8 @@ fn build_alloc_and_set_family(
         "_ll_alloc_and_set_isconstant".to_string(),
         vec![LowLevelType::Signed],
         LowLevelType::Bool,
-        |_r, _a, _res| {
-            build_ll_alloc_and_set_isconstant_helper_graph("_ll_alloc_and_set_isconstant")
+        |rtyper, _a, _res| {
+            build_ll_alloc_and_set_isconstant_helper_graph(rtyper, "_ll_alloc_and_set_isconstant")
         },
     )?;
 
@@ -3385,9 +3387,11 @@ pub(crate) fn build_ll_arraymove_helper_graph(
 /// ```
 ///
 /// `_ll_new_empty_item_array` with `INITIAL_EMPTY_LIST_ALLOCATION == 0`
-/// is `malloc(LIST.items.TO, 0)`. `rgc.ll_arraycopy(..., 0, 0, p)` is
+/// is `_ll_prebuilt_empty_array` (`specialize:memo`): a Constant
+/// immortal empty GcArray. `rgc.ll_arraycopy(..., 0, 0, p)` is
 /// the start=0 [`build_ll_arraycopy_helper_graph`] callee.
 pub(crate) fn build_ll_list_resize_hint_really_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
@@ -3515,7 +3519,8 @@ pub(crate) fn build_ll_list_resize_hint_really_helper_graph(
         .into_ref(),
     ]);
 
-    // reset: ll_assert(newsize == 0); l.length = 0; l.items = malloc(0).
+    // reset: ll_assert(newsize == 0); l.length = 0;
+    // l.items = _ll_new_empty_item_array (prebuilt empty array).
     let eq0 = variable_with_lltype("eq0", LowLevelType::Bool);
     block_reset
         .borrow_mut()
@@ -3551,19 +3556,14 @@ pub(crate) fn build_ll_list_resize_hint_really_helper_graph(
             ],
             Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
         ));
-    let empty = variable_with_lltype("empty", items_ptr.clone());
-    block_reset
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "malloc_varsize",
-            vec![
-                lowlevel_type_const(array_type.clone()),
-                gc_flavor_const()?,
-                signed_const(0),
-            ],
-            Hlvalue::Variable(empty.clone()),
-        ));
+    let annotator = rtyper
+        .annotator
+        .upgrade()
+        .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
+    let empty_items = crate::translator::rtyper::lltypesystem::rlist::_ll_new_empty_item_array(
+        &annotator.bookkeeper,
+        &array_type,
+    )?;
     block_reset
         .borrow_mut()
         .operations
@@ -3572,7 +3572,10 @@ pub(crate) fn build_ll_list_resize_hint_really_helper_graph(
             vec![
                 Hlvalue::Variable(l_reset),
                 void_field_const("items"),
-                Hlvalue::Variable(empty),
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(empty_items)),
+                    items_ptr.clone(),
+                )),
             ],
             Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
         ));
@@ -4157,8 +4160,9 @@ fn mint_ll_list_resize_hint_really_family(
             "_ll_list_resize_hint_really".to_string(),
             hint_args.clone(),
             LowLevelType::Void,
-            move |_r, _a, _res| {
+            move |rtyper, _a, _res| {
                 build_ll_list_resize_hint_really_helper_graph(
+                    rtyper,
                     "_ll_list_resize_hint_really",
                     ptr,
                     item,
@@ -4187,8 +4191,8 @@ fn mint_ll_list_resize_hint_really_family(
         "_ll_alloc_and_set_isconstant".to_string(),
         vec![LowLevelType::Signed],
         LowLevelType::Bool,
-        |_r, _a, _res| {
-            build_ll_alloc_and_set_isconstant_helper_graph("_ll_alloc_and_set_isconstant")
+        |rtyper, _a, _res| {
+            build_ll_alloc_and_set_isconstant_helper_graph(rtyper, "_ll_alloc_and_set_isconstant")
         },
     )?;
     let orig_fn = sub_helper_funcptr_constant(rtyper, &orig)?;
@@ -5846,29 +5850,15 @@ fn build_ll_alloc_and_set_nonnull_helper_graph(
 /// Function pointer whose `_name` is the CallPath `lib.rs` marks
 /// `jit.isconstant`. Spine B splits that name on `::` so
 /// `rewrite_op_direct_call` emits `int_isconstant`.
-fn isconstant_intrinsic_funcptr() -> Constant {
-    let ft = FuncType {
-        args: vec![LowLevelType::Signed],
-        result: LowLevelType::Bool,
-    };
-    let ptr = functionptr(
-        ft.clone(),
-        "majit_rlib::jit::isconstant",
-        None,
-        Some("majit_rlib::jit::isconstant".to_string()),
-    );
-    Constant::with_concretetype(
-        ConstValue::LLPtr(Box::new(ptr)),
-        LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Func(ft),
-        })),
-    )
+fn isconstant_intrinsic_funcptr(rtyper: &RPythonTyper) -> Result<Constant, TyperError> {
+    jit_isconstant_intrinsic_funcptr(rtyper)
 }
 
 /// `rlib/jit.py isconstant`: the interpreter fallback is
 /// `NonConstant(False)` inside the marked intrinsic; the traced path is
 /// the oopspec `jit.isconstant`, rewritten to `int_isconstant`.
 pub(crate) fn build_ll_alloc_and_set_isconstant_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
 ) -> Result<PyGraph, TyperError> {
     let value = variable_with_lltype("value", LowLevelType::Signed);
@@ -5883,7 +5873,7 @@ pub(crate) fn build_ll_alloc_and_set_isconstant_helper_graph(
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
         vec![
-            Hlvalue::Constant(isconstant_intrinsic_funcptr()),
+            Hlvalue::Constant(isconstant_intrinsic_funcptr(rtyper)?),
             Hlvalue::Variable(value),
         ],
         Hlvalue::Variable(result.clone()),
@@ -7029,8 +7019,8 @@ pub fn pair_list_list_rtype_eq(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) 
         {
             let isvirtual_name = isvirtual_name.clone();
             let ptr1 = ptr1.clone();
-            move |_r, _a, _res| {
-                build_ll_listeq_isvirtual_helper_graph(&isvirtual_name, ptr1.clone())
+            move |rtyper, _a, _res| {
+                build_ll_listeq_isvirtual_helper_graph(rtyper, &isvirtual_name, ptr1.clone())
             }
         },
     )?;
@@ -7045,8 +7035,8 @@ pub fn pair_list_list_rtype_eq(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) 
             {
                 let isvirtual_name2 = isvirtual_name2.clone();
                 let ptr2 = ptr2.clone();
-                move |_r, _a, _res| {
-                    build_ll_listeq_isvirtual_helper_graph(&isvirtual_name2, ptr2.clone())
+                move |rtyper, _a, _res| {
+                    build_ll_listeq_isvirtual_helper_graph(rtyper, &isvirtual_name2, ptr2.clone())
                 }
             },
         )?
@@ -7538,29 +7528,18 @@ fn build_ll_listeq_helper_graph(
 /// Function pointer whose `_name` is the CallPath harvested from
 /// `rlib/jit.py isvirtual`. Spine B splits that name on `::` so
 /// `rewrite_op_direct_call` emits `ref_isvirtual`.
-fn isvirtual_intrinsic_funcptr(ptr_lltype: LowLevelType) -> Constant {
-    let ft = FuncType {
-        args: vec![ptr_lltype],
-        result: LowLevelType::Bool,
-    };
-    let ptr = functionptr(
-        ft.clone(),
-        "majit_rlib::jit::isvirtual",
-        None,
-        Some("majit_rlib::jit::isvirtual".to_string()),
-    );
-    Constant::with_concretetype(
-        ConstValue::LLPtr(Box::new(ptr)),
-        LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Func(ft),
-        })),
-    )
+fn isvirtual_intrinsic_funcptr(
+    rtyper: &RPythonTyper,
+    ptr_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    jit_isvirtual_intrinsic_funcptr(rtyper, ptr_lltype)
 }
 
 /// `rlib/jit.py isvirtual`: the interpreter fallback is
 /// `NonConstant(False)` inside the marked intrinsic; the traced path is
 /// the oopspec `jit.isvirtual`, rewritten to `ref_isvirtual`.
 fn build_ll_listeq_isvirtual_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -7576,7 +7555,7 @@ fn build_ll_listeq_isvirtual_helper_graph(
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
         vec![
-            Hlvalue::Constant(isvirtual_intrinsic_funcptr(ptr_lltype)),
+            Hlvalue::Constant(isvirtual_intrinsic_funcptr(rtyper, ptr_lltype)?),
             Hlvalue::Variable(value),
         ],
         Hlvalue::Variable(result.clone()),
@@ -13876,9 +13855,12 @@ mod tests {
 
     #[test]
     fn ll_listeq_isvirtual_helper_calls_jit_isvirtual() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
         let ptr = resized_list_lltype();
-        let helper = build_ll_listeq_isvirtual_helper_graph("_ll_listeq_isvirtual_resized", ptr)
-            .expect("build_ll_listeq_isvirtual_helper_graph");
+        let helper =
+            build_ll_listeq_isvirtual_helper_graph(&rtyper, "_ll_listeq_isvirtual_resized", ptr)
+                .expect("build_ll_listeq_isvirtual_helper_graph");
         assert_eq!(
             helper.func.annspecialcase.as_deref(),
             Some("specialize:call_location")
@@ -13973,8 +13955,11 @@ mod tests {
     /// `_ll_list_resize_hint_really`).
     #[test]
     fn build_ll_list_resize_hint_really_has_reset_and_overallocate_arms() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
         let ptr = resized_list_lltype();
         let helper = build_ll_list_resize_hint_really_helper_graph(
+            &rtyper,
             "_ll_list_resize_hint_really",
             ptr,
             LowLevelType::Signed,
@@ -14000,13 +13985,108 @@ mod tests {
         let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
         assert_eq!(n("int_le"), 1);
         assert_eq!(n("debug_assert"), 1);
-        assert_eq!(n("malloc_varsize"), 2);
+        // Grow arm still `malloc_varsize`; reset is the memoized Constant
+        // `_ll_prebuilt_empty_array` (`specialize:memo`).
+        assert_eq!(n("malloc_varsize"), 1);
         assert_eq!(n("int_is_true"), 1);
         assert_eq!(n("direct_call"), 1);
         assert_eq!(n("int_rshift"), 1);
         let start = inner.startblock.borrow();
         assert_eq!(start.inputargs.len(), 3);
         assert_eq!(start.exits.len(), 2);
+    }
+
+    fn reset_block_of(graph: &FunctionGraph) -> crate::flowspace::model::BlockRef {
+        graph
+            .startblock
+            .borrow()
+            .exits
+            .iter()
+            .find(|link| {
+                matches!(
+                    &link.borrow().exitcase,
+                    Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::Bool(true))
+                )
+            })
+            .expect("newsize<=0 reset arm")
+            .borrow()
+            .target
+            .clone()
+            .expect("reset target")
+    }
+
+    fn reset_items_constant(graph: &FunctionGraph) -> Constant {
+        for op in &reset_block_of(graph).borrow().operations {
+            if op.opname != "setfield" {
+                continue;
+            }
+            let Some(Hlvalue::Constant(field)) = op.args.get(1) else {
+                continue;
+            };
+            if !matches!(&field.value, ConstValue::ByteStr(b) if b == b"items") {
+                continue;
+            }
+            if let Some(Hlvalue::Constant(value)) = op.args.get(2) {
+                return value.clone();
+            }
+        }
+        panic!("reset setfield items Constant missing");
+    }
+
+    fn empty_array_identity(constant: &Constant) -> usize {
+        let ConstValue::LLPtr(ptr) = &constant.value else {
+            panic!("reset items is not an LLPtr, got {:?}", constant.value);
+        };
+        match &ptr._obj0 {
+            crate::translator::rtyper::lltypesystem::lltype::PtrObj::Strong(
+                crate::translator::rtyper::lltypesystem::lltype::_ptr_obj::Array(arr),
+            ) => arr.identity(),
+            other => panic!("reset items must be a GcArray, got {other:?}"),
+        }
+    }
+
+    /// Reset is `_ll_new_empty_item_array` with
+    /// `INITIAL_EMPTY_LIST_ALLOCATION == 0`: no `malloc_varsize`, the
+    /// `items` field is a Constant, and two graphs of the same item
+    /// type share `_ll_prebuilt_empty_array`'s container.
+    #[test]
+    fn build_ll_list_resize_hint_really_reset_reuses_prebuilt_empty_array() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let ptr = resized_list_lltype();
+        let helper1 = build_ll_list_resize_hint_really_helper_graph(
+            &rtyper,
+            "_ll_list_resize_hint_really",
+            ptr.clone(),
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+        )
+        .expect("resize graph 1");
+        let helper2 = build_ll_list_resize_hint_really_helper_graph(
+            &rtyper,
+            "_ll_list_resize_hint_really",
+            ptr,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+        )
+        .expect("resize graph 2");
+        let g1 = helper1.graph.borrow();
+        let g2 = helper2.graph.borrow();
+        assert!(
+            reset_block_of(&g1)
+                .borrow()
+                .operations
+                .iter()
+                .all(|op| op.opname != "malloc_varsize"),
+            "reset must not malloc_varsize"
+        );
+        let items1 = reset_items_constant(&g1);
+        let items2 = reset_items_constant(&g2);
+        assert_eq!(
+            empty_array_identity(&items1),
+            empty_array_identity(&items2),
+            "memoized prebuilt empty array is one container per item lltype"
+        );
     }
 
     #[test]

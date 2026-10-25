@@ -653,7 +653,7 @@ fn materialize_prebuilt_str(desc: &StrConstDescriptor) -> i64 {
             // ([`pyre_object::unicodeobject::prebuilt_str_storage_bytes`]);
             // a descriptor with identity gets its own block. Either way the
             // hash is `ll_strhash` over the chars.
-            if desc.container_id.is_none() {
+            if desc.container_index.is_none() {
                 pyre_object::unicodeobject::prebuilt_str_storage_bytes(&desc.bytes) as i64
             } else {
                 let payload = pyre_object::unicodeobject::alloc_utf8_payload(&desc.bytes, false);
@@ -666,7 +666,7 @@ fn materialize_prebuilt_str(desc: &StrConstDescriptor) -> i64 {
         StrConstKind::UnicodeObject => {
             let wtf8 = rustpython_wtf8::Wtf8::from_bytes(&desc.bytes)
                 .expect("prebuilt UnicodeObject constant bytes are not valid WTF-8");
-            if desc.container_id.is_some() {
+            if desc.container_index.is_some() {
                 pyre_object::unicodeobject::w_str_from_wtf8_immortal(wtf8.to_owned()) as i64
             } else {
                 pyre_object::unicodeobject::box_str_constant(wtf8) as i64
@@ -709,15 +709,66 @@ fn materialize_prebuilt_unicode(bytes: &[u8], precomputed_hash: i64) -> i64 {
     ptr as i64
 }
 
-/// Intern key matches `assembler.py Assembler.emit_const`: a descriptor
-/// that carries `value._obj.container` identity is keyed by
-/// `(container_id, kind)` so two containers with equal bytes stay two
-/// blocks. Descriptors without identity (`ConstInternedStr`) keep the
-/// `(bytes, kind)` key.
+/// Intern table for one assembly's jitcode set (`assembler.py`
+/// `constants_dict` / `constants_r` retain the container; the runtime
+/// maps that assembly's dense ordinal onto the materialized block).
+/// Owned by the loader of one jitcode table, not process-wide: two
+/// independent assemblies may reuse ordinal 0 for different contents.
+#[derive(Default)]
+pub struct AssemblyConstIntern {
+    str_by_index: Vec<Option<i64>>,
+    instance_by_index: Vec<Option<i64>>,
+}
+
+impl AssemblyConstIntern {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn str_addr(&self, index: u32) -> Option<i64> {
+        self.str_by_index.get(index as usize).copied().flatten()
+    }
+
+    fn insert_str(&mut self, index: u32, addr: i64) -> i64 {
+        let i = index as usize;
+        if self.str_by_index.len() <= i {
+            self.str_by_index.resize(i + 1, None);
+        }
+        if let Some(existing) = self.str_by_index[i] {
+            existing
+        } else {
+            self.str_by_index[i] = Some(addr);
+            addr
+        }
+    }
+
+    fn instance_addr(&self, index: u32) -> Option<i64> {
+        self.instance_by_index
+            .get(index as usize)
+            .copied()
+            .flatten()
+    }
+
+    fn insert_instance(&mut self, index: u32, addr: i64) -> i64 {
+        let i = index as usize;
+        if self.instance_by_index.len() <= i {
+            self.instance_by_index.resize(i + 1, None);
+        }
+        if let Some(existing) = self.instance_by_index[i] {
+            existing
+        } else {
+            self.instance_by_index[i] = Some(addr);
+            addr
+        }
+    }
+}
+
+/// Bytes-only intern key (`ConstInternedStr`): share by `(bytes, kind)`,
+/// including the interpreter's interned literal storage.
 #[derive(Hash, Eq, PartialEq)]
-enum StrConstInternKey {
-    Container { id: u64, kind: StrConstKind },
-    Bytes { bytes: Vec<u8>, kind: StrConstKind },
+struct StrConstBytesKey {
+    bytes: Vec<u8>,
+    kind: StrConstKind,
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
@@ -733,10 +784,16 @@ enum StrConstInternKey {
 /// runtime analog of the assembler's per-jitcode dedup. `StrConstKind::Str`
 /// without identity is `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`);
 /// `StrConstKind::UnicodeObject` without identity is `box_str_constant`'s
-/// process-wide `WEAK_INTERN`. `INTERNED` is process-wide because the lazy
-/// per-jitcode loader calls this once per entry.
+/// process-wide `WEAK_INTERN`. Container-backed descriptors intern through
+/// `intern` (one table per assembly); bytes-only descriptors keep
+/// process-wide `(bytes, kind)` sharing.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
-    static INTERNED: LazyLock<std::sync::Mutex<HashMap<StrConstInternKey, i64>>> =
+    let mut intern = AssemblyConstIntern::new();
+    materialize_str_consts_in(jitcodes, &mut intern);
+}
+
+pub fn materialize_str_consts_in(jitcodes: &mut [Arc<JitCode>], intern: &mut AssemblyConstIntern) {
+    static BYTES_INTERNED: LazyLock<std::sync::Mutex<HashMap<StrConstBytesKey, i64>>> =
         LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
     for arc in jitcodes.iter_mut() {
         // Body-less placeholder shells, and bodies with no deferred strings
@@ -754,23 +811,26 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
             let idx = body.str_consts[i].constants_r_index;
             let addr = {
                 let desc = &body.str_consts[i];
-                let key = match desc.container_id {
-                    Some(id) => StrConstInternKey::Container {
-                        id,
-                        kind: desc.kind,
-                    },
-                    None => StrConstInternKey::Bytes {
+                if let Some(container_index) = desc.container_index {
+                    if let Some(a) = intern.str_addr(container_index) {
+                        a
+                    } else {
+                        let a = materialize_prebuilt_str(desc);
+                        intern.insert_str(container_index, a)
+                    }
+                } else {
+                    let key = StrConstBytesKey {
                         bytes: desc.bytes.clone(),
                         kind: desc.kind,
-                    },
-                };
-                let mut interned = INTERNED.lock().unwrap();
-                if let Some(&a) = interned.get(&key) {
-                    a
-                } else {
-                    let a = materialize_prebuilt_str(desc);
-                    interned.insert(key, a);
-                    a
+                    };
+                    let mut interned = BYTES_INTERNED.lock().unwrap();
+                    if let Some(&a) = interned.get(&key) {
+                        a
+                    } else {
+                        let a = materialize_prebuilt_str(desc);
+                        interned.insert(key, a);
+                        a
+                    }
                 }
             };
             // The slot must still hold its non-canonical sentinel — never a
@@ -979,11 +1039,17 @@ pub fn materialize_empty_array_consts(jitcodes: &mut [Arc<JitCode>]) {
 /// `convert_const_exact`). Each descriptor names a `constants_r` slot
 /// holding a non-canonical sentinel; overwrite it with the immortal
 /// instance `create_instance` would malloc. Intern one instance per
-/// HostObject identity (`iprebuiltinstances[value]`, `emit_const`'s
+/// assembly ordinal (`iprebuiltinstances[value]`, `emit_const`'s
 /// `value._obj.container`).
 pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
-    static CELLS: LazyLock<std::sync::Mutex<Vec<(u64, i64)>>> =
-        LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+    let mut intern = AssemblyConstIntern::new();
+    materialize_prebuilt_instance_consts_in(jitcodes, &mut intern);
+}
+
+pub fn materialize_prebuilt_instance_consts_in(
+    jitcodes: &mut [Arc<JitCode>],
+    intern: &mut AssemblyConstIntern,
+) {
     for arc in jitcodes.iter_mut() {
         if arc
             .try_body()
@@ -999,29 +1065,12 @@ pub fn materialize_prebuilt_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
         for i in 0..body.prebuilt_instance_consts.len() {
             let desc = body.prebuilt_instance_consts[i].clone();
             let idx = desc.constants_r_index;
-            let identity = desc.identity;
-            // Allocate outside the intern lock: `create_instance` can
-            // panic (`get_vtable_for_gcstruct` on a typeptr header with
-            // no registered vtable), and a std Mutex held across that
-            // panic poisons every later intern.
-            let cached = {
-                let cells = CELLS.lock().unwrap();
-                cells
-                    .iter()
-                    .find(|(id, _)| *id == identity)
-                    .map(|(_, a)| *a)
-            };
-            let addr = if let Some(a) = cached {
+            let container_index = desc.container_index;
+            let addr = if let Some(a) = intern.instance_addr(container_index) {
                 a
             } else {
                 let a = prebuilt_empty_class_instance_addr(&desc);
-                let mut cells = CELLS.lock().unwrap();
-                if let Some((_, existing)) = cells.iter().find(|(id, _)| *id == identity) {
-                    *existing
-                } else {
-                    cells.push((identity, a));
-                    a
-                }
+                intern.insert_instance(container_index, a)
             };
             assert_eq!(
                 (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
@@ -1272,7 +1321,7 @@ mod tests {
             bytes: b"hello".to_vec(),
             precomputed_hash: 0x1234_5678,
             kind: StrConstKind::Str,
-            container_id: None,
+            container_index: None,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -1307,13 +1356,13 @@ mod tests {
             let p = pyre_object::unicodeobject::alloc_utf8_payload(&bytes, false);
             pyre_object::lowlevel_string::ll_strhash(p) as i64
         };
-        for container_id in [None, Some(0xC0FFEE_u64)] {
+        for container_index in [None, Some(0_u32)] {
             let descs = vec![StrConstDescriptor {
                 constants_r_index: 0,
                 bytes: bytes.clone(),
                 precomputed_hash: hash,
                 kind: StrConstKind::Str,
-                container_id,
+                container_index,
             }];
             let mut jcs = vec![jitcode_with_str_consts(descs)];
             materialize_str_consts(&mut jcs);
@@ -1339,7 +1388,7 @@ mod tests {
             bytes: b"x".to_vec(),
             precomputed_hash: 7,
             kind: StrConstKind::Str,
-            container_id: None,
+            container_index: None,
         };
         let mut jcs = vec![
             jitcode_with_str_consts(vec![desc()]),
@@ -1367,7 +1416,7 @@ mod tests {
                 bytes: b"y".to_vec(),
                 precomputed_hash: 9,
                 kind: StrConstKind::Str,
-                container_id: None,
+                container_index: None,
             };
             let mut first = vec![jitcode_with_str_consts(vec![desc()])];
             let mut second = vec![jitcode_with_str_consts(vec![desc()])];
@@ -1503,7 +1552,7 @@ mod tests {
             bytes: Vec::new(),
             precomputed_hash: -1,
             kind: StrConstKind::Str,
-            container_id: None,
+            container_index: None,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -1537,7 +1586,7 @@ mod tests {
             bytes: unicode_const_bytes(&cells),
             precomputed_hash: hash,
             kind: StrConstKind::Unicode,
-            container_id: None,
+            container_index: None,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -1552,17 +1601,17 @@ mod tests {
     #[test]
     fn materialize_str_consts_keys_by_container_identity() {
         let bytes = b"same-bytes".to_vec();
-        let desc = |constants_r_index, container_id| StrConstDescriptor {
+        let desc = |constants_r_index, container_index| StrConstDescriptor {
             constants_r_index,
             bytes: bytes.clone(),
             precomputed_hash: 11,
             kind: StrConstKind::Str,
-            container_id,
+            container_index,
         };
         let mut jcs = vec![jitcode_with_str_consts(vec![
-            desc(0, Some(0xA11CE_0001)),
-            desc(1, Some(0xA11CE_0002)),
-            desc(2, Some(0xA11CE_0001)),
+            desc(0, Some(0)),
+            desc(1, Some(1)),
+            desc(2, Some(0)),
         ])];
         materialize_str_consts(&mut jcs);
         let a0 = jcs[0].body().constants_r[0].get();
@@ -1570,11 +1619,34 @@ mod tests {
         let a2 = jcs[0].body().constants_r[2].get();
         assert_ne!(
             a0, a1,
-            "equal bytes with different container ids must be distinct blocks"
+            "equal bytes with different container ordinals must be distinct blocks"
         );
-        assert_eq!(a0, a2, "equal container ids must share one block");
+        assert_eq!(a0, a2, "equal container ordinals must share one block");
         assert_ne!(a0, sentinel(0));
         assert_ne!(a1, sentinel(1));
+    }
+
+    #[test]
+    fn materialize_str_consts_independent_assemblies_same_ordinal_stay_distinct() {
+        let desc = |bytes: &[u8]| StrConstDescriptor {
+            constants_r_index: 0,
+            bytes: bytes.to_vec(),
+            precomputed_hash: 13,
+            kind: StrConstKind::Str,
+            container_index: Some(0),
+        };
+        let mut first = vec![jitcode_with_str_consts(vec![desc(b"assembly-a")])];
+        let mut second = vec![jitcode_with_str_consts(vec![desc(b"assembly-b")])];
+        materialize_str_consts(&mut first);
+        materialize_str_consts(&mut second);
+        let a0 = first[0].body().constants_r[0].get();
+        let a1 = second[0].body().constants_r[0].get();
+        assert_ne!(
+            a0, a1,
+            "independent jitcode sets must not share a container ordinal"
+        );
+        assert_ne!(a0, sentinel(0));
+        assert_ne!(a1, sentinel(0));
     }
 
     #[test]
@@ -1668,14 +1740,14 @@ mod tests {
     }
 
     fn prebuilt_instance_desc(
-        identity: u64,
+        container_index: u32,
         size: usize,
         type_id: u64,
         has_vtable: bool,
     ) -> majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor {
         majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor {
             constants_r_index: 0,
-            identity,
+            container_index,
             size,
             type_id,
             has_vtable,
@@ -1814,7 +1886,7 @@ mod tests {
     #[test]
     fn materialize_prebuilt_instance_consts_overwrites_sentinel_with_header_only_instance() {
         let type_id = majit_ir::descr::path_hash("c1i::HeaderOnlyEmpty");
-        let desc = prebuilt_instance_desc(0xC110_0001, 0, type_id, false);
+        let desc = prebuilt_instance_desc(0, 0, type_id, false);
         publish_kind0_size_then_stamp(&desc);
         let tid = prebuilt_instance_tid(&desc);
         assert_header_tid_is_stamped(tid, &desc);
@@ -1843,7 +1915,7 @@ mod tests {
                 .is_none(),
             "size descr must not be pre-stamped"
         );
-        let desc = prebuilt_instance_desc(0xC110_0009, 0, type_id, false);
+        let desc = prebuilt_instance_desc(0, 0, type_id, false);
         let stamped_tid = publish_kind0_size_then_stamp(&desc);
         let tid = prebuilt_instance_tid(&desc);
         assert_header_tid_is_stamped(tid, &desc);
@@ -1860,25 +1932,26 @@ mod tests {
     #[test]
     fn materialize_prebuilt_instance_consts_interns_one_instance_per_identity() {
         let type_id = majit_ir::descr::path_hash("c1i::InternByIdentity");
-        let same = prebuilt_instance_desc(0xC110_0002, 0, type_id, false);
+        let same = prebuilt_instance_desc(0, 0, type_id, false);
         publish_kind0_size_then_stamp(&same);
         let tid = prebuilt_instance_tid(&same);
         assert_header_tid_is_stamped(tid, &same);
+        let mut intern = AssemblyConstIntern::new();
         let mut first = vec![jitcode_with_prebuilt("a", same.clone())];
         let mut second = vec![jitcode_with_prebuilt("b", same.clone())];
-        materialize_prebuilt_instance_consts(&mut first);
-        materialize_prebuilt_instance_consts(&mut second);
+        materialize_prebuilt_instance_consts_in(&mut first, &mut intern);
+        materialize_prebuilt_instance_consts_in(&mut second, &mut intern);
         assert_eq!(
             first[0].body().constants_r[0],
             second[0].body().constants_r[0],
-            "one HostObject identity must resolve to one immortal instance"
+            "one HostObject ordinal must resolve to one immortal instance"
         );
         let addr_a = first[0].body().constants_r[0].get();
         assert_raw_prebuilt_payload(addr_a, &same, None);
         let other = {
-            let desc = prebuilt_instance_desc(0xC110_0003, 0, type_id, false);
+            let desc = prebuilt_instance_desc(1, 0, type_id, false);
             let mut jcs = vec![jitcode_with_prebuilt("other", desc)];
-            materialize_prebuilt_instance_consts(&mut jcs);
+            materialize_prebuilt_instance_consts_in(&mut jcs, &mut intern);
             jcs[0].body().constants_r[0].get()
         };
         assert_ne!(
@@ -1890,8 +1963,8 @@ mod tests {
     #[test]
     fn materialize_prebuilt_instance_consts_two_identities_of_one_class_are_distinct() {
         let type_id = majit_ir::descr::path_hash("c1i::TwoRuntimeHosts");
-        let a = prebuilt_instance_desc(0xC110_0006, 0, type_id, false);
-        let b = prebuilt_instance_desc(0xC110_0007, 0, type_id, false);
+        let a = prebuilt_instance_desc(0, 0, type_id, false);
+        let b = prebuilt_instance_desc(1, 0, type_id, false);
         publish_kind0_size_then_stamp(&a);
         let tid = prebuilt_instance_tid(&a);
         assert_header_tid_is_stamped(tid, &a);
@@ -1919,7 +1992,7 @@ mod tests {
             gc.register_gcstruct_vtable(type_id, real_vtable, real_tid);
         }
 
-        let desc = prebuilt_instance_desc(0xC110_0004, 8, type_id, true);
+        let desc = prebuilt_instance_desc(0, 8, type_id, true);
         // heaptracker.setup_cache_gcstruct2vtable before get_size_descr.
         crate::jitcode_runtime::materialize_gccache_owned_descrs();
         let mut jcs = vec![jitcode_with_prebuilt("registered_vtable", desc.clone())];
@@ -1938,7 +2011,7 @@ mod tests {
     #[should_panic(expected = "no registered vtable")]
     fn materialize_prebuilt_instance_consts_panics_when_typeptr_header_has_no_vtable() {
         let type_id = majit_ir::descr::path_hash("c1i::MissingVtableEmpty");
-        let desc = prebuilt_instance_desc(0xC110_0005, 8, type_id, true);
+        let desc = prebuilt_instance_desc(0, 8, type_id, true);
         let mut jcs = vec![jitcode_with_prebuilt("missing_vtable", desc)];
         materialize_prebuilt_instance_consts(&mut jcs);
     }
@@ -1953,7 +2026,7 @@ mod tests {
             0,
             false,
         );
-        let desc = prebuilt_instance_desc(0xC110_0008, 0, type_id, false);
+        let desc = prebuilt_instance_desc(0, 0, type_id, false);
         // Collector-less materialize takes the raw branch and does not call
         // `prebuilt_instance_tid`. The layout check still lives there and
         // is reached with a collector (`prebuilt_empty_class_instance_addr`).
@@ -1963,7 +2036,7 @@ mod tests {
     #[test]
     fn materialize_prebuilt_instance_consts_unpublished_struct_without_collector_matches_new() {
         let type_id = majit_ir::descr::path_hash("c1i::UnpublishedPrebuilt");
-        let desc = prebuilt_instance_desc(0xC110_000B, 0, type_id, false);
+        let desc = prebuilt_instance_desc(0, 0, type_id, false);
         let mut jcs = vec![jitcode_with_prebuilt("unpublished", desc.clone())];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
@@ -1980,7 +2053,7 @@ mod tests {
             gc.register_gcstruct_vtable(type_id, real_vtable, real_tid);
         }
 
-        let desc = prebuilt_instance_desc(0xC110_000A, 8, type_id, true);
+        let desc = prebuilt_instance_desc(0, 8, type_id, true);
         // heaptracker.setup_cache_gcstruct2vtable before get_size_descr.
         crate::jitcode_runtime::materialize_gccache_owned_descrs();
         let mut jcs = vec![jitcode_with_prebuilt("vtable_before_new", desc.clone())];
@@ -2007,7 +2080,7 @@ mod tests {
         let type_id = majit_ir::descr::path_hash("c1i::RawFlavorEmpty");
         let desc = majit_jitcode::jitcode::PrebuiltInstanceConstDescriptor {
             constants_r_index: 0,
-            identity: 0xC110_00F1,
+            container_index: 0,
             size: 16,
             type_id,
             has_vtable: false,
@@ -2045,7 +2118,7 @@ mod tests {
             let mut gc = majit_ir::descr::gc_cache().lock();
             gc.register_gcstruct_vtable(type_id, real_vtable, 1);
         }
-        let desc = prebuilt_instance_desc(0xC110_00F2, 8, type_id, true);
+        let desc = prebuilt_instance_desc(0, 8, type_id, true);
         let mut jcs = vec![jitcode_with_prebuilt("truncated_path_hash", desc.clone())];
         materialize_prebuilt_instance_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();

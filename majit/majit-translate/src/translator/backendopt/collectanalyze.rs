@@ -203,6 +203,7 @@ mod tests {
     };
     use crate::translator::rtyper::lltypesystem::lltype;
     use crate::translator::translator::TranslationContext;
+    use indexmap::IndexMap;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -212,14 +213,14 @@ mod tests {
         let mut graph = FunctionGraph::new(name, start);
         graph.func = Some(GraphFunc::new(
             name,
-            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         ));
         Rc::new(RefCell::new(graph))
     }
 
     /// `flags={'flavor': 'gc'}` malloc op fixture.
     fn malloc_op(flavor: &str) -> SpaceOperation {
-        let mut flags = HashMap::new();
+        let mut flags = IndexMap::new();
         flags.insert(
             ConstValue::UniStr("flavor".to_string()),
             ConstValue::UniStr(flavor.to_string()),

@@ -29,7 +29,7 @@ use std::rc::Rc;
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::codewriter::call::{CallControl, CallKind};
 use crate::codewriter::jtransform_opname::lower_graph;
-use crate::flowspace::model::{ConstValue, FunctionGraph, Hlvalue};
+use crate::flowspace::model::{ConstValue, FunctionGraph, Hlvalue, host_env_callable};
 use crate::model::{CallTarget, OpKind, ValueType};
 use crate::parse::CallPath;
 use crate::policy::{DefaultJitPolicy, JitPolicy};
@@ -261,10 +261,11 @@ fn is_search_family_leaf(name: &str) -> bool {
     )
 }
 
-/// Stamp `func._name` to the `name__<argtypes>` leaf so
-/// `jtransform_opname::callee_name_from_funcptr` spells the same
-/// CallPath this walk registers. Builders still emit the unspecialized
-/// `func._name`; `cachedgraph` would have named the graph this way.
+/// `description.py FunctionDesc.cachedgraph` stamps `graph.name` to
+/// `name__<argtypes>` while the function object (and its oopspec) stays
+/// the unspecialized identity. Helper graphs this walk registers under
+/// that label are relabelled; a graphless funcptr and a HOST_ENV
+/// `rlib/jit.py` builtin keep `func._name`.
 fn specialize_direct_call_funcptr_names(graph: &FunctionGraph) {
     for block in graph.iterblocks() {
         for op in &mut block.borrow_mut().operations {
@@ -280,9 +281,29 @@ fn specialize_direct_call_funcptr_names(graph: &FunctionGraph) {
             let PtrObj::Strong(_ptr_obj::Func(func)) = &mut ptr._obj0 else {
                 continue;
             };
+            if func.graph.is_none() || host_env_jit_builtin_func(func) {
+                continue;
+            }
             func._name = specialized_callee_leaf(func);
         }
     }
+}
+
+/// HOST_ENV `majit_rlib.jit` / `jit` ExtRegistry identity
+/// (`host_env_callable`). `cachedgraph` alt_name is a label, not a
+/// new function object.
+fn host_env_jit_builtin_func(func: &_func) -> bool {
+    let segs: Vec<String> = func
+        ._name
+        .split("::")
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let jit_module = matches!(
+        segs.as_slice(),
+        [crate_name, module, ..] if crate_name == "majit_rlib" && module == "jit"
+    ) || matches!(segs.as_slice(), [module, ..] if module == "jit");
+    jit_module && host_env_callable(&segs).is_some()
 }
 
 /// The helper path for `ll_find`, minting and registering the graph on first use.
@@ -447,6 +468,9 @@ fn follow_regular_direct_call(cc: &CallControl, func: &_func) -> bool {
     if func.graph.is_none() {
         return false;
     }
+    if host_env_jit_builtin_func(func) {
+        return false;
+    }
     let name = unspecialized_helper_name(&func._name);
     let op = crate::model::SpaceOperation {
         result: None,
@@ -462,6 +486,31 @@ fn follow_regular_direct_call(cc: &CallControl, func: &_func) -> bool {
     }
 }
 
+/// `rlib/jit.py isconstant` / `isvirtual` body (`return NonConstant(False)`).
+/// `find_all_graphs` follows only `'regular'`, so this stays in
+/// `function_graphs` for `RaiseAnalyzer` and is not a jitcode candidate.
+fn register_host_env_jit_body_graph(
+    cc: &mut CallControl,
+    rtyper: &RPythonTyper,
+    func: &_func,
+    seen: &mut HashSet<usize>,
+) {
+    let Some(graph_id) = func.graph else {
+        return;
+    };
+    if !host_env_jit_builtin_func(func) {
+        return;
+    }
+    if !seen.insert(graph_id) {
+        return;
+    }
+    let Some(callee) = graph_ref_for_funcptr_id(rtyper, graph_id) else {
+        return;
+    };
+    let path = CallPath::from_segments(func._name.split("::").filter(|s| !s.is_empty()));
+    register_callee_graph(cc, path, &callee.borrow(), false);
+}
+
 fn visit_direct_call_callees(
     cc: &mut CallControl,
     rtyper: &RPythonTyper,
@@ -472,6 +521,7 @@ fn visit_direct_call_callees(
     specialize_direct_call_funcptr_names(graph);
     for func in direct_call_funcobjs(graph) {
         if !follow_regular_direct_call(cc, &func) {
+            register_host_env_jit_body_graph(cc, rtyper, &func, seen);
             continue;
         }
         let graph_id = func
@@ -1923,6 +1973,103 @@ mod tests {
             cc.is_candidate(&path),
             "_ll_list_resize_ge must be a candidate; registered {:?}",
             cc.function_graphs().keys()
+        );
+    }
+
+    /// `FunctionDesc.cachedgraph` labels the helper graph; the
+    /// `rlib/jit.py isconstant` funcobj keeps its unspecialized name so
+    /// `rewrite_op_direct_call` still hits `jit.isconstant`.
+    #[test]
+    fn specialize_keeps_isconstant_funcptr_name() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let prep = crate::rlib::rstring::build_twoway_preprocess_helper_graph(
+            &rtyper,
+            "_twoway_preprocess",
+            STRPTR.clone(),
+        )
+        .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge")
+            .clone();
+        drop(graphs);
+        let mut cc = CallControl::new();
+        register_direct_call_callees(&mut cc, &rtyper, &prep.graph.borrow());
+        let path = CallPath::from_segments(["_ll_list_resize_ge"]);
+        register_callee_graph(&mut cc, path, &ge.borrow(), true);
+
+        let mut isconstant_names = Vec::new();
+        for graph in ann.translator.graphs.borrow().iter() {
+            for func in direct_call_funcobjs(&graph.borrow()) {
+                let unspecialized = unspecialized_helper_name(&func._name);
+                if unspecialized.rsplit("::").next() == Some("isconstant") {
+                    isconstant_names.push(func._name.clone());
+                }
+            }
+        }
+        assert!(
+            isconstant_names
+                .iter()
+                .any(|name| name == "majit_rlib::jit::isconstant"),
+            "isconstant funcptr identity stays unspecialized, got {isconstant_names:?}"
+        );
+        assert!(
+            isconstant_names.iter().all(|name| !name.contains("__")),
+            "cachedgraph alt_name is not the isconstant funcobj, got {isconstant_names:?}"
+        );
+
+        let wrapper = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .find(|g| unspecialized_helper_name(&g.borrow().name) == "_ll_alloc_and_set_isconstant")
+            .expect("_ll_alloc_and_set_isconstant family graph")
+            .clone();
+        let model = lower_graph(&wrapper.borrow());
+        let calls: Vec<_> = model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => target.path_segments(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls
+                .iter()
+                .any(|segs| segs.as_slice() == ["majit_rlib", "jit", "isconstant"]),
+            "lower_graph still emits Call to jit.isconstant, got {calls:?}"
+        );
+
+        cc.mark_oopspec(
+            CallPath::from_segments(["majit_rlib", "jit", "isconstant"]),
+            "jit.isconstant".to_string(),
+        );
+        let rewritten = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&model);
+        assert!(
+            rewritten
+                .graph
+                .iter_blocks()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::IsConstant { .. })),
+            "rewrite_op_direct_call still rewrites jit.isconstant"
+        );
+
+        let isc_path = CallPath::from_segments(["majit_rlib", "jit", "isconstant"]);
+        assert!(
+            cc.has_function_graph(&isc_path),
+            "isconstant body graph is in function_graphs for RaiseAnalyzer"
+        );
+        assert!(
+            !cc.is_candidate(&isc_path),
+            "find_all_graphs follows only regular; isconstant is Builtin"
         );
     }
 }

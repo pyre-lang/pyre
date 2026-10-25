@@ -493,7 +493,7 @@ trait AssemblerEncode {
         bytes: Vec<u8>,
         precomputed_hash: i64,
         kind: StrConstKind,
-        container_id: Option<u64>,
+        container: Option<&crate::translator::rtyper::lltypesystem::lltype::_ptr>,
         state: &mut AssemblyState,
     ) -> u8;
 
@@ -601,6 +601,7 @@ impl AssemblerExt for Assembler {
             constants_r: Vec::new(),
             constants_f: Vec::new(),
             str_consts: Vec::new(),
+            str_const_live: Vec::new(),
             unit_variant_consts: Vec::new(),
             exc_instance_consts: Vec::new(),
             type_static_consts: Vec::new(),
@@ -608,6 +609,7 @@ impl AssemblerExt for Assembler {
             reloc_consts_r: Vec::new(),
             empty_array_consts: Vec::new(),
             prebuilt_instance_consts: Vec::new(),
+            prebuilt_instance_live: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -4186,13 +4188,7 @@ impl AssemblerEncode for Assembler {
             && let Some((bytes, hash)) =
                 crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
         {
-            return self.emit_str_const_r(
-                bytes,
-                hash,
-                StrConstKind::Str,
-                llptr_container_identity(p),
-                state,
-            );
+            return self.emit_str_const_r(bytes, hash, StrConstKind::Str, Some(p), state);
         }
         if let ConstValue::LLPtr(p) = value
             && let Some((utf8, stored_hash)) =
@@ -4219,7 +4215,7 @@ impl AssemblerEncode for Assembler {
                 unicode_const_bytes(&cells),
                 hash,
                 StrConstKind::Unicode,
-                llptr_container_identity(p),
+                Some(p),
                 state,
             );
         }
@@ -4293,29 +4289,34 @@ impl AssemblerEncode for Assembler {
     /// Record a prebuilt-string constant for runtime materialization and
     /// pool its sentinel, returning the `r`-bank register index.
     /// `assembler.py Assembler.emit_const` keys a GC ref by
-    /// `value._obj.container`; an `LLPtr` therefore dedups by that
-    /// container identity.  `container_id is None` is a Rust string
-    /// literal lowered directly (`ConstInternedStr`) with no container,
-    /// so those entries still share a slot by equal bytes and kind.
+    /// `value._obj.container` and keeps that object in `constants_dict` /
+    /// `constants_r`. An `LLPtr` therefore dedups by the live container
+    /// and the assembly retains the `_ptr` so its identity cannot be
+    /// reused while this assembler lives. The descriptor carries the
+    /// dense ordinal of that retained container, not a translator
+    /// address. `container is None` is a Rust string literal lowered
+    /// directly (`ConstInternedStr`) with no container, so those entries
+    /// still share a slot by equal bytes and kind.
     fn emit_str_const_r(
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
         kind: StrConstKind,
-        container_id: Option<u64>,
+        container: Option<&crate::translator::rtyper::lltypesystem::lltype::_ptr>,
         state: &mut AssemblyState,
     ) -> u8 {
-        let ordinal = if let Some(id) = container_id {
+        let container_index = container.map(|p| intern_live_str_container(self, p));
+        let ordinal = if let Some(idx) = container_index {
             state
                 .str_consts
                 .iter()
-                .position(|d| d.container_id == Some(id))
+                .position(|d| d.container_index == Some(idx))
         } else {
             // No `_obj.container`: a Rust string literal lowered directly.
             state
                 .str_consts
                 .iter()
-                .position(|d| d.container_id.is_none() && d.bytes == bytes && d.kind == kind)
+                .position(|d| d.container_index.is_none() && d.bytes == bytes && d.kind == kind)
         };
         if let Some(ordinal) = ordinal {
             return self.emit_const_r_bits(str_const_sentinel(ordinal), state);
@@ -4328,13 +4329,15 @@ impl AssemblerEncode for Assembler {
             constants_r_index + 1,
             "a fresh str-const sentinel must push a new constants_r slot"
         );
+        state.str_const_live.push(container.cloned());
         state.str_consts.push(StrConstDescriptor {
             constants_r_index,
             bytes,
             precomputed_hash,
             kind,
-            container_id,
+            container_index,
         });
+        debug_assert_eq!(state.str_const_live.len(), state.str_consts.len());
         reg
     }
 
@@ -4481,18 +4484,20 @@ impl AssemblerEncode for Assembler {
 
     /// Record a prebuilt empty-class instance for runtime materialization
     /// and pool its sentinel — [`Self::emit_str_const_r`]'s shape for
-    /// `InstanceRepr.convert_const_exact`. Identical HostObject identities
-    /// share one descriptor and one sentinel (`iprebuiltinstances[value]`,
-    /// `emit_const`'s `value_key = value._obj.container`).
+    /// `InstanceRepr.convert_const_exact`. Identical HostObjects share
+    /// one assembly-wide ordinal and one sentinel
+    /// (`iprebuiltinstances[value]`, `emit_const`'s
+    /// `value_key = value._obj.container`).
     fn emit_prebuilt_instance_const_r(
         &mut self,
         spec: EmptyClassPrebuilt,
         state: &mut AssemblyState,
     ) -> u8 {
+        let container_index = intern_live_prebuilt_instance(self, &spec.host);
         if let Some(ordinal) = state
             .prebuilt_instance_consts
             .iter()
-            .position(|d| d.identity == spec.identity)
+            .position(|d| d.container_index == container_index)
         {
             return self.emit_const_r_bits(prebuilt_instance_const_sentinel(ordinal), state);
         }
@@ -4520,17 +4525,22 @@ impl AssemblerEncode for Assembler {
             constants_r_index + 1,
             "a fresh prebuilt-instance sentinel must push a new constants_r slot"
         );
+        state.prebuilt_instance_live.push(spec.host);
         state
             .prebuilt_instance_consts
             .push(super::jitcode::PrebuiltInstanceConstDescriptor {
                 constants_r_index,
-                identity: spec.identity,
+                container_index,
                 size: spec.size,
                 type_id: spec.type_id,
                 has_vtable: spec.has_vtable,
                 is_gc_managed: spec.is_gc_managed,
                 headerless: spec.headerless,
             });
+        debug_assert_eq!(
+            state.prebuilt_instance_live.len(),
+            state.prebuilt_instance_consts.len()
+        );
         reg
     }
 
@@ -4669,7 +4679,9 @@ fn exc_instance_const_sentinel(ordinal: usize) -> i64 {
 
 /// `assembler.py Assembler.emit_const` `value_key = value._obj.container`
 /// — container identity of a live `_ptr`, not the pointer's own
-/// `_hashable_identity` counter.
+/// `_hashable_identity` counter. Valid only while `p` retains the
+/// container; the descriptor stores a dense ordinal instead of this
+/// address.
 fn llptr_container_identity(
     p: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
 ) -> Option<u64> {
@@ -4679,6 +4691,69 @@ fn llptr_container_identity(
         _ptr_obj::Array(a) => Some(a.identity() as u64),
         _ptr_obj::Opaque(o) => Some(o.identity() as u64),
         _ => None,
+    }
+}
+
+fn llptr_same_container(
+    a: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+    b: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> bool {
+    match (llptr_container_identity(a), llptr_container_identity(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Translate-side live containers for one [`Assembler`]
+/// (`assembler.py emit_const` `constants_dict`).
+struct LiveRefConsts {
+    str_containers: Vec<crate::translator::rtyper::lltypesystem::lltype::_ptr>,
+    prebuilt_instances: Vec<crate::flowspace::model::HostObject>,
+}
+
+fn live_ref_consts_mut(asm: &mut Assembler) -> &mut LiveRefConsts {
+    if asm.live_ref_consts.is_none() {
+        asm.live_ref_consts = Some(Box::new(LiveRefConsts {
+            str_containers: Vec::new(),
+            prebuilt_instances: Vec::new(),
+        }));
+    }
+    asm.live_ref_consts
+        .as_mut()
+        .expect("live_ref_consts")
+        .downcast_mut::<LiveRefConsts>()
+        .expect("LiveRefConsts")
+}
+
+fn intern_live_str_container(
+    asm: &mut Assembler,
+    p: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> u32 {
+    let live = live_ref_consts_mut(asm);
+    if let Some(i) = live
+        .str_containers
+        .iter()
+        .position(|q| llptr_same_container(q, p))
+    {
+        i as u32
+    } else {
+        let i = live.str_containers.len();
+        live.str_containers.push(p.clone());
+        i as u32
+    }
+}
+
+fn intern_live_prebuilt_instance(
+    asm: &mut Assembler,
+    host: &crate::flowspace::model::HostObject,
+) -> u32 {
+    let live = live_ref_consts_mut(asm);
+    if let Some(i) = live.prebuilt_instances.iter().position(|h| h == host) {
+        i as u32
+    } else {
+        let i = live.prebuilt_instances.len();
+        live.prebuilt_instances.push(host.clone());
+        i as u32
     }
 }
 
@@ -4697,7 +4772,7 @@ fn empty_array_host_object_name(obj: &crate::flowspace::model::HostObject) -> Op
 /// `has_gcstruct_a_vtable`; the size spec is the same
 /// `bh_size_spec_from_callcontrol` row `new` / `new_with_vtable` emit.
 struct EmptyClassPrebuilt {
-    identity: u64,
+    host: crate::flowspace::model::HostObject,
     size: usize,
     type_id: u64,
     has_vtable: bool,
@@ -4744,7 +4819,7 @@ fn empty_class_prebuilt_instance(
         return None;
     }
     Some(EmptyClassPrebuilt {
-        identity: obj.identity_id() as u64,
+        host: obj.clone(),
         size: spec.size,
         type_id: spec.type_id,
         has_vtable: crate::codewriter::heaptracker::callcontrol_has_vtable(cc, owner),
@@ -4763,6 +4838,10 @@ struct AssemblyState {
     /// [`JitCodeBody::str_consts`].  Parallel to `constants_r`: each entry
     /// owns the `constants_r` slot named by its `constants_r_index`.
     str_consts: Vec<StrConstDescriptor>,
+    /// Live `_ptr` for each [`Self::str_consts`] entry (`assembler.py`
+    /// `constants_r` / `constants_dict` retain `value._obj.container`).
+    /// `None` is a bytes-only literal with no container.
+    str_const_live: Vec<Option<crate::translator::rtyper::lltypesystem::lltype::_ptr>>,
     /// Unit-variant singleton constants recorded while assembling,
     /// committed to [`JitCodeBody::unit_variant_consts`]; same ownership
     /// contract as `str_consts`.
@@ -4782,8 +4861,11 @@ struct AssemblyState {
     empty_array_consts: Vec<super::jitcode::EmptyArrayConstDescriptor>,
     /// Prebuilt empty-class instances recorded while assembling,
     /// committed to [`JitCodeBody::prebuilt_instance_consts`]. Keyed by
-    /// HostObject identity (`convert_const_exact` / `emit_const`).
+    /// the live HostObject (`convert_const_exact` / `emit_const`).
     prebuilt_instance_consts: Vec<super::jitcode::PrebuiltInstanceConstDescriptor>,
+    /// Live HostObject for each [`Self::prebuilt_instance_consts`] entry
+    /// (`assembler.py` `constants_dict` retains `value._obj.container`).
+    prebuilt_instance_live: Vec<crate::flowspace::model::HostObject>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -8140,6 +8222,7 @@ mod tests {
             constants_r: Vec::new(),
             constants_f: Vec::new(),
             str_consts: Vec::new(),
+            str_const_live: Vec::new(),
             unit_variant_consts: Vec::new(),
             exc_instance_consts: Vec::new(),
             type_static_consts: Vec::new(),
@@ -8147,6 +8230,7 @@ mod tests {
             reloc_consts_r: Vec::new(),
             empty_array_consts: Vec::new(),
             prebuilt_instance_consts: Vec::new(),
+            prebuilt_instance_live: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -9339,7 +9423,6 @@ mod tests {
         let inst = class
             .reusable_prebuilt_instance()
             .expect("empty class instance");
-        let identity = inst.identity_id() as u64;
         let mut flat = SSARepr {
             name: "empty_class".into(),
             insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
@@ -9352,7 +9435,7 @@ mod tests {
         let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 1);
         let desc = &body.prebuilt_instance_consts[0];
-        assert_eq!(desc.identity, identity);
+        assert_eq!(desc.container_index, 0);
         assert_eq!(desc.size, 0);
         assert!(!desc.has_vtable);
         assert!(desc.is_gc_managed);
@@ -9414,7 +9497,6 @@ mod tests {
             .reusable_prebuilt_instance()
             .expect("same interned instance");
         assert_eq!(a.identity_id(), b.identity_id());
-        let identity = a.identity_id() as u64;
         let mut flat = SSARepr {
             name: "empty_class_dedup".into(),
             insns: vec![
@@ -9431,7 +9513,7 @@ mod tests {
         let mut asm = Assembler::new();
         let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 1);
-        assert_eq!(body.prebuilt_instance_consts[0].identity, identity);
+        assert_eq!(body.prebuilt_instance_consts[0].container_index, 0);
         assert_eq!(body.constants_r.len(), 1);
         assert_eq!(body.constants_r[0], prebuilt_instance_const_sentinel(0));
     }
@@ -9444,8 +9526,6 @@ mod tests {
         let a = HostObject::new_instance(class.clone(), Vec::new());
         let b = HostObject::new_instance(class, Vec::new());
         assert_ne!(a.identity_id(), b.identity_id());
-        let id_a = a.identity_id() as u64;
-        let id_b = b.identity_id() as u64;
         let mut flat = SSARepr {
             name: "empty_class_two_hosts".into(),
             insns: vec![
@@ -9462,8 +9542,8 @@ mod tests {
         let mut asm = Assembler::new();
         let body = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
         assert_eq!(body.prebuilt_instance_consts.len(), 2);
-        assert_eq!(body.prebuilt_instance_consts[0].identity, id_a);
-        assert_eq!(body.prebuilt_instance_consts[1].identity, id_b);
+        assert_eq!(body.prebuilt_instance_consts[0].container_index, 0);
+        assert_eq!(body.prebuilt_instance_consts[1].container_index, 1);
         assert_eq!(
             body.prebuilt_instance_consts[0].type_id,
             body.prebuilt_instance_consts[1].type_id
@@ -10147,7 +10227,7 @@ mod tests {
         let id1 = llptr_container_identity(&p1).expect("p1 container");
         let id2 = llptr_container_identity(&p2).expect("p2 container");
         assert_ne!(id1, id2, "uncached llstr allocates a fresh container");
-        let v1 = ConstValue::LLPtr(Box::new(p1));
+        let v1 = ConstValue::LLPtr(Box::new(p1.clone()));
         let v2 = ConstValue::LLPtr(Box::new(p2.clone()));
         let reg_a = asm.emit_const_r(&v1, &mut state, None);
         let reg_a2 = asm.emit_const_r(&v1, &mut state, None);
@@ -10164,9 +10244,67 @@ mod tests {
             state
                 .str_consts
                 .iter()
-                .map(|d| d.container_id)
+                .map(|d| d.container_index)
                 .collect::<Vec<_>>(),
-            vec![Some(id1), Some(id2)]
+            vec![Some(0), Some(1)]
+        );
+        assert_eq!(state.str_const_live.len(), 2);
+        assert!(
+            llptr_same_container(state.str_const_live[0].as_ref().unwrap(), &p1),
+            "assembly retains the first container"
+        );
+        assert!(
+            llptr_same_container(state.str_const_live[1].as_ref().unwrap(), &p2),
+            "assembly retains the second container"
+        );
+    }
+
+    #[test]
+    fn emit_const_r_same_container_across_jitcodes_shares_one_ordinal() {
+        use crate::translator::rtyper::lltypesystem::rstr::llstr;
+        let mut asm = Assembler::new();
+        let p = llstr(b"hello").expect("llstr");
+        let v = ConstValue::LLPtr(Box::new(p.clone()));
+        let mut state_a = empty_state();
+        asm.emit_const_r(&v, &mut state_a, None);
+        let mut state_b = empty_state();
+        asm.emit_const_r(&v, &mut state_b, None);
+        assert_eq!(state_a.str_consts.len(), 1);
+        assert_eq!(state_b.str_consts.len(), 1);
+        assert_eq!(state_a.str_consts[0].container_index, Some(0));
+        assert_eq!(state_b.str_consts[0].container_index, Some(0));
+        let live = asm
+            .live_ref_consts
+            .as_ref()
+            .and_then(|b| b.downcast_ref::<LiveRefConsts>())
+            .expect("live_ref_consts");
+        assert_eq!(live.str_containers.len(), 1);
+        assert!(llptr_same_container(&live.str_containers[0], &p));
+    }
+
+    #[test]
+    fn emit_const_r_retains_container_after_input_drops() {
+        use crate::translator::rtyper::lltypesystem::rstr::llstr;
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        let id = {
+            let p = llstr(b"keep-alive").expect("llstr");
+            let id = llptr_container_identity(&p).expect("container");
+            let v = ConstValue::LLPtr(Box::new(p));
+            asm.emit_const_r(&v, &mut state, None);
+            id
+        };
+        let live = state.str_const_live[0].as_ref().expect("retained _ptr");
+        assert_eq!(llptr_container_identity(live), Some(id));
+        let asm_live = asm
+            .live_ref_consts
+            .as_ref()
+            .and_then(|b| b.downcast_ref::<LiveRefConsts>())
+            .expect("live_ref_consts");
+        assert_eq!(asm_live.str_containers.len(), 1);
+        assert_eq!(
+            llptr_container_identity(&asm_live.str_containers[0]),
+            Some(id)
         );
     }
 
@@ -12063,11 +12201,7 @@ mod tests {
         let p = graph
             .push_op_var(
                 graph.startblock,
-                OpKind::RawMalloc {
-                    owner: owner.into(),
-                    zero,
-                    length: None,
-                },
+                OpKind::raw_malloc(owner, zero, None),
                 true,
             )
             .expect("raw malloc result");

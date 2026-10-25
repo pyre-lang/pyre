@@ -38,6 +38,7 @@
 //!   those entry types must first be added as new `ExtRegistryEntry`
 //!   enum variants before `findbltintyper` can route them.
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1664,7 +1665,7 @@ fn rtype_hint_with(hop: &HighLevelOp, pairs: &[(&str, bool)]) -> RTypeResult {
             TyperError::message("rtype_hint: argument has no concretetype".to_string())
         })?,
     };
-    let mut hints = HashMap::new();
+    let mut hints = IndexMap::new();
     for (key, value) in pairs {
         hints.insert(ConstValue::byte_str(*key), ConstValue::Bool(*value));
     }
@@ -1739,7 +1740,7 @@ pub(super) fn rtype_jit_force_virtualizable(
         LowLevelType::Void,
     )));
     vlist.push(Hlvalue::Constant(Constant::with_concretetype(
-        ConstValue::Dict(std::sync::Arc::new(std::collections::HashMap::new())),
+        ConstValue::Dict(std::sync::Arc::new(indexmap::IndexMap::new())),
         LowLevelType::Void,
     )));
     // This is a call returning None, not an operation with an impossible
@@ -3868,7 +3869,7 @@ pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RType
         }
     };
 
-    let mut flags_map = HashMap::new();
+    let mut flags_map = IndexMap::new();
     // upstream: flags = {'flavor': 'gc'}
     flags_map.insert(
         ConstValue::ByteStr(b"flavor".to_vec()),
@@ -4033,7 +4034,7 @@ pub fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeRe
             "rtype_free: assertion `v_flavor.value == 'raw'` failed (got {flavor_value:?})"
         )));
     }
-    let mut flags_map = HashMap::new();
+    let mut flags_map = IndexMap::new();
     flags_map.insert(
         ConstValue::ByteStr(b"flavor".to_vec()),
         ConstValue::ByteStr(b"raw".to_vec()),
@@ -4117,7 +4118,7 @@ pub fn rtype_free_non_gc_object(
             "rtype_free_non_gc_object: assertion `flavor != 'gc'` failed".to_string(),
         ));
     }
-    let mut flags_map = HashMap::new();
+    let mut flags_map = IndexMap::new();
     flags_map.insert(
         ConstValue::ByteStr(b"flavor".to_vec()),
         ConstValue::ByteStr(flavor_str.as_bytes().to_vec()),

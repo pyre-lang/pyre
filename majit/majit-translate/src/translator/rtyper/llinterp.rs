@@ -1441,7 +1441,7 @@ mod tests {
         };
         let flavor_c = || {
             Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::sync::Arc::new(
-                std::collections::HashMap::new(),
+                indexmap::IndexMap::new(),
             ))))
         };
         let int_c = |n: i64| Hlvalue::Constant(FlowConstant::new(ConstValue::Int(n)));
@@ -1511,7 +1511,7 @@ mod tests {
             char_array,
         ))));
         let flavor_c = Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::sync::Arc::new(
-            std::collections::HashMap::new(),
+            indexmap::IndexMap::new(),
         ))));
         let neg_len = Hlvalue::Constant(FlowConstant::new(ConstValue::Int(-1)));
 

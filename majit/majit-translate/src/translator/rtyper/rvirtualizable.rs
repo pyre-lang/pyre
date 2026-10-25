@@ -157,7 +157,7 @@ mod tests {
     use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
 
     fn force_op(vable: &Variable, access_directly: bool) -> SpaceOperation {
-        let mut flags = HashMap::new();
+        let mut flags = indexmap::IndexMap::new();
         if access_directly {
             flags.insert(
                 ConstValue::byte_str("access_directly"),

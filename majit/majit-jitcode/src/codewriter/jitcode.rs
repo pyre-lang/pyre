@@ -84,8 +84,9 @@ pub enum StrConstKind {
 /// boxed `W_UnicodeObject`) is materialized at jitcode-load time (the
 /// build-time translator cannot allocate it; see
 /// [`JitCodeBody::str_consts`]).  The content key is `bytes` when
-/// [`Self::container_id`] is `None`; otherwise the assembler keyed by
-/// `value._obj.container` (`assembler.py Assembler.emit_const`).
+/// [`Self::container_index`] is `None`; otherwise the assembler keyed by
+/// `value._obj.container` (`assembler.py Assembler.emit_const`) and this
+/// is that container's dense ordinal in the assembly that retained it.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StrConstDescriptor {
     /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
@@ -106,11 +107,13 @@ pub struct StrConstDescriptor {
     /// [`StrConstKind::Str`].
     #[serde(default)]
     pub kind: StrConstKind,
-    /// `assembler.py Assembler.emit_const` `value._obj.container` identity.
-    /// `None` is a bytes-only literal (`ConstInternedStr`) with no
-    /// container; the runtime then intern-keys by `(bytes, kind)`.
+    /// Dense ordinal of `value._obj.container` in the assembly that
+    /// emitted this descriptor (`assembler.py Assembler.emit_const`
+    /// `constants_dict` keys the container object). `None` is a
+    /// bytes-only literal (`ConstInternedStr`) with no container; the
+    /// runtime then intern-keys by `(bytes, kind)`.
     #[serde(default)]
-    pub container_id: Option<u64>,
+    pub container_index: Option<u32>,
 }
 
 /// Little-endian UCS-4 cells stored in [`StrConstDescriptor::bytes`]
@@ -251,16 +254,18 @@ pub struct EmptyArrayConstDescriptor {
 /// instance. Layout (`size` / `type_id` / `has_vtable` / `is_gc_managed` /
 /// `headerless`) is resolved at assembly from the registered size spec
 /// (`rewrite_op_malloc`'s `new_with_vtable` vs `new`); the intern key is
-/// the source HostObject's identity (`convert_const_exact`'s
-/// `iprebuiltinstances`).
+/// the source HostObject's dense ordinal in the assembly that retained
+/// it (`convert_const_exact`'s `iprebuiltinstances`, `emit_const`'s
+/// `constants_dict`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PrebuiltInstanceConstDescriptor {
     /// Position in [`JitCodeBody::constants_r`] holding the sentinel.
     pub constants_r_index: usize,
-    /// `HostObject::identity_id`. Distinct HostObjects of one class stay
+    /// Dense ordinal of the source HostObject in the assembly that
+    /// emitted this descriptor. Distinct HostObjects of one class stay
     /// distinct objects; one HostObject referenced from several jitcodes
-    /// resolves to one object.
-    pub identity: u64,
+    /// of the same assembly resolves to one object.
+    pub container_index: u32,
     /// Payload size of `create_instance`'s `self.object_type`.
     pub size: usize,
     /// Size-descr STRUCT identity (`BhSizeSpec.type_id`). Runtime looks

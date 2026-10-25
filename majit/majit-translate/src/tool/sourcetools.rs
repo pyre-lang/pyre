@@ -277,7 +277,7 @@ mod tests {
         // Upstream `sourcetools.py func_with_new_name(func,
         // newname, globals=None)`: `Some(globals)` replaces the
         // function's `__globals__` on the renamed copy.
-        let mut original_globals = std::collections::HashMap::new();
+        let mut original_globals = indexmap::IndexMap::new();
         original_globals.insert(
             ConstValue::byte_str("__name__"),
             ConstValue::byte_str("orig.mod"),
@@ -287,7 +287,7 @@ mod tests {
             Constant::new(ConstValue::Dict(std::sync::Arc::new(original_globals))),
         );
 
-        let mut new_globals_map = std::collections::HashMap::new();
+        let mut new_globals_map = indexmap::IndexMap::new();
         new_globals_map.insert(
             ConstValue::byte_str("__name__"),
             ConstValue::byte_str("override.mod"),

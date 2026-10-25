@@ -6628,7 +6628,9 @@ mod tests {
         )));
         let mut func = GraphFunc::new(
             "py_func",
-            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(
+                indexmap::IndexMap::new(),
+            ))),
         );
         func._llfnobjattrs_
             .insert("_name".to_string(), ConstValue::byte_str("forced_name"));

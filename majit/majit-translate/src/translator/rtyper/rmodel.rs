@@ -57,8 +57,8 @@
 
 #![allow(private_interfaces)]
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -249,7 +249,7 @@ pub(crate) fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
 pub(crate) fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
-    let flags = HashMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"))]);
+    let flags = IndexMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"))]);
     HighLevelOp::inputconst(
         &LowLevelType::Void,
         &ConstValue::Dict(std::sync::Arc::new(flags)),

@@ -684,10 +684,16 @@ pub(crate) fn remap_op_kind(
         OpKind::RawMalloc {
             owner,
             zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
             length,
         } => OpKind::RawMalloc {
             owner: owner.clone(),
             zero: *zero,
+            track_allocation: *track_allocation,
+            add_memory_pressure: *add_memory_pressure,
+            extra_flags: extra_flags.clone(),
             length: length.as_ref().map(remap_var),
         },
         OpKind::RawFree { ptr } => OpKind::RawFree {

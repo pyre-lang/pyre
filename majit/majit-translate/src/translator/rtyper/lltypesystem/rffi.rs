@@ -7,6 +7,7 @@
 //! deferred until the corresponding RPython platform/type metadata is ported.
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -823,7 +824,7 @@ fn raw_flavor_no_track_const() -> Result<Hlvalue, TyperError> {
         clippy::mutable_key_type,
         reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
     )]
-    let flags = HashMap::from([
+    let flags = IndexMap::from([
         (ConstValue::byte_str("flavor"), ConstValue::byte_str("raw")),
         (
             ConstValue::byte_str("track_allocation"),
@@ -873,7 +874,7 @@ fn signed_ccharp_dict_repr(rtyper: Rc<RPythonTyper>) -> Result<OrderedDictRepr, 
 fn convert_fq_raw_copies_const(repr: &OrderedDictRepr) -> Result<Hlvalue, TyperError> {
     let host = {
         let fq = _fq_addr_from_string.lock();
-        let mut items = HashMap::new();
+        let mut items = IndexMap::new();
         for (k, ptr) in fq.raw_copies.iter() {
             items.insert(
                 ConstValue::Int(*k as i64),

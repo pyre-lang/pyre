@@ -6,6 +6,7 @@
 //! initially; downstream simplification passes arrive with the
 //! rtyper port.
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::{
@@ -2381,7 +2382,7 @@ impl<'a> ListComprehensionDetector<'a> {
             }
             found.expect("lost 'iter' operation")
         };
-        let mut hint_items = HashMap::new();
+        let mut hint_items = IndexMap::new();
         hint_items.insert(
             ConstValue::byte_str(if exactlength {
                 "maxlength"
@@ -2428,7 +2429,7 @@ impl<'a> ListComprehensionDetector<'a> {
                     continue;
                 };
                 let mut hints =
-                    HashMap::from([(ConstValue::byte_str("fence"), ConstValue::Bool(true))]);
+                    IndexMap::from([(ConstValue::byte_str("fence"), ConstValue::Bool(true))]);
                 if exactlength
                     && BlockKey::of(block) == BlockKey::of(&loopnextblock)
                     && stopblocks

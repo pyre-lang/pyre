@@ -1105,18 +1105,27 @@ pub enum OpKind {
     /// `lltype.malloc(T, flavor='raw')` for a fixed-size struct, or
     /// `malloc_varsize` with `flavor='raw'` when `length` is set.
     ///
-    /// `jtransform.py _rewrite_raw_malloc` turns this into a residual
-    /// direct call of `raw_malloc_fixedsize` (the `_zero` helper when
-    /// `zero` is set) or `raw_malloc_varsize` when `length` carries the
-    /// item count (`rewrite_op_malloc_varsize`). `TYPE.OF == lltype.Char`
-    /// takes `OS_RAW_MALLOC_VARSIZE_CHAR`. The result is a Signed
-    /// address. The MIR front end emits the fixed-size form when a call
-    /// passes `&` / `&mut` of a primitive into a raw scalar-pointer
-    /// parameter: the borrow aliases the word, and `history.py` `getkind`
-    /// of that parameter is the address.
+    /// `jtransform.py _rewrite_raw_malloc` reads the flags dict
+    /// `op.args[1].value` (`flavor`, `zero`, `track_allocation`,
+    /// `add_memory_pressure`) and residualizes `raw_malloc_fixedsize`
+    /// / `raw_malloc_varsize` with the matching suffix. `TYPE.OF ==
+    /// lltype.Char` takes `OS_RAW_MALLOC_VARSIZE_CHAR`. The result is a
+    /// Signed address. The MIR front end emits the fixed-size form when
+    /// a call passes `&` / `&mut` of a primitive into a raw
+    /// scalar-pointer parameter: the borrow aliases the word, and
+    /// `history.py` `getkind` of that parameter is the address.
     RawMalloc {
         owner: String,
+        /// `flags['zero']`; default false.
         zero: bool,
+        /// `flags.get('track_allocation', True)`.
+        track_allocation: bool,
+        /// `flags.get('add_memory_pressure', False)`.
+        add_memory_pressure: bool,
+        /// Remaining flag names after the ones `_rewrite_raw_malloc`
+        /// pops. Empty in the normal case; a leftover panics
+        /// (`UnsupportedMallocFlags`).
+        extra_flags: Vec<String>,
         /// `op.args[2]` of `malloc_varsize`; `None` for fixed-size `malloc`.
         /// `rewrite_op_malloc_varsize` passes this as the argument of
         /// `raw_malloc_varsize`.
@@ -1889,6 +1898,39 @@ pub enum OpKind {
         ty: ValueType,
         value: Option<crate::flowspace::model::ConstValue>,
     },
+}
+
+impl OpKind {
+    /// `lltype.malloc(..., flavor='raw')` with the defaults
+    /// `_rewrite_raw_malloc` uses: `track_allocation=True`,
+    /// `add_memory_pressure=False`, no leftover flags.
+    pub fn raw_malloc(
+        owner: impl Into<String>,
+        zero: bool,
+        length: Option<crate::flowspace::model::Variable>,
+    ) -> Self {
+        Self::raw_malloc_with_flags(owner, zero, true, false, Vec::new(), length)
+    }
+
+    /// `lltype.malloc(..., flavor='raw')` carrying the flags dict
+    /// `_rewrite_raw_malloc` pops from `op.args[1].value`.
+    pub fn raw_malloc_with_flags(
+        owner: impl Into<String>,
+        zero: bool,
+        track_allocation: bool,
+        add_memory_pressure: bool,
+        extra_flags: Vec<String>,
+        length: Option<crate::flowspace::model::Variable>,
+    ) -> Self {
+        OpKind::RawMalloc {
+            owner: owner.into(),
+            zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
+            length,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

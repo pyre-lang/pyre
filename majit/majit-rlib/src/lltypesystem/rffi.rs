@@ -12,7 +12,7 @@
 //! erased managed object.
 
 use parking_lot::Mutex;
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -27,21 +27,30 @@ const RAW_BLOCK_ALIGN: usize = std::mem::align_of::<u128>();
 /// `support.py ll_raw_malloc_varsize_char`. A zero-size request still returns
 /// a distinct address.
 #[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
-#[majit_macros::dont_look_inside_cannot_raise]
+#[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_char(size: usize) -> usize {
     // The size is kept in front of the block so `raw_free(ptr)` can rebuild
-    // the layout `dealloc` needs.
-    let total = size.saturating_add(RAW_BLOCK_ALIGN);
-    let layout = Layout::from_size_align(total, RAW_BLOCK_ALIGN)
-        .unwrap_or_else(|_| handle_alloc_error(Layout::new::<u128>()));
+    // the layout `dealloc` needs. Overflow or a failed `alloc` is
+    // MemoryError (`ll_raw_malloc_varsize_char` can raise).
+    let Some(total) = size.checked_add(RAW_BLOCK_ALIGN) else {
+        return raw_malloc_char_memory_error();
+    };
+    let Ok(layout) = Layout::from_size_align(total, RAW_BLOCK_ALIGN) else {
+        return raw_malloc_char_memory_error();
+    };
     unsafe {
         let base = alloc(layout);
         if base.is_null() {
-            handle_alloc_error(layout);
+            return raw_malloc_char_memory_error();
         }
         (base as *mut usize).write(total);
         base as usize + RAW_BLOCK_ALIGN
     }
+}
+
+fn raw_malloc_char_memory_error() -> usize {
+    majit_gc::raise_memory_error();
+    0
 }
 
 /// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw', zero=True)` —
@@ -50,13 +59,60 @@ pub fn raw_malloc_varsize_char(size: usize) -> usize {
 /// attaches `OS_RAW_MALLOC_VARSIZE_CHAR`. `size` is a byte count; for
 /// `Array(Char)` that is the item count `n`.
 #[majit_macros::oopspec("raw_malloc_varsize_zero(size)")]
-#[majit_macros::dont_look_inside_cannot_raise]
+#[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_zero(size: usize) -> usize {
+    raw_malloc_varsize_char_impl(size, true, false)
+}
+
+fn raw_malloc_varsize_char_impl(size: usize, zero: bool, add_memory_pressure: bool) -> usize {
+    if add_memory_pressure && size > 0 {
+        majit_gc::add_memory_pressure(size as isize, majit_ir::GcRef::NULL);
+    }
     let ptr = raw_malloc_varsize_char(size);
-    if size > 0 {
+    if ptr != 0 && zero && size > 0 {
         unsafe { (ptr as *mut u8).write_bytes(0, size) };
     }
     ptr
+}
+
+/// `_rewrite_raw_malloc` `name += '_add_memory_pressure'` on the CHAR path.
+#[majit_macros::oopspec("raw_malloc_varsize_char_add_memory_pressure(size)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_add_memory_pressure(size: usize) -> usize {
+    raw_malloc_varsize_char_impl(size, false, true)
+}
+
+/// `_rewrite_raw_malloc` `_zero` + `_add_memory_pressure` on the CHAR path.
+#[majit_macros::oopspec("raw_malloc_varsize_zero_add_memory_pressure(size)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_add_memory_pressure(size: usize) -> usize {
+    raw_malloc_varsize_char_impl(size, true, true)
+}
+
+/// `_rewrite_raw_malloc` `name += '_no_track_allocation'` on the CHAR path.
+/// `track_allocation` is a debug tracker; the allocation is the same.
+#[majit_macros::oopspec("raw_malloc_varsize_char_no_track_allocation(size)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_no_track_allocation(size: usize) -> usize {
+    raw_malloc_varsize_char(size)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_no_track_allocation(size)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_no_track_allocation(size: usize) -> usize {
+    raw_malloc_varsize_zero(size)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_add_memory_pressure_no_track_allocation(size)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_add_memory_pressure_no_track_allocation(size: usize) -> usize {
+    raw_malloc_varsize_char_add_memory_pressure(size)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_add_memory_pressure_no_track_allocation(size)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_add_memory_pressure_no_track_allocation(size: usize) -> usize {
+    raw_malloc_varsize_zero_add_memory_pressure(size)
 }
 
 /// `lltype.free(ptr, flavor='raw')` — `support.py ll_raw_free`. Frees a block
