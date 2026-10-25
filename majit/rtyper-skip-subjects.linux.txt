@@ -1987,6 +1987,7 @@ two-phase-rtype-skipped	pyre_interpreter::pyopcode::execute_return_value
 two-phase-rtype-skipped	pyre_interpreter::type_methods::complex_component_spec
 two-phase-rtype-skipped	pyre_interpreter::type_methods::padded_byte_len
 two-phase-rtype-skipped	pyre_jit::eval::exit_frame_handler_needs_unwritten_stack
+two-phase-rtype-skipped	pyre_jit::eval::exit_frame_handler_needs_unwritten_stack__AccessDirect_None
 two-phase-rtype-skipped	pyre_module::module::mmap::interp_mmap::mmap_get_attr_i64::<Impl>::call_once
 two-phase-rtype-skipped	pyre_object::kwargsdict::<Impl>::copy
 two-phase-rtype-skipped	pyre_object::quasiimmut::<Impl>::new

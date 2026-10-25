@@ -549,9 +549,15 @@ impl CallRegistry {
     /// function `HostObject` (Arc-identical to the one
     /// `bookkeeper.descs` already keys, so `getdesc` resolves to the
     /// same `FunctionDesc`/cachedgraph) under the method name on the
-    /// interned class object.  Free functions register as
-    /// `[module, fn]` with a lowercase module segment that is never a
-    /// registry root, so the membership gate filters them out.
+    /// interned class object.  A `cachedgraph` alt_name alias
+    /// (`{method}__AccessDirect_None`) names a specialized graph on
+    /// the desc, not a class attribute
+    /// (`description.py FunctionDesc.cachedgraph`,
+    /// `classdesc.py ClassDesc.find_source_for`), so those aliases
+    /// are skipped; canonical `entries` keys are walked unchanged.
+    /// Free functions register as `[module, fn]` with a lowercase
+    /// module segment that is never a registry root, so the
+    /// membership gate filters them out.
     ///
     /// Called once from `dual_gate_registry` after
     /// `populate_call_registry_from_call_graphs`.
@@ -598,6 +604,14 @@ impl CallRegistry {
             Vec::with_capacity(entries.len() + aliases.len());
         sorted_entries.extend(entries.iter());
         for (alias_key, canonical_key) in aliases.iter() {
+            // A `cachedgraph` alt_name names a specialized graph on the desc,
+            // not a class attribute (`description.py FunctionDesc.cachedgraph`,
+            // `classdesc.py ClassDesc.find_source_for`).
+            if alias_key.segments().last().is_some_and(|leaf| {
+                leaf.ends_with(crate::codewriter::call::ACCESS_DIRECT_ALT_SUFFIX)
+            }) {
+                continue;
+            }
             if let Some(entry) = entries.get(canonical_key) {
                 sorted_entries.push((alias_key, entry));
             }
@@ -2541,5 +2555,34 @@ mod tests {
         registry.alias(earlier.clone(), &canonical);
         let keys = registry.keys_for_entry(&canonical);
         assert_eq!(keys, vec![canonical, earlier, alias]);
+    }
+
+    /// A `cachedgraph` alt_name names a specialized graph on the desc
+    /// (`description.py FunctionDesc.cachedgraph`); it is never a
+    /// member of `cls.__dict__` (`classdesc.py ClassDesc.find_source_for`).
+    #[test]
+    fn seed_struct_root_method_members_skips_access_direct_alt_name() {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "Owner".to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
+        let registry = CallRegistry::new(bk);
+        registry.set_struct_fields(Rc::new(fields));
+        let canonical = FunctionPathKey::from_segments(["Owner", "method"]);
+        registry.get_or_register(canonical.clone(), signature(&["self"]));
+        let alias = FunctionPathKey::from_segments(["Owner", "method__AccessDirect_None"]);
+        registry.alias(alias, &canonical);
+        registry.seed_struct_root_method_members();
+        let class_host = registry.bookkeeper().intern_class_by_qualname("Owner");
+        assert!(
+            class_host.class_get("method").is_some(),
+            "canonical method must be a class attribute"
+        );
+        assert!(
+            class_host.class_get("method__AccessDirect_None").is_none(),
+            "cachedgraph alt_name must not be a class attribute"
+        );
     }
 }
