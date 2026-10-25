@@ -46,5 +46,97 @@ def main():
     print('surrogate', getattr(C, chr(0xD800)))
     print('retained', Retained.b)
 
+    class ProbeDict(dict):
+        def __getitem__(self, key):
+            if key in ("__classcell__", "__classdictcell__"):
+                raise RuntimeError("probed " + str(key))
+            return super().__getitem__(key)
+
+        def __missing__(self, key):
+            if key in ("__classcell__", "__classdictcell__"):
+                raise RuntimeError("missing " + str(key))
+            raise KeyError(key)
+
+    class ProbeMeta(type):
+        @classmethod
+        def __prepare__(mcs, name, bases):
+            return ProbeDict()
+
+        def __new__(mcs, name, bases, ns):
+            return "sentinel"
+
+    class Probe(metaclass=ProbeMeta):
+        def method(self):
+            return super()
+
+    print('probe', Probe)
+
+    class SetNameDesc:
+        def __set_name__(self, owner, name):
+            print("set_name", owner.probe())
+
+    class SetNameOwner:
+        d = SetNameDesc()
+
+        def probe():
+            return __class__.__name__
+
+    class NonTypeMeta(type):
+        def __new__(mcs, name, bases, ns):
+            return ns["method"]
+
+    class NonTypeOwner(metaclass=NonTypeMeta):
+        def method(self):
+            return __class__
+
+    try:
+        NonTypeOwner(None)
+        print('non_type_cell', 'filled')
+    except NameError as exc:
+        print('non_type_cell', type(exc).__name__)
+
+    try:
+        class D(object, object):
+            __classcell__ = 1
+        print('dup_classcell', 'ok')
+    except Exception as exc:
+        print('dup_classcell', type(exc).__name__)
+
+    class Stash:
+        stashed = locals()
+
+        def method(self):
+            return __class__
+
+    print('classcell_in_stashed', '__classcell__' in Stash.stashed)
+
+    class CellMutDesc:
+        def __set_name__(self, owner, name):
+            owner.method.__closure__[0].cell_contents = 123
+
+    try:
+        class CellMut:
+            d = CellMutDesc()
+
+            def method(self):
+                return __class__
+        print('set_name_cell', 'ok')
+    except Exception as exc:
+        print('set_name_cell', type(exc).__name__)
+
+    class CellMutSDesc:
+        def __set_name__(self, owner, name):
+            owner.method.__closure__[0].cell_contents = "s"
+
+    try:
+        class CellMutS:
+            d = CellMutSDesc()
+
+            def method(self):
+                return __class__
+        print('set_name_cell_s', 'ok')
+    except Exception as exc:
+        print('set_name_cell_s', type(exc).__name__)
+
 
 main()

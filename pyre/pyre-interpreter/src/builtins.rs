@@ -7366,16 +7366,30 @@ pub(crate) fn type_new_take_qualname(w_type: PyObjectRef, ns: PyObjectRef) -> cr
     Ok(pyre_object::w_none())
 }
 
-/// `type_new_set_classcell` / `type_new_set_classdictcell` refuse a namespace
-/// entry that is not a cell.  The offending type is spelled with `%.200R`, so
-/// a metaclass `__repr__` renders it — and when that repr raises,
-/// `_PyErr_FormatV` returns without setting the `TypeError`, leaving the
-/// repr's own exception in its place.
-pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyError {
-    // `%.200R` clips the rendering at 200 code points.
+/// `%.200R`: `__repr__` clipped at 200 code points. A raising `__repr__`
+/// is returned as-is (`_PyErr_FormatV` leaves it in place).
+pub(crate) fn py_repr_clipped_200(
+    obj: PyObjectRef,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     const MAX_REPR_CODE_POINTS: usize = 200;
+    let rendered = unsafe { crate::display::py_repr_wtf8(obj) }?;
+    let mut clipped = rustpython_wtf8::Wtf8Buf::new();
+    for point in rendered.code_points().take(MAX_REPR_CODE_POINTS) {
+        clipped.push(point);
+    }
+    Ok(clipped)
+}
+
+/// [3.15-spec] `typeobject.py _store_type_in_classcell` formats the
+/// offending type with `%T` (`not int`). `typeobject.c type_new_set_classcell`
+/// (and `type_new_set_classdictcell`) use `%.200R` of `Py_TYPE(cell)`
+/// (`not <class 'int'>`; a metaclass `__repr__` returning `"custom-repr"`
+/// yields `not custom-repr`). Artefact: v3.15.1 `Objects/typeobject.c` plus
+/// a 3.15.1t measurement. A raising `__repr__` leaves that exception in
+/// place: `_PyErr_FormatV` returns without setting the TypeError.
+pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyError {
     let rendered = match crate::typedef::r#type(value) {
-        Some(w_valtype) => match unsafe { crate::display::py_repr_wtf8(w_valtype.as_ptr()) } {
+        Some(w_valtype) => match py_repr_clipped_200(w_valtype.as_ptr()) {
             Ok(rendered) => rendered,
             Err(error) => return error,
         },
@@ -7384,13 +7398,9 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
             crate::error::type_name_of(value)
         )),
     };
-    let mut clipped = rustpython_wtf8::Wtf8Buf::new();
-    for point in rendered.code_points().take(MAX_REPR_CODE_POINTS) {
-        clipped.push(point);
-    }
     crate::PyError::type_error(crate::display::wtf8_format!(
         format!("{key} must be a nonlocal cell, not "),
-        clipped
+        rendered
     ))
 }
 
