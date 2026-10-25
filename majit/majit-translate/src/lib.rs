@@ -2069,6 +2069,12 @@ fn analyze_pipeline_from_module_paths(
             None => provider.get_struct_layout(struct_name),
         };
         if let Some(mut layout) = layout {
+            if let Some(align) = exact.and_then(|item| {
+                item.align
+                    .or_else(|| item.host.as_ref().map(|host| host.align))
+            }) {
+                layout.align = align as usize;
+            }
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }

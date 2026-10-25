@@ -5141,9 +5141,8 @@ enum FieldLayoutResolution {
 
 /// Resolution order of the `fielddescrof` mint: `bh_field_lookup` (Parent /
 /// Layout), then `heuristic_field_layout`, then `scalar_word`.
-/// `require_mutate_field_resolved` panics only on `Unresolved`.
-/// `descr.py get_field_descr` / `getattr(STRUCT, fieldname)` raise only
-/// when the field does not exist.
+/// `require_mutate_field_resolved` accepts only Parent / Layout, matching
+/// `descr.py get_field_descr` / `symbolic.get_field_token` (`llmemory.offsetof`).
 fn resolve_field_layout(
     cc: &CallControl,
     field: &crate::model::FieldDescriptor,
@@ -5178,7 +5177,9 @@ fn resolve_field_layout(
 /// still mints offset 0; only a mutate operand of
 /// `record_quasiimmut_field` / `jit_force_quasi_immutable` is required.
 ///
-/// Uses `resolve_field_layout`, the same order `fielddescrof` mints with.
+/// Uses `resolve_field_layout`. Only a Parent / Layout hit is a real
+/// `symbolic.get_field_token` offset; Heuristic is a size-as-align walk
+/// and is not `llmemory.offsetof`.
 fn require_mutate_field_resolved(
     callcontrol: Option<&CallControl>,
     mutate_field: &crate::model::FieldDescriptor,
@@ -5188,9 +5189,9 @@ fn require_mutate_field_resolved(
     let Some(cc) = callcontrol else {
         return;
     };
-    if !matches!(
+    if matches!(
         resolve_field_layout(cc, mutate_field),
-        FieldLayoutResolution::Unresolved
+        FieldLayoutResolution::Parent(_) | FieldLayoutResolution::Layout(_)
     ) {
         return;
     }
@@ -6007,11 +6008,12 @@ fn fielddescrof(
                 majit_ir::descr::path_hash_for_gc_kind(owner, false)
             };
         }
-        // `resolve_field_layout` is the same order `require_mutate_field_resolved`
-        // judges: `bh_field_lookup` (Parent / Layout), then
-        // `heuristic_field_layout`, then `scalar_word`. The Layout arm still
-        // runs `transparent_scalar_field` here so a one-word newtype stays a
-        // leaf load.
+        // `resolve_field_layout` mints in this order: `bh_field_lookup`
+        // (Parent / Layout), then `heuristic_field_layout`, then
+        // `scalar_word`. `require_mutate_field_resolved` accepts only
+        // Parent / Layout (`descr.py get_field_descr`). The Layout arm
+        // still runs `transparent_scalar_field` here so a one-word
+        // newtype stays a leaf load.
         let resolution = resolve_field_layout(cc, field);
         let mut found_parent_field = matches!(resolution, FieldLayoutResolution::Parent(_));
         match resolution {
@@ -6304,24 +6306,34 @@ fn heuristic_field_layout(
 )> {
     let fields = cc.struct_field_entries(owner)?;
     let mut offset = 0usize;
+    let word = crate::layout::target_word_size();
     for row in fields {
         let name = &row.name;
         let type_str = &row.ty;
-        let (flag, field_type, mut field_size) = if cc.is_known_struct(type_str) {
+        let (flag, field_type, mut field_size, align) = if cc.is_known_struct(type_str) {
+            let (size, align) = match cc.struct_layout_for(type_str) {
+                Some(layout) => (layout.size, layout.align.max(1)),
+                None => (word, word.max(1)),
+            };
             (
                 majit_ir::descr::ArrayFlag::Struct,
                 majit_ir::value::Type::Ref,
-                cc.struct_layout_for(type_str)
-                    .map(|layout| layout.size)
-                    .unwrap_or(std::mem::size_of::<usize>()),
+                size,
+                align,
             )
         } else {
-            type_flag_from_str(type_str, &cc.raw_alloc_flavor_structs)
+            let (flag, field_type, field_size) =
+                type_flag_from_str(type_str, &cc.raw_alloc_flavor_structs);
+            (
+                flag,
+                field_type,
+                field_size,
+                scalar_align(field_size).max(1),
+            )
         };
         if field_type == majit_ir::value::Type::Void || field_size == 0 {
             continue;
         }
-        let align = scalar_align(field_size);
         offset = (offset + align - 1) & !(align - 1);
         if name == field_name {
             return Some((
@@ -10657,10 +10669,14 @@ mod tests {
     /// Owner known only through `struct_field_entries`, with an embedded
     /// `mutate_value` whose layout is registered separately. The parent's
     /// flattened descrs hold `mutate_value.ptr` / `mutate_value.lock`, so
-    /// `bh_field_lookup` misses and `heuristic_field_layout` supplies the
-    /// offset. `descr.py get_field_descr` / `getattr(STRUCT, fieldname)`
-    /// succeed when that field exists.
+    /// `bh_field_lookup` misses and only `heuristic_field_layout` would
+    /// supply an offset. `descr.py get_field_descr` /
+    /// `symbolic.get_field_token` require the real layout; Heuristic is
+    /// not `llmemory.offsetof`.
     #[test]
+    #[should_panic(
+        expected = "the hidden field must be named mutate_<name> (rclass.py InstanceRepr._setup_repr)"
+    )]
     fn record_quasiimmut_field_assembles_when_heuristic_resolves_embedded_mutate() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
         use crate::model::{FieldDescriptor, ImmutableRank};
@@ -10744,30 +10760,54 @@ mod tests {
             .expect("heuristic_field_layout must find the embedded mutate_value row");
         assert_ne!(heuristic_offset, 0);
 
-        let asm = assemble_quasiimmut_field_read(owner, "value", cc);
-        assert!(
-            asm.insns.contains_key("record_quasiimmut_field/rdd"),
-            "expected key record_quasiimmut_field/rdd, got {:?}",
-            asm.insns.keys().collect::<Vec<_>>()
+        let _ = assemble_quasiimmut_field_read(owner, "value", cc);
+    }
+
+    /// wasm32-shaped `{ u32 a; Watcher {size 8, align 4} mutate_x }`.
+    /// `symbolic.get_field_token` / `llmemory.offsetof` place the watcher
+    /// at 4; `scalar_align(8)` would round it to 8.
+    #[test]
+    fn heuristic_field_layout_uses_embedded_struct_recorded_align() {
+        use crate::call::{CallControl, StructLayout};
+
+        let owner = "assembler_heuristic_align_test::Outer";
+        let watcher = "assembler_heuristic_align_test::Watcher";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let watcher_id = majit_ir::descr::StructId::from_canonical(watcher);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (watcher.to_string(), Some(watcher_id)),
+            ]));
+
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("a".to_string(), "u32".to_string()),
+                ("mutate_x".to_string(), watcher.to_string()),
+            ],
         );
-        let mutate_offsets: Vec<usize> = asm
-            .snapshot_descrs()
-            .into_iter()
-            .filter_map(|descr| match descr {
-                crate::jitcode::BhDescr::Field {
-                    name,
-                    owner,
-                    offset,
-                    ..
-                } if owner == QUASIIMMUT_EMBEDDED_OWNER && name == "mutate_value" => Some(offset),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            mutate_offsets,
-            vec![heuristic_offset],
-            "mutate descr must carry the heuristic offset, not 0"
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(struct_fields);
+        cc.set_known_struct_names([watcher.to_string()].into_iter().collect());
+        cc.set_struct_layout(
+            watcher_id,
+            StructLayout {
+                size: 8,
+                align: 4,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: Vec::new(),
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
         );
+
+        let (offset, size, ..) = heuristic_field_layout(&cc, owner, "mutate_x")
+            .expect("heuristic_field_layout must find mutate_x");
+        assert_eq!(size, 8);
+        assert_eq!(offset, 4);
     }
 
     /// Watcher listed under another name (`size_watchers`) while the
