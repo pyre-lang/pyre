@@ -658,22 +658,28 @@ pub struct Transformer<'a> {
     /// (`jtransform.py` populates with `Variable` objects).
     vable_flags: std::collections::HashMap<crate::flowspace::model::Variable, VableFlags>,
     /// Value aliases from identity rewrites (same_as / hint rewriting).
+    /// RPython `optimize_block` `renamings` Var→Var subset.
     aliases: std::collections::HashMap<
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
     >,
-    /// `optimize_block` `renamings_constants` (`jtransform.py`): `{Var: Const}`
-    /// subset of `do_rename`. `rewrite_op_same_as` / the record_exact_value
-    /// helper result is that Constant. `do_renaming` substitutes it into
-    /// every later `LinkArg` operand; Variable-only slots keep the result,
-    /// which `materialize_const_result` defines once at the rename.
+    /// RPython `optimize_block` `renamings_constants` — `{Var: Const}` only.
+    /// Void keys are stored for after-rewrite LinkArg slots and skipped
+    /// before `rewrite_operation` (`do_rename` early-return).
+    /// `rewrite_op_same_as` / the record_exact_value helper result is that
+    /// Constant. LinkArg slots become Const; Variable-only slots keep the
+    /// result, which `materialize_const_result` defines once at the rename.
     /// Exit `LinkArg`s and `follow_constant_exit` read the same map.
     /// Cleared at the start of every `optimize_block` (`renamings_constants = {}`):
     /// a later block sees a fresh inputarg and the Constant already on the link.
-    const_aliases: std::collections::HashMap<
+    renamings_constants: std::collections::HashMap<
         crate::flowspace::model::Variable,
         crate::flowspace::model::Constant,
     >,
+    /// Ops as `rewrite_operation` saw them (constants-only rename, no
+    /// Var→Var). Tests assert the upstream order.
+    #[cfg(test)]
+    rewrite_input_ops: Vec<SpaceOperation>,
     /// Source GC pointer of each `cast_ptr_to_int` result.  Rust spells
     /// `lltype.cast_opaque_ptr` as `p as usize as *mut T`; the second
     /// cast folds back to this source (`rewrite_op_cast_opaque_ptr`).
@@ -797,7 +803,7 @@ enum VirtualizableGetset {
 /// — prepend the constant-injection ops that `decode_builtin_call`'s
 /// `NormalizedArg::ConstInt(v)` slots required, in front of the
 /// downstream rewrite result.  No-op when no ConstInt slot was
-/// materialised.  `Identity` / `Keep` are passed through unchanged
+/// materialised.  `Identity` / `Constant` / `Keep` are passed through unchanged
 /// (downstream consumers of those variants do not observe the
 /// materialised Variables — only `Replace` branches receive the
 /// `effective_args` list).
@@ -824,10 +830,21 @@ enum RewriteResult {
     /// Remove the op (identity/alias: result remaps to the given Variable).
     /// RPython `jtransform.py rewrite_op_same_as` returns `op.args[0]`
     /// directly; pyre wraps it in this enum so the caller can fold the
-    /// alias into the rename map.
+    /// alias into the rename map. `optimize_block` `None` return.
     Identity(crate::flowspace::model::Variable),
+    /// Fold the result to a Constant. `optimize_block` `isinstance(op1, Constant)`.
+    /// Production rewrites Identity a `Const*` producer Variable; this
+    /// arm is hit by the test fold `__test_fold_to_const_int`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Constant(crate::flowspace::model::Constant),
     /// Keep the op unchanged
     Keep,
+}
+
+/// `optimize_block.do_rename(var, var_or_const)` target.
+enum RenameTarget {
+    Var(crate::flowspace::model::Variable),
+    Const(crate::flowspace::model::Constant),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1163,28 +1180,20 @@ fn gc_ref_store_base_and_value(
 /// `ptr::null[_mut]()` / `PY_NULL` builtin the `rtype_ptr_null` arm has
 /// not yet folded. `rewrite.py handle_write_barrier_setarrayitem` skips
 /// `COND_CALL_GC_WB` for `is_null_constant`.
+///
+/// `LinkArg::Const` is the slot `_do_renaming(renamings_constants)` can
+/// fill; a Variable defined by a `Const*` op is the SSA encoding of a
+/// flow Constant and is recovered through [`renamed_constant_of`].
 fn link_arg_is_null_ref(graph: &FunctionGraph, arg: &LinkArg) -> bool {
-    let LinkArg::Value(variable) = arg else {
-        return false;
-    };
-    graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|def| {
-            def.result.as_ref() == Some(variable)
-                && match &def.kind {
-                    OpKind::ConstRefNull => true,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        args,
-                        result_ty,
-                    } => {
-                        args.is_empty()
-                            && is_null_ptr_result(result_ty)
-                            && resolves_to_null_ptr_builtin(segments)
-                    }
-                    _ => false,
-                }
-        })
-    })
+    match arg {
+        LinkArg::Const(c) => ConstKind::from_constant(c).is_null_ref(),
+        LinkArg::Value(variable) => {
+            let aliases = std::collections::HashMap::new();
+            let constants = std::collections::HashMap::new();
+            renamed_constant_of(graph, variable, &aliases, &constants)
+                .is_some_and(|kind| kind.is_null_ref())
+        }
+    }
 }
 
 /// Ops `rewrite_op_direct_call` / `optimize_block` drop as `same_as` —
@@ -1501,41 +1510,36 @@ fn split_args_by_kind(
 /// `jtransform.py _rewrite_cmp_ptrs` (`rewrite_op_ptr_eq` /
 /// `rewrite_op_ptr_ne`): a pointer compared against NULL is the unary
 /// `ptr_iszero` / `ptr_nonzero` test over the other operand, not a
-/// two-operand `ptr_eq`.  Pyre's front materialises NULL as a Variable
-/// defined by [`OpKind::ConstRefNull`], so the constant is found through its
-/// definition.  The unary form is what `optimize_goto_if_not` fuses into
-/// `goto_if_not_ptr_iszero`, which the walker answers from the heap cache
-/// without recording once the nullity is known; `ptr_eq(x, NULL)` fused into
-/// `goto_if_not_ptr_eq` still recorded `ptr_eq` + `guard_false` per test.
+/// two-operand `ptr_eq`.  The frontend materialises NULL as a Variable
+/// defined by [`OpKind::ConstRefNull`], so the constant is found through
+/// [`renamed_constant_of`] (`isinstance(arg, Constant)` after
+/// `renamings_constants`).  The unary form is what `optimize_goto_if_not`
+/// fuses into `goto_if_not_ptr_iszero`, which the walker answers from the
+/// heap cache without recording once the nullity is known; `ptr_eq(x, NULL)`
+/// fused into `goto_if_not_ptr_eq` still recorded `ptr_eq` + `guard_false`
+/// per test.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn null_test_rewrite(
     graph: &FunctionGraph,
     op: &SpaceOperation,
     eq: bool,
     lhs: &crate::flowspace::model::Variable,
     rhs: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
 ) -> Option<RewriteResult> {
-    // The block under rewrite still holds its original operations, so a NULL
-    // defined there is the `ptr::null[_mut]()` / `PY_NULL` call the
-    // `rtype_ptr_null` arm of `rewrite_op_direct_call` has not yet folded.
     let is_null_const = |variable: &crate::flowspace::model::Variable| {
-        graph.blocks.iter().any(|block| {
-            block.operations.iter().any(|def| {
-                def.result.as_ref() == Some(variable)
-                    && match &def.kind {
-                        OpKind::ConstRefNull => true,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            args,
-                            result_ty,
-                        } => {
-                            args.is_empty()
-                                && is_null_ptr_result(result_ty)
-                                && resolves_to_null_ptr_builtin(segments)
-                        }
-                        _ => false,
-                    }
-            })
-        })
+        renamed_constant_of(graph, variable, aliases, constants)
+            .is_some_and(|kind| kind.is_null_ref())
     };
     let operand = if is_null_const(rhs) {
         lhs
@@ -1544,82 +1548,306 @@ fn null_test_rewrite(
     } else {
         return None;
     };
+    Some(rewrite_ptr_null_equality(op, eq, operand))
+}
+
+/// `_rewrite_equality` / `rewrite_op_ptr_eq` unary form. The result is
+/// `lltype.Bool` so `optimize_goto_if_not` can fuse it (`rtype_is_None`,
+/// `ptr_iszero`).
+fn rewrite_ptr_null_equality(
+    op: &SpaceOperation,
+    eq: bool,
+    operand: &crate::flowspace::model::Variable,
+) -> RewriteResult {
     if let Some(result) = &op.result {
         result.set_concretetype(Some(
             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
         ));
     }
-    Some(RewriteResult::Replace(vec![SpaceOperation {
+    RewriteResult::Replace(vec![SpaceOperation {
         result: op.result.clone(),
         kind: OpKind::UnaryOp {
             op: if eq { "ptr_iszero" } else { "ptr_nonzero" }.into(),
             operand: operand.clone(),
             result_ty: ValueType::Int,
         },
-    }]))
+    }])
 }
 
-/// Pyre's frontend materialises source constants as SSA Variables. Recover
-/// the upstream `Constant`/`Variable` distinction at the graph boundary.
+/// A flow-graph `Constant` (`jtransform.py` `isinstance(v, Constant)`).
+///
+/// The frontend materialises source constants as SSA Variables produced by
+/// a `Const*` op (or a 0-arg null builtin Call the `rtype_ptr_null` arm
+/// rewrites to `ConstRefNull`). After `optimize_block` applies only
+/// `renamings_constants` before rewrite, an Identity (`same_as` / cast) of
+/// that producer is still a Variable; this is the Constant that rewrite
+/// would see if the operand slot could hold one.
+enum ConstKind {
+    /// Payload `_rewrite_equality` / null tests read off `Constant.value`.
+    Value(crate::flowspace::model::ConstValue),
+    /// Other source Constants (`ConstFnAddr`, `__str_const`, …) that
+    /// `promote_greens` / `_rewrite_symmetric` skip as `isinstance(Constant)`.
+    Other,
+}
+
+impl ConstKind {
+    fn from_constant(c: &crate::flowspace::model::Constant) -> Self {
+        Self::Value(c.value.clone())
+    }
+
+    /// `jtransform.py _rewrite_equality`: `not arg.value`.
+    fn is_falsy(&self) -> bool {
+        match self {
+            Self::Value(value) => const_value_is_falsy(value),
+            Self::Other => false,
+        }
+    }
+
+    /// Null pointer constant (`lltype.nullptr` / `ConstRefNull`).
+    fn is_null_ref(&self) -> bool {
+        match self {
+            Self::Value(value) => const_value_is_null_ref(value),
+            Self::Other => false,
+        }
+    }
+}
+
+fn const_value_is_falsy(value: &crate::flowspace::model::ConstValue) -> bool {
+    use crate::flowspace::model::ConstValue;
+    match value {
+        ConstValue::Int(0)
+        | ConstValue::UInt(0)
+        | ConstValue::Int128(0)
+        | ConstValue::UInt128(0)
+        | ConstValue::Bool(false)
+        | ConstValue::None => true,
+        ConstValue::LLAddress(addr) => !addr.nonzero(),
+        ConstValue::LLPtr(p) => !p.nonzero(),
+        _ => false,
+    }
+}
+
+fn const_value_is_null_ref(value: &crate::flowspace::model::ConstValue) -> bool {
+    use crate::flowspace::model::ConstValue;
+    match value {
+        ConstValue::None => true,
+        ConstValue::LLAddress(addr) => !addr.nonzero(),
+        ConstValue::LLPtr(p) => !p.nonzero(),
+        _ => false,
+    }
+}
+
+fn defining_op<'a>(
+    graph: &'a FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> Option<&'a SpaceOperation> {
+    graph.blocks.iter().find_map(|block| {
+        block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(variable))
+    })
+}
+
+/// `Const*` / null-builtin producer of `variable` with no Identity chase.
+/// Live-var scans (`autodetect_jit_markers_redvars`, `jit_merge_point`)
+/// use this: `isinstance(v, Variable)` does not follow `same_as`.
+fn defining_const_kind(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+) -> Option<ConstKind> {
+    const_kind_of_op(&defining_op(graph, variable)?.kind)
+}
+
+fn const_kind_of_op(kind: &OpKind) -> Option<ConstKind> {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::_address;
+    let value = match kind {
+        OpKind::ConstInt(n) => ConstValue::Int(*n),
+        OpKind::ConstUInt(n) => ConstValue::UInt(*n),
+        OpKind::ConstInt128(n) => ConstValue::Int128(*n),
+        OpKind::ConstUInt128(n) => ConstValue::UInt128(*n),
+        OpKind::ConstBool(b) => ConstValue::Bool(*b),
+        OpKind::ConstFloat(bits) => ConstValue::Float(*bits),
+        OpKind::ConstStr(bytes) | OpKind::ConstInternedStr(bytes) => {
+            ConstValue::ByteStr(bytes.clone())
+        }
+        OpKind::ConstRef(obj) => ConstValue::HostObject(obj.clone()),
+        OpKind::ConstRefNull => ConstValue::None,
+        OpKind::ConstNone => ConstValue::None,
+        OpKind::ConstRefAddr(addr) => ConstValue::LLAddress(_address::IntCast(*addr)),
+        OpKind::ConstFnAddr { .. } | OpKind::ConstSymbolic { .. } | OpKind::ConstSingleFloat(_) => {
+            return Some(ConstKind::Other);
+        }
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty,
+        } if args.is_empty()
+            && is_null_ptr_result(result_ty)
+            && resolves_to_null_ptr_builtin(segments) =>
+        {
+            ConstValue::None
+        }
+        OpKind::Call { target, .. } => match target {
+            CallTarget::FunctionPath { segments, .. }
+                if segments.first().is_some_and(|s| s == "__str_const")
+                    || crate::model::fn_const_segments(target).is_some() =>
+            {
+                return Some(ConstKind::Other);
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(ConstKind::Value(value))
+}
+
+/// Identity (`same_as` / cast) operand still in the residual graph.
+fn identity_operand(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Variable> {
+    match &defining_op(graph, var)?.kind {
+        OpKind::UnaryOp { op, operand, .. } if is_same_as_identity_unary(op) => {
+            Some(operand.clone())
+        }
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if is_same_as_identity_call_path(segments) => {
+            args.iter().find_map(LinkArg::as_variable).cloned()
+        }
+        _ => None,
+    }
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn follow_identity_producer(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+) -> crate::flowspace::model::Variable {
+    let mut cur = resolve_alias(var, aliases);
+    for _ in 0..32 {
+        let Some(src) = identity_operand(graph, &cur) else {
+            break;
+        };
+        let next = resolve_alias(&src, aliases);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// `jtransform.py` `isinstance(v, Constant)` as rewrite sees the operand
+/// after `_do_renaming(renamings_constants)`.
+///
+/// A Variable defined by a `Const*` op is the SSA encoding of a flow
+/// Constant. BinOp slots cannot hold `LinkArg::Const`, so this chases
+/// `renamings` / `renamings_constants` and the Identity chain in the
+/// residual graph to that producer.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn renamed_constant_of(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
+) -> Option<ConstKind> {
+    if let Some(c) = constants.get(variable) {
+        return Some(ConstKind::from_constant(c));
+    }
+    let resolved = resolve_alias(variable, aliases);
+    if resolved != *variable
+        && let Some(c) = constants.get(&resolved)
+    {
+        return Some(ConstKind::from_constant(c));
+    }
+    let producer = follow_identity_producer(graph, &resolved, aliases);
+    defining_const_kind(graph, &producer)
+}
+
+/// Recover the upstream `Constant`/`Variable` distinction at the graph
+/// boundary without chasing Identity. `isinstance(v, Variable)` on a
+/// live-var scan.
 fn is_source_constant_variable(
     graph: &FunctionGraph,
     variable: &crate::flowspace::model::Variable,
 ) -> bool {
-    graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            if op.result.as_ref() != Some(variable) {
-                return false;
-            }
-            match &op.kind {
-                OpKind::ConstInt(_)
-                | OpKind::ConstFnAddr { .. }
-                | OpKind::ConstUInt(_)
-                | OpKind::ConstBool(_)
-                | OpKind::ConstFloat(_)
-                | OpKind::ConstStr(_)
-                | OpKind::ConstInternedStr(_)
-                | OpKind::ConstRef(_)
-                | OpKind::ConstRefNull
-                | OpKind::ConstNone
-                | OpKind::ConstRefAddr(_) => true,
-                OpKind::Call { target, .. } => match target {
-                    CallTarget::FunctionPath { segments, .. } => {
-                        segments.first().is_some_and(|s| s == "__str_const")
-                            || crate::model::fn_const_segments(target).is_some()
-                    }
-                    _ => false,
-                },
-                _ => false,
-            }
-        })
-    })
+    defining_const_kind(graph, variable).is_some()
 }
 
-/// jtransform.py `_rewrite_equality`'s `not arg.value` test.
-///
-/// Upstream reads the value straight off the `Constant`; pyre's front end
-/// materialises source constants as SSA Variables produced by a `Const*`
-/// operation, so the value has to be fetched from that producer.  The zeros
-/// are one per register class: `Signed` / `Unsigned` / `Bool` for `'i'` and
-/// the null pointer for `'r'`.  `ConstNone` is deliberately absent — it is a
-/// `lltype.Void` constant, not a null pointer, and never reaches an operand
-/// position.
-fn is_falsy_source_constant(
+/// After `optimize_block` stops remapping Var→Var before rewrite, a
+/// `same_as` of a `Const*` producer is still a Variable. Follow
+/// `renamings` / `renamings_constants` so `_rewrite_symmetric` and
+/// `_rewrite_equality` still see `isinstance(Constant)`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn is_renamed_source_constant(
     graph: &FunctionGraph,
     variable: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
 ) -> bool {
-    graph.blocks.iter().any(|block| {
-        block.operations.iter().any(|op| {
-            op.result.as_ref() == Some(variable)
-                && matches!(
-                    op.kind,
-                    OpKind::ConstInt(0)
-                        | OpKind::ConstUInt(0)
-                        | OpKind::ConstBool(false)
-                        | OpKind::ConstRefNull
-                )
-        })
-    })
+    renamed_constant_of(graph, variable, aliases, constants).is_some()
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn is_renamed_falsy_constant(
+    graph: &FunctionGraph,
+    variable: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
+) -> bool {
+    renamed_constant_of(graph, variable, aliases, constants).is_some_and(|kind| kind.is_falsy())
+}
+
+/// `jtransform.py Transformer.optimize_block.do_rename`:
+/// `value = lltype._cast_whatever(var.concretetype, value)` then
+/// `renamings_constants[var] = Constant(value, var.concretetype)`.
+fn recast_renamed_constant(
+    var: &crate::flowspace::model::Variable,
+    c: crate::flowspace::model::Constant,
+) -> crate::flowspace::model::Constant {
+    match var.concretetype() {
+        Some(ct) => crate::flowspace::model::Constant::with_concretetype(c.value, ct),
+        None => c,
+    }
 }
 
 /// jtransform.py `_rewrite_symmetric` — "rewrite 'c1+v2' into 'v2+c1' in an
@@ -1631,7 +1859,10 @@ fn is_falsy_source_constant(
 /// `ptr_ne`.  Because it is a whole-operation rewrite rather than one arm of
 /// a dispatch, pyre runs it as a normalisation over the operation on its way
 /// into `rewrite_operation`; the arms that follow therefore never have to
-/// consider a constant left-hand operand.
+/// consider a constant left-hand operand. BinOp operands cannot hold a
+/// `Constant`, so `renamings` / `renamings_constants` recover
+/// `isinstance(op.args[0], Constant)` after Var→Var renaming moves after
+/// rewrite.
 ///
 /// The opnames are pyre's front-end labels (`front::mir::canonical_binop_label`
 /// leaves comparisons bare and prefixes nothing), plus the already-typed
@@ -1639,7 +1870,22 @@ fn is_falsy_source_constant(
 /// comparisons are renamed to their mirror when the operands swap; the
 /// symmetric ops keep their name, which is upstream's
 /// `.get(op.opname, op.opname)` default.
-fn rewrite_symmetric(graph: &FunctionGraph, op: SpaceOperation) -> SpaceOperation {
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn rewrite_symmetric(
+    graph: &FunctionGraph,
+    op: SpaceOperation,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
+) -> SpaceOperation {
     let OpKind::BinOp {
         op: binop_name,
         lhs,
@@ -1653,7 +1899,9 @@ fn rewrite_symmetric(graph: &FunctionGraph, op: SpaceOperation) -> SpaceOperatio
         return op;
     }
     // `isinstance(op.args[0], Constant) and isinstance(op.args[1], Variable)`
-    if !is_source_constant_variable(graph, lhs) || is_source_constant_variable(graph, rhs) {
+    if !is_renamed_source_constant(graph, lhs, aliases, constants)
+        || is_renamed_source_constant(graph, rhs, aliases, constants)
+    {
         return op;
     }
     SpaceOperation {
@@ -1838,6 +2086,12 @@ fn collect_unsigned_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64
 /// shifted value is (`lloperation.py` `uint_rshift` count stays signed).
 /// `eq`/`ne` and wrapping add/sub/mul stay `int_*`. `uint_floordiv` /
 /// `uint_mod` are not emitted (`blackhole.py` has neither).
+///
+/// `original` is the block op before any rename. After the
+/// `optimize_block` order matches `jtransform.py`, rewrite input equals
+/// that op except Var→Const on LinkArg slots; unsignedness is still
+/// read off `original` because identity aliases must not drop a
+/// `r_uint` annotation.
 fn prefix_unsigned_binop(
     original: &SpaceOperation,
     op: SpaceOperation,
@@ -2873,7 +3127,9 @@ impl<'a> Transformer<'a> {
             vable_array_vars: std::collections::HashMap::new(),
             vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
-            const_aliases: std::collections::HashMap::new(),
+            renamings_constants: std::collections::HashMap::new(),
+            #[cfg(test)]
+            rewrite_input_ops: Vec::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
@@ -3035,6 +3291,44 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// `jtransform.py Transformer.optimize_block.do_rename`.
+    fn do_rename(&mut self, var: crate::flowspace::model::Variable, target: RenameTarget) {
+        if FunctionGraph::concretetype_of(&var) == crate::model::ConcreteType::Void {
+            self.renamings_constants
+                .insert(var.clone(), void_none_constant());
+            if let RenameTarget::Var(v) = target {
+                self.aliases.insert(var, resolve_alias(&v, &self.aliases));
+            }
+            return;
+        }
+        match target {
+            RenameTarget::Var(v) => {
+                // Copy Const through alias only when the rename TARGET is
+                // already in `renamings_constants` (Identity of a
+                // `RewriteResult::Constant` / Void). Identity of a `Const*`
+                // producer aliases to that producer: BinOp/WB slots cannot
+                // hold Const, and Call rewrite drops Const args
+                // (`call_arg_vars`).
+                if let Some(c) = self.renamings_constants.get(&v).cloned() {
+                    let recast = recast_renamed_constant(&var, c);
+                    self.renamings_constants.insert(var, recast);
+                    return;
+                }
+                let resolved = resolve_alias(&v, &self.aliases);
+                if let Some(c) = self.renamings_constants.get(&resolved).cloned() {
+                    let recast = recast_renamed_constant(&var, c);
+                    self.renamings_constants.insert(var, recast);
+                    return;
+                }
+                self.aliases.insert(var, resolved);
+            }
+            RenameTarget::Const(c) => {
+                let recast = recast_renamed_constant(&var, c);
+                self.renamings_constants.insert(var, recast);
+            }
+        }
+    }
+
     /// RPython: Transformer.optimize_block()
     fn optimize_block(
         &mut self,
@@ -3058,7 +3352,12 @@ impl<'a> Transformer<'a> {
         // only to the block that filled it.
         self.vable_array_vars.clear();
         self.vable_flags.clear();
-        self.const_aliases.clear();
+        // `renamings_constants` is rebound per block (`optimize_block`).
+        // `renamings` (`self.aliases`) stays graph-wide: Variable identity
+        // is unique across the graph.
+        self.renamings_constants.clear();
+        #[cfg(test)]
+        self.rewrite_input_ops.clear();
 
         let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
@@ -3069,39 +3368,61 @@ impl<'a> Transformer<'a> {
         // is upstream's unbound name: the loop body never ran, so there is no
         // last operation and the elision test below does not apply.
         let mut count_before_last_operation = None;
+        let no_aliases = std::collections::HashMap::new();
         for original_op in &original_ops {
-            // Captured before `remap_op`: a preceding `same_as` has already
-            // been aliased onto the original pointer, whose concretetype
-            // is not the array item type the `same_as` result carried.
+            // Front-emitted pointer of this `direct_ptradd`. Rewrite now
+            // sees original variables, so this is the same operand the
+            // rewrite reads except when a LinkArg was a Var→Const rename.
+            // The item type still lives here when a preceding `same_as`
+            // result carries `TO.OF`.
             self.direct_ptradd_type_arg = direct_ptradd_type_arg(original_op);
             self.pct_x_rhs_before_alias = match &original_op.kind {
                 OpKind::BinOp { op, rhs, .. } if op == "mod" => Some(rhs.clone()),
                 _ => None,
             };
-            let op = remap_op(original_op, &self.aliases);
-            // `jtransform.py`: `if renamings_constants: op = self._do_renaming(renamings_constants, op)`
-            // before `rewrite_operation`.
-            let op = do_renaming(op, &self.const_aliases);
+            // `_do_renaming(renamings_constants, op)` before
+            // `rewrite_operation`: Var→Const only, skipping Void.
+            let op = remap_op_renamings(
+                original_op,
+                &no_aliases,
+                Some((&self.renamings_constants, false)),
+            );
             self.hook_access_field(original_op, &op, graph_name, graph);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
-            let op = rewrite_symmetric(graph, op);
+            let op = rewrite_symmetric(graph, op, &self.aliases, &self.renamings_constants);
             let op = prefix_unsigned_binop(original_op, op, &self.unsigned_vars);
+            #[cfg(test)]
+            self.rewrite_input_ops.push(op.clone());
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
             count_before_last_operation = Some(new_ops.len());
             match rewritten {
                 RewriteResult::Replace(ops) => {
-                    new_ops.extend(ops);
+                    new_ops.extend(ops.iter().map(|op1| {
+                        remap_op_renamings(
+                            op1,
+                            &self.aliases,
+                            Some((&self.renamings_constants, true)),
+                        )
+                    }));
                 }
                 RewriteResult::Identity(alias_target) => {
                     if let Some(result) = op.result.clone() {
-                        self.aliases
-                            .insert(result, resolve_alias(&alias_target, &self.aliases));
+                        self.do_rename(result, RenameTarget::Var(alias_target));
+                    }
+                }
+                RewriteResult::Constant(c) => {
+                    if let Some(result) = op.result.clone() {
+                        self.do_rename(result, RenameTarget::Const(c));
                     }
                 }
                 RewriteResult::Keep => {
-                    new_ops.push(op);
+                    new_ops.push(remap_op_renamings(
+                        &op,
+                        &self.aliases,
+                        Some((&self.renamings_constants, true)),
+                    ));
                 }
             }
             self.direct_ptradd_type_arg = None;
@@ -3136,18 +3457,21 @@ impl<'a> Transformer<'a> {
             )
         };
         // `_do_renaming_on_link`: only `link.args`.
+        let remap_exit_arg = |arg: &LinkArg| {
+            remap_link_arg(arg, &no_aliases, Some((&self.renamings_constants, true)))
+        };
         for exit in &mut exits {
             for arg in &mut exit.args {
-                *arg = rewrite_linkarg_const_alias(arg.clone(), &self.const_aliases);
+                *arg = remap_exit_arg(arg);
             }
         }
         // `jtransform.py`: `block.exitswitch = renamings.get(block.exitswitch, block.exitswitch)`
         // then `self.follow_constant_exit(block)`. `ExitSwitch` cannot hold a
-        // Constant; a const-aliased switch Variable is looked up here so the
+        // Constant; a const-renamed switch Variable is looked up here so the
         // fold still sees it, before `optimize_goto_if_not`.
         let canraise = graph.blocks[block_idx].canraise();
         let (exitswitch, exits) =
-            follow_constant_exit(exitswitch, exits, &self.const_aliases, canraise);
+            follow_constant_exit(exitswitch, exits, &self.renamings_constants, canraise);
         {
             let block = &mut graph.blocks[block_idx];
             block.operations = new_ops;
@@ -3400,13 +3724,17 @@ impl<'a> Transformer<'a> {
             OpKind::FieldRead { base, .. } | OpKind::FieldWrite { base, .. } => base,
             _ => unreachable!("renaming preserves field-access kind"),
         };
+        // `renamed_op` is constants-only remapped; Var→Var aliases are
+        // applied after rewrite. Key flags on the resolved operand, the
+        // same handle `rewrite_op_jit_force_virtualizable` inserts.
+        let renamed_base = resolve_alias(renamed_base, &self.aliases);
         // Merge with flags already filed by `rewrite_op_hint` /
         // `rewrite_op_jit_force_virtualizable` in this block. After
         // `join_blocks` the access may name the hinted SSA value, whose
         // annotation is empty; overwriting would drop `fresh_virtualizable`.
         let flags = self
             .vable_flags
-            .get(renamed_base)
+            .get(&renamed_base)
             .copied()
             .unwrap_or_default()
             .merge(VableFlags::from_annotation(original_base));
@@ -4488,6 +4816,12 @@ impl<'a> Transformer<'a> {
             // RPython `Transformer.rewrite_op_same_as` / `rewrite_op_cast_*`
             // drop the op and alias the result to the operand. `deref` is
             // the `&mut *p` reborrow of the same pointer.
+            #[cfg(test)]
+            OpKind::UnaryOp { op: unop_name, .. } if unop_name == "__test_fold_to_const_int" => {
+                RewriteResult::Constant(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Int(7),
+                ))
+            }
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -5165,10 +5499,24 @@ impl<'a> Transformer<'a> {
             } if matches!(binop_name.as_str(), "eq" | "ne")
                 && self.get_value_kind_var(lhs) == 'i'
                 && self.get_value_kind_var(rhs) == 'i'
-                && (is_falsy_source_constant(graph, lhs)
-                    || is_falsy_source_constant(graph, rhs)) =>
+                && (is_renamed_falsy_constant(
+                    graph,
+                    lhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                ) || is_renamed_falsy_constant(
+                    graph,
+                    rhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                )) =>
             {
-                let operand = if is_falsy_source_constant(graph, lhs) {
+                let operand = if is_renamed_falsy_constant(
+                    graph,
+                    lhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                ) {
                     rhs
                 } else {
                     lhs
@@ -5200,31 +5548,33 @@ impl<'a> Transformer<'a> {
                 op: binop_name,
                 lhs,
                 rhs,
-                result_ty,
+                result_ty: _,
             } if matches!(binop_name.as_str(), "eq" | "ne" | "is_")
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r'
-                && (is_falsy_source_constant(graph, lhs)
-                    || is_falsy_source_constant(graph, rhs)) =>
+                && (is_renamed_falsy_constant(
+                    graph,
+                    lhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                ) || is_renamed_falsy_constant(
+                    graph,
+                    rhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                )) =>
             {
-                let operand = if is_falsy_source_constant(graph, lhs) {
+                let operand = if is_renamed_falsy_constant(
+                    graph,
+                    lhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                ) {
                     rhs
                 } else {
                     lhs
                 };
-                let unop = if binop_name == "ne" {
-                    "ptr_nonzero"
-                } else {
-                    "ptr_iszero"
-                };
-                RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::UnaryOp {
-                        op: unop.into(),
-                        operand: operand.clone(),
-                        result_ty: result_ty.clone(),
-                    },
-                }])
+                rewrite_ptr_null_equality(op, binop_name != "ne", operand)
             }
             // `pairtype(AbstractStringRepr, AbstractStringRepr).rtype_eq`
             // (`rstr.py`): `hop.gendirectcall(ll_streq, v_str1, v_str2)`;
@@ -5354,8 +5704,15 @@ impl<'a> Transformer<'a> {
                 // jtransform.py `rewrite_op_ptr_eq`: `_rewrite_equality`
                 // (NULL → `ptr_iszero`) then the rclass-instance promotion.
                 // `is_` is `rptr.py` `rtype_is_` → `ptr_eq`.
-                if let Some(rewritten) = null_test_rewrite(graph, op, binop_name != "ne", lhs, rhs)
-                {
+                if let Some(rewritten) = null_test_rewrite(
+                    graph,
+                    op,
+                    binop_name != "ne",
+                    lhs,
+                    rhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                ) {
                     return rewritten;
                 }
                 // The comparison answers an integer, so the result banks as
@@ -5383,30 +5740,43 @@ impl<'a> Transformer<'a> {
                 }])
             }
             // Already-named `ptr_eq`/`ptr_ne` from rtyper `PtrRepr.rtype_eq`.
-            // `rewrite_op_ptr_eq` still promotes rclass instances.
+            // `rewrite_op_ptr_eq`: `_rewrite_equality` (NULL → `ptr_iszero`)
+            // then the rclass-instance promotion.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "ptr_eq" | "ptr_ne")
-                && self.is_rclass_instance(lhs)
-                && self.is_rclass_instance(rhs) =>
-            {
-                let new_op = if binop_name == "ptr_eq" {
-                    "instance_ptr_eq"
+            } if matches!(binop_name.as_str(), "ptr_eq" | "ptr_ne") => {
+                if let Some(rewritten) = null_test_rewrite(
+                    graph,
+                    op,
+                    binop_name != "ptr_ne",
+                    lhs,
+                    rhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                ) {
+                    return rewritten;
+                }
+                if self.is_rclass_instance(lhs) && self.is_rclass_instance(rhs) {
+                    let new_op = if binop_name == "ptr_eq" {
+                        "instance_ptr_eq"
+                    } else {
+                        "instance_ptr_ne"
+                    };
+                    RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::BinOp {
+                            op: new_op.into(),
+                            lhs: lhs.clone(),
+                            rhs: rhs.clone(),
+                            result_ty: result_ty.clone(),
+                        },
+                    }])
                 } else {
-                    "instance_ptr_ne"
-                };
-                RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::BinOp {
-                        op: new_op.into(),
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                        result_ty: result_ty.clone(),
-                    },
-                }])
+                    RewriteResult::Keep
+                }
             }
             // jtransform.py `_rewrite_cmp_ptrs`: non-GC ptr
             // equality becomes int_eq/int_ne.  Mixed i+r operands from
@@ -6500,7 +6870,7 @@ impl<'a> Transformer<'a> {
                 );
                 RewriteResult::Replace(ops)
             }
-            RewriteResult::Identity(_) | RewriteResult::Keep => {
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) | RewriteResult::Keep => {
                 panic!("raw malloc residual of {owner} did not rewrite to a direct call")
             }
         }
@@ -6555,7 +6925,7 @@ impl<'a> Transformer<'a> {
                 None,
             ) {
                 rewritten @ RewriteResult::Replace(_) => rewritten,
-                RewriteResult::Identity(_) | RewriteResult::Keep => {
+                RewriteResult::Identity(_) | RewriteResult::Constant(_) | RewriteResult::Keep => {
                     panic!("raw malloc residual of {owner} did not rewrite to a direct call")
                 }
             };
@@ -6646,7 +7016,7 @@ impl<'a> Transformer<'a> {
                 );
                 RewriteResult::Replace(ops)
             }
-            RewriteResult::Identity(_) | RewriteResult::Keep => {
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) | RewriteResult::Keep => {
                 panic!("raw malloc residual of {owner} did not rewrite to a direct call")
             }
         }
@@ -6968,7 +7338,7 @@ impl<'a> Transformer<'a> {
         match self.rewrite_operation(&find_call, graph_name, graph) {
             RewriteResult::Replace(mut rewritten) => ops.append(&mut rewritten),
             RewriteResult::Keep => ops.push(find_call),
-            RewriteResult::Identity(_) => {
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
                 unreachable!("ll_find is a four-arg helper, never an identity rewrite")
             }
         }
@@ -7617,10 +7987,9 @@ impl<'a> Transformer<'a> {
                     detail: format!("rewrite: {label}(...) → identity"),
                 });
                 if let Some(arg) = args.first() {
-                    // Key on the resolved operand: `optimize_block`
-                    // remaps every op through `aliases` before rewriting,
-                    // so this is the same handle the later field reads
-                    // present as their base.
+                    // Key on the resolved operand. Rewrite now sees
+                    // original variables; later field reads still look
+                    // up this resolved handle.
                     let key = resolve_alias(arg, &self.aliases);
                     let mut flags = self.vable_flags.get(&key).copied().unwrap_or_default();
                     match hint_kind {
@@ -7843,7 +8212,7 @@ impl<'a> Transformer<'a> {
             return rewritten;
         }
         match &rewritten {
-            RewriteResult::Identity(_) => return rewritten,
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) => return rewritten,
             RewriteResult::Replace(ops) if ops.is_empty() => return rewritten,
             RewriteResult::Replace(ops)
                 if ops.iter().any(|candidate| {
@@ -7867,7 +8236,9 @@ impl<'a> Transformer<'a> {
                     .unwrap_or_else(|| result_var.clone());
                 (ops, guarded)
             }
-            RewriteResult::Identity(_) => unreachable!("identity already returned"),
+            RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
+                unreachable!("identity already returned")
+            }
         };
         let kind_char = vtable_word_guard_kind(&guarded);
         self.notes.push(GraphTransformNote {
@@ -7936,9 +8307,11 @@ impl<'a> Transformer<'a> {
         // the getfield would be a use of the array. Keep the array op.
         if field.vec_part == Some(crate::model::VecFieldPart::Buf)
             && let OpKind::FieldRead { base, .. } = &op.kind
-            && self.vable_array_vars.contains_key(base)
         {
-            return RewriteResult::Identity(base.clone());
+            let array_base = resolve_alias(base, &self.aliases);
+            if self.vable_array_vars.contains_key(&array_base) {
+                return RewriteResult::Identity(array_base);
+            }
         }
         if let OpKind::FieldRead { base, .. } = &op.kind
             && crate::codewriter::heaptracker::is_typeptr_field(field)
@@ -8090,7 +8463,7 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Identity(addr) => {
                     retarget_field_bases(graph, &result, &addr);
                 }
-                RewriteResult::Keep => {}
+                RewriteResult::Keep | RewriteResult::Constant(_) => {}
             }
             return RewriteResult::Replace(ops);
         }
@@ -8738,8 +9111,10 @@ impl<'a> Transformer<'a> {
             .as_ref()
             .and_then(|result| self.get_value_type(result))
             .unwrap_or_else(|| item_ty.clone());
-        if let Some((vable_base, arr_idx, itemsize, is_signed)) =
-            self.vable_array_vars.get(base).cloned()
+        if let Some((vable_base, arr_idx, itemsize, is_signed)) = self
+            .vable_array_vars
+            .get(&resolve_alias(base, &self.aliases))
+            .cloned()
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -8864,8 +9239,10 @@ impl<'a> Transformer<'a> {
         base: &crate::flowspace::model::Variable,
         graph_name: &str,
     ) -> RewriteResult {
-        let Some((vable_base, arr_idx, itemsize, is_signed)) =
-            self.vable_array_vars.get(base).cloned()
+        let Some((vable_base, arr_idx, itemsize, is_signed)) = self
+            .vable_array_vars
+            .get(&resolve_alias(base, &self.aliases))
+            .cloned()
         else {
             return RewriteResult::Keep;
         };
@@ -8916,8 +9293,10 @@ impl<'a> Transformer<'a> {
             .as_variable()
             .and_then(|v| self.get_value_type(v))
             .unwrap_or_else(|| item_ty.clone());
-        if let Some((vable_base, arr_idx, itemsize, is_signed)) =
-            self.vable_array_vars.get(base).cloned()
+        if let Some((vable_base, arr_idx, itemsize, is_signed)) = self
+            .vable_array_vars
+            .get(&resolve_alias(base, &self.aliases))
+            .cloned()
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -12461,7 +12840,7 @@ impl<'a> Transformer<'a> {
                 match rewritten {
                     RewriteResult::Replace(rewritten) => ops.extend(rewritten),
                     RewriteResult::Keep => ops.push(malloc),
-                    RewriteResult::Identity(_) => {
+                    RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
                         unreachable!("{malloc_target}: an allocator call is never an identity")
                     }
                 }
@@ -12736,9 +13115,13 @@ impl<'a> Transformer<'a> {
     /// green arg. This ensures green values are constant before the recursive
     /// call.
     ///
-    /// `promote_greens`: skip `Constant` and Void. A source constant is
-    /// an SSA `Const*` Variable here, which `is_source_constant_variable`
-    /// recovers.
+    /// `promote_greens`: skip `Constant` and Void.
+    ///
+    /// Upstream skips `isinstance(box, Constant)` as rewrite sees the
+    /// arg after `_do_renaming(renamings_constants)`, which includes a
+    /// renamed `same_as` of a Constant. JitMergePoint green slots cannot
+    /// hold `LinkArg::Const`, so [`is_renamed_source_constant`] recovers
+    /// that same `isinstance(Constant)` answer.
     fn promote_greens(
         &self,
         graph: &FunctionGraph,
@@ -12746,7 +13129,7 @@ impl<'a> Transformer<'a> {
     ) -> Vec<SpaceOperation> {
         let mut ops = Vec::new();
         for var in green_args {
-            if is_source_constant_variable(graph, var) {
+            if is_renamed_source_constant(graph, var, &self.aliases, &self.renamings_constants) {
                 continue;
             }
             let kind = self.get_value_kind_var(var);
@@ -13611,9 +13994,9 @@ impl<'a> Transformer<'a> {
                 }
                 LinkArg::Const(c) => {
                     // `do_rename(op.result, Constant)`: LinkArg uses see the
-                    // Constant via `const_aliases`; Variable-only slots keep
-                    // `result`, defined once here (`materialize` / ConstInt).
-                    self.const_aliases.insert(result.clone(), c.clone());
+                    // Constant via `renamings_constants`; Variable-only slots
+                    // keep `result`, defined once here (`materialize` / ConstInt).
+                    self.do_rename(result.clone(), RenameTarget::Const(c.clone()));
                     ops.push(materialize_const_result(result, c));
                 }
             }
@@ -15142,6 +15525,10 @@ fn resolve_alias(
     cur
 }
 
+fn void_none_constant() -> crate::flowspace::model::Constant {
+    crate::flowspace::model::Constant::new(crate::flowspace::model::ConstValue::None)
+}
+
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -15154,132 +15541,6 @@ fn remap_value(
     >,
 ) -> crate::flowspace::model::Variable {
     resolve_alias(value, aliases)
-}
-
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
-fn rewrite_linkarg_const_alias(
-    arg: LinkArg,
-    const_aliases: &std::collections::HashMap<
-        crate::flowspace::model::Variable,
-        crate::flowspace::model::Constant,
-    >,
-) -> LinkArg {
-    match arg {
-        LinkArg::Value(v) => match const_aliases.get(&v) {
-            Some(c) => LinkArg::Const(c.clone()),
-            None => LinkArg::Value(v),
-        },
-        other => other,
-    }
-}
-
-/// `jtransform.py Transformer._do_renaming(renamings_constants, op)`:
-/// substitute a Constant into every operand slot that can hold one
-/// (`LinkArg`, including `ListOfKind`-shaped `Vec<LinkArg>`).
-///
-/// Slots typed as plain `Variable` cannot hold a Constant; they keep the
-/// renamed result, which `materialize_const_result` defined at the rename.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
-fn do_renaming(
-    op: SpaceOperation,
-    const_aliases: &std::collections::HashMap<
-        crate::flowspace::model::Variable,
-        crate::flowspace::model::Constant,
-    >,
-) -> SpaceOperation {
-    if const_aliases.is_empty() {
-        return op;
-    }
-    let kind = match op.kind {
-        OpKind::Call {
-            target,
-            args,
-            result_ty,
-        } => OpKind::Call {
-            target,
-            args: args
-                .into_iter()
-                .map(|arg| rewrite_linkarg_const_alias(arg, const_aliases))
-                .collect(),
-            result_ty,
-        },
-        OpKind::FieldWrite {
-            base,
-            field,
-            value,
-            ty,
-        } => OpKind::FieldWrite {
-            base,
-            field,
-            value: rewrite_linkarg_const_alias(value, const_aliases),
-            ty,
-        },
-        OpKind::ArrayWrite {
-            base,
-            index,
-            value,
-            item_ty,
-            array_type_id,
-            nolength,
-        } => OpKind::ArrayWrite {
-            base,
-            index,
-            value: rewrite_linkarg_const_alias(value, const_aliases),
-            item_ty,
-            array_type_id,
-            nolength,
-        },
-        OpKind::VableFieldWrite {
-            base,
-            field_index,
-            value,
-            ty,
-        } => OpKind::VableFieldWrite {
-            base,
-            field_index,
-            value: rewrite_linkarg_const_alias(value, const_aliases),
-            ty,
-        },
-        OpKind::VableArrayWrite {
-            base,
-            array_index,
-            elem_index,
-            value,
-            item_ty,
-            array_itemsize,
-            array_is_signed,
-        } => OpKind::VableArrayWrite {
-            base,
-            array_index,
-            elem_index,
-            value: rewrite_linkarg_const_alias(value, const_aliases),
-            item_ty,
-            array_itemsize,
-            array_is_signed,
-        },
-        OpKind::JitForceQuasiImmutable { base, mutate_field } => OpKind::JitForceQuasiImmutable {
-            base: rewrite_linkarg_const_alias(base, const_aliases),
-            mutate_field,
-        },
-        OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
-            opname,
-            args: args
-                .into_iter()
-                .map(|arg| rewrite_linkarg_const_alias(arg, const_aliases))
-                .collect(),
-        },
-        kind => kind,
-    };
-    SpaceOperation {
-        result: op.result,
-        kind,
-    }
 }
 
 /// `jtransform_opname::materialize` / `handle_builtin_call` `NormalizedArg::ConstInt`:
@@ -15342,7 +15603,7 @@ fn materialize_const_result_copy(
 }
 
 /// `jtransform.py Transformer.follow_constant_exit`: when `exitswitch` is
-/// a Constant (here: a Variable in `const_aliases`) and the block cannot
+/// a Constant (here: a Variable in `renamings_constants`) and the block cannot
 /// raise, keep the matching link as the sole unconditional exit.
 /// `follow_constant_exit` compares `link.llexitcase` only.
 #[expect(
@@ -15352,7 +15613,7 @@ fn materialize_const_result_copy(
 fn follow_constant_exit(
     exitswitch: Option<crate::model::ExitSwitch>,
     mut exits: Vec<crate::model::Link>,
-    const_aliases: &std::collections::HashMap<
+    renamings_constants: &std::collections::HashMap<
         crate::flowspace::model::Variable,
         crate::flowspace::model::Constant,
     >,
@@ -15362,7 +15623,7 @@ fn follow_constant_exit(
     let Some(ExitSwitch::Value(v)) = &exitswitch else {
         return (exitswitch, exits);
     };
-    let Some(c) = const_aliases.get(v) else {
+    let Some(c) = renamings_constants.get(v) else {
         return (exitswitch, exits);
     };
     if canraise {
@@ -15421,16 +15682,100 @@ fn remap_call_funcptr(
     }
 }
 
+/// `_do_renaming` on a `LinkArg`. Variable slots stay Variables;
+/// LinkArg can become `Const` when `renamings_constants` names the var.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+fn remap_link_arg(
+    arg: &LinkArg,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: Option<(
+        &std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Constant,
+        >,
+        bool,
+    )>,
+) -> LinkArg {
+    match arg {
+        LinkArg::Const(c) => LinkArg::Const(c.clone()),
+        LinkArg::Value(v) => {
+            if let Some(c) = lookup_renamed_constant(v, aliases, constants) {
+                return LinkArg::Const(c);
+            }
+            LinkArg::Value(remap_value(v, aliases))
+        }
+    }
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn lookup_renamed_constant(
+    v: &crate::flowspace::model::Variable,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: Option<(
+        &std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Constant,
+        >,
+        bool,
+    )>,
+) -> Option<crate::flowspace::model::Constant> {
+    let (map, apply_void) = constants?;
+    let pick = |key: &crate::flowspace::model::Variable| {
+        let c = map.get(key)?;
+        if !apply_void && FunctionGraph::concretetype_of(key) == crate::model::ConcreteType::Void {
+            return None;
+        }
+        Some(c.clone())
+    };
+    pick(v).or_else(|| {
+        let resolved = resolve_alias(v, aliases);
+        if resolved == *v {
+            None
+        } else {
+            pick(&resolved)
+        }
+    })
+}
+
 fn remap_op(
     op: &SpaceOperation,
     aliases: &std::collections::HashMap<
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
     >,
+) -> SpaceOperation {
+    remap_op_renamings(op, aliases, None)
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn remap_op_renamings(
+    op: &SpaceOperation,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: Option<(
+        &std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Constant,
+        >,
+        bool,
+    )>,
 ) -> SpaceOperation {
     let kind = match &op.kind {
         OpKind::Input { .. }
@@ -15563,7 +15908,7 @@ fn remap_op(
             opname: opname.clone(),
             args: args
                 .iter()
-                .map(|a| a.map_value(|v| remap_value(v, aliases)))
+                .map(|a| remap_link_arg(a, aliases, constants))
                 .collect(),
         },
         OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
@@ -15636,7 +15981,7 @@ fn remap_op(
             mutate_field: mutate_field.clone(),
         },
         OpKind::JitForceQuasiImmutable { base, mutate_field } => OpKind::JitForceQuasiImmutable {
-            base: base.map_value(|v| remap_value(v, aliases)),
+            base: remap_link_arg(base, aliases, constants),
             mutate_field: mutate_field.clone(),
         },
         OpKind::FieldRead {
@@ -15658,7 +16003,7 @@ fn remap_op(
         } => OpKind::FieldWrite {
             base: remap_value(base, aliases),
             field: field.clone(),
-            value: value.map_value(|v| remap_value(v, aliases)),
+            value: remap_link_arg(value, aliases, constants),
             ty: ty.clone(),
         },
         OpKind::ArrayRead {
@@ -15698,7 +16043,7 @@ fn remap_op(
         } => OpKind::ArrayWrite {
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
-            value: value.map_value(|v| remap_value(v, aliases)),
+            value: remap_link_arg(value, aliases, constants),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
@@ -15739,7 +16084,7 @@ fn remap_op(
             target: target.clone(),
             args: args
                 .iter()
-                .map(|arg| arg.map_value(|var| remap_value(var, aliases)))
+                .map(|arg| remap_link_arg(arg, aliases, constants))
                 .collect(),
             result_ty: result_ty.clone(),
         },
@@ -15766,7 +16111,7 @@ fn remap_op(
         } => OpKind::VableFieldWrite {
             base: remap_value(base, aliases),
             field_index: *field_index,
-            value: value.map_value(|v| remap_value(v, aliases)),
+            value: remap_link_arg(value, aliases, constants),
             ty: ty.clone(),
         },
         OpKind::VableArrayRead {
@@ -15809,7 +16154,7 @@ fn remap_op(
             base: remap_value(base, aliases),
             array_index: *array_index,
             elem_index: remap_value(elem_index, aliases),
-            value: value.map_value(|v| remap_value(v, aliases)),
+            value: remap_link_arg(value, aliases, constants),
             item_ty: item_ty.clone(),
             array_itemsize: *array_itemsize,
             array_is_signed: *array_is_signed,
@@ -16078,8 +16423,11 @@ pub(crate) fn is_current_gc_ref_path(segments: &[String]) -> bool {
         || segments == ["pyre_object", "current_gc_ref"]
 }
 
-/// `direct_ptradd`'s pointer argument as the front emitted it, before
-/// `same_as` renaming. Its `concretetype` is `TO.OF`.
+/// `direct_ptradd`'s pointer argument as the front emitted it. Captured
+/// from the block op before any rename; after the `optimize_block` order
+/// matches `jtransform.py`, rewrite sees original variables, so this is
+/// that same operand except a LinkArg Var→Const. Its `concretetype` is
+/// `TO.OF`.
 fn direct_ptradd_type_arg(op: &SpaceOperation) -> Option<crate::flowspace::model::Variable> {
     let OpKind::Call { target, args, .. } = &op.kind else {
         return None;
@@ -16178,7 +16526,7 @@ fn raw_list_item_malloc(
     match rewritten {
         RewriteResult::Replace(rewritten) => ops.extend(rewritten),
         RewriteResult::Keep => ops.push(malloc),
-        RewriteResult::Identity(_) => {
+        RewriteResult::Identity(_) | RewriteResult::Constant(_) => {
             unreachable!("{path}: an allocator call is never an identity")
         }
     }
@@ -20089,6 +20437,73 @@ mod tests {
         }
     }
 
+    /// An exitswitch on `ptr_eq(x, same_as(NULL))` fuses to
+    /// `goto_if_not_ptr_iszero` once `_rewrite_equality` folds the Identity
+    /// of the null Constant.
+    #[test]
+    fn ptr_eq_of_same_as_null_fuses_to_goto_if_not_ptr_iszero() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::ExitSwitch;
+
+        let mut graph = FunctionGraph::new("fuse_same_as_null");
+        let start = graph.startblock;
+        let x = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::GcRef);
+        let v0 = graph
+            .push_op_var(start, OpKind::ConstRefNull, true)
+            .unwrap();
+        let v1 = graph
+            .push_op_var(
+                start,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: v0,
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let t = graph
+            .push_op_var(
+                start,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs: x.clone(),
+                    rhs: v1,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        graph.set_return(if_true, None);
+        graph.set_return(if_false, None);
+        graph.set_branch(start, t, if_true, vec![], if_false, vec![]);
+
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        match &transformed.graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(
+                    opname, "ptr_iszero",
+                    "folded null test must fuse: {opname} {args:?}"
+                );
+                assert_eq!(args, &vec![x]);
+            }
+            other => panic!("expected fused goto_if_not_ptr_iszero, got {other:?}"),
+        }
+    }
+
     /// the GotoIfNotOp lowering Stage 1: a non-supported result op (`int_add`) is NOT
     /// fusable — `optimize_goto_if_not` returns false and leaves the
     /// block untouched (`jtransform.py` opname gate).
@@ -20301,6 +20716,144 @@ mod tests {
         assert_eq!(
             guard, &input_var,
             "GuardValue.value must follow _do_renaming through same_as"
+        );
+    }
+
+    /// `optimize_block` applies only Var→Const before rewrite. A
+    /// `same_as` Identity leaves the next rewrite looking at `v1`; the
+    /// emitted op is remapped to `v0`.
+    #[test]
+    fn optimize_block_rewrite_sees_identity_source_emits_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_then_getfield");
+        let v0 = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let v1 = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::cast_instance_call("Function", v0.clone()),
+                true,
+            )
+            .unwrap();
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: v1.clone(),
+                    field: FieldDescriptor::new("x", Some("Function".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, None);
+        let exceptblock = graph.exceptblock;
+        let block_idx = graph.startblock.0;
+        transformer.optimize_block(&mut graph, block_idx, "cast_then_getfield", exceptblock);
+
+        let rewrite_base = transformer
+            .rewrite_input_ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, .. } => Some(base),
+                _ => None,
+            })
+            .expect("FieldRead must reach rewrite_operation");
+        assert_eq!(
+            rewrite_base, &v1,
+            "rewrite must see the cast result, not the alias target"
+        );
+
+        let emitted_base = graph.blocks[block_idx]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, .. } => Some(base),
+                _ => None,
+            })
+            .expect("FieldRead must be emitted");
+        assert_eq!(
+            emitted_base, &v0,
+            "emitted FieldRead.base must follow _do_renaming through the Identity"
+        );
+    }
+
+    /// A Var→Const rename is applied before the next rewrite, on LinkArg
+    /// slots (`_do_renaming(renamings_constants, op)`).
+    #[test]
+    fn optimize_block_applies_var_to_const_before_rewrite() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("const_then_setfield");
+        let base = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let folded = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "__test_fold_to_const_int".into(),
+                    operand: base.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor::new("n", Some("S".into())),
+                value: LinkArg::Value(folded.clone()),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let exceptblock = graph.exceptblock;
+        let block_idx = graph.startblock.0;
+        transformer.optimize_block(&mut graph, block_idx, "const_then_setfield", exceptblock);
+
+        let rewrite_value = transformer
+            .rewrite_input_ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { value, .. } => Some(value),
+                _ => None,
+            })
+            .expect("FieldWrite must reach rewrite_operation");
+        match rewrite_value {
+            LinkArg::Const(c) => assert_eq!(c.value, crate::flowspace::model::ConstValue::Int(7)),
+            LinkArg::Value(v) => panic!("rewrite must see the Constant, got Value({v:?})"),
+        }
+        assert!(
+            graph.blocks[block_idx]
+                .operations
+                .iter()
+                .all(|op| !matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. } if op == "__test_fold_to_const_int"
+                )),
+            "Constant return must drop the folding op from the emitted block"
         );
     }
 
@@ -23741,7 +24294,7 @@ mod tests {
                     "{forbidden} must not be projected from a guessed spelling; ops={ops:?}"
                 );
             }
-            RewriteResult::Keep | RewriteResult::Identity(_) => {}
+            RewriteResult::Keep | RewriteResult::Identity(_) | RewriteResult::Constant(_) => {}
         }
     }
 
@@ -23769,6 +24322,7 @@ mod tests {
             }
             RewriteResult::Keep => panic!("{name} must rewrite, got Keep"),
             RewriteResult::Identity(_) => panic!("{name} must rewrite, got Identity"),
+            RewriteResult::Constant(_) => panic!("{name} must rewrite, got Constant"),
         }
     }
 
@@ -23948,6 +24502,7 @@ mod tests {
             }
             RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
             RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
+            RewriteResult::Constant(_) => panic!("direct_ptradd must rewrite, got Constant"),
         }
     }
 
@@ -24604,6 +25159,7 @@ mod tests {
             RewriteResult::Replace(ops) => (ops, (ptr, shift)),
             RewriteResult::Keep => panic!("direct_ptradd must rewrite, got Keep"),
             RewriteResult::Identity(_) => panic!("direct_ptradd must rewrite, got Identity"),
+            RewriteResult::Constant(_) => panic!("direct_ptradd must rewrite, got Constant"),
         }
     }
 
@@ -24703,6 +25259,9 @@ mod tests {
             RewriteResult::Keep => panic!("signed float() must rewrite, got Keep"),
             RewriteResult::Identity(_) => {
                 panic!("signed float() must rewrite, got Identity")
+            }
+            RewriteResult::Constant(_) => {
+                panic!("signed float() must rewrite, got Constant")
             }
         }
     }
@@ -32511,6 +33070,7 @@ mod tests {
             }
             RewriteResult::Identity(_) => panic!("expected cast_ptr_to_int, got Identity"),
             RewriteResult::Keep => panic!("expected cast_ptr_to_int, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected cast_ptr_to_int, got Constant"),
         }
         assert_eq!(
             FunctionGraph::concretetype_of(&result),
@@ -32548,6 +33108,7 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, src),
             RewriteResult::Replace(_) => panic!("expected Identity, got Replace"),
             RewriteResult::Keep => panic!("expected Identity, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Identity, got Constant"),
         }
     }
 
@@ -32602,6 +33163,7 @@ mod tests {
             RewriteResult::Replace(_) => {}
             RewriteResult::Identity(_) => panic!("expected residual/regular rewrite, got Identity"),
             RewriteResult::Keep => panic!("expected residual/regular rewrite, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected residual/regular rewrite, got Constant"),
         }
         assert_eq!(
             FunctionGraph::concretetype_of(&result),
@@ -33387,6 +33949,7 @@ mod tests {
         ) {
             RewriteResult::Replace(_) | RewriteResult::Identity(_) => {}
             RewriteResult::Keep => panic!("cast_ptr_to_int must rewrite"),
+            RewriteResult::Constant(_) => panic!("cast_ptr_to_int must rewrite, got Constant"),
         }
         let op_int_to_ptr = SpaceOperation {
             result: Some(result.clone()),
@@ -33409,6 +33972,7 @@ mod tests {
             }
             RewriteResult::Replace(_) => panic!("expected Identity of int word, got Replace"),
             RewriteResult::Keep => panic!("expected Identity of int word, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Identity of int word, got Constant"),
         }
         assert_eq!(
             FunctionGraph::concretetype_of(&result),
@@ -33454,6 +34018,7 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, as_int),
             RewriteResult::Replace(_) => panic!("expected Identity of int word, got Replace"),
             RewriteResult::Keep => panic!("expected Identity of int word, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Identity of int word, got Constant"),
         }
         assert_eq!(
             FunctionGraph::concretetype_of(&result),
@@ -38256,6 +38821,119 @@ mod tests {
                 unary_op(&ops),
                 Some(("ptr_nonzero".to_string(), x)),
                 "`p != NULL` must fold to the unary pointer test: {ops:?}"
+            );
+        }
+
+        /// `v0 = ConstRefNull; v1 = same_as(v0); r = ptr_eq(x, v1)` —
+        /// `_rewrite_equality` sees `isinstance(v1, Constant)` after
+        /// Identity, same as `renamings_constants` handing rewrite a
+        /// Constant.
+        #[test]
+        fn a_ref_equality_against_same_as_null_becomes_ptr_iszero() {
+            let mut graph = FunctionGraph::new("same_as_null_eq");
+            let x = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let v0 = graph
+                .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
+                .unwrap();
+            let v1 = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::UnaryOp {
+                        op: "same_as".into(),
+                        operand: v0,
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap();
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "eq".into(),
+                        lhs: x.clone(),
+                        rhs: v1,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::GcRef);
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            assert_eq!(
+                unary_op(ops),
+                Some(("ptr_iszero".to_string(), x)),
+                "`ptr_eq(x, same_as(NULL))` must fold to ptr_iszero(x): {ops:?}"
+            );
+            assert!(
+                binary_op(ops).is_none(),
+                "the binary compare must be gone: {ops:?}"
+            );
+        }
+
+        /// The same shape with a cast Identity (`rewrite_op_cast_pointer`
+        /// → `same_as`) between the null producer and the compare.
+        #[test]
+        fn a_ref_equality_against_cast_null_becomes_ptr_iszero() {
+            let mut graph = FunctionGraph::new("cast_null_eq");
+            let x = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let v0 = graph
+                .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
+                .unwrap();
+            let v1 = graph
+                .push_op_var(
+                    graph.startblock,
+                    crate::model::cast_instance_call("Function", v0),
+                    true,
+                )
+                .unwrap();
+            FunctionGraph::set_concretetype_of_inline(&v1, ConcreteType::GcRef);
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "eq".into(),
+                        lhs: x.clone(),
+                        rhs: v1,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::GcRef);
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            assert_eq!(
+                unary_op(ops),
+                Some(("ptr_iszero".to_string(), x)),
+                "`ptr_eq(x, CAST(NULL))` must fold to ptr_iszero(x), not instance_ptr_eq: {ops:?}"
+            );
+            assert!(
+                binary_op(ops).is_none(),
+                "the binary compare must be gone: {ops:?}"
             );
         }
 
