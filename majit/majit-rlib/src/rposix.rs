@@ -410,17 +410,20 @@ fn handle_posix_error(result: i64) -> Result<i64, i32> {
 
 /// `rposix.read` (`replace_os_function('read')`). `count < 0` is `EINVAL`
 /// before the buffer is allocated. The buffer is `rffi.scoped_alloc_buffer`;
-/// only `got` bytes are copied out.
+/// only `got` bytes are copied out. The outer `Err` is an escaping
+/// `rffi.py mallocfn` `MemoryError`; the inner is `handle_posix_error`.
 #[cfg(unix)]
 #[majit_macros::replace_os_function("read")]
-pub fn read(fd: i32, count: i64) -> Result<Vec<u8>, i32> {
+pub fn read(fd: i32, count: i64) -> Result<Result<Vec<u8>, i32>, crate::rffi::MemoryError> {
     if count < 0 {
-        return Err(libc::EINVAL);
+        return Ok(Err(libc::EINVAL));
     }
     let n = count as usize;
-    let buf = crate::rffi::scoped_alloc_buffer::new(n);
-    let got = handle_posix_error(unsafe { c_read(fd, buf.raw.cast(), n) } as i64)?;
-    Ok(buf.str(got as usize))
+    let buf = crate::rffi::scoped_alloc_buffer::new(n)?;
+    match handle_posix_error(unsafe { c_read(fd, buf.raw.cast(), n) } as i64) {
+        Ok(got) => buf.str(got as usize).map(Ok),
+        Err(errno) => Ok(Err(errno)),
+    }
 }
 
 /// `rposix.write` (`replace_os_function('write')`).
@@ -3509,10 +3512,10 @@ mod tests {
         .unwrap();
         assert!(fd >= 0);
         assert!(!isatty(fd));
-        assert_eq!(read(fd, -1), Err(libc::EINVAL));
+        assert_eq!(read(fd, -1), Ok(Err(libc::EINVAL)));
         assert_eq!(write(fd, b"xy").unwrap(), 2);
         assert_eq!(lseek(fd, 0, 0).unwrap(), 0);
-        assert_eq!(read(fd, 2).unwrap(), b"xy");
+        assert_eq!(read(fd, 2).unwrap().unwrap(), b"xy");
         assert_eq!(lseek(fd, 0, libc::SEEK_END).unwrap(), 2);
         let fst = crate::rposix_stat::fstat(fd).unwrap();
         assert_eq!(fst.st_size, 2);

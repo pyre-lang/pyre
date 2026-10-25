@@ -1146,14 +1146,11 @@ mod context_methods {
             // `SSL_CERT_FILE` and `SSL_CERT_DIR` name files, so their bytes
             // reach the host as a path for the same reason `fs_path`'s do.
             let env_path = |name: &[u8]| {
-                pyre_interpreter::host_seam::getenv(name)
-                    .ok()
-                    .flatten()
-                    .map(|value| {
-                        std::path::PathBuf::from(
-                            pyre_interpreter::gateway::os_string_from_fs_bytes(&value),
-                        )
-                    })
+                pyre_interpreter::host_seam::getenv(name).map(|value| {
+                    std::path::PathBuf::from(pyre_interpreter::gateway::os_string_from_fs_bytes(
+                        &value,
+                    ))
+                })
             };
             let cert_file = env_path(b"SSL_CERT_FILE").filter(|path| path.is_file());
             match cert_file {

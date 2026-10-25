@@ -21507,10 +21507,7 @@ pub const HASH_SEED_ERROR: &str =
 /// A digest taken before this runs pins a random secret and the variable is
 /// ignored from then on, so the launcher calls it before anything hashes.
 pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
-    let value = crate::host_seam::getenv(b"PYTHONHASHSEED")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let value = crate::host_seam::getenv(b"PYTHONHASHSEED").unwrap_or_default();
     if value.is_empty() || value.as_slice() == b"random" {
         // Force the getrandom backend (and its optional `/dev/urandom`
         // fallback) to run before a sandbox seccomp filter is installed.
@@ -24986,8 +24983,11 @@ pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     {
         // The controller services one read per request; copy the reply (at most
         // `buf.len()` bytes) into the caller's buffer.
-        let data = majit_rlib::rposix::read(fd, buf.len() as i64)
-            .map_err(std::io::Error::from_raw_os_error)?;
+        let data = match majit_rlib::rposix::read(fd, buf.len() as i64) {
+            Ok(Ok(data)) => data,
+            Ok(Err(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
+            Err(e) => majit_rlib::rsandbox::reraise(e),
+        };
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
         return Ok(n);

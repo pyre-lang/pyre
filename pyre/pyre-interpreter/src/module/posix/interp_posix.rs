@@ -3751,14 +3751,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // Windows `n > INT_MAX` reaches the C runtime as EINVAL
                 // instead of data.
                 let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
-                // `rposix.read`'s `scoped_alloc_buffer` is a raw malloc whose
-                // failure is `MemoryError`; the port's raw malloc aborts, so
-                // the request is reserved fallibly first. Under sandbox the
-                // trampoline allocates nothing for the count.
-                #[cfg(all(unix, not(feature = "sandbox")))]
-                Vec::<u8>::new()
-                    .try_reserve_exact(n)
-                    .map_err(|_| crate::PyError::memory_error(""))?;
                 #[cfg(unix)]
                 let buf = {
                     // interp_posix.py `read`: `rposix.read` sits inside
@@ -3767,11 +3759,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // surfacing as `InterruptedError`.
                     loop {
                         match majit_rlib::rposix::read(fd, n as i64) {
-                            Ok(buf) => break buf,
-                            Err(errno) => crate::builtins::eintr_retry_with(
+                            Ok(Ok(buf)) => break buf,
+                            Ok(Err(errno)) => crate::builtins::eintr_retry_with(
                                 std::io::Error::from_raw_os_error(errno),
                                 |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
                             )?,
+                            Err(e) => {
+                                return Err(crate::error::get_converted_unexpected_exception(
+                                    pyre_object::PY_NULL,
+                                    &e,
+                                ));
+                            }
                         }
                     }
                 };
@@ -3868,8 +3866,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 #[cfg(feature = "sandbox")]
                 let result = {
-                    let data = majit_rlib::rposix::read(fd, target.len() as i64)
-                        .map_err(|errno| errno_err(errno, ""))?;
+                    let data = match majit_rlib::rposix::read(fd, target.len() as i64) {
+                        Ok(Ok(data)) => data,
+                        Ok(Err(errno)) => return Err(errno_err(errno, "")),
+                        Err(e) => {
+                            return Err(crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &e,
+                            ));
+                        }
+                    };
                     let length = data.len().min(target.len());
                     target[..length].copy_from_slice(&data[..length]);
                     length as i64
@@ -5337,9 +5343,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let fd = pyre_object::with_roots!(w_fd => crate::baseobjspace::c_int_w(w_fd))?;
                 #[cfg(unix)]
                 {
-                    Ok(pyre_object::w_bool_from(
-                        pyre_object::with_roots!(w_fd => majit_rlib::rposix::isatty(fd)),
-                    ))
+                    // interp_posix.py `isatty`: `except OSError as e: raise wrap_oserror(...)`.
+                    let tty = pyre_object::with_roots!(w_fd => {
+                        majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::isatty(fd))
+                    })
+                    .map_err(|errno| errno_err(errno, ""))?;
+                    Ok(pyre_object::w_bool_from(tty))
                 }
                 #[cfg(not(unix))]
                 Ok(pyre_object::w_bool_from(host_os::isatty(fd)))
@@ -6200,7 +6209,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// `argument_unavailable` (`interp_posix.py`) — a modifier this
     /// platform has no call to apply, named together with the entry point that
     /// was asked to apply it.
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(feature = "host_env")]
     fn argument_unavailable(funcname: &str, arg: &str) -> crate::PyError {
         crate::PyError::not_implemented(format!("{funcname}: {arg} unavailable on this platform"))
     }
@@ -11941,117 +11950,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
 
-        // os.access(path, mode, *, dir_fd=None, effective_ids=False,
-        //           follow_symlinks=True) -> bool
-        crate::__pyre_put_new!(
-            ns_slot,
-            "access",
-            posix_builtin(
-                "access",
-                |args| {
-                    // `access` names three keyword-only modifiers, so a third
-                    // positional is an error rather than a `dir_fd`.
-                    let (bound, mut kwargs, kwonly) = bind_path_args(
-                        args,
-                        "access",
-                        &["path", "mode"],
-                        2,
-                        &["dir_fd", "effective_ids", "follow_symlinks"],
-                    )?;
-                    // The parameters convert in declaration order, and every one of
-                    // them can raise, so the order is observable: `path` reports
-                    // before `mode`, `mode` before `dir_fd`, and both before either
-                    // flag's `__bool__` is called at all.
-                    let roots = pyre_object::gc_roots::push_roots();
-                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                    let path = crate::gateway::fsencode_path_named_w(
-                        bound[0].expect("path is required"),
-                        "access",
-                        "path",
-                    );
-                    kwargs = reload_bound_kwonly(kw_base, kw_n);
-                    let path = path?.as_bytes;
-                    // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
-                    let roots = pyre_object::gc_roots::push_roots();
-                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                    let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"));
-                    kwargs = reload_bound_kwonly(kw_base, kw_n);
-                    drop(roots);
-                    let mode = mode?;
-                    // interp_posix.py `access` types `dir_fd` as
-                    // `DirFD(rposix.HAVE_FACCESSAT)`, so a host with no `faccessat`
-                    // turns the descriptor away instead of resolving the name
-                    // against the working directory as though none had been given.
-                    let roots = pyre_object::gc_roots::push_roots();
-                    let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                    let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_FACCESSAT);
-                    kwargs = reload_bound_kwonly(kw_base, kw_n);
-                    drop(roots);
-                    let dir_fd = dir_fd?;
-                    let effective_ids = match bound_kwonly_named(&kwargs, kwonly, "effective_ids") {
-                        Some(v) => {
-                            let roots = pyre_object::gc_roots::push_roots();
-                            let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                            let r = crate::baseobjspace::is_true(v);
-                            kwargs = reload_bound_kwonly(kw_base, kw_n);
-                            drop(roots);
-                            r?
-                        }
-                        None => false,
-                    };
-                    let follow_symlinks =
-                        match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
-                            Some(v) => crate::baseobjspace::is_true(v)?,
-                            None => true,
-                        };
-                    // interp_posix.py `access` — the two flag modifiers have no other
-                    // call to reach, so without `faccessat` they are refused rather
-                    // than answered as though they had been applied.
-                    if !HAVE_FACCESSAT {
-                        if !follow_symlinks {
-                            return Err(argument_unavailable("access", "follow_symlinks"));
-                        }
-                        if effective_ids {
-                            return Err(argument_unavailable("access", "effective_ids"));
-                        }
-                    }
-                    // interp_posix.py keeps the plain `access` for the
-                    // unmodified call and reaches for `faccessat` only where the
-                    // name resolves against a descriptor, the final symlink must
-                    // not be followed, or the effective ids are the ones to ask
-                    // about. `rposix.py` is the flag mapping.
-                    let allowed = if dir_fd.is_some() || !follow_symlinks || effective_ids {
-                        let c_path = std::ffi::CString::new(path.as_slice())
-                            .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-                        let mut flags = 0;
-                        if !follow_symlinks {
-                            flags |= libc::AT_SYMLINK_NOFOLLOW;
-                        }
-                        if effective_ids {
-                            flags |= libc::AT_EACCESS;
-                        }
-                        unsafe {
-                            majit_rlib::rposix::c_faccessat(
-                                dir_fd.unwrap_or(libc::AT_FDCWD),
-                                c_path.as_ptr(),
-                                mode,
-                                flags,
-                            ) == 0
-                        }
-                    } else {
-                        majit_rlib::rposix::access(&path, mode)
-                    };
-                    // `rposix.access` and `rposix.faccessat` both answer
-                    // `error == 0` without `handle_posix_error`, so a refused
-                    // call is False and not an `OSError` — including the EINVAL
-                    // a mode outside `R_OK | W_OK | X_OK` can draw.
-                    Ok(pyre_object::w_bool_from(allowed))
-                },
-                &["path", "mode"],
-                &["dir_fd", "effective_ids", "follow_symlinks"],
-            )
-        );
-
         // os.chroot(path) -> None
         crate::__pyre_put_new!(
             ns_slot,
@@ -14145,6 +14043,125 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             )
         );
     }
+
+    // os.access(path, mode, *, dir_fd=None, effective_ids=False,
+    //           follow_symlinks=True) -> bool
+    //
+    // Overwrites the `install_noop_stubs` placeholder. `sandbox` implies
+    // `host_env`; `HAVE_FACCESSAT` is false there so modifiers are refused
+    // and the call is `rposix.access` plus wrap_oserror2.
+    #[cfg(all(unix, feature = "host_env"))]
+    crate::__pyre_put_new!(
+        ns_slot,
+        "access",
+        posix_builtin(
+            "access",
+            |args| {
+                // `access` names three keyword-only modifiers, so a third
+                // positional is an error rather than a `dir_fd`.
+                let (bound, mut kwargs, kwonly) = bind_path_args(
+                    args,
+                    "access",
+                    &["path", "mode"],
+                    2,
+                    &["dir_fd", "effective_ids", "follow_symlinks"],
+                )?;
+                // The parameters convert in declaration order, and every one of
+                // them can raise, so the order is observable: `path` reports
+                // before `mode`, `mode` before `dir_fd`, and both before either
+                // flag's `__bool__` is called at all.
+                let roots = pyre_object::gc_roots::push_roots();
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                let path = crate::gateway::fsencode_path_named_w(
+                    bound[0].expect("path is required"),
+                    "access",
+                    "path",
+                );
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
+                let path = path?;
+                // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
+                let roots = pyre_object::gc_roots::push_roots();
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"));
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
+                drop(roots);
+                let mode = mode?;
+                // interp_posix.py `access` types `dir_fd` as
+                // `DirFD(rposix.HAVE_FACCESSAT)`, so a host with no `faccessat`
+                // turns the descriptor away instead of resolving the name
+                // against the working directory as though none had been given.
+                let roots = pyre_object::gc_roots::push_roots();
+                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_FACCESSAT);
+                kwargs = reload_bound_kwonly(kw_base, kw_n);
+                drop(roots);
+                let dir_fd = dir_fd?;
+                let effective_ids = match bound_kwonly_named(&kwargs, kwonly, "effective_ids") {
+                    Some(v) => {
+                        let roots = pyre_object::gc_roots::push_roots();
+                        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
+                        let r = crate::baseobjspace::is_true(v);
+                        kwargs = reload_bound_kwonly(kw_base, kw_n);
+                        drop(roots);
+                        r?
+                    }
+                    None => false,
+                };
+                let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
+                    Some(v) => crate::baseobjspace::is_true(v)?,
+                    None => true,
+                };
+                // interp_posix.py `access` — the two flag modifiers have no other
+                // call to reach, so without `faccessat` they are refused rather
+                // than answered as though they had been applied.
+                if !HAVE_FACCESSAT {
+                    if !follow_symlinks {
+                        return Err(argument_unavailable("access", "follow_symlinks"));
+                    }
+                    if effective_ids {
+                        return Err(argument_unavailable("access", "effective_ids"));
+                    }
+                }
+                // interp_posix.py keeps the plain `access` for the
+                // unmodified call and reaches for `faccessat` only where the
+                // name resolves against a descriptor, the final symlink must
+                // not be followed, or the effective ids are the ones to ask
+                // about. `rposix.py` is the flag mapping.
+                let allowed = if dir_fd.is_some() || !follow_symlinks || effective_ids {
+                    let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                        .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+                    let mut flags = 0;
+                    if !follow_symlinks {
+                        flags |= libc::AT_SYMLINK_NOFOLLOW;
+                    }
+                    if effective_ids {
+                        flags |= libc::AT_EACCESS;
+                    }
+                    unsafe {
+                        majit_rlib::rposix::c_faccessat(
+                            dir_fd.unwrap_or(libc::AT_FDCWD),
+                            c_path.as_ptr(),
+                            mode,
+                            flags,
+                        ) == 0
+                    }
+                } else {
+                    // interp_posix.py `access`: `except OSError as e: raise wrap_oserror2(...)`.
+                    majit_rlib::rsandbox::catch_os_error(|| {
+                        majit_rlib::rposix::access(&path.as_bytes, mode)
+                    })
+                    .map_err(|errno| errno_err_with_filename(errno, path.w_path()))?
+                };
+                // `rposix.access` and `rposix.faccessat` both answer
+                // `error == 0` without `handle_posix_error`, so a refused
+                // call is False and not an `OSError` — including the EINVAL
+                // a mode outside `R_OK | W_OK | X_OK` can draw.
+                Ok(pyre_object::w_bool_from(allowed))
+            },
+            &["path", "mode"],
+            &["dir_fd", "effective_ids", "follow_symlinks"],
+        )
+    );
 
     // ── the descriptor calls Windows serves through the C runtime (the same
     //    noop placeholders, overridden) ───────────────────────────────────

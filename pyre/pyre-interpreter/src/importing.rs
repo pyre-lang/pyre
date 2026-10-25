@@ -460,6 +460,19 @@ impl SourceProvider for HostFsProvider {
 #[cfg(all(feature = "host_env", feature = "sandbox"))]
 struct SeamSourceProvider;
 
+/// `importing.py _readall` `finally: os.close(fd)`.
+#[cfg(all(feature = "host_env", feature = "sandbox"))]
+struct ReadallClose {
+    fd: i32,
+}
+
+#[cfg(all(feature = "host_env", feature = "sandbox"))]
+impl Drop for ReadallClose {
+    fn drop(&mut self) {
+        let _ = majit_rlib::rposix::close(self.fd);
+    }
+}
+
 #[cfg(all(feature = "host_env", feature = "sandbox"))]
 impl SeamSourceProvider {
     fn stat_mode(path: &Path) -> Option<u32> {
@@ -488,19 +501,20 @@ impl SourceProvider for SeamSourceProvider {
                 Err(err) => return Err(std::io::Error::from_raw_os_error(err)),
             }
         };
+        let _close = ReadallClose { fd };
         let mut data = Vec::new();
         loop {
             match majit_rlib::rposix::read(fd, 65536) {
-                Ok(chunk) if chunk.is_empty() => break,
-                Ok(chunk) => data.extend_from_slice(&chunk),
-                Err(err) if err == libc::EINTR => continue,
-                Err(err) => {
-                    let _ = majit_rlib::rposix::close(fd);
-                    return Err(std::io::Error::from_raw_os_error(err));
+                Ok(Ok(chunk)) if chunk.is_empty() => break,
+                Ok(Ok(chunk)) => {
+                    data.extend_from_slice(&chunk);
+                    continue;
                 }
+                Ok(Err(err)) if err == libc::EINTR => continue,
+                Ok(Err(err)) => return Err(std::io::Error::from_raw_os_error(err)),
+                Err(e) => majit_rlib::rsandbox::reraise(e),
             }
         }
-        let _ = majit_rlib::rposix::close(fd);
         Ok(data)
     }
 }
@@ -3325,8 +3339,6 @@ fn compute_startup_path_config() -> StartupPathConfig {
     use std::os::unix::ffi::OsStrExt;
     let executable = PathBuf::from("/bin/pyre");
     let stdlib = crate::host_seam::getenv(b"PYRE_STDLIB")
-        .ok()
-        .flatten()
         .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
     StartupPathConfig {
         base_executable: executable.clone(),

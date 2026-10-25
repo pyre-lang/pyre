@@ -143,13 +143,12 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
 ];
 
 /// The raw bytes of a variable, from the installed table when there is one and
-/// otherwise from the process environment through the host seam. A seam error
-/// reads as unset, the same as a name the environment does not carry.
+/// otherwise from the process environment through the host seam.
 fn read_raw(name: &str) -> Option<Vec<u8>> {
     if let Some(table) = LAUNCH_ENV.lock().as_ref() {
         return table.get(name).cloned();
     }
-    crate::host_seam::getenv(name.as_bytes()).ok().flatten()
+    crate::host_seam::getenv(name.as_bytes())
 }
 
 /// The decoded value, or `None` when unset *or* not valid Unicode — the

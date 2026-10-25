@@ -85,13 +85,9 @@ pub struct SandboxStub {
     pub fnname: &'static str,
 }
 
-fn sandbox_stub_message(fnname: &'static str) -> String {
-    format!("Not implemented: sandboxing for external function '{fnname}'")
-}
-
-/// Write the `not_implemented_stub` stderr line and panic with [`SandboxStub`].
+/// Panic with [`SandboxStub`] carrying `fnname` so the rustc-path catcher
+/// can call `rsandbox.py not_implemented_stub`.
 pub fn sandbox_stub_panic(fnname: &'static str) -> ! {
-    eprintln!("{}", sandbox_stub_message(fnname));
     std::panic::panic_any(SandboxStub { fnname })
 }
 
@@ -104,9 +100,9 @@ pub fn register_sandbox_stub_publisher(publisher: SandboxStubPublisher) {
     let _ = SANDBOX_STUB_PUBLISHER.set(publisher);
 }
 
-/// Write the `not_implemented_stub` stderr line and invoke the publisher hook.
+/// Invoke the residual publisher with `fnname` so it can call
+/// `rsandbox.py not_implemented_stub`.
 pub fn sandbox_stub_publish(fnname: &'static str) {
-    eprintln!("{}", sandbox_stub_message(fnname));
     if let Some(publisher) = SANDBOX_STUB_PUBLISHER.get() {
         publisher(fnname);
     }
@@ -390,8 +386,8 @@ mod tests {
 
     #[test]
     fn str2chararray_and_str2rawmem_copy_a_slice() {
-        let (buf, gc, case) = alloc_buffer(8);
-        assert_eq!(case, 2);
+        let (buf, gc, case) = alloc_buffer(8).unwrap();
+        assert_eq!(case, 0);
         unsafe {
             c_memset(cast::<VOIDP>(buf), 0xFF, 8);
             assert_eq!(str2chararray(b"hello", buf, 3), 3);
@@ -416,19 +412,17 @@ mod tests {
 
     #[test]
     fn alloc_buffer_str_from_buffer_and_scoped_drop() {
-        let (raw, gc, case) = alloc_buffer(8);
+        let (raw, gc, case) = alloc_buffer(8).unwrap();
         unsafe {
             c_memset(cast::<VOIDP>(raw), 0x41, 8);
-            assert_eq!(str_from_buffer(raw, gc, case, 8, 3), b"AAA");
-            keep_buffer_alive_until_here(raw, gc, case);
+            assert_eq!(str_from_buffer(raw, gc, case, 8, 3).unwrap(), b"AAA");
         }
 
-        let staged = scoped_alloc_buffer::new(8);
+        let staged = scoped_alloc_buffer::new(8).unwrap();
         assert_eq!(staged.size, 8);
-        assert_eq!(staged.case_num, 2);
+        assert_eq!(staged.case_num, 0);
         unsafe { c_memset(cast::<VOIDP>(staged.raw), 0x42, 8) };
-        assert_eq!(staged.str(2), b"BB");
-        drop(staged);
+        assert_eq!(staged.str(2).unwrap(), b"BB");
 
         let view = scoped_view_charp::new(b"ab\0c");
         assert_eq!(view.flag, 0x06);
@@ -488,7 +482,7 @@ mod tests {
         assert_eq!(rec.v, 5);
         assert_eq!(getintfield!(&rec, v), 5isize);
 
-        let (base, gc, case) = alloc_buffer(4);
+        let (base, gc, case) = alloc_buffer(4).unwrap();
         unsafe {
             c_memset(cast::<VOIDP>(base), 0, 4);
             *base = 1;
@@ -545,7 +539,7 @@ mod tests {
 
     #[test]
     fn c_memcpy_and_c_memset_fill_a_raw_buffer() {
-        let (buf, gc, case) = alloc_buffer(8);
+        let (buf, gc, case) = alloc_buffer(8).unwrap();
         unsafe {
             c_memset(cast::<VOIDP>(buf), 0x11, 8);
             assert_eq!(charpsize2str(buf, 8), vec![0x11; 8]);

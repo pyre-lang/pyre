@@ -4,14 +4,22 @@
 //! re-export these so each name is defined once.
 
 /// The not-implemented stub for OS surface that the sandbox controller does not
-/// service (signal/socket/dup/ftruncate/…). Port of `rsandbox.py`'s
-/// `get_sandbox_stub`/`not_implemented_stub`: raise `RuntimeError` rather than
-/// touch the OS (`not_implemented_stub` does `raise RuntimeError(msg)`).
+/// service (signal/socket/dup/ftruncate/…). `rsandbox.py get_sandbox_stub`
+/// builds the message; `not_implemented_stub` writes it and raises.
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 pub fn stub(fnname: &str) -> crate::PyError {
-    crate::PyError::runtime_error(format!(
-        "Not implemented: sandboxing for external function '{fnname}'"
-    ))
+    let msg = format!("Not implemented: sandboxing for external function '{fnname}'");
+    #[cfg(feature = "sandbox")]
+    {
+        crate::error::get_converted_unexpected_exception(
+            pyre_object::PY_NULL,
+            &majit_rlib::rsandbox::not_implemented_stub(&msg),
+        )
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        crate::PyError::runtime_error(msg)
+    }
 }
 
 /// Catch a rustc-path [`majit_rlib::rffi::SandboxStub`] panic and turn it into
@@ -30,7 +38,10 @@ where
                 {
                     match payload.downcast::<majit_rlib::rsandbox::SandboxError>() {
                         Ok(err) => {
-                            return Err(crate::host_seam::seam_os_err((*err).into(), ""));
+                            return Err(crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &*err,
+                            ));
                         }
                         Err(payload) => std::panic::resume_unwind(payload),
                     }

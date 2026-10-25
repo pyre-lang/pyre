@@ -62,7 +62,69 @@ impl std::fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
+impl SandboxError {
+    /// RPython exception class name `rsandbox.py reraise_error` raises for
+    /// this variant. `Protocol` is a loader-level `ValueError`
+    /// (`rmarshal.Loader.need_more_data` / `check_finished` / the `load_*`
+    /// `ValueError`s); `FdLoader.need_more_data` is `IOError` and maps to
+    /// [`SandboxError::Io`].
+    pub fn rpython_exception_class_name(&self) -> &'static str {
+        match self {
+            SandboxError::Os(_) => "OSError",
+            SandboxError::Io => "IOError",
+            SandboxError::Overflow => "OverflowError",
+            SandboxError::Value => "ValueError",
+            SandboxError::ZeroDivision => "ZeroDivisionError",
+            SandboxError::Memory => "MemoryError",
+            SandboxError::Key => "KeyError",
+            SandboxError::Index => "IndexError",
+            SandboxError::Runtime => "RuntimeError",
+            SandboxError::Protocol(_) => "ValueError",
+        }
+    }
+}
+
 pub type SandboxResult<T> = Result<T, SandboxError>;
+
+/// Catch an `OSError` escaping a non-`Result` trampoline, matching an interp
+/// caller of `except OSError as e: raise wrap_oserror(...)`.
+///
+/// `SandboxError::Os(errno)` becomes `Err(errno)`; any other payload is
+/// resumed so it reaches `error.py get_converted_unexpected_exception`.
+#[cfg(feature = "sandbox")]
+pub fn catch_os_error<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Ok(value),
+        Err(payload) => match payload.downcast::<SandboxError>() {
+            Ok(err) => match *err {
+                SandboxError::Os(errno) => Err(errno),
+                other => std::panic::resume_unwind(Box::new(other)),
+            },
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+#[cfg(not(feature = "sandbox"))]
+#[inline(always)]
+pub fn catch_os_error<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
+    Ok(f())
+}
+
+#[cfg(feature = "sandbox")]
+impl From<crate::rffi::MemoryError> for SandboxError {
+    fn from(_: crate::rffi::MemoryError) -> Self {
+        SandboxError::Memory
+    }
+}
+
+/// Re-raise an RPython exception that a typed result carried out of a trampoline,
+/// for a caller whose upstream does not catch it: it unwinds to the
+/// `BuiltinCode.handle_exception` boundary (`catch_sandbox_stub`).
+#[cfg(feature = "sandbox")]
+pub fn reraise(err: impl Into<SandboxError>) -> ! {
+    std::panic::panic_any(err.into())
+}
 
 /// Map an exception code (the first int of a reply) to a [`SandboxError`].
 ///
@@ -251,14 +313,21 @@ impl<T: SandboxLoad> SandboxLoad for Result<T, i32> {
 
     fn from_error(err: SandboxError) -> Self {
         match err {
-            SandboxError::Os(errno) => {
-                // Native `handle_posix_error` reads the errno `c_*` saved
-                // with `RFFI_SAVE_ERRNO`. The trampoline has no llexternal
-                // wrapper, so store the marshalled errno here.
-                crate::rposix::set_saved_errno(errno);
-                Err(errno)
-            }
+            SandboxError::Os(errno) => Err(errno),
             other => std::panic::panic_any(other),
+        }
+    }
+}
+
+impl<T: SandboxLoad> SandboxLoad for Result<T, crate::rffi::MemoryError> {
+    fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self> {
+        Ok(Ok(T::load(loader)?))
+    }
+
+    fn from_error(err: SandboxError) -> Self {
+        match err {
+            SandboxError::Memory => Err(crate::rffi::MemoryError),
+            other => Ok(T::from_error(other)),
         }
     }
 }
@@ -356,15 +425,8 @@ impl NeedMore for FdNeedMore {
     fn need_more(&mut self) -> SandboxResult<Vec<u8>> {
         let mut buf = vec![0u8; self.buflen];
         // SAFETY: read(2) into a buffer we own and sized; raw un-sandboxed read.
-        // Retry on EINTR so a delivered signal does not spuriously fail the
-        // protocol read.
-        let count = loop {
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut c_void, self.buflen) };
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break n;
-        };
+        // `rsandbox.FdLoader.need_more_data` calls `ll_read_not_sandboxed` once.
+        let count = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut c_void, self.buflen) };
         if count <= 0 {
             return Err(SandboxError::Io);
         }
@@ -384,14 +446,9 @@ pub fn fd_loader(fd: i32) -> Loader<FdNeedMore> {
 pub fn writeall_not_sandboxed(fd: i32, mut buf: &[u8]) -> SandboxResult<()> {
     while !buf.is_empty() {
         // SAFETY: write(2) from a slice we hold for the duration of the call.
-        // Retry on EINTR so a delivered signal does not spuriously fail the write.
-        let count = loop {
-            let n = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, buf.len()) };
-            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            break n;
-        };
+        // `rsandbox.writeall_not_sandboxed` calls `ll_write_not_sandboxed` once
+        // per partial write; `count <= 0` is `IOError`.
+        let count = unsafe { libc::write(fd, buf.as_ptr() as *const c_void, buf.len()) };
         if count <= 0 {
             return Err(SandboxError::Io);
         }
@@ -414,13 +471,17 @@ pub fn reraise_error<N: NeedMore>(error: i64, loader: &mut Loader<N>) -> Sandbox
     }
 }
 
-/// rsandbox.py `not_implemented_stub` — raise `RuntimeError` for an external
-/// whose signature cannot be marshalled. The RPython original also writes `msg`
-/// to fd 2; this port omits that write (matching the majit sibling mirror) so
-/// the untrusted child never writes directly to an inherited host fd.
+/// `rsandbox.py not_implemented_stub` — write `msg + '\n'` to fd 2 with
+/// `writeall_not_sandboxed`; a write failure is that `IOError`, otherwise
+/// `RuntimeError` (the RPython `msg` is ignored).
 pub fn not_implemented_stub(msg: &str) -> SandboxError {
-    let _ = msg;
-    SandboxError::Runtime
+    let mut line = String::with_capacity(msg.len() + 1);
+    line.push_str(msg);
+    line.push('\n');
+    match writeall_not_sandboxed(2, line.as_bytes()) {
+        Ok(()) => SandboxError::Runtime,
+        Err(err) => err,
+    }
 }
 
 /// `rsandbox.py` `execute` — marshal `fnname` (TYPE_STRING) followed by the
@@ -670,6 +731,28 @@ mod tests {
         assert_eq!(
             i64::load(&mut crate::rmarshal::Loader::from_bytes(buf)).unwrap(),
             -1
+        );
+    }
+
+    #[test]
+    fn catch_os_error_returns_the_closure_value() {
+        assert_eq!(catch_os_error(|| 7), Ok(7));
+    }
+
+    #[cfg(feature = "sandbox")]
+    #[test]
+    fn catch_os_error_maps_os_and_resumes_any_other_payload() {
+        assert_eq!(
+            catch_os_error(|| -> i32 { std::panic::panic_any(SandboxError::Os(libc::ENOENT)) }),
+            Err(libc::ENOENT)
+        );
+        let resumed = std::panic::catch_unwind(|| {
+            let _ = catch_os_error(|| -> i32 { std::panic::panic_any(SandboxError::Value) });
+        });
+        let payload = resumed.expect_err("non-Os SandboxError resumes");
+        assert_eq!(
+            payload.downcast_ref::<SandboxError>(),
+            Some(&SandboxError::Value)
         );
     }
 }

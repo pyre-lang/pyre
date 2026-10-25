@@ -402,21 +402,7 @@ fn list_from_roots(first: usize) -> PyObjectRef {
     list_from_root_slots(first..pyre_object::gc_roots::shadow_stack_len())
 }
 
-#[cfg(feature = "sandbox")]
-fn heap_dump_write_via_host(fd: i32, bytes: &[u8]) -> Result<isize, i32> {
-    pyre_interpreter::host_seam::raw_heap_dump_write(fd, bytes)
-        .map(|written| written as isize)
-        // A non-OS seam failure still needs an errno. Use the collector's code
-        // for targets and failure modes that cannot supply one.
-        .map_err(|error| match error {
-            pyre_interpreter::host_seam::SeamError::Os(errno) => errno,
-            _ => majit_gc::HEAP_DUMP_EIO,
-        })
-}
-
 pub(super) fn dump_rpy_heap_fd(fd: i32) -> Result<(), pyre_interpreter::PyError> {
-    #[cfg(feature = "sandbox")]
-    majit_gc::set_heap_dump_write(Some(heap_dump_write_via_host));
     match majit_gc::dump_rpy_heap(fd) {
         Ok(true) => Ok(()),
         Ok(false) => Err(pyre_interpreter::PyError::not_implemented(

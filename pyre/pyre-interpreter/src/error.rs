@@ -5652,25 +5652,75 @@ pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
 ///         % (e, extra)))
 /// ```
 ///
-/// The four typed arms re-raise `e` to sort it by RPython exception class.
-/// A `dyn Error` carries no such class: an interrupt reaches pyre through the
-/// signal module rather than as a host error, an allocation failure aborts the
-/// process instead of unwinding, and a stack overflow is caught by the
-/// recursion guard before any host error exists.  So every host error lands in
-/// the `except:` arm, which is also the one that reads `e` — reporting the
-/// failure instead of discarding it.  `extra` names the traceback
-/// `debug_print_traceback` dumps, and nothing dumps one here.
+/// Sorts `e` by RPython exception class the way that `try`/`except` chain
+/// does. An escaping `rffi.MemoryError` is `OperationError(w_MemoryError, w_None)`.
+/// Under sandbox a `SandboxError` is that class (`rsandbox.reraise_error`):
+/// `Memory`/`Runtime` become `OperationError(w_MemoryError/w_RuntimeError, w_None)`;
+/// every other class falls through to the `except:` SystemError arm.
 ///
 /// `@jit.dont_look_inside` (`error.py get_converted_unexpected_exception`).
 #[majit_macros::dont_look_inside]
 pub fn get_converted_unexpected_exception(
     _space: PyObjectRef,
-    error: &dyn std::error::Error,
+    error: &(dyn std::error::Error + 'static),
 ) -> OperationError {
     let _ = _space;
+    let none_value = |kind: PyErrorKind| {
+        PyError::from_type_and_value(
+            pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind_to_exc_kind(kind)),
+            pyre_object::w_none(),
+        )
+    };
+    if error
+        .downcast_ref::<majit_rlib::rffi::MemoryError>()
+        .is_some()
+    {
+        return none_value(PyErrorKind::MemoryError);
+    }
+    #[cfg(all(unix, feature = "sandbox"))]
+    if let Some(err) = error.downcast_ref::<majit_rlib::rsandbox::SandboxError>() {
+        let kind = match err {
+            majit_rlib::rsandbox::SandboxError::Memory => Some(PyErrorKind::MemoryError),
+            majit_rlib::rsandbox::SandboxError::Runtime => Some(PyErrorKind::RuntimeError),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return none_value(kind);
+        }
+    }
+    let name = {
+        #[cfg(all(unix, feature = "sandbox"))]
+        {
+            error
+                .downcast_ref::<majit_rlib::rsandbox::SandboxError>()
+                .map(majit_rlib::rsandbox::SandboxError::rpython_exception_class_name)
+                .unwrap_or("Exception")
+        }
+        #[cfg(not(all(unix, feature = "sandbox")))]
+        {
+            "Exception"
+        }
+    };
+    let addr = error as *const dyn std::error::Error as *const () as usize;
+    let repr = format!("<{name} object at 0x{addr:x}>");
+    // `debug_print_traceback`: dump the internal traceback to stderr. Under
+    // sandbox that is `writeall_not_sandboxed` on fd 2, the same un-sandboxed
+    // write `not_implemented_stub` uses.
+    let traceback = std::backtrace::Backtrace::force_capture();
+    #[cfg(all(unix, feature = "sandbox"))]
+    {
+        let dump = format!("{traceback}\n");
+        let _ = majit_rlib::rsandbox::writeall_not_sandboxed(2, dump.as_bytes());
+    }
+    #[cfg(not(all(unix, feature = "sandbox")))]
+    {
+        eprintln!("{traceback}");
+    }
     PyError::new(
         crate::PyErrorKind::SystemError,
-        format!("unexpected internal exception (please report a bug): {error:?}"),
+        format!(
+            "unexpected internal exception (please report a bug): {repr}; internal traceback was dumped to stderr"
+        ),
     )
 }
 

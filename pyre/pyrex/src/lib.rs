@@ -543,25 +543,6 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
     ))
 }
 
-/// Catch a trampoline `SandboxError` so launcher startup does not unwind
-/// past `rsandbox.reraise_error`.
-#[cfg(all(unix, feature = "sandbox"))]
-fn catch_sandbox_os<T, F>(f: F) -> Result<T, i32>
-where
-    F: FnOnce() -> Result<T, i32>,
-{
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(result) => result,
-        Err(payload) => match payload.downcast::<majit_rlib::rsandbox::SandboxError>() {
-            Ok(err) => match *err {
-                majit_rlib::rsandbox::SandboxError::Os(errno) => Err(errno),
-                _ => Err(libc::EIO),
-            },
-            Err(payload) => std::panic::resume_unwind(payload),
-        },
-    }
-}
-
 /// The working directory to seed `sys.path` with. Under sandbox it is read from
 /// the controller (the virtual `/tmp`) through `rposix.getcwd`, so an untrusted
 /// child never learns the trusted parent's real working directory; off sandbox
@@ -573,7 +554,8 @@ fn sys_path_cwd() -> std::path::PathBuf {
         let got = {
             #[cfg(feature = "sandbox")]
             {
-                catch_sandbox_os(|| majit_rlib::rposix::getcwd())
+                majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd())
+                    .unwrap_or_else(Err)
             }
             #[cfg(not(feature = "sandbox"))]
             {
@@ -656,10 +638,11 @@ fn read_stdin_source() -> std::io::Result<String> {
     let data = {
         let mut data = Vec::new();
         loop {
-            match catch_sandbox_os(|| majit_rlib::rposix::read(0, 65536)) {
-                Ok(chunk) if chunk.is_empty() => break,
-                Ok(chunk) => data.extend_from_slice(&chunk),
-                Err(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
+            match majit_rlib::rposix::read(0, 65536) {
+                Ok(Ok(chunk)) if chunk.is_empty() => break,
+                Ok(Ok(chunk)) => data.extend_from_slice(&chunk),
+                Ok(Err(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
+                Err(e) => majit_rlib::rsandbox::reraise(e),
             }
         }
         data
@@ -672,6 +655,31 @@ fn read_stdin_source() -> std::io::Result<String> {
     };
     String::from_utf8(data)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "stdin not utf-8"))
+}
+
+/// Catch a non-OS [`SandboxError`] from the stdin trampoline the way
+/// `app_main.py run_toplevel` reports an uncaught exception from `run_it`.
+/// `OSError` stays in [`read_stdin_source`]'s `Result`; any other payload is
+/// resumed so it is not swallowed here.
+#[cfg(feature = "sandbox")]
+fn read_stdin_source_catching_sandbox() -> std::io::Result<String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(read_stdin_source)) {
+        Ok(result) => result,
+        Err(payload) => match payload.downcast::<majit_rlib::rsandbox::SandboxError>() {
+            Ok(err) => {
+                let execution_context = setup_exec_context();
+                let ec_ptr = Rc::as_ptr(&execution_context);
+                let (canonical, _main_module) =
+                    pyre_interpreter::app_main::prepare_main_module(&execution_context);
+                let pyerr = pyre_interpreter::error::get_converted_unexpected_exception(
+                    pyre_object::PY_NULL,
+                    &*err,
+                );
+                handle_main_error(pyerr, canonical, ec_ptr);
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
 }
 
 // Native stack the interpreter runs on. Both figures sit well above the byte
@@ -1122,7 +1130,16 @@ fn real_main(binary_name: &str) {
             } else {
                 // Otherwise stdin is read to EOF and executed as a single
                 // `exec` unit named `<stdin>`.
-                let source = match read_stdin_source() {
+                let source = match {
+                    #[cfg(feature = "sandbox")]
+                    {
+                        read_stdin_source_catching_sandbox()
+                    }
+                    #[cfg(not(feature = "sandbox"))]
+                    {
+                        read_stdin_source()
+                    }
+                } {
                     Ok(source) => source,
                     Err(e) => {
                         eprintln!("{binary_name}: cannot read stdin: {e}");

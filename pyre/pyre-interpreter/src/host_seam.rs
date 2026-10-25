@@ -1,7 +1,7 @@
 //! Leftover OS helpers that are not `replace_os_function` /
 //! `replace_time_function` wrappers: [`sys`] (the libc names a sandbox
 //! module may mention), [`getenv`] (Charon wasm-layout entry), diagnostic
-//! stdio, [`raw_heap_dump_write`], and selector-C stubs.
+//! stdio, and selector-C stubs.
 //!
 //! Mediated OS/time calls go through `majit_rlib` wrappers; under
 //! `feature = "sandbox"` those expand to `rsandbox.make_sandbox_trampoline`
@@ -10,11 +10,6 @@
 //! selective: a host call outside that surface still compiles, and the
 //! Linux `seccomp` backstop is what catches it. See `pyre_sandbox`'s
 //! crate-root "Structural constraint" note.
-
-#[cfg(feature = "sandbox")]
-use majit_rlib::rmarshal::MarshalValue;
-#[cfg(feature = "sandbox")]
-use majit_rlib::rsandbox::{self as client, SandboxError, SyscallResult};
 
 /// `host_seam::sys` — the libc surface a sandbox-compiled module is allowed to
 /// name. Off sandbox it is `libc` verbatim; under sandbox it re-exports only
@@ -58,13 +53,14 @@ pub mod sys {
     pub use libc::winsize;
     // Constants (added as sandbox-reachable modules need them).
     pub use libc::{
-        AT_FDCWD, CODESET, EBADF, EINTR, EINVAL, ENOSYS, F_OK, LC_ALL, LC_COLLATE, LC_CTYPE,
-        LC_MESSAGES, LC_MONETARY, LC_NUMERIC, LC_TIME, O_ACCMODE, O_APPEND, O_ASYNC, O_CLOEXEC,
-        O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL, O_FSYNC, O_NOCTTY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY,
-        O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL,
-        RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE, RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT,
-        S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET, ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED,
-        WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED, X_OK,
+        AT_EACCESS, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CODESET, EBADF, EINTR, EINVAL, ENOSYS, F_OK,
+        LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES, LC_MONETARY, LC_NUMERIC, LC_TIME, O_ACCMODE,
+        O_APPEND, O_ASYNC, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_DSYNC, O_EXCL, O_FSYNC, O_NOCTTY,
+        O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_RDWR, O_SYNC, O_TRUNC, O_WRONLY, PRIO_PGRP,
+        PRIO_PROCESS, PRIO_USER, R_OK, RTLD_GLOBAL, RTLD_LAZY, RTLD_LOCAL, RTLD_NODELETE,
+        RTLD_NOLOAD, RTLD_NOW, RUSAGE_SELF, S_IFDIR, S_IFMT, S_IFREG, SEEK_CUR, SEEK_END, SEEK_SET,
+        ST_NOSUID, ST_RDONLY, TIOCGWINSZ, W_OK, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED,
+        WUNTRACED, X_OK,
     };
     // `posix`'s darwin-only names: the `setpriority` scopes, the `copyfile`
     // flags `_fcopyfile` takes, and `<stdio.h>`'s own `TMP_MAX`.
@@ -181,131 +177,19 @@ pub mod sys {
     };
 }
 
-/// An error from an OS seam operation. Self-contained in the interpreter so the
-/// non-sandbox build does not depend on `pyre-sandbox`. Numeric codes mirror the
-/// sandbox `EXCEPTION_TABLE`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SeamError {
-    /// `OSError(errno)`.
-    Os(i32),
-    Io,
-    Overflow,
-    Value,
-    ZeroDivision,
-    Memory,
-    Key,
-    Index,
-    Runtime,
-}
-
-#[cfg(feature = "sandbox")]
-impl From<SandboxError> for SeamError {
-    fn from(e: SandboxError) -> Self {
-        match e {
-            SandboxError::Os(errno) => SeamError::Os(errno),
-            SandboxError::Io => SeamError::Io,
-            SandboxError::Overflow => SeamError::Overflow,
-            SandboxError::Value => SeamError::Value,
-            SandboxError::ZeroDivision => SeamError::ZeroDivision,
-            SandboxError::Memory => SeamError::Memory,
-            SandboxError::Key => SeamError::Key,
-            SandboxError::Index => SeamError::Index,
-            SandboxError::Runtime | SandboxError::Protocol(_) => SeamError::Runtime,
-        }
-    }
-}
-
-pub type SeamResult<T> = Result<T, SeamError>;
-
-/// Map a [`SeamError`] onto the interpreter's `PyError`, mirroring the
-/// `io_err`/`fd_io_err` conversions the real-syscall call sites use. `context`
-/// is the path that becomes the `OSError`'s `filename` (empty = omit, matching
-/// the `""` the fd call sites pass). Both real and trampoline-backed opens
-/// use this conversion so they expose the same Python exception shape.
-pub fn seam_os_err(e: SeamError, context: &str) -> crate::PyError {
-    if context.is_empty() {
-        return seam_os_err_with_filename(e, pyre_object::PY_NULL);
-    }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let filename_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(context));
-    seam_os_err_with_filename(e, pyre_object::gc_roots::shadow_stack_get(filename_slot))
-}
-
-/// `wrap_oserror2(space, e, w_path)` in `interp_posix.py`: retain the exact
-/// argument object for `OSError.filename` instead of rebuilding its spelling.
-pub fn seam_os_err_with_filename(
-    e: SeamError,
-    w_filename: pyre_object::PyObjectRef,
-) -> crate::PyError {
-    match e {
-        SeamError::Os(errno) => crate::PyError::os_error_syscall(errno, w_filename),
-        SeamError::Io => crate::PyError::os_error_with_errno(libc::EIO, "I/O error"),
-        SeamError::Value => crate::PyError::value_error("embedded null in path"),
-        SeamError::Overflow => crate::PyError::overflow_error("integer overflow"),
-        SeamError::ZeroDivision => crate::PyError::runtime_error("division by zero"),
-        SeamError::Memory => crate::PyError::memory_error("out of memory"),
-        SeamError::Key => crate::PyError::key_error("key error"),
-        SeamError::Index => crate::PyError::index_error("index out of range"),
-        SeamError::Runtime => crate::PyError::runtime_error("sandbox runtime error"),
-    }
-}
-
 pub use crate::host_seam_stub::catch_sandbox_stub;
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 pub use crate::host_seam_stub::stub;
-
-/// The sandbox trampoline for `inspector.py raw_os_write`, whose
-/// `_nowrapper=True` declaration deliberately keeps the GIL held. Heap
-/// dumping calls this while it owns the collector's `&mut MiniMarkGC` and,
-/// when another mutator exists, the stop-the-world guard. Protocol I/O is
-/// `ll_write_not_sandboxed` (`sandboxsafe=True`, `_nowrapper=True`); this
-/// private `client::syscall` path stays off `rposix.write` so the dump
-/// owner does not enter a wrapper while holding the collector.
-///
-/// Keep this boundary private to the collector hook. Every ordinary host
-/// write continues to use `rposix.write`.
-#[cfg(feature = "sandbox")]
-pub fn raw_heap_dump_write(fd: i32, data: &[u8]) -> SeamResult<i64> {
-    let args = [
-        MarshalValue::Int(fd as i64),
-        MarshalValue::Str(data.to_vec()),
-    ];
-    let result = client::syscall(
-        "ll_os.ll_os_write",
-        &args,
-        majit_rlib::rsandbox::ResultKind::Int,
-    )?;
-    match result {
-        SyscallResult::Int(written) => Ok(written),
-        _ => Err(SeamError::Runtime),
-    }
-}
 
 /// Read one process-environment value through `rposix_environ.getenv_llimpl`.
 ///
 /// Keep this target-independent entry point at the module root: Charon's
 /// wasm-layout extraction does not retain nested modules, while ordinary
 /// Unix builds still go through the same wrapper (the `ll_os.ll_os_getenv`
-/// trampoline under sandbox).
-pub fn getenv(name: &[u8]) -> SeamResult<Option<Vec<u8>>> {
-    #[cfg(feature = "sandbox")]
-    {
-        // `getenv_llimpl` is `Option<Vec<u8>>`; a controller error panics
-        // with `SandboxError` (`rsandbox.reraise_error`). Startup callers
-        // sit outside `catch_sandbox_stub`, so convert here.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            majit_rlib::rposix_environ::getenv_llimpl(name)
-        })) {
-            Ok(value) => Ok(value),
-            Err(payload) => match payload.downcast::<SandboxError>() {
-                Ok(err) => Err((*err).into()),
-                Err(payload) => std::panic::resume_unwind(payload),
-            },
-        }
-    }
-    #[cfg(not(feature = "sandbox"))]
-    Ok(majit_rlib::rposix_environ::getenv_llimpl(name))
+/// trampoline under sandbox). A trampoline exception from `reraise_error`
+/// propagates.
+pub fn getenv(name: &[u8]) -> Option<Vec<u8>> {
+    majit_rlib::rposix_environ::getenv_llimpl(name)
 }
 
 // ── Interpreter stdio ────────────────────────────────────────────────────────

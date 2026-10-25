@@ -344,7 +344,12 @@ fn fcntl(
             // own length when it exceeds the 1024-byte floor.
             let src = majit_rlib::rffi::scoped_str2charp::new(Some(data));
             let total = ARG_BUFSZ.max(data.len()) + ARG_GUARD.len();
-            let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total);
+            let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total).map_err(|e| {
+                pyre_interpreter::error::get_converted_unexpected_exception(
+                    pyre_object::PY_NULL,
+                    &e,
+                )
+            })?;
             unsafe { fill_guarded(staged.raw, src.buf, data.len(), total) };
             loop {
                 let rv = unsafe { ll::fcntl_str(fd, cmd, staged.raw) };
@@ -725,7 +730,9 @@ fn stage_ioctl(
 ) -> Result<(i32, Vec<u8>, bool), pyre_interpreter::PyError> {
     let ll_arg = FreeCharp(majit_rlib::rffi::str2charp(arg, true));
     let total = ARG_BUFSZ.max(arg.len()) + ARG_GUARD.len();
-    let buf = majit_rlib::rffi::scoped_alloc_buffer::new(total);
+    let buf = majit_rlib::rffi::scoped_alloc_buffer::new(total).map_err(|e| {
+        pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+    })?;
     unsafe { fill_guarded(buf.raw, ll_arg.0, arg.len(), total) };
     let rv = unsafe { ll::ioctl_str(fd, request, buf.raw) };
     if rv < 0 {
