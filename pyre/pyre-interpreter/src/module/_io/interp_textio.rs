@@ -347,6 +347,18 @@ impl Default for W_TextIOWrapper {
     }
 }
 
+/// Unique stand-in stored in `Function.w_kw_defs` for an omitted `newline`
+/// (`interp_textio.py reconfigure` `kwargs_w.pop("newline", None)`: RPython
+/// `None` is omitted, `w_None` is universal). A dict value cannot be `PY_NULL`.
+fn omitted_newline() -> PyObjectRef {
+    static CELL: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    CELL.get_or_init(pyre_object::listobject::w_list_new_empty)
+}
+
+fn newline_omitted(w: PyObjectRef) -> bool {
+    w.is_null() || std::ptr::eq(w, omitted_newline())
+}
+
 impl W_TextIOWrapper {
     fn self_obj(&self) -> PyObjectRef {
         self as *const Self as PyObjectRef
@@ -2154,11 +2166,24 @@ impl W_TextIOWrapper {
 
     fn reconfigure(
         &mut self,
-        #[default(pyre_object::w_none())] encoding: PyObjectRef,
-        #[default(pyre_object::w_none())] mut errors: PyObjectRef,
-        #[default(pyre_object::PY_NULL)] mut newline: PyObjectRef,
-        #[default(pyre_object::w_none())] mut line_buffering: PyObjectRef,
-        #[default(pyre_object::w_none())] mut write_through: PyObjectRef,
+        // `interp_textio.py reconfigure`: `__args__.unpack()` then
+        // `if args_w: raise TypeError("reconfigure() takes no positional arguments")`.
+        // `_pyio.TextIOWrapper.reconfigure(self, *, encoding=None, ...)`.
+        #[kwonly]
+        #[default(pyre_object::w_none())]
+        encoding: PyObjectRef,
+        #[kwonly]
+        #[default(pyre_object::w_none())]
+        mut errors: PyObjectRef,
+        #[kwonly]
+        #[default(omitted_newline())]
+        mut newline: PyObjectRef,
+        #[kwonly]
+        #[default(pyre_object::w_none())]
+        mut line_buffering: PyObjectRef,
+        #[kwonly]
+        #[default(pyre_object::w_none())]
+        mut write_through: PyObjectRef,
     ) -> Result<(), crate::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
@@ -2166,7 +2191,7 @@ impl W_TextIOWrapper {
         if Self::from_slot(slot).decoded.text.is_some()
             && (!unsafe { pyre_object::is_none(encoding) }
                 || !unsafe { pyre_object::is_none(errors) }
-                || !newline.is_null())
+                || !newline_omitted(newline))
         {
             return Err(super::unsupported(
                 "It is not possible to set the encoding or newline of stream after the first read",
@@ -2186,7 +2211,7 @@ impl W_TextIOWrapper {
             pyre_object::with_roots!(line_buffering, newline, write_through => Self::io_check_errors(&value))?;
             Some(value)
         };
-        let new_newline = if newline.is_null() {
+        let new_newline = if newline_omitted(newline) {
             None
         } else {
             Some(Self::unwrap_newline(newline)?)

@@ -21876,10 +21876,15 @@ fn init_instancemethod_type(ns: PyObjectRef) {
         crate::__pyre_put_new!(
             ns_slot,
             "__get__",
-            crate::gateway::make_builtin_function_with_signature(
-                "__get__",
-                instancemethod_descr_get,
-                crate::gateway::Signature::new(vec!["self", "obj", "owner"], None, None, 0, 3),
+            // `classobject.py InstanceMethod.descr_get(self, space, w_obj, w_klass=None)`:
+            // the owner slot is optional. `Function.defs_w` holds that None.
+            crate::gateway::function_set_positional_defaults(
+                crate::gateway::make_builtin_function_with_signature(
+                    "__get__",
+                    instancemethod_descr_get,
+                    crate::gateway::Signature::new(vec!["self", "obj", "owner"], None, None, 0, 3,),
+                ),
+                &[pyre_object::w_none()],
             )
         );
         crate::__pyre_put_new!(
@@ -23708,8 +23713,8 @@ fn init_int_type(ns: PyObjectRef) {
             )
         )
     };
-    // intobject.py descr_repr. CPython 3.14 inherits object.__str__, whose
-    // implementation delegates virtually to this repr slot.
+    // intobject.py descr_repr. object.__str__ delegates virtually to this
+    // repr slot; the type dict has no `__str__` key.
     let int_to_text = |args: &[PyObjectRef]| {
         let obj = args[0];
         // Exact machine int: `intobject.py descr_repr` — `ll_int2dec` +

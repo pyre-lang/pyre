@@ -1086,30 +1086,33 @@ impl W_Deque {
         #[default(None)] iterable: Option<PyObjectRef>,
         #[default(None)] maxlen: Option<PyObjectRef>,
     ) -> Result<(), crate::PyError> {
-        // gateway_nonnegint_w(w_maxlen): None unbounded; non-int → TypeError; negative → ValueError.
-        // Validated before the clear so a bad maxlen leaves the deque untouched.
-        self.maxlen = match maxlen {
-            Some(m) if !unsafe { is_none(m) } => {
-                if !unsafe { is_int(m) } {
-                    return Err(crate::PyError::type_error("an integer is required"));
-                }
-                let v = unsafe { w_int_get_value(m) };
-                if v < 0 {
-                    return Err(crate::PyError::value_error("maxlen must be non-negative"));
-                }
-                v
-            }
-            _ => -1,
-        };
+        // `interp_deque.py init`: `gateway_nonnegint_w(w_maxlen)` after the
+        // `is_none` arm.  Conversion goes through `gateway_int_w`.
+        // [3.15-spec] a negative bound is `maxlen must be non-negative`
+        // (`_collectionsmodule.c deque_init`), not gateway_nonnegint_w's
+        // `expected a non-negative integer`.
         let mut self_obj = self as *mut W_Deque as PyObjectRef;
+        let has_iterable = iterable.is_some();
+        let mut iterable_obj = iterable.unwrap_or(PY_NULL);
+        let mut maxlen_obj = maxlen.unwrap_or(PY_NULL);
+        let maxlen_val = if maxlen_obj.is_null() || unsafe { is_none(maxlen_obj) } {
+            -1
+        } else {
+            let v = pyre_object::with_roots!(self_obj, iterable_obj, maxlen_obj => {
+                crate::baseobjspace::gateway_int_w(maxlen_obj)
+            })?;
+            if v < 0 {
+                return Err(crate::PyError::value_error("maxlen must be non-negative"));
+            }
+            v
+        };
+        W_Deque::from_obj(self_obj).expect("deque").maxlen = maxlen_val;
         // Reinitialize by clearing, but only when non-empty (`init`:
         // `if self.len > 0: self.clear()`). `store` bumps the iteration lock
         // (`modified`) so an outstanding scan of an existing deque detects the
         // reset; an already-empty deque leaves `lock` untouched, so re-init
         // while iterating an empty deque yields StopIteration, not a mutation
         // RuntimeError.
-        let has_iterable = iterable.is_some();
-        let mut iterable_obj = iterable.unwrap_or(PY_NULL);
         if deque_len(self_obj) > 0 {
             pyre_object::with_roots!(self_obj, iterable_obj => clear_blocks(self_obj));
         }

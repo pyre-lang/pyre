@@ -1723,11 +1723,11 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
     unsafe {
         if is_tuple(seq) {
             return w_tuple_getitem(seq, index as i64)
-                .ok_or_else(|| PyError::type_error("tuple index out of range"));
+                .ok_or_else(|| PyError::index_error("tuple index out of range"));
         }
         if is_list(seq) {
             return w_list_getitem(seq, index as i64)
-                .ok_or_else(|| PyError::type_error("list index out of range"));
+                .ok_or_else(|| PyError::index_error("list index out of range"));
         }
         if is_str(seq) {
             // Read the code point through the WTF-8 view so a surrogate-bearing
@@ -1738,7 +1738,7 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
                     one.push(c);
                     pyre_object::w_str_from_wtf8_managed(one)
                 })
-                .ok_or_else(|| PyError::type_error("string index out of range"));
+                .ok_or_else(|| PyError::index_error("string index out of range"));
         }
         // Try getitem for instances
         if is_instance(seq) {

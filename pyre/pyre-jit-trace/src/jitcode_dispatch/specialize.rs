@@ -7363,14 +7363,6 @@ const FLOAT_NE_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-NE-SUBWALK",
 };
 
-/// floatobject.py `descr_pos`.
-const FLOAT_POS_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_interpreter::objspace::descroperation::_float_pos",
-    commit_label: "float_pos_commit",
-    call_site_label: "float_pos_call_site",
-    decline_tag: "FLOAT-POS-SUBWALK",
-};
-
 /// intobject.py `descr_abs` after `ovfcheck`.
 #[allow(dead_code)]
 const INT_ABS_DESCENT: HelperDescent = HelperDescent {
@@ -7774,40 +7766,19 @@ pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
     )
 }
 
-/// Exact builtin `float` `UNARY_POSITIVE`: walk `_float_pos`.
-/// Exact `int` stays residual: `_self_unaryop('pos')` is `self.int(space)`
-/// and returns `self`, so a write-through here would be a new fold.
+/// Exact builtin `float`/`int` `UNARY_POSITIVE` stay residual.
+/// `descr_pos` → `descr_float` returns `self` for an exact float;
+/// `_self_unaryop('pos')` returns `self` for exact int. Walking
+/// `_float_pos` would allocate a fresh box.
 pub(crate) fn try_walker_orthodox_unary_pos<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
+    _op_pc: usize,
     r_args: &[OpRef],
-    dst: usize,
+    _dst: usize,
     dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !ctx.is_authoritative_executor || r_args.len() != 1 || dst_bank != 'r' {
         return Ok(None);
-    }
-    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
-        return Ok(None);
-    };
-    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
-        return Ok(None);
-    }
-    if unsafe { pyre_object::is_float(obj) } {
-        let x = unsafe { pyre_object::w_float_get_value(obj) };
-        let xa = walker_coerce_dispatching_operand_to_float(
-            ctx, op_pc, r_args[0], obj, false, x, false,
-        )?;
-        return try_walker_orthodox_descent(
-            ctx,
-            op_pc,
-            &[],
-            &[],
-            &[(xa, x)],
-            dst,
-            dst_bank,
-            &FLOAT_POS_DESCENT,
-        );
     }
     Ok(None)
 }
