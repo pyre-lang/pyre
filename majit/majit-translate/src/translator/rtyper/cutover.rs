@@ -9973,6 +9973,7 @@ mod tests {
                     item_ty: ValueType::Ref(None),
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
             }],
@@ -10618,6 +10619,7 @@ mod tests {
                     item_ty: ValueType::Int,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
             };

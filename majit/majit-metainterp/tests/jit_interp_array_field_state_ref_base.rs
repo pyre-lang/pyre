@@ -1,8 +1,12 @@
 //! An `array_fields` base spelled as a `ref(T)` state scalar.
 //!
 //! `array_fields = { S::f => E }` says the field `f` holds a buffer BASE
-//! POINTER, so `<obj>.f[i]` is a `getfield_gc_r` of the base followed by a
-//! `get/setarrayitem_gc` on the element. The vocabulary is accepted by both
+//! ADDRESS, so `<obj>.f[i]` is a `getfield_gc_i` of the base followed by a
+//! `get/setarrayitem_raw` on the element. A headerless `*mut T` field is
+//! `Ptr(lltype.Array)`: `history.py` `getkind` banks a Ptr whose
+//! `TO._gckind == 'raw'` as kind `'int'`, and `jtransform.py`
+//! `Transformer.rewrite_op_getarrayitem` / `rewrite_op_setarrayitem` choose
+//! the op from `ARRAY._gckind`. The vocabulary is accepted by both
 //! `#[jit_inline]` and `#[jit_interp]`, but `<obj>` can be spelled two ways and
 //! only one of them was ever resolved:
 //!
@@ -241,23 +245,33 @@ fn the_compiled_trace_lowers_both_element_accesses_to_array_ops() {
 
     let loop_ops = COMPILED.lock().clone();
     let count = |wanted: OpCode| loop_ops.iter().filter(|op| **op == wanted).count();
-    let sets = count(OpCode::SetarrayitemGc);
-    let gets = count(OpCode::GetarrayitemGcI);
-    let bases = count(OpCode::GetfieldGcR);
+    let sets = count(OpCode::SetarrayitemRaw);
+    let gets = count(OpCode::GetarrayitemRawI);
+    let bases = count(OpCode::GetfieldGcI);
     assert!(
         bases > 0,
-        "the buffer base must be read out of the holder as a pointer field; \
+        "the buffer base must be read out of the holder as an int field \
+         (`getfield_gc_i`; `history.py` `getkind` of a raw Ptr is `'int'`); \
          loop was {loop_ops:?}",
     );
     assert!(
         sets > 0,
-        "the element write must survive as a setarrayitem; an arm that degraded \
+        "the element write must survive as a setarrayitem_raw; an arm that degraded \
          to an abort stub leaves none. Loop was {loop_ops:?}",
     );
     assert!(
         gets > 0,
-        "the element read must survive as a getarrayitem; an arm that degraded \
+        "the element read must survive as a getarrayitem_raw; an arm that degraded \
          to an abort stub leaves none. Loop was {loop_ops:?}",
+    );
+    assert!(
+        count(OpCode::SetarrayitemGc) == 0
+            && count(OpCode::GetarrayitemGcI) == 0
+            && count(OpCode::GetfieldGcR) == 0,
+        "a headerless `*mut i64` buffer must not lower through GC array/field \
+         ops (`jtransform.py` `Transformer.rewrite_op_getarrayitem` / \
+         `rewrite_op_setarrayitem` pick `raw` from `ARRAY._gckind`); \
+         loop was {loop_ops:?}",
     );
 }
 

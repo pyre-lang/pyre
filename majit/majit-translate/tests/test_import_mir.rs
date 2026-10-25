@@ -16,7 +16,7 @@ use majit_translate::{
     },
     flowspace::argument::Signature,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, VecFieldPart},
+    model::{ArrayGcKind, CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, VecFieldPart},
     translator::rtyper::{legacy_annotator, legacy_resolve},
 };
 
@@ -124,6 +124,7 @@ fn tuple_len_reads_the_fixed_list_not_the_items_block() {
             OpKind::ArrayLen {
                 array_type_id: Some(id),
                 nolength: false,
+                gckind: ArrayGcKind::Gc,
                 ..
             } if id == "majit::object_ref_gcarray"
         )),

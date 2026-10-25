@@ -1114,6 +1114,7 @@ mod tests {
                     base: slice.clone(),
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -1215,6 +1216,7 @@ mod tests {
                     base: receiver_b,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -1264,6 +1266,7 @@ mod tests {
                     base: site_slice,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -1973,6 +1976,7 @@ mod tests {
                     item_ty: ValueType::Ref(None),
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -1989,6 +1993,7 @@ mod tests {
                     item_ty: ValueType::Ref(None),
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
             },
             reload_op,
@@ -2230,6 +2235,7 @@ mod tests {
                     base: slice.clone(),
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -2263,6 +2269,7 @@ mod tests {
                     base: slice.clone(),
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -2295,6 +2302,7 @@ mod tests {
                     base: slice.clone(),
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -2418,6 +2426,7 @@ mod tests {
                     base: cast,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -2913,6 +2922,7 @@ mod tests {
                 base: slice.clone(),
                 array_type_id: Some("[i64]".into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             true,
         );

@@ -714,9 +714,13 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
 // ── Array-backed storage: `array_fields` element read/write ─────────
 //
 // The non-virtualizable array vocabulary. `data` holds the buffer BASE
-// POINTER, so `stack.data[i]` is a `getfield_gc_r` for the base followed by
-// `get/setarrayitem_gc_i` — the elements do not ride a guard's `vable_array`
-// resume section, so a guard's snapshot stays O(1) in the buffer length.
+// POINTER, so `stack.data[i]` is a `getfield_gc_i` for the base followed by
+// `get/setarrayitem_raw_i` (`history.py` `getkind` of a Ptr whose
+// `TO._gckind == 'raw'` is kind `'int'`; `jtransform.py`
+// `Transformer.rewrite_op_getarrayitem` / `rewrite_op_setarrayitem` take
+// the op from `ARRAY._gckind`) — the elements do not ride a guard's
+// `vable_array` resume section, so a guard's snapshot stays O(1) in the
+// buffer length.
 
 #[repr(C)]
 struct InlineArrayStack {
@@ -760,7 +764,7 @@ fn inline_array_stack_pop(stack: usize) -> i64 {
 /// enough for what these tests claim — that the emitter selected the array
 /// opcode at all rather than falling back to a residual call — and each
 /// caller corroborates it with a register-bank assertion that only the
-/// getfield_gc_r + array-op pair produces.
+/// getfield_gc_i + raw array-op pair produces.
 fn jitcode_contains_opcode(jitcode: &majit_metainterp::JitCode, key: &str) -> bool {
     let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()
         .get(key)
@@ -769,34 +773,55 @@ fn jitcode_contains_opcode(jitcode: &majit_metainterp::JitCode, key: &str) -> bo
 }
 
 #[test]
-fn jit_inline_array_field_write_emits_setarrayitem_gc_i() {
+fn jit_inline_array_field_write_emits_setarrayitem_raw_i() {
     let mut asm = majit_metainterp::Assembler::new();
     let jitcode = __majit_inline_jitcode_inline_array_stack_push_with_asm(&mut asm);
     assert!(
-        jitcode_contains_opcode(&jitcode, "setarrayitem_gc_i/riid"),
-        "`stack.data[sp] = value` should lower to setarrayitem_gc_i, not a residual call"
+        jitcode_contains_opcode(&jitcode, "setarrayitem_raw_i/iiid"),
+        "`stack.data[sp] = value` should lower to setarrayitem_raw_i, not a residual call"
     );
-    // The buffer base is loaded through a getfield_gc_r, so the ref bank
-    // holds both the struct pointer and the buffer pointer.
     assert!(
-        jitcode.c_num_regs_r >= 2,
-        "struct ref + loaded buffer base both need ref registers, got {}",
+        !jitcode_contains_opcode(&jitcode, "getfield_gc_r/rd>r"),
+        "a headerless `*mut T` base is `getfield_gc_i`, not getfield_gc_r; code={:?}",
+        jitcode.code
+    );
+    // The struct ref stays in the ref bank. The buffer base is a raw
+    // address (`history.py` `getkind`), loaded through getfield_gc_i into
+    // the int bank with the index and the value.
+    assert!(
+        jitcode.c_num_regs_r >= 1,
+        "struct ref needs a ref register, got {}",
         jitcode.c_num_regs_r
+    );
+    assert!(
+        jitcode.c_num_regs_i >= 2,
+        "the raw base and the index both need int registers, got {}",
+        jitcode.c_num_regs_i
     );
 }
 
 #[test]
-fn jit_inline_array_field_read_emits_getarrayitem_gc_i() {
+fn jit_inline_array_field_read_emits_getarrayitem_raw_i() {
     let mut asm = majit_metainterp::Assembler::new();
     let jitcode = __majit_inline_jitcode_inline_array_stack_pop_with_asm(&mut asm);
     assert!(
-        jitcode_contains_opcode(&jitcode, "getarrayitem_gc_i/rid>i"),
-        "`stack.data[sp]` should lower to getarrayitem_gc_i, not a residual call"
+        jitcode_contains_opcode(&jitcode, "getarrayitem_raw_i/iid>i"),
+        "`stack.data[sp]` should lower to getarrayitem_raw_i, not a residual call"
     );
     assert!(
-        jitcode.c_num_regs_r >= 2,
-        "struct ref + loaded buffer base both need ref registers, got {}",
+        !jitcode_contains_opcode(&jitcode, "getfield_gc_r/rd>r"),
+        "a headerless `*mut T` base is `getfield_gc_i`, not getfield_gc_r; code={:?}",
+        jitcode.code
+    );
+    assert!(
+        jitcode.c_num_regs_r >= 1,
+        "struct ref needs a ref register, got {}",
         jitcode.c_num_regs_r
+    );
+    assert!(
+        jitcode.c_num_regs_i >= 2,
+        "the raw base and the index both need int registers, got {}",
+        jitcode.c_num_regs_i
     );
 }
 

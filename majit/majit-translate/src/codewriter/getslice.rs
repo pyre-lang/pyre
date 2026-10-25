@@ -416,6 +416,7 @@ pub fn build_ll_listslice_startonly_graph(
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         },
     );
     let newlength = push(
@@ -478,6 +479,7 @@ pub fn build_ll_listslice_minusone_graph(
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         },
     );
     let one = push(&mut graph, start_block, OpKind::ConstInt(1));
@@ -585,6 +587,7 @@ pub fn build_ll_listslice_rangeto_graph(
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         },
     );
     let in_range = push(
@@ -681,6 +684,7 @@ pub fn build_ll_listslice_startstop_graph(
             base: l1.clone(),
             array_type_id: array_type_id.clone(),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         },
     );
     let in_range = push(
@@ -1034,6 +1038,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("objref".into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,
@@ -1059,6 +1064,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("objref".into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,
@@ -1114,6 +1120,7 @@ mod tests {
                 base: args.clone(),
                 array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             true,
         );
@@ -1132,6 +1139,7 @@ mod tests {
                 base: bytes.clone(),
                 array_type_id: Some("bytes".into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             true,
         );
@@ -1211,6 +1219,7 @@ mod tests {
                 base: items.clone(),
                 array_type_id: Some("[i64]".into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             true,
         );
@@ -1249,6 +1258,7 @@ mod tests {
                 item_ty: ValueType::Float,
                 array_type_id: Some("[f64]".into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,

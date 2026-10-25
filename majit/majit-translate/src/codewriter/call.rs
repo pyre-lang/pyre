@@ -15464,18 +15464,51 @@ fn array_item_spelling(
 /// and S4c degrades to `EF_RANDOM_EFFECTS`. STR.chars is
 /// `CHAR_ARRAY = GcArray(Char)` (`ll_str.py`).
 fn effect_array_type_id(base: &crate::flowspace::model::Variable) -> Option<String> {
+    Some(array_type_id_of_lltype(&effect_array_of_base(base)))
+}
+
+/// `ARRAY = op.args[0].concretetype.TO` (`Transformer.rewrite_op_getarrayitem`).
+/// A missing ARRAY keeps STR.chars (`GcArray(Char)`, `ll_str.py`).
+fn effect_array_of_base(
+    base: &crate::flowspace::model::Variable,
+) -> crate::translator::rtyper::lltypesystem::lltype::Array {
     use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, PtrTarget};
-    let arr = match base.concretetype() {
+    match base.concretetype() {
         Some(LowLevelType::Ptr(ptr)) => match ptr.TO {
-            PtrTarget::Array(arr) => Some(arr),
-            _ => None,
+            PtrTarget::Array(arr) => arr,
+            _ => Array::gc(LowLevelType::Char),
         },
-        Some(LowLevelType::Array(arr)) => Some(*arr),
-        _ => None,
-    };
-    Some(array_type_id_of_lltype(
-        &arr.unwrap_or_else(|| Array::gc(LowLevelType::Char)),
-    ))
+        Some(LowLevelType::Array(arr)) => *arr,
+        _ => Array::gc(LowLevelType::Char),
+    }
+}
+
+/// `ARRAY._hints['nolength']` (`Transformer.rewrite_op_getarrayitem`).
+fn effect_array_nolength(arr: &crate::translator::rtyper::lltypesystem::lltype::Array) -> bool {
+    use crate::flowspace::model::ConstValue;
+    matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true)))
+}
+
+/// `ARRAY._gckind` (`Transformer.rewrite_op_getarrayitem`).
+fn effect_array_gckind(
+    arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) -> crate::model::ArrayGcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    match arr._gckind {
+        GcKind::Gc => crate::model::ArrayGcKind::Gc,
+        GcKind::Raw | GcKind::Prebuilt => crate::model::ArrayGcKind::Raw,
+    }
+}
+
+fn effect_array_op_facts(
+    base: &crate::flowspace::model::Variable,
+) -> (Option<String>, bool, crate::model::ArrayGcKind) {
+    let arr = effect_array_of_base(base);
+    (
+        Some(array_type_id_of_lltype(&arr)),
+        effect_array_nolength(&arr),
+        effect_array_gckind(&arr),
+    )
 }
 
 fn effect_linkarg(hlv: &crate::flowspace::model::Hlvalue) -> LinkArg {
@@ -15795,21 +15828,22 @@ fn effect_transduce_op(
         }
         "getarraysize" => {
             let base = effect_expect_var(&op.args[0]);
-            let array_type_id = effect_array_type_id(&base);
+            let (array_type_id, nolength, gckind) = effect_array_op_facts(&base);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
                 OpKind::ArrayLen {
                     base,
                     array_type_id,
-                    nolength: false,
+                    nolength,
+                    gckind,
                 },
                 result,
             );
         }
         "getarrayitem" => {
             let base = effect_expect_var(&op.args[0]);
-            let array_type_id = effect_array_type_id(&base);
+            let (array_type_id, nolength, gckind) = effect_array_op_facts(&base);
             let index = effect_materialize(out, block, &op.args[1]);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
@@ -15819,7 +15853,8 @@ fn effect_transduce_op(
                     index,
                     item_ty: effect_value_type_of(&result),
                     array_type_id,
-                    nolength: false,
+                    nolength,
+                    gckind,
                     pure: false,
                 },
                 result,
@@ -15827,7 +15862,7 @@ fn effect_transduce_op(
         }
         "setarrayitem" => {
             let base = effect_expect_var(&op.args[0]);
-            let array_type_id = effect_array_type_id(&base);
+            let (array_type_id, nolength, gckind) = effect_array_op_facts(&base);
             let index = effect_materialize(out, block, &op.args[1]);
             let value = effect_linkarg(&op.args[2]);
             let item_ty = match &op.args[2] {
@@ -15842,7 +15877,8 @@ fn effect_transduce_op(
                     value,
                     item_ty,
                     array_type_id,
-                    nolength: false,
+                    nolength,
+                    gckind,
                 },
                 false,
             );
@@ -28330,6 +28366,46 @@ mod tests {
                 } if array_type_id.as_deref() == Some(expected_id.as_str())
             ),
             "array write of Array(Signed), got {operand:?}"
+        );
+    }
+
+    /// `effect_transduce_op` reads `ARRAY._gckind` from `op.args[0]`, the
+    /// same `Transformer.rewrite_op_getarrayitem` path. A length-bearing
+    /// raw `Array(Signed)` is Raw.
+    #[test]
+    fn effect_transduce_getarrayitem_raw_array_is_raw() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr};
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let arr = Array::new(LowLevelType::Signed);
+        let array_ll = LowLevelType::Array(Box::new(arr));
+        let ptr_ll = LowLevelType::from(Ptr::from_container_type(array_ll).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let index = variable_with_lltype("i", LowLevelType::Signed);
+        let result = variable_with_lltype("v", LowLevelType::Signed);
+        let graph = rtyped_one_op_with_inputs(
+            "getarrayitem_raw",
+            "getarrayitem",
+            vec![base.clone(), index.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                crate::flowspace::model::Hlvalue::Variable(index),
+            ],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let gckinds: Vec<_> = converted
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::ArrayRead {
+                    gckind, nolength, ..
+                } => Some((*gckind, *nolength)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gckinds,
+            vec![(crate::model::ArrayGcKind::Raw, false)],
+            "lltype.Array._gckind is raw and independent of nolength"
         );
     }
 

@@ -25705,6 +25705,7 @@ fn items_capacity_arraylen<'a>(ops: &'a [&'a SpaceOperation]) -> Option<&'a Spac
             OpKind::ArrayLen {
                 array_type_id: Some(id),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 ..
             } if id == super::OBJECT_REF_GCARRAY_TYPE_ID
         )

@@ -601,13 +601,11 @@ pub struct InlinedPrefixEntry {
 /// One entry in `array_fields = { Struct::field => ElementType, ... }`.
 ///
 /// Declares that `Struct.field` holds the base pointer of a contiguous
-/// array of `ElementType`, so `base.field[i]` lowers to a `getfield_gc_r`
-/// for the buffer pointer followed by `get/setarrayitem_gc_i` on it.
-///
-/// `ElementType in Header` is the same declaration for pointer elements
-/// that begin at `Header`'s `items` field. The load is `getarrayitem_gc_r`
-/// with that field's offset as `base_size`. Integer elements stay on
-/// `get/setarrayitem_gc_i` and have no header.
+/// array of `ElementType`. A headerless field is `Ptr(lltype.Array)`
+/// (`ARRAY._gckind == 'raw'`): `getfield_gc_i` for the address, then
+/// `get/setarrayitem_raw_*`. `ElementType in Header` is a `GcArray`
+/// whose element 0 is `Header.items`: `getfield_gc_r` then
+/// `get/setarrayitem_gc_*`, with that field's offset as `base_size`.
 ///
 /// This is the non-virtualizable array vocabulary: the elements do NOT ride
 /// a guard's `vable_array` resume section, so the snapshot stays O(1) in the

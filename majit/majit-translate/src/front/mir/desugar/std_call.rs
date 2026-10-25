@@ -2879,6 +2879,7 @@ impl<'a> Lowering<'a> {
                             base: list.clone(),
                             array_type_id: Some("[u8]".to_string()),
                             nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
                         },
                     });
                     len

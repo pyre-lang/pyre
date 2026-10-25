@@ -190,11 +190,49 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     s.trim() != inner
 }
 
+/// `ARRAY._gckind` from a registered array type identity.
+///
+/// `rewrite_op_getarrayitem` branches on `ARRAY._gckind`, independent of
+/// the `nolength` hint: `lltype.GcArray` is `'gc'` even with
+/// `_hints['nolength']`; `lltype.Array` / `rffi.CArray` is `'raw'`.
+/// A `Vec<T>` identity is the GC item-buffer of a `Box<[T]>` fat data
+/// word (`getfield_gc_r` then `getarrayitem_gc_*`). A headerless
+/// `*const T` / `[T; N]` / `[u32]` item-run is `'raw'`. Missing
+/// identity keeps the `getattr(ARRAY, '_gckind', 'gc')` default.
+pub fn gckind_from_array_type_id(array_type_id: Option<&str>) -> crate::model::ArrayGcKind {
+    if !nolength_from_array_type_id(array_type_id) {
+        return crate::model::ArrayGcKind::Gc;
+    }
+    let Some(s) = array_type_id else {
+        return crate::model::ArrayGcKind::Gc;
+    };
+    let mut inner = s.trim();
+    loop {
+        let stripped = inner
+            .strip_prefix("*const ")
+            .or_else(|| inner.strip_prefix("*mut "))
+            .or_else(|| inner.strip_prefix("&mut "))
+            .or_else(|| inner.strip_prefix('&'));
+        match stripped {
+            Some(rest) => inner = rest.trim_start(),
+            None => break,
+        }
+    }
+    let vec_tail = inner.rsplit("::").next().unwrap_or(inner);
+    if vec_tail.starts_with("Vec<") {
+        crate::model::ArrayGcKind::Gc
+    } else {
+        crate::model::ArrayGcKind::Raw
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_array_type_id, depth0_sep, fat_box_scalar_array_id, nolength_from_array_type_id,
+        canonical_array_type_id, depth0_sep, fat_box_scalar_array_id, gckind_from_array_type_id,
+        nolength_from_array_type_id,
     };
+    use crate::model::ArrayGcKind;
 
     #[test]
     fn fat_box_scalar_slice_uses_the_headerless_vec_identity() {
@@ -213,6 +251,17 @@ mod tests {
         assert_eq!(fat_box_scalar_array_id("[[u8]]"), None);
         assert!(nolength_from_array_type_id(Some("Vec<u8>")));
         assert!(!nolength_from_array_type_id(Some("[u8]")));
+        assert_eq!(gckind_from_array_type_id(Some("Vec<u8>")), ArrayGcKind::Gc);
+        assert_eq!(gckind_from_array_type_id(Some("[u8]")), ArrayGcKind::Gc);
+        assert_eq!(
+            gckind_from_array_type_id(Some("*const i64")),
+            ArrayGcKind::Raw
+        );
+        assert_eq!(
+            gckind_from_array_type_id(Some("[i64; 4]")),
+            ArrayGcKind::Raw
+        );
+        assert_eq!(gckind_from_array_type_id(None), ArrayGcKind::Gc);
     }
 
     #[test]
@@ -242,6 +291,11 @@ mod tests {
                 nolength_from_array_type_id(Some(id)),
                 "{id} indexes a headerless buffer"
             );
+            assert_eq!(
+                gckind_from_array_type_id(Some(id)),
+                ArrayGcKind::Gc,
+                "{id} is lltype.GcArray with _hints['nolength']"
+            );
         }
     }
 
@@ -257,6 +311,11 @@ mod tests {
             assert!(
                 nolength_from_array_type_id(Some(id)),
                 "{id} has no length header"
+            );
+            assert_eq!(
+                gckind_from_array_type_id(Some(id)),
+                ArrayGcKind::Raw,
+                "{id} is lltype.Array"
             );
         }
     }

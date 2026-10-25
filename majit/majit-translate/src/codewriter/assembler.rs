@@ -2626,15 +2626,23 @@ impl AssemblerEncode for Assembler {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
                 pure,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
-                assert!(
-                    kc == 'r' || kc == 'i',
-                    "getarrayitem base must be Ref (gc) or Int (raw), got {kc:?} — graph {:?}",
+                let is_gc = gckind.is_gc();
+                // `rewrite_op_getarrayitem` picks the opcode from
+                // `ARRAY._gckind`. `history.py` `getkind` of `Ptr(ARRAY)`
+                // matches that gckind, so the base bank is `'r'` for gc
+                // and `'i'` for raw.
+                assert_eq!(
+                    kc,
+                    if is_gc { 'r' } else { 'i' },
+                    "getarrayitem base bank must match ARRAY._gckind={} \
+                     (jtransform.py rewrite_op_getarrayitem), got {kc:?} — graph {:?}",
+                    gckind.as_str(),
                     self.current_graph_name,
                 );
-                let is_gc = kc == 'r';
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
@@ -2686,7 +2694,8 @@ impl AssemblerEncode for Assembler {
                 };
                 // `jtransform.py rewrite_op_getarrayitem`: `_gckind != 'gc'`
                 // emits `getarrayitem_raw_*` and strips `_pure`.  A
-                // `getarrayitem_raw_r` is refused.
+                // `getarrayitem_raw_r` is refused. Opcode family follows
+                // the op's `gckind`, not the base bank.
                 if !is_gc && result_kind == 'r' {
                     panic!(
                         "getarrayitem_raw_r not supported \
@@ -2717,14 +2726,21 @@ impl AssemblerEncode for Assembler {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
-                assert!(
-                    kc == 'r' || kc == 'i',
-                    "setarrayitem base must be Ref (gc) or Int (raw), got {kc:?} — graph {:?}",
+                let is_gc = gckind.is_gc();
+                // `rewrite_op_setarrayitem` interpolates `ARRAY._gckind`
+                // into `setarrayitem_{gckind}_*`. Base bank follows
+                // `getkind(Ptr(ARRAY))`.
+                assert_eq!(
+                    kc,
+                    if is_gc { 'r' } else { 'i' },
+                    "setarrayitem base bank must match ARRAY._gckind={} \
+                     (jtransform.py rewrite_op_setarrayitem), got {kc:?} — graph {:?}",
+                    gckind.as_str(),
                     self.current_graph_name,
                 );
-                let is_gc = kc == 'r';
                 state.code.push(reg);
                 argcodes.push(kc);
                 let (reg, kc) = self.lookup_reg_with_kind_var(index, regallocs);
@@ -2924,11 +2940,18 @@ impl AssemblerEncode for Assembler {
                 base,
                 array_type_id,
                 nolength,
+                gckind,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 // `jtransform.py rewrite_op_getarraysize` asserts
                 // `ARRAY._gckind == 'gc'`.  An Int-bank base is not
                 // `arraylen_gc`.
+                assert!(
+                    gckind.is_gc(),
+                    "arraylen_gc requires ARRAY._gckind == 'gc' \
+                     (jtransform.py rewrite_op_getarraysize) — graph {:?}",
+                    self.current_graph_name,
+                );
                 assert_eq!(
                     kc, 'r',
                     "arraylen_gc base must use the Ref register bank \
@@ -6800,12 +6823,24 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::NewArray { .. } => "new_array".into(),
         OpKind::NewArrayClear { .. } => "new_array_clear".into(),
         OpKind::NewListClear { .. } => "newlist_clear".into(),
-        // RPython: getarrayitem_gc_i etc.
-        OpKind::ArrayRead { item_ty, .. } => {
-            format!("getarrayitem_gc_{}", value_type_to_kind(item_ty))
+        // RPython: getarrayitem_{gckind}_i etc. (`rewrite_op_getarrayitem`).
+        OpKind::ArrayRead {
+            item_ty, gckind, ..
+        } => {
+            format!(
+                "getarrayitem_{}_{}",
+                gckind.as_str(),
+                value_type_to_kind(item_ty)
+            )
         }
-        OpKind::ArrayWrite { item_ty, .. } => {
-            format!("setarrayitem_gc_{}", value_type_to_kind(item_ty))
+        OpKind::ArrayWrite {
+            item_ty, gckind, ..
+        } => {
+            format!(
+                "setarrayitem_{}_{}",
+                gckind.as_str(),
+                value_type_to_kind(item_ty)
+            )
         }
         OpKind::ArrayLen { .. } => "arraylen_gc".into(),
         // RPython: getinteriorfield_gc_i etc.
@@ -11457,6 +11492,7 @@ mod tests {
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             false,
         );
@@ -13128,6 +13164,11 @@ mod tests {
                     base: base_var.clone(),
                     array_type_id: Some("*const i64".into()),
                     nolength: true,
+                    // `rewrite_op_getarraysize` asserts `_gckind == 'gc'`
+                    // before emitting `arraylen_gc`. This case is that
+                    // opcode over a `nolength` descr, which has no length
+                    // word (`bh_arraylen_gc`).
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -13184,6 +13225,7 @@ mod tests {
                     base: array_var,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -13348,6 +13390,7 @@ mod tests {
                     item_ty: ValueType::Int,
                     array_type_id: Some("[Signed]".to_string()),
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -13362,6 +13405,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: Some("[Signed]".to_string()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             false,
         );
@@ -13372,6 +13416,7 @@ mod tests {
                     base: array,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 true,
             )
@@ -13485,6 +13530,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: Some("[Signed]".to_string()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             false,
         );
@@ -13585,6 +13631,7 @@ mod tests {
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -13701,6 +13748,7 @@ mod tests {
                     item_ty: ValueType::Int,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure,
                 },
                 true,

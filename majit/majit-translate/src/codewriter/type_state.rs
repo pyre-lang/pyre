@@ -347,14 +347,15 @@ fn gc_access_base<'a>(
         | OpKind::VableArrayRead { base, .. }
         | OpKind::VableArrayWrite { base, .. }
         | OpKind::VableArrayLen { base, .. } => Some((base, true)),
-        // `nolength` is a raw items region (`ARRAY._gckind == 'raw'`).
-        // Its base is the address integer (`getkind` → int). Promoting
-        // that address to `GcRef` puts an `int_add` result in the ref
-        // bank (`int_add/ii>r`), which no blackhole handler has.
-        // A length-prefixed array is the GC family and stays `GcRef`.
-        OpKind::ArrayRead { base, nolength, .. }
-        | OpKind::ArrayWrite { base, nolength, .. }
-        | OpKind::ArrayLen { base, nolength, .. } => Some((base, !nolength)),
+        // `ARRAY._gckind == 'raw'`: the base is the address integer
+        // (`history.py` `getkind` → int). Promoting that address to
+        // `GcRef` puts an `int_add` result in the ref bank
+        // (`int_add/ii>r`), which no blackhole handler has.
+        // A `GcArray` stays `GcRef`. Opcode family follows `gckind`,
+        // not the `nolength` hint (`rewrite_op_getarrayitem`).
+        OpKind::ArrayRead { base, gckind, .. }
+        | OpKind::ArrayWrite { base, gckind, .. }
+        | OpKind::ArrayLen { base, gckind, .. } => Some((base, gckind.is_gc())),
         _ => None,
     }
 }
@@ -1290,6 +1291,7 @@ mod tests {
                     item_ty: ValueType::Int,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -1332,6 +1334,9 @@ mod tests {
                     index,
                     value: crate::model::LinkArg::Value(value),
                     item_ty: ValueType::Int,
+                    gckind: crate::front::typestr::gckind_from_array_type_id(
+                        array_type_id.as_deref(),
+                    ),
                     array_type_id,
                     nolength,
                 },
@@ -1905,6 +1910,7 @@ mod tests {
             base: base.clone(),
             array_type_id: None,
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         };
         let vable = OpKind::VableArrayLen {
             base,

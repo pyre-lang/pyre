@@ -754,6 +754,7 @@ fn block_emptied_after_the_head_collapse_is_still_rewired_past() {
             item_ty: ValueType::Int,
             array_type_id: None,
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         },
         false,
     );
