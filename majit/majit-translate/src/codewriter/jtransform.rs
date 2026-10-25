@@ -22766,6 +22766,39 @@ mod tests {
                 branch_payloads: None,
             }
         ));
+        let mds = crate::parse::CallPath::from_segments([
+            "celldict",
+            "ModuleDictStrategy",
+            "jit_force_quasi_immutable",
+        ]);
+        mark_qi_llop(&mut cc, &mds);
+        assert!(is_jit_force_quasi_immutable_target(
+            &cc,
+            &CallTarget::Method {
+                name: "jit_force_quasi_immutable".to_string(),
+                receiver_root: Some("ModuleDictStrategy".to_string()),
+                resolved_path: Some(mds.clone()),
+                fun_decl_id: None,
+                branch_payloads: None,
+            }
+        ));
+        assert!(is_jit_force_quasi_immutable_target(
+            &cc,
+            &CallTarget::function_path([
+                "celldict",
+                "ModuleDictStrategy",
+                "jit_force_quasi_immutable"
+            ])
+        ));
+        assert_eq!(
+            jit_force_quasi_immutable_struct_owner(&CallTarget::function_path([
+                "celldict",
+                "ModuleDictStrategy",
+                "jit_force_quasi_immutable"
+            ]))
+            .as_deref(),
+            Some("ModuleDictStrategy")
+        );
     }
 
     #[test]
@@ -22819,6 +22852,64 @@ mod tests {
                         && mutate_field.owner_root.as_deref() == Some("Function")
             ),
             "expected [Live, JitForceQuasiImmutable mutate_code/Function], got {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|o| matches!(o, OpKind::Call { .. })),
+            "call must be rewritten, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_op_jit_force_quasi_immutable_emits_module_dict_mutate_version() {
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let mut graph = FunctionGraph::new("mutated");
+        let inst = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, inst.clone());
+        let path = crate::parse::CallPath::for_impl_method(
+            "celldict::ModuleDictStrategy",
+            "jit_force_quasi_immutable",
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("ModuleDictStrategy".to_string()),
+                    resolved_path: Some(path.clone()),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: vec![
+                    LinkArg::from(inst.clone()),
+                    LinkArg::Const(Constant::new(ConstValue::byte_str("mutate_version"))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_with_qi_llop(&graph, path);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live))
+            .expect("Live marker present");
+        assert!(
+            matches!(
+                ops[live_idx + 1],
+                OpKind::JitForceQuasiImmutable { mutate_field, .. }
+                    if mutate_field.name == "mutate_version"
+                        && mutate_field.owner_root.as_deref() == Some("ModuleDictStrategy")
+            ),
+            "expected [Live, JitForceQuasiImmutable mutate_version/ModuleDictStrategy], got {ops:?}"
         );
         assert!(
             !ops.iter().any(|o| matches!(o, OpKind::Call { .. })),

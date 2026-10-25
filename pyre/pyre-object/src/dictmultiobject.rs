@@ -4193,16 +4193,11 @@ pub unsafe fn w_dict_getitem_str_object_strategy_hashed(
     dict_entries_get_str(entries, key, hash)
 }
 
-/// `pypy/objspace/std/dictmultiobject.py W_DictMultiObject.setitem_str`
-/// — `w_dict.get_strategy().setitem_str(w_dict, key, value)`.
-/// Dispatches through the polymorphic strategy slot so module dicts
-/// fan out via `ModuleDictStrategy::setitem_str` and regular dicts
-/// via `ObjectDictStrategy::setitem_str`.
+/// `W_DictMultiObject.setitem_str` — `w_dict.get_strategy().setitem_str(w_dict, key, value)`.
+/// The module-dict arm is looked inside through [`w_dict_setitem_str_hashed`]
+/// into `ModuleDictStrategy.setitem_str`; the generic arm is the residual
+/// [`w_dict_setitem_str_hashed_generic`].
 ///
-/// Residualise the setitem_str leaf (`@dont_look_inside`,
-/// `rlib/jit.py`): the strategy dispatch it wraps mutates
-/// runtime-mutable dict storage the tracer cannot model.
-#[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -4213,8 +4208,13 @@ pub unsafe fn w_dict_setitem_str(obj: PyObjectRef, key: &str, value: PyObjectRef
 /// [`w_dict_setitem_str`] for a caller that already holds `key`'s digest, as
 /// [`w_dict_getitem_str_hashed`] takes it.
 ///
-/// Residualised for [`w_dict_setitem_str`]'s reason.
-#[majit_macros::dont_look_inside]
+/// The module-dict arm (`is_module_dict && !object_strategy`) is looked
+/// inside and reaches `ModuleDictStrategy.setitem_str` via
+/// [`w_module_dict_setitem_str`]. `ModuleDictStrategy` has no
+/// `setitem_str_hashed` override; the trait default forwards to
+/// `setitem_str` and discards `hash`, which this arm matches. The generic
+/// arm residualises through [`w_dict_setitem_str_hashed_generic`].
+///
 /// # Safety
 /// Same as [`w_dict_setitem_str`].
 pub unsafe fn w_dict_setitem_str_hashed(
@@ -4229,9 +4229,26 @@ pub unsafe fn w_dict_setitem_str_hashed(
     // Every other strategy, including a module dict after
     // `switch_to_object_strategy`, can run user code and keeps the guard.
     if is_module_dict(obj) && !w_module_dict_is_object_strategy(obj) {
-        w_dict_get_strategy(obj).setitem_str_hashed(obj, key, hash, value);
+        let _ = hash;
+        w_module_dict_setitem_str(obj, key, value);
         return;
     }
+    w_dict_setitem_str_hashed_generic(obj, key, hash, value)
+}
+
+/// Generic (non-module) arm of [`w_dict_setitem_str_hashed`].
+///
+/// The non-module strategies can run user `__hash__`/`__eq__` and mutate
+/// storage under the dict lock.
+#[majit_macros::dont_look_inside]
+/// # Safety
+/// Same as [`w_dict_setitem_str_hashed`].
+unsafe fn w_dict_setitem_str_hashed_generic(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+    value: PyObjectRef,
+) {
     lock_dict_refs!(_dict_guard, obj, value);
     w_dict_get_strategy(obj).setitem_str_hashed(obj, key, hash, value)
 }
