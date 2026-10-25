@@ -243,7 +243,7 @@ fn clear_shutdown_module_dict_pass(
         // and move its `__del__` to a later sweep, after names this pass
         // has already replaced. Root the dict across the store and any
         // collection it triggers.
-        let delivers_none = release_delivers_no_finalizer(old);
+        let delivers_none = pyre_object::with_roots!(d => release_delivers_no_finalizer(old));
         let did_sweep = pyre_object::with_roots!(d => {
             unsafe {
                 pyre_object::w_dict_setitem_wtf8(d, &name, pyre_object::w_none());
@@ -439,16 +439,36 @@ fn finalize_delete_special() {
     let Some(dict) = interpreter_module_dict(crate::importing::get_interpreter_sys_module()) else {
         return;
     };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict);
     for name in SYS_CLEARED {
         // `_PySys_ClearAttrString` binds `None` rather than deleting the name,
         // so a late reader finds a value that is not there instead of a name
         // that is not there.
-        unsafe { pyre_object::w_dict_setitem_str(dict, name, pyre_object::w_none()) };
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                name,
+                pyre_object::w_none(),
+            )
+        };
     }
     for (name, original) in SYS_STREAMS {
-        let value = unsafe { pyre_object::w_dict_getitem_str(dict, original) }
-            .unwrap_or_else(pyre_object::w_none);
-        unsafe { pyre_object::w_dict_setitem_str(dict, name, value) };
+        let value = unsafe {
+            pyre_object::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                original,
+            )
+        }
+        .unwrap_or_else(pyre_object::w_none);
+        unsafe {
+            pyre_object::w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                name,
+                value,
+            )
+        };
     }
 }
 
