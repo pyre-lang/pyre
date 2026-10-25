@@ -2050,9 +2050,7 @@ fn cast_instance_intrinsic(
         // afterward.  `pairtype(SomePtr, SomeObject).union` (`llannotation.py`)
         // refuses Instance ∪ Ptr, so a GCREFOpaque classdef cannot share a
         // `dstorage` / `frame_ptr` attr with the SomePtr field projection.
-        crate::translator::rtyper::llannotation::lltype_to_annotation(
-            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
-        )
+        crate::annotator::bookkeeper::gcref_ptr_annotation()
     } else if majit_ir::descr::is_list_container_spelling(&root) {
         // `[T]` / `Vec<T>` dests are the current op's list (`Bookkeeper.getlistdef`),
         // not a fresh ListDef per projection. `setbinding` then `contains`

@@ -1147,7 +1147,13 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
 ///   `ValueType` (the residual really produces an integer / float / bool);
 /// - output is itself a foreign **opaque** ADT (`BigInt` → `BigInt`,
 ///   the `Add`/`Sub`/`Mul`/`clone` cluster) → `Ref(None)`, the
-///   classdef-less `SomeInstance` shell `bigint_from` produces;
+///   classdef-less `SomeInstance` shell `bigint_from` produces,
+///   except a str-family result (`is_str_family_class_root`: rust-heap
+///   `String`, `Wtf8Buf`, …) keeps `Ref(Some(root))` so the residual
+///   annotates `SomeString` (`annotator/model.py` `SomeString`,
+///   `s_str0()`). Dropping that root minted the classdef-less Instance
+///   `pairtype(SomeObject, SomeObject).union` cannot join with
+///   `String::new()` (`binaryop.py`);
 /// - output is a payload-carrying enum (`GcAllocOutcome`) →
 ///   `Ref(Some(root))`, the intern key a caller `match` on
 ///   `Allocated`/`Failed`/`NoRoute` getattr's `__discriminant` through;
@@ -1353,11 +1359,13 @@ pub(in crate::front::mir) fn first_input_is_adt_free(
 /// or `None` to decline (see [`collect_foreign_opaque_method_externals`]).
 /// A scalar literal output keeps its `ValueType`; `()` is `Void`
 /// (`history.py` `getkind`, `Vec::set_len` / `Vec::resize`); an
-/// opaque-ADT output projects to `Ref(None)`; a payload-carrying enum
-/// keeps `Ref(Some(root))` when `tyref_to_value_type` painted a class
-/// root (`unaryop.py` `SomeInstance.getattr` needs `self.classdef`).
-/// A payload enum with no class root is declined. A fieldless enum,
-/// tuple, reference, or non-opaque struct is declined.
+/// opaque-ADT output projects to `Ref(None)` except a str-family result
+/// (`is_str_family_class_root`) which keeps `Ref(Some(root))`; a
+/// payload-carrying enum keeps `Ref(Some(root))` when
+/// `tyref_to_value_type` painted a class root (`unaryop.py`
+/// `SomeInstance.getattr` needs `self.classdef`). A payload enum with
+/// no class root is declined. A fieldless enum, tuple, reference, or
+/// non-opaque struct is declined.
 pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
     output: &TyRef,
     llbc: &Llbc,
@@ -1381,7 +1389,14 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //
         // - the result ADT is itself a foreign opaque type (the
         //   `BigInt`-returning arithmetic cluster) → classdef-less
-        //   `SomeInstance`, the shell `bigint_from` produces;
+        //   `SomeInstance`, the shell `bigint_from` produces, except a
+        //   str-family result (`is_str_family_class_root`: rust-heap
+        //   `String`, …) keeps the class root so
+        //   `foreign_opaque_method_return_shell` seeds `s_str0()`
+        //   (`annotator/model.py` `SomeString`). Dropping it to
+        //   `Ref(None)` minted the classdef-less Instance
+        //   `pairtype(SomeObject, SomeObject).union` cannot join with
+        //   `String::new()` (`binaryop.py`);
         // - the result is a payload-carrying enum (`GcAllocOutcome`)
         //   whose class root `tyref_to_value_type` already painted →
         //   keep `Ref(Some(root))` so registration intern's the
@@ -1392,12 +1407,21 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         ValueType::Ref(root) => {
             let def_id = output_adt_def_id_free(output, llbc)?;
             let td = llbc.type_by_id(def_id)?;
+            let str_family_root = root
+                .as_ref()
+                .filter(|r| is_str_family_class_root(r))
+                .cloned()
+                .or_else(|| {
+                    tyref_is_rust_heap_string(output, llbc).then(|| {
+                        class_identity_spelling(&td.item_meta.name_path(), no_tombstoned_leaves())
+                    })
+                });
             match &td.kind {
-                TypeDeclKind::Opaque => Some(ValueType::Ref(None)),
+                TypeDeclKind::Opaque => Some(ValueType::Ref(str_family_root)),
                 TypeDeclKind::Enum(_) if !type_decl_is_fieldless_enum(td, llbc) => {
                     root.map(|r| ValueType::Ref(Some(r)))
                 }
-                _ if td.published_struct_copy => Some(ValueType::Ref(None)),
+                _ if td.published_struct_copy => Some(ValueType::Ref(str_family_root)),
                 _ => None,
             }
         }
@@ -4463,7 +4487,10 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // pair(SomeString, SomeInstance).union() handler.  The raw-pointer form
     // is the same translated value when a Rust object field owns the buffer
     // behind `*mut Wtf8Buf` (`W_UnicodeObject.value`).
-    // A Rust-heap `String` is not rstr `STR`; seed it as `SomeInstance(String)`.
+    // A rust-heap `String` is not rstr `STR`; the `ValueType` stays
+    // `Ref` so `ll_strconcat` does not consume a `{cap, ptr, len}`
+    // header. `valuetype_to_someshell` shells that Ref as `s_str0()`
+    // (`annotator/model.py` `SomeString`).
     if tyref_is_rust_heap_string(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
     }

@@ -5398,16 +5398,20 @@ pub(crate) fn derive_subject_inputcells(
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 // Rust's `gc_roots::pin_root(PyObjectRef)` parameter is the
                 // source spelling of RPython GC-transformer's opaque root
-                // slot.  The front marks that exact input as `GCREF`; seed a
-                // SomePtr(GCREF), not the W_Root-like SomeInstance fallback,
-                // so heterogeneous StringRepr / InstanceRepr livevars meet
-                // only after their ordinary cast_opaque_ptr conversion.
-                if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("GCREF") {
-                    cells.push(
-                        crate::translator::rtyper::llannotation::lltype_to_annotation(
-                            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
-                        ),
-                    );
+                // slot.  The front peels the `GCREF` alias to the pointee
+                // (`header::GCREFOpaque`).  `llmemory.py` `GCREF` is
+                // `lltype.Ptr(lltype.GcOpaqueType('GCREF'))`;
+                // `llannotation.py` `lltype_to_annotation` of that Ptr is
+                // `SomePtr`.  Seed that, not a ClassDef instance, so
+                // StringRepr / InstanceRepr livevars meet only after
+                // `cast_opaque_ptr`.
+                if class_root.as_deref().is_some_and(|root| {
+                    crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                        || crate::annotator::bookkeeper::is_gcref_type_spelling(
+                            majit_ir::descr::class_root_leaf(root),
+                        )
+                }) {
+                    cells.push(crate::annotator::bookkeeper::gcref_ptr_annotation());
                     continue;
                 }
                 // A tuple param carries its `Tuple<A,B>` shape; its `.N`
@@ -7259,6 +7263,89 @@ mod tests {
             "Input define has no SpaceOperation analogue (handled by block \
              topology via block.inputargs); translate_op must yield empty Vec"
         );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_gcrefopaque_input_as_someptr() {
+        let mut graph = LegacyGraph::new("try_gc_write_barrier_managed");
+        let entry = graph.startblock;
+        let obj = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("header::GCREFOpaque".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, obj);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "header::GCREFOpaque".to_string(),
+            Vec::<(String, String)>::new(),
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("GCREFOpaque Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "header::GCREFOpaque Input must seed SomePtr(GCREF), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_str_family_ref_as_somestring() {
+        // `is_str_family_class_root` / `s_str0()`: a `&str` / `String`
+        // Input is `SomeString`, including when only the `Ref` payload
+        // names the family (`valuetype_to_someshell`). `String::new()`
+        // is the same shell (`string_constructor`).
+        use crate::annotator::model::{SomeString, union};
+        let s_new = SomeValue::String(SomeString::new(false, false));
+        for (name, ty, class_root) in [
+            (
+                "named",
+                ValueType::Ref(Some("string::String".to_string())),
+                Some("string::String".to_string()),
+            ),
+            (
+                "payload_only",
+                ValueType::Ref(Some("str".to_string())),
+                None,
+            ),
+        ] {
+            let mut graph = LegacyGraph::new(name);
+            let entry = graph.startblock;
+            let var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "s".to_string(),
+                        ty,
+                        class_root,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(entry, var);
+            let cells = derive_subject_inputcells(&graph, None)
+                .expect("str-family Input must project to a definite SomeValue cell");
+            assert_eq!(cells.len(), 1);
+            assert!(
+                matches!(cells[0], SomeValue::String(_)),
+                "{name}: str-family Input must seed SomeString, got {:?}",
+                cells[0],
+            );
+            union(&cells[0], &s_new).unwrap_or_else(|e| {
+                panic!("{name}: str-family Input must union with String::new(): {e}")
+            });
+        }
     }
 
     #[test]

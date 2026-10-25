@@ -5583,6 +5583,7 @@ impl<'a> Lowering<'a> {
                 }
             }
         };
+        let is_gcref_null = matches!(kind, OpKind::ConstRefNull);
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -5590,6 +5591,19 @@ impl<'a> Lowering<'a> {
             result: Some(res.clone()),
             kind,
         });
+        // `T::default` / `null_mut` of a thin GC pointer is a GCREF
+        // `ConstRefNull` (`const_ref_gcref_constant`). Dest `PyObjectRef`
+        // is `lltype.cast_opaque_ptr` (`lltype.py` `ann_cast_opaque_ptr`).
+        if is_gcref_null
+            && let Some((op, recast)) =
+                self.ptr_cast_marker(Some(&ValueType::Ref(None)), None, dest_ty, &res)
+        {
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(recast.clone()),
+                kind: op,
+            });
+            return Some(recast);
+        }
         Some(res)
     }
 

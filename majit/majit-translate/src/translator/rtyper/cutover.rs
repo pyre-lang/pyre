@@ -354,11 +354,19 @@ pub(crate) fn dual_gate_check_with_registry(
     if let Err(payload) = baseline {
         let msg = crate::annotator::model::panic_payload_text(&*payload)
             .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
-        return Err(format!(
-            "dual-gate baseline panicked (legacy walker crashed before \
-             comparison could run — comparison cannot validate the real \
-             path's result): {msg}"
-        ));
+        // `resolve_types` panics on leftover Unknown
+        // (`rtyper.py setconcretetype` / `bindingrepr` has no default).
+        // The panic runs after every typed cell is already committed, so
+        // comparison can still see the kinds the legacy walker *did*
+        // resolve; leftover Unknown stays Unknown and is accepted as a
+        // real-path refinement below.
+        if !msg.contains("setconcretetype: no binding") {
+            return Err(format!(
+                "dual-gate baseline panicked (legacy walker crashed before \
+                 comparison could run — comparison cannot validate the real \
+                 path's result): {msg}"
+            ));
+        }
     }
     let followed_legacy = call_registry.session_if_started().map(|(annotator, _)| {
         annotator_followed_legacy_vars(&annotator, &graph, &real_value_to_var)
@@ -1383,9 +1391,9 @@ fn collect_divergences_on(
             }
         }
         let legacy_kind = LegacyGraph::concretetype_of(var);
-        // A kind the legacy walker resolved must match the real path;
-        // conversely the real path must not resolve a kind for a value
-        // the legacy walker left Unknown.
+        // A kind the legacy walker resolved must match the real path.
+        // Leftover Unknown is a typer gap (`rtyper.py setconcretetype`
+        // has no default); the real path's kind is authoritative.
         //
         // Exception: the real path refining a boxed-pointer (`GcRef`)
         // slot to `Void` is sound, not a divergence.  On a `Match` the
@@ -1428,10 +1436,9 @@ fn collect_divergences_on(
         // `BUILD_SLICE` discriminant read off an `Arg<T>` marker field, a
         // `JUMP_*` delta — all bare bytecode operands the rtyper types
         // `Signed` (matching upstream, where a bytecode oparg is a plain
-        // int).  The legacy walker's `GcRef` is the pyre-only conservative
-        // `Unknown → GcRef` backfill (`legacy_resolve.rs:374-378`), which has
-        // no RPython analogue (upstream's rtyper never leaves a value
-        // untyped, so it never defaults to ref); it is the divergent side.
+        // int).  The legacy walker's `GcRef` is a classdef-less `Ref`
+        // annotation; `setconcretetype` has no Unknown→GcRef default
+        // (`rtyper.py`). The real path is authoritative.
         //
         // This pair once appeared unacceptable because accepting it crashed
         // `emit_list_of_kind` (`assembler.rs:2169`).  That crash was a phase
@@ -1448,12 +1455,17 @@ fn collect_divergences_on(
             legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Signed;
         // Same conservative-legacy refinement for a genuine floating-point
         // value. `long_pow`'s negative-exponent arm extracts `f64` payloads
-        // from generic Result shells; Charon's erased legacy walk falls back
-        // Unknown→GcRef while the annotator/rtyper positively assigns Float.
+        // from generic Result shells; Charon's erased legacy walk keeps a
+        // classdef-less `Ref` while the annotator/rtyper positively assigns Float.
         // Like the Signed case, publish commits the real kind before
         // jtransform partitions registers, so the float bank is authoritative.
         let real_refines_gcref_to_float =
             legacy_kind == ConcreteType::GcRef && real_kind == ConcreteType::Float;
+        // Leftover Unknown: the legacy walker did not type this Variable
+        // (`rtyper.py setconcretetype` / `bindingrepr`). Real is
+        // authoritative — the same refinement the old Unknown→GcRef
+        // backfill papered over as `legacy=GcRef` vs Signed/Float/Void.
+        let real_refines_unknown = legacy_kind == ConcreteType::Unknown && real_present.is_some();
         // A duplicate phi inputarg the real path's `remove_duplicate_inputargs`
         // merged away is untyped in the real graph (its column no longer
         // exists) while the legacy walker types the retained identity.  The
@@ -1507,6 +1519,7 @@ fn collect_divergences_on(
         let diverges = if real_refines_gcref_to_void
             || real_refines_gcref_to_signed
             || real_refines_gcref_to_float
+            || real_refines_unknown
             || real_dropped_duplicate_inputarg
             || real_dropped_dead_op_result
             || real_rebuilt_switch_discriminant
@@ -3275,13 +3288,15 @@ fn residual_stub_result_shell(
 
 /// The result a `_signature_` declares for a residual callee whose `ref`
 /// token alone would shell it as a classdef-less instance: `SomeString` for
-/// a low-level `STR` pointer (`FunctionGraph::return_is_str`), `SomeList`
-/// for a pointer onto a Rust container (`FunctionGraph::return_container_root`,
-/// the `GcArray` a field of that type already projects), else
-/// `SomeInstance(classdef)` of a by-value ADT result or of a
-/// pointer to a registered GC struct (`FunctionGraph::return_class_root`),
-/// whose payload reads (`__discriminant`, `__pos_0`) the classdef-less
-/// shell cannot annotate. A raw-pointer return is nullable
+/// a low-level `STR` pointer (`FunctionGraph::return_is_str`) or a
+/// str-family `return_class_root` (`is_str_family_class_root` / `s_str0()`,
+/// `annotator/model.py` `SomeString`), `SomeList` for a pointer onto a
+/// Rust container (`FunctionGraph::return_container_root`, the `GcArray`
+/// a field of that type already projects), else `SomeInstance(classdef)`
+/// of a by-value ADT result or of a pointer to a registered GC struct
+/// (`FunctionGraph::return_class_root`), whose payload reads
+/// (`__discriminant`, `__pos_0`) the classdef-less shell cannot
+/// annotate. A raw-pointer return is nullable
 /// (`FunctionGraph::return_can_be_none`).
 ///
 /// A one-word-item `Vec` residual is `SomeRustVec` (`project_rust_vec`).
@@ -3317,6 +3332,19 @@ fn declared_return_annotation(
     }
     let root = graph.return_class_root.as_deref()?;
     let bk = registry.bookkeeper();
+    // `llmemory.py` `GCREF`; `lltype.GcOpaqueType` has no ClassDef.
+    if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
+        return Some(crate::annotator::bookkeeper::gcref_ptr_annotation());
+    }
+    // A by-value rust-heap `String` is `ValueType::Ref` (`return_is_str`
+    // is false: not rstr `STR`). Residual token `"ref"` would otherwise
+    // intern a ClassDef or fall through to the classdef-less
+    // `valuetype_to_someshell(Ref(None))` shell. `rstr.py` has one
+    // string type: `is_str_family_class_root` / `s_str0()`, the same
+    // seed `__str_const` / `ConstValue::ByteStr` uses.
+    if crate::front::mir::is_str_family_class_root(root) {
+        return Some(crate::annotator::model::s_str0());
+    }
     // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
     // the same shell FieldRead and a `raw:<owner>` token already use.
     // SomeInstance here made mergeinputargs raise Instance(X) ∪ Ptr(X)
@@ -3495,7 +3523,12 @@ fn declared_funcptr_type_from_legacy(
     for var in &startblock.inputargs {
         let (ty, class_root) = input_ty.get(var)?;
         args.push(
-            if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("GCREF") {
+            if class_root.as_deref().is_some_and(|root| {
+                crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                    || crate::annotator::bookkeeper::is_gcref_type_spelling(
+                        majit_ir::descr::class_root_leaf(root),
+                    )
+            }) {
                 crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
             } else {
                 valuetype_to_lltype(ty)?
@@ -4165,9 +4198,11 @@ pub(crate) fn register_atomic_load_llexternals(
 /// The result shell comes from the per-method faithful `ValueType` the
 /// collector read off the LLBC output signature — a `Ref(None)`
 /// classdef-less `SomeInstance` for a `BigInt`-returning method (matching
-/// `bigint_from`), a `SomeInstance(classdef)` of the interned enum-base
-/// for a payload-enum return (`GcAllocOutcome::from_hook`), or a scalar
-/// shell for an integer/float/bool return.  Same non-overwriting,
+/// `bigint_from`), `s_str0()` (`annotator/model.py` `SomeString`) for a
+/// str-family result (`is_str_family_class_root`: rust-heap `String`,
+/// …), a `SomeInstance(classdef)` of the interned enum-base for a
+/// payload-enum return (`GcAllocOutcome::from_hook`), or a scalar shell
+/// for an integer/float/bool return.  Same non-overwriting,
 /// annotator-only-carrier contract as [`register_foreign_stdlib_externals`].
 pub(crate) fn register_foreign_opaque_method_externals(
     registry: &CallRegistry,
@@ -4194,17 +4229,26 @@ pub(crate) fn register_foreign_opaque_method_externals(
 ///
 /// `valuetype_to_someshell(Ref)` always drops the classdef
 /// (`annotation_state.rs`), which is the right shell for an opaque
-/// `BigInt` return.  A payload-carrying enum (`GcAllocOutcome`) needs
-/// the interned enum-base ClassDef so a caller `match` can getattr
-/// `__discriminant` (`rclass.py` `InstanceRepr.rtype_getattr`).
-/// [`declared_return_annotation`] is the wrong intern here: a raw-word
-/// payload enum is a `raw_word_owner`, so that helper prefers
-/// `raw_struct_ptr_annotation` (`SomePtr`) over `SomeInstance`.
+/// `BigInt` return.  A str-family result (`is_str_family_class_root`:
+/// rust-heap `String`, `Wtf8Buf`, …) is `s_str0()` (`annotator/model.py`
+/// `SomeString`), the same seed `__str_const` / `ConstValue::ByteStr`
+/// uses; intern'ing a ClassDef would mint `SomeInstance(String)` and
+/// `pairtype(SomeObject, SomeObject).union` cannot join that with
+/// `String::new()` (`binaryop.py`).  A payload-carrying enum
+/// (`GcAllocOutcome`) needs the interned enum-base ClassDef so a
+/// caller `match` can getattr `__discriminant` (`rclass.py`
+/// `InstanceRepr.rtype_getattr`). [`declared_return_annotation`] is the
+/// wrong intern here: a raw-word payload enum is a `raw_word_owner`, so
+/// that helper prefers `raw_struct_ptr_annotation` (`SomePtr`) over
+/// `SomeInstance`.
 fn foreign_opaque_method_return_shell(
     registry: &CallRegistry,
     result_ty: &crate::model::ValueType,
 ) -> Option<crate::annotator::model::SomeValue> {
     if let crate::model::ValueType::Ref(Some(root)) = result_ty {
+        if crate::front::mir::is_str_family_class_root(root) {
+            return Some(crate::annotator::model::s_str0());
+        }
         let bk = registry.bookkeeper();
         let host = bk.intern_class_by_qualname(root);
         if let Ok(classdef) = bk.getuniqueclassdef(&host) {
@@ -6141,7 +6185,7 @@ fn lltype_for_named_ref(
 /// `real=Unknown` against the legacy walker's `GcRef` — the legacy
 /// walker types the same slot from this identical `result_ty` at
 /// `legacy_resolve::infer_concrete_from_op` (`OpKind::Call { result_ty }
-/// => valuetype_to_concrete(result_ty)`), plus its final GcRef backfill.
+/// => valuetype_to_concrete(result_ty)`).
 ///
 /// A twin with an annotator binding is typed through
 /// `RPythonTyper.setconcretetype` (`bindingrepr` → `getrepr` →
@@ -6494,9 +6538,11 @@ pub(crate) fn dual_gate_outcome_from_cache(
     if let Err(payload) = baseline {
         let msg = crate::annotator::model::panic_payload_text(&*payload)
             .unwrap_or_else(|| "<unrecognised panic payload>".to_string());
-        return Err(format!(
-            "two-phase baseline panicked (legacy walker crashed before comparison): {msg}"
-        ));
+        if !msg.contains("setconcretetype: no binding") {
+            return Err(format!(
+                "two-phase baseline panicked (legacy walker crashed before comparison): {msg}"
+            ));
+        }
     }
     let followed_legacy = call_registry
         .session_if_started()
@@ -9244,6 +9290,12 @@ mod tests {
         let (_, rtyper) = registry.ensure_session().expect("session");
 
         let mut graph = LegacyGraph::new("function_get_qualname_obj_shaped");
+        let operand = graph.alloc_value_var();
+        graph
+            .block_mut(graph.startblock)
+            .inputargs
+            .push(operand.clone());
+        setbinding(&operand, ValueType::Ref(None));
         let result = graph.alloc_value_var();
         let layout_result = graph.alloc_value_var();
         graph
@@ -9251,7 +9303,7 @@ mod tests {
             .operations
             .push(crate::model::SpaceOperation {
                 result: Some(result.clone()),
-                kind: crate::model::cast_instance_call("Function", Variable::new()),
+                kind: crate::model::cast_instance_call("Function", operand.clone()),
             });
         graph
             .block_mut(graph.startblock)
@@ -9260,7 +9312,7 @@ mod tests {
                 result: Some(layout_result.clone()),
                 kind: crate::model::cast_instance_call_result(
                     "Function",
-                    Variable::new(),
+                    operand,
                     ValueType::Ref(Some("function::Function".into())),
                 ),
             });
@@ -10802,12 +10854,22 @@ mod tests {
     fn collect_divergences_accepts_gcref_refined_to_signed() {
         // A `(GcRef, Signed)` pair is an accepted refinement: the real path
         // resolved a genuine integer (an oparg-decoded index / discriminant /
-        // delta) where the legacy walker left the pyre-only conservative
-        // `Unknown → GcRef` backfill.  Real is authoritative, so the graph
-        // lifts via real rather than Skipping to legacy.
+        // delta) where the legacy walker kept a classdef-less `Ref`.
+        // Real is authoritative, so the graph lifts via real rather than
+        // Skipping to legacy.
         assert!(
             diff_single_var(ConcreteType::GcRef, ConcreteType::Signed).is_empty(),
             "legacy=GcRef, real=Signed is an accepted real refinement"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_accepts_unknown_refined_to_signed() {
+        // Leftover Unknown is a typer gap (`rtyper.py setconcretetype`);
+        // the real path's Signed is authoritative.
+        assert!(
+            diff_single_var(ConcreteType::Unknown, ConcreteType::Signed).is_empty(),
+            "legacy=Unknown, real=Signed is an accepted real refinement"
         );
     }
 
@@ -12699,6 +12761,53 @@ mod tests {
             crate::annotator::bookkeeper::two_word_fat_struct("&[u8]").unwrap(),
             "the declared fn type returns the two-word fat window, not Ptr(STR)"
         );
+    }
+
+    #[test]
+    fn declared_return_annotation_str_family_class_root_is_somestring() {
+        // A residual returning rust-heap `String` stamps `return_is_str =
+        // false` (`dont_look_inside_return_is_str`: not Ptr(STR)) and
+        // `return_class_root = string::String`. Interning a ClassDef
+        // would mint `SomeInstance(String)`; `binaryop.py`
+        // `pairtype(SomeObject, SomeObject).union` cannot join that
+        // with `String::new()`. `is_str_family_class_root` / `s_str0()`.
+        use crate::annotator::model::{SomeString, SomeValue, union};
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut graph = LegacyGraph::new("name_utf8_mirror");
+        graph.return_type = Some("ref".into());
+        graph.return_is_str = false;
+        graph.return_class_root = Some("string::String".into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a str-family residual declares its annotation");
+        assert!(
+            matches!(declared, SomeValue::String(_)),
+            "str-family residual is SomeString, got {declared:?}"
+        );
+        let s_new = SomeValue::String(SomeString::new(false, false));
+        union(&declared, &s_new).expect("str-family residual must union with String::new()");
+    }
+
+    #[test]
+    fn foreign_opaque_str_family_result_annotates_somestring_and_unions_with_string_new() {
+        // Harvested residual `String::new` / `Default::default` on an
+        // opaque rust-heap `String` keeps `Ref(Some(string::String))`
+        // (`foreign_opaque_method_result_valuetype`). Intern'ing a
+        // ClassDef would mint `SomeInstance(String)`; `binaryop.py`
+        // `pairtype(SomeObject, SomeObject).union` cannot join that
+        // with `String::new()`. `is_str_family_class_root` / `s_str0()`.
+        use crate::annotator::model::{SomeString, SomeValue, union};
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let result_ty = crate::model::ValueType::Ref(Some("string::String".into()));
+        let shell = foreign_opaque_method_return_shell(&registry, &result_ty)
+            .expect("a str-family residual has a shell");
+        assert!(
+            matches!(shell, SomeValue::String(_)),
+            "str-family residual is SomeString, got {shell:?}"
+        );
+        let s_new = SomeValue::String(SomeString::new(false, false));
+        union(&shell, &s_new).expect("str-family residual must union with String::new()");
     }
 
     #[test]

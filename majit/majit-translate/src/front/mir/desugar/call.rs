@@ -3967,7 +3967,28 @@ impl<'a> Lowering<'a> {
                                 return Ok(());
                             }
                             if let Some(orig) = self.cast_ptr_to_int_src.get(&args[0]).cloned() {
-                                self.local_var[dest_local] = Some(LocalValue::One(orig));
+                                // Same recast as the `as` identity fold:
+                                // `lltype.py` `ann_cast_opaque_ptr` so a
+                                // GCREF orig used as `PyObjectRef` becomes
+                                // `SomeInstance(PyObject)`.
+                                let recovered = match self.ptr_cast_marker(
+                                    Some(&ValueType::Ref(None)),
+                                    None,
+                                    &call.dest.ty,
+                                    &orig,
+                                ) {
+                                    Some((kind, res)) => {
+                                        self.graph.block_mut(bb_id).operations.push(
+                                            SpaceOperation {
+                                                result: Some(res.clone()),
+                                                kind,
+                                            },
+                                        );
+                                        res
+                                    }
+                                    None => orig,
+                                };
+                                self.local_var[dest_local] = Some(LocalValue::One(recovered));
                                 let target_bb = self.block_id[target];
                                 let link_args = self.edge_args(mir_bb, target)?;
                                 self.graph.set_goto(bb_id, target_bb, link_args);

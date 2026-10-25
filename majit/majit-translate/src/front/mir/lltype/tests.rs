@@ -4134,6 +4134,107 @@ fn foreign_payload_enum_associated_fn_is_harvested_as_function_path() {
     );
 }
 
+/// Foreign opaque rust-heap `alloc::string::String::new`: TypeDecl is
+/// Opaque (the alloc crate is not extracted), FunDecl is a zero-arg
+/// inherent method whose result is that ADT. Harvest must keep the
+/// str-family class root so the residual annotates `SomeString`, not a
+/// classdef-less `SomeInstance`.
+fn string_new_opaque_fixture() -> Llbc {
+    let span = || {
+        serde_json::json!({
+            "data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 1}
+            }
+        })
+    };
+    let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+    let item_meta = |name: Vec<serde_json::Value>, is_local: bool| {
+        serde_json::json!({
+            "name": name,
+            "span": span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [],
+        "types": [],
+        "const_generics": [],
+        "trait_refs": []
+    });
+    let string_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": generics.clone()}
+    });
+    let impl_seg = serde_json::json!({"Impl": {"Ty": {
+        "skip_binder": {"Value": [0, string_ty.clone()]},
+        "kind": "InherentImplBlock"
+    }}});
+    let string_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(
+            vec![ident("alloc"), ident("string"), ident("String")],
+            false,
+        ),
+        "kind": "Opaque"
+    });
+    let string_new = serde_json::json!({
+        "def_id": 0,
+        "item_meta": item_meta(
+            vec![ident("alloc"), ident("string"), impl_seg, ident("new")],
+            false,
+        ),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [],
+            "output": string_ty
+        },
+        "body": "Opaque"
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [string_decl],
+            "fun_decls": [string_new],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("String::new opaque fixture Llbc parses")
+}
+
+#[test]
+fn foreign_opaque_string_new_keeps_str_family_root() {
+    let llbc = string_new_opaque_fixture();
+    let harvested = super::collect_foreign_opaque_method_externals(&llbc);
+    let row = harvested.iter().find(|(segments, _, _)| {
+        segments.last().map(String::as_str) == Some("new")
+            && segments.iter().any(|s| s == "String" || s == "string")
+    });
+    assert!(
+        row.is_some(),
+        "String::new must be harvested: {harvested:?}"
+    );
+    let (_, _, result_ty) = row.unwrap();
+    let crate::model::ValueType::Ref(Some(root)) = result_ty else {
+        panic!("String::new residual must keep a named Ref, got {result_ty:?}");
+    };
+    assert!(
+        super::is_str_family_class_root(root),
+        "String::new residual class root must be str-family, got {root:?}"
+    );
+}
+
 #[test]
 fn range_contains_is_not_harvested_as_function_path() {
     // A bodyless `Range::contains` is not harvested as an opaque

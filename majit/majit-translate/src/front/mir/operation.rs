@@ -1994,10 +1994,18 @@ impl<'a> Lowering<'a> {
                     }
                     // A prebuilt singleton kept in a `OnceLock<usize>` reads
                     // back as the registered object itself
-                    // ([`Lowering::prebuilt_once_value_locals`]); the word it
-                    // is stored as is already that GC reference.
+                    // ([`Lowering::prebuilt_once_value_locals`]). The word is
+                    // a GCREF `ConstRefAddr` (`const_ref_gcref_constant`).
+                    // Dest `PyObjectRef` is `lltype.cast_opaque_ptr`
+                    // (`lltype.py` `ann_cast_opaque_ptr`); aliasing would
+                    // keep `SomePtr(GCREF)` on a `SomeInstance(PyObject)`
+                    // slot (`pairtype(SomePtr, SomeObject).union`).
                     if src_is_prebuilt_once_value && matches!(dst_kind, ValueType::Ref(_)) {
-                        return Ok((None, arg));
+                        match self.ptr_cast_marker(Some(&ValueType::Ref(None)), None, dest_ty, &arg)
+                        {
+                            Some((op, res)) => return Ok((Some(op), res)),
+                            None => return Ok((None, arg)),
+                        }
                     }
                     let src_width = match &operand {
                         Operand::Copy(place) | Operand::Move(place) => {
@@ -2209,13 +2217,16 @@ impl<'a> Lowering<'a> {
                             res,
                         ));
                     }
-                    // `p as usize as *mut T` is `lltype.cast_opaque_ptr`.
-                    // Fold the int→ptr half back to the original GC pointer
-                    // so OptEarlyForce does not force_box a virtual
-                    // W_IntObject (`jtransform.py rewrite_op_cast_opaque_ptr`).
-                    // A flavor-raw dest is int-banked (`rclass.py getgcflavor`);
-                    // folding would leave a GC `*const ()` actual against
-                    // FUNC.ARGS Int. Fall through to `ptr_cast_marker`.
+                    // `p as usize as *mut T` is `lltype.cast_opaque_ptr`
+                    // (`lltype.py` `ann_cast_opaque_ptr`). Recover the
+                    // original GC pointer so OptEarlyForce does not
+                    // force_box a virtual W_IntObject
+                    // (`jtransform.py rewrite_op_cast_opaque_ptr`), then
+                    // narrow to the dest class: a GCREF orig used as
+                    // `PyObjectRef` must become `SomeInstance(PyObject)`,
+                    // not keep `SomePtr(GCREF)`. A flavor-raw dest is
+                    // int-banked (`rclass.py getgcflavor`); folding would
+                    // leave a GC `*const ()` actual against FUNC.ARGS Int.
                     if matches!(dst_kind, ValueType::Ref(_))
                         && flavor_raw_pointer_class_root(
                             dest_ty,
@@ -2226,7 +2237,15 @@ impl<'a> Lowering<'a> {
                         .is_none()
                         && let Some(orig) = self.cast_ptr_to_int_src.get(&arg).cloned()
                     {
-                        return Ok((None, orig));
+                        match self.ptr_cast_marker(
+                            Some(&ValueType::Ref(None)),
+                            None,
+                            dest_ty,
+                            &orig,
+                        ) {
+                            Some((op, res)) => return Ok((Some(op), res)),
+                            None => return Ok((None, orig)),
+                        }
                     }
                     // `promote(p as usize) as *mut T` (`jit.py` `promote`,
                     // `Function.getcode`). The promote result is a new
