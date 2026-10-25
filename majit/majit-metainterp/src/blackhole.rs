@@ -1161,13 +1161,24 @@ impl BlackholeInterpreter {
         JitException::ExitFrameWithExceptionRef(GcRef(exc as usize))
     }
 
-    /// blackhole.py _prepare_resume_from_failure
+    /// blackhole.py `_prepare_resume_from_failure`
     ///
     /// Extract exception from the CPU deadframe on guard failure.
     /// Returns the exception value (0 if none).
+    ///
+    /// `resume_in_blackhole` calls this then `_run_forever`. Upstream
+    /// `_prepare_resume_from_failure` is `cpu.grab_exc_value(deadframe)`; a
+    /// non-exception guard yields a null `current_exc`, and a fresh
+    /// `BlackholeInterpreter` has `exception_last_value` null
+    /// (`acquire_interp` / `cleanup_registers`). Pyre's TLS twin
+    /// `BH_LAST_EXC_VALUE` may still hold an exception compiled code already
+    /// caught: a matching `GUARD_EXCEPTION` resets only the backend
+    /// `_store_exception` cells. This resume's exception is the deadframe
+    /// grab, so zero the TLS here. Do not drain the backend cells.
     pub fn prepare_resume_from_failure(deadframe_exc: i64) -> i64 {
         // RPython: lltype.cast_opaque_ptr(rclass.OBJECTPTR,
         //          self.cpu.grab_exc_value(deadframe))
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
         deadframe_exc
     }
 
@@ -6635,6 +6646,37 @@ mod tests {
                 super::BH_LAST_EXC_VALUE.with(|c| c.get()),
                 0,
                 "the cell is drained once the value has another root"
+            );
+            super::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        }
+
+        /// `prepare_resume_from_failure` zeros a leftover TLS exception so a
+        /// compiled `GUARD_EXCEPTION` that already consumed the backend cells
+        /// cannot be re-raised (`bhimpl_abort_permanent` reads the cell). The
+        /// deadframe grab is returned unchanged.
+        #[test]
+        fn test_prepare_resume_from_failure_zeros_stale_tls() {
+            const STALE: i64 = 0x5eed_00c0;
+            const DEADFRAME_EXC: i64 = 0x5eed_00d1;
+            super::BH_LAST_EXC_VALUE.with(|c| c.set(STALE));
+            let got = super::BlackholeInterpreter::prepare_resume_from_failure(0);
+            assert_eq!(got, 0, "a null deadframe grab stays null");
+            assert_eq!(
+                super::BH_LAST_EXC_VALUE.with(|c| c.get()),
+                0,
+                "stale TLS must be zeroed even when the deadframe holds no exception"
+            );
+
+            super::BH_LAST_EXC_VALUE.with(|c| c.set(STALE));
+            let got = super::BlackholeInterpreter::prepare_resume_from_failure(DEADFRAME_EXC);
+            assert_eq!(
+                got, DEADFRAME_EXC,
+                "the deadframe grab is the resume's exception"
+            );
+            assert_eq!(
+                super::BH_LAST_EXC_VALUE.with(|c| c.get()),
+                0,
+                "TLS is not the resume's exception channel"
             );
             super::BH_LAST_EXC_VALUE.with(|c| c.set(0));
         }

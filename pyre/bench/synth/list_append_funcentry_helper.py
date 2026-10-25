@@ -1,15 +1,15 @@
-# pyre-check: max-pypy-ratio=125
-# Function-entry `push` deopts on each list realloc. The orthodox
-# append fold compiles two helper traces with 1 guard failure
-# on dynasm and cranelift (was 5).
-# The trip count puts pypy above the startup-subtraction floor, so this ratio
-# is a measurement rather than pyre divided by the floor constant. The ceiling
-# is twice the slowest backend observed (61.9x on cranelift).
+# pyre-check: max-pypy-ratio=10
+# Function-entry `push` is a no-loop helper; list growth is a residual
+# cond_call rather than a deopt. Three loops compile, as on pypy: the `push`
+# entry trace, `main`'s loop with `push` inlined, and the app-level
+# `_regular_sum` loop for the closing `sum` calls (`app_functional.sum`).
+# The ceiling keeps the macOS reading (3.1x locally) above its 2.5x floor
+# while leaving room for the Linux runners, where pypy is relatively faster.
 # #171/#34: the orthodox list.append fold fires in function-entry (no-loop)
 # helper traces, not only loop traces.  `push` is a no-loop helper called in a
 # hot loop on two alternating receivers, so it traces from entry (header_pc==0)
-# and its spare-capacity guard resume must reconstruct the alternating receiver
-# correctly across the many realloc deopts — a wrong receiver box would route an
+# and its spare-capacity resume must reconstruct the alternating receiver
+# correctly — a wrong receiver box would route an
 # append into the other list and corrupt the cross-checked sums below.
 N = 1500000
 

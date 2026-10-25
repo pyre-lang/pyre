@@ -3202,6 +3202,10 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // blackhole.py resume_in_blackhole:
     //   current_exc = _prepare_resume_from_failure(guard_opnum, deadframe)
     //   _run_forever(blackholeinterp, current_exc)
+    // `_prepare_resume_from_failure` is `cpu.grab_exc_value(deadframe)`; the
+    // live exception is that grab (`guard_exc` / `GuardExcRoot`), not the
+    // TLS twin. Compiled `GUARD_EXCEPTION` resets only the backend cells,
+    // so the helper zeros `BH_LAST_EXC_VALUE` here.
     // `_resume_mainloop` prologue (blackhole.py): when the guard
     // failure carries a pending exception (GUARD_NO_EXCEPTION /
     // GUARD_EXCEPTION / GUARD_NOT_FORCED → `cpu.grab_exc_value(deadframe)`),
@@ -3210,7 +3214,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // resuming the no-exception path. `_run_forever` re-offers the exception
     // to each caller in turn (resume_mainloop returns the unhandled exc, the
     // loop advances to nextblackholeinterp), so walk the chain here.
-    if guard_exc != 0 {
+    let current_exc =
+        majit_metainterp::blackhole::BlackholeInterpreter::prepare_resume_from_failure(guard_exc);
+    if current_exc != 0 {
         loop {
             // The traceback records below allocate their nodes through the
             // collecting nursery hook and can move the exception; the park

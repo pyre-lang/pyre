@@ -69,6 +69,7 @@ two-phase-annotate-skipped	pyre_interpreter::_pypy_generic_alias::generic_alias_
 two-phase-annotate-skipped	pyre_interpreter::_pypy_generic_alias::make_generic_alias
 two-phase-annotate-skipped	pyre_interpreter::_pypy_generic_alias::make_starred
 two-phase-annotate-skipped	pyre_interpreter::app_functional::__majit_wrap_builtin_sorted
+two-phase-annotate-skipped	pyre_interpreter::app_functional::__majit_wrap_builtin_sum
 two-phase-annotate-skipped	pyre_interpreter::app_functional::install_applevel_builtins
 two-phase-annotate-skipped	pyre_interpreter::app_functional::is_published_sorted
 two-phase-annotate-skipped	pyre_interpreter::argument::<Impl>::_combine_wrapped
@@ -2077,6 +2078,7 @@ two-phase-annotate-skipped	pyre_object::unicode_array::<Impl>::pop
 two-phase-annotate-skipped	pyre_object::unicode_array::<Impl>::remove
 two-phase-annotate-skipped	pyre_object::weakref::w_weakref_new
 two-phase-annotate-skipped	quasiimmut::QuasiImmutField::invalidate_then_store__spec_closure_5068dd9c8e7166cd
+two-phase-annotate-skipped	rordereddict::RDict::clone__spec_BytesKey_PyObject_ObjectKeyHasher__b2c277c41cc8c9df
 two-phase-annotate-skipped	rordereddict::RDict::clone_index_block__spec_BytesKey_PyObject_ObjectKeyHasher__d08d41f8f489c315
 two-phase-annotate-skipped	rordereddict::RDict::clone_index_block__spec_IdentityKey_PyObject_ObjectKeyHasher__bc09bd4cdd137f58
 two-phase-annotate-skipped	rordereddict::RDict::clone_index_block__spec_ObjectKey_PyObject_ObjectKeyHasher__2d65836373e73eba
