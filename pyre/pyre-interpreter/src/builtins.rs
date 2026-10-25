@@ -20270,18 +20270,16 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     if !args.is_empty() {
         return Err(crate::PyError::type_error("globals() takes no arguments"));
     }
-    // interp_inspect.py globals:
-    //   caller = ec.gettopframe_nohidden()
-    //   if caller is None: return None
-    //   return caller.get_w_globals()
+    // PyPy `interp_inspect.globals` returns
+    // `ec.gettopframe_nohidden().get_w_globals()` and has no frameless branch;
+    // [3.15-spec] the frameless branch follows `builtin_globals_impl` /
+    // `_PyEval_GetGlobalsFromRunningMain` (C source v3.15.1).
     let frame = topframe_nohidden();
     if frame.is_null() {
         return Ok(pyre_object::w_none());
     }
     let dict = unsafe { (*frame).get_w_globals() };
-    if dict.is_null() {
-        return Ok(pyre_object::w_none());
-    }
+    debug_assert!(!dict.is_null());
     Ok(dict)
 }
 
