@@ -28,8 +28,12 @@ pub fn prepare_main_module(
             shadow_stack_get(name_slot),
         )
     };
+    // PyPy `module.py Module` is an ordinary GC object. The managed twin
+    // matches that, so detaching `sys.modules` can make the module/dict
+    // cycle unreachable. The allocation can collect: the dict is already
+    // on `_roots`, and the result is pinned before `set_sys_module`.
     let module_slot = shadow_stack_len();
-    let _ = pin_root(pyre_object::module::w_module_new_aliasing_dict(
+    let _ = pin_root(pyre_object::module::w_module_new_aliasing_dict_managed(
         "__main__",
         shadow_stack_get(globals_slot),
     ));

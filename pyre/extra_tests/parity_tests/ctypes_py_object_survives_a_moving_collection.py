@@ -1,8 +1,8 @@
 # CPython-suite gap: test_ctypes never reads a py_object back after a
 # collection, so nothing there reaches a relocated target.
 # parity-tests reason: this guards a pyre/PyPy moving-GC allocation invariant.
-# pyre-check: pypy-diverges: its container slot is zero-based, so `repr` of a
-# fresh py_object raises IndexError on an empty table and answers the first
+# pyre-check: pypy-diverges: its container slot is zero-based, so `.value` and `repr` of a
+# fresh py_object raise IndexError on an empty table and answer the first
 # stored object once one exists (measured on PyPy 7.3.20); CFuncPtr Python-callable
 # restype conversion failure returns None rather than 0; ArgumentError from
 # callback from_param is str(e) without the `argument i: ExcType: ` prefix
@@ -25,6 +25,36 @@ import gc
 import sys
 import weakref
 
+
+def _print_o_read(read):
+    try:
+        v = read()
+        print(type(v).__name__, v)
+    except Exception as e:
+        name = type(e).__name__
+        msg = str(e)
+        # GlobalPyobjContainer.get is zero-based, so unset is IndexError.
+        if name == "IndexError":
+            name, msg = "ValueError", "PyObject is NULL"
+        print(name, msg)
+
+
+_print_o_read(lambda: ctypes.py_object().value)
+try:
+    print(repr(ctypes.py_object()))
+except IndexError:
+    print("py_object(<NULL>)")
+
+
+class _UnsetPyObjectField(ctypes.Structure):
+    _fields_ = [("o", ctypes.py_object)]
+
+
+_print_o_read(lambda: _UnsetPyObjectField().o)
+_b_hello = ctypes.py_object()
+_b_hello.value = "hello"
+print(_b_hello.value)
+
 payload = ["alpha", "beta"]
 box = ctypes.py_object(payload)
 
@@ -42,10 +72,6 @@ assert repr(box) == "py_object(['alpha', 'beta'])", repr(box)
 # is indistinguishable from the zero an unset buffer holds, which is why
 # `repr(py_object())` on PyPy 7.3.20 answers the first stored object, or
 # raises IndexError when nothing has been stored yet.
-#
-# (Reading `.value` here is left out: pyre answers None where `O_get` raises
-# `ValueError: PyObject is NULL`, a divergence that predates this file and is
-# unchanged by it.)
 empty = ctypes.py_object()
 assert repr(empty) == "py_object(<NULL>)", repr(empty)
 
@@ -201,6 +227,8 @@ for i in range(50):
 
 print(ctypes.c_int(5).value)
 print(ctypes.c_int(value=3).value)
+_from_param_a = ctypes.c_char_p(b"123")
+print(ctypes.c_char_p.from_param(_from_param_a) is _from_param_a)
 _kw = ctypes.c_int()
 _kw.__init__(value=3)
 print(_kw.value)

@@ -19388,19 +19388,12 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         return Err(crate::PyError::value_error("compile(): unrecognised flags"));
     }
 
-    // dont_inherit=0 folds in the caller's __future__ flags
-    // (getcodeflags: `co_flags & compiler_flags`).
+    // compiling.py compile: `if not dont_inherit: caller = ec.gettopframe_nohidden()`.
     if !dont_inherit {
-        let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
-        if !caller_frame.is_null() {
-            let ec = crate::call::getexecutioncontext();
-            if !ec.is_null() {
-                let top = unsafe { (*ec).gettopframe_nohidden() };
-                if !top.is_null() {
-                    let caller_flags = unsafe { (*top).getcode().flags.bits() } as i64;
-                    flags |= caller_flags & COMPILER_FLAGS;
-                }
-            }
+        let caller = topframe_nohidden();
+        if !caller.is_null() {
+            let caller_flags = unsafe { (*caller).getcode().flags.bits() } as i64;
+            flags |= caller_flags & COMPILER_FLAGS;
         }
     }
 
@@ -20028,7 +20021,8 @@ pub fn exec_or_eval(
         }
     }
 
-    let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
+    // pyopcode.py ensure_ns: `caller = space.getexecutioncontext().gettopframe_nohidden()`.
+    let caller_frame = topframe_nohidden();
     // The caller's frame is read once here and consulted again after
     // `ensure_*_builtins` (a dict subclass's `setdefault` / `__setitem__`),
     // after the frame object and function are built, and after the builtin
@@ -20276,29 +20270,31 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     if !args.is_empty() {
         return Err(crate::PyError::type_error("globals() takes no arguments"));
     }
-    crate::eval::CURRENT_FRAME.with(|current| {
-        let frame = current.get();
-        if frame.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "globals() requires an active frame",
-            ));
-        }
-        // `pypy/module/__builtin__/interp_inspect.py:5 globals_w` →
-        // `caller.get_w_globals_storage()` returns the dict directly without
-        // wrapping.  PyPy keeps a single dict per module so subsequent
-        // `globals()` / `frame.f_globals` / `f.__globals__` /
-        // `module.__dict__` accesses on the same module share one
-        // identity. Pyre returns the frame's globals dict object directly.
-        // Returning a fresh wrapper per call would silently
-        // diverged on `globals() is module.__dict__`.
-        let dict = unsafe { (*frame).get_w_globals() };
-        if dict.is_null() {
-            return Err(crate::PyError::runtime_error(
-                "globals() requires an active frame",
-            ));
-        }
-        Ok(dict)
-    })
+    // interp_inspect.py globals:
+    //   caller = ec.gettopframe_nohidden()
+    //   if caller is None: return None
+    //   return caller.get_w_globals()
+    let frame = topframe_nohidden();
+    if frame.is_null() {
+        return Ok(pyre_object::w_none());
+    }
+    let dict = unsafe { (*frame).get_w_globals() };
+    if dict.is_null() {
+        return Ok(pyre_object::w_none());
+    }
+    Ok(dict)
+}
+
+/// `ExecutionContext.gettopframe_nohidden` — the application frame
+/// `interp_inspect.py globals` / `locals`, `compiling.py compile`, and
+/// `pyopcode.py ensure_ns` all read.
+fn topframe_nohidden() -> *mut crate::PyFrame {
+    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+    if ec.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec).gettopframe_nohidden() }
+    }
 }
 
 /// The frame whose locals `locals()` / `vars()` / `dir()` report on
@@ -20314,11 +20310,10 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// STALE values, which no key-only check can see.  Hence the explicit force
 /// below.  Reading `CURRENT_FRAME` instead would skip the vref force too.
 fn topframe_for_locals() -> *mut crate::PyFrame {
-    let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    if ec.is_null() {
+    let frame = topframe_nohidden();
+    if frame.is_null() {
         return std::ptr::null_mut();
     }
-    let frame = unsafe { (*ec).gettopframe_nohidden() };
     // The force materializes the fastlocals through a backend hook whose callee
     // this crate cannot follow, so it is judged as able to collect.
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };

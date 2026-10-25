@@ -1016,7 +1016,12 @@ unsafe fn bytes_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 }
 
 /// Custom trace for `W_BytearrayObject`. `data` is a GC-managed leaf
-/// `Vec<u8>` storage box (off-GC storage).
+/// `Vec<u8>` storage box (off-GC storage) for exact and subclass alike
+/// (`w_bytearray_alloc` / `w_bytearray_subclass_from_bytes`).
+///
+/// `try_gc_owns_object` remains only for the `gc_alloc_storage_box`
+/// `malloc_raw` fallback (`tid == 0` or no GC hook); product constructors
+/// always store a collected box.
 unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let ba = unsafe { &mut *(obj_addr as *mut pyre_object::bytearrayobject::W_BytearrayObject) };
     f(&mut ba.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -1032,6 +1037,8 @@ unsafe fn bytearray_user_object_custom_trace(
     obj_addr: usize,
     f: &mut dyn FnMut(*mut majit_ir::GcRef),
 ) {
+    // Same `data` visit as the exact type: the subclass constructor now
+    // allocates the payload through `gc_alloc_storage_box`.
     unsafe { bytearray_object_custom_trace(obj_addr, f) };
     unsafe {
         pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(

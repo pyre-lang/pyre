@@ -103,10 +103,13 @@ fn collect_and_run_finalizers(ec_ptr: *const crate::executioncontext::PyExecutio
 ///   `class MyStr(str)` instance retags `w_class` and is rejected here, so its
 ///   `__del__` and its own attributes stay on the collecting path.
 /// * A module still registered in `sys.modules` under its own `__name__`. It
-///   stays reachable from there no matter what `__main__` does, so the release
-///   removes no object at all from the reachable set. This is every `import`
-///   name. Reading the live `sys.modules` rather than assuming is what keeps a
-///   program that replaced or deleted the entry on the collecting path.
+///   stays reachable from there no matter what another module's dict does, so
+///   the release removes no object at all from the reachable set. This is
+///   every `import` name. Reading the live mapping rather than assuming is
+///   what keeps a program that replaced or deleted the entry on the collecting
+///   path. After [`crate::importing::release_sys_modules_for_shutdown`] has
+///   emptied that mapping, the answer is always false: a detached module is
+///   no longer proof of reachability.
 ///
 /// The point is not that these values are cheap to collect — it is that the
 /// collection cannot reach a different answer, so every `__del__` still runs at
@@ -182,7 +185,7 @@ fn release_delivers_no_finalizer(mut value: pyre_object::PyObjectRef) -> bool {
         || !majit_gc::gc_object_finalizer_pending(value as usize)
 }
 
-/// `PYRE_GC_DIAG`: how many `__main__` bindings the release walk let go, and
+/// `PYRE_GC_DIAG`: how many module-dict bindings the shutdown walk let go, and
 /// how many of them it collected after. `swept` is the count
 /// [`release_delivers_no_finalizer`] exists to keep near zero; a run where it
 /// tracks `released` is one where the walk is back to a mark-and-sweep per name.
@@ -202,39 +205,92 @@ fn shutdown_module_private_name(name: &rustpython_wtf8::Wtf8) -> bool {
     bytes.first() == Some(&b'_') && bytes.get(1) != Some(&b'_')
 }
 
-fn clear_shutdown_module_name(dict: pyre_object::PyObjectRef, name: &rustpython_wtf8::Wtf8) {
-    let should_clear = unsafe { pyre_object::w_dict_getitem_wtf8(dict, name) }
-        .is_some_and(|value| unsafe { !pyre_object::is_none(value) });
-    if should_clear {
-        unsafe {
-            pyre_object::w_dict_setitem_wtf8(dict, name, pyre_object::w_none());
+/// `_PyModule_ClearDict`: one name pass, forward dict order. Re-reads the
+/// live value rather than trusting the snapshot, because a `__del__` already
+/// run by this walk may have rebound the name.
+fn clear_shutdown_module_dict_pass(
+    dict: &mut pyre_object::PyObjectRef,
+    ec_ptr: *const crate::executioncontext::PyExecutionContext,
+    released: &mut usize,
+    swept: &mut usize,
+    private_only: bool,
+) {
+    let mut keys: Vec<rustpython_wtf8::Wtf8Buf> =
+        unsafe { pyre_object::w_dict_str_entries_wtf8(*dict) }
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+    let mut index = 0;
+    while index < keys.len() {
+        let name = keys[index].clone();
+        index += 1;
+        if private_only {
+            if !shutdown_module_private_name(&name) {
+                continue;
+            }
+        } else if name.as_bytes() == b"__builtins__" {
+            continue;
+        }
+        let Some(old) = (unsafe { pyre_object::w_dict_getitem_wtf8(*dict, &name) }) else {
+            continue;
+        };
+        if unsafe { pyre_object::is_none(old) } {
+            continue;
+        }
+        let mut d = *dict;
+        // Root the dict across the store and any collection it triggers.
+        // Do not root `old`: a pin would keep a finalizable value reachable
+        // and move its `__del__` to a later sweep, after names this pass
+        // has already replaced.
+        let did_sweep = pyre_object::with_roots!(d => {
+            unsafe {
+                pyre_object::w_dict_setitem_wtf8(d, &name, pyre_object::w_none());
+            }
+            *released += 1;
+            if release_delivers_no_finalizer(old) {
+                false
+            } else {
+                *swept += 1;
+                collect_and_run_finalizers(ec_ptr);
+                true
+            }
+        });
+        *dict = d;
+        if did_sweep {
+            // Re-read remaining entries from the live dict: a `__del__` this
+            // collection ran may have rebound a name still ahead of us, and
+            // the dict pointer itself may have moved.
+            keys = unsafe { pyre_object::w_dict_str_entries_wtf8(*dict) }
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            index = keys.iter().position(|n| n == &name).map_or(0, |at| at + 1);
         }
     }
 }
 
-/// `_PyModule_ClearDict`: clear string-keyed module globals in two name passes.
-fn clear_shutdown_module_dict(dict: pyre_object::PyObjectRef) {
+/// `_PyModule_ClearDict`: clear string-keyed module globals in two name
+/// passes (private `_x` names first, then every name except `__builtins__`),
+/// both in forward dict order. A store that can deliver a finalizer is
+/// followed by a collection while this dict is still rooted.
+fn clear_shutdown_module_dict(
+    dict: &mut pyre_object::PyObjectRef,
+    ec_ptr: *const crate::executioncontext::PyExecutionContext,
+    released: &mut usize,
+    swept: &mut usize,
+) {
     if dict.is_null() {
         return;
     }
-    let keys: Vec<rustpython_wtf8::Wtf8Buf> = unsafe { pyre_object::w_dict_str_entries_wtf8(dict) }
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    for name in &keys {
-        if shutdown_module_private_name(name) {
-            clear_shutdown_module_name(dict, name);
-        }
-    }
-    for name in &keys {
-        if name.as_bytes() != b"__builtins__" {
-            clear_shutdown_module_name(dict, name);
-        }
-    }
+    clear_shutdown_module_dict_pass(dict, ec_ptr, released, swept, true);
+    clear_shutdown_module_dict_pass(dict, ec_ptr, released, swept, false);
 }
 
-/// `finalize_modules`: clear detached modules newest-first while their peers
-/// remain available to finalizers that run between module dictionaries.
+/// `finalize_modules`: collect after detaching `sys.modules`, then clear
+/// surviving module dictionaries newest-first with `_PyModule_ClearDict`.
+/// `sys` and `builtins` dictionaries are left intact: they outlive every
+/// other namespace, the same way `ObjSpace.sys` / `ObjSpace.builtin` remain
+/// on the space after `ObjSpace.finish`.
 fn clear_shutdown_modules(
     released: crate::importing::ReleasedSysModules,
     ec_ptr: *const crate::executioncontext::PyExecutionContext,
@@ -256,10 +312,9 @@ fn clear_shutdown_modules(
         names.push(name);
         let _ = pyre_object::gc_roots::pin_root(module);
     }
-    // finalize_remove_modules in CPython v3.14.6 retains weak references:
-    // holding these modules strongly would keep their cycles alive until
-    // their globals are cleared. PyPy Module objects likewise have ordinary
-    // GC lifetime; ObjSpace.finish does not clear their dictionaries. Keep
+    // Holding these modules strongly would keep their cycles alive until
+    // their globals are cleared. PyPy `module.py Module` has ordinary GC
+    // lifetime; `ObjSpace.finish` does not clear their dictionaries. Keep
     // only GC-managed weak carriers across the collection so finalizers can
     // inspect the intact graph (test_module_finalization_at_shutdown).
     for index in 0..names.len() {
@@ -273,31 +328,30 @@ fn clear_shutdown_modules(
             pyre_object::gc_roots::shadow_stack_get(roots_start + index).cast(),
         )
     };
-    // CPython v3.14.6 pylifecycle.c finalize_modules collects unconditionally
-    // after detaching sys.modules and before clearing surviving module dicts.
-    // A previous finalizer can release the next link in a chain even when
-    // detaching the cache itself made nothing unreachable. Collect while those
-    // finalizers can still read their globals (test_module's
-    // test_module_finalization_at_shutdown).
-    // PyPy ObjSpace.finish runs module shutdown hooks without this dict-clear
-    // phase; this collection preserves the existing CPython shutdown contract.
+    // Collect after detaching `sys.modules` and before clearing surviving
+    // module dictionaries. A previous finalizer can release the next link in
+    // a chain even when detaching the cache itself made nothing unreachable.
+    // Collect while those finalizers can still read their globals
+    // (test_module_finalization_at_shutdown).
+    // PyPy `ObjSpace.finish` runs module shutdown hooks without this
+    // dict-clear phase.
     // incminimark.IncrementalMiniMarkGC.deal_with_objects_with_finalizers
-    // preserves dependency order across successive collections. Unlike
-    // CPython's refcount/cyclic-GC finalization, one collection need not finish
-    // the unreachable module graph. Allow the required first collection,
-    // then at most one pass per finalizer still registered at entry. The first
-    // pass also drains objects already delivered to the death queue. Stop early
-    // when no finalizer is delivered. Snapshot the bound: a __del__ that
-    // creates another finalizable cycle must not extend shutdown indefinitely.
-    // PyPy ObjSpace.finish and CPython finalize_modules both have bounded
-    // shutdown phases; this bound preserves the GC's dependency ordering
-    // without chasing newly created generations forever.
+    // preserves dependency order across successive collections. One
+    // collection need not finish the unreachable module graph. Allow the
+    // required first collection, then at most one pass per finalizer still
+    // registered at entry. The first pass also drains objects already
+    // delivered to the death queue. Stop early when no finalizer is
+    // delivered. Snapshot the bound: a `__del__` that creates another
+    // finalizable cycle must not extend shutdown indefinitely. This bound
+    // preserves the GC's dependency ordering without chasing newly created
+    // generations forever.
     let collection_limit = majit_gc::gc_registered_finalizer_count().saturating_add(1);
     for _ in 0..collection_limit {
         if !collect_and_run_finalizers(ec_ptr) {
             break;
         }
     }
+    let (mut released_count, mut swept) = (0usize, 0usize);
     for index in (0..names.len()).rev() {
         let module = module_at(index);
         let is_core_module = sys_module_slot.is_some_and(|slot| module == module_at(slot))
@@ -308,19 +362,14 @@ fn clear_shutdown_modules(
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
             continue;
         }
-        // _PyWeakref_GET_REF owns the surviving module through _PyModule_Clear.
+        // A strong hold on the surviving module through `_PyModule_Clear`.
         // The weak carrier alone must not be its root while a store allocates.
         let module_root = pyre_object::gc_roots::push_roots();
         let module = module_root.pin_root(module);
-        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-        clear_shutdown_module_dict(dict);
+        let mut dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        clear_shutdown_module_dict(&mut dict, ec_ptr, &mut released_count, &mut swept);
     }
-    // One collection for the whole walk, not one per module. `finalize_modules`
-    // clears the module dictionaries and lets refcounting release what they
-    // held; a sweep per module buys no ordering here, because a finalizer that
-    // reads a global reaches its own already-cleared namespace either way, and
-    // it costs a full mark-and-sweep for each of the ~100 modules a bare
-    // `import unittest` loads.
+    teardown_census(released_count, swept);
     collect_and_run_finalizers(ec_ptr);
 }
 
@@ -401,42 +450,39 @@ fn finalize_delete_special() {
     }
 }
 
-/// PyPy `ObjSpace.finish()` / module teardown ordering: join non-daemon
-/// threads, collect already-unreachable cycles, then release `__main__`
-/// globals from newest to oldest while the older globals their `__del__`
-/// methods may reference are still present.
-///
-/// Newest-to-oldest is what keeps those references working, and it is not
-/// interchangeable with the insertion order `_PyModule_ClearDict` uses. A name
-/// is bound before every name that could be finalized while reading it — most
-/// of all `import sys`, which is usually the very first — so releasing in
-/// insertion order strands `sys` at `None` and every finalizer that writes to
-/// `sys.stderr` dies with an `AttributeError` instead of running. Refcounting
-/// makes the question moot upstream: a finalizer there runs from the decref of
-/// the name being released, while every other slot still holds its original
-/// value, which is not reproducible without leaving dangling pointers in the
-/// dict.
-///
-/// The value is rebound to `None` rather than deleted, as `_PyModule_ClearDict`
-/// does: a `__del__` that reads an already-released name then sees `None`, the
-/// way it would upstream, instead of raising `NameError` at a name the program
-/// can see is still defined.
-///
-/// `__main__` is not the whole reachable set: an object stored in another
-/// module's namespace stays alive through that module's dict. The
-/// `finalize_modules` phase that follows detaches `sys.modules` and clears the
-/// remaining module dictionaries newest-first.
+/// PyPy `ObjSpace.finish` joins non-daemon threads and runs module shutdown
+/// hooks; it has no module-dict teardown phase. `finalize_modules` then
+/// deletes the special sys/builtins names, detaches every `sys.modules`
+/// entry, collects, and clears surviving module dictionaries newest-first
+/// with `_PyModule_ClearDict`.
 pub fn finalize_runtime(
     mut canonical: pyre_object::PyObjectRef,
     ec_ptr: *const crate::executioncontext::PyExecutionContext,
 ) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let canonical_slot = if canonical.is_null() {
+        None
+    } else {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        canonical = pyre_object::gc_roots::pin_root(canonical);
+        Some(slot)
+    };
+    let reload_canonical = || {
+        canonical_slot.map_or(
+            pyre_object::PY_NULL,
+            pyre_object::gc_roots::shadow_stack_get,
+        )
+    };
     // `make_pre_finalization_calls`: join the non-daemon threads, then run the
     // atexit callbacks, and repeat while a callback or a thread it started
     // left either a non-daemon thread (`interp_has_threads`) or another
     // callback (`interp_has_atexit_callbacks`).
     loop {
+        let mut canonical = reload_canonical();
         pyre_object::with_roots!(canonical => run_threading_shutdown());
+        let mut canonical = reload_canonical();
         pyre_object::with_roots!(canonical => run_atexit_callbacks(canonical, ec_ptr));
+        let mut canonical = reload_canonical();
         if !crate::module::thread::has_shutdown_handles()
             && !pyre_object::with_roots!(canonical => has_atexit_callbacks(canonical, ec_ptr))
         {
@@ -453,51 +499,33 @@ pub fn finalize_runtime(
     crate::module::signal::interp_signal::clear_handlers();
     // baseobjspace.py `finish()` runs every started module's shutdown
     // hook; `_io`'s (moduledef.py:37-40) flushes the streams that are still
-    // alive.  The per-global teardown below reaches only the ones `__main__`
-    // itself holds, so without this a stream owned by any other module loses
-    // its buffered writes.
+    // alive. Without this a stream owned by a module whose dict is cleared
+    // below loses its buffered writes.
+    let mut canonical = reload_canonical();
     pyre_object::with_roots!(canonical => crate::module::_io::flush_all_streams());
     // `faulthandler`'s (moduledef.py `shutdown`) cancels the watchdog and
     // restores the signal handlers before any module is torn down.
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     crate::module::faulthandler::handler::finish();
-    // `finalize_modules` opens with this and every release below is its module
-    // teardown, so the clearing has to precede the whole walk rather than sit
-    // beside `clear_shutdown_modules`.
+    // `finalize_modules` opens with this; the detach and module-dict walk
+    // follow immediately, so the special names are gone before any `__del__`
+    // from that walk can hide in them.
     finalize_delete_special();
-    let mut swept_something_finalizable =
-        pyre_object::with_roots!(canonical => collect_and_run_finalizers(ec_ptr));
-    let (mut released, mut swept) = (0usize, 0usize);
-    let mut entries = unsafe { pyre_object::w_dict_str_entries(canonical) };
-    entries.reverse();
-    for (name, _) in entries {
-        if name == "__builtins__" {
-            continue;
-        }
-        // Re-read rather than trusting the snapshot: a `__del__` already run by
-        // this loop may have rebound the name, and the decision below is only
-        // sound about the value actually being released.
-        let value = unsafe { pyre_object::w_dict_getitem_str(canonical, &name) };
+    // The program has returned: drop the main frame chain so `w_globals`
+    // does not keep `__main__`'s namespace reachable through the EC after
+    // `sys.modules` is emptied. PyPy `executioncontext.py leave` has already
+    // popped the frame; this catches a launcher that left `topframeref` set.
+    if !ec_ptr.is_null() {
         unsafe {
-            pyre_object::w_dict_setitem_str(canonical, &name, pyre_object::w_none());
+            let ec = &mut *(ec_ptr as *mut crate::executioncontext::PyExecutionContext);
+            ec.topframeref = std::ptr::null_mut();
         }
-        released += 1;
-        if value.is_none_or(release_delivers_no_finalizer) {
-            continue;
-        }
-        swept += 1;
-        swept_something_finalizable =
-            pyre_object::with_roots!(canonical => collect_and_run_finalizers(ec_ptr));
-    }
-    teardown_census(released, swept);
-    // Close the loop on a swept heap and a drained queue. A release the loop
-    // skipped removes nothing from the reachable set, and one it did not is
-    // followed immediately by the sweep above, so the only way this heap can
-    // hold a finalizer the last sweep missed is a `__del__` that sweep ran and
-    // that dropped the last reference to something else.
-    if swept_something_finalizable {
-        collect_and_run_finalizers(ec_ptr);
     }
     let shutdown_modules = crate::importing::release_sys_modules_for_shutdown();
+    // Drop the `canonical` pin so the post-detach collection can reach a
+    // `__main__` global's `__del__`. `sys.modules` no longer holds the module.
+    if let Some(slot) = canonical_slot {
+        pyre_object::gc_roots::shadow_stack_set(slot, pyre_object::w_none());
+    }
     clear_shutdown_modules(shutdown_modules, ec_ptr);
 }

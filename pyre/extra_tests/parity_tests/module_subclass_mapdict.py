@@ -10,6 +10,12 @@
 # list_subclass_slots:
 # slots tests omit instance-owned slots on a native list subclass. this targets PyPy/pyre
 # native-subclass storage layout.
+#
+# function_ctype_cif_descr_is_freed:
+# unique function ctypes allocate a raw cif_descr. An array argument decays to
+# a pointer, so arities of interned int must differ or the cache returns one
+# type. Dropping them and collecting must free the descr (`W_CTypeFunc.__del__`);
+# a later callback call must still work. A weakref counts how many types died.
 
 """Subclass instances of the module types that accept subclassing.
 
@@ -309,4 +315,51 @@ def list_subclass_slots():
     else:
         raise AssertionError("a deleted list-subclass slot must be unbound")
 list_subclass_slots()
+
+
+def function_ctype_cif_descr_is_freed():
+    """Dropped function ctypes free their raw cif_descr; a later call still works."""
+    if _cffi_backend is None:
+        return
+    new_function_type = _cffi_backend.new_function_type
+    new_primitive_type = _cffi_backend.new_primitive_type
+    new_void_type = _cffi_backend.new_void_type
+    callback = _cffi_backend.callback
+
+    int_type = new_primitive_type("int")
+    void = new_void_type()
+    n = 300
+    refs = []
+    weakrefs_ok = True
+    k = 1
+    while k <= n:
+        # Each arity is its own intern key; an array argument would decay
+        # to one pointer type and the cache would return a single ctype.
+        ft = new_function_type(tuple(int_type for _ in range(k)), void)
+        if weakrefs_ok:
+            try:
+                refs.append(weakref.ref(ft))
+            except TypeError:
+                weakrefs_ok = False
+                del refs[:]
+        del ft
+        k += 1
+    gc.collect()
+    gc.collect()
+    b_int = new_primitive_type("int")
+    b_func = new_function_type((b_int,), b_int)
+    called = callback(b_func, lambda x: x + 1)
+    got = called(41)
+    if weakrefs_ok:
+        dead = 0
+        for r in refs:
+            if r() is None:
+                dead += 1
+        print("function_types n=%d call=%d dead=%d" % (n, got, dead))
+    else:
+        print("function_types n=%d call=%d" % (n, got))
+    assert got == 42
+
+
+function_ctype_cif_descr_is_freed()
 print("OK")

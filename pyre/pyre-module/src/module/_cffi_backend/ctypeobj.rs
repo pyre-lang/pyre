@@ -462,12 +462,18 @@ pub fn set_size(ct: &mut W_CType, size: i64) {
 }
 
 /// Sweep half of `size?`. The collector runs no `Drop` on the payload.
+/// A function type also frees its raw `cif_descr` (`W_CTypeFunc.__del__`).
 ///
 /// # Safety
 /// `obj` must be a GC-dead `W_CType`, and this must run once.
 pub unsafe fn w_ctype_dealloc(obj: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_CType)).mutate_size.reclaim();
+        let ct = &mut *(obj as *mut W_CType);
+        ct.mutate_size.reclaim();
+        if ct.kind == KIND_FUNC && ct.cif_descr != 0 {
+            super::ctypefunc::free_cif_descr(ct.cif_descr);
+            ct.cif_descr = 0;
+        }
     }
 }
 

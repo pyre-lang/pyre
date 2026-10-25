@@ -3840,17 +3840,27 @@ pub struct ReleasedSysModules {
     pub modules: Vec<(Wtf8Buf, PyObjectRef)>,
 }
 
-/// `finalize_remove_modules`: snapshot real modules, then detach import-cache
-/// entries so module/dict cycles can become unreachable during shutdown.
+/// `finalize_remove_modules` / `finalize_clear_modules_dict`: snapshot every
+/// real module in `sys.modules` order, then empty the mapping — `sys` and
+/// `builtins` included — so module/dict cycles can become unreachable during
+/// shutdown. The bootstrap name→module registry keeps only the `sys` /
+/// `builtins` entries (`ObjSpace.sys` / `ObjSpace.builtin`, `interp->sysdict`
+/// / `interp->builtins`); every other entry is released because the registry
+/// is a GC root and a managed module must be collectible.
 pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
     let dict = sys_modules_dict();
     if dict.is_null() {
+        SYS_MODULES
+            .lock()
+            .retain(|name, _| name == "sys" || name == "builtins");
         return ReleasedSysModules {
             modules: Vec::new(),
         };
     }
     let entries = unsafe { pyre_object::w_dict_items(dict) };
-    let mut modules = Vec::new();
+    let mut names = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let roots_start = pyre_object::gc_roots::shadow_stack_len();
     for (key, module) in entries {
         let name = if unsafe { pyre_object::is_str(key) } {
             Some(unsafe { pyre_object::w_str_get_wtf8(key) }.to_owned())
@@ -3859,19 +3869,24 @@ pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
         };
         if !module.is_null()
             && unsafe { pyre_object::is_module(module) }
-            && let Some(name) = &name
+            && let Some(name) = name
         {
-            modules.push((name.clone(), module));
+            names.push(name);
+            let _ = pyre_object::gc_roots::pin_root(module);
         }
-        let keep_entry = name.as_deref().is_some_and(|name| {
-            let bytes = name.as_bytes();
-            bytes == b"sys" || bytes == b"builtins"
-        });
-        if !keep_entry {
-            unsafe {
-                pyre_object::w_dict_delitem(dict, key);
-            }
-        }
+    }
+    unsafe {
+        pyre_object::w_dict_clear(dict);
+    }
+    SYS_MODULES
+        .lock()
+        .retain(|name, _| name == "sys" || name == "builtins");
+    let mut modules = Vec::with_capacity(names.len());
+    for (index, name) in names.into_iter().enumerate() {
+        modules.push((
+            name,
+            pyre_object::gc_roots::shadow_stack_get(roots_start + index),
+        ));
     }
     ReleasedSysModules { modules }
 }
@@ -5118,8 +5133,8 @@ fn load_source_module(
     let globals_slot = code_slot + 1;
     let _ = roots.pin_root(w_globals);
     // PyPy `interpreter/module.py:Module.__init__` seeds `__name__` on
-    // the module's w_dict.  `w_module_new_aliasing_dict` below does that
-    // via `w_dict_setitem_str("__name__", ...)`, so an explicit store
+    // the module's w_dict.  `w_module_new_aliasing_dict_managed` below does
+    // that via `w_dict_setitem_str("__name__", ...)`, so an explicit store
     // here would be redundant.
     //
     // `__file__`/`__cached__` setting moved into `exec_code_module`
@@ -5169,13 +5184,15 @@ fn load_source_module(
     // Create the module object BEFORE execution and register in sys.modules.
     // PyPy: load_source_module → set_sys_modules BEFORE exec_code_module.
     // This prevents infinite recursion on circular imports.
+    // PyPy `module.py Module` is an ordinary GC object; the managed twin
+    // matches that, so detaching `sys.modules` can make the module/dict
+    // cycle unreachable. The allocation can collect: the dict is already on
+    // `roots`, and the result is pinned before `set_sys_module`.
     let canonical = roots.get(globals_slot);
-    let mut module = pyre_object::w_module_new_aliasing_dict(modulename, canonical);
-    pyre_object::with_roots!(module => set_sys_module(modulename, module));
-    // Exec and the sys.modules reads below can collect. The identity compare
-    // after exec has to see the same module the dict entry was updated to.
+    let module = pyre_object::w_module_new_aliasing_dict_managed(modulename, canonical);
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
+    set_sys_module(modulename, roots.get(module_slot));
 
     // A source copy of the public submodule (`from . import _bootstrap` once
     // `_frozen_importlib` is blocked) still execs here under the frozen
@@ -5624,9 +5641,12 @@ fn load_namespace_package(
         pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__path__", path_list);
     }
 
-    let mut module = pyre_object::w_module_new_aliasing_dict(modulename, roots.get(globals_slot));
-    pyre_object::with_roots!(module => set_sys_module(modulename, module));
-    Ok(module)
+    let module =
+        pyre_object::w_module_new_aliasing_dict_managed(modulename, roots.get(globals_slot));
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(module);
+    set_sys_module(modulename, roots.get(module_slot));
+    Ok(roots.get(module_slot))
 }
 
 // ── load_part ────────────────────────────────────────────────────────

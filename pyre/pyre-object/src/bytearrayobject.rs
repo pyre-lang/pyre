@@ -251,23 +251,41 @@ pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
 
 /// Allocate a bytearray user subclass in the managed heap so its mapdict
 /// edges and buffer-export cycles participate in collection.
+///
+/// `W_BytearrayObject.__init__` stores `_data =
+/// resizable_list_supporting_raw_ptr(data)` — a GC list — for exact and
+/// subclass alike. The payload is the same storage box `w_bytearray_alloc`
+/// uses (`bytes_data_gc_type_id`), so sweep runs the box destructor.
 pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObjectRef {
+    let length = bytes.len();
+    let alloc = if bytes.is_empty() { 0 } else { bytes.len() + 1 };
+    // Same rooting as `w_bytearray_alloc`: the data box has no heap edge until
+    // the body is written, and the post-pressure collect can move nursery
+    // pointers. Pin the box, the class, and the body; reload after the last
+    // collection.
     let _roots = crate::gc_roots::push_roots();
-    let root_base = crate::gc_roots::shadow_stack_len();
+    let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
+    let data = crate::gc_storage::gc_alloc_storage_box(
+        bytes.to_vec(),
+        crate::bytesobject::bytes_data_gc_type_id(),
+    );
+    let data_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_BYTEARRAY_USER_GC_TYPE_ID,
         W_BYTEARRAY_USER_OBJECT_SIZE,
     );
+    let data = crate::gc_roots::shadow_stack_get(data_slot) as *mut Vec<u8>;
     let payload = W_BytearrayObjectUser {
         base: W_BytearrayObject {
             ob_header: PyObject {
                 ob_type: &BYTEARRAY_USER_TYPE as *const PyType,
-                w_class: crate::gc_roots::shadow_stack_get(root_base),
+                w_class: crate::gc_roots::shadow_stack_get(class_slot),
             },
-            data: crate::lltype::malloc_raw(bytes.to_vec()),
-            length: crate::object_array::length_cell(bytes.len()),
-            alloc: if bytes.is_empty() { 0 } else { bytes.len() + 1 },
+            data,
+            length: crate::object_array::length_cell(length),
+            alloc,
             logical_offset: 0,
             exports: 0,
         },
@@ -281,11 +299,17 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     };
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    if alloc > 0 && majit_gc::maybe_collect_for_external_malloc(alloc) {
+        majit_ir::eval_breaker_word::set_memory_error();
+    }
+    account_buffer_growth(crate::gc_roots::shadow_stack_get(obj_slot), alloc);
     // `allocate_instance` registers the fresh instance on the finalizer queue
     // when its subtype has `__del__`; the `w_class` is already stamped above,
     // so the hook resolves the subclass rather than the canonical bytearray type.
-    crate::gc_hook::maybe_register_finalizer(obj);
-    obj
+    crate::gc_hook::maybe_register_finalizer(crate::gc_roots::shadow_stack_get(obj_slot));
+    crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
 /// # Safety

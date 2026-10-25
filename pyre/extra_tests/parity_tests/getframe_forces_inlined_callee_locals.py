@@ -20,6 +20,7 @@ and the frame is never handed out from a compiled callee.
 """
 
 import sys
+import types
 
 MOD = 1000003
 ROUNDS = 9000
@@ -67,5 +68,41 @@ if seen[0] == 0:
 if seen[1] != 0:
     print(f"frame reads disagreed {seen[1]} time(s)")
     results.append(False)
+
+# An inlined callee's residual `globals()` / `eval` / `vars` / `dir` must
+# read that callee's module, which `ExecutionContext.gettopframe_nohidden`
+# names.  A helper module owns `NAME`; the loop that calls it lives in
+# `__main__`.
+helper = types.ModuleType("e275_helper")
+helper.__name__ = "e275_helper"
+exec(
+    "NAME = 'e275_helper'\n"
+    "def probe():\n"
+    "    g = globals()['NAME']\n"
+    "    e = eval('NAME')\n"
+    "    v = vars()['g']\n"
+    "    d = 'g' in dir()\n"
+    "    return g, e, v, d\n",
+    helper.__dict__,
+)
+sys.modules["e275_helper"] = helper
+
+cold = helper.probe()
+print("cold", cold)
+
+
+def outer():
+    s = None
+    for _ in range(20000):
+        s = helper.probe()
+    return s
+
+
+hot = outer()
+print("hot", hot)
+if hot != cold:
+    print("hot/cold disagree", cold, hot)
+    results.append(False)
+
 if not results:
     print("OK")
