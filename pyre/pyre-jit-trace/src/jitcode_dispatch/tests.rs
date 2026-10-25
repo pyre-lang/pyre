@@ -12571,7 +12571,7 @@ fn make_call_descr(
 #[derive(Clone, Copy)]
 enum SymbolicBoxStrArg {
     /// Interned object's STR (`OpKind::ConstStr` /
-    /// `StrConstDescriptor.as_unicode_object = false`). Intern by chars
+    /// `StrConstKind::Str`). Intern by chars
     /// (`WeakValueDictRepr.ll_get`); identity is the interned wrapper.
     InternedStr,
     /// Prebuilt STR constants materialize as `_utf8` storage (`OpKind::ConstStr`).

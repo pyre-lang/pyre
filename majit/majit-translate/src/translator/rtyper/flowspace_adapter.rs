@@ -4407,7 +4407,12 @@ pub fn translate_op(
             if opname == "int_between" && args.len() == 3 =>
         {
             let mut hl_args = Vec::with_capacity(args.len());
-            for (i, var) in args.iter().enumerate() {
+            for (i, arg) in args.iter().enumerate() {
+                let var = arg.as_variable().ok_or_else(|| {
+                    TyperError::message(format!(
+                        "int_between arg{i} is a Constant; expected a Variable"
+                    ))
+                })?;
                 hl_args.push(lookup_operand(value_map, var, op, &format!("arg{i}"))?);
             }
             let result = resolve_result_hlvalue(op, value_map)?;

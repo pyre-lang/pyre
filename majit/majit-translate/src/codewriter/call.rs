@@ -10387,6 +10387,24 @@ impl CallControl {
     // shared skeleton here — that would add a third analysis framework
     // duplicating `graphanalyze.rs` over the wrong graph model.
 
+    /// `call.py guess_call_kind`: `hasattr(func, 'oopspec')` → Builtin.
+    /// Harvested `recorded_oopspec` is the production mark. A graphless
+    /// HOST_ENV `rlib/jit.py` builtin (`ExtRegistryEntry`) is the same
+    /// funcobj when this CallControl has no harvest. `GraphAnalyzer.analyze`
+    /// follows a graph when the funcobj has one (`isconstant` returns
+    /// `NonConstant(False)`: cannot raise); without a graph the harvested
+    /// oopspec is that builtin, not `canraise.py analyze_external_call`'s
+    /// `getattr(fnobj, 'canraise', True)`.
+    fn is_oopspec_builtin_path(&self, path: &CallPath) -> bool {
+        if self
+            .func_effects_with_crate_alias(path)
+            .is_some_and(|f| f.recorded_oopspec().is_some())
+        {
+            return true;
+        }
+        jit_module_host_builtin(&path.segments)
+    }
+
     /// RPython: RaiseAnalyzer.analyze() — transitive can-raise analysis.
     ///
     /// canraise.py: RaiseAnalyzer(BoolGraphAnalyzer)
@@ -10410,8 +10428,11 @@ impl CallControl {
         let path = resolved.as_ref().unwrap_or(path);
         let graph = match self.function_graphs.get(path) {
             Some(g) => g,
-            // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
             None => {
+                if self.is_oopspec_builtin_path(path) {
+                    return false;
+                }
+                // `canraise.py analyze_external_call`: getattr(fnobj, 'canraise', True)
                 return self
                     .external_funcobj(path)
                     .map(|funcobj| funcobj.canraise)
@@ -10442,6 +10463,26 @@ impl CallControl {
                             if crate::codewriter::jtransform::is_jit_force_quasi_immutable_target(
                                 self, target,
                             ) =>
+                        {
+                            false
+                        }
+                        OpKind::Call { target, .. }
+                            if crate::model::fn_const_segments(target).is_some() =>
+                        {
+                            // `__fn_const` is a function item (`rewrite_op_direct_call`
+                            // rewrites it to `ConstFnAddr`), not an invocation.
+                            false
+                        }
+                        // `lloperation.py` `jit_conditional_call` is `LLOp()`
+                        // so `canraise=()`. `RaiseAnalyzer.analyze_simple_operation`
+                        // (`canraise.py`) answers False. The Call is the
+                        // interpreter-facing form `lower_graph` emits
+                        // (`oopspec jit.conditional_call`); callee effects
+                        // reach through the `we_are_jitted()`-false
+                        // `direct_call`. Do not walk a harvested residual
+                        // body (`if cond: function(*args)`).
+                        OpKind::Call { target, .. }
+                            if is_jit_conditional_call_target(target) =>
                         {
                             false
                         }
@@ -10955,6 +10996,12 @@ impl CallControl {
                         | OpKind::NewArray { .. }
                         | OpKind::NewArrayClear { .. }
                         | OpKind::NewListClear { .. } => break 'walk true,
+                        // collectanalyze.py: `LL_OPERATIONS[op.opname].canmallocgc`
+                        OpKind::UnaryOp { op, .. } | OpKind::BinOp { op, .. }
+                            if llop_canmallocgc(op) =>
+                        {
+                            break 'walk true;
+                        }
                         // The Call is the llop, not a graph to recurse into.
                         // `CollectAnalyzer.analyze_simple_operation` answers
                         // True only for `malloc` / `malloc_varsize` with
@@ -11616,6 +11663,42 @@ fn user_path_behind_majit_call_target(path: &CallPath) -> Option<CallPath> {
     let mut segments = path.segments.clone();
     *segments.last_mut()? = user.to_string();
     Some(CallPath { segments })
+}
+
+/// Interpreter-facing `oopspec("jit.conditional_call")` Call
+/// (`is_jit_conditional_call_path`). Identity is the HOST_ENV
+/// `ConditionalCallEntry` path, never a residual body graph.
+fn is_jit_conditional_call_target(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return false;
+    };
+    crate::flowspace::model::is_jit_conditional_call_path(segments)
+}
+
+/// HOST_ENV `rlib/jit.py` builtins (`ExtRegistryEntry` on `majit_rlib.jit`
+/// / crate-stripped `jit`). Production harvests `func.oopspec`; a
+/// unit-test CallControl has no harvest and still names the same
+/// funcobjs. `FunctionDesc.cachedgraph` alt_name is `name__<argtypes>`
+/// (`unspecialized_helper_name`); HOST_ENV keys the declaration.
+fn jit_module_host_builtin(segs: &[String]) -> bool {
+    if crate::flowspace::model::is_jit_conditional_call_path(segs) {
+        return true;
+    }
+    let leaf = match segs {
+        [crate_name, module, leaf] if crate_name == "majit_rlib" && module == "jit" => {
+            leaf.as_str()
+        }
+        [module, leaf] if module == "jit" => leaf.as_str(),
+        _ => return false,
+    };
+    let leaf = leaf.split("__").next().unwrap_or(leaf);
+    let leaf = crate::front::clause_spec::template_callable_leaf(leaf);
+    let host_segs = [
+        "majit_rlib".to_string(),
+        "jit".to_string(),
+        leaf.to_string(),
+    ];
+    crate::flowspace::model::host_env_callable(&host_segs).is_some()
 }
 
 /// `call.py` `guess_call_kind` rejects `rposix._get_errno` and
@@ -13457,6 +13540,28 @@ pub(crate) fn type_align(type_str: &str, raw_alloc_flavor_structs: &HashSet<Stri
     panic!("type `{type_str}` has no layout and no fields (size {size})")
 }
 
+/// `LL_OPERATIONS[opname].canraise` (`lloperation.py` / `canraise.py
+/// analyze_simple_operation`). `()` → No, `(MemoryError,)` →
+/// MemoryErrorOnly, any other non-empty tuple → Yes.
+fn llop_raise_class(opname: &str) -> Option<RaiseClass> {
+    let desc = crate::translator::rtyper::lltypesystem::lloperation::ll_operations().get(opname)?;
+    Some(if desc.canraise.is_empty() {
+        RaiseClass::No
+    } else if desc.canraise.len() == 1 && desc.canraise[0] == "MemoryError" {
+        RaiseClass::MemoryErrorOnly
+    } else {
+        RaiseClass::Yes
+    })
+}
+
+/// `LL_OPERATIONS[opname].canmallocgc` (`collectanalyze.py
+/// analyze_simple_operation`).
+fn llop_canmallocgc(opname: &str) -> bool {
+    crate::translator::rtyper::lltypesystem::lloperation::ll_operations()
+        .get(opname)
+        .is_some_and(|desc| desc.canmallocgc)
+}
+
 /// RPython: `RaiseAnalyzer.analyze_simple_operation(op)` (canraise.py).
 ///
 /// ```python
@@ -13497,18 +13602,28 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         OpKind::RawLoad { .. } | OpKind::RawStore { .. } | OpKind::RawFree { .. } => RaiseClass::No,
         // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
         OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
-        // RPython LL: int_add, int_sub, int_lt, int_and, etc → cannot raise
-        // (non-ovf, non-div arithmetic)
-        OpKind::BinOp { op, .. }
+        // `canraise.py analyze_simple_operation`: `LL_OPERATIONS[op.opname].canraise`.
+        // UnaryOp / BinOp carry the llop name (or a stripped arithmetic
+        // mnemonic). Table hit wins; unknown arithmetic keeps the
+        // non-ovf / non-div heuristic.
+        OpKind::BinOp { op, .. } => llop_raise_class(op).unwrap_or_else(|| {
             if !op.contains("div")
                 && !op.contains("mod")
                 && !op.contains("rem")
-                && !op.contains("ovf") =>
-        {
-            RaiseClass::No
-        }
-        // RPython LL: int_neg, bool_not → cannot raise
-        OpKind::UnaryOp { op, .. } if !op.contains("ovf") => RaiseClass::No,
+                && !op.contains("ovf")
+            {
+                RaiseClass::No
+            } else {
+                RaiseClass::Yes
+            }
+        }),
+        OpKind::UnaryOp { op, .. } => llop_raise_class(op).unwrap_or_else(|| {
+            if !op.contains("ovf") {
+                RaiseClass::No
+            } else {
+                RaiseClass::Yes
+            }
+        }),
         // RPython LL: same_as, cast_*, hint → cannot raise
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
@@ -13571,11 +13686,6 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         // `*_guard_value` — `jtransform.py:1632` hint handling has no raising
         // analogue.
         OpKind::Hint { .. } => RaiseClass::No,
-        // RPython LL: int_floordiv, int_mod → canraise = (ZeroDivisionError,)
-        OpKind::BinOp { .. } => RaiseClass::Yes, // div/mod/rem/ovf (others matched above)
-        // RPython LL: int_neg_ovf → canraise = (OverflowError,)
-        OpKind::UnaryOp { .. } => RaiseClass::Yes, // ovf (others matched above)
-
         // The analyzer runs over the rtyped graph, before
         // `jtransform.rewrite_op_jit_force_quasi_immutable` rewrites this
         // Call. `LL_OPERATIONS['jit_force_quasi_immutable']` has no
@@ -14134,22 +14244,40 @@ pub(crate) fn effect_graph_from_rtyped_helper(
         .block(out.returnblock)
         .inputargs
         .first()
-        .is_some_and(|ret| FunctionGraph::concretetype_of(ret) == ConcreteType::Signed)
+        .is_some_and(|ret| {
+            ret.concretetype()
+                .and_then(|t| crate::model::try_getkind(&t, true, true, true).ok())
+                == Some(ConcreteType::Signed)
+        })
     {
         out.return_type = Some("i64".into());
     }
     out
 }
 
-fn effect_value_type_of(var: &crate::flowspace::model::Variable) -> crate::model::ValueType {
+fn effect_value_type_from_concrete(kind: crate::model::ConcreteType) -> crate::model::ValueType {
     use crate::model::{ConcreteType, ValueType};
-    match FunctionGraph::concretetype_of(var) {
+    match kind {
         ConcreteType::Signed => ValueType::Int,
         ConcreteType::GcRef => ValueType::Ref(None),
         ConcreteType::Float => ValueType::Float,
         ConcreteType::Void => ValueType::Void,
         ConcreteType::Unknown => ValueType::Int,
     }
+}
+
+fn effect_value_type_from_lltype(
+    lltype: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<crate::model::ValueType> {
+    crate::model::try_getkind(lltype, true, true, true)
+        .ok()
+        .map(effect_value_type_from_concrete)
+}
+
+fn effect_value_type_of(var: &crate::flowspace::model::Variable) -> crate::model::ValueType {
+    var.concretetype()
+        .and_then(|lltype| effect_value_type_from_lltype(&lltype))
+        .unwrap_or(crate::model::ValueType::Int)
 }
 
 /// ARRAY identity for `arraydescrof_concrete`. A named `array_type_id`
@@ -14166,16 +14294,19 @@ fn effect_array_type_id(base: &crate::flowspace::model::Variable) -> Option<Stri
         Some(LowLevelType::Array(arr)) => arr.OF,
         _ => return Some("GcArray(Char)".to_string()),
     };
-    let elem = match of {
-        LowLevelType::Char => "Char",
-        LowLevelType::UniChar => "UniChar",
-        LowLevelType::Signed => "Signed",
-        LowLevelType::Unsigned => "Unsigned",
-        LowLevelType::Bool => "Bool",
-        LowLevelType::Float => "Float",
-        _ => return Some("GcArray(Char)".to_string()),
-    };
-    Some(format!("GcArray({elem})"))
+    match of {
+        LowLevelType::Char => Some("GcArray(Char)".to_string()),
+        LowLevelType::UniChar => Some("GcArray(UniChar)".to_string()),
+        LowLevelType::Signed => Some("GcArray(Signed)".to_string()),
+        LowLevelType::Unsigned => Some("GcArray(Unsigned)".to_string()),
+        LowLevelType::Bool => Some("GcArray(Bool)".to_string()),
+        LowLevelType::Float => Some("GcArray(Float)".to_string()),
+        // `rewrite_op_getinteriorfield`: ARRAY.OF is the element struct
+        // (`odictentry`). `extract_element_type_from_str` recovers that
+        // name from `GcArray({s._name})`.
+        LowLevelType::Struct(s) => Some(format!("GcArray({})", s._name)),
+        _ => Some("GcArray(Char)".to_string()),
+    }
 }
 
 fn effect_linkarg(hlv: &crate::flowspace::model::Hlvalue) -> LinkArg {
@@ -14221,7 +14352,11 @@ fn effect_materialize(
                         .unwrap_or_else(|| LowLevelType::Ptr(Box::new(ptr._TYPE.clone())));
                     let kind = match ptr._obj0_value() {
                         Ok(None) => OpKind::ConstRefNull,
-                        _ => OpKind::ConstRefAddr(ptr._hashable_identity() as i64),
+                        _ => panic!(
+                            "effect_graph_from_rtyped_helper: non-null LLPtr constant \
+                             must stay a ConstValue (effect_linkarg / emit_const); \
+                             cannot pool _hashable_identity"
+                        ),
                     };
                     (kind, lltype)
                 }
@@ -14284,6 +14419,61 @@ fn effect_owner_root(base: &crate::flowspace::model::Variable) -> Option<String>
     }
 }
 
+/// FIELD lltype of `setfield` / `getfield`: struct of `op.args[0]` plus
+/// the field name `op.args[1]`.
+fn effect_field_lltype(
+    base: &crate::flowspace::model::Variable,
+    field_name: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match base.concretetype()? {
+        LowLevelType::Ptr(ptr) => match ptr.TO {
+            PtrTarget::Struct(s) => s.getattr_field_type(field_name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// ARRAY.OF struct name for `getinteriorfield` / `setinteriorfield`
+/// (`jtransform.py rewrite_op_getinteriorfield`: `STRUCT = v_inst.concretetype.TO.OF`).
+fn effect_interior_owner(base: &crate::flowspace::model::Variable) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let of = match base.concretetype()? {
+        LowLevelType::Ptr(ptr) => match ptr.TO {
+            PtrTarget::Array(arr) => arr.OF,
+            _ => return None,
+        },
+        LowLevelType::Array(arr) => arr.OF,
+        _ => return None,
+    };
+    match of {
+        LowLevelType::Struct(s) => Some(s._name),
+        _ => None,
+    }
+}
+
+/// FIELD lltype of `setinteriorfield`: `ARRAY.OF` of `op.args[0]` plus
+/// the field name `op.args[2]`.
+fn effect_interior_field_lltype(
+    base: &crate::flowspace::model::Variable,
+    field_name: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let of = match base.concretetype()? {
+        LowLevelType::Ptr(ptr) => match ptr.TO {
+            PtrTarget::Array(arr) => arr.OF,
+            _ => return None,
+        },
+        LowLevelType::Array(arr) => arr.OF,
+        _ => return None,
+    };
+    match of {
+        LowLevelType::Struct(s) => s.getattr_field_type(field_name),
+        _ => None,
+    }
+}
+
 fn effect_malloc_owner(hlv: &crate::flowspace::model::Hlvalue) -> String {
     use crate::flowspace::model::{ConstValue, Hlvalue};
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -14323,6 +14513,26 @@ fn effect_malloc_array_type_id(hlv: &crate::flowspace::model::Hlvalue) -> Option
                     Some(format!("Array({elem})"))
                 }
                 _ => Some(lltype.short_name()),
+            },
+            _ => None,
+        },
+        Hlvalue::Variable(_) => None,
+    }
+}
+
+/// `jtransform.py rewrite_op_malloc_varsize` uses `ARRAY.OF` for the
+/// array descr; `item_ty` is that element's register kind, not the
+/// RESULT pointer's.
+fn effect_malloc_array_item_ty(
+    hlv: &crate::flowspace::model::Hlvalue,
+) -> Option<crate::model::ValueType> {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => match &**lltype {
+                LowLevelType::Array(a) => effect_value_type_from_lltype(&a.OF),
+                _ => None,
             },
             _ => None,
         },
@@ -14464,23 +14674,21 @@ fn effect_transduce_op(
         "direct_call" => {
             let callee = effect_callee_name_from_funcptr(&op.args[0]);
             let target = CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()));
-            let args: Vec<_> = op.args[1..]
-                .iter()
-                .map(|a| effect_materialize(out, block, a))
-                .collect();
+            let args: Vec<_> = op.args[1..].iter().map(effect_linkarg).collect();
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
                 OpKind::Call {
                     target,
-                    args: crate::model::call_args(args),
+                    args,
                     result_ty: effect_value_type_of(&result),
                 },
                 result,
             );
         }
         name @ ("cast_ptr_to_adr" | "cast_adr_to_ptr" | "cast_primitive" | "cast_bool_to_int"
-        | "cast_char_to_int" | "cast_int_to_char" | "cast_opaque_ptr") => {
+        | "cast_char_to_int" | "cast_int_to_char" | "cast_opaque_ptr" | "cast_pointer"
+        | "cast_int_to_uint" | "cast_uint_to_int") => {
             let operand = effect_materialize(out, block, &op.args[0]);
             let result = effect_expect_var(&op.result);
             let _ = name;
@@ -14508,23 +14716,34 @@ fn effect_transduce_op(
                 result,
             );
         }
-        name @ ("gc_id" | "gc_fq_register") => {
-            // `gc_id`: `LLOp(sideeffects=False, canmallocgc=True)` so
-            // `canraise=(MemoryError,)`. Graph-less `Call` +
-            // `mark_canmallocgc(["gc_id"])` is how CollectAnalyzer sees
-            // `canmallocgc`. `gc_fq_register`: `LLOp()` defaults
-            // (side effects, `canmallocgc=False`, `canraise=()`).
-            let args: Vec<_> = op
-                .args
-                .iter()
-                .map(|a| effect_materialize(out, block, a))
-                .collect();
+        name @ ("gc_id" | "gc_fq_register" | "debug_assert" | "gc_writebarrier") => {
+            // `canraise.py analyze_simple_operation` reads
+            // `LL_OPERATIONS[op.opname].canraise`. UnaryOp keeps that
+            // opname so `op_can_raise` / CollectAnalyzer consult
+            // `ll_operations()`. `gc_id`: `LLOp(sideeffects=False,
+            // canmallocgc=True)` so `canraise=(MemoryError,)`.
+            // `gc_fq_register`: `LLOp()` so `canraise=()`.
+            // `debug_assert`: `LLOp(tryfold=True)` so `canraise=()`.
+            // `gc_writebarrier`: `LLOp(canrun=True)` so `canraise=()`.
+            // Extra Variable operands stay materialised so they remain
+            // defined; Constant extras (the fq `SpecTag`, the assert
+            // message) are already values. The last arg is the pointer
+            // (or assert-message) operand.
+            let Some((last, rest)) = op.args.split_last() else {
+                panic!("effect_graph_from_rtyped_helper: {name} has no operand");
+            };
+            for arg in rest {
+                if matches!(arg, crate::flowspace::model::Hlvalue::Variable(_)) {
+                    let _ = effect_materialize(out, block, arg);
+                }
+            }
+            let operand = effect_materialize(out, block, last);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
-                OpKind::Call {
-                    target: CallTarget::function_path([name]),
-                    args: crate::model::call_args(args),
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
                     result_ty: effect_value_type_of(&result),
                 },
                 result,
@@ -14538,6 +14757,7 @@ fn effect_transduce_op(
                 OpKind::RawMalloc {
                     owner,
                     zero: effect_malloc_zero(&op.args[1]),
+                    length: None,
                 }
             } else {
                 OpKind::New { owner }
@@ -14546,22 +14766,24 @@ fn effect_transduce_op(
         }
         "malloc_varsize" => {
             let result = effect_expect_var(&op.result);
+            let length = effect_materialize(out, block, &op.args[2]);
             if op.args.get(1).is_some_and(effect_malloc_flavor_is_raw) {
                 out.push_op_with_result_var(
                     block,
                     OpKind::RawMalloc {
                         owner: effect_malloc_owner(&op.args[0]),
                         zero: effect_malloc_zero(&op.args[1]),
+                        length: Some(length),
                     },
                     result,
                 );
             } else {
-                let length = effect_materialize(out, block, &op.args[2]);
                 out.push_op_with_result_var(
                     block,
                     OpKind::NewArray {
                         length,
-                        item_ty: effect_value_type_of(&result),
+                        item_ty: effect_malloc_array_item_ty(&op.args[0])
+                            .unwrap_or_else(|| effect_value_type_of(&result)),
                         array_type_id: effect_malloc_array_type_id(&op.args[0]),
                     },
                     result,
@@ -14593,10 +14815,12 @@ fn effect_transduce_op(
             let field_name = effect_field_name(&op.args[1]);
             let owner_root = effect_owner_root(&base);
             let value = effect_linkarg(&op.args[2]);
-            let ty = match &op.args[2] {
-                crate::flowspace::model::Hlvalue::Variable(v) => effect_value_type_of(v),
-                crate::flowspace::model::Hlvalue::Constant(_) => ValueType::Int,
-            };
+            let ty = effect_field_lltype(&base, &field_name)
+                .and_then(|lltype| effect_value_type_from_lltype(&lltype))
+                .unwrap_or_else(|| match &op.args[2] {
+                    crate::flowspace::model::Hlvalue::Variable(v) => effect_value_type_of(v),
+                    crate::flowspace::model::Hlvalue::Constant(_) => ValueType::Int,
+                });
             out.push_op_var(
                 block,
                 OpKind::FieldWrite {
@@ -14610,8 +14834,8 @@ fn effect_transduce_op(
         }
         name @ ("int_add" | "int_sub" | "int_mul" | "int_and" | "int_or" | "int_xor"
         | "int_rshift" | "int_lshift" | "int_lt" | "int_le" | "int_eq" | "int_ne"
-        | "int_gt" | "int_ge" | "adr_add" | "char_eq" | "char_ne" | "unichar_eq"
-        | "unichar_ne") => {
+        | "int_gt" | "int_ge" | "uint_add" | "uint_and" | "uint_lshift" | "uint_rshift"
+        | "adr_add" | "char_eq" | "char_ne" | "unichar_eq" | "unichar_ne") => {
             let lhs = effect_materialize(out, block, &op.args[0]);
             let rhs = effect_materialize(out, block, &op.args[1]);
             let result = effect_expect_var(&op.result);
@@ -14629,6 +14853,94 @@ fn effect_transduce_op(
                 },
                 result,
             );
+        }
+        "getinteriorfield" => {
+            // `jtransform.py rewrite_op_getinteriorfield`: GcArray of
+            // Struct → `getinteriorfield_gc_*` with
+            // `cpu.interiorfielddescrof(ARRAY, fieldname)`.
+            // `writeanalyze.py ReadWriteAnalyzer.analyze_simple_operation`
+            // records `("readinteriorfield", TYPE, name)`.
+            let base = effect_expect_var(&op.args[0]);
+            let array_type_id = effect_array_type_id(&base);
+            let index = effect_materialize(out, block, &op.args[1]);
+            let field_name = effect_field_name(&op.args[2]);
+            let owner_root = effect_interior_owner(&base);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::InteriorFieldRead {
+                    base,
+                    index,
+                    field: FieldDescriptor::new(field_name, owner_root),
+                    item_ty: effect_value_type_of(&result),
+                    array_type_id,
+                },
+                result,
+            );
+        }
+        "setinteriorfield" => {
+            // `jtransform.py rewrite_op_setinteriorfield`:
+            // `setinteriorfield_gc_*`. `writeanalyze.py
+            // WriteAnalyzer.analyze_simple_operation` records
+            // `("interiorfield", TYPE, name)`.
+            let base = effect_expect_var(&op.args[0]);
+            let array_type_id = effect_array_type_id(&base);
+            let index = effect_materialize(out, block, &op.args[1]);
+            let field_name = effect_field_name(&op.args[2]);
+            let owner_root = effect_interior_owner(&base);
+            let value = effect_materialize(out, block, &op.args[3]);
+            let item_ty = effect_interior_field_lltype(&base, &field_name)
+                .and_then(|lltype| effect_value_type_from_lltype(&lltype))
+                .unwrap_or_else(|| match &op.args[3] {
+                    crate::flowspace::model::Hlvalue::Variable(v) => effect_value_type_of(v),
+                    crate::flowspace::model::Hlvalue::Constant(c) => c
+                        .concretetype
+                        .as_ref()
+                        .and_then(effect_value_type_from_lltype)
+                        .unwrap_or(ValueType::Int),
+                });
+            out.push_op_var(
+                block,
+                OpKind::InteriorFieldWrite {
+                    base,
+                    index,
+                    field: FieldDescriptor::new(field_name, owner_root),
+                    value,
+                    item_ty,
+                    array_type_id,
+                },
+                false,
+            );
+        }
+        "raw_memcopy" => {
+            // `lloperation.py`: `LLOp(revdb_protect=True)`.
+            // `writeanalyze.py analyze_simple_operation` does not
+            // record raw memory writes as struct/array field writes.
+            // UnaryOp keeps the llop name so RaiseAnalyzer /
+            // CollectAnalyzer consult `ll_operations()`. The dest
+            // address is `op.args[1]` (`rstr.py copy_string_to_raw`).
+            for arg in &op.args {
+                let _ = effect_materialize(out, block, arg);
+            }
+            let dest = effect_materialize(out, block, &op.args[1]);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "raw_memcopy".to_string(),
+                    operand: dest,
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        "keepalive" => {
+            // `jtransform.py rewrite_op_keepalive` renames to `-live-`.
+            // `lloperation.py`: `LLOp()` so `canraise=()`.
+            for arg in &op.args {
+                let _ = effect_materialize(out, block, arg);
+            }
+            out.push_op_var(block, OpKind::Live, false);
         }
         other => panic!("effect_graph_from_rtyped_helper: unsupported opname {other:?}"),
     }
@@ -20938,6 +21250,54 @@ mod tests {
         );
     }
 
+    /// Graphless HOST_ENV `rlib/jit.py` @oopspec builtins are Builtin,
+    /// not `analyze_external_call` default True. An unmarked graphless
+    /// path stays conservative.
+    #[test]
+    fn graphless_oopspec_builtin_cannot_raise() {
+        let cc = CallControl::new();
+        let isconstant = CallPath::from_segments(["majit_rlib", "jit", "isconstant"]);
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &isconstant,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "rlib/jit.py isconstant returns NonConstant(False)"
+        );
+        let specialized = CallPath::from_segments(["majit_rlib", "jit", "isconstant__Signed"]);
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &specialized,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "cachedgraph name__<argtypes> is the same HOST_ENV builtin"
+        );
+        let cond = CallPath::from_segments(["majit_rlib", "jit", "conditional_call3"]);
+        assert!(
+            !cc.analyze_can_raise_impl(
+                &cond,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "lloperation.py jit_conditional_call has canraise=()"
+        );
+        let other = CallPath::from_segments(["some_external"]);
+        assert!(
+            cc.analyze_can_raise_impl(
+                &other,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+                false,
+            ),
+            "unmarked graphless stays analyze_external_call default True"
+        );
+    }
+
     #[test]
     fn test_getcalldescr_extraeffect_override() {
         // When extraeffect is provided, it overrides the analyzers.
@@ -21942,10 +22302,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_op_can_raise_division() {
-        // Division ops can raise (ZeroDivisionError).
-        // RPython: LL_OPERATIONS[int_floordiv].canraise = (ZeroDivisionError,)
+    fn raise_of_binop(opname: &str) -> CanRaise {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("divider");
         let a_var = graph.alloc_value_var();
@@ -21953,7 +22310,7 @@ mod tests {
         graph.push_op_var(
             graph.startblock,
             OpKind::BinOp {
-                op: "int_floordiv".to_string(),
+                op: opname.to_string(),
                 lhs: a_var,
                 rhs: b_var,
                 result_ty: ValueType::Int,
@@ -21963,11 +22320,23 @@ mod tests {
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["divider"]);
         cc.register_function_graph(path, graph);
+        cc._canraise(
+            &CallTarget::function_path(["divider"]),
+            &mut AnalysisCache::default(),
+        )
+    }
 
-        let target = CallTarget::function_path(["divider"]);
-        let mut cache = AnalysisCache::default();
-        let result = cc._canraise(&target, &mut cache);
-        assert_eq!(result, CanRaise::Yes);
+    #[test]
+    fn test_op_can_raise_division() {
+        // `canraise.py analyze_simple_operation` reads
+        // `LL_OPERATIONS[op.opname].canraise`. `int_floordiv` is
+        // `LLOp(canfold=True)` so `canraise=()` (C-like; no
+        // ZeroDivisionError at the llop). A stripped mnemonic that is
+        // not an llop name (`div`) still uses the unknown-arithmetic
+        // heuristic.
+        assert_eq!(raise_of_binop("int_floordiv"), CanRaise::No);
+        assert_eq!(raise_of_binop("div"), CanRaise::Yes);
+        assert_eq!(raise_of_binop("int_add_ovf"), CanRaise::Yes);
     }
 
     #[test]
@@ -22684,7 +23053,9 @@ mod tests {
                 args: vec![
                     crate::model::LinkArg::from(frame_var.clone()),
                     crate::model::LinkArg::Const(Constant::new(ConstValue::byte_str("last_instr"))),
-                    crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(flags))),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(
+                        std::sync::Arc::new(flags),
+                    ))),
                 ],
                 result_ty: ValueType::Void,
             },
@@ -22698,7 +23069,7 @@ mod tests {
                     crate::model::LinkArg::from(frame_var),
                     crate::model::LinkArg::Const(Constant::new(ConstValue::byte_str("pycode"))),
                     crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(
-                        std::collections::HashMap::new(),
+                        std::sync::Arc::new(std::collections::HashMap::new()),
                     ))),
                 ],
                 result_ty: ValueType::Void,
@@ -25090,5 +25461,514 @@ mod tests {
         let effects = rw_of(&cc, &mut cache, "caller");
         assert!(!is_top(&effects));
         assert_eq!(write_fields(&effects), vec![0]);
+    }
+
+    fn rtyped_one_op(
+        name: &str,
+        opname: &str,
+        args: Vec<crate::flowspace::model::Hlvalue>,
+        result: crate::flowspace::model::Variable,
+    ) -> crate::flowspace::model::FunctionGraph {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph as FlowGraph, Hlvalue, Link, SpaceOperation,
+        };
+        let start = Block::shared(vec![]);
+        let graph =
+            FlowGraph::with_return_var(name, start.clone(), Hlvalue::Variable(result.clone()));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(result)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        graph
+    }
+
+    fn malloc_flags(flavor: &str) -> crate::flowspace::model::Hlvalue {
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let flags = std::collections::HashMap::from([(
+            ConstValue::byte_str("flavor"),
+            ConstValue::byte_str(flavor),
+        )]);
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Dict(std::sync::Arc::new(flags)),
+            LowLevelType::Void,
+        ))
+    }
+
+    fn array_ptr_lltype(
+        of: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> (
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr};
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(of)));
+        let ptr = Ptr::from_container_type(array_ll.clone()).expect("array ptr");
+        (array_ll, LowLevelType::from(ptr))
+    }
+
+    fn converted_raise(name: &str, graph: crate::flowspace::model::FunctionGraph) -> CanRaise {
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments([name]);
+        cc.register_function_graph(path, converted);
+        cc._canraise(
+            &CallTarget::function_path([name]),
+            &mut AnalysisCache::default(),
+        )
+    }
+
+    /// `canraise.py analyze_simple_operation`: `LL_OPERATIONS['gc_fq_register'].canraise == ()`.
+    #[test]
+    fn effect_graph_gc_fq_register_cannot_raise() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let obj = variable_with_lltype("obj", GCREF.clone());
+        let tag = constant_with_lltype(
+            crate::flowspace::model::ConstValue::Int(0),
+            LowLevelType::Signed,
+        );
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op(
+            "fq",
+            "gc_fq_register",
+            vec![tag, crate::flowspace::model::Hlvalue::Variable(obj)],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "gc_fq_register"
+            )),
+            "gc_fq_register stays a simple llop: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("fq", graph), CanRaise::No);
+    }
+
+    /// `canraise.py analyze_simple_operation`: `gc_id` is `canmallocgc` so
+    /// `canraise=(MemoryError,)`; `do_ignore_memory_error` suppresses it.
+    #[test]
+    fn effect_graph_gc_id_raises_only_memoryerror() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let ptr = variable_with_lltype("p", GCREF.clone());
+        let result = variable_with_lltype("id", LowLevelType::Signed);
+        let graph = rtyped_one_op(
+            "gid",
+            "gc_id",
+            vec![crate::flowspace::model::Hlvalue::Variable(ptr)],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["gid"]);
+        cc.register_function_graph(path.clone(), converted);
+        assert_eq!(
+            cc._canraise(
+                &CallTarget::function_path(["gid"]),
+                &mut AnalysisCache::default()
+            ),
+            CanRaise::MemoryErrorOnly
+        );
+        assert!(cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            false
+        ));
+        assert!(!cc.analyze_can_raise_impl(
+            &path,
+            &mut CallTracker::new(),
+            &mut new_analyzed_calls(),
+            true
+        ));
+    }
+
+    /// `jtransform.py rewrite_op_malloc_varsize` takes `ARRAY.OF` for the
+    /// array descr; Char items are the int bank, GC pointers the ref bank.
+    #[test]
+    fn effect_graph_malloc_varsize_item_ty_from_array_of() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use crate::translator::rtyper::rmodel::lowlevel_type_const;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let length = variable_with_lltype("n", LowLevelType::Signed);
+        let (char_array, char_ptr) = array_ptr_lltype(LowLevelType::Char);
+        let char_result = variable_with_lltype("chars", char_ptr);
+        let char_graph = rtyped_one_op(
+            "mv_char",
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(char_array),
+                malloc_flags("gc"),
+                crate::flowspace::model::Hlvalue::Variable(length.clone()),
+            ],
+            char_result,
+        );
+        let char_converted = effect_graph_from_rtyped_helper(&char_graph);
+        let char_ty = char_converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::NewArray { item_ty, .. } => Some(item_ty.clone()),
+                _ => None,
+            });
+        assert_eq!(
+            char_ty,
+            Some(ValueType::Int),
+            "ARRAY.OF Char is the int bank"
+        );
+
+        let (ref_array, ref_ptr) = array_ptr_lltype(GCREF.clone());
+        let ref_result = variable_with_lltype("ptrs", ref_ptr);
+        let ref_graph = rtyped_one_op(
+            "mv_ref",
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(ref_array),
+                malloc_flags("gc"),
+                crate::flowspace::model::Hlvalue::Variable(length),
+            ],
+            ref_result,
+        );
+        let ref_converted = effect_graph_from_rtyped_helper(&ref_graph);
+        let ref_ty = ref_converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::NewArray { item_ty, .. } => Some(item_ty.clone()),
+                _ => None,
+            });
+        assert_eq!(
+            ref_ty,
+            Some(ValueType::Ref(None)),
+            "ARRAY.OF GCREF is the ref bank"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_malloc_varsize` keeps `op.args[2]` as the
+    /// length of `raw_malloc_varsize`.
+    #[test]
+    fn effect_graph_raw_malloc_varsize_keeps_length() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rmodel::lowlevel_type_const;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let length = variable_with_lltype("n", LowLevelType::Signed);
+        let (array_ll, ptr_ll) = array_ptr_lltype(LowLevelType::Char);
+        let result = variable_with_lltype("buf", ptr_ll);
+        let graph = rtyped_one_op(
+            "raw_mv",
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(array_ll),
+                malloc_flags("raw"),
+                crate::flowspace::model::Hlvalue::Variable(length.clone()),
+            ],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let kept = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::RawMalloc {
+                    length: Some(n), ..
+                } => Some(n.clone()),
+                _ => None,
+            });
+        assert_eq!(
+            kept.as_ref(),
+            Some(&length),
+            "raw malloc_varsize keeps length"
+        );
+    }
+
+    /// `setfield` `ty` is the FIELD lltype, including a Constant pointer or float.
+    #[test]
+    fn effect_graph_setfield_ty_from_field_lltype() {
+        use crate::flowspace::model::{ConstValue, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::gc(
+            "S",
+            vec![
+                ("p".to_string(), GCREF.clone()),
+                ("f".to_string(), LowLevelType::Float),
+            ],
+        );
+        let base_ty = LowLevelType::from(
+            Ptr::from_container_type(LowLevelType::Struct(Box::new(st))).expect("struct ptr"),
+        );
+        let base = variable_with_lltype("s", base_ty);
+        let void = variable_with_lltype("v", LowLevelType::Void);
+        let p_name = constant_with_lltype(ConstValue::byte_str("p"), LowLevelType::Void);
+        let f_name = constant_with_lltype(ConstValue::byte_str("f"), LowLevelType::Void);
+        let null = constant_with_lltype(ConstValue::None, GCREF.clone());
+        let fl = constant_with_lltype(ConstValue::Float(1.0f64.to_bits()), LowLevelType::Float);
+
+        let ptr_graph = rtyped_one_op(
+            "sf_p",
+            "setfield",
+            vec![Hlvalue::Variable(base.clone()), p_name, null],
+            void.clone(),
+        );
+        let ptr_converted = effect_graph_from_rtyped_helper(&ptr_graph);
+        let ptr_ty = ptr_converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::FieldWrite { ty, field, .. } if field.name == "p" => Some(ty.clone()),
+                _ => None,
+            });
+        assert_eq!(ptr_ty, Some(ValueType::Ref(None)), "pointer field is Ref");
+
+        let float_graph = rtyped_one_op(
+            "sf_f",
+            "setfield",
+            vec![Hlvalue::Variable(base), f_name, fl],
+            void,
+        );
+        let float_converted = effect_graph_from_rtyped_helper(&float_graph);
+        let float_ty = float_converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::FieldWrite { ty, field, .. } if field.name == "f" => Some(ty.clone()),
+                _ => None,
+            });
+        assert_eq!(float_ty, Some(ValueType::Float), "float field is Float");
+    }
+
+    /// `jtransform.py rewrite_op_getinteriorfield`: GcArray of Struct is
+    /// `InteriorFieldRead` with ARRAY.OF as the field owner.
+    #[test]
+    fn effect_graph_getinteriorfield_is_interior_field_read() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::new(
+            "odictentry",
+            vec![("key".to_string(), LowLevelType::Signed)],
+        );
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(st)))));
+        let base_ty = LowLevelType::from(Ptr::from_container_type(array_ll).expect("array ptr"));
+        let base = variable_with_lltype("entries", base_ty);
+        let index = variable_with_lltype("i", LowLevelType::Signed);
+        let field = constant_with_lltype(
+            crate::flowspace::model::ConstValue::byte_str("key"),
+            LowLevelType::Void,
+        );
+        let result = variable_with_lltype("k", LowLevelType::Signed);
+        let graph = rtyped_one_op(
+            "gif",
+            "getinteriorfield",
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base.clone()),
+                crate::flowspace::model::Hlvalue::Variable(index.clone()),
+                field,
+            ],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let found = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::InteriorFieldRead {
+                    field,
+                    array_type_id,
+                    index: idx,
+                    ..
+                } => Some((
+                    field.name.clone(),
+                    field.owner_root.clone(),
+                    array_type_id.clone(),
+                    idx.clone(),
+                )),
+                _ => None,
+            });
+        assert_eq!(
+            found,
+            Some((
+                "key".to_string(),
+                Some("odictentry".to_string()),
+                Some("GcArray(odictentry)".to_string()),
+                index,
+            )),
+            "getinteriorfield: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `writeanalyze.py WriteAnalyzer.analyze_simple_operation`:
+    /// `setinteriorfield` is an interior write; Constant values are
+    /// materialised into a Variable.
+    #[test]
+    fn effect_graph_setinteriorfield_is_interior_field_write() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::new(
+            "odictentry",
+            vec![("f_valid".to_string(), LowLevelType::Bool)],
+        );
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(st)))));
+        let base_ty = LowLevelType::from(Ptr::from_container_type(array_ll).expect("array ptr"));
+        let base = variable_with_lltype("entries", base_ty);
+        let index = variable_with_lltype("i", LowLevelType::Signed);
+        let field = constant_with_lltype(
+            crate::flowspace::model::ConstValue::byte_str("f_valid"),
+            LowLevelType::Void,
+        );
+        let value = constant_with_lltype(
+            crate::flowspace::model::ConstValue::Bool(true),
+            LowLevelType::Bool,
+        );
+        let void = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op(
+            "sif",
+            "setinteriorfield",
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                crate::flowspace::model::Hlvalue::Variable(index),
+                field,
+                value,
+            ],
+            void,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let found = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::InteriorFieldWrite {
+                    field,
+                    array_type_id,
+                    item_ty,
+                    ..
+                } => Some((
+                    field.name.clone(),
+                    field.owner_root.clone(),
+                    array_type_id.clone(),
+                    item_ty.clone(),
+                )),
+                _ => None,
+            });
+        assert_eq!(
+            found,
+            Some((
+                "f_valid".to_string(),
+                Some("odictentry".to_string()),
+                Some("GcArray(odictentry)".to_string()),
+                ValueType::Int,
+            )),
+            "setinteriorfield: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `lloperation.py`: `raw_memcopy` is `LLOp(revdb_protect=True)`;
+    /// UnaryOp keeps the llop name so analyzers consult `ll_operations()`.
+    #[test]
+    fn effect_graph_raw_memcopy_keeps_opname() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let src = variable_with_lltype("src", LowLevelType::Address);
+        let dest = variable_with_lltype("dst", LowLevelType::Address);
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op(
+            "rmc",
+            "raw_memcopy",
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(src),
+                crate::flowspace::model::Hlvalue::Variable(dest.clone()),
+                crate::flowspace::model::Hlvalue::Variable(n),
+            ],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "raw_memcopy" && operand == &dest
+            )),
+            "raw_memcopy: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("rmc", graph), CanRaise::No);
+    }
+
+    /// `jtransform.py rewrite_op_keepalive` emits `-live-`.
+    #[test]
+    fn effect_graph_keepalive_is_live() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let src = variable_with_lltype("src", LowLevelType::Address);
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op(
+            "ka",
+            "keepalive",
+            vec![crate::flowspace::model::Hlvalue::Variable(src)],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::Live)),
+            "keepalive: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("ka", graph), CanRaise::No);
+    }
+
+    /// `canraise.py analyze_simple_operation`: `LL_OPERATIONS['debug_assert'].canraise == ()`.
+    #[test]
+    fn effect_graph_debug_assert_cannot_raise() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let cond = variable_with_lltype("c", LowLevelType::Bool);
+        let msg = constant_with_lltype(
+            crate::flowspace::model::ConstValue::byte_str("assertion failed"),
+            LowLevelType::Void,
+        );
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op(
+            "da",
+            "debug_assert",
+            vec![crate::flowspace::model::Hlvalue::Variable(cond), msg],
+            result,
+        );
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "debug_assert"
+            )),
+            "debug_assert: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(converted_raise("da", graph), CanRaise::No);
     }
 }

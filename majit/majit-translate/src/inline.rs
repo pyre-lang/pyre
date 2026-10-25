@@ -681,9 +681,14 @@ pub(crate) fn remap_op_kind(
             owner: owner.clone(),
             vtable: *vtable,
         },
-        OpKind::RawMalloc { owner, zero } => OpKind::RawMalloc {
+        OpKind::RawMalloc {
+            owner,
+            zero,
+            length,
+        } => OpKind::RawMalloc {
             owner: owner.clone(),
             zero: *zero,
+            length: length.as_ref().map(remap_var),
         },
         OpKind::RawFree { ptr } => OpKind::RawFree {
             ptr: remap_var(ptr),
@@ -1155,7 +1160,7 @@ pub(crate) fn remap_op_kind(
         },
         OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
             opname: opname.clone(),
-            args: args.iter().map(&remap_var).collect(),
+            args: args.iter().map(|a| a.map_value(&remap_var)).collect(),
         },
         OpKind::LoadStatic {
             segments,
@@ -1209,10 +1214,10 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
-        | OpKind::NewWithVtable { .. }
-        | OpKind::RawMalloc { .. } => {
+        | OpKind::NewWithVtable { .. } => {
             vec![]
         }
+        OpKind::RawMalloc { length, .. } => length.iter().map(clone_var).collect(),
         OpKind::RawFree { ptr } => vec![clone_var(ptr)],
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
         OpKind::NewList { args } => args.iter().map(clone_var).collect(),
@@ -1226,7 +1231,10 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         // descriptors, not values.
         OpKind::NewListClear { length, .. } => vec![clone_var(length)],
         OpKind::GetSlice { args } => args.iter().map(clone_var).collect(),
-        OpKind::LoweredBlackholeOp { args, .. } => args.iter().map(clone_var).collect(),
+        OpKind::LoweredBlackholeOp { args, .. } => args
+            .iter()
+            .filter_map(|a| a.as_variable().map(clone_var))
+            .collect(),
         OpKind::VableForce { base } => vec![clone_var(base)],
         OpKind::Hint { value, .. } => vec![clone_var(value)],
         OpKind::JitMergePoint {

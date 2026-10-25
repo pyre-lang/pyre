@@ -4671,6 +4671,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "majit_rlib::ll_raw_malloc_fixedsize_zero",
         majit_rlib::rffi::ll_raw_malloc_fixedsize_zero,
     );
+    cpa3!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_varsize",
+        "majit_rlib::ll_raw_malloc_varsize",
+        majit_rlib::rffi::ll_raw_malloc_varsize,
+    );
+    cpa3!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_varsize_zero",
+        "majit_rlib::ll_raw_malloc_varsize_zero",
+        majit_rlib::rffi::ll_raw_malloc_varsize_zero,
+    );
     cpa1!(
         &mut entries,
         "majit_rlib::rffi::ll_raw_free",

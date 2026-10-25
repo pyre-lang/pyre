@@ -35,7 +35,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use majit_jitcode::jitcode::{ConstIRelocKind, JitCode};
+use majit_jitcode::jitcode::{
+    ConstIRelocKind, JitCode, StrConstDescriptor, StrConstKind, unicode_const_cells,
+};
 
 /// Path recorded for a `symbolic_fnaddr_for_path` / `symbolic_fnaddr_for_target`
 /// hash. The codewriter's registry lives in the build-script process; this is
@@ -634,19 +636,88 @@ const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
 /// Materialize one immortal string constant.
 ///
-/// `as_unicode_object` is the `box_str_constant` result — a `W_UnicodeObject`
-/// the residual `w_name` ABI passes as one Ref. Otherwise the slot is rstr
-/// `Ptr(STR)` (`CONST_STR_CACHE`, `BaseLLStringRepr.convert_const` /
-/// [`pyre_object::unicodeobject::prebuilt_str_storage`]): `bh_strlen` /
-/// `bh_strgetitem` read that payload.
-fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_object: bool) -> i64 {
-    if as_unicode_object {
-        let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
-            .expect("prebuilt STR constant bytes are not valid WTF-8");
-        pyre_object::unicodeobject::box_str_constant(wtf8) as i64
-    } else {
-        pyre_object::unicodeobject::prebuilt_str_storage_bytes(bytes) as i64
+/// [`StrConstKind::UnicodeObject`] is the `box_str_constant` result — a
+/// `W_UnicodeObject` the residual `w_name` ABI passes as one Ref.
+/// [`StrConstKind::Str`] is rstr `Ptr(STR)` (`StringRepr.convert_const`):
+/// `bh_strlen` / `bh_strgetitem` read that payload.
+/// [`StrConstKind::Unicode`] is rstr `Ptr(UNICODE)` (`UnicodeRepr.lowleveltype`):
+/// `unicodelen` / `unicodegetitem` / `ll_find_char_unicode` read UCS-4 cells
+/// through `unicode_as_unichars`.
+fn materialize_prebuilt_str(desc: &StrConstDescriptor) -> i64 {
+    match desc.kind {
+        StrConstKind::Unicode => materialize_prebuilt_unicode(&desc.bytes, desc.precomputed_hash),
+        StrConstKind::Str => {
+            // `BaseLLStringRepr.convert_const` copies each `Char` into STR
+            // storage. Without `value._obj.container` identity the block is
+            // the `CONST_STR_CACHE` entry for these chars
+            // ([`pyre_object::unicodeobject::prebuilt_str_storage_bytes`]);
+            // a descriptor with identity gets its own block. Either way the
+            // hash is `ll_strhash` over the chars.
+            if desc.container_id.is_none() {
+                pyre_object::unicodeobject::prebuilt_str_storage_bytes(&desc.bytes) as i64
+            } else {
+                let payload = pyre_object::unicodeobject::alloc_utf8_payload(&desc.bytes, false);
+                // `p.hash = 0; self.ll.ll_strhash(p)`: the payload comes back with a
+                // zero hash and `ll_strhash` precomputes it over the chars.
+                let _ = pyre_object::lowlevel_string::ll_strhash(payload);
+                payload as i64
+            }
+        }
+        StrConstKind::UnicodeObject => {
+            let wtf8 = rustpython_wtf8::Wtf8::from_bytes(&desc.bytes)
+                .expect("prebuilt UnicodeObject constant bytes are not valid WTF-8");
+            if desc.container_id.is_some() {
+                pyre_object::unicodeobject::w_str_from_wtf8_immortal(wtf8.to_owned()) as i64
+            } else {
+                pyre_object::unicodeobject::box_str_constant(wtf8) as i64
+            }
+        }
     }
+}
+
+/// Immortal rstr `Ptr(UNICODE)` (`bh_newunicode` / `unicode_as_unichars`
+/// layout: `hash` @0, `length` @one word, UCS-4 `chars` after the header).
+/// Uses `alloc_varsize_with_gc_header_immortal`, the same prebuilt route
+/// as STR (`alloc_raw_utf8_payload`) and empty-class instances.
+fn materialize_prebuilt_unicode(bytes: &[u8], precomputed_hash: i64) -> i64 {
+    let cells = unicode_const_cells(bytes);
+    let n = cells.len();
+    let items = n
+        .checked_mul(std::mem::size_of::<u32>())
+        .expect("Ptr(UNICODE) chars overflow");
+    let total = pyre_object::lowlevel_string::LOWLEVEL_UNICODE_BASE_SIZE
+        .checked_add(items)
+        .expect("Ptr(UNICODE) block overflow");
+    let tid = pyre_object::lowlevel_string::lowlevel_unicode_gc_type_id();
+    let ptr = majit_gc::header::alloc_varsize_with_gc_header_immortal(total, tid);
+    assert!(
+        !ptr.is_null(),
+        "materialize_prebuilt_unicode: immortal allocation failed"
+    );
+    unsafe {
+        ptr.cast::<isize>().write(precomputed_hash as isize);
+        ptr.add(pyre_object::lowlevel_string::LOWLEVEL_STRING_LEN_OFFSET)
+            .cast::<usize>()
+            .write(n);
+        std::ptr::copy_nonoverlapping(
+            cells.as_ptr(),
+            ptr.add(pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET)
+                .cast::<u32>(),
+            n,
+        );
+    }
+    ptr as i64
+}
+
+/// Intern key matches `assembler.py Assembler.emit_const`: a descriptor
+/// that carries `value._obj.container` identity is keyed by
+/// `(container_id, kind)` so two containers with equal bytes stay two
+/// blocks. Descriptors without identity (`ConstInternedStr`) keep the
+/// `(bytes, kind)` key.
+#[derive(Hash, Eq, PartialEq)]
+enum StrConstInternKey {
+    Container { id: u64, kind: StrConstKind },
+    Bytes { bytes: Vec<u8>, kind: StrConstKind },
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
@@ -659,14 +730,14 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_obj
 /// consumer can observe the sentinel as a forged GCREF.
 ///
 /// Identical literals share one immortal block across the whole table, the
-/// runtime analog of the assembler's per-jitcode dedup.  `as_unicode_object`
-/// false is `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`); true is
-/// `box_str_constant`'s process-wide `WEAK_INTERN`.  `interned` is only a
-/// local fast path over that: [`materialize_prebuilt_str`] resolves through
-/// those process-wide stores, so the one-block identity holds across calls
-/// even though entries are materialized one jitcode at a time.
+/// runtime analog of the assembler's per-jitcode dedup. `StrConstKind::Str`
+/// without identity is `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`);
+/// `StrConstKind::UnicodeObject` without identity is `box_str_constant`'s
+/// process-wide `WEAK_INTERN`. `INTERNED` is process-wide because the lazy
+/// per-jitcode loader calls this once per entry.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
-    let mut interned: HashMap<(Vec<u8>, bool), i64> = HashMap::new();
+    static INTERNED: LazyLock<std::sync::Mutex<HashMap<StrConstInternKey, i64>>> =
+        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
     for arc in jitcodes.iter_mut() {
         // Body-less placeholder shells, and bodies with no deferred strings
         // (the common case — only cutover string literals record any), need
@@ -681,15 +752,23 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
         let body = jc.body_mut();
         for i in 0..body.str_consts.len() {
             let idx = body.str_consts[i].constants_r_index;
-            let hash = body.str_consts[i].precomputed_hash;
-            let as_unicode_object = body.str_consts[i].as_unicode_object;
             let addr = {
-                let bytes = &body.str_consts[i].bytes;
-                let key = (bytes.clone(), as_unicode_object);
+                let desc = &body.str_consts[i];
+                let key = match desc.container_id {
+                    Some(id) => StrConstInternKey::Container {
+                        id,
+                        kind: desc.kind,
+                    },
+                    None => StrConstInternKey::Bytes {
+                        bytes: desc.bytes.clone(),
+                        kind: desc.kind,
+                    },
+                };
+                let mut interned = INTERNED.lock().unwrap();
                 if let Some(&a) = interned.get(&key) {
                     a
                 } else {
-                    let a = materialize_prebuilt_str(&key.0, hash, as_unicode_object);
+                    let a = materialize_prebuilt_str(desc);
                     interned.insert(key, a);
                     a
                 }
@@ -1131,7 +1210,10 @@ fn item_is_object_pointer(item: &str) -> bool {
 mod tests {
     use super::*;
     use majit_jitcode::codewriter::assembler::STR_CONST_SENTINEL_BASE;
-    use majit_jitcode::jitcode::{ConstIRelocKind, JitCode, JitCodeBody, StrConstDescriptor};
+    use majit_jitcode::jitcode::{
+        ConstIRelocKind, JitCode, JitCodeBody, StrConstDescriptor, StrConstKind,
+        unicode_const_bytes,
+    };
 
     fn sentinel(ordinal: i64) -> i64 {
         STR_CONST_SENTINEL_BASE | ordinal
@@ -1189,7 +1271,8 @@ mod tests {
             constants_r_index: 0,
             bytes: b"hello".to_vec(),
             precomputed_hash: 0x1234_5678,
-            as_unicode_object: false,
+            kind: StrConstKind::Str,
+            container_id: None,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -1210,13 +1293,53 @@ mod tests {
         assert_eq!(got, b"hello");
     }
 
+    /// `BaseLLStringRepr.convert_const` stores arbitrary `Char` cells; a
+    /// lone `0xff` is a valid STR payload with or without a container id, and
+    /// its hash is `ll_strhash` over those chars.
+    #[test]
+    fn materialize_str_consts_str_kind_preserves_arbitrary_char_bytes() {
+        use majit_ir::GcRef;
+        use majit_metainterp::cpu::Cpu;
+
+        let bytes = vec![b'a', 0xff, b'b'];
+        let hash = 0x55aa_i64;
+        let expected_hash = {
+            let p = pyre_object::unicodeobject::alloc_utf8_payload(&bytes, false);
+            pyre_object::lowlevel_string::ll_strhash(p) as i64
+        };
+        for container_id in [None, Some(0xC0FFEE_u64)] {
+            let descs = vec![StrConstDescriptor {
+                constants_r_index: 0,
+                bytes: bytes.clone(),
+                precomputed_hash: hash,
+                kind: StrConstKind::Str,
+                container_id,
+            }];
+            let mut jcs = vec![jitcode_with_str_consts(descs)];
+            materialize_str_consts(&mut jcs);
+            let addr = jcs[0].body().constants_r[0].get();
+            let cpu = crate::pyre_cpu::PyreCpu::new();
+            assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(3));
+            let got: Vec<u8> = (0..3)
+                .map(|i| cpu.bh_strgetitem(GcRef(addr as usize), i).unwrap() as u8)
+                .collect();
+            assert_eq!(got, bytes);
+            let got_hash = unsafe { *(addr as *const isize) } as i64;
+            assert_eq!(
+                got_hash, expected_hash,
+                "STR constant hash is ll_strhash over its chars"
+            );
+        }
+    }
+
     #[test]
     fn materialize_str_consts_interns_identical_bytes_across_jitcodes() {
         let desc = || StrConstDescriptor {
             constants_r_index: 0,
             bytes: b"x".to_vec(),
             precomputed_hash: 7,
-            as_unicode_object: false,
+            kind: StrConstKind::Str,
+            container_id: None,
         };
         let mut jcs = vec![
             jitcode_with_str_consts(vec![desc()]),
@@ -1243,7 +1366,8 @@ mod tests {
                 constants_r_index: 0,
                 bytes: b"y".to_vec(),
                 precomputed_hash: 9,
-                as_unicode_object: false,
+                kind: StrConstKind::Str,
+                container_id: None,
             };
             let mut first = vec![jitcode_with_str_consts(vec![desc()])];
             let mut second = vec![jitcode_with_str_consts(vec![desc()])];
@@ -1378,13 +1502,79 @@ mod tests {
             constants_r_index: 0,
             bytes: Vec::new(),
             precomputed_hash: -1,
-            as_unicode_object: false,
+            kind: StrConstKind::Str,
+            container_id: None,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
         let cpu = crate::pyre_cpu::PyreCpu::new();
         assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(0));
+    }
+
+    /// `unicode_as_unichars` layout: `hash` @0, `length` @one word, UCS-4
+    /// `chars` after the header (`rstr.py UNICODE`, `bh_newunicode`).
+    fn unicode_as_unichars_cells(addr: i64) -> &'static [u32] {
+        let len = unsafe {
+            *((addr as usize + pyre_object::lowlevel_string::LOWLEVEL_STRING_LEN_OFFSET)
+                as *const usize)
+        };
+        unsafe {
+            std::slice::from_raw_parts(
+                (addr as usize + pyre_object::lowlevel_string::LOWLEVEL_STRING_CHARS_OFFSET)
+                    as *const u32,
+                len,
+            )
+        }
+    }
+
+    #[test]
+    fn materialize_str_consts_unicode_u0100_and_u1f600() {
+        let cells = [0x0100u32, 0x1F600];
+        let hash = 0x1111_2222_3333_i64;
+        let descs = vec![StrConstDescriptor {
+            constants_r_index: 0,
+            bytes: unicode_const_bytes(&cells),
+            precomputed_hash: hash,
+            kind: StrConstKind::Unicode,
+            container_id: None,
+        }];
+        let mut jcs = vec![jitcode_with_str_consts(descs)];
+        materialize_str_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_ne!(addr, sentinel(0), "sentinel must be overwritten");
+        assert_eq!((addr as u64) & SENTINEL_HIGH_MASK, 0);
+        assert_eq!(unicode_as_unichars_cells(addr), &cells);
+        let got_hash = unsafe { *(addr as *const isize) } as i64;
+        assert_eq!(got_hash, hash);
+    }
+
+    #[test]
+    fn materialize_str_consts_keys_by_container_identity() {
+        let bytes = b"same-bytes".to_vec();
+        let desc = |constants_r_index, container_id| StrConstDescriptor {
+            constants_r_index,
+            bytes: bytes.clone(),
+            precomputed_hash: 11,
+            kind: StrConstKind::Str,
+            container_id,
+        };
+        let mut jcs = vec![jitcode_with_str_consts(vec![
+            desc(0, Some(0xA11CE_0001)),
+            desc(1, Some(0xA11CE_0002)),
+            desc(2, Some(0xA11CE_0001)),
+        ])];
+        materialize_str_consts(&mut jcs);
+        let a0 = jcs[0].body().constants_r[0].get();
+        let a1 = jcs[0].body().constants_r[1].get();
+        let a2 = jcs[0].body().constants_r[2].get();
+        assert_ne!(
+            a0, a1,
+            "equal bytes with different container ids must be distinct blocks"
+        );
+        assert_eq!(a0, a2, "equal container ids must share one block");
+        assert_ne!(a0, sentinel(0));
+        assert_ne!(a1, sentinel(1));
     }
 
     #[test]

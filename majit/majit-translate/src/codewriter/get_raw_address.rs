@@ -28,8 +28,7 @@ use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType}
 use crate::parse::CallPath;
 use crate::runtime_names::shims;
 use crate::translator::rtyper::lltypesystem::rffi::{
-    build_get_raw_address_buf_from_string_helper_graph,
-    build_ll_get_raw_address_of_string_helper_graph,
+    build_get_raw_address_buf_from_string_family, build_ll_get_raw_address_of_string_helper_graph,
 };
 
 /// Rtyper helper name (`lowlevel_helper_function_with_builder`).
@@ -86,10 +85,10 @@ fn register(cc: &mut CallControl) {
         "majit_gc",
         "gc_move_out_of_nursery",
     ]));
-    // `gc_id` (`lloperation.py`) is `canmallocgc`; `ll_dict_setitem`
-    // resizes the entries array (`rordereddict.py`).
+    // `gc_id` (`lloperation.py`) is `canmallocgc`. `ll_dict_setitem`
+    // resizes through its helper graph (`rordereddict.py`); CollectAnalyzer
+    // follows that `direct_call` once the callee graph is registered.
     cc.mark_canmallocgc(CallPath::from_segments(["gc_id"]));
-    cc.mark_canmallocgc(CallPath::from_segments(["ll_dict_setitem"]));
     register_buf_effect_graph(cc);
     register_residual_graph(cc, NATIVE_LEAF);
     register_residual_graph(cc, LL_GET_RAW_ADDRESS_OF_STRING);
@@ -112,17 +111,43 @@ fn bind_fnaddr(cc: &mut CallControl, dest_leaf: &str, src_leaf: &str) {
 /// a candidate: the only caller is the refused `get_raw_address_of_string`
 /// graph. Register the rtyped body (`gc_id`, `ll_dict_getitem` with a
 /// KeyError miss, `str2charp`, `ll_dict_setitem`, `cast_opaque_ptr`,
-/// `gc_fq_register`) for `getcalldescr` analyzers without a tracing
-/// prohibition and without `add_candidate_graph_if_look_inside`.
+/// `gc_fq_register`) and every collected callee graph
+/// (`copy_string_to_raw`, `ll_dict_getitem`, `ll_dict_setitem`, and
+/// the lookup/resize helpers they call) for `getcalldescr` analyzers
+/// without a tracing prohibition and without
+/// `add_candidate_graph_if_look_inside`.
+const COPY_STRING_TO_RAW_OOPSPEC: &str =
+    "stroruni.copy_string_to_raw(src, ptrdst, srcstart, length)";
+
 fn register_buf_effect_graph(cc: &mut CallControl) {
     let path = CallPath::from_segments([BUF_LEAF]);
     if cc.has_function_graph(&path) {
         return;
     }
-    let py = build_get_raw_address_buf_from_string_helper_graph(BUF_LEAF)
+    let (py, callees) = build_get_raw_address_buf_from_string_family(BUF_LEAF)
         .expect("_get_raw_address_buf_from_string helper graph");
     let graph = effect_graph_from_rtyped_helper(&py.graph.borrow());
     cc.register_function_graph(path, graph);
+    for (name, gref) in callees {
+        let callee_path = CallPath::from_segments([name.as_str()]);
+        if name == "copy_string_to_raw" {
+            cc.mark_oopspec(callee_path.clone(), COPY_STRING_TO_RAW_OOPSPEC.to_string());
+            cc.mark_oopspec_argnames(
+                callee_path.clone(),
+                vec![
+                    "src".to_string(),
+                    "ptrdst".to_string(),
+                    "srcstart".to_string(),
+                    "length".to_string(),
+                ],
+            );
+        }
+        if cc.has_function_graph(&callee_path) {
+            continue;
+        }
+        let callee_graph = effect_graph_from_rtyped_helper(&gref.borrow());
+        cc.register_function_graph(callee_path, callee_graph);
+    }
 }
 
 fn register_residual_graph(cc: &mut CallControl, name: &str) {
@@ -392,6 +417,120 @@ mod tests {
                 _ => false,
             }),
             "str2charp call/malloc: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn copy_string_to_raw_oopspec_and_convertible_callees_are_registered() {
+        let cc = mint();
+        let target = CallTarget::function_path(["copy_string_to_raw"]);
+        assert_eq!(
+            cc.get_oopspec(&target).as_deref(),
+            Some(COPY_STRING_TO_RAW_OOPSPEC)
+        );
+        assert!(
+            cc.has_function_graph(&CallPath::from_segments(["copy_string_to_raw"])),
+            "copy_string_to_raw graph is converted and registered"
+        );
+        assert!(
+            cc.has_function_graph(&CallPath::from_segments(["str2charp"])),
+            "str2charp graph is convertible and registered"
+        );
+        assert!(
+            cc.has_function_graph(&CallPath::from_segments(["ll_dict_getitem"])),
+            "ll_dict_getitem graph is convertible and registered"
+        );
+        assert!(
+            cc.has_function_graph(&CallPath::from_segments(["ll_dict_setitem"])),
+            "ll_dict_setitem graph is convertible and registered"
+        );
+    }
+
+    /// `getcalldescr` (`call.py`) walks `copy_string_to_raw`,
+    /// `ll_dict_getitem`, and `ll_dict_setitem`. Dict setitem writes
+    /// (`_ll_dict_setitem_lookup_done`: `setfield resize_counter`,
+    /// `setinteriorfield` key/value/f_valid) become write descriptors;
+    /// interior writes also record the containing array
+    /// (`effectinfo.py` extraef).
+    #[test]
+    fn get_raw_address_buf_from_string_walks_copy_and_dict_graphs() {
+        use majit_ir::descr::ExtraEffect;
+        let cc = mint();
+        for name in [
+            "copy_string_to_raw",
+            "ll_dict_getitem",
+            "ll_dict_setitem",
+            "_ll_dict_setitem_lookup_done",
+        ] {
+            assert!(
+                cc.has_function_graph(&CallPath::from_segments([name])),
+                "missing converted graph {name}"
+            );
+        }
+
+        let copy = cc
+            .function_graphs()
+            .get(&CallPath::from_segments(["copy_string_to_raw"]))
+            .expect("copy_string_to_raw");
+        assert!(
+            copy.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "raw_memcopy"
+            )),
+            "copy_string_to_raw raw_memcopy"
+        );
+        assert!(
+            copy.iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::Live)),
+            "copy_string_to_raw keepalive"
+        );
+
+        let mut interior_writes = std::collections::BTreeSet::new();
+        for (_, graph) in cc.function_graphs().iter() {
+            for (_, op) in graph.iter_block_ops() {
+                if let OpKind::InteriorFieldWrite { field, .. } = &op.kind {
+                    interior_writes.insert(field.name.clone());
+                }
+            }
+        }
+        assert!(
+            interior_writes.contains("key")
+                && interior_writes.contains("value")
+                && interior_writes.contains("f_valid"),
+            "dict setitem interior writes: {interior_writes:?}"
+        );
+
+        let descr = calldescr(&cc, BUF_LEAF);
+        assert_eq!(descr.extra_info.extraeffect, ExtraEffect::CanRaise);
+        assert!(descr.extra_info.can_collect);
+        assert!(
+            descr
+                .extra_info
+                ._write_descrs_arrays
+                .as_ref()
+                .is_some_and(|ds| !ds.is_empty()),
+            "setitem interior writes are array writes: {:?}",
+            descr
+                .extra_info
+                ._write_descrs_arrays
+                .as_ref()
+                .map(|ds| ds.len())
+        );
+        assert!(
+            descr
+                .extra_info
+                .write_descrs_arrays
+                .as_ref()
+                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+            "write_descrs_arrays bitstring"
+        );
+        assert!(
+            descr
+                .extra_info
+                .write_descrs_fields
+                .as_ref()
+                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+            "setitem setfield resize_counter"
         );
     }
 }

@@ -646,6 +646,18 @@ pub struct Transformer<'a> {
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
     >,
+    /// `optimize_block` `renamings_constants` (`jtransform.py`): `{Var: Const}`
+    /// subset of `do_rename`. `rewrite_op_same_as` / the record_exact_value
+    /// helper result is that Constant. `do_renaming` substitutes it into
+    /// every later `LinkArg` operand; Variable-only slots keep the result,
+    /// which `materialize_const_result` defines once at the rename.
+    /// Exit `LinkArg`s and `follow_constant_exit` read the same map.
+    /// Lives on the Transformer across blocks (SSA names are graph-unique;
+    /// a later block sees a fresh inputarg, the Constant already on the link).
+    const_aliases: std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
     /// Source GC pointer of each `cast_ptr_to_int` result.  Rust spells
     /// `lltype.cast_opaque_ptr` as `p as usize as *mut T`; the second
     /// cast folds back to this source (`rewrite_op_cast_opaque_ptr`).
@@ -747,7 +759,7 @@ impl VableFlags {
                 crate::flowspace::model::ConstValue::Bool(true),
             );
         }
-        crate::flowspace::model::ConstValue::Dict(items)
+        crate::flowspace::model::ConstValue::Dict(std::sync::Arc::new(items))
     }
 }
 
@@ -2808,6 +2820,7 @@ impl<'a> Transformer<'a> {
             vable_array_vars: std::collections::HashMap::new(),
             vable_flags: std::collections::HashMap::new(),
             aliases: std::collections::HashMap::new(),
+            const_aliases: std::collections::HashMap::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
@@ -3007,6 +3020,9 @@ impl<'a> Transformer<'a> {
             // is not the array item type the `same_as` result carried.
             self.direct_ptradd_type_arg = direct_ptradd_type_arg(original_op);
             let op = remap_op(original_op, &self.aliases);
+            // `jtransform.py`: `if renamings_constants: op = self._do_renaming(renamings_constants, op)`
+            // before `rewrite_operation`.
+            let op = do_renaming(op, &self.const_aliases);
             self.hook_access_field(original_op, &op, graph_name, graph);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
@@ -3050,7 +3066,7 @@ impl<'a> Transformer<'a> {
             block.exitswitch = None;
         }
 
-        let (exitswitch, exits) = {
+        let (exitswitch, mut exits) = {
             let block = &graph.blocks[block_idx];
             remap_control_flow_metadata_var(
                 &block.exitswitch,
@@ -3059,6 +3075,24 @@ impl<'a> Transformer<'a> {
                 |b| b,
             )
         };
+        for exit in &mut exits {
+            for arg in &mut exit.args {
+                *arg = rewrite_linkarg_const_alias(arg.clone(), &self.const_aliases);
+            }
+            if let Some(arg) = exit.last_exception.take() {
+                exit.last_exception = Some(rewrite_linkarg_const_alias(arg, &self.const_aliases));
+            }
+            if let Some(arg) = exit.last_exc_value.take() {
+                exit.last_exc_value = Some(rewrite_linkarg_const_alias(arg, &self.const_aliases));
+            }
+        }
+        // `jtransform.py`: `block.exitswitch = renamings.get(block.exitswitch, block.exitswitch)`
+        // then `self.follow_constant_exit(block)`. `ExitSwitch` cannot hold a
+        // Constant; a const-aliased switch Variable is looked up here so the
+        // fold still sees it, before `optimize_goto_if_not`.
+        let canraise = graph.blocks[block_idx].canraise();
+        let (exitswitch, exits) =
+            follow_constant_exit(exitswitch, exits, &self.const_aliases, canraise);
         {
             let block = &mut graph.blocks[block_idx];
             block.operations = new_ops;
@@ -5599,13 +5633,11 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
-            OpKind::RawMalloc { .. } => {
-                let (owner, zero) = match &op.kind {
-                    OpKind::RawMalloc { owner, zero } => (owner.clone(), *zero),
-                    _ => unreachable!("RawMalloc arm"),
-                };
-                self.rewrite_op_raw_malloc(op, graph_name, graph, &owner, zero)
-            }
+            OpKind::RawMalloc {
+                owner,
+                zero,
+                length,
+            } => self.rewrite_op_raw_malloc(op, graph_name, graph, owner, *zero, length.clone()),
             OpKind::RawFree { .. } => {
                 let ptr = match &op.kind {
                     OpKind::RawFree { ptr } => ptr.clone(),
@@ -5706,6 +5738,10 @@ impl<'a> Transformer<'a> {
     /// build_ll_0_raw_malloc_fixedsize` closes the STRUCT into a
     /// zero-argument specialization; the size here is a constant
     /// argument of `ll_raw_malloc_fixedsize`.
+    ///
+    /// `rewrite_op_malloc_varsize` passes the item count as
+    /// `raw_malloc_varsize` (`[op.args[2]]`). `TYPE.OF == lltype.Char`
+    /// takes `OS_RAW_MALLOC_VARSIZE_CHAR` and `EF_CAN_RAISE`.
     fn rewrite_op_raw_malloc(
         &mut self,
         op: &SpaceOperation,
@@ -5713,7 +5749,11 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
         owner: &str,
         zero: bool,
+        length: Option<crate::flowspace::model::Variable>,
     ) -> RewriteResult {
+        if let Some(n) = length {
+            return self._rewrite_raw_malloc_varsize(op, graph_name, graph, owner, zero, n);
+        }
         let layout = {
             let cc = self.callcontrol.as_deref().unwrap_or_else(|| {
                 panic!(
@@ -5776,6 +5816,125 @@ impl<'a> Transformer<'a> {
                     SpaceOperation {
                         result: Some(size_var),
                         kind: OpKind::ConstInt(size as i64),
+                    },
+                );
+                RewriteResult::Replace(ops)
+            }
+            RewriteResult::Identity(_) | RewriteResult::Keep => {
+                panic!("raw malloc residual of {owner} did not rewrite to a direct call")
+            }
+        }
+    }
+
+    /// `jtransform.py _rewrite_raw_malloc(op, 'raw_malloc_varsize', [n])`.
+    fn _rewrite_raw_malloc_varsize(
+        &mut self,
+        op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+        owner: &str,
+        zero: bool,
+        n: crate::flowspace::model::Variable,
+    ) -> RewriteResult {
+        assert!(
+            op.result.is_some(),
+            "raw malloc of {owner} has no result variable"
+        );
+        // `_rewrite_raw_malloc`: `name += '_zero'` when `zero=True`.
+        // `TYPE.OF == lltype.Char` keeps that name for the `_zero` helper
+        // and still attaches `OS_RAW_MALLOC_VARSIZE_CHAR`; the non-zero
+        // Char helper is `raw_malloc_varsize_char`. `size` is a byte
+        // count; for `Array(Char)` that is the item count `n`.
+        let item_is_char = raw_malloc_varsize_item_is_char(op, owner);
+        if item_is_char {
+            let leaf = if zero {
+                "raw_malloc_varsize_zero"
+            } else {
+                "raw_malloc_varsize_char"
+            };
+            let target = CallTarget::function_path(["majit_rlib", "lltypesystem", "rffi", leaf]);
+            let call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: vec![LinkArg::Value(n.clone())],
+                    result_ty: ValueType::Int,
+                },
+            };
+            return match self._handle_oopspec_call(
+                graph,
+                &call,
+                &target,
+                std::slice::from_ref(&n),
+                &ValueType::Int,
+                graph_name,
+                OopSpecIndex::RawMallocVarsizeChar,
+                Some(ExtraEffect::CanRaise),
+                None,
+            ) {
+                rewritten @ RewriteResult::Replace(_) => rewritten,
+                RewriteResult::Identity(_) | RewriteResult::Keep => {
+                    panic!("raw malloc residual of {owner} did not rewrite to a direct call")
+                }
+            };
+        }
+        // Non-Char: `ll_raw_malloc_varsize(n, basesize, itemsize)` like
+        // `ll_raw_malloc_fixedsize(size)`. `transform.py
+        // gct_fv_raw_malloc_varsize` / `_ll_malloc_varsize_no_length`.
+        let (basesize, itemsize) =
+            raw_malloc_varsize_basesize_itemsize(op, owner, self.callcontrol.as_deref());
+        let leaf = if zero {
+            "ll_raw_malloc_varsize_zero"
+        } else {
+            "ll_raw_malloc_varsize"
+        };
+        let target = CallTarget::function_path(["majit_rlib", "rffi", leaf]);
+        let basesize_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let itemsize_var = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let args = [n.clone(), basesize_var.clone(), itemsize_var.clone()];
+        let call = SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![
+                    LinkArg::Value(n),
+                    LinkArg::Value(basesize_var.clone()),
+                    LinkArg::Value(itemsize_var.clone()),
+                ],
+                result_ty: ValueType::Int,
+            },
+        };
+        let rewritten = self._handle_oopspec_call(
+            graph,
+            &call,
+            &target,
+            &args,
+            &ValueType::Int,
+            graph_name,
+            OopSpecIndex::None,
+            Some(ExtraEffect::CanRaise),
+            None,
+        );
+        match rewritten {
+            RewriteResult::Replace(mut ops) => {
+                ops.insert(
+                    0,
+                    SpaceOperation {
+                        result: Some(itemsize_var),
+                        kind: OpKind::ConstInt(itemsize),
+                    },
+                );
+                ops.insert(
+                    0,
+                    SpaceOperation {
+                        result: Some(basesize_var),
+                        kind: OpKind::ConstInt(basesize),
                     },
                 );
                 RewriteResult::Replace(ops)
@@ -6063,7 +6222,7 @@ impl<'a> Transformer<'a> {
             result: Some(v_end.clone()),
             kind: OpKind::LoweredBlackholeOp {
                 opname: "strlen".into(),
-                args: vec![lhs.clone()],
+                args: vec![lhs.clone().into()],
             },
         });
 
@@ -8506,7 +8665,7 @@ impl<'a> Transformer<'a> {
                 result: op.result.clone(),
                 kind: OpKind::LoweredBlackholeOp {
                     opname: "strgetitem".into(),
-                    args: vec![args[0].clone(), args[1].clone()],
+                    args: vec![args[0].clone().into(), args[1].clone().into()],
                 },
             }]);
         }
@@ -8523,7 +8682,7 @@ impl<'a> Transformer<'a> {
                 result: op.result.clone(),
                 kind: OpKind::LoweredBlackholeOp {
                     opname: "strlen".into(),
-                    args: vec![args[0].clone()],
+                    args: vec![args[0].clone().into()],
                 },
             }]);
         }
@@ -9640,7 +9799,7 @@ impl<'a> Transformer<'a> {
             result: op.result.clone(),
             kind: OpKind::LoweredBlackholeOp {
                 opname: oopspec_name.to_string(),
-                args: args.to_vec(),
+                args: crate::model::call_args(args.iter().cloned()),
             },
         }])
     }
@@ -9802,7 +9961,7 @@ impl<'a> Transformer<'a> {
                 result: op.result.clone(),
                 kind: OpKind::LoweredBlackholeOp {
                     opname: opname.to_string(),
-                    args: args.to_vec(),
+                    args: crate::model::call_args(args.iter().cloned()),
                 },
             }]));
         }
@@ -12566,11 +12725,9 @@ impl<'a> Transformer<'a> {
     ///
     /// `getkind(op.args[0].concretetype)`: int → `record_exact_value_i`,
     /// ref → `record_exact_value_r`, no result. Constants stay operands
-    /// (`op.args` passed through upstream). `LoweredBlackholeOp.args` is
-    /// `Vec<Variable>`, so a Constant becomes the Const* define
-    /// `record_exact_value_const_opkind` picks — `ConstStr` for a
-    /// prebuilt `Ptr(STR)` so `assembler.py Assembler.emit_const` can
-    /// pool it through `emit_const_r`.
+    /// (`op.args` passed through upstream) and reach `Assembler.emit_const`
+    /// (`assembler.py`) through the same `LinkArg::Const` path as
+    /// `FieldWrite.value`.
     ///
     /// `alias_result` is the Call result of `rlib/jit.py record_exact_value`
     /// (`majit_rlib::jit::record_exact_value`). `Entry.specialize_call` is
@@ -12584,7 +12741,7 @@ impl<'a> Transformer<'a> {
     fn rewrite_op_jit_record_exact_value(
         &mut self,
         args: &[LinkArg],
-        graph: &mut FunctionGraph,
+        _graph: &mut FunctionGraph,
         graph_name: &str,
         alias_result: Option<crate::flowspace::model::Variable>,
     ) -> RewriteResult {
@@ -12602,22 +12759,30 @@ impl<'a> Transformer<'a> {
             assert_eq!(kind1, 'r', "record_exact_value ref pair");
             "record_exact_value_r"
         };
-        let mut ops = Vec::new();
-        let arg0 = self.record_exact_value_arg_var(&args[0], graph, &mut ops);
-        let arg1 = self.record_exact_value_arg_var(&args[1], graph, &mut ops);
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!("rewrite: jit_record_exact_value → {opname}"),
         });
-        ops.push(SpaceOperation {
+        let mut ops = vec![SpaceOperation {
             result: None,
             kind: OpKind::LoweredBlackholeOp {
                 opname: opname.to_string(),
-                args: vec![arg0, arg1.clone()],
+                args: vec![args[0].clone(), args[1].clone()],
             },
-        });
+        }];
         if let Some(result) = alias_result {
-            self.aliases.insert(result, arg1);
+            match &args[1] {
+                LinkArg::Value(v) => {
+                    self.aliases.insert(result, v.clone());
+                }
+                LinkArg::Const(c) => {
+                    // `do_rename(op.result, Constant)`: LinkArg uses see the
+                    // Constant via `const_aliases`; Variable-only slots keep
+                    // `result`, defined once here (`materialize` / ConstInt).
+                    self.const_aliases.insert(result.clone(), c.clone());
+                    ops.push(materialize_const_result(result, c));
+                }
+            }
         }
         RewriteResult::Replace(ops)
     }
@@ -12636,32 +12801,6 @@ impl<'a> Transformer<'a> {
                     crate::model::ConcreteType::Void => 'v',
                     crate::model::ConcreteType::Unknown => 'r',
                 }
-            }
-        }
-    }
-
-    fn record_exact_value_arg_var(
-        &self,
-        arg: &LinkArg,
-        graph: &mut FunctionGraph,
-        prefix: &mut Vec<SpaceOperation>,
-    ) -> crate::flowspace::model::Variable {
-        match arg {
-            LinkArg::Value(v) => v.clone(),
-            LinkArg::Const(c) => {
-                let kind = record_exact_value_const_opkind(&c.value);
-                let ty = match self.record_exact_value_arg_kind(arg) {
-                    'i' => crate::model::ConcreteType::Signed,
-                    'r' => crate::model::ConcreteType::GcRef,
-                    'f' => crate::model::ConcreteType::Float,
-                    _ => crate::model::ConcreteType::Void,
-                };
-                let var = graph.alloc_value_var_with_type(ty);
-                prefix.push(SpaceOperation {
-                    result: Some(var.clone()),
-                    kind,
-                });
-                var
             }
         }
     }
@@ -14166,6 +14305,228 @@ fn remap_value(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+fn rewrite_linkarg_const_alias(
+    arg: LinkArg,
+    const_aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
+) -> LinkArg {
+    match arg {
+        LinkArg::Value(v) => match const_aliases.get(&v) {
+            Some(c) => LinkArg::Const(c.clone()),
+            None => LinkArg::Value(v),
+        },
+        other => other,
+    }
+}
+
+/// `jtransform.py Transformer._do_renaming(renamings_constants, op)`:
+/// substitute a Constant into every operand slot that can hold one
+/// (`LinkArg`, including `ListOfKind`-shaped `Vec<LinkArg>`).
+///
+/// Slots typed as plain `Variable` cannot hold a Constant; they keep the
+/// renamed result, which `materialize_const_result` defined at the rename.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn do_renaming(
+    op: SpaceOperation,
+    const_aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
+) -> SpaceOperation {
+    if const_aliases.is_empty() {
+        return op;
+    }
+    let kind = match op.kind {
+        OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } => OpKind::Call {
+            target,
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_linkarg_const_alias(arg, const_aliases))
+                .collect(),
+            result_ty,
+        },
+        OpKind::FieldWrite {
+            base,
+            field,
+            value,
+            ty,
+        } => OpKind::FieldWrite {
+            base,
+            field,
+            value: rewrite_linkarg_const_alias(value, const_aliases),
+            ty,
+        },
+        OpKind::ArrayWrite {
+            base,
+            index,
+            value,
+            item_ty,
+            array_type_id,
+            nolength,
+        } => OpKind::ArrayWrite {
+            base,
+            index,
+            value: rewrite_linkarg_const_alias(value, const_aliases),
+            item_ty,
+            array_type_id,
+            nolength,
+        },
+        OpKind::VableFieldWrite {
+            base,
+            field_index,
+            value,
+            ty,
+        } => OpKind::VableFieldWrite {
+            base,
+            field_index,
+            value: rewrite_linkarg_const_alias(value, const_aliases),
+            ty,
+        },
+        OpKind::VableArrayWrite {
+            base,
+            array_index,
+            elem_index,
+            value,
+            item_ty,
+            array_itemsize,
+            array_is_signed,
+        } => OpKind::VableArrayWrite {
+            base,
+            array_index,
+            elem_index,
+            value: rewrite_linkarg_const_alias(value, const_aliases),
+            item_ty,
+            array_itemsize,
+            array_is_signed,
+        },
+        OpKind::JitForceQuasiImmutable { base, mutate_field } => OpKind::JitForceQuasiImmutable {
+            base: rewrite_linkarg_const_alias(base, const_aliases),
+            mutate_field,
+        },
+        OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
+            opname,
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_linkarg_const_alias(arg, const_aliases))
+                .collect(),
+        },
+        kind => kind,
+    };
+    SpaceOperation {
+        result: op.result,
+        kind,
+    }
+}
+
+/// `jtransform_opname::materialize` / `handle_builtin_call` `NormalizedArg::ConstInt`:
+/// a Constant occupying a Variable-only slot is a Const* that defines that
+/// variable. Called once at `do_rename(result, Constant)` so later
+/// Variable-only uses of `result` stay defined.
+fn materialize_const_result(
+    result: crate::flowspace::model::Variable,
+    c: &crate::flowspace::model::Constant,
+) -> SpaceOperation {
+    use crate::flowspace::model::ConstValue;
+    let kind = match &c.value {
+        ConstValue::Int(n) => OpKind::ConstInt(*n),
+        ConstValue::UInt(n) => OpKind::ConstUInt(*n),
+        ConstValue::Bool(b) => OpKind::ConstBool(*b),
+        ConstValue::Float(bits) => OpKind::ConstFloat(*bits),
+        ConstValue::None => OpKind::ConstNone,
+        ConstValue::LLPtr(p) if !p.nonzero() => OpKind::ConstRefNull,
+        other => panic!("materialize_const_result: cannot materialise constant operand {other:?}"),
+    };
+    if let Some(ty) = c.concretetype.clone() {
+        result.set_concretetype(Some(ty));
+    }
+    SpaceOperation {
+        result: Some(result),
+        kind,
+    }
+}
+
+/// `jtransform.py Transformer.follow_constant_exit`: when `exitswitch` is
+/// a Constant (here: a Variable in `const_aliases`) and the block cannot
+/// raise, keep the matching link as the sole unconditional exit.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn follow_constant_exit(
+    exitswitch: Option<crate::model::ExitSwitch>,
+    mut exits: Vec<crate::model::Link>,
+    const_aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
+    canraise: bool,
+) -> (Option<crate::model::ExitSwitch>, Vec<crate::model::Link>) {
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, ExitSwitch};
+    let Some(ExitSwitch::Value(v)) = &exitswitch else {
+        return (exitswitch, exits);
+    };
+    let Some(c) = const_aliases.get(v) else {
+        return (exitswitch, exits);
+    };
+    if canraise {
+        return (exitswitch, exits);
+    }
+    let llvalue = &c.value;
+    let mut taken_idx = None;
+    for (i, link) in exits.iter().enumerate() {
+        if link.llexitcase.as_ref() == Some(llvalue) {
+            taken_idx = Some(i);
+            break;
+        }
+        if let (Some(ExitCase::Bool(b)), ConstValue::Bool(cb)) = (&link.exitcase, llvalue)
+            && b == cb
+        {
+            taken_idx = Some(i);
+            break;
+        }
+    }
+    let idx = match taken_idx {
+        Some(i) => i,
+        None => {
+            let last = exits
+                .len()
+                .checked_sub(1)
+                .expect("follow_constant_exit: no exits");
+            let last_link = &exits[last];
+            let is_default = matches!(
+                &last_link.exitcase,
+                Some(ExitCase::Const(ConstValue::UniStr(s))) if s == "default"
+            ) || matches!(
+                &last_link.llexitcase,
+                Some(ConstValue::UniStr(s)) if s == "default"
+            );
+            assert!(
+                is_default,
+                "follow_constant_exit: no matching exit and last is not default"
+            );
+            last
+        }
+    };
+    let mut taken = exits.swap_remove(idx);
+    taken.exitcase = None;
+    taken.llexitcase = None;
+    (None, vec![taken])
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn remap_call_funcptr(
     funcptr: &CallFuncPtr,
     aliases: &std::collections::HashMap<
@@ -14213,8 +14574,16 @@ fn remap_op(
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
-        | OpKind::NewWithVtable { .. }
-        | OpKind::RawMalloc { .. } => op.kind.clone(),
+        | OpKind::NewWithVtable { .. } => op.kind.clone(),
+        OpKind::RawMalloc {
+            owner,
+            zero,
+            length,
+        } => OpKind::RawMalloc {
+            owner: owner.clone(),
+            zero: *zero,
+            length: length.as_ref().map(|v| remap_value(v, aliases)),
+        },
         OpKind::RawFree { ptr } => OpKind::RawFree {
             ptr: remap_value(ptr, aliases),
         },
@@ -14284,7 +14653,10 @@ fn remap_op(
         },
         OpKind::LoweredBlackholeOp { opname, args } => OpKind::LoweredBlackholeOp {
             opname: opname.clone(),
-            args: args.iter().map(|a| remap_value(a, aliases)).collect(),
+            args: args
+                .iter()
+                .map(|a| a.map_value(|v| remap_value(v, aliases)))
+                .collect(),
         },
         OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
             value: remap_value(value, aliases),
@@ -15102,51 +15474,6 @@ fn is_record_exact_value_helper(target: &CallTarget) -> bool {
         if segments.as_slice() == ["majit_rlib", "jit", "record_exact_value"])
 }
 
-/// Const* define other `_i`/`_r` ops already emit for a Constant
-/// operand. `rewrite_op_jit_record_exact_value` keeps `op.args`
-/// unchanged upstream; `LoweredBlackholeOp.args` is `Vec<Variable>`,
-/// so a Constant becomes this define. Null GC pointers are
-/// `ConstRefNull`. A prebuilt `Ptr(STR)` is `ConstStr`, the same
-/// define `ref_copy` already lowers through `emit_const_r`. HostObject
-/// stays `ConstRef`.
-pub(crate) fn record_exact_value_const_opkind(
-    value: &crate::flowspace::model::ConstValue,
-) -> OpKind {
-    use crate::flowspace::model::ConstValue;
-    use crate::translator::rtyper::lltypesystem::lltype::_address;
-    match value {
-        ConstValue::Bool(b) => OpKind::ConstBool(*b),
-        ConstValue::Int(n) => OpKind::ConstInt(*n),
-        ConstValue::UInt(n) => OpKind::ConstUInt(*n),
-        ConstValue::None => OpKind::ConstRefNull,
-        ConstValue::LLAddress(_address::Null) => OpKind::ConstRefNull,
-        ConstValue::LLAddress(_address::IntCast(addr)) => OpKind::ConstRefAddr(*addr),
-        ConstValue::LLAddress(_address::Fake(p)) => record_exact_value_gcptr_opkind(p),
-        ConstValue::LLPtr(p) => record_exact_value_gcptr_opkind(p),
-        ConstValue::HostObject(obj) => OpKind::ConstRef(obj.clone()),
-        other => panic!("rewrite_op_jit_record_exact_value: unsupported constant {other:?}"),
-    }
-}
-
-/// `assembler.py Assembler.emit_const` pools a GC `Ptr` as the pointed-to
-/// object (`cast_opaque_ptr(GCREF, value)`). A translator `_ptr` is
-/// process-local, so a prebuilt `Ptr(STR)` becomes `ConstStr` (bytes
-/// plus hash, minted by `emit_const_r`); a null pointer is
-/// `ConstRefNull`.
-fn record_exact_value_gcptr_opkind(
-    p: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
-) -> OpKind {
-    if !p.nonzero() {
-        return OpKind::ConstRefNull;
-    }
-    if let Some((bytes, _)) =
-        crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
-    {
-        return OpKind::ConstStr(bytes);
-    }
-    panic!("rewrite_op_jit_record_exact_value: non-null GC pointer constant is not a prebuilt STR")
-}
-
 /// Match a `CallEffectOverride` pattern against a call target.
 ///
 /// The match is loose only in the asymmetric receiver-root direction:
@@ -15666,6 +15993,128 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
     }
+}
+
+/// `jtransform.py _rewrite_raw_malloc`: `TYPE.OF == lltype.Char`.
+///
+/// The ARRAY is `op.args[0].value`. `effect_malloc_owner` stores it as
+/// `Array({OF.short_name()})`; a result whose concretetype is
+/// `Ptr(Array)` carries `OF` directly.
+fn raw_malloc_varsize_item_is_char(op: &SpaceOperation, owner: &str) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    if let Some(result) = op.result.as_ref()
+        && let Some(ll) = result.concretetype()
+    {
+        let of = match ll {
+            LowLevelType::Ptr(ptr) => match ptr.TO {
+                PtrTarget::Array(arr) => Some(arr.OF),
+                _ => None,
+            },
+            LowLevelType::Array(arr) => Some(arr.OF),
+            _ => None,
+        };
+        if let Some(of) = of {
+            return matches!(of, LowLevelType::Char);
+        }
+    }
+    owner
+        .strip_prefix("Array(")
+        .and_then(|s| s.strip_suffix(')'))
+        == Some("Char")
+}
+
+fn raw_malloc_varsize_array(
+    op: &SpaceOperation,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let ll = op.result.as_ref()?.concretetype()?;
+    match ll {
+        LowLevelType::Ptr(ptr) => match ptr.TO {
+            PtrTarget::Array(arr) => Some(arr),
+            _ => None,
+        },
+        LowLevelType::Array(arr) => Some(*arr),
+        _ => None,
+    }
+}
+
+fn raw_malloc_varsize_of_from_owner(
+    owner: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let inner = owner
+        .strip_prefix("CArray(")
+        .or_else(|| owner.strip_prefix("Array("))
+        .and_then(|s| s.strip_suffix(')'))?;
+    match inner {
+        "Char" => Some(LowLevelType::Char),
+        "UniChar" => Some(LowLevelType::UniChar),
+        "Signed" => Some(LowLevelType::Signed),
+        "Unsigned" => Some(LowLevelType::Unsigned),
+        "Bool" => Some(LowLevelType::Bool),
+        "Float" => Some(LowLevelType::Float),
+        "SingleFloat" => Some(LowLevelType::SingleFloat),
+        "Address" => Some(LowLevelType::Address),
+        _ => None,
+    }
+}
+
+/// `symbolic.py get_array_token` item size (`sizeof(ARRAY.OF)`).
+fn raw_malloc_varsize_item_nbytes(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    word: i64,
+    cc: Option<&crate::call::CallControl>,
+) -> i64 {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match of {
+        LowLevelType::Signed | LowLevelType::Unsigned | LowLevelType::Address => word,
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong | LowLevelType::Float => 8,
+        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => 16,
+        LowLevelType::SingleFloat | LowLevelType::UniChar => 4,
+        LowLevelType::Bool | LowLevelType::Char => 1,
+        LowLevelType::Ptr(_) => word,
+        LowLevelType::Struct(st) => cc
+            .and_then(|cc| cc.struct_layout_for(&st._name))
+            .map(|layout| layout.size as i64)
+            .unwrap_or(word),
+        _ => word,
+    }
+}
+
+/// `transform.py varsize_malloc_helper`: `c_const_size = sizeof(TYPE, 0)`,
+/// `c_item_size = sizeof(ARRAY.OF)`. `CArray` / `nolength` basesize is 0
+/// (`symbolic.py get_array_token`).
+fn raw_malloc_varsize_basesize_itemsize(
+    op: &SpaceOperation,
+    owner: &str,
+    cc: Option<&crate::call::CallControl>,
+) -> (i64, i64) {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let word = cc
+        .map(|cc| cc.array_header_size as i64)
+        .unwrap_or_else(|| crate::layout::target_word_size() as i64);
+    let array = raw_malloc_varsize_array(op);
+    let of = array
+        .as_ref()
+        .map(|arr| arr.OF.clone())
+        .or_else(|| raw_malloc_varsize_of_from_owner(owner))
+        .unwrap_or(LowLevelType::Signed);
+    let nolength = match &array {
+        Some(arr) => matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true))),
+        // `effect_malloc_owner` prints `Array(OF)` for `CArray` too.
+        None => true,
+    };
+    let extra = match &array {
+        Some(arr) => match arr._hints.get("extra_item_after_alloc") {
+            Some(ConstValue::Int(n)) => *n,
+            _ => 0,
+        },
+        None => 0,
+    };
+    let itemsize = raw_malloc_varsize_item_nbytes(&of, word, cc);
+    let basesize = if nolength { 0 } else { word } + extra * itemsize;
+    (basesize, itemsize)
 }
 
 /// Call sites matched, per `call_effects` override entry.
@@ -23394,8 +23843,8 @@ mod tests {
         let ops = &result.graph.block(graph.startblock).operations;
         assert!(
             ops.iter()
-                .any(|op| matches!(op.kind, OpKind::ConstBool(true))),
-            "Constant(True) materialises as ConstBool: {ops:?}"
+                .all(|op| !matches!(op.kind, OpKind::ConstBool(_))),
+            "Constant stays an operand, no ConstBool define: {ops:?}"
         );
         let rec = ops
             .iter()
@@ -23412,6 +23861,13 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], lt);
+        assert!(
+            matches!(
+                &args[1],
+                LinkArg::Const(c) if matches!(c.value, crate::flowspace::model::ConstValue::Bool(true))
+            ),
+            "const operand is LinkArg::Const: {args:?}"
+        );
     }
 
     fn objectptr_const(null: bool) -> crate::flowspace::model::Constant {
@@ -23448,17 +23904,13 @@ mod tests {
 
         let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
-        if expect_null {
-            assert!(
-                ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
-                "null ConstPtr materialises as ConstRefNull: {ops:?}"
-            );
-        } else {
-            assert!(
-                ops.iter().any(|op| matches!(op.kind, OpKind::ConstStr(_))),
-                "non-null Ptr(STR) materialises as ConstStr: {ops:?}"
-            );
-        }
+        assert!(
+            ops.iter().all(|op| !matches!(
+                op.kind,
+                OpKind::ConstRefNull | OpKind::ConstStr(_) | OpKind::ConstRefAddr(_)
+            )),
+            "ref Constant stays an operand, no Const* define: {ops:?}"
+        );
         let rec = ops
             .iter()
             .find(|op| {
@@ -23474,6 +23926,23 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], value);
+        let LinkArg::Const(c) = &args[1] else {
+            panic!("const operand is LinkArg::Const: {args:?}");
+        };
+        if expect_null {
+            assert!(
+                matches!(
+                    &c.value,
+                    crate::flowspace::model::ConstValue::LLPtr(p) if !p.nonzero()
+                ) || matches!(c.value, crate::flowspace::model::ConstValue::None),
+                "null const operand: {c:?}"
+            );
+        } else {
+            assert!(
+                matches!(&c.value, crate::flowspace::model::ConstValue::LLPtr(_)),
+                "prebuilt Ptr const operand: {c:?}"
+            );
+        }
     }
 
     #[test]
@@ -23537,19 +24006,21 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("expected record_exact_value_i, got {ops:?}"));
         assert!(rec.result.is_none(), "record_exact_value_i is void");
-        let const_def = ops
-            .iter()
-            .find(|op| matches!(op.kind, OpKind::ConstBool(true)))
-            .unwrap_or_else(|| panic!("Constant(True) materialises as ConstBool: {ops:?}"));
-        let const_var = const_def
-            .result
-            .clone()
-            .expect("ConstBool defines a result");
+        assert!(
+            ops.iter()
+                .filter(|op| matches!(op.kind, OpKind::ConstBool(_)))
+                .all(|op| op.result.as_ref() == Some(&result)),
+            "ConstBool, if present, defines the helper result: {ops:?}"
+        );
         assert_eq!(block.exits.len(), 1);
-        assert_eq!(
-            block.exits[0].args,
-            vec![LinkArg::Value(const_var)],
-            "helper result is the const operand: {ops:?}"
+        assert!(
+            matches!(
+                block.exits[0].args.as_slice(),
+                [LinkArg::Const(c)]
+                    if matches!(c.value, crate::flowspace::model::ConstValue::Bool(true))
+            ),
+            "helper result is the const operand: {:?}, ops={ops:?}",
+            block.exits[0].args
         );
     }
 
@@ -23560,6 +24031,165 @@ mod tests {
             "jit",
             "record_exact_value",
         ]);
+    }
+
+    fn assert_block_uses_are_defined(block: &crate::model::Block) {
+        use std::collections::HashSet;
+        let mut defined: HashSet<crate::flowspace::model::Variable> =
+            block.inputargs.iter().cloned().collect();
+        for op in &block.operations {
+            for var in crate::inline::op_variable_refs(&op.kind) {
+                assert!(
+                    defined.contains(&var),
+                    "use of {var:?} has no definition in the block; ops={:?} inputs={:?}",
+                    block.operations,
+                    block.inputargs
+                );
+            }
+            if let Some(result) = &op.result {
+                defined.insert(result.clone());
+            }
+        }
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                assert!(
+                    defined.contains(v),
+                    "exitswitch {v:?} is undefined; ops={:?}",
+                    block.operations
+                );
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    assert!(
+                        defined.contains(v),
+                        "fused exitswitch arg {v:?} is undefined; ops={:?}",
+                        block.operations
+                    );
+                }
+            }
+            Some(crate::model::ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            for arg in &link.args {
+                if let LinkArg::Value(v) = arg {
+                    assert!(
+                        defined.contains(v),
+                        "link arg {v:?} is undefined; ops={:?}",
+                        block.operations
+                    );
+                }
+            }
+            for extra in [&link.last_exception, &link.last_exc_value] {
+                if let Some(LinkArg::Value(v)) = extra {
+                    assert!(
+                        defined.contains(v),
+                        "exc link arg {v:?} is undefined; ops={:?}",
+                        block.operations
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_graph_record_exact_value_helper_result_later_uses_are_defined() {
+        let mut graph = FunctionGraph::new("record_exact_value_helper_later_use");
+        let value = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, value.clone());
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        result.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+        ));
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["majit_rlib", "jit", "record_exact_value"]),
+                args: vec![
+                    LinkArg::from(value.clone()),
+                    LinkArg::Const(crate::flowspace::model::Constant::with_concretetype(
+                        crate::flowspace::model::ConstValue::Bool(true),
+                        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                    )),
+                ],
+                result_ty: ValueType::Bool,
+            },
+            result.clone(),
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::UnaryOp {
+                op: "int_neg".into(),
+                operand: result.clone(),
+                result_ty: ValueType::Int,
+            },
+            true,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["my_mod", "use_exact"]),
+                args: vec![LinkArg::from(result.clone())],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+
+        let (if_true, _true_args) = graph.create_block_with_arg_vars(1);
+        let if_false = graph.create_block();
+        graph.block_mut(graph.returnblock).inputargs.clear();
+        graph.set_goto(if_true, graph.returnblock, vec![]);
+        graph.set_goto(if_false, graph.returnblock, vec![]);
+        graph.set_branch(
+            graph.startblock,
+            result.clone(),
+            if_true,
+            vec![result.clone()],
+            if_false,
+            vec![],
+        );
+
+        let transformed = transform_graph(&graph, &GraphTransformConfig::default());
+        for block in &transformed.graph.blocks {
+            assert_block_uses_are_defined(block);
+        }
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "record_exact_value_i"
+            )),
+            "expected record_exact_value_i, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.as_slice() == ["my_mod", "use_exact"]
+                    && matches!(
+                        args.as_slice(),
+                        [LinkArg::Const(c)]
+                            if matches!(c.value, crate::flowspace::model::ConstValue::Bool(true))
+                    )
+            )),
+            "Call.args LinkArg use must be the Constant: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "int_neg" && operand == &result
+            )),
+            "Variable-only int_neg operand stays the helper result: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                matches!(op.kind, OpKind::ConstBool(true)) && op.result.as_ref() == Some(&result)
+            }),
+            "helper result is defined by ConstBool at the rename: {ops:?}"
+        );
     }
 
     #[test]
@@ -23758,7 +24388,7 @@ mod tests {
                 args: vec![
                     LinkArg::from(frame_var.clone()),
                     LinkArg::Const(Constant::new(ConstValue::byte_str("next_instr"))),
-                    LinkArg::Const(Constant::new(ConstValue::Dict(flags))),
+                    LinkArg::Const(Constant::new(ConstValue::Dict(std::sync::Arc::new(flags)))),
                 ],
                 result_ty: ValueType::Void,
             },
@@ -28766,6 +29396,204 @@ mod tests {
         assert_eq!(
             super::map_user_oopspec_to_index("dict.setitem"),
             OopSpecIndex::None
+        );
+    }
+
+    fn raw_tuple_i64_layout() -> crate::call::StructLayout {
+        use crate::call::StructFieldLayout;
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        crate::call::StructLayout {
+            size: 8,
+            align: 8,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            fields: vec![StructFieldLayout {
+                name: "f".into(),
+                offset: 0,
+                size: 8,
+                flag: ArrayFlag::Signed,
+                field_type: Type::Int,
+                rank: None,
+            }],
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn transform_raw_malloc(
+        owner: &str,
+        zero: bool,
+        with_length: bool,
+        layout: Option<(majit_ir::descr::StructId, crate::call::StructLayout)>,
+    ) -> (FunctionGraph, crate::flowspace::model::Variable) {
+        use crate::call::CallControl;
+
+        let mut graph = FunctionGraph::new("raw_malloc");
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let length = with_length.then(|| n.clone());
+        let p = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::RawMalloc {
+                    owner: owner.into(),
+                    zero,
+                    length,
+                },
+                true,
+            )
+            .expect("raw malloc result");
+        FunctionGraph::set_concretetype_of_inline(&p, ConcreteType::Signed);
+        if with_length {
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+            let of = if owner.contains("Char") && !owner.contains("UniChar") {
+                LowLevelType::Char
+            } else {
+                LowLevelType::Signed
+            };
+            p.set_concretetype(Some(CArrayPtr(of)));
+        }
+        graph.set_return(graph.startblock, Some(p.clone()));
+        let mut cc = CallControl::new();
+        if let Some((sid, layout)) = layout {
+            cc.set_struct_layout(sid, layout);
+        }
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
+        (transformed, n)
+    }
+
+    fn raw_malloc_residual(
+        ops: &[SpaceOperation],
+    ) -> (
+        &str,
+        &crate::call::CallDescriptor,
+        &[crate::flowspace::model::Variable],
+    ) {
+        let residual = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    descriptor, args_i, ..
+                } => Some((descriptor, args_i.as_slice())),
+                _ => None,
+            })
+            .expect("raw malloc residual");
+        let path = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ConstFnAddr { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .expect("raw malloc funcptr");
+        (path, residual.0, residual.1)
+    }
+
+    fn helper_fnaddr_publishes(path: &str) -> bool {
+        let leaf = path.rsplit("::").next().unwrap_or(path);
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|row| {
+            if row.path == path || row.path.ends_with(leaf) {
+                found = true;
+                assert_ne!(row.get(), 0, "{path} fnaddr");
+            }
+        });
+        found
+    }
+
+    /// `jtransform.py test_raw_malloc`: `malloc_varsize` of `CArray(Char)`
+    /// residualizes `raw_malloc_varsize_char` with `OS_RAW_MALLOC_VARSIZE_CHAR`.
+    #[test]
+    fn raw_malloc_varsize_char_lowers_to_oopspec_residual() {
+        let (graph, n) = transform_raw_malloc("Array(Char)", false, true, None);
+        let ops = &graph.block(graph.startblock).operations;
+        let (path, descriptor, args_i) = raw_malloc_residual(ops);
+        assert_eq!(
+            path, "majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char",
+            "Char varsize residual is the CHAR helper, got {path}"
+        );
+        assert!(
+            helper_fnaddr_publishes(path) || path.ends_with("raw_malloc_varsize_char"),
+            "Char varsize residual {path} is the published helper"
+        );
+        assert_eq!(args_i, std::slice::from_ref(&n));
+        assert_eq!(
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::RawMallocVarsizeChar
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+        assert!(matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)));
+    }
+
+    /// `jtransform.py test_raw_malloc_zero` without zero: a non-Char raw
+    /// array residualizes `ll_raw_malloc_varsize(n, basesize, itemsize)`
+    /// and does not take the CHAR oopspec. `CArray(Signed)` basesize is 0.
+    #[test]
+    fn raw_malloc_varsize_non_char_lowers_to_varsize_residual() {
+        let (graph, n) = transform_raw_malloc("Array(Signed)", false, true, None);
+        let ops = &graph.block(graph.startblock).operations;
+        let (path, descriptor, args_i) = raw_malloc_residual(ops);
+        assert_eq!(
+            path, "majit_rlib::rffi::ll_raw_malloc_varsize",
+            "non-Char varsize residual is the new helper, got {path}"
+        );
+        assert!(
+            !path.contains("raw_malloc_varsize_char"),
+            "non-Char must not use the CHAR helper, got {path}"
+        );
+        assert!(
+            helper_fnaddr_publishes(path) || path.ends_with("ll_raw_malloc_varsize"),
+            "non-Char varsize residual {path} is the published helper"
+        );
+        let [n_arg, basesize_arg, itemsize_arg] = args_i else {
+            panic!("non-Char residual takes n, basesize, itemsize, got {args_i:?}");
+        };
+        assert_eq!(n_arg, &n);
+        let word = crate::layout::target_word_size() as i64;
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(basesize_arg) && matches!(op.kind, OpKind::ConstInt(0))
+            }),
+            "CArray/nolength basesize is 0, ops {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(itemsize_arg)
+                    && matches!(op.kind, OpKind::ConstInt(size) if size == word)
+            }),
+            "Signed itemsize is WORD, ops {ops:?}"
+        );
+        assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::None);
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+    }
+
+    /// `jtransform.py test_raw_malloc_fixedsize`: `length: None` stays
+    /// the `ll_raw_malloc_fixedsize` residual of `layout.size`.
+    #[test]
+    fn raw_malloc_fixedsize_length_none_keeps_layout_size() {
+        let owner = "Tuple<i64>";
+        let sid = majit_ir::descr::struct_id_for_name(owner).expect("Tuple<i64> shape id");
+        let (graph, _) =
+            transform_raw_malloc(owner, false, false, Some((sid, raw_tuple_i64_layout())));
+        let ops = &graph.block(graph.startblock).operations;
+        let (path, descriptor, args_i) = raw_malloc_residual(ops);
+        assert!(
+            path.ends_with("ll_raw_malloc_fixedsize"),
+            "fixed-size residual is ll_raw_malloc_fixedsize, got {path}"
+        );
+        assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::None);
+        let [size] = args_i else {
+            panic!("fixed-size residual takes the layout size, got {args_i:?}");
+        };
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(size) && matches!(op.kind, OpKind::ConstInt(8))
+            }),
+            "layout.size 8 is the size argument, ops {ops:?}"
         );
     }
 

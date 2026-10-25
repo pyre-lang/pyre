@@ -186,6 +186,7 @@ fn use_c_form(opname: &str) -> bool {
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{
     ConstIRelocDescriptor, ConstIRelocKind, ConstRRelocDescriptor, JitCodeBody, StrConstDescriptor,
+    StrConstKind, unicode_const_bytes,
 };
 use crate::regalloc::RegAllocator;
 
@@ -491,7 +492,8 @@ trait AssemblerEncode {
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
-        as_unicode_object: bool,
+        kind: StrConstKind,
+        container_id: Option<u64>,
         state: &mut AssemblyState,
     ) -> u8;
 
@@ -1778,7 +1780,13 @@ impl AssemblerEncode for Assembler {
                     self.current_graph_name,
                 );
                 let hash = crate::translator::rtyper::lltypesystem::rstr::ll_strhash_value(bytes);
-                let idx = self.emit_str_const_r(bytes.clone(), hash, true, state);
+                let idx = self.emit_str_const_r(
+                    bytes.clone(),
+                    hash,
+                    StrConstKind::UnicodeObject,
+                    None,
+                    state,
+                );
                 finish_const_copy(self, startposition, &mut argcodes, idx, 'r', dest, state);
             }
             OpKind::ConstRefNull => {
@@ -3370,6 +3378,56 @@ impl AssemblerEncode for Assembler {
                 state.code[startposition] = opnum;
             }
 
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                // Mixed Variable/Constant operands, same shape as
+                // `FieldWrite.value`. A Constant goes through `emit_const`
+                // (`assembler.py Assembler.emit_const`); `record_exact_value`
+                // is not in USE_C_FORM so an int constant pools as `'i'`.
+                for arg in args {
+                    match arg {
+                        crate::model::LinkArg::Value(var) => {
+                            if crate::model::FunctionGraph::concretetype_of(var)
+                                == crate::model::ConcreteType::Void
+                            {
+                                continue;
+                            }
+                            let (reg, kind_char) = self.lookup_reg_with_kind_var(var, regallocs);
+                            state.code.push(reg);
+                            argcodes.push(kind_char);
+                        }
+                        crate::model::LinkArg::Const(c) => {
+                            let kind = crate::flatten::constant_kind(c);
+                            if kind == 'i' {
+                                let (byte, argcode) = self.emit_const_i_from_const_allow_short(
+                                    &c.value,
+                                    use_c_form(opname),
+                                    state,
+                                    callcontrol,
+                                );
+                                state.code.push(byte);
+                                argcodes.push(argcode);
+                            } else {
+                                let byte = self.emit_const(&c.value, kind, state, callcontrol);
+                                state.code.push(byte);
+                                argcodes.push(kind);
+                            }
+                        }
+                    }
+                }
+                if let Some(result) = op.result.as_ref()
+                    && crate::model::FunctionGraph::concretetype_of(result)
+                        != crate::model::ConcreteType::Void
+                {
+                    argcodes.push('>');
+                    let (reg, kind_char) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kind_char);
+                    state.code.push(reg);
+                }
+                let key = format!("{opname}/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
+
             // Default: encode operand registers + result register (no descriptor)
             other => {
                 let mut operand_kinds = String::new();
@@ -4128,7 +4186,42 @@ impl AssemblerEncode for Assembler {
             && let Some((bytes, hash)) =
                 crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
         {
-            return self.emit_str_const_r(bytes, hash, false, state);
+            return self.emit_str_const_r(
+                bytes,
+                hash,
+                StrConstKind::Str,
+                llptr_container_identity(p),
+                state,
+            );
+        }
+        if let ConstValue::LLPtr(p) = value
+            && let Some((utf8, stored_hash)) =
+                crate::translator::rtyper::lltypesystem::rstr::prebuilt_unicode_bytes_and_hash(p)
+        {
+            // `prebuilt_unicode_bytes_and_hash` is the inverse of
+            // `alloc_array_unicode`: UTF-8 of the `UniChar` sequence.
+            // The runtime UNICODE block stores UCS-4 cells
+            // (`rstr.py UNICODE` / `unicode_as_unichars`), and
+            // `UnicodeRepr.convert_const` writes `ll_strhash` over
+            // those cells (`LLHelpers.ll_strhash` / `ll_hash_string`
+            // of `s.chars`).
+            let cells: Vec<u32> = std::str::from_utf8(&utf8)
+                .expect("prebuilt Ptr(UNICODE) UTF-8")
+                .chars()
+                .map(u32::from)
+                .collect();
+            let hash = if stored_hash == 0 {
+                ll_strhash_unichars(&cells)
+            } else {
+                stored_hash
+            };
+            return self.emit_str_const_r(
+                unicode_const_bytes(&cells),
+                hash,
+                StrConstKind::Unicode,
+                llptr_container_identity(p),
+                state,
+            );
         }
         // A unit-variant prebuilt singleton is likewise process-local
         // (`rpbc.py SingleFrozenPBCRepr`'s prebuilt instance): the
@@ -4198,23 +4291,33 @@ impl AssemblerEncode for Assembler {
     }
 
     /// Record a prebuilt-string constant for runtime materialization and
-    /// pool its sentinel, returning the `r`-bank register index.  Identical
-    /// literals (by bytes) share one descriptor and one sentinel, so
-    /// [`Self::emit_const_r_bits`]' dedup-by-bits collapses them to a single
-    /// pool entry — the analog of upstream `emit_const`'s `value_key` dedup
-    /// (`assembler.py:116`).
+    /// pool its sentinel, returning the `r`-bank register index.
+    /// `assembler.py Assembler.emit_const` keys a GC ref by
+    /// `value._obj.container`; an `LLPtr` therefore dedups by that
+    /// container identity.  `container_id is None` is a Rust string
+    /// literal lowered directly (`ConstInternedStr`) with no container,
+    /// so those entries still share a slot by equal bytes and kind.
     fn emit_str_const_r(
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
-        as_unicode_object: bool,
+        kind: StrConstKind,
+        container_id: Option<u64>,
         state: &mut AssemblyState,
     ) -> u8 {
-        if let Some(ordinal) = state
-            .str_consts
-            .iter()
-            .position(|d| d.bytes == bytes && d.as_unicode_object == as_unicode_object)
-        {
+        let ordinal = if let Some(id) = container_id {
+            state
+                .str_consts
+                .iter()
+                .position(|d| d.container_id == Some(id))
+        } else {
+            // No `_obj.container`: a Rust string literal lowered directly.
+            state
+                .str_consts
+                .iter()
+                .position(|d| d.container_id.is_none() && d.bytes == bytes && d.kind == kind)
+        };
+        if let Some(ordinal) = ordinal {
             return self.emit_const_r_bits(str_const_sentinel(ordinal), state);
         }
         let ordinal = state.str_consts.len();
@@ -4229,7 +4332,8 @@ impl AssemblerEncode for Assembler {
             constants_r_index,
             bytes,
             precomputed_hash,
-            as_unicode_object,
+            kind,
+            container_id,
         });
         reg
     }
@@ -4521,6 +4625,21 @@ fn check_result(int: (usize, usize), reference: (usize, usize), float: (usize, u
     }
 }
 
+/// `LLHelpers._ll_strhash` / `ll_hash_string` over UNICODE `chars`
+/// (`rstr.py UnicodeRepr.convert_const`, `objectmodel.py _hash_string`).
+/// Empty is `-1`; a real hash of `0` becomes `29872897`.
+fn ll_strhash_unichars(chars: &[u32]) -> i64 {
+    let Some(&first) = chars.first() else {
+        return -1;
+    };
+    let mut x = (first as i64) << 7;
+    for &c in chars {
+        x = 1000003i64.wrapping_mul(x) ^ c as i64;
+    }
+    x ^= chars.len() as i64;
+    if x == 0 { 29872897 } else { x }
+}
+
 /// `STR_CONST_SENTINEL_BASE | ordinal` — see [`STR_CONST_SENTINEL_BASE`].
 fn str_const_sentinel(ordinal: usize) -> i64 {
     debug_assert!(
@@ -4546,6 +4665,21 @@ fn exc_instance_const_sentinel(ordinal: usize) -> i64 {
         "too many prebuilt exception instances in one jitcode"
     );
     EXC_INSTANCE_CONST_SENTINEL_BASE | ordinal as i64
+}
+
+/// `assembler.py Assembler.emit_const` `value_key = value._obj.container`
+/// — container identity of a live `_ptr`, not the pointer's own
+/// `_hashable_identity` counter.
+fn llptr_container_identity(
+    p: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> Option<u64> {
+    use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+    match p._obj0_value().ok().flatten()? {
+        _ptr_obj::Struct(s) => Some(s.identity() as u64),
+        _ptr_obj::Array(a) => Some(a.identity() as u64),
+        _ptr_obj::Opaque(o) => Some(o.identity() as u64),
+        _ => None,
+    }
 }
 
 /// Class name of a zero-length shaped-array HostObject instance
@@ -9791,6 +9925,35 @@ mod tests {
         assert!(asm.insns.contains_key("ref_return/r"));
     }
 
+    /// `BaseLLStringRepr.convert_const` copies each `Char` into STR storage;
+    /// a lone `0xff` must reach `str_consts[i].bytes` verbatim.
+    #[test]
+    fn assemble_ref_return_prebuilt_str_preserves_arbitrary_char_bytes() {
+        use crate::translator::rtyper::lltypesystem::rstr::{
+            const_str_cache_llstr, ll_strhash_value,
+        };
+        let bytes: &[u8] = &[b'a', 0xff, b'b'];
+        let mut flat = SSARepr {
+            name: "return_prebuilt_str_raw_chars".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::new(ConstValue::LLPtr(Box::new(
+                    const_str_cache_llstr(bytes).expect("cache llstr"),
+                ))),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+
+        assert_eq!(body.str_consts.len(), 1);
+        assert_eq!(body.str_consts[0].kind, StrConstKind::Str);
+        assert_eq!(body.str_consts[0].bytes, bytes);
+        assert_eq!(body.str_consts[0].precomputed_hash, ll_strhash_value(bytes));
+    }
+
     fn assemble_record_exact_value(
         value_ty: crate::model::ValueType,
         value_kind: crate::model::ConcreteType,
@@ -9953,6 +10116,7 @@ mod tests {
             ll_strhash_value(b"hello")
         );
         assert_eq!(state.str_consts[0].constants_r_index, 0);
+        assert_eq!(state.str_consts[0].kind, StrConstKind::Str);
         assert_eq!(state.constants_r, vec![str_const_sentinel(0)]);
 
         // The same literal dedups to the same descriptor + pool slot.
@@ -9971,6 +10135,54 @@ mod tests {
             state.constants_r,
             vec![str_const_sentinel(0), str_const_sentinel(1)]
         );
+    }
+
+    #[test]
+    fn emit_const_r_distinct_container_equal_bytes_are_not_deduped() {
+        use crate::translator::rtyper::lltypesystem::rstr::llstr;
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        let p1 = llstr(b"hello").expect("llstr");
+        let p2 = llstr(b"hello").expect("llstr");
+        let id1 = llptr_container_identity(&p1).expect("p1 container");
+        let id2 = llptr_container_identity(&p2).expect("p2 container");
+        assert_ne!(id1, id2, "uncached llstr allocates a fresh container");
+        let v1 = ConstValue::LLPtr(Box::new(p1));
+        let v2 = ConstValue::LLPtr(Box::new(p2.clone()));
+        let reg_a = asm.emit_const_r(&v1, &mut state, None);
+        let reg_a2 = asm.emit_const_r(&v1, &mut state, None);
+        assert_eq!(reg_a2, reg_a);
+        assert_eq!(state.str_consts.len(), 1);
+        let reg_b = asm.emit_const_r(&v2, &mut state, None);
+        assert_ne!(reg_b, reg_a);
+        assert_eq!(state.str_consts.len(), 2);
+        assert_eq!(state.str_consts[0].bytes, b"hello".to_vec());
+        assert_eq!(state.str_consts[1].bytes, b"hello".to_vec());
+        assert_eq!(state.str_consts[0].kind, StrConstKind::Str);
+        assert_eq!(state.str_consts[1].kind, StrConstKind::Str);
+        assert_eq!(
+            state
+                .str_consts
+                .iter()
+                .map(|d| d.container_id)
+                .collect::<Vec<_>>(),
+            vec![Some(id1), Some(id2)]
+        );
+    }
+
+    #[test]
+    fn emit_const_r_records_prebuilt_unicode_descriptor() {
+        use crate::translator::rtyper::lltypesystem::rstr::emptyunicodefun;
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        let p = emptyunicodefun().expect("empty unicode");
+        let reg = asm.emit_const_r(&ConstValue::LLPtr(Box::new(p)), &mut state, None);
+        assert_eq!(state.str_consts.len(), 1);
+        assert_eq!(state.str_consts[0].kind, StrConstKind::Unicode);
+        assert!(state.str_consts[0].bytes.is_empty());
+        assert_eq!(state.str_consts[0].precomputed_hash, -1);
+        assert_eq!(state.constants_r, vec![str_const_sentinel(0)]);
+        let _ = reg;
     }
 
     #[test]
@@ -11828,6 +12040,18 @@ mod tests {
             ZERO,
         );
         cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_malloc_varsize"]),
+            0x4444_0004,
+        );
+        cc.register_function_fnaddr(
+            crate::parse::CallPath::from_segments([
+                "majit_rlib",
+                "rffi",
+                "ll_raw_malloc_varsize_zero",
+            ]),
+            0x5555_0005,
+        );
+        cc.register_function_fnaddr(
             crate::parse::CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_free"]),
             FREE,
         );
@@ -11842,6 +12066,7 @@ mod tests {
                 OpKind::RawMalloc {
                     owner: owner.into(),
                     zero,
+                    length: None,
                 },
                 true,
             )

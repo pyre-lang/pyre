@@ -16,18 +16,21 @@
 //! `_search_normal`) carry their graphs (`HighLevelOp.gendirectcall` /
 //! `getcallable`). [`ll_find_path`] walks those funcptrs depth-first
 //! (`call.py CallControl.find_all_graphs`) and registers each graph
-//! once, keyed by graph identity (`annlowlevel.py`
-//! `LowLevelAnnotatorPolicy.default_specialize` / `cachedgraph`
-//! `name__<argtypes>`). `policy.look_inside_graph` decides candidacy.
-//! A residual callee aliases the `HELPER_FNADDRS` row whose native
-//! takes the same STR / UNICODE layout.
+//! once by graph identity (`funcobj.graph` / `GraphKey::of`).
+//! `cachedgraph` `name__<argtypes>` is the alt_name label
+//! (`description.py FunctionDesc.cachedgraph`); Array pointees spell
+//! the element type (`array_Char`). `policy.look_inside_graph` decides
+//! candidacy. A residual callee aliases the `HELPER_FNADDRS` row whose
+//! native takes the same STR / UNICODE layout.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
-use crate::codewriter::call::CallControl;
+use crate::codewriter::call::{CallControl, CallKind};
 use crate::codewriter::jtransform_opname::lower_graph;
 use crate::flowspace::model::{ConstValue, FunctionGraph, Hlvalue};
+use crate::model::{CallTarget, OpKind, ValueType};
 use crate::parse::CallPath;
 use crate::policy::{DefaultJitPolicy, JitPolicy};
 use crate::rlib::rstring::effect_graph_from_search_helper;
@@ -77,12 +80,19 @@ fn search_normal_fnaddr_path() -> String {
 
 /// `description.py FunctionDesc.cachedgraph` `nameof` on one lltype.
 /// `default_specialize` keys `cachedgraph` by the argument-lltype tuple;
-/// Ptr uses `TO.__name__ + "Ptr"` (`lltype.py Ptr.__name__`), Struct and
-/// Primitive use `__name__` (`rpy_string`, `Signed`, `Char`).
+/// the `name__<argtypes>` alt_name is only a label. Ptr uses
+/// `TO.__name__ + "Ptr"` (`lltype.py Ptr.__name__`), Struct and
+/// Primitive use `__name__` (`rpy_string`, `Signed`, `Char`). Array
+/// spells `array_<OF>` so `Ptr(Array(Char))` and `Ptr(Array(UniChar))`
+/// never share a label.
 fn lltype_nameof(ty: &LowLevelType) -> String {
     match ty {
         LowLevelType::Ptr(p) => format!("{}Ptr", ptr_target_nameof(&p.TO)),
         LowLevelType::Struct(s) => s._name.clone(),
+        LowLevelType::Array(arr) => format!("array_{}", lltype_nameof(&arr.OF)),
+        LowLevelType::FixedSizeArray(arr) => {
+            format!("array{}_{}", arr.length, lltype_nameof(&arr.OF))
+        }
         LowLevelType::ForwardReference(fwd) => fwd
             .resolved()
             .as_ref()
@@ -116,7 +126,10 @@ fn ptr_target_nameof(to: &PtrTarget) -> String {
                 other => lltype_nameof(&other),
             })
             .unwrap_or_else(|| "ForwardReference".to_string()),
-        PtrTarget::Array(_) | PtrTarget::FixedSizeArray(_) => "array".to_string(),
+        PtrTarget::Array(arr) => format!("array_{}", lltype_nameof(&arr.OF)),
+        PtrTarget::FixedSizeArray(arr) => {
+            format!("array{}_{}", arr.length, lltype_nameof(&arr.OF))
+        }
         PtrTarget::Func(_) => "func".to_string(),
         PtrTarget::Opaque(opaque) => opaque.tag.clone(),
     }
@@ -182,9 +195,9 @@ fn specialized_callee_leaf(func: &_func) -> String {
     specialized_helper_leaf(&func._name, &func.TYPE.args)
 }
 
-/// CallPath for one callee. Prefer the graph's own name when the builder
-/// already stamped `name__<argtypes>`; otherwise derive it from
-/// `func._name` plus argument lltypes (`cachedgraph` `nameof`).
+/// CallPath label for one callee. Prefer the graph's own alt_name when
+/// the builder already stamped `name__<argtypes>`; otherwise derive it
+/// from `func._name` plus argument lltypes (`cachedgraph` `nameof`).
 fn callee_path(func: &_func, graph: &FunctionGraph) -> CallPath {
     let unspecialized = unspecialized_helper_name(&graph.name);
     if graph.name != unspecialized {
@@ -194,9 +207,10 @@ fn callee_path(func: &_func, graph: &FunctionGraph) -> CallPath {
     }
 }
 
-/// `cachedgraph` alt_name is `graph.name`; GraphStore keys by
-/// `(source_identity, name)`, so STR and UNICODE specializations of
-/// the same `func._name` must not share a name.
+/// `cachedgraph` alt_name is `graph.name`, a label.
+/// `call.py find_all_graphs` follows the graph object; GraphStore keys
+/// by `(source_identity, name)`, so two distinct graphs must not share
+/// a label.
 fn stamp_specialized_graph_name(graph: &mut FunctionGraph, leaf: &str) {
     graph.name = leaf.to_string();
     if let Some(func) = graph.func.as_mut() {
@@ -366,10 +380,13 @@ pub fn search_elidable_path_on(cc: &mut CallControl, ptr_lltype: &LowLevelType) 
     let ann = RPythonAnnotator::new(None, None, None, false);
     let rtyper = RPythonTyper::new(&ann);
     let leaf = specialized_helper_leaf(SEARCH_ELIDABLE, &ll_search_arg_types(ptr_lltype));
+    // Residual of `ll_search`'s callee: `ll_search` already asserted,
+    // so `value_can_be_none` is false (`transform_dead_code`).
     let py = crate::rlib::rstring::build_search_elidable_helper_graph(
         &rtyper,
         &leaf,
         ptr_lltype.clone(),
+        false,
     )
     .expect("_search_elidable helper graph");
     register_direct_call_callees(cc, &rtyper, &py.graph.borrow());
@@ -381,19 +398,68 @@ fn callee_already_registered(cc: &CallControl, path: &CallPath) -> bool {
     cc.has_function_graph(path) || cc.jitcode_handle(path).is_some() || cc.has_opname_graph(path)
 }
 
-/// Walk `direct_call` callee graphs depth-first, once per specialized
-/// path (`call.py CallControl.find_all_graphs` follows the funcptr
-/// GRAPH; `annlowlevel.py default_specialize` / `cachedgraph` names
-/// one graph per argument lltype). Each callee is registered then
-/// `add_candidate_graph_if_look_inside`; `policy.look_inside_graph`
-/// decides candidacy. Nested callees of a residual are registered for
-/// `getcalldescr` only.
+fn registered_label_graph_name(cc: &CallControl, path: &CallPath) -> Option<String> {
+    if let Some(graph) = cc.function_graphs().get(path) {
+        return Some(graph.name.clone());
+    }
+    if callee_already_registered(cc, path) {
+        return Some(path.last_segment().unwrap_or("").to_string());
+    }
+    None
+}
+
+fn stored_graph_arg_lltypes(cc: &CallControl, path: &CallPath) -> Option<Vec<LowLevelType>> {
+    let graph = cc.function_graphs().get(path)?;
+    let inputs = &graph.block(graph.startblock).inputargs;
+    let mut types = Vec::with_capacity(inputs.len());
+    for var in inputs {
+        types.push(var.concretetype()?);
+    }
+    Some(types)
+}
+
+/// Walk `direct_call` callee graphs depth-first, once per graph object
+/// (`call.py CallControl.find_all_graphs` follows the funcptr GRAPH;
+/// `annlowlevel.py default_specialize` / `cachedgraph` caches by the
+/// specialization key and uses `name__<argtypes>` only as alt_name).
+/// Each callee is registered then `add_candidate_graph_if_look_inside`;
+/// `policy.look_inside_graph` decides candidacy. Nested callees of a
+/// residual are registered for `getcalldescr` only.
+///
+/// `seen` deduplicates graph identity inside one walk. A label already
+/// registered as an effect-only graph is still offered as a candidate
+/// when a later walk reaches it with `offer_candidate` — effect analysis
+/// (`getcalldescr` / `effectinfo`) never marks a graph as seen for
+/// candidacy (`call.py CallControl.find_all_graphs`).
 fn register_direct_call_callees(
     cc: &mut CallControl,
     rtyper: &RPythonTyper,
     graph: &crate::flowspace::model::FunctionGraph,
 ) {
-    visit_direct_call_callees(cc, rtyper, graph, true);
+    visit_direct_call_callees(cc, rtyper, graph, true, &mut HashSet::new());
+}
+
+/// `call.py CallControl.guess_call_kind` on a `direct_call` funcobj.
+/// `find_all_graphs` follows only `'regular'`. A missing graph is residual;
+/// a recorded oopspec is builtin. Residual-from-`graphs_from` during this
+/// walk is a graph not yet in the candidate set — still registered here.
+fn follow_regular_direct_call(cc: &CallControl, func: &_func) -> bool {
+    if func.graph.is_none() {
+        return false;
+    }
+    let name = unspecialized_helper_name(&func._name);
+    let op = crate::model::SpaceOperation {
+        result: None,
+        kind: OpKind::Call {
+            target: CallTarget::function_path(name.split("::").filter(|s| !s.is_empty())),
+            args: Vec::new(),
+            result_ty: ValueType::Void,
+        },
+    };
+    match cc.guess_call_kind(&op) {
+        CallKind::Builtin | CallKind::Recursive => false,
+        CallKind::Regular | CallKind::Residual => true,
+    }
 }
 
 fn visit_direct_call_callees(
@@ -401,16 +467,34 @@ fn visit_direct_call_callees(
     rtyper: &RPythonTyper,
     graph: &crate::flowspace::model::FunctionGraph,
     offer_candidate: bool,
+    seen: &mut HashSet<usize>,
 ) {
     specialize_direct_call_funcptr_names(graph);
     for func in direct_call_funcobjs(graph) {
+        if !follow_regular_direct_call(cc, &func) {
+            continue;
+        }
         let graph_id = func
             .graph
-            .expect("HighLevelOp.gendirectcall funcptr carries graph");
+            .expect("regular direct_call funcptr carries graph");
+        if !seen.insert(graph_id) {
+            continue;
+        }
         let callee = graph_ref_for_funcptr_id(rtyper, graph_id)
             .expect("funcobj.graph lives on translator.graphs");
         let path = callee_path(&func, &callee.borrow());
-        if callee_already_registered(cc, &path) {
+        if let Some(existing) = registered_label_graph_name(cc, &path) {
+            if stored_graph_arg_lltypes(cc, &path).is_some_and(|args| args != func.TYPE.args) {
+                panic!(
+                    "specialized label {path} already names graph {existing}; colliding graph {}",
+                    callee.borrow().name
+                );
+            }
+            if offer_candidate && !cc.is_candidate(&path) {
+                register_callee_graph(cc, path.clone(), &callee.borrow(), true);
+                let nested_offer = cc.is_candidate(&path);
+                visit_direct_call_callees(cc, rtyper, &callee.borrow(), nested_offer, seen);
+            }
             continue;
         }
         let leaf = path
@@ -424,7 +508,7 @@ fn visit_direct_call_callees(
         specialize_direct_call_funcptr_names(&callee.borrow());
         register_callee_graph(cc, path.clone(), &callee.borrow(), offer_candidate);
         let nested_offer = offer_candidate && cc.is_candidate(&path);
-        visit_direct_call_callees(cc, rtyper, &callee.borrow(), nested_offer);
+        visit_direct_call_callees(cc, rtyper, &callee.borrow(), nested_offer, seen);
     }
 }
 
@@ -460,10 +544,13 @@ fn register_callee_graph(
     callee: &crate::flowspace::model::FunctionGraph,
     offer_candidate: bool,
 ) {
-    if callee_already_registered(cc, &path) {
+    if cc.is_candidate(&path) {
         return;
     }
     if !offer_candidate {
+        if callee_already_registered(cc, &path) {
+            return;
+        }
         let graph = effect_graph_from_search_helper(callee);
         cc.register_function_graph(path, graph);
         return;
@@ -474,7 +561,7 @@ fn register_callee_graph(
     if look_inside {
         cc.register_opname_helper_graph(path.clone(), flowspace_graph_for_opname_drain(callee));
         cc.register_function_graph(path.clone(), lower_graph(callee));
-    } else {
+    } else if !callee_already_registered(cc, &path) {
         cc.register_function_graph(path.clone(), effect);
     }
     cc.add_candidate_graph_if_look_inside(path.clone());
@@ -547,8 +634,8 @@ mod tests {
     use crate::codewriter::codewriter::CodeWriter;
     use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
     use crate::flowspace::model::{
-        Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, Hlvalue,
-        Link, SpaceOperation,
+        Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, GraphKey,
+        Hlvalue, Link, SpaceOperation,
     };
     use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
     use crate::policy::JitPolicy;
@@ -791,6 +878,72 @@ mod tests {
         assert!(cc.is_elidable(&CallTarget::function_path([str_search_elidable_leaf()])));
     }
 
+    /// Effect-only registration of a shared helper (first reached under
+    /// residual `_search_elidable`) does not block a later candidate
+    /// offer (`call.py CallControl.find_all_graphs`). Reverse order ends
+    /// in the same candidate + jitcode state.
+    #[test]
+    fn shared_helper_effect_only_then_candidate_becomes_candidate() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let elidable = crate::rlib::rstring::build_search_elidable_helper_graph(
+            &rtyper,
+            SEARCH_ELIDABLE,
+            STRPTR.clone(),
+            false,
+        )
+        .expect("_search_elidable");
+        let prep = crate::rlib::rstring::build_twoway_preprocess_helper_graph(
+            &rtyper,
+            "_twoway_preprocess",
+            STRPTR.clone(),
+        )
+        .expect("_twoway_preprocess");
+        let path = specialized_helper_path("ll_newlist", &[LowLevelType::Signed]);
+
+        // Nested callees of a residual (`offer_candidate == false`) are
+        // registered for `getcalldescr` only (`call.py find_all_graphs`
+        // under a non-candidate).
+        let mut residual_first = CallControl::new();
+        visit_direct_call_callees(
+            &mut residual_first,
+            &rtyper,
+            &elidable.graph.borrow(),
+            false,
+            &mut HashSet::new(),
+        );
+        assert!(
+            residual_first.has_function_graph(&path),
+            "residual walk registers {path}: {:?}",
+            residual_first.function_graphs().keys()
+        );
+        assert!(
+            !residual_first.is_candidate(&path),
+            "ll_newlist under residual _search_elidable is effect-only"
+        );
+        register_direct_call_callees(&mut residual_first, &rtyper, &prep.graph.borrow());
+        assert!(
+            residual_first.is_candidate(&path),
+            "later candidate walk offers the shared helper"
+        );
+        assert!(
+            residual_first.jitcode_handle(&path).is_some(),
+            "candidate helper has a jitcode"
+        );
+
+        let mut candidate_first = CallControl::new();
+        register_direct_call_callees(&mut candidate_first, &rtyper, &prep.graph.borrow());
+        visit_direct_call_callees(
+            &mut candidate_first,
+            &rtyper,
+            &elidable.graph.borrow(),
+            false,
+            &mut HashSet::new(),
+        );
+        assert!(candidate_first.is_candidate(&path));
+        assert!(candidate_first.jitcode_handle(&path).is_some());
+    }
+
     fn unwrap_pygraph(py: crate::flowspace::pygraph::PyGraph) -> FlowGraph {
         let crate::flowspace::pygraph::PyGraph { graph, .. } = py;
         Rc::try_unwrap(graph)
@@ -865,6 +1018,8 @@ mod tests {
     /// `contains` through `ll_find` residuals `ll_find_char` (m == 1,
     /// `ElidableCannotRaise`) and `_search_elidable` (m > 1 via
     /// `ll_search`, `ElidableOrMemoryError` from `_twoway_preprocess`).
+    /// `ll_search` narrowed `value`, so `_search_normal`
+    /// `assert value is not None` is cut (`transform_dead_code`).
     /// `jit_record_exact_value` lives on the `ll_find` CFG; Spine B
     /// lowers it to `record_exact_value_i` when that rewrite is present.
     #[test]
@@ -1341,6 +1496,8 @@ mod tests {
 
     /// `getcalldescr` (`call.py`) on `_search_elidable`: `_canraise`
     /// `"mem"` from `_twoway_preprocess` → `EF_ELIDABLE_OR_MEMORYERROR`.
+    /// `ll_search` narrowed `value`, so `_search_normal`
+    /// `assert value is not None` is cut (`transform_dead_code`).
     #[test]
     fn search_elidable_calldescr_is_elidable_or_memoryerror() {
         use majit_ir::value::Type;
@@ -1624,6 +1781,148 @@ mod tests {
             ),
             None,
             "STR _search_normal has no native row"
+        );
+    }
+
+    fn residual_named_helper(name: &str, arg: LowLevelType) -> FlowGraph {
+        let x = variable_with_lltype("x", arg);
+        let start = Block::shared(vec![Hlvalue::Variable(x)]);
+        let ret = variable_with_lltype("out", LowLevelType::Signed);
+        let mut graph =
+            FlowGraph::with_return_var(name.to_string(), start.clone(), Hlvalue::Variable(ret));
+        start.closeblock(vec![
+            Link::new(
+                vec![constant_with_lltype(
+                    ConstValue::Int(0),
+                    LowLevelType::Signed,
+                )],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let mut func = GraphFunc::new(name, Constant::new(ConstValue::Dict(Default::default())));
+        func._elidable_function_ = true;
+        graph.func = Some(func);
+        graph
+    }
+
+    /// `call.py find_all_graphs` follows graph identity. Two distinct
+    /// graphs that share `func._name` and would have spelled the same
+    /// `arrayPtr` label (STR vs UNICODE `chars`) both register, with
+    /// `array_Char` / `array_UniChar` alt_names.
+    #[test]
+    fn callcontrol_registers_distinct_graphs_that_share_func_name() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let char_ptr = chars_array_ptr_lltype_from_strptr(&STRPTR).expect("STR chars");
+        let uni_ptr = chars_array_ptr_lltype_from_strptr(&UNICODEPTR).expect("UNICODE chars");
+        let char_leaf = specialized_helper_leaf("helper", &[char_ptr.clone()]);
+        let uni_leaf = specialized_helper_leaf("helper", &[uni_ptr.clone()]);
+        assert_ne!(char_leaf, uni_leaf);
+        assert!(
+            char_leaf.contains("array_Char"),
+            "Char array label: {char_leaf}"
+        );
+        assert!(
+            uni_leaf.contains("array_UniChar"),
+            "UniChar array label: {uni_leaf}"
+        );
+
+        let char_graph = residual_named_helper("helper", char_ptr.clone()).into_ref();
+        let uni_graph = residual_named_helper("helper", uni_ptr.clone()).into_ref();
+        ann.translator
+            .graphs
+            .borrow_mut()
+            .extend([char_graph.clone(), uni_graph.clone()]);
+        let char_id = GraphKey::of(&char_graph).as_usize();
+        let uni_id = GraphKey::of(&uni_graph).as_usize();
+        assert_ne!(char_id, uni_id);
+
+        let start = Block::shared(vec![]);
+        let ret = variable_with_lltype("out", LowLevelType::Signed);
+        let parent = FlowGraph::with_return_var("caller", start.clone(), Hlvalue::Variable(ret));
+        for (arg, graph_id) in [(char_ptr, char_id), (uni_ptr, uni_id)] {
+            let ft = FuncType {
+                args: vec![arg.clone()],
+                result: LowLevelType::Signed,
+            };
+            let funcptr = functionptr(ft, "helper", Some(graph_id), Some("helper".into()));
+            let callee =
+                constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+            let out = variable_with_lltype("out", LowLevelType::Signed);
+            start.borrow_mut().operations.push(SpaceOperation::new(
+                "direct_call",
+                vec![callee, Hlvalue::Variable(variable_with_lltype("x", arg))],
+                Hlvalue::Variable(out),
+            ));
+        }
+        start.closeblock(vec![
+            Link::new(
+                vec![constant_with_lltype(
+                    ConstValue::Int(0),
+                    LowLevelType::Signed,
+                )],
+                Some(parent.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let mut cc = CallControl::new();
+        register_direct_call_callees(&mut cc, &rtyper, &parent);
+        let char_path = CallPath::from_segments([char_leaf.as_str()]);
+        let uni_path = CallPath::from_segments([uni_leaf.as_str()]);
+        assert_ne!(char_path, uni_path);
+        assert!(
+            cc.has_function_graph(&char_path),
+            "missing {char_path}; registered {:?}",
+            cc.function_graphs().keys()
+        );
+        assert!(
+            cc.has_function_graph(&uni_path),
+            "missing {uni_path}; registered {:?}",
+            cc.function_graphs().keys()
+        );
+        let char_stored = cc
+            .function_graphs()
+            .get(&char_path)
+            .expect("Char helper graph");
+        let uni_stored = cc
+            .function_graphs()
+            .get(&uni_path)
+            .expect("UniChar helper graph");
+        assert!(!std::rc::Rc::ptr_eq(&char_stored, &uni_stored));
+    }
+
+    /// `_ll_list_resize_ge` is an ordinary traced graph (`rlist.py
+    /// _ll_list_resize_ge`). The strfind walk offers it as a candidate;
+    /// `lower_graph` transduces `jit_conditional_call` instead of demoting.
+    #[test]
+    fn ll_list_resize_ge_registers_as_a_candidate() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let prep = crate::rlib::rstring::build_twoway_preprocess_helper_graph(
+            &rtyper,
+            "_twoway_preprocess",
+            STRPTR.clone(),
+        )
+        .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge")
+            .clone();
+        drop(graphs);
+        let mut cc = CallControl::new();
+        register_direct_call_callees(&mut cc, &rtyper, &prep.graph.borrow());
+        let path = CallPath::from_segments(["_ll_list_resize_ge"]);
+        register_callee_graph(&mut cc, path.clone(), &ge.borrow(), true);
+        assert!(
+            cc.is_candidate(&path),
+            "_ll_list_resize_ge must be a candidate; registered {:?}",
+            cc.function_graphs().keys()
         );
     }
 }

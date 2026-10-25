@@ -23,7 +23,7 @@ fn execute_box_str_constant(args: &[Value]) -> Option<Value> {
         return None;
     };
     // `box_str_constant`'s source is `&Wtf8` — rstr `Ptr(STR)`
-    // (`OpKind::ConstStr`, `StrConstDescriptor.as_unicode_object = false`).
+    // (`OpKind::ConstStr`, `StrConstKind::Str`).
     // Intern by chars (`WeakValueDictRepr.ll_get`). A wrapper-kind operand
     // (`OpKind::ConstInternedStr`) is `interned_str_from_typed_const` with
     // `BoxStrConstKind::InternedUnicode`; this residual's argument is STR.

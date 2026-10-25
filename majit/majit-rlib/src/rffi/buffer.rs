@@ -773,6 +773,95 @@ pub extern "C" fn ll_raw_malloc_fixedsize_zero(size: i64) -> i64 {
     ptr as usize as i64
 }
 
+/// `transform.py _ll_compute_size`: `ovfcheck(itemsize * n)` then
+/// `ovfcheck(basesize + varsize)`. Overflow is MemoryError. A result
+/// that does not fit a signed word (`tot_size < 0` or
+/// `tot_size > sys.maxint`) is MemoryError too.
+fn ll_compute_size(n: i64, basesize: i64, itemsize: i64) -> Option<usize> {
+    let varsize = itemsize.checked_mul(n)?;
+    let tot_size = basesize.checked_add(varsize)?;
+    let bytes = usize::try_from(tot_size).ok()?;
+    if bytes > isize::MAX as usize {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// MemoryError result of a raw malloc helper: NULL, the same false
+/// `allocate` result `_ll_malloc_fixedsize` raises MemoryError on.
+fn raw_malloc_memory_error() -> i64 {
+    0
+}
+
+/// Variable-size `lltype.malloc(ARRAY, n, flavor='raw')`.
+///
+/// `support.py build_raw_malloc_varsize_builder` closes ARRAY into a
+/// one-argument `_ll_1_raw_malloc_varsize`. The size here is
+/// `basesize + n * itemsize`; `CArray` / `nolength` arrays have
+/// basesize 0. Alignment stays inside `raw_malloc`.
+///
+/// `n`, `basesize`, `itemsize`, and the address are `i64` words
+/// (`extern "C"`). A `usize` parameter is i32 on wasm32.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_varsize(n: i64, basesize: i64, itemsize: i64) -> i64 {
+    let Some(bytes) = ll_compute_size(n, basesize, itemsize) else {
+        return raw_malloc_memory_error();
+    };
+    unsafe { raw_malloc(bytes) as usize as i64 }
+}
+
+/// `zero=True` form of [`ll_raw_malloc_varsize`]. The block is cleared
+/// for `basesize + n * itemsize` bytes. A zero-size request still
+/// returns a distinct block and writes nothing.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_varsize_zero(n: i64, basesize: i64, itemsize: i64) -> i64 {
+    let Some(bytes) = ll_compute_size(n, basesize, itemsize) else {
+        return raw_malloc_memory_error();
+    };
+    let ptr = unsafe { raw_malloc(bytes) };
+    if bytes > 0 {
+        unsafe { ptr.write_bytes(0, bytes) };
+    }
+    ptr as usize as i64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "majit_rlib::rffi::ll_raw_malloc_varsize",
+        ll_raw_malloc_varsize as *const (),
+        3,
+    );
+
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static __MAJIT_HELPER_FNADDR_ll_raw_malloc_varsize_zero: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_zero",
+        ll_raw_malloc_varsize_zero as *const (),
+        3,
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn __majit_register_helper_fnaddr_ll_raw_malloc_varsize() {
+    majit_ir::helper_fnaddr::register(
+        "majit_rlib::rffi::ll_raw_malloc_varsize",
+        ll_raw_malloc_varsize as *const (),
+        3,
+    );
+    majit_ir::helper_fnaddr::register(
+        "majit_rlib::rffi::ll_raw_malloc_varsize_zero",
+        ll_raw_malloc_varsize_zero as *const (),
+        3,
+    );
+}
+
 /// `lltype.free(ptr, flavor='raw')`. `jtransform.py rewrite_op_free`
 /// residualizes this as `raw_free`; the call cannot raise.
 /// `ptr` is an `i64` word; the body casts it to `usize`.
@@ -785,7 +874,10 @@ pub extern "C" fn ll_raw_free(ptr: i64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ll_raw_free, ll_raw_malloc_fixedsize, ll_raw_malloc_fixedsize_zero};
+    use super::{
+        ll_raw_free, ll_raw_malloc_fixedsize, ll_raw_malloc_fixedsize_zero, ll_raw_malloc_varsize,
+        ll_raw_malloc_varsize_zero,
+    };
 
     #[test]
     fn fixedsize_roundtrip_zero_clears_and_free() {
@@ -820,6 +912,56 @@ mod tests {
         }
         ll_raw_free(odd);
         ll_raw_free(0);
+    }
+
+    /// `transform.py _ll_compute_size`: payload is `basesize + n * itemsize`.
+    /// The `_zero` helper clears that many bytes. Overflow of the signed
+    /// product or sum is MemoryError (`NULL`, the false `allocate` result
+    /// `_ll_malloc_fixedsize` raises on).
+    #[test]
+    fn raw_malloc_varsize_basesize_plus_n_itemsize_zero_and_overflow() {
+        let ptr = ll_raw_malloc_varsize(3, 8, 4);
+        assert_ne!(ptr, 0);
+        assert_eq!((ptr as usize) & 15, 0);
+        unsafe {
+            let p = ptr as *mut u8;
+            for i in 0..20 {
+                p.add(i).write(0x5A);
+                assert_eq!(p.add(i).read(), 0x5A);
+            }
+        }
+        ll_raw_free(ptr);
+
+        let zeroed = ll_raw_malloc_varsize_zero(3, 8, 4);
+        assert_ne!(zeroed, 0);
+        unsafe {
+            let bytes = std::slice::from_raw_parts(zeroed as *const u8, 20);
+            assert!(bytes.iter().all(|b| *b == 0));
+        }
+        ll_raw_free(zeroed);
+
+        let empty = ll_raw_malloc_varsize(0, 0, 8);
+        assert_ne!(empty, 0);
+        ll_raw_free(empty);
+
+        assert_eq!(ll_raw_malloc_varsize(i64::MAX, 0, 2), 0);
+        assert_eq!(ll_raw_malloc_varsize_zero(i64::MAX, 8, 8), 0);
+        // n=-1, basesize=0, itemsize=8 → tot_size=-8, MemoryError.
+        assert_eq!(ll_raw_malloc_varsize(-1, 0, 8), 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn raw_malloc_varsize_helpers_are_published() {
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        for leaf in ["ll_raw_malloc_varsize", "ll_raw_malloc_varsize_zero"] {
+            let path = format!("majit_rlib::rffi::{leaf}");
+            assert!(
+                published.contains(&path.as_str()),
+                "{path} is not published"
+            );
+        }
     }
 
     #[test]

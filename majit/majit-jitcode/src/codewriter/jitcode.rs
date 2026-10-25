@@ -59,27 +59,80 @@ pub trait SsaReprDump: std::fmt::Debug {
 /// Field-by-field mapping below preserves the RPython names. Where
 /// RPython uses `chr(int)` to pack a 0..255 register count into a single
 /// byte we use `u8` directly; the value range is identical.
-/// A prebuilt-string constant whose runtime STR GcStruct is materialized
-/// at jitcode-load time (the build-time translator cannot allocate it; see
-/// [`JitCodeBody::str_consts`]).  The content key is `bytes`; identical
-/// literals across a jitcode share one descriptor.
+/// Runtime layout of a deferred prebuilt-string `constants_r` slot.
+///
+/// Three layouts share one descriptor because the assembler pools every
+/// prebuilt string-shaped constant through `emit_str_const_r`. Default
+/// is [`Self::Str`] so older serialized descriptors without this field
+/// keep the rstr `Ptr(STR)` payload.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum StrConstKind {
+    /// rstr `Ptr(STR)` (`StringRepr.convert_const` / `StringRepr.lowleveltype`).
+    #[default]
+    Str,
+    /// rstr `Ptr(UNICODE)` (`UnicodeRepr.convert_const` /
+    /// `UnicodeRepr.lowleveltype`). Consumers are `unicodelen`,
+    /// `unicodegetitem`, `copyunicodecontent`, and residual
+    /// `ll_find_char_unicode`.
+    Unicode,
+    /// Interned `W_UnicodeObject` (`ConstInternedStr` residual `w_name` ABI,
+    /// `box_str_constant` / `WeakValueDictRepr.convert_const`).
+    UnicodeObject,
+}
+
+/// A prebuilt-string constant whose runtime STR / UNICODE GcStruct (or
+/// boxed `W_UnicodeObject`) is materialized at jitcode-load time (the
+/// build-time translator cannot allocate it; see
+/// [`JitCodeBody::str_consts`]).  The content key is `bytes` when
+/// [`Self::container_id`] is `None`; otherwise the assembler keyed by
+/// `value._obj.container` (`assembler.py Assembler.emit_const`).
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StrConstDescriptor {
     /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
     /// the runtime load pass overwrites with the live STR address.
     pub constants_r_index: usize,
-    /// The string's bytes (Latin-1 / Py2 `str` embedding, the `chars`
-    /// payload of the prebuilt `Ptr(STR)` container).
+    /// Payload bytes. [`StrConstKind::Str`] stores the `Ptr(STR)` `chars`
+    /// (`Char` cells verbatim). [`StrConstKind::UnicodeObject`] stores the
+    /// interned `W_UnicodeObject` WTF-8. [`StrConstKind::Unicode`] stores
+    /// little-endian UCS-4 `UniChar` cells.
     pub bytes: Vec<u8>,
-    /// `ll_strhash_value(bytes)` (the `0 -> 29872897` not-computed fixup
-    /// already applied), written to the STR block's `hash` field at
-    /// offset 0 so the runtime never recomputes it.
+    /// `ll_strhash` of the payload (the `0 -> 29872897` not-computed
+    /// fixup already applied). Written to the STR / UNICODE block's
+    /// `hash` field at offset 0 so the runtime never recomputes it.
+    /// For [`StrConstKind::Unicode`] this is `ll_strhash` over the
+    /// `UniChar` cells (`UnicodeRepr.convert_const`).
     pub precomputed_hash: i64,
-    /// When true, the load pass writes the interned `W_UnicodeObject`
-    /// wrapper into the slot (`box_str_constant` result). When false,
-    /// it writes the rstr `_utf8` payload (`StringRepr.convert_const`).
+    /// Slot layout at runtime. Missing field deserializes as
+    /// [`StrConstKind::Str`].
     #[serde(default)]
-    pub as_unicode_object: bool,
+    pub kind: StrConstKind,
+    /// `assembler.py Assembler.emit_const` `value._obj.container` identity.
+    /// `None` is a bytes-only literal (`ConstInternedStr`) with no
+    /// container; the runtime then intern-keys by `(bytes, kind)`.
+    #[serde(default)]
+    pub container_id: Option<u64>,
+}
+
+/// Little-endian UCS-4 cells stored in [`StrConstDescriptor::bytes`]
+/// when [`StrConstKind::Unicode`].
+pub fn unicode_const_cells(bytes: &[u8]) -> Vec<u32> {
+    assert!(
+        bytes.len().is_multiple_of(4),
+        "Ptr(UNICODE) descriptor bytes must be UCS-4 cells"
+    );
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// Pack UCS-4 `UniChar` cells into [`StrConstDescriptor::bytes`].
+pub fn unicode_const_bytes(cells: &[u32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(cells.len() * 4);
+    for &cell in cells {
+        bytes.extend_from_slice(&cell.to_le_bytes());
+    }
+    bytes
 }
 
 /// A payload-less enum-variant singleton constant whose runtime cell is
