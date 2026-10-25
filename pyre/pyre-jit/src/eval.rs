@@ -8,7 +8,7 @@
 //! Equivalent to PyPy's `pypyjit/interp_jit.py` — the JIT is injected
 //! from outside the interpreter.
 
-use crate::jit::state::{PyreEnv, PyreJitState};
+use crate::jit::state::{PyreEnv, PyreJitState, PyreMeta};
 use crate::jit::trace::trace_bytecode;
 use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
@@ -7862,6 +7862,87 @@ impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
     }
 }
 
+/// The `SwitchToBlackhole` a `MetaInterp::interpret` walk that returned
+/// `Abort` stands for.
+///
+/// `history.py SwitchToBlackhole`: `raising_exception` is the flag the
+/// raise site passed. Both `ABORT_ESCAPE` raises in `pyjitpl.py`
+/// (`vable_after_residual_call`, `do_not_in_trace_call`) pass
+/// `raising_exception=True`. Any other abort leaves it false, so a saved
+/// `last_exc_value` is `exception_last_value` on the first blackhole frame
+/// (`blackhole.py convert_and_run_from_pyjitpl`) rather than the exception
+/// `_run_forever` raises immediately.
+pub(crate) fn interpret_abort_switch_to_blackhole(
+    meta: &majit_metainterp::MetaInterp<PyreMeta>,
+) -> majit_metainterp::SwitchToBlackhole {
+    let reason = meta
+        .last_interpret_abort_reason
+        .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP);
+    majit_metainterp::SwitchToBlackhole {
+        reason,
+        raising_exception: meta.last_exc_value != 0
+            && reason == majit_metainterp::counters::ABORT_ESCAPE,
+    }
+}
+
+/// `pyjitpl.py MetaInterp.run_blackhole_interp_to_cancel_tracing(stb)` on
+/// the metainterp-owned framestack an `interpret` walk stopped in:
+/// `blackhole.py convert_and_run_from_pyjitpl` finishes those frames from the
+/// state the concrete walk reached. Each Python level publishes its frame as
+/// `topframeref` while it runs and is marked finished when it is torn down.
+pub(crate) fn run_blackhole_interp_to_cancel_tracing(
+    meta: &mut majit_metainterp::MetaInterp<PyreMeta>,
+    stb: majit_metainterp::SwitchToBlackhole,
+) -> majit_metainterp::jitexc::JitException {
+    // `pyjitpl.py finish_setup` stores one `BlackholeInterpBuilder` on
+    // `metainterp_sd.blackholeinterpbuilder`. Acquire through that pool
+    // (`blackhole.py convert_and_run_from_pyjitpl`) rather than minting a
+    // second builder whose cpu is unbound.
+    let staticdata = std::sync::Arc::clone(&meta.staticdata);
+    let mut builder =
+        majit_metainterp::SharedBlackholeInterpPool::new(&staticdata.blackholeinterpbuilder);
+    let per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
+    let saved_root =
+        majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
+    let set_topframeref = |frame_ptr: i64| {
+        if frame_ptr != 0 {
+            unsafe {
+                (*ec).topframeref = frame_ptr as *mut PyFrame;
+            }
+        }
+    };
+    let level_recursion = std::cell::RefCell::new(
+        per_frame
+            .iter()
+            .skip(1)
+            .filter(|&&(frame_ptr, _)| frame_ptr != 0)
+            .map(|&(frame_ptr, _)| {
+                pyre_interpreter::call::enter_recursive_frame(frame_ptr as *const PyFrame)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let finish_level = |frame_ptr: i64| {
+        pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+        if frame_ptr != 0 {
+            level_recursion.borrow_mut().pop();
+        }
+    };
+    let outcome = meta.run_blackhole_interp_to_cancel_tracing(
+        stb,
+        &mut builder,
+        Some(per_frame.as_slice()),
+        Some(&set_topframeref as &dyn Fn(i64)),
+        Some(&finish_level as &dyn Fn(i64)),
+    );
+    unsafe {
+        (*ec).topframeref = majit_gc::shadow_stack::get(saved_root).0 as *mut PyFrame;
+    }
+    majit_gc::shadow_stack::pop_to(saved_root);
+    outcome
+}
+
 /// Walk the build-time portal with metainterp-owned frames. Cancellation
 /// finishes those frames in the blackhole before handing control back to the
 /// native portal (`pyjitpl.py run_blackhole_interp_to_cancel_tracing`).
@@ -7977,68 +8058,8 @@ fn drive_portal_metatrace(
             outcome
         }
         TraceAction::Abort | TraceAction::CloseLoop | TraceAction::CloseLoopWithArgs { .. } => {
-            let staticdata = std::sync::Arc::clone(&meta.staticdata);
-            let mut builder = majit_metainterp::SharedBlackholeInterpPool::new(
-                &staticdata.blackholeinterpbuilder,
-            );
-            let per_frame =
-                pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
-            let ec = pyre_interpreter::call::getexecutioncontext()
-                as *mut pyre_interpreter::PyExecutionContext;
-            let saved_root =
-                majit_gc::shadow_stack::push(
-                    majit_ir::GcRef(unsafe { (*ec).topframeref } as usize),
-                );
-            let set_topframeref = |frame_ptr: i64| {
-                if frame_ptr != 0 {
-                    unsafe {
-                        (*ec).topframeref = frame_ptr as *mut PyFrame;
-                    }
-                }
-            };
-            let level_recursion = std::cell::RefCell::new(
-                per_frame
-                    .iter()
-                    .skip(1)
-                    .filter(|&&(frame_ptr, _)| frame_ptr != 0)
-                    .map(|&(frame_ptr, _)| {
-                        pyre_interpreter::call::enter_recursive_frame(frame_ptr as *const PyFrame)
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            let finish_level = |frame_ptr: i64| {
-                pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
-                if frame_ptr != 0 {
-                    level_recursion.borrow_mut().pop();
-                }
-            };
-            let reason = meta
-                .last_interpret_abort_reason
-                .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP);
-            // `history.py SwitchToBlackhole`: `raising_exception` is the
-            // flag the raise site passed. Both `ABORT_ESCAPE` raises in
-            // `pyjitpl.py` (`vable_after_residual_call`,
-            // `do_not_in_trace_call`) pass `raising_exception=True`. Any
-            // other abort leaves it false, so a saved `last_exc_value`
-            // is `exception_last_value` on the first blackhole frame
-            // (`blackhole.py convert_and_run_from_pyjitpl`) rather than
-            // the exception `_run_forever` raises immediately.
-            let outcome = meta.run_blackhole_interp_to_cancel_tracing(
-                majit_metainterp::SwitchToBlackhole {
-                    reason,
-                    raising_exception: meta.last_exc_value != 0
-                        && reason == majit_metainterp::counters::ABORT_ESCAPE,
-                },
-                &mut builder,
-                Some(per_frame.as_slice()),
-                Some(&set_topframeref as &dyn Fn(i64)),
-                Some(&finish_level as &dyn Fn(i64)),
-            );
-            unsafe {
-                (*ec).topframeref = majit_gc::shadow_stack::get(saved_root).0 as *mut PyFrame;
-            }
-            majit_gc::shadow_stack::pop_to(saved_root);
-            outcome
+            let stb = interpret_abort_switch_to_blackhole(meta);
+            run_blackhole_interp_to_cancel_tracing(meta, stb)
         }
         other => panic!("unexpected portal tracing action: {other:?}"),
     };
@@ -8697,6 +8718,10 @@ fn run_compiled_generatorentry(
             }
             return None;
         }
+        // `pyjitpl.py handle_guard_failure` parks the grabbed exception
+        // for the walk; keep it alive through the blackhole fallback so
+        // a moving collection cannot leave a stale word in this local.
+        let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
         // `compile.py AbstractResumeGuardDescr.handle_fail`:
         // `must_compile` then `_trace_and_compile_from_bridge`.
         // `warmstate.py execute_assembler` is this driver's WarmEnterState
@@ -8733,7 +8758,12 @@ fn run_compiled_generatorentry(
                     .expect("a guard exit carrying resume storage carries its layout");
                 let _guard = GuardCompilingScope::new(descr_arc);
                 let resolution = crate::call_jit::trace_and_compile_from_bridge(
-                    descr_arc, None, &values, layout, guard_exc, true,
+                    descr_arc,
+                    None,
+                    &values,
+                    layout,
+                    guard_exc_root.get(),
+                    true,
                 );
                 match resolution {
                     crate::call_jit::BridgeResolution::CompiledContinueLive(live) => {
@@ -8769,7 +8799,7 @@ fn run_compiled_generatorentry(
             exit_layout
                 .as_deref()
                 .expect("a guard exit carrying resume storage carries its layout"),
-            guard_exc,
+            guard_exc_root.get(),
             true,
             None,
         );
@@ -11966,12 +11996,21 @@ fn handle_fail(
         .and_then(majit_backend::descr_owning_jct)
         .filter(|token| token.is_invalidated())
     {
-        let (driver, _) = driver_pair();
-        if driver
-            .get_loop_token_arc(green_key)
-            .is_some_and(|installed| std::sync::Arc::ptr_eq(&installed, &owner))
-        {
-            driver.invalidate_loop(green_key);
+        // `compile.py _trace_and_compile_from_bridge` uses
+        // `self.jitdriver_sd` of the failing loop
+        // (`rd_loop_token.outermost_jitdriver_sd`). A generatorentry
+        // or unpackiterable guard's token lives on that driver's cell.
+        if let Some(jd_no) = owner.outermost_jitdriver_index {
+            let (driver, _) = driver_pair();
+            if driver
+                .meta_interp()
+                .get_loop_token_on_driver(jd_no, green_key)
+                .is_some_and(|installed| std::sync::Arc::ptr_eq(&installed, &owner))
+            {
+                driver
+                    .meta_interp_mut()
+                    .invalidate_loop_on_driver(jd_no, green_key);
+            }
         }
     }
 
@@ -11997,7 +12036,7 @@ fn handle_fail(
                 Some(frame),
                 raw_values,
                 exit_layout,
-                guard_exc,
+                _guard_exc_root.get(),
                 true,
             )
         };
@@ -12118,6 +12157,10 @@ fn dispatch_handle_fail(
             HandleFailDispatch::Fallthrough
         }
     };
+    // Keep the grabbed exception rooted across the bridge attempt so a
+    // moving collection forwards it before the blackhole fallback reads
+    // the word (`pyjitpl.py handle_guard_failure`).
+    let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
     match handle_fail(
         frame_root.frame(),
         green_key,
@@ -12128,7 +12171,7 @@ fn dispatch_handle_fail(
         owning_key,
         exit_layout,
         raw_values,
-        guard_exc,
+        guard_exc_root.get(),
         info,
         savedata,
     ) {
@@ -12142,7 +12185,7 @@ fn dispatch_handle_fail(
             let bh_result = resume_in_blackhole_from_exit_layout(
                 raw_values,
                 exit_layout,
-                guard_exc,
+                guard_exc_root.get(),
                 false,
                 savedata,
             );

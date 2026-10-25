@@ -1546,6 +1546,7 @@ two-phase-annotate-skipped	pyre_jit::eval::eval_with_jit
 two-phase-annotate-skipped	pyre_jit::eval::eval_with_jit_inner
 two-phase-annotate-skipped	pyre_jit::eval::handle_jitexception
 two-phase-annotate-skipped	pyre_jit::eval::install_build_time_liveness_before_trace
+two-phase-annotate-skipped	pyre_jit::eval::interpret_abort_switch_to_blackhole
 two-phase-annotate-skipped	pyre_jit::eval::jit_is_off
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed::<Impl>::call_once
@@ -1555,6 +1556,7 @@ two-phase-annotate-skipped	pyre_jit::eval::portal_runner_dispatch
 two-phase-annotate-skipped	pyre_jit::eval::publish_kind0_descrs_before_trace
 two-phase-annotate-skipped	pyre_jit::eval::report_exit_frame_delivery
 two-phase-annotate-skipped	pyre_jit::eval::report_exit_frame_delivery__AccessDirect_None
+two-phase-annotate-skipped	pyre_jit::eval::run_blackhole_interp_to_cancel_tracing
 two-phase-annotate-skipped	pyre_jit::eval::screen_exit_frame_delivery
 two-phase-annotate-skipped	pyre_jit::eval::screen_exit_frame_delivery__AccessDirect_None
 two-phase-annotate-skipped	pyre_jit::eval::screen_frame_already_recorded

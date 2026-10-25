@@ -2512,29 +2512,80 @@ impl<S: JitState> JitDriver<S> {
         self.meta.framestack.frames.len()
     }
 
-    /// `MetaInterp::rebuild_portal_framestack_from_resumedata` with this
-    /// driver's allocator, so a virtual the register rebuild materializes
-    /// is allocated like one a frame value names.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rebuild_portal_framestack_from_resumedata(
+    /// State-independent `start_bridge_tracing` body for an entry no
+    /// direct reader preceded (`execute_replay = true`): pendingfields
+    /// and virtuals through the executing BoxReader
+    /// (`resume.py ResumeDataBoxReader.allocate_with_vtable` is
+    /// `execute_new_with_vtable`), ResumeAtPosition, compiled-target
+    /// lookups, `rebuild_from_resumedata`'s vref decode
+    /// (`consume_vref_and_vable_boxes`) then `newframe` / `consume_boxes`,
+    /// then virtualref reconnection (`pyjitpl.py
+    /// rebuild_state_after_failure` after that return).
+    ///
+    /// Uses `S::mint_bridge_array_descr` like `start_bridge_tracing`.
+    /// The generatorentry (jd2) path calls this because `driver_pair()`
+    /// is typed for `PyreJitState`.
+    pub fn resume_bridge_from_executing_reader(
         &mut self,
-        frames: &[majit_ir::resumedata::RebuiltFrame],
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+        resume_data: &crate::ResumeDataResult,
         fail_values: &[i64],
         fail_types: &[majit_ir::Type],
         materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
-        resume_liveness: &[u8],
-        resume_op_live: u8,
-        reader: &mut crate::BridgeVirtualCache<'_>,
     ) -> bool {
-        self.meta.rebuild_portal_framestack_from_resumedata(
-            frames,
+        let Some(allocator) = self
+            .blackhole_allocator
+            .as_deref()
+            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
+        else {
+            return false;
+        };
+        let virtual_count = resume_data
+            .storage
+            .as_deref()
+            .map_or(0, |storage| storage.rd_virtuals().map_or(0, <[_]>::len));
+        let mut reader = crate::BridgeVirtualCache::executing(
+            virtual_count,
+            S::mint_bridge_array_descr,
+            allocator,
+            fail_values,
+            fail_types,
+        );
+        if !self
+            .meta
+            .apply_state_independent_bridge_resume(descr_arc, resume_data, &mut reader)
+        {
+            return false;
+        }
+        // resume.py `rebuild_from_resumedata`: `consume_vref_and_vable_boxes`
+        // before the `newframe` loop.
+        let Some(virtualref_boxes) = self
+            .meta
+            .consume_bridge_virtualref_boxes(resume_data, &mut reader)
+        else {
+            return false;
+        };
+        let liveness = self.meta.staticdata.liveness_info.snapshot_arc();
+        let op_live = self.meta.staticdata.op_live as u8;
+        let rebuilt = self.meta.rebuild_portal_framestack_from_resumedata(
+            &resume_data.frames,
             fail_values,
             fail_types,
             materialized,
-            resume_liveness,
-            resume_op_live,
-            reader,
-        )
+            liveness.as_ref(),
+            op_live,
+            &mut reader,
+        );
+        if !rebuilt {
+            return false;
+        }
+        // pyjitpl.py `rebuild_state_after_failure` after
+        // `rebuild_from_resumedata` returns the vref pairs.
+        // Re-read through the still-live cache: `getref_base()` at
+        // reconnection, not a usize copied before `newframe`.
+        self.meta
+            .reconnect_bridge_virtualrefs(virtualref_boxes, &reader);
+        true
     }
 
     /// Pre-register the per-driver green / red schema with the embedded
@@ -6328,14 +6379,12 @@ impl<S: JitState> JitDriver<S> {
             let mut virt_cache = match allocator {
                 Some(allocator) => crate::BridgeVirtualCache::executing(
                     virtual_count,
-                    crate::default_bridge_array_descr,
+                    S::mint_bridge_array_descr,
                     allocator,
                     raw_values,
                     &fail_types,
                 ),
-                None => {
-                    crate::BridgeVirtualCache::new(virtual_count, crate::default_bridge_array_descr)
-                }
+                None => crate::BridgeVirtualCache::new(virtual_count, S::mint_bridge_array_descr),
             };
             let mut frames = Vec::with_capacity(sections.len());
             for (depth, (jitcode, pc)) in sections.into_iter().enumerate() {
@@ -9856,18 +9905,8 @@ impl<S: JitState> JitDriver<S> {
     /// WarmEnterState (`JitDriver::index`). Compile-time
     /// `MetaInterp::invalidate_loop` still reads `get_procedure_token`.
     pub fn invalidate_loop(&mut self, green_key: u64) {
-        if let Some(token) = self
-            .meta
-            .get_procedure_token_on_driver(self.index().unwrap_or(0), green_key)
-        {
-            token.invalidate();
-            if crate::debug::have_debug_prints() {
-                crate::debug::log_one(
-                    "jit-invalidate",
-                    &format!("invalidated loop at key={green_key}"),
-                );
-            }
-        }
+        self.meta
+            .invalidate_loop_on_driver(self.index().unwrap_or(0), green_key);
     }
 
     /// Drop the metainterpreter metadata for a loop that has already been
@@ -11580,15 +11619,6 @@ impl<S: JitState> JitDriver<S> {
         // pyjitpl.py:2890 parity: bridge traces start at resume_pc, not at
         // function entry (pc=0). Set header_pc so init_symbolic correctly
         // detects this is NOT a function-entry trace.
-        // pyjitpl.py reached_loop_header parity:
-        // Set live lookup callback for has_compiled_targets(greenkey).
-        // RPython: ptoken = self.get_procedure_token(greenboxes)
-        //          if has_compiled_targets(ptoken): ...
-        // Use a raw pointer to self.meta for the callback — safe because
-        // bridge tracing runs synchronously within start_bridge_tracing's
-        // caller scope, so self.meta outlives the callback.
-        let meta_ptr = &self.meta as *const _ as *const ();
-        let depth_ptr = std::ptr::addr_of_mut!(self.meta.portal_call_depth);
         // pyjitpl.py `handle_guard_failure` runs on a MetaInterp whose
         // `jitdriver_sd` is the guard's owning loop's driver. A bridge trace
         // that reaches a loop header (`jit_merge_point` → `compile_loop`)
@@ -11645,74 +11675,15 @@ impl<S: JitState> JitDriver<S> {
         // can apply bridge-only behavior without overloading
         // `has_compiled_targets_fn` presence.
         ctx.is_bridge_trace = true;
-        // pyjitpl.py `_handle_guard_failure`:
-        //
-        //     self.seen_loop_header_for_jdindex = -1
-        //     if isinstance(key, compile.ResumeAtPositionDescr):
-        //         self.seen_loop_header_for_jdindex = self.jitdriver_sd.index
-        //
-        // A `ResumeAtPositionDescr` is the descr `inline_short_preamble`
-        // stamps onto the guards it replays (unroll.py:337 / :409), so the
-        // guard sits at the target loop's entry and the bridge grown from it
-        // has to close at the very first merge point it reaches. Pre-arming
-        // the flag is what makes that happen: the merge point's own ladder
-        // (`if not any_operation` / `portal_call_depth` /
-        // `has_compiled_targets`, pyjitpl.py) is skipped and the
-        // close protocol runs. Without it the bridge records a whole extra
-        // iteration before it can close.
-        //
-        // The flag is one-shot on both sides: the merge point resets it to
-        // -1 (pyjitpl.py) after consuming it, so only the FIRST crossing
-        // is forced. `compile_trace`'s sibling read of the same descr class
-        // (`inline_short_preamble = False`, compile.py) lives at
-        // `pyjitpl.rs`'s bridge compile entry.
-        //
-        // Upstream writes `self.jitdriver_sd.index` straight into the flag
-        // because that value IS the `jdindex` the following merge point
-        // carries. Pyre's registered slot and the op's build-time `jdindex`
-        // can differ by the `ensure_default_driver_sd` placeholder shift, and
-        // the merge point asserts the two agree, so arm a request instead and
-        // let the merge point stamp its own `jdindex`.
-        //
-        // The test is on `get_resumestorage()`, not on the failing descr:
-        // upstream's `key` is the resolved storage, so a guard that shares a
-        // short-preamble donor's resume data through `ResumeGuardCopiedDescr`
-        // arms the flag as well. `compile_trace`'s sibling read is the one
-        // that stays unresolved (compile.py:1040 tests `resumekey` itself).
-        ctx.bridge_resume_at_position =
-            crate::compile::get_resumestorage(descr_arc).is_resume_at_position();
         if let Some((_, ptr)) = &live_vable {
             ctx.set_virtualizable_heap_ptr(*ptr);
         }
         ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
         ctx.bridge_target_header_pc = parent_header_pc;
-        ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
-            let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
-            meta.has_compiled_targets(gk)
-        }));
-        ctx.compiled_key_for_greens_fn = Some(Box::new(
-            move |greens: &(Vec<i64>, Vec<i64>, Vec<i64>)| -> Option<u64> {
-                let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
-                meta.compiled_key_for_greens(greens)
-            },
-        ));
-        // pyjitpl.py:1551 first-iteration auto loop-header
-        // `if self.metainterp.portal_call_depth: return` parity —
-        // sample the live counter through the same self.meta
-        // pointer.  Same lifetime invariant as
-        // `has_compiled_targets_fn` (bridge tracing runs
-        // synchronously within `start_bridge_tracing`'s scope).
-        ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
-            let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
-            meta.portal_call_depth
-        }));
-        ctx.portal_call_depth_adjust_fn = Some(Box::new(move |delta: i32| unsafe {
-            *depth_ptr += delta;
-        }));
-        ctx.unique_id_for_greenkey_fn = Some(Box::new(move |jd_no, greenkey| {
-            let meta = unsafe { &*(meta_ptr as *const crate::pyjitpl::MetaInterp<S::Meta>) };
-            meta.unique_id_for_greenkey(jd_no, greenkey)
-        }));
+        // ResumeAtPosition, has_compiled_targets, compiled_key_for_greens,
+        // and portal_call_depth are installed by
+        // `apply_state_independent_bridge_resume` once the BoxReader exists
+        // (`pyjitpl.py _handle_guard_failure` / `reached_loop_header`).
         // resume.py rebuild_from_resumedata parity: map frame locals to bridge InputArg OpRefs
         // so bridge tracing sees locals as symbolic variables, not concrete values.
         // resume.py getvirtual_ptr parity: when frame.values contains
@@ -11844,6 +11815,18 @@ impl<S: JitState> JitDriver<S> {
                 {
                     ctx.mark_bridge_replay_incomplete();
                 }
+            }
+            // Recording-only: the frontend records pendingfields
+            // (`PyreJitState::prepare_bridge_resume` /
+            // jit_interp `replay_pending_fields`). The executing
+            // reader applies them in `apply_state_independent_bridge_resume`
+            // (`resume.py AbstractResumeDataReader._prepare`).
+            if reader.allocator().is_none() {
+                let ctx = self
+                    .meta
+                    .tracing
+                    .as_mut()
+                    .expect("bridge: tracing context must be live");
                 let sym = self
                     .sym
                     .as_mut()
@@ -11857,6 +11840,29 @@ impl<S: JitState> JitDriver<S> {
                     &retrace.fail_types,
                     &mut reader,
                 );
+            }
+            if !self
+                .meta
+                .apply_state_independent_bridge_resume(descr_arc, bfm, &mut reader)
+            {
+                drop(reader);
+                self.meta.stage_abort_reason(AbortReason::Bridge.as_int());
+                self.meta.abort_trace(false);
+                self.clear_tracing_session_state();
+                self.resume_data_result = None;
+                self.last_bridge_is_exception_guard = false;
+                return false;
+            }
+            {
+                let ctx = self
+                    .meta
+                    .tracing
+                    .as_mut()
+                    .expect("bridge: tracing context must be live");
+                let sym = self
+                    .sym
+                    .as_mut()
+                    .expect("bridge: sym must be live after S::create_sym");
                 // resume.py `rebuild_from_resumedata`:
                 // `consume_vref_and_vable_boxes` before the frame loop.
                 boxes = S::consume_vref_and_vable_boxes(

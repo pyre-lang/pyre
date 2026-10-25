@@ -270,8 +270,8 @@ pub use pyjitpl::{
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, PendingRefArrayWrite, decode_fieldnum, default_bridge_array_descr,
-    emit_pending_field_op, materialize_bridge_virtual, rebuilt_value_to_opref,
-    replay_pending_fields, seed_bridge_virtualizable_boxes,
+    emit_pending_field_op, live_bridge_ref_addr, materialize_bridge_virtual,
+    rebuilt_value_to_opref, replay_pending_fields, seed_bridge_virtualizable_boxes,
 };
 pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::ClearReplaceFrames;

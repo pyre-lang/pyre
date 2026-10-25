@@ -1171,6 +1171,11 @@ jobs:
         # only on main so per-PR target caches don't multiply across refs past
         # GitHub's 10 GB cache budget and trigger LRU eviction.
         save-if: ${{ github.ref == 'refs/heads/main' && matrix.backend != 'cranelift' }}
+        # Save even when a later step fails. The dependency builds do not
+        # depend on whether check.py's gates pass, and with saving tied to a
+        # green job a main whose check.py is red never stores an entry, so
+        # every run restores nothing and rebuilds from scratch.
+        cache-on-failure: true
     - name: Download Charon artifact
       # Run-scoped handoff from prepare-charon-llbc. Cross-run reuse still
       # comes from the prepare job's cache; consumers avoid cache eviction
