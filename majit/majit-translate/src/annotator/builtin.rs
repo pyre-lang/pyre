@@ -1058,8 +1058,12 @@ pub fn builtin_bool(
             ConstValue::Int128(n) => *n != 0,
             ConstValue::UInt128(n) => *n != 0,
             ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
+            ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => {
+                return Ok(SomeValue::Bool(r));
+            }
             ConstValue::ByteStr(s) => !s.is_empty(),
             ConstValue::UniStr(s) => !s.is_empty(),
+            ConstValue::UniChar(_) => true,
             ConstValue::None => false,
             ConstValue::Tuple(items) => !items.is_empty(),
             ConstValue::List(items) => !items.is_empty(),
@@ -1079,10 +1083,7 @@ pub fn builtin_bool(
             | ConstValue::SpecTag(_) => true,
             ConstValue::AddressOffset(_) => true,
             ConstValue::InheritanceId { .. } => true,
-            ConstValue::LLAddress(addr) => matches!(
-                addr,
-                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)
-            ),
+            ConstValue::LLAddress(addr) | ConstValue::AddressAsInt(addr) => addr.nonzero(),
             // Placeholder never appears in production flow; stay
             // conservative rather than crash.
             ConstValue::Placeholder => return Ok(SomeValue::Bool(r)),

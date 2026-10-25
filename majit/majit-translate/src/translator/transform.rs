@@ -982,8 +982,11 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::Int128(_)
         | ConstValue::UInt128(_)
         | ConstValue::Float(_)
+        | ConstValue::SingleFloat(_)
+        | ConstValue::LongFloat(_)
         | ConstValue::ByteStr(_)
         | ConstValue::UniStr(_)
+        | ConstValue::UniChar(_)
         | ConstValue::None
         | ConstValue::HostObject(_)
         | ConstValue::Function(_)
@@ -997,6 +1000,7 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
         | ConstValue::LLAddress(_)
+        | ConstValue::AddressAsInt(_)
         | ConstValue::Atom(_)
         | ConstValue::SpecTag(_)
         | ConstValue::Placeholder

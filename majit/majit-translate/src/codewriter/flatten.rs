@@ -374,6 +374,7 @@ fn signed_switch_key(value: &ConstValue) -> Option<i64> {
             Some(i64::from(u32::from(c)))
         }
         ConstValue::ByteStr(bytes) if bytes.len() == 1 => Some(i64::from(bytes[0])),
+        ConstValue::UniChar(cp) => Some(i64::from(*cp)),
         _ => None,
     }
 }
@@ -1651,11 +1652,13 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
-        | ConstValue::LLAddress(_) => 'i',
+        | ConstValue::LLAddress(_)
+        | ConstValue::AddressAsInt(_) => 'i',
         ConstValue::Int128(_) | ConstValue::UInt128(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
         }
-        ConstValue::Float(_) => 'f',
+        ConstValue::Float(_) | ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => 'f',
+        ConstValue::UniChar(_) => 'i',
         ConstValue::None
         | ConstValue::ByteStr(_)
         | ConstValue::UniStr(_)

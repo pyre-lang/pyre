@@ -81,6 +81,16 @@ pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType
     );
 }
 
+/// `r_singlefloat(floatval)` (`rarithmetic.py`): `struct.pack("f", floatval)`.
+pub fn r_singlefloat_bits(floatval: f64) -> u32 {
+    (floatval as f32).to_bits()
+}
+
+/// `r_longfloat(floatval)` (`rarithmetic.py`): stores `floatval` as a Python float.
+pub fn r_longfloat_bits(floatval: f64) -> u64 {
+    floatval.to_bits()
+}
+
 /// RPython `signedtype(t)` (rarithmetic.py).
 ///
 /// ```python

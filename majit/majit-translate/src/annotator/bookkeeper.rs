@@ -42,8 +42,8 @@ use super::dictdef::{DictDef, DictKey};
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
-    SomeOrderedDict, SomePBC, SomeString, SomeTuple, SomeType, SomeUnicodeCodePoint,
-    SomeUnicodeString, SomeValue, s_impossible_value, s_none, union,
+    SomeLongFloat, SomeOrderedDict, SomePBC, SomeSingleFloat, SomeString, SomeTuple, SomeType,
+    SomeUnicodeCodePoint, SomeUnicodeString, SomeValue, s_impossible_value, s_none, union,
 };
 use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
@@ -5280,6 +5280,16 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Float(s))
             }
+            ConstValue::SingleFloat(_) => {
+                let mut s = SomeSingleFloat::new();
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::SingleFloat(s))
+            }
+            ConstValue::LongFloat(_) => {
+                let mut s = SomeLongFloat::new();
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::LongFloat(s))
+            }
             ConstValue::ByteStr(s) => {
                 let no_nul = !s.contains(&0);
                 let result = if s.len() == 1 {
@@ -5307,6 +5317,12 @@ impl Bookkeeper {
                     SomeValue::UnicodeString(st)
                 };
                 Ok(result)
+            }
+            ConstValue::UniChar(cp) => {
+                let no_nul = *cp != 0;
+                let mut ch = SomeUnicodeCodePoint::new(no_nul);
+                ch.inner.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::UnicodeCodePoint(ch))
             }
             ConstValue::None => Ok(s_none()),
             ConstValue::Tuple(items) => {
@@ -5344,8 +5360,9 @@ impl Bookkeeper {
                 }
                 Ok(result)
             }
-            ConstValue::AddressOffset(_) => {
-                // AddressOffset.annotation() returns SomeInteger()
+            ConstValue::AddressOffset(_) | ConstValue::AddressAsInt(_) => {
+                // AddressOffset.annotation() / AddressAsInt.annotation()
+                // return SomeInteger().
                 let mut s = SomeInteger::new(false, false);
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Integer(s))

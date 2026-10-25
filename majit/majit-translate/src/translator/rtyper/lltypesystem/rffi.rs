@@ -24,8 +24,9 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, Array, FixedSizeArray, FuncType, GCREF, LowLevelType, LowLevelValue, MallocFlavor,
-    OpaqueType, Ptr, PtrTarget, SomePtr, Struct, functionptr_with_external_name, malloc, typeOf,
+    _ptr, Array, CastWhateverError, FixedSizeArray, FuncType, GCREF, LowLevelType, LowLevelValue,
+    MallocFlavor, OpaqueType, Ptr, PtrTarget, SomePtr, Struct, functionptr_with_external_name,
+    malloc, nullptr, typeOf,
 };
 use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
 use crate::translator::rtyper::lltypesystem::rstr::{
@@ -471,6 +472,36 @@ pub fn charpp2liststr() -> Result<(), TyperError> {
 
 pub fn cast() -> Result<(), TyperError> {
     Err(deferred("cast"))
+}
+
+/// Interpreter-level `rffi.cast(TGT, value)` (`rffi.py` = `ll2ctypes.force_cast`).
+/// `ll2ctypes` is never added (`lltypesystem/mod.rs`). Integer 0 to a `Ptr`
+/// is `nullptr`, matching `ctypes.c_void_p(0)` → null.
+pub fn cast_value(tgt: &LowLevelType, value: &ConstValue) -> Result<ConstValue, CastWhateverError> {
+    let LowLevelType::Ptr(tgt_ptr) = tgt else {
+        return Err(CastWhateverError::TypeError(format!(
+            "rffi.cast() first arg should be a TYPE, got {tgt:?}"
+        )));
+    };
+    let n = match value {
+        ConstValue::UInt(n) => *n,
+        ConstValue::Int(n) => *n as u64,
+        ConstValue::Bool(false) => 0,
+        ConstValue::Bool(true) => 1,
+        _ => {
+            return Err(CastWhateverError::TypeError(format!(
+                "casting {value:?} to {tgt:?}"
+            )));
+        }
+    };
+    if n == 0 {
+        return nullptr(tgt_ptr.TO.clone().into())
+            .map(|p| ConstValue::LLPtr(Box::new(p)))
+            .map_err(CastWhateverError::TypeError);
+    }
+    Err(CastWhateverError::TypeError(format!(
+        "rffi.cast of non-zero integer to {tgt:?} needs ll2ctypes"
+    )))
 }
 
 pub fn ptradd() -> Result<(), TyperError> {

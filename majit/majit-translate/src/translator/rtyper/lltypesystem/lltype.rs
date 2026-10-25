@@ -461,6 +461,7 @@ impl LowLevelType {
                     ConstValue::Int(_)
                         | ConstValue::AddressOffset(_)
                         | ConstValue::InheritanceId { .. }
+                        | ConstValue::AddressAsInt(_)
                 )
             }
             // Upstream checks `typeOf(value)` against the exact Number
@@ -481,14 +482,13 @@ impl LowLevelType {
             LowLevelType::SignedLongLongLong => matches!(value, ConstValue::Int128(_)),
             // `typeOf(r_ulonglonglong)` is `UnsignedLongLongLong`.
             LowLevelType::UnsignedLongLongLong => matches!(value, ConstValue::UInt128(_)),
-            // upstream `Float` / `SingleFloat` / `LongFloat` accept
-            // Python `float`.
-            LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
-                matches!(value, ConstValue::Float(_))
-            }
+            LowLevelType::Float => matches!(value, ConstValue::Float(_)),
+            LowLevelType::SingleFloat => matches!(value, ConstValue::SingleFloat(_)),
+            LowLevelType::LongFloat => matches!(value, ConstValue::LongFloat(_)),
             LowLevelType::Char => matches!(value, ConstValue::ByteStr(s) if s.len() == 1),
             LowLevelType::UniChar => {
-                matches!(value, ConstValue::UniStr(s) if s.chars().count() == 1)
+                matches!(value, ConstValue::UniChar(_))
+                    || matches!(value, ConstValue::UniStr(s) if s.chars().count() == 1)
             }
             // Address is a Primitive with `_defl = NULL`. Concrete
             // values are llmemory.fakeaddress instances; pyre carries
@@ -3360,8 +3360,8 @@ impl _ptr {
     /// checking at each step that `struc` is the parent's first inlined field
     /// (`getattr(parent, PARENTTYPE._names[0]) != struc`) and then verifying
     /// the widened-to type equals `PTRTYPE.TO`.
-    pub fn _cast_to(&self, ptrtype: &Ptr) -> Result<_ptr, String> {
-        let down_or_up = castable(ptrtype, &self._TYPE)?;
+    pub fn _cast_to(&self, ptrtype: &Ptr) -> Result<_ptr, CastWhateverError> {
+        let down_or_up = castable(ptrtype, &self._TYPE).map_err(CastWhateverError::type_error)?;
         if down_or_up == 0 {
             return Ok(self.clone());
         }
@@ -3369,9 +3369,7 @@ impl _ptr {
         if !self.nonzero() {
             return Ok(ptrtype._defl());
         }
-        // upstream (lltype.py:1428): `if isinstance(self._obj, int): return
-        // _ptr(PTRTYPE, self._obj, solid=True)` — a tagged-integer pointer
-        // re-tags to the target type, keeping its integer payload.
+        // `if isinstance(self._obj, int): return _ptr(PTRTYPE, self._obj, solid=True)`
         if let Ok(Some(_ptr_obj::IntCast(n))) = self._obj0_value() {
             return Ok(_ptr::new_with_solid(
                 ptrtype.clone(),
@@ -3380,37 +3378,40 @@ impl _ptr {
             ));
         }
         if down_or_up < 0 {
-            // upstream (lltype.py:1436-1451): walk *up* the parent chain
-            // `-down_or_up` times via `_parentstructure()`, checking at each
-            // step that `struc` is the parent's first inlined field, then
-            // verify the widened-to type equals `PTRTYPE.TO`.
             let mut u = -down_or_up;
-            let mut struc = self
-                ._obj()
-                .map_err(|_| "_ptr._cast_to: delayed pointer".to_string())?;
+            let mut struc = self._obj().map_err(|_| CastWhateverError::DelayedPointer)?;
             let mut parent_type: Option<LowLevelType> = None;
             while u > 0 {
-                let parentable = parentable_of_obj(&struc)
-                    .ok_or_else(|| format!("_ptr._cast_to: {struc:?} is not a _parentable"))?;
-                let parent = parentable
-                    .parentstructure(true)
-                    .ok_or_else(|| format!("widening to trash: {:?}", self._TYPE))?;
+                let parentable = parentable_of_obj(&struc).ok_or_else(|| {
+                    CastWhateverError::type_error(format!(
+                        "_ptr._cast_to: {struc:?} is not a _parentable"
+                    ))
+                })?;
+                let parent = parentable.parentstructure(true).ok_or_else(|| {
+                    CastWhateverError::runtime_error(format!("widening to trash: {self:?}"))
+                })?;
                 let ptype = parentable
                     .parent_type()
                     .expect("a parented container always records its parent type");
-                // `getattr(parent, PARENTTYPE._names[0]) != struc` → InvalidCast.
                 let LowLevelType::Struct(ps) = &ptype else {
-                    return Err(format!(
+                    return Err(CastWhateverError::type_error(format!(
                         "_ptr._cast_to: up-cast parent {ptype:?} is not a struct"
-                    ));
+                    )));
                 };
                 let first_name = ps._names.first().ok_or_else(|| {
-                    format!("_ptr._cast_to: parent struct {:?} has no fields", ps._name)
+                    CastWhateverError::type_error(format!(
+                        "_ptr._cast_to: parent struct {:?} has no fields",
+                        ps._name
+                    ))
                 })?;
                 match first_field_container(&parent, first_name) {
                     Some(fc) if fc == struc => {}
                     _ => {
-                        return Err(format!("InvalidCast: {:?} to {:?}", self._TYPE, ptrtype));
+                        // `InvalidCast(CURTYPE, PTRTYPE)` is a TypeError.
+                        return Err(CastWhateverError::type_error(format!(
+                            "InvalidCast: {:?} to {:?}",
+                            self._TYPE, ptrtype
+                        )));
                     }
                 }
                 struc = parent;
@@ -3420,10 +3421,10 @@ impl _ptr {
             let parent_type = parent_type.expect("an up-cast walks at least once");
             let target_type: LowLevelType = ptrtype.TO.clone().into();
             if parent_type != target_type {
-                return Err(format!(
+                return Err(CastWhateverError::runtime_error(format!(
                     "widening {:?} inside {parent_type:?} instead of {target_type:?}",
                     self._TYPE
-                ));
+                )));
             }
             return Ok(_ptr::new_with_solid(
                 ptrtype.clone(),
@@ -3431,11 +3432,6 @@ impl _ptr {
                 self._solid,
             ));
         }
-        // upstream: `while down_or_up: p = getattr(p, typeOf(p).TO._names[0])`.
-        // The first field of a Struct in our port is the leading entry
-        // of `_flds`; for the instance/class hierarchy that is
-        // `("super", parent_struct)`. Walk by repeated `_obj.getattr`
-        // re-pointing through the chain.
         let mut current = self.clone();
         let mut steps = down_or_up;
         while steps > 0 {
@@ -3444,37 +3440,36 @@ impl _ptr {
                 PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
                     Some(LowLevelType::Struct(s)) => *s,
                     _ => {
-                        return Err(format!(
+                        return Err(CastWhateverError::type_error(format!(
                             "_ptr._cast_to: ForwardReference {fwd:?} did not \
                              resolve to a Struct"
-                        ));
+                        )));
                     }
                 },
                 _ => {
-                    return Err(format!(
+                    return Err(CastWhateverError::type_error(format!(
                         "_ptr._cast_to: cast walk requires Struct target, got {:?}",
                         current._TYPE
-                    ));
+                    )));
                 }
             };
             let first_name = to_struct._names.first().ok_or_else(|| {
-                format!(
+                CastWhateverError::type_error(format!(
                     "_ptr._cast_to: struct {:?} has no fields to walk",
                     to_struct._name
-                )
+                ))
             })?;
-            let lv = current.getattr(first_name)?;
+            let lv = current
+                .getattr(first_name)
+                .map_err(CastWhateverError::type_error)?;
             let LowLevelValue::Ptr(next) = lv else {
-                return Err(format!(
+                return Err(CastWhateverError::type_error(format!(
                     "_ptr._cast_to: vtable.{first_name} did not yield a Ptr value"
-                ));
+                )));
             };
             current = *next;
             steps -= 1;
         }
-        // Re-wrap with the target Ptr type while preserving the
-        // underlying object and solid bit. Upstream `_ptr(PTRTYPE,
-        // p._obj, solid=self._solid)`.
         let obj0 = current._obj0_value();
         Ok(_ptr::new_with_solid(ptrtype.clone(), obj0, self._solid))
     }
@@ -5445,13 +5440,16 @@ pub fn cast_int_to_ptr(PTRTYPE: &Ptr, oddint: i64) -> Result<_ptr, String> {
     ))
 }
 
-/// RPython `TypeError` / `RuntimeError` from `cast_primitive` and
-/// `_cast_whatever`. `optimize_block.do_rename` swallows `RuntimeError`
-/// and lets `TypeError` propagate.
+/// RPython exception kinds from `cast_primitive` / `_cast_whatever` /
+/// `_ptr._cast_to`. `optimize_block.do_rename` swallows only
+/// `RuntimeError` (`except RuntimeError: return`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CastWhateverError {
     TypeError(String),
     RuntimeError(String),
+    ValueError(String),
+    OverflowError(String),
+    DelayedPointer,
 }
 
 impl CastWhateverError {
@@ -5459,11 +5457,27 @@ impl CastWhateverError {
         Self::TypeError(msg.into())
     }
 
-    fn from_cast_string(msg: String) -> Self {
-        if msg.contains("DelayedPointer") {
-            Self::RuntimeError(msg)
-        } else {
+    fn runtime_error(msg: impl Into<String>) -> Self {
+        Self::RuntimeError(msg.into())
+    }
+
+    fn value_error(msg: impl Into<String>) -> Self {
+        Self::ValueError(msg.into())
+    }
+
+    fn overflow_error(msg: impl Into<String>) -> Self {
+        Self::OverflowError(msg.into())
+    }
+}
+
+impl std::fmt::Display for CastWhateverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             Self::TypeError(msg)
+            | Self::RuntimeError(msg)
+            | Self::ValueError(msg)
+            | Self::OverflowError(msg) => f.write_str(msg),
+            Self::DelayedPointer => f.write_str("DelayedPointer"),
         }
     }
 }
@@ -5479,23 +5493,21 @@ pub fn typeOf_const(value: &ConstValue) -> Result<LowLevelType, CastWhateverErro
         ConstValue::UInt128(_) => Ok(LowLevelType::UnsignedLongLongLong),
         ConstValue::Bool(_) => Ok(LowLevelType::Bool),
         ConstValue::Float(_) => Ok(LowLevelType::Float),
+        ConstValue::SingleFloat(_) => Ok(LowLevelType::SingleFloat),
+        ConstValue::LongFloat(_) => Ok(LowLevelType::LongFloat),
         ConstValue::ByteStr(bytes) => {
-            if bytes.len() == 1 {
-                Ok(LowLevelType::Char)
-            } else {
-                Err(CastWhateverError::type_error("typeOf('str object')"))
-            }
+            assert!(bytes.len() == 1, "len(val) == 1");
+            Ok(LowLevelType::Char)
         }
         ConstValue::UniStr(s) => {
-            let mut chars = s.chars();
-            match (chars.next(), chars.next()) {
-                (Some(_), None) => Ok(LowLevelType::UniChar),
-                _ => Err(CastWhateverError::type_error("typeOf('unicode object')")),
-            }
+            assert!(s.chars().count() == 1, "len(val) == 1");
+            Ok(LowLevelType::UniChar)
         }
+        ConstValue::UniChar(_) => Ok(LowLevelType::UniChar),
         ConstValue::None => Ok(LowLevelType::Void),
         ConstValue::LLPtr(ptr) => Ok(LowLevelType::Ptr(Box::new(ptr._TYPE.clone()))),
         ConstValue::LLAddress(_) => Ok(LowLevelType::Address),
+        ConstValue::AddressAsInt(_) => Ok(LowLevelType::Signed),
         other => Err(CastWhateverError::type_error(format!(
             "typeOf('{} object')",
             const_value_type_name(other)
@@ -5529,7 +5541,7 @@ fn const_as_i128(value: &ConstValue) -> Result<i128, CastWhateverError> {
         ConstValue::UInt(n) => Ok(*n as i128),
         ConstValue::Int128(n) => Ok(*n),
         ConstValue::UInt128(n) => Ok(*n as i128),
-        ConstValue::Float(bits) => Ok(f64::from_bits(*bits) as i128),
+        ConstValue::Float(bits) => f64_trunc_toward_zero_as_i128(f64::from_bits(*bits)),
         ConstValue::ByteStr(bytes) if bytes.len() == 1 => Ok(bytes[0] as i128),
         ConstValue::UniStr(s) => {
             let mut chars = s.chars();
@@ -5538,13 +5550,54 @@ fn const_as_i128(value: &ConstValue) -> Result<i128, CastWhateverError> {
                 _ => Err(CastWhateverError::type_error("unsupported cast")),
             }
         }
+        ConstValue::UniChar(cp) => Ok(*cp as i128),
         _ => Err(CastWhateverError::type_error("unsupported cast")),
+    }
+}
+
+/// Python 2 `long(float)`: NaN is `ValueError`, infinity is `OverflowError`,
+/// a finite value truncates toward zero to an arbitrary-precision integer.
+/// The result is then wrapped to 128 bits so `Number._cast` / `intmask`
+/// can take the destination width.
+fn f64_trunc_toward_zero_as_i128(f: f64) -> Result<i128, CastWhateverError> {
+    if f.is_nan() {
+        return Err(CastWhateverError::value_error(
+            "cannot convert float NaN to integer",
+        ));
+    }
+    if f.is_infinite() {
+        return Err(CastWhateverError::overflow_error(
+            "cannot convert float infinity to integer",
+        ));
+    }
+    let bits = f.to_bits();
+    let sign = (bits >> 63) != 0;
+    let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    if exp < 0 {
+        return Ok(0);
+    }
+    let mantissa = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    let shift = exp - 52;
+    let mag: u128 = if shift >= 128 {
+        0
+    } else if shift >= 0 {
+        (mantissa as u128) << shift
+    } else if shift > -64 {
+        (mantissa as u128) >> ((-shift) as u32)
+    } else {
+        0
+    };
+    if sign {
+        Ok(mag.wrapping_neg() as i128)
+    } else {
+        Ok(mag as i128)
     }
 }
 
 fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
     match value {
-        ConstValue::Float(bits) => Ok(f64::from_bits(*bits)),
+        ConstValue::Float(bits) | ConstValue::LongFloat(bits) => Ok(f64::from_bits(*bits)),
+        ConstValue::SingleFloat(bits) => Ok(f32::from_bits(*bits) as f64),
         ConstValue::Bool(true) => Ok(1.0),
         ConstValue::Bool(false) => Ok(0.0),
         ConstValue::Int(n) => Ok(*n as f64),
@@ -5559,6 +5612,7 @@ fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
                 _ => Err(CastWhateverError::type_error("unsupported cast")),
             }
         }
+        ConstValue::UniChar(cp) => Ok(*cp as f64),
         _ => Err(CastWhateverError::type_error("unsupported cast")),
     }
 }
@@ -5594,8 +5648,15 @@ pub fn cast_primitive(
     if orig == LowLevelType::Char || orig == LowLevelType::UniChar {
         work = ConstValue::Int(const_as_i128(&work)? as i64);
     } else if orig == LowLevelType::Float {
-        if matches!(tgt, LowLevelType::SingleFloat | LowLevelType::LongFloat) {
-            return Err(CastWhateverError::type_error("unsupported cast"));
+        if *tgt == LowLevelType::SingleFloat {
+            return Ok(ConstValue::SingleFloat(
+                crate::rlib::rarithmetic::r_singlefloat_bits(const_as_f64(&work)?),
+            ));
+        }
+        if *tgt == LowLevelType::LongFloat {
+            return Ok(ConstValue::LongFloat(
+                crate::rlib::rarithmetic::r_longfloat_bits(const_as_f64(&work)?),
+            ));
         }
         work = ConstValue::Int128(const_as_i128(&work)?);
     }
@@ -5604,17 +5665,20 @@ pub fn cast_primitive(
         LowLevelType::Char => {
             let n = const_as_i128(&work)?;
             if !(0..=255).contains(&n) {
-                return Err(CastWhateverError::type_error("unsupported cast"));
+                return Err(CastWhateverError::value_error(
+                    "chr() arg not in range(256)",
+                ));
             }
             return Ok(ConstValue::ByteStr(vec![n as u8]));
         }
         LowLevelType::UniChar => {
             let n = const_as_i128(&work)?;
-            let ch = u32::try_from(n)
-                .ok()
-                .and_then(char::from_u32)
-                .ok_or_else(|| CastWhateverError::type_error("unsupported cast"))?;
-            return Ok(ConstValue::UniStr(ch.to_string()));
+            if !(0..=0x10FFFF).contains(&n) {
+                return Err(CastWhateverError::value_error(
+                    "unichr() arg not in range(0x110000) (wide Python)",
+                ));
+            }
+            return Ok(ConstValue::UniChar(n as u32));
         }
         LowLevelType::Float => {
             return Ok(ConstValue::float(const_as_f64(&work)?));
@@ -5657,12 +5721,22 @@ fn ptr_cast_value(
     let orig_opaque = matches!(orig.TO, PtrTarget::Opaque(_));
     let tgt_opaque = matches!(tgt.TO, PtrTarget::Opaque(_));
     let casted = if orig_opaque || tgt_opaque {
-        cast_opaque_ptr(tgt, ptr)
+        if let Err(DelayedPointer) = ptr._obj() {
+            return Err(CastWhateverError::DelayedPointer);
+        }
+        cast_opaque_ptr(tgt, ptr).map_err(|msg| opaque_cast_error(ptr, &msg))?
     } else {
-        cast_pointer(tgt, ptr)
-    }
-    .map_err(CastWhateverError::from_cast_string)?;
+        ptr._cast_to(tgt)?
+    };
     Ok(ConstValue::LLPtr(Box::new(casted)))
+}
+
+fn opaque_cast_error(ptr: &_ptr, msg: &str) -> CastWhateverError {
+    if let Err(DelayedPointer) = ptr._obj() {
+        CastWhateverError::DelayedPointer
+    } else {
+        CastWhateverError::type_error(msg.to_string())
+    }
 }
 
 /// RPython `lltype._cast_whatever(TGT, value)`. Branch order matches
@@ -5674,73 +5748,74 @@ pub fn _cast_whatever(
     value: &ConstValue,
 ) -> Result<ConstValue, CastWhateverError> {
     let orig = typeOf_const(value)?;
-    if orig == *tgt {
+    _cast_whatever_from(tgt, &orig, value)
+}
+
+/// ORIG is `typeOf(value)` (`value._TYPE`); a caller whose value has no
+/// intrinsic lltype passes the `Constant.concretetype` that carries `_TYPE`.
+pub fn _cast_whatever_from(
+    tgt: &LowLevelType,
+    orig: &LowLevelType,
+    value: &ConstValue,
+) -> Result<ConstValue, CastWhateverError> {
+    if orig == tgt {
         return Ok(value.clone());
     }
     // `isinstance(TGT, Primitive) and isinstance(ORIG, Primitive)`.
-    // `llmemory.Address` is not a Primitive.
-    if tgt.is_primitive()
-        && orig.is_primitive()
-        && *tgt != LowLevelType::Address
-        && orig != LowLevelType::Address
-    {
+    // `llmemory.Address = lltype.Primitive("Address", NULL)`.
+    if tgt.is_primitive() && orig.is_primitive() {
         return cast_primitive(tgt, value);
     } else if let LowLevelType::Ptr(tgt_ptr) = tgt {
-        if let LowLevelType::Ptr(orig_ptr) = &orig {
+        if let LowLevelType::Ptr(orig_ptr) = orig {
             return ptr_cast_value(tgt_ptr, orig_ptr, value);
-        } else if orig == LowLevelType::Address {
-            let ConstValue::LLAddress(addr) = value else {
-                return Err(dont_know_how_to_cast(&orig, tgt));
+        } else if *orig == LowLevelType::Address {
+            let addr = match value {
+                ConstValue::LLAddress(addr) => addr,
+                _ => return Err(dont_know_how_to_cast(orig, tgt)),
             };
-            let casted = match addr {
-                _address::Null => nullptr(tgt_ptr.TO.clone().into())
-                    .map_err(CastWhateverError::from_cast_string)?,
-                _address::Fake(ptr) => {
-                    let orig_ptr = &ptr._TYPE;
-                    let orig_opaque = matches!(orig_ptr.TO, PtrTarget::Opaque(_));
-                    let tgt_opaque = matches!(tgt_ptr.TO, PtrTarget::Opaque(_));
-                    if orig_opaque || tgt_opaque {
-                        cast_opaque_ptr(tgt_ptr, ptr)
-                    } else {
-                        cast_pointer(tgt_ptr, ptr)
-                    }
-                    .map_err(CastWhateverError::from_cast_string)?
+            let casted = super::llmemory::cast_adr_to_ptr(addr, tgt_ptr).map_err(|msg| {
+                if let Err(DelayedPointer) = match addr {
+                    _address::Fake(ptr) => ptr._obj().map(|_| ()),
+                    _ => Ok(()),
+                } {
+                    CastWhateverError::DelayedPointer
+                } else {
+                    CastWhateverError::type_error(msg)
                 }
-                _address::IntCast(_) => return Err(dont_know_how_to_cast(&orig, tgt)),
-            };
+            })?;
             return Ok(ConstValue::LLPtr(Box::new(casted)));
-        } else if orig == LowLevelType::Signed {
+        } else if *orig == LowLevelType::Unsigned && tgt == &*super::rffi::VOIDP {
+            return super::rffi::cast_value(tgt, value);
+        } else if *orig == LowLevelType::Signed {
             let n = const_as_i128(value)? as i64;
-            let casted =
-                cast_int_to_ptr(tgt_ptr, n).map_err(CastWhateverError::from_cast_string)?;
+            let casted = match cast_int_to_ptr(tgt_ptr, n) {
+                Ok(p) => p,
+                Err(msg) if n != 0 && n & 1 == 0 => {
+                    return Err(CastWhateverError::value_error(msg));
+                }
+                Err(msg) => return Err(CastWhateverError::type_error(msg)),
+            };
             return Ok(ConstValue::LLPtr(Box::new(casted)));
         }
-        // `TGT == rffi.VOIDP and ORIG == Unsigned` needs `rffi`; omitted
-        // here so that path raises the same TypeError as the fallthrough.
     } else if *tgt == LowLevelType::Address {
-        if let LowLevelType::Ptr(_) = &orig {
+        if let LowLevelType::Ptr(_) = orig {
             let ConstValue::LLPtr(ptr) = value else {
-                return Err(dont_know_how_to_cast(&orig, tgt));
+                return Err(dont_know_how_to_cast(orig, tgt));
             };
-            let addr = if ptr.nonzero() {
-                _address::Fake(Box::new((**ptr).clone()))
-            } else {
-                _address::Null
-            };
-            return Ok(ConstValue::LLAddress(addr));
+            return Ok(ConstValue::LLAddress(super::llmemory::cast_ptr_to_adr(ptr)));
         }
     } else if *tgt == LowLevelType::Signed {
-        if let LowLevelType::Ptr(orig_ptr) = &orig
+        if let LowLevelType::Ptr(orig_ptr) = orig
             && orig_ptr.TO._gckind() == GcKind::Raw
         {
             let ConstValue::LLPtr(ptr) = value else {
-                return Err(dont_know_how_to_cast(&orig, tgt));
+                return Err(dont_know_how_to_cast(orig, tgt));
             };
-            let n = cast_ptr_to_int(ptr).map_err(CastWhateverError::from_cast_string)?;
-            return Ok(ConstValue::Int(n));
+            let adr = super::llmemory::cast_ptr_to_adr(ptr);
+            return super::llmemory::cast_adr_to_int_value(&adr, Some("symbolic"));
         }
     }
-    Err(dont_know_how_to_cast(&orig, tgt))
+    Err(dont_know_how_to_cast(orig, tgt))
 }
 
 /// RPython `cast_pointer(PTRTYPE, ptr)` (`lltype.py`):
@@ -5757,7 +5832,7 @@ pub fn _cast_whatever(
 /// and other repr-side static-cast call sites. The actual chain walk
 /// lives on [`_ptr::_cast_to`].
 pub fn cast_pointer(ptrtype: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
-    ptr._cast_to(ptrtype)
+    ptr._cast_to(ptrtype).map_err(|e| e.to_string())
 }
 
 impl _ptr_obj {
@@ -6677,7 +6752,9 @@ impl crate::annotator::model::SomeObjectTrait for SomePtr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flowspace::model::{Block, Constant, FunctionGraph, GraphFunc, Variable};
+    use crate::flowspace::model::{
+        Block, ConstValue, Constant, FunctionGraph, GraphFunc, Variable,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -7419,11 +7496,13 @@ mod tests {
         assert!(!LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::Int(1)));
         assert!(!LowLevelType::Signed.contains_value(&ConstValue::Bool(true)));
 
-        // RPython `Float` / `SingleFloat` / `LongFloat` accept Python float.
-        // pyre stores floats as u64 bit-patterns in ConstValue::Float.
+        // `typeOf(float) == Float`, `r_singlefloat._TYPE == SingleFloat`,
+        // `typeOf(r_longfloat) == LongFloat`.
         assert!(LowLevelType::Float.contains_value(&ConstValue::Float(0)));
-        assert!(LowLevelType::SingleFloat.contains_value(&ConstValue::Float(0)));
-        assert!(LowLevelType::LongFloat.contains_value(&ConstValue::Float(0)));
+        assert!(LowLevelType::SingleFloat.contains_value(&ConstValue::SingleFloat(0)));
+        assert!(LowLevelType::LongFloat.contains_value(&ConstValue::LongFloat(0)));
+        assert!(!LowLevelType::SingleFloat.contains_value(&ConstValue::Float(0)));
+        assert!(!LowLevelType::LongFloat.contains_value(&ConstValue::Float(0)));
         assert!(!LowLevelType::Float.contains_value(&ConstValue::Int(0)));
     }
 
@@ -7446,6 +7525,7 @@ mod tests {
 
         assert!(LowLevelType::UniChar.contains_value(&ConstValue::uni_str("a")));
         assert!(LowLevelType::UniChar.contains_value(&ConstValue::uni_str("π")));
+        assert!(LowLevelType::UniChar.contains_value(&ConstValue::UniChar(0xD800)));
         assert!(!LowLevelType::UniChar.contains_value(&ConstValue::uni_str("πi")));
         assert!(!LowLevelType::UniChar.contains_value(&ConstValue::uni_str("")));
         assert!(!LowLevelType::UniChar.contains_value(&ConstValue::byte_str(b"a")));
@@ -9444,5 +9524,238 @@ mod tests {
         let live2 = _ptr::new_with_solid(live._TYPE.clone(), live._obj0_value(), live._solid);
         assert_ne!(live._hashable_identity(), live2._hashable_identity());
         assert_eq!(cast_ptr_to_int(&live), cast_ptr_to_int(&live2));
+    }
+
+    fn standalone_child_and_parent_ptr() -> (_ptr, Ptr, Ptr) {
+        let child = Struct::gc_rtti("child_cast", vec![("x".into(), LowLevelType::Signed)]);
+        let child_t = LowLevelType::Struct(Box::new(child));
+        let parent = Struct::gc_rtti(
+            "parent_cast",
+            vec![
+                ("super".into(), child_t.clone()),
+                ("y".into(), LowLevelType::Signed),
+            ],
+        );
+        let parent_t = LowLevelType::Struct(Box::new(parent));
+        let child_ptr = Ptr::from_container_type(child_t.clone()).unwrap();
+        let parent_ptr = Ptr::from_container_type(parent_t).unwrap();
+        let live = malloc(child_t, None, MallocFlavor::Gc, true).unwrap();
+        (live, child_ptr, parent_ptr)
+    }
+
+    #[test]
+    fn cast_to_standalone_child_widens_to_trash_as_runtime_error() {
+        let (live, _child_ptr, parent_ptr) = standalone_child_and_parent_ptr();
+        let err = live
+            ._cast_to(&parent_ptr)
+            .expect_err("up-cast needs a parent");
+        assert!(
+            matches!(err, CastWhateverError::RuntimeError(ref msg) if msg.contains("widening to trash")),
+            "standalone child up-cast is RuntimeError, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cast_to_delayed_pointer_is_delayed_pointer_error() {
+        let (_live, child_ptr, parent_ptr) = standalone_child_and_parent_ptr();
+        let delayed = _ptr::new(child_ptr, Err(DelayedPointer));
+        let err = delayed
+            ._cast_to(&parent_ptr)
+            .expect_err("delayed _obj raises DelayedPointer");
+        assert_eq!(err, CastWhateverError::DelayedPointer);
+    }
+
+    #[test]
+    fn type_error_and_value_error_are_distinct_cast_errors() {
+        let type_err = _cast_whatever(&LowLevelType::Signed, &ConstValue::None)
+            .expect_err("None is not a primitive");
+        assert!(
+            matches!(type_err, CastWhateverError::TypeError(_)),
+            "None → Signed is TypeError, got {type_err:?}"
+        );
+        let value_err = cast_primitive(&LowLevelType::Char, &ConstValue::Int(256))
+            .expect_err("chr(256) is out of range");
+        assert!(
+            matches!(value_err, CastWhateverError::ValueError(_)),
+            "chr(256) is ValueError, got {value_err:?}"
+        );
+        assert_ne!(
+            std::mem::discriminant(&type_err),
+            std::mem::discriminant(&value_err)
+        );
+    }
+
+    #[test]
+    fn cast_primitive_float_to_singlefloat_round_trips() {
+        let res = cast_primitive(&LowLevelType::SingleFloat, &ConstValue::float(2.1))
+            .expect("Float → SingleFloat");
+        let ConstValue::SingleFloat(bits) = res else {
+            panic!("expected r_singlefloat, got {res:?}");
+        };
+        assert_eq!(
+            bits,
+            crate::rlib::rarithmetic::r_singlefloat_bits(2.1),
+            "struct.pack('f', 2.1) bits"
+        );
+        assert_eq!(typeOf_const(&res).unwrap(), LowLevelType::SingleFloat);
+        let back = cast_primitive(&LowLevelType::Float, &res).expect("SingleFloat → Float");
+        assert_eq!(
+            back,
+            ConstValue::float(f32::from_bits(bits) as f64),
+            "float(r_singlefloat(2.1))"
+        );
+        let long = cast_primitive(&LowLevelType::LongFloat, &ConstValue::float(2.1))
+            .expect("Float → LongFloat");
+        assert_eq!(long, ConstValue::LongFloat(2.1f64.to_bits()));
+        assert_eq!(typeOf_const(&long).unwrap(), LowLevelType::LongFloat);
+    }
+
+    #[test]
+    fn cast_primitive_float_to_signed_uses_long_then_mask() {
+        let two_pow_128 =
+            cast_primitive(&LowLevelType::Signed, &ConstValue::float(2.0f64.powi(128)))
+                .expect("2.0**128 → Signed");
+        assert_eq!(two_pow_128, ConstValue::Int(0));
+        let neg =
+            cast_primitive(&LowLevelType::Signed, &ConstValue::float(-1.5)).expect("-1.5 → Signed");
+        assert_eq!(neg, ConstValue::Int(-1));
+        let nan = cast_primitive(&LowLevelType::Signed, &ConstValue::float(f64::NAN))
+            .expect_err("NaN raises");
+        assert!(
+            matches!(nan, CastWhateverError::ValueError(_)),
+            "long(NaN) is ValueError, got {nan:?}"
+        );
+        let inf = cast_primitive(&LowLevelType::Signed, &ConstValue::float(f64::INFINITY))
+            .expect_err("inf raises");
+        assert!(
+            matches!(inf, CastWhateverError::OverflowError(_)),
+            "long(inf) is OverflowError, got {inf:?}"
+        );
+    }
+
+    #[test]
+    fn cast_primitive_char_out_of_range_is_value_error() {
+        let err = cast_primitive(&LowLevelType::Char, &ConstValue::Int(-1))
+            .expect_err("chr(-1) is out of range");
+        assert!(
+            matches!(err, CastWhateverError::ValueError(ref msg) if msg.contains("chr()")),
+            "got {err:?}"
+        );
+        let err = cast_primitive(&LowLevelType::UniChar, &ConstValue::Int(0x110000))
+            .expect_err("unichr(0x110000) is out of range");
+        assert!(
+            matches!(err, CastWhateverError::ValueError(ref msg) if msg.contains("unichr()")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cast_primitive_unichar_accepts_surrogate() {
+        let res = cast_primitive(&LowLevelType::UniChar, &ConstValue::Int(0xD800))
+            .expect("unichr(0xD800) is a surrogate code point");
+        assert_eq!(res, ConstValue::UniChar(0xD800));
+        assert_eq!(typeOf_const(&res).unwrap(), LowLevelType::UniChar);
+    }
+
+    #[test]
+    #[should_panic(expected = "len(val) == 1")]
+    fn typeof_byte_string_asserts_length_one() {
+        let _ = typeOf_const(&ConstValue::ByteStr(b"ab".to_vec()));
+    }
+
+    #[test]
+    #[should_panic(expected = "len(val) == 1")]
+    fn typeof_unicode_string_asserts_length_one() {
+        let _ = typeOf_const(&ConstValue::UniStr("ab".into()));
+    }
+
+    #[test]
+    fn typeof_fallback_formats_type_name() {
+        let err =
+            typeOf_const(&ConstValue::Dict(Default::default())).expect_err("a dict has no lltype");
+        assert_eq!(err.to_string(), "typeOf('dict object')");
+    }
+
+    #[test]
+    fn cast_whatever_bool_of_null_address_is_false() {
+        let got = _cast_whatever(&LowLevelType::Bool, &ConstValue::LLAddress(_address::Null))
+            .expect("Address is a Primitive; bool(NULL) is False");
+        assert_eq!(got, ConstValue::Bool(false));
+    }
+
+    #[test]
+    fn cast_whatever_unsigned_zero_to_voidp_is_null() {
+        let got = _cast_whatever(&*super::super::rffi::VOIDP, &ConstValue::UInt(0))
+            .expect("rffi.cast(VOIDP, 0) is nullptr");
+        let ConstValue::LLPtr(ptr) = got else {
+            panic!("expected a VOIDP pointer, got {got:?}");
+        };
+        assert!(!ptr.nonzero(), "unsigned 0 → VOIDP is null");
+        assert_eq!(
+            LowLevelType::Ptr(Box::new(ptr._TYPE.clone())),
+            *super::super::rffi::VOIDP
+        );
+    }
+
+    #[test]
+    fn cast_whatever_raw_ptr_to_signed_is_address_as_int() {
+        use super::super::llmemory::{cast_int_value_to_adr, cast_ptr_to_adr};
+        let s = Struct::new("raw_thing", vec![("x".into(), LowLevelType::Signed)]);
+        let live = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        let got = _cast_whatever(
+            &LowLevelType::Signed,
+            &ConstValue::LLPtr(Box::new(live.clone())),
+        )
+        .expect("raw Ptr → Signed is cast_adr_to_int(..., 'symbolic')");
+        let ConstValue::AddressAsInt(adr) = &got else {
+            panic!("expected AddressAsInt, got {got:?}");
+        };
+        assert_eq!(*adr, cast_ptr_to_adr(&live));
+        assert_eq!(cast_int_value_to_adr(&got).as_ref(), Some(adr));
+    }
+
+    #[test]
+    fn cast_whatever_ptr_to_address_normalizes() {
+        use super::super::llmemory::cast_ptr_to_adr;
+        let s = Struct::new("adr_thing", vec![("x".into(), LowLevelType::Signed)]);
+        let live = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        let got = _cast_whatever(
+            &LowLevelType::Address,
+            &ConstValue::LLPtr(Box::new(live.clone())),
+        )
+        .expect("Ptr → Address is _cast_to_adr");
+        assert_eq!(got, ConstValue::LLAddress(cast_ptr_to_adr(&live)));
+    }
+
+    #[test]
+    fn cast_whatever_null_and_intcast_address_to_ptr() {
+        let s = Struct::new("from_adr", vec![("x".into(), LowLevelType::Signed)]);
+        let t = LowLevelType::Struct(Box::new(s));
+        let ptr_t = Ptr::from_container_type(t.clone()).unwrap();
+        let tgt = LowLevelType::Ptr(Box::new(ptr_t));
+        let null = _cast_whatever(&tgt, &ConstValue::LLAddress(_address::Null))
+            .expect("NULL address → nullptr");
+        let ConstValue::LLPtr(p) = null else {
+            panic!("expected nullptr, got {null:?}");
+        };
+        assert!(!p.nonzero());
+        let zero = _cast_whatever(&tgt, &ConstValue::LLAddress(_address::IntCast(0)))
+            .expect("IntCast(0) rebuilds NULL then nullptr");
+        let ConstValue::LLPtr(p0) = zero else {
+            panic!("expected nullptr from IntCast(0), got {zero:?}");
+        };
+        assert!(!p0.nonzero());
     }
 }

@@ -444,8 +444,10 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::Int128(value) => *value != 0,
         ConstValue::UInt128(value) => *value != 0,
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
+        ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => true,
         ConstValue::ByteStr(text) => !text.is_empty(),
         ConstValue::UniStr(text) => !text.is_empty(),
+        ConstValue::UniChar(_) => true,
         ConstValue::Tuple(items) => !items.is_empty(),
         ConstValue::List(items) => !items.is_empty(),
         ConstValue::Dict(items) => !items.is_empty(),
@@ -456,6 +458,7 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
         | ConstValue::LLAddress(_)
+        | ConstValue::AddressAsInt(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::SpecTag(_)

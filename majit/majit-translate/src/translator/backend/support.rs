@@ -231,13 +231,14 @@ fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType
         // SingleFloat`, `r_longfloat → LongFloat`. pyre flattens the
         // Python-side float subtypes into `Float(u64)` bits — the
         // bit pattern itself does not encode width.
-        (
-            ConstValue::Float(_),
-            LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat,
-        ) => true,
+        (ConstValue::Float(_), LowLevelType::Float) => true,
+        (ConstValue::SingleFloat(_), LowLevelType::SingleFloat) => true,
+        (ConstValue::LongFloat(_), LowLevelType::LongFloat) => true,
         // Upstream `:65 lltype.typeOf(c) == Char` for a 1-char str.
         (ConstValue::ByteStr(s), LowLevelType::Char) => s.len() == 1,
         (ConstValue::UniStr(s), LowLevelType::UniChar) => s.chars().count() == 1,
+        (ConstValue::UniChar(_), LowLevelType::UniChar) => true,
+        (ConstValue::AddressAsInt(_), LowLevelType::Signed) => true,
         (ConstValue::LLAddress(_), LowLevelType::Address) => true,
         (ConstValue::LLPtr(ptr), LowLevelType::Ptr(declared)) => &typeOf(ptr) == declared.as_ref(),
         // Every other pair is a real mismatch (e.g. Bool concretetype

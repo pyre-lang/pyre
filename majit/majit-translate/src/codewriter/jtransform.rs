@@ -1803,20 +1803,30 @@ fn is_renamed_falsy_constant(
 /// `value = lltype._cast_whatever(var.concretetype, value)` then
 /// `renamings_constants[var] = Constant(value, var.concretetype)`.
 /// `RuntimeError` skips the constants map (`except RuntimeError: return`).
+///
+/// `lltype._cast_whatever` starts with `ORIG = typeOf(value)`, and
+/// `typeOf(val)` is `val._TYPE`. A host-object / prebuilt reference has
+/// no intrinsic lltype; `Constant.concretetype` carries `_TYPE`.
 fn recast_renamed_constant(
     var: &crate::flowspace::model::Variable,
     c: crate::flowspace::model::Constant,
 ) -> Option<crate::flowspace::model::Constant> {
-    use crate::translator::rtyper::lltypesystem::lltype::{_cast_whatever, CastWhateverError};
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        _cast_whatever_from, CastWhateverError, typeOf_const,
+    };
     let Some(ct) = var.concretetype() else {
         return Some(c);
     };
-    match _cast_whatever(&ct, &c.value) {
+    let orig = match typeOf_const(&c.value) {
+        Ok(orig) => orig,
+        Err(e) => c.concretetype.clone().unwrap_or_else(|| panic!("{e}")),
+    };
+    match _cast_whatever_from(&ct, &orig, &c.value) {
         Ok(value) => Some(crate::flowspace::model::Constant::with_concretetype(
             value, ct,
         )),
         Err(CastWhateverError::RuntimeError(_)) => None,
-        Err(CastWhateverError::TypeError(msg)) => panic!("{msg}"),
+        Err(e) => panic!("{e}"),
     }
 }
 
@@ -3302,6 +3312,36 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    fn constant_for_rename_target(
+        &self,
+        v: &crate::flowspace::model::Variable,
+    ) -> Option<crate::flowspace::model::Constant> {
+        if let Some(c) = self.renamings_constants.get(v).cloned() {
+            return Some(c);
+        }
+        let resolved = resolve_alias(v, &self.aliases);
+        self.renamings_constants.get(&resolved).cloned()
+    }
+
+    fn emit_constant_result(
+        &mut self,
+        new_ops: &mut Vec<SpaceOperation>,
+        result: crate::flowspace::model::Variable,
+        c: crate::flowspace::model::Constant,
+    ) {
+        let is_void = FunctionGraph::concretetype_of(&result) == crate::model::ConcreteType::Void;
+        if is_void {
+            self.do_rename(result, RenameTarget::Const(c));
+            return;
+        }
+        let recast = recast_renamed_constant(&result, c.clone());
+        let defining = recast.as_ref().unwrap_or(&c);
+        new_ops.push(materialize_const_result(result.clone(), defining));
+        if let Some(recast) = recast {
+            self.do_rename(result, RenameTarget::Const(recast));
+        }
+    }
+
     /// RPython: Transformer.optimize_block()
     fn optimize_block(
         &mut self,
@@ -3335,12 +3375,12 @@ impl<'a> Transformer<'a> {
         let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
         let original_ops = graph.blocks[block_idx].operations.clone();
-        // `jtransform.py count_before_last_operation = len(newoperations)`
-        // — recorded on every iteration, so after the loop it holds the count
-        // from just before the last operation contributed anything.  `None`
-        // is upstream's unbound name: the loop body never ran, so there is no
-        // last operation and the elision test below does not apply.
-        let mut count_before_last_operation = None;
+        // Track "the last original op was rewritten away" explicitly.
+        // A materialized `Const*` is the SSA image of a vanished Constant
+        // rewrite, not a surviving last op (`jtransform.py` returns
+        // `None` / Constant with no `newoperations` append). An opless
+        // block never enters the loop, so the flag stays false.
+        let mut last_op_rewritten_away = false;
         let no_aliases = std::collections::HashMap::new();
         for original_op in &original_ops {
             // Front-emitted pointer of this `direct_ptradd`. Rewrite now
@@ -3369,9 +3409,9 @@ impl<'a> Transformer<'a> {
             #[cfg(test)]
             self.rewrite_input_ops.push(op.clone());
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
-            count_before_last_operation = Some(new_ops.len());
             match rewritten {
                 RewriteResult::Replace(ops) => {
+                    last_op_rewritten_away = ops.is_empty();
                     new_ops.extend(ops.iter().map(|op1| {
                         remap_op_renamings(
                             op1,
@@ -3381,29 +3421,23 @@ impl<'a> Transformer<'a> {
                     }));
                 }
                 RewriteResult::Identity(alias_target) => {
+                    last_op_rewritten_away = true;
                     if let Some(result) = op.result.clone() {
-                        self.do_rename(result, RenameTarget::Var(alias_target));
-                    }
-                }
-                RewriteResult::Constant(c) => {
-                    if let Some(result) = op.result.clone() {
-                        let is_void = FunctionGraph::concretetype_of(&result)
-                            == crate::model::ConcreteType::Void;
-                        if is_void {
-                            // `do_rename`: Void is `Constant(None, Void)`,
-                            // never `_cast_whatever`.
-                            self.do_rename(result, RenameTarget::Const(c));
+                        if let Some(c) = self.constant_for_rename_target(&alias_target) {
+                            self.emit_constant_result(&mut new_ops, result, c);
                         } else {
-                            let recast = recast_renamed_constant(&result, c.clone());
-                            let defining = recast.as_ref().unwrap_or(&c);
-                            new_ops.push(materialize_const_result(result.clone(), defining));
-                            if let Some(recast) = recast {
-                                self.do_rename(result, RenameTarget::Const(recast));
-                            }
+                            self.do_rename(result, RenameTarget::Var(alias_target));
                         }
                     }
                 }
+                RewriteResult::Constant(c) => {
+                    last_op_rewritten_away = true;
+                    if let Some(result) = op.result.clone() {
+                        self.emit_constant_result(&mut new_ops, result, c);
+                    }
+                }
                 RewriteResult::Keep => {
+                    last_op_rewritten_away = false;
                     new_ops.push(remap_op_renamings(
                         &op,
                         &self.aliases,
@@ -3421,8 +3455,7 @@ impl<'a> Transformer<'a> {
         // exits and the `last_exception` exitswitch have to go with it —
         // otherwise the block keeps an exception edge for an operation that
         // is not in it any more.
-        if graph.blocks[block_idx].canraise() && count_before_last_operation == Some(new_ops.len())
-        {
+        if graph.blocks[block_idx].canraise() && last_op_rewritten_away {
             // `jtransform.py _killed_exception_raising_operation`
             let block = &mut graph.blocks[block_idx];
             assert!(
@@ -3977,6 +4010,9 @@ impl<'a> Transformer<'a> {
             RewriteResult::Identity(_) => {
                 panic!("force_cast follow-up rewrite was Identity")
             }
+            RewriteResult::Constant(_) => {
+                panic!("force_cast follow-up rewrite was Constant")
+            }
         }
     }
 
@@ -4024,6 +4060,9 @@ impl<'a> Transformer<'a> {
             RewriteResult::Keep => {
                 panic!("inner force_cast Keep on a stamped intermediate")
             }
+            RewriteResult::Constant(_) => {
+                panic!("inner force_cast Constant on a stamped intermediate")
+            }
         }
     }
 
@@ -4050,6 +4089,9 @@ impl<'a> Transformer<'a> {
             }
             RewriteResult::Keep => {
                 panic!("outer force_cast Keep on a stamped intermediate")
+            }
+            RewriteResult::Constant(_) => {
+                panic!("outer force_cast Constant on a stamped intermediate")
             }
         }
     }
@@ -7048,6 +7090,8 @@ impl<'a> Transformer<'a> {
 
     /// RPython `Transformer._is_rclass_instance`
     /// (`jtransform.py`): `lltype._castdepth(v.concretetype.TO, rclass.OBJECT) >= 0`.
+    /// `ForwardReference.become` rebinds `__class__` to the real container, so
+    /// a resolved `PtrTarget::ForwardReference` is a Struct for `_castdepth`.
     fn is_rclass_instance(&self, var: &crate::flowspace::model::Variable) -> bool {
         use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
         use crate::translator::rtyper::rclass::OBJECT;
@@ -7057,13 +7101,18 @@ impl<'a> Transformer<'a> {
         let LowLevelType::Ptr(ptr) = ct else {
             return false;
         };
-        let PtrTarget::Struct(outside) = &ptr.TO else {
-            return false;
+        let outside = match &ptr.TO {
+            PtrTarget::Struct(s) => s.clone(),
+            PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+                Some(LowLevelType::Struct(s)) => *s,
+                _ => return false,
+            },
+            _ => return false,
         };
         let LowLevelType::Struct(object) = &*OBJECT else {
             return false;
         };
-        crate::translator::rtyper::lltypesystem::lltype::_castdepth(outside, object) >= 0
+        crate::translator::rtyper::lltypesystem::lltype::_castdepth(&outside, object) >= 0
     }
 
     /// RPython `Transformer._is_gc`: `rgc.lltype_is_gc(v.concretetype)`.
@@ -7104,17 +7153,17 @@ impl<'a> Transformer<'a> {
                 } else {
                     "instance_ptr_ne"
                 };
-            } else if rhs.concretetype().is_none()
-                || is_renamed_falsy_constant(graph, rhs, &self.aliases, &self.renamings_constants)
-            {
-                // `nullptr(OBJECTPTR)` is an rclass instance upstream
-                // (`_is_rclass_instance` reads `concretetype`, not the
-                // value). Pyre's `ConstRefNull` often has no cell; a
-                // missing type keeps today's `ptr_eq` and
-                // `_rewrite_equality` still folds it to `ptr_iszero`.
+            } else if rhs.concretetype().is_none() {
+                // Exempt only an untyped `ConstRefNull` (no concretetype).
+                // A null with an explicit non-instance pointer type such as
+                // `GCREF` still panics. `_rewrite_equality` folds the untyped
+                // null to `ptr_iszero`.
             } else {
                 panic!(
-                    "graph {graph_name}: ptr equality of an rclass instance against a non-instance"
+                    "graph {graph_name}: ptr equality of an rclass instance against a non-instance \
+                     (lhs={:?}, rhs={:?})",
+                    lhs.concretetype(),
+                    rhs.concretetype()
                 );
             }
         }
@@ -15601,7 +15650,17 @@ fn materialize_const_result(
         ConstValue::Int128(n) => OpKind::ConstInt128(*n),
         ConstValue::UInt128(n) => OpKind::ConstUInt128(*n),
         ConstValue::Bool(b) => OpKind::ConstBool(*b),
-        ConstValue::Float(bits) => OpKind::ConstFloat(*bits),
+        ConstValue::Float(bits) | ConstValue::LongFloat(bits) => OpKind::ConstFloat(*bits),
+        ConstValue::SingleFloat(bits) => OpKind::ConstSingleFloat(*bits),
+        ConstValue::UniChar(cp) => OpKind::ConstInt(*cp as i64),
+        ConstValue::AddressAsInt(addr) => {
+            use crate::translator::rtyper::lltypesystem::lltype::_address;
+            match addr {
+                _address::Null => OpKind::ConstInt(0),
+                _address::IntCast(n) => OpKind::ConstInt(*n),
+                _address::Fake(_) => return materialize_const_result_copy(result, c),
+            }
+        }
         ConstValue::None => OpKind::ConstNone,
         ConstValue::ByteStr(s) => OpKind::ConstStr(s.clone()),
         ConstValue::UniStr(s) => OpKind::ConstInternedStr(s.as_bytes().to_vec()),
@@ -21086,10 +21145,141 @@ mod tests {
         );
     }
 
-    /// Same Constant rewrite as an exitswitch: the switch variable is defined.
+    /// Identity of a constant-map target (`a = fold(); b = same_as(a); c = add(x, b)`)
+    /// emits a Const* defining `b`.
+    #[test]
+    fn identity_of_folded_constant_defines_same_as_result() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("identity_of_const");
+        let start = graph.startblock;
+        let x = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::Signed);
+        let folded = graph
+            .push_op_var(
+                start,
+                OpKind::UnaryOp {
+                    op: "__test_fold_to_const_5".into(),
+                    operand: x.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&folded, ConcreteType::Signed);
+        let aliased = graph
+            .push_op_var(
+                start,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: folded,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&aliased, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                start,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: x,
+                    rhs: aliased.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+        graph.set_return(start, Some(sum));
+        let exceptblock = graph.exceptblock;
+        transformer.optimize_block(&mut graph, start.0, "identity_of_const", exceptblock);
+
+        assert_block_uses_are_defined(&graph.blocks[start.0]);
+        let block = &graph.blocks[start.0];
+        assert!(
+            block.operations.iter().any(|op| {
+                matches!((&op.kind, &op.result), (OpKind::ConstInt(5), Some(r)) if r == &aliased)
+            }),
+            "same_as of a folded constant must emit ConstInt(5) defining b: {:?}",
+            block.operations
+        );
+    }
+
+    fn child_ptr_standalone_and_parent_type() -> (
+        crate::translator::rtyper::lltypesystem::lltype::_ptr,
+        crate::translator::rtyper::lltypesystem::lltype::Ptr,
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, MallocFlavor, Ptr, Struct, malloc,
+        };
+        let child = Struct::gc_rtti("child_w", vec![("x".into(), LowLevelType::Signed)]);
+        let child_t = LowLevelType::Struct(Box::new(child));
+        let parent = Struct::gc_rtti(
+            "parent_w",
+            vec![
+                ("super".into(), child_t.clone()),
+                ("y".into(), LowLevelType::Signed),
+            ],
+        );
+        let parent_t = LowLevelType::Struct(Box::new(parent));
+        let child_ptr = Ptr::from_container_type(child_t.clone()).unwrap();
+        let live = malloc(child_t, None, MallocFlavor::Gc, true).unwrap();
+        let parent_ptr = LowLevelType::Ptr(Box::new(Ptr::from_container_type(parent_t).unwrap()));
+        (live, child_ptr, parent_ptr)
+    }
+
+    /// `do_rename` swallows only `RuntimeError` (`except RuntimeError: return`).
+    #[test]
+    fn recast_of_widening_to_trash_is_skipped() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        let (live, _child_ptr, parent_ptr) = child_ptr_standalone_and_parent_type();
+        let mut graph = FunctionGraph::new("recast_runtime");
+        let var = graph.alloc_value_var();
+        var.set_concretetype(Some(parent_ptr));
+        let recast =
+            recast_renamed_constant(&var, Constant::new(ConstValue::LLPtr(Box::new(live))));
+        assert!(
+            recast.is_none(),
+            "widening to trash is RuntimeError and must skip the constants map"
+        );
+    }
+
+    /// `DelayedPointer` derives from `Exception`, not `RuntimeError`.
+    #[test]
+    #[should_panic(expected = "DelayedPointer")]
+    fn recast_of_delayed_pointer_does_not_swallow() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr, DelayedPointer};
+        let (_live, child_ptr, parent_ptr) = child_ptr_standalone_and_parent_type();
+        let delayed = _ptr::new(child_ptr, Err(DelayedPointer));
+        let mut graph = FunctionGraph::new("recast_delayed");
+        let var = graph.alloc_value_var();
+        var.set_concretetype(Some(parent_ptr));
+        let _ = recast_renamed_constant(&var, Constant::new(ConstValue::LLPtr(Box::new(delayed))));
+    }
+
+    /// Constant rewrite of the exitswitch: an int switch whose cases
+    /// include the constant. `follow_constant_exit` (`jtransform.py
+    /// Transformer.follow_constant_exit`) keeps the matching link.
     #[test]
     fn optimize_block_constant_result_defines_exitswitch() {
         use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::ConstValue;
         use crate::model::{ExitCase, ExitSwitch, Link};
 
         let config = GraphTransformConfig::default();
@@ -21141,25 +21331,42 @@ mod tests {
             start,
             Some(ExitSwitch::Value(folded.clone())),
             vec![
-                Link::from_variables(&graph, vec![], if_true, Some(ExitCase::Bool(true))),
-                Link::from_variables(&graph, vec![], if_false, Some(ExitCase::Bool(false))),
+                Link::from_variables(
+                    &graph,
+                    vec![],
+                    if_true,
+                    Some(ExitCase::Const(ConstValue::Int(5))),
+                )
+                .with_llexitcase_from_exitcase(),
+                Link::from_variables(
+                    &graph,
+                    vec![],
+                    if_false,
+                    Some(ExitCase::Const(ConstValue::Int(0))),
+                )
+                .with_llexitcase_from_exitcase(),
             ],
         );
         let exceptblock = graph.exceptblock;
         transformer.optimize_block(&mut graph, start.0, "const_feeds_exitswitch", exceptblock);
 
         assert_block_uses_are_defined(&graph.blocks[start.0]);
-        match &graph.blocks[start.0].exitswitch {
-            Some(ExitSwitch::Value(var)) => {
-                assert_eq!(var, &folded, "exitswitch stays the Const*-defined variable")
-            }
-            other => panic!("expected Value exitswitch, got {other:?}"),
-        }
+        assert!(
+            graph.blocks[start.0].exitswitch.is_none(),
+            "follow_constant_exit collapses a constant switch: {:?}",
+            graph.blocks[start.0].exitswitch
+        );
+        assert_eq!(graph.blocks[start.0].exits.len(), 1);
+        assert_eq!(
+            graph.blocks[start.0].exits[0].target, if_true,
+            "taken link is the Int(5) case: {:?}",
+            graph.blocks[start.0].exits
+        );
         assert!(
             graph.blocks[start.0].operations.iter().any(|op| {
                 matches!((&op.kind, &op.result), (OpKind::ConstInt(5), Some(r)) if r == &folded)
             }),
-            "exitswitch producer must be defined: {:?}",
+            "constant result still defines the folded var: {:?}",
             graph.blocks[start.0].operations
         );
     }
@@ -26641,9 +26848,9 @@ mod tests {
             matches!(
                 block.exits[0].args.as_slice(),
                 [LinkArg::Const(c)]
-                    if matches!(c.value, crate::flowspace::model::ConstValue::Bool(true))
+                    if matches!(c.value, crate::flowspace::model::ConstValue::Int(1))
             ),
-            "helper result is the const operand: {:?}, ops={ops:?}",
+            "helper result is Signed; Bool(true) recasts to 1: {:?}, ops={ops:?}",
             block.exits[0].args
         );
     }
@@ -26662,9 +26869,19 @@ mod tests {
         used: bool,
     ) -> (FunctionGraph, crate::flowspace::model::Variable) {
         let mut graph = FunctionGraph::new("record_exact_value_ref_const");
-        let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        // `rlib/jit.py record_exact_value` specialize_call: the helper
+        // result has the argument's concretetype (`hop.r_result` from the
+        // union, `ll_record_exact_value` returns `ll_const_value`). A
+        // `Ptr(STR)` argument is STRPTR, not OBJECTPTR.
+        let llty = const_value
+            .concretetype
+            .clone()
+            .expect("record_exact_value const carries concretetype");
+        let value = graph.alloc_value_var();
+        value.set_concretetype(Some(llty.clone()));
         graph.push_inputarg_var(graph.startblock, value.clone());
-        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var();
+        result.set_concretetype(Some(llty));
         graph.push_op_with_result_var(
             graph.startblock,
             OpKind::Call {
@@ -30366,6 +30583,80 @@ mod tests {
         );
     }
 
+    /// A canraise last op folded to a constant drops its exception exits.
+    /// The materialized Const* does not count as the surviving last op.
+    #[test]
+    fn constant_folded_last_op_drops_the_blocks_exception_exits() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::{ExitSwitch, Link, exception_exitcase};
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("killed_exc_const_op");
+        let entry = graph.startblock;
+
+        let operand = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        FunctionGraph::set_concretetype_of_inline(&operand, ConcreteType::Signed);
+        let folded = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "__test_fold_to_const_5".to_string(),
+                    operand,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&folded, ConcreteType::Signed);
+
+        let continuation = graph.create_block();
+        let phi = graph.alloc_value_var();
+        graph.push_inputarg_var(continuation, phi.clone());
+        graph.set_return(continuation, Some(phi));
+
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
+        let normal_link = Link::from_variables(&graph, vec![folded], continuation, None);
+        let exc_link = Link::from_variables(
+            &graph,
+            vec![last_exception_var.clone(), last_exc_value_var.clone()],
+            exc_block,
+            Some(exception_exitcase()),
+        )
+        .extravars(
+            Some(LinkArg::Value(last_exception_var)),
+            Some(LinkArg::Value(last_exc_value_var)),
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![normal_link, exc_link],
+        );
+        assert!(graph.blocks[entry.0].canraise());
+
+        transformer.optimize_block(&mut graph, entry.0, "killed_exc_const_op", exc_block);
+
+        let block = &graph.blocks[entry.0];
+        assert!(
+            block.exitswitch.is_none(),
+            "a last op folded to a constant must drop last_exception: {:?}",
+            block.exitswitch
+        );
+        assert_eq!(
+            block.exits.len(),
+            1,
+            "the exception exit must go with the folded operation"
+        );
+        assert!(
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ConstInt(5))),
+            "the Const* image of the fold must still be present: {:?}",
+            block.operations
+        );
+    }
+
     /// A block that never had an operation has no *last* operation, so
     /// `jtransform.py len(newoperations) == count_before_last_operation`
     /// does not apply to it — upstream never binds the name and the
@@ -33734,6 +34025,7 @@ mod tests {
             RewriteResult::Replace(ops) => (ops, arg),
             RewriteResult::Identity(_) => panic!("expected Replace, got Identity"),
             RewriteResult::Keep => panic!("expected Replace, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Replace, got Constant"),
         }
     }
 
@@ -33747,6 +34039,7 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             RewriteResult::Replace(_) => panic!("expected Identity, got Replace"),
             RewriteResult::Keep => panic!("expected Identity, got Keep"),
+            RewriteResult::Constant(_) => panic!("expected Identity, got Constant"),
         }
     }
 
@@ -39615,6 +39908,73 @@ mod tests {
             );
         }
 
+        /// `ForwardReference.become` rebinds the container to a Struct, so a
+        /// null whose type is `Ptr(Fwd(PyObject))` with `super` = OBJECT is an
+        /// instance (`_castdepth` 1), not a typed non-instance like `GCREF`.
+        #[test]
+        fn ptr_eq_of_instance_against_resolved_forward_ref_null_is_ptr_iszero() {
+            use crate::translator::rtyper::lltypesystem::lltype::{
+                ForwardReference, LowLevelType, Ptr, PtrTarget,
+            };
+            use crate::translator::rtyper::rclass::OBJECTPTR;
+            let LowLevelType::Ptr(objectptr) = OBJECTPTR.clone() else {
+                panic!("OBJECTPTR is a Ptr");
+            };
+            let PtrTarget::Struct(object) = &objectptr.TO else {
+                panic!("OBJECT is a Struct");
+            };
+            // write_cell's null is `Ptr(Fwd(GcStruct pyobject::PyObject { super, ... }))`.
+            let child = crate::translator::rtyper::lltypesystem::lltype::Struct::gc(
+                "pyobject::PyObject",
+                vec![(
+                    "super".into(),
+                    LowLevelType::Struct(Box::new(object.clone())),
+                )],
+            );
+            let fwd = ForwardReference::gc();
+            fwd.r#become(LowLevelType::Struct(Box::new(child))).unwrap();
+            let fwd_ty = LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::ForwardReference(fwd),
+            }));
+            let mut graph = FunctionGraph::new("instance_vs_fwd_object_null");
+            let x = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            x.set_concretetype(Some(OBJECTPTR.clone()));
+            let null = graph
+                .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
+                .unwrap();
+            null.set_concretetype(Some(fwd_ty));
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_eq".into(),
+                        lhs: x.clone(),
+                        rhs: null,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            assert_eq!(
+                unary_op(ops),
+                Some(("ptr_iszero".to_string(), x)),
+                "`Ptr(Fwd(OBJECT))` null is an instance after become(): {ops:?}"
+            );
+        }
+
         #[test]
         fn ptr_eq_of_raw_ptr_against_null_becomes_int_is_zero() {
             use crate::translator::rtyper::rclass::NONGCOBJECTPTR;
@@ -39759,6 +40119,44 @@ mod tests {
                     },
                     true,
                 )
+                .unwrap();
+            lhs.set_concretetype(Some(OBJECTPTR.clone()));
+            rhs.set_concretetype(Some(GCREF.clone()));
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_eq".into(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let _ = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        }
+
+        #[test]
+        #[should_panic(expected = "instance_vs_gcref_null_ptr_eq")]
+        fn ptr_eq_of_instance_against_gcref_typed_null_panics() {
+            use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+            use crate::translator::rtyper::rclass::OBJECTPTR;
+            let mut graph = FunctionGraph::new("instance_vs_gcref_null_ptr_eq");
+            let lhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs = graph
+                .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
                 .unwrap();
             lhs.set_concretetype(Some(OBJECTPTR.clone()));
             rhs.set_concretetype(Some(GCREF.clone()));
