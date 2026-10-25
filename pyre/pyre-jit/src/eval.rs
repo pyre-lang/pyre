@@ -8699,6 +8699,9 @@ fn run_compiled_generatorentry(
         }
         // `compile.py AbstractResumeGuardDescr.handle_fail`:
         // `must_compile` then `_trace_and_compile_from_bridge`.
+        // `warmstate.py execute_assembler` is this driver's WarmEnterState
+        // method and passes that `jitdriver_sd` to `handle_fail`. This
+        // function is that method for `generatorentry_driver`.
         if let Some(ref descr_arc) = descr_arc {
             let (must_compile, _) = {
                 let (driver, _) = driver_pair();
@@ -8707,6 +8710,7 @@ fn run_compiled_generatorentry(
                     &values,
                     guard_value_operand,
                     green_key,
+                    pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX as usize,
                 )
             };
             if must_compile && !majit_metainterp::MetaInterp::<()>::stack_almost_full() {

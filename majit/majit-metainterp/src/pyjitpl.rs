@@ -1686,20 +1686,6 @@ pub(crate) fn translate_trace_iter_opref(
     translated
 }
 
-/// opencoder.py `TraceIterator._get(i)`: the box object `_cache[i]` holds
-/// for a recorded position, or `None` for a constant / absent slot.
-pub(crate) fn trace_iter_cached_box(
-    opref: OpRef,
-    cache: &[Option<majit_ir::operand::Operand>],
-) -> Option<&majit_ir::operand::Operand> {
-    if opref.is_none() || opref.is_constant() {
-        return None;
-    }
-    cache
-        .get(opref.raw() as usize)
-        .and_then(|slot| slot.as_ref())
-}
-
 fn translate_trace_iter_box_map(
     mut box_map: SnapshotBoxes,
     cache: &[Option<majit_ir::operand::Operand>],
@@ -16033,28 +16019,32 @@ impl<M: Clone> MetaInterp<M> {
     /// [`Self::owning_key_for_descr`].
     ///
     /// Returns (should_compile, owning_green_key).
+    ///
+    /// `jitdriver_sd` is the index `handle_fail(deadframe, metainterp_sd,
+    /// jitdriver_sd)` received from `execute_assembler` /
+    /// `assembler_call_helper`. `AbstractResumeGuardDescr.must_compile`
+    /// ticks that driver's `warmstate.increment_trace_eagerness`.
     pub fn must_compile_with_values(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         fail_values: &[i64],
         guard_value_operand: Option<i64>,
         fallback_green_key: u64,
+        jitdriver_sd: usize,
     ) -> (bool, u64) {
         let owning_key = Self::owning_key_for_descr(descr_arc, fallback_green_key);
-        self.must_compile_with_owning_key(descr_arc, fail_values, guard_value_operand, owning_key)
+        self.must_compile_with_owning_key(
+            descr_arc,
+            fail_values,
+            guard_value_operand,
+            owning_key,
+            jitdriver_sd,
+        )
     }
 
-    /// [`Self::must_compile_with_values`] for a caller that has already
-    /// resolved the owning loop.
-    ///
-    /// `compile.py handle_fail` reads `resumedescr.rd_loop_token` once per
-    /// failure and `must_compile` never re-derives the loop it belongs to; a
-    /// caller that walked the owning JCT to look the guard's layout up holds
-    /// the same answer and hands it in rather than paying the weakref upgrade
-    /// a second time inside one event.
-    /// `compile.py must_compile` ticks `rd_loop_token.outermost_jitdriver_sd`.
-    /// `compile.py make_jitcell_token` always sets that field; a missing token
-    /// ticks the portal driver.
+    /// `rd_loop_token.outermost_jitdriver_sd` for `handle_async_forcing`.
+    /// `compile.py make_jitcell_token` always sets that field; a missing
+    /// token is the portal driver.
     pub(crate) fn jitdriver_index_for_failed_token(
         &self,
         token: Option<&majit_backend::JitCellToken>,
@@ -16110,12 +16100,25 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// [`Self::must_compile_with_values`] for a caller that has already
+    /// resolved the owning loop.
+    ///
+    /// `compile.py handle_fail` reads `resumedescr.rd_loop_token` once per
+    /// failure and `must_compile` never re-derives the loop it belongs to; a
+    /// caller that walked the owning JCT to look the guard's layout up holds
+    /// the same answer and hands it in rather than paying the weakref upgrade
+    /// a second time inside one event.
+    ///
+    /// `jitdriver_sd` is the `handle_fail` argument.
+    /// `AbstractResumeGuardDescr.must_compile` ticks
+    /// `jitdriver_sd.warmstate.increment_trace_eagerness`.
     pub fn must_compile_with_owning_key(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         fail_values: &[i64],
         guard_value_operand: Option<i64>,
         owning_key: u64,
+        jitdriver_sd: usize,
     ) -> (bool, u64) {
         crate::mc_diag_bump(0); // must_compile_with_values entered
         let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
@@ -16181,14 +16184,13 @@ impl<M: Clone> MetaInterp<M> {
                     return (false, owning_key);
                 }
             };
-        // compile.py must_compile: increment =
+        // compile.py AbstractResumeGuardDescr.must_compile: increment =
         // jitdriver_sd.warmstate.increment_trace_eagerness, then
-        // warmrunnerdesc.jitcounter.tick. jitdriver_sd is
-        // rd_loop_token.outermost_jitdriver_sd, not leftover
-        // active_jitdriver_sd from a later trace.
-        let jd_no = self
-            .jitdriver_index_for_failed_token(majit_backend::descr_owning_jct(descr_fd).as_deref());
-        let fired = self.warm_state_for_driver(jd_no).tick_guard_failure(hash);
+        // warmrunnerdesc.jitcounter.tick. jitdriver_sd is the
+        // handle_fail argument, not rd_loop_token.outermost_jitdriver_sd.
+        let fired = self
+            .warm_state_for_driver(jitdriver_sd)
+            .tick_guard_failure(hash);
         if fired {
             crate::mc_diag_bump(4); // jitcounter FIRED
         }
@@ -35783,13 +35785,20 @@ mod tests {
         let fd = descr.as_fail_descr().expect("resume guard");
         fd.make_a_counter_per_value(0, MetaInterp::<()>::TY_REF);
 
-        assert!(!meta.must_compile_with_values(&descr, &[], Some(0x100), 1).0);
         assert!(
-            !meta.must_compile_with_values(&descr, &[], Some(0x200), 1).0,
+            !meta
+                .must_compile_with_values(&descr, &[], Some(0x100), 1, 0)
+                .0
+        );
+        assert!(
+            !meta
+                .must_compile_with_values(&descr, &[], Some(0x200), 1, 0)
+                .0,
             "distinct live addresses hash into distinct jitcounter buckets"
         );
         assert!(
-            meta.must_compile_with_values(&descr, &[], Some(0x100), 1).0,
+            meta.must_compile_with_values(&descr, &[], Some(0x100), 1, 0)
+                .0,
             "the same live address ticks the same bucket"
         );
     }
@@ -35808,25 +35817,25 @@ mod tests {
         let hash = meta.warm_state_for_driver(0).fetch_next_hash();
         fd.store_hash(hash);
 
-        assert!(!meta.must_compile_with_values(&descr, &[], None, 1).0);
+        assert!(!meta.must_compile_with_values(&descr, &[], None, 1, 0).0);
         assert!(
-            meta.must_compile_with_values(&descr, &[], None, 1).0,
+            meta.must_compile_with_values(&descr, &[], None, 1, 0).0,
             "trace_eagerness 2 fires on the second failure"
         );
 
         fd.start_compiling();
         assert!(
-            !meta.must_compile_with_values(&descr, &[], None, 1).0,
+            !meta.must_compile_with_values(&descr, &[], None, 1, 0).0,
             "ST_BUSY_FLAG set by start_compiling skips the tick"
         );
         fd.done_compiling();
 
         assert!(
-            !meta.must_compile_with_values(&descr, &[], None, 1).0,
+            !meta.must_compile_with_values(&descr, &[], None, 1, 0).0,
             "the firing tick reset the counter"
         );
         assert!(
-            meta.must_compile_with_values(&descr, &[], None, 1).0,
+            meta.must_compile_with_values(&descr, &[], None, 1, 0).0,
             "later failures tick until the threshold again"
         );
     }
@@ -35846,18 +35855,18 @@ mod tests {
         fd.set_bridge_declined_terminally();
 
         assert!(fd.bridge_declined_terminally());
-        assert!(!meta.must_compile_with_values(&descr, &[], None, 1).0);
+        assert!(!meta.must_compile_with_values(&descr, &[], None, 1, 0).0);
         assert!(
-            !meta.must_compile_with_values(&descr, &[], None, 1).0,
+            !meta.must_compile_with_values(&descr, &[], None, 1, 0).0,
             "a terminal decline must not fire must_compile"
         );
     }
 
     #[test]
     fn must_compile_ticks_the_compiling_driver_counter() {
-        // compile.py must_compile ticks
-        // rd_loop_token.outermost_jitdriver_sd.increment_trace_eagerness,
-        // not leftover active_jitdriver_sd.
+        // compile.py AbstractResumeGuardDescr.must_compile ticks
+        // the handle_fail jitdriver_sd argument, not leftover
+        // active_jitdriver_sd and not rd_loop_token.outermost_jitdriver_sd.
         let mut meta = MetaInterp::<()>::new(1);
         extern "C" fn portal_runner_helper() -> i64 {
             0
@@ -35879,7 +35888,7 @@ mod tests {
             .set_param_trace_eagerness(2);
         meta.active_jitdriver_sd = Some(idx0);
 
-        let token = crate::compile::make_jitcell_token(Some(idx1));
+        let token = crate::compile::make_jitcell_token(Some(idx0));
         token.set_number(91);
         crate::compile::wire_clt_loop_token_wref(&token);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
@@ -35888,14 +35897,14 @@ mod tests {
         let hash = meta.warm_state_for_driver(idx1).fetch_next_hash();
         fd.store_hash(hash);
 
-        assert!(!meta.must_compile_with_values(&descr, &[], None, 1).0);
+        assert!(!meta.must_compile_with_values(&descr, &[], None, 1, idx1).0);
         assert!(
-            meta.must_compile_with_values(&descr, &[], None, 1).0,
-            "increment_trace_eagerness on rd_loop_token.outermost_jitdriver_sd fires at 2"
+            meta.must_compile_with_values(&descr, &[], None, 1, idx1).0,
+            "increment_trace_eagerness on handle_fail's jitdriver_sd fires at 2"
         );
         assert!(
             !meta.warm_state_for_driver(0).tick_guard_failure(hash),
-            "driver 0's timetable did not receive the failed-token ticks"
+            "rd_loop_token.outermost_jitdriver_sd's timetable did not receive the ticks"
         );
         let _keep = token;
     }
@@ -35952,6 +35961,30 @@ mod tests {
         assert!(
             !meta.warm_state_for_driver(idx1).tick_guard_failure(hash),
             "outermost_jitdriver_sd's timetable did not receive the ticks"
+        );
+
+        // Non-plain `must_compile_with_values` ticks the same handle_fail
+        // `jitdriver_sd` argument, not `rd_loop_token.outermost_jitdriver_sd`.
+        let descr2 = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let fd2 = descr2.as_fail_descr().expect("resume guard");
+        fd2.set_rd_loop_token_clt(token.compiled_loop_token_expect());
+        let hash2 = meta.warm_state_for_driver(idx0).fetch_next_hash();
+        fd2.store_hash(hash2);
+        assert!(!meta.must_compile_with_values(&descr2, &[], None, 1, idx0).0);
+        assert!(
+            !meta.must_compile_with_values(&descr2, &[], None, 1, idx0).0,
+            "must_compile_with_values ticks handle_fail's jitdriver_sd (idx0, eagerness 8)"
+        );
+        for _ in 0..5 {
+            assert!(!meta.must_compile_with_values(&descr2, &[], None, 1, idx0).0);
+        }
+        assert!(
+            meta.must_compile_with_values(&descr2, &[], None, 1, idx0).0,
+            "eighth tick on handle_fail's jitdriver_sd fires"
+        );
+        assert!(
+            !meta.warm_state_for_driver(idx1).tick_guard_failure(hash2),
+            "outermost_jitdriver_sd's timetable did not receive the owning-key ticks"
         );
         let _keep = token;
     }

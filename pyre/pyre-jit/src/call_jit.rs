@@ -5401,13 +5401,20 @@ fn jit_ca_handle_guard_failure(
     let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
 
     // compile.py must_compile: jitcounter.tick(guard_hash, increment)
+    // `warmspot.py assembler_call_helper` is built per jitdriver and
+    // passes that `jd` to `handle_fail`. This callback is that helper;
+    // the deadframe is the callee `execute_token` result, so the
+    // closed-over `jd` is the callee driver's index.
     let (must_compile, _) = {
+        let jitdriver_sd = failing_loop_jitdriver_index(&descr_arc)
+            .unwrap_or(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX);
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().must_compile_with_values(
             &descr_arc,
             &[],
             guard_value_operand,
             source_green_key,
+            jitdriver_sd,
         )
     };
     // compile.py: must_compile() and not stack_almost_full()
@@ -5568,12 +5575,16 @@ fn try_compile_ca_bridge(
         return None;
     };
     let (must_compile, owning_key) = {
+        // Same `assembler_call_helper` `jd` as `jit_ca_handle_guard_failure`.
+        let jitdriver_sd = failing_loop_jitdriver_index(descr_arc)
+            .unwrap_or(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX);
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().must_compile_with_values(
             descr_arc,
             raw_values,
             guard_value_operand,
             source_green_key,
+            jitdriver_sd,
         )
     };
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {

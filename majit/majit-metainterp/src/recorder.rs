@@ -369,7 +369,12 @@ fn untag_snapshot_pools(
     }
 }
 
-/// Untag one snapshot word and rewrite it into the prepare cache's namespace.
+/// Untag one snapshot word into the prepare cache's namespace.
+///
+/// `opencoder.py SnapshotIterator._untag` for TAGBOX is
+/// `TraceIterator._get(v)`: one `_cache[i]` lookup, the box object
+/// itself. Constants go through the tagged pools (`ConstInt` /
+/// `ConstPtr` / `_floats` / `_bigints`) with no cache.
 fn snapshot_box_from_tagged<'c>(
     tagged: i64,
     inputargs: &[InputArgRc],
@@ -377,20 +382,31 @@ fn snapshot_box_from_tagged<'c>(
     trb: &TraceRecordBuffer,
     unique_cache: &'c [Option<Operand>],
 ) -> (crate::resume::SnapshotBox, Option<&'c Operand>) {
+    use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX};
+    let tag = (tagged & TAG_MASK as i64) as u8;
+    if tag == TAGBOX {
+        let v = tagged >> TAG_SHIFT;
+        debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
+        let cached = unique_cache
+            .get(v as usize)
+            .and_then(|slot| slot.as_ref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "snapshot_box_from_tagged: TraceIterator._get({v}) is None (cache_len={})",
+                    unique_cache.len(),
+                )
+            });
+        return (
+            crate::resume::SnapshotBox {
+                opref: cached.to_opref(),
+                cached: None,
+            },
+            Some(cached),
+        );
+    }
     let decoded = untag_snapshot_pools(inputargs, value_slots, trb, tagged);
     let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded);
-    // opencoder.py `SnapshotIterator._untag` returns `_cache[i]`, the box
-    // object itself. `_cache` is `_index`-keyed. Look up before rewriting
-    // the OpRef into the optimizer namespace.
-    let orig = snap_box.opref();
-    let cached = crate::pyjitpl::trace_iter_cached_box(orig, unique_cache);
-    (
-        crate::resume::SnapshotBox {
-            opref: crate::pyjitpl::translate_trace_iter_opref(orig, unique_cache),
-            cached: cached.cloned(),
-        },
-        cached,
-    )
+    (snap_box, None)
 }
 
 /// One byte-mode bridge's resume source.

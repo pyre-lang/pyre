@@ -7777,11 +7777,14 @@ impl<S: JitState> JitDriver<S> {
         // live (`compile.py must_compile` `cpu.get_value_direct`). The
         // fail-values slice is only the fallback for backends that
         // resolve the GUARD_VALUE index from the dense vector.
+        // `warmstate.py execute_assembler` / `warmspot.py
+        // assembler_call_helper` call `handle_fail(deadframe,
+        // metainterp_sd, jitdriver_sd)` with this driver's `jitdriver_sd`.
+        let jitdriver_sd = self.index().unwrap_or(0);
         let (must_compile, owning_key) = if let Some(rgd) = rgd_plain {
             // `must_compile(self, deadframe, metainterp_sd, jitdriver_sd)`:
             // tick this portal's warmstate, the `jd` `execute_assembler` /
             // `assembler_call_helper` passed into `handle_fail`.
-            let jitdriver_sd = self.index().unwrap_or(0);
             self.meta.must_compile_resume_guard(
                 rgd,
                 &[],
@@ -7795,6 +7798,7 @@ impl<S: JitState> JitDriver<S> {
                 &[],
                 guard_value_operand,
                 owning_key,
+                jitdriver_sd,
             )
         };
         // compile.py: must_compile() and not stack_almost_full().
@@ -9782,11 +9786,15 @@ impl<S: JitState> JitDriver<S> {
         };
         // Carried off the result — see the sibling run loop.
         let owning_key = descr_owning_key.unwrap_or(fallback_green_key);
+        // `warmstate.py execute_assembler` passes this driver's
+        // `jitdriver_sd` into `handle_fail`.
+        let jitdriver_sd = self.index().unwrap_or(0);
         let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
             &descr_arc,
             &raw_values,
             guard_value_operand,
             owning_key,
+            jitdriver_sd,
         );
         // compile.py: must_compile() and not stack_almost_full().
         // `no_bridge_enabled()` is the same opt-out the two sibling loops
