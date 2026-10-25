@@ -2609,10 +2609,31 @@ impl TraceCtx {
     /// history.py `ConstPtr.value` — typed green keys hold copied Ref
     /// addresses (`green_key_values`, `close_typed_key`,
     /// `cut_inner_green_key`, each `current_merge_points[i].green_key_typed`).
+    /// The merge-point `(ints, refs, floats)` banks (`header_greens`,
+    /// `close_greens`, `live_portal_greens`) copy the same words;
+    /// `portal_resume_args` reads those banks first. `merge_point_green_key`
+    /// puts Ref/Str/Unicode in the refs bank; `GreenKey::walk_refs` forwards
+    /// only `GreenType::Ref` slots and treats a missing type as `Int`. An
+    /// empty spec therefore visits nothing: the refs bank can hold
+    /// Str/Unicode words, which are frontend string slots, not moving
+    /// GC pointers.
     pub(crate) fn walk_stored_greenkey_refs(
         &mut self,
         visitor: &mut impl FnMut(&mut majit_ir::GcRef),
     ) {
+        {
+            let owned_spec = self.driver_descriptor.as_ref().map(|d| d.green_args_spec());
+            let spec: &[GreenType] = owned_spec.as_deref().unwrap_or_else(|| {
+                self.green_key_values
+                    .as_ref()
+                    .map(|k| k.types.as_slice())
+                    .or_else(|| self.close_typed_key.as_ref().map(|k| k.types.as_slice()))
+                    .unwrap_or(&[])
+            });
+            Self::walk_green_bank_ref_words(&mut self.header_greens, spec, visitor);
+            Self::walk_green_bank_ref_words(&mut self.close_greens, spec, visitor);
+            Self::walk_green_bank_ref_words(&mut self.live_portal_greens, spec, visitor);
+        }
         if let Some(gk) = self.green_key_values.as_mut() {
             gk.walk_refs(visitor);
         }
@@ -2624,6 +2645,39 @@ impl TraceCtx {
         }
         for mp in &mut self.current_merge_points {
             mp.green_key_typed.walk_refs(visitor);
+        }
+    }
+
+    fn walk_green_bank_ref_words(
+        banks: &mut Option<(Vec<i64>, Vec<i64>, Vec<i64>)>,
+        spec: &[GreenType],
+        visitor: &mut impl FnMut(&mut majit_ir::GcRef),
+    ) {
+        let Some((_, refs, _)) = banks.as_mut() else {
+            return;
+        };
+        // GreenKey::walk_refs: a missing type is Int, not a GC pointer.
+        if spec.is_empty() {
+            return;
+        }
+        let mut ref_i = 0usize;
+        for tp in spec {
+            match tp {
+                GreenType::Ref => {
+                    if let Some(word) = refs.get_mut(ref_i)
+                        && *word != 0
+                    {
+                        let mut gcref = majit_ir::GcRef(*word as usize);
+                        visitor(&mut gcref);
+                        *word = gcref.0 as i64;
+                    }
+                    ref_i += 1;
+                }
+                GreenType::Str | GreenType::Unicode => {
+                    ref_i += 1;
+                }
+                GreenType::Int | GreenType::Void | GreenType::Float => {}
+            }
         }
     }
 

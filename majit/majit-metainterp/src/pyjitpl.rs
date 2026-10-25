@@ -31952,6 +31952,10 @@ mod tests {
         trace_ctx.set_green_key_values(key.clone());
         trace_ctx.set_close_typed_key(key.clone());
         trace_ctx.add_merge_point_with_key(key.get_uhash(), key.clone(), Vec::new(), 0);
+        let bank = (vec![7], vec![old as i64], Vec::new());
+        trace_ctx.header_greens = Some(bank.clone());
+        trace_ctx.close_greens = Some(bank.clone());
+        trace_ctx.live_portal_greens = Some(bank);
         let pos = trace_ctx.get_trace_position();
         meta.tracing = Some(trace_ctx);
         meta.portal_trace_positions = Some(vec![(0, Some((key.get_uhash(), key.clone())), pos)]);
@@ -31998,6 +32002,10 @@ mod tests {
             ctx.current_merge_points[0].green_key_typed.values[1],
             new as i64
         );
+        assert_eq!(ctx.header_greens.as_ref().unwrap().1, [new as i64]);
+        assert_eq!(ctx.close_greens.as_ref().unwrap().1, [new as i64]);
+        assert_eq!(ctx.live_portal_greens.as_ref().unwrap().1, [new as i64]);
+        assert_eq!(ctx.portal_resume_args().green_ref, [new as i64]);
     }
 
     fn intern_const_ptr(addr: GcRef) -> (OpRef, u32, RestoreConstPtr) {

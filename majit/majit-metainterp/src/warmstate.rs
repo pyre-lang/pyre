@@ -1115,7 +1115,11 @@ impl WarmEnterState {
         let cell = self.cell_by_key(cell_key);
         let is_runnable = cell.as_ref().is_some_and(|c| c.is_compiled());
         let hash = self.bucket_of(cell_key);
-        let greens = cell.as_ref().map(|c| c.current_greens());
+        let greens = if self.has_confirm_enter_jit() {
+            cell.as_ref().map(|c| c.current_greens())
+        } else {
+            None
+        };
         matches!(
             self.maybe_compile_and_run_decision(
                 cell.as_deref(),
@@ -1172,7 +1176,11 @@ impl WarmEnterState {
             .as_ref()
             .is_some_and(|c| c.is_compiled() && has_compiled_meta(cell_key));
         let hash = self.bucket_of(cell_key);
-        let greens = cell.as_ref().map(|c| c.current_greens());
+        let greens = if self.has_confirm_enter_jit() {
+            cell.as_ref().map(|c| c.current_greens())
+        } else {
+            None
+        };
         self.maybe_compile_and_run_decision(
             cell.as_deref(),
             hash,
@@ -1187,9 +1195,18 @@ impl WarmEnterState {
 
     /// Compatibility form for callers whose compiled-loop metadata is wholly
     /// represented by the warm cell itself.
+    ///
+    /// `green_types` is the driver's `_green_args_spec` (`warmstate.py`
+    /// `confirm_enter_jit(*args)`). A hook packs one type per stored green;
+    /// this wrapper does not invent a spec. Callers that install no hook
+    /// may pass `&[]` — confirm is not consulted.
     #[inline]
-    pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
-        self.maybe_compile_decision_with_meta(cell_key, |_| true, &[], &[])
+    pub fn maybe_compile_decision(
+        &mut self,
+        cell_key: u64,
+        green_types: &[GreenType],
+    ) -> HotResult {
+        self.maybe_compile_decision_with_meta(cell_key, |_| true, green_types, &[])
     }
 
     /// [`Self::maybe_compile_decision`] followed by the mark that
@@ -1208,7 +1225,7 @@ impl WarmEnterState {
     /// [`Self::start_tracing_cell_for_key`] / `JitCell(*greenargs)`.
     #[cfg(test)]
     pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
-        match self.maybe_compile_decision(cell_key) {
+        match self.maybe_compile_decision(cell_key, &[]) {
             HotResult::StartTracing => self.start_tracing_cell(cell_key, None, &[], &[]),
             other => other,
         }
@@ -5247,7 +5264,7 @@ mod tests {
             HotResult::AlreadyTracing
         ));
         assert!(matches!(
-            ws.maybe_compile_decision(cell_key),
+            ws.maybe_compile_decision(cell_key, &key.types),
             HotResult::AlreadyTracing
         ));
         assert!(matches!(
@@ -6169,10 +6186,19 @@ mod tests {
         let key = GreenKey::new(vec![31, 33]);
         let hash = key.get_uhash();
 
-        assert!(matches!(ws.maybe_compile_decision(hash), HotResult::NotHot));
-        assert!(matches!(ws.maybe_compile_decision(hash), HotResult::NotHot));
+        assert!(matches!(
+            ws.maybe_compile_decision(hash, &key.types),
+            HotResult::NotHot
+        ));
+        assert!(matches!(
+            ws.maybe_compile_decision(hash, &key.types),
+            HotResult::NotHot
+        ));
         assert!(
-            matches!(ws.maybe_compile_decision(hash), HotResult::StartTracing),
+            matches!(
+                ws.maybe_compile_decision(hash, &key.types),
+                HotResult::StartTracing
+            ),
             "the decision alone answers, and it is not a veto position",
         );
         assert_eq!(
@@ -7637,7 +7663,7 @@ mod tests {
         );
 
         assert!(matches!(
-            ws.maybe_compile_decision(ws.cell_key_for(&gk(42)).expect("cell")),
+            ws.maybe_compile_decision(ws.cell_key_for(&gk(42)).expect("cell"), &gk(42).types),
             HotResult::NotHot
         ));
         assert!(
@@ -7758,7 +7784,7 @@ mod tests {
 
         let generation = ws.cell_generation();
         assert!(matches!(
-            ws.maybe_compile_decision(cell_key),
+            ws.maybe_compile_decision(cell_key, &gk(42).types),
             HotResult::NotHot
         ));
         assert_eq!(ws.cell_generation(), generation);
