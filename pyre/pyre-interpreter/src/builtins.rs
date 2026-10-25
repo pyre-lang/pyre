@@ -7379,9 +7379,10 @@ pub(crate) fn py_repr_clipped_200(
 /// offending type with `%T` (`not int`). `typeobject.c type_new_set_classcell`
 /// (and `type_new_set_classdictcell`) use `%.200R` of `Py_TYPE(cell)`
 /// (`not <class 'int'>`; a metaclass `__repr__` returning `"custom-repr"`
-/// yields `not custom-repr`). Artefact: v3.15.1 `Objects/typeobject.c` plus
-/// a 3.15.1t measurement. A raising `__repr__` leaves that exception in
-/// place: `_PyErr_FormatV` returns without setting the TypeError.
+/// yields `not custom-repr`). Artefact:
+/// `Objects/typeobject.c type_new_set_classcell` read at v3.15.0 and
+/// v3.15.1. A raising `__repr__` leaves that exception in place:
+/// `_PyErr_FormatV` returns without setting the TypeError.
 pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyError {
     let rendered = match crate::typedef::r#type(value) {
         Some(w_valtype) => match py_repr_clipped_200(w_valtype.as_ptr()) {

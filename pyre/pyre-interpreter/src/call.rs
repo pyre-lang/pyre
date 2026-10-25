@@ -6975,11 +6975,6 @@ fn build_class_inner(
         let has_non_string_key = unsafe { pyre_object::w_dict_items(class_dict) }
             .iter()
             .any(|&(key, _)| !unsafe { pyre_object::is_str(key) });
-        // `_create_new_type` validates the cell before `W_TypeObject.__init__`
-        // (MRO / C3). Duplicate bases therefore lose to a non-cell
-        // `__classcell__`.
-        let w_effective_bases = pyre_object::gc_roots::shadow_stack_get(bases_root);
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
         // Slot creation, C3 validation and `__set_name__` below all allocate
         // and can execute Python; the nascent type has no other referrer
         // until its mro is installed, so keep it rooted and reread it after
@@ -6999,6 +6994,17 @@ fn build_class_inner(
                 pyre_object::w_cell_set(classcell, pyre_object::gc_roots::shadow_stack_get(w_root))
             };
         }
+        // `_create_new_type` binds the cell (`_store_type_in_classcell`)
+        // after `allocate_instance` and before `W_TypeObject.__init__` (MRO
+        // / C3). Duplicate bases therefore see a bound cell. A non-cell
+        // `__classcell__` still loses: that TypeError is raised earlier,
+        // when `classcell_root` is read.
+        unsafe {
+            crate::baseobjspace::validate_c3_mro(
+                pyre_object::gc_roots::shadow_stack_get(bases_root),
+                false,
+            )?
+        };
         // `w_type_new` is `malloc_fixedsize` (`incminimark.py`); a nursery-full
         // minor moves the namespace dict. `typeobject.py W_TypeObject.__init__`
         // consumes `__qualname__` off that dict. RPython's gctransform reloads
@@ -7116,11 +7122,39 @@ fn build_class_inner(
     let _ = pyre_object::gc_roots::pin_root(w_type);
     let w_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
 
+    // type_new_init_subclass (typeobject.c) — fire `__init_subclass__` on
+    // the bases with the keywords that reached `type.__new__`.  Only the
+    // default-metaclass path builds the class here via `w_type_new`,
+    // bypassing `type.__new__`; for it the class-definition keywords are
+    // exactly the keywords `type.__new__` would have seen.  The metaclass
+    // path routes through `type.__new__` (builtins.rs `type_descr_new`),
+    // which fires `__init_subclass__` with the subset of keywords the
+    // metaclass actually forwarded — so it must NOT be re-fired here.
+    // compiling.py `build_class` checks the cell only after
+    // `space.call_args(w_meta, args)` returned, i.e. after `_set_names`
+    // and `_init_subclass`.
+    if !has_metaclass {
+        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match current_kwds() {
+            Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
+                pyre_object::w_dict_items(kw)
+                    .into_iter()
+                    .filter(|(k, _)| pyre_object::is_str(*k))
+                    .collect()
+            },
+            _ => Vec::new(),
+        };
+        call_init_subclass_on_bases(
+            w_type(),
+            pyre_object::gc_roots::shadow_stack_get(bases_root),
+            &init_subclass_kwargs,
+        )?;
+    }
+
     // compiling.py `build_class` after `space.call_args(w_meta, args)`:
     // `if isinstance(w_cell, Cell) and isinstance(w_class, W_TypeObject)`.
     // `w_cell` is the body's return value. The default path is `w_meta = type`,
-    // so the check runs there too. A `__set_name__` that overwrites the cell
-    // is visible here because `_set_names` already ran.
+    // so the check runs there too. `_set_names` and `_init_subclass` both
+    // ran before the check.
     let w_cell = pyre_object::gc_roots::shadow_stack_get(w_cell_slot);
     if !w_cell.is_null()
         && unsafe { pyre_object::is_cell(w_cell) }
@@ -7130,8 +7164,9 @@ fn build_class_inner(
         // [3.15-spec] compiling.py `build_class` formats every operand with
         // `%S` (`defining C as`). `bltinmodule.c builtin___build_class__`
         // uses `%.200R` for the cell contents, the name object, and the
-        // class (`defining 'C' as`). Artefact: v3.15.1 `Python/bltinmodule.c`
-        // plus a 3.15.1t measurement.
+        // class (`defining 'C' as`). Artefact:
+        // `Python/bltinmodule.c builtin___build_class__` read at v3.15.0
+        // and v3.15.1.
         if cell_value.is_null() {
             let name_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
@@ -7168,31 +7203,6 @@ fn build_class_inner(
                 class_repr,
             )));
         }
-    }
-
-    // type_new_init_subclass (typeobject.c) — fire __init_subclass__ on
-    // the bases with the keywords that reached `type.__new__`.  Only the
-    // default-metaclass path builds the class here via `w_type_new`,
-    // bypassing `type.__new__`; for it the class-definition keywords are
-    // exactly the keywords `type.__new__` would have seen.  The metaclass
-    // path routes through `type.__new__` (builtins.rs `type_descr_new`),
-    // which fires __init_subclass__ with the subset of keywords the
-    // metaclass actually forwarded — so it must NOT be re-fired here.
-    if !has_metaclass {
-        let init_subclass_kwargs: Vec<(PyObjectRef, PyObjectRef)> = match current_kwds() {
-            Some(kw) if unsafe { pyre_object::is_dict(kw) } => unsafe {
-                pyre_object::w_dict_items(kw)
-                    .into_iter()
-                    .filter(|(k, _)| pyre_object::is_str(*k))
-                    .collect()
-            },
-            _ => Vec::new(),
-        };
-        call_init_subclass_on_bases(
-            w_type(),
-            pyre_object::gc_roots::shadow_stack_get(bases_root),
-            &init_subclass_kwargs,
-        )?;
     }
 
     Ok(w_type())
