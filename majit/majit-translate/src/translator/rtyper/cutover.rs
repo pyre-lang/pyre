@@ -2492,7 +2492,8 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         // late once `translate_op` Layer-1 has already baked a
         // `UserFunction` HostObject. `rlib/jit.py` ExtRegistry, not a
         // `FunctionDesc`.
-        if let Some(reason) = registration_decline(&canonical_strip)
+        if let Some(reason) = registration_decline(&path.segments)
+            .or_else(|| registration_decline(&canonical_strip))
             .or_else(|| registration_decline_graph_origin(graph.as_ref(), &foreign_callables))
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
@@ -2721,7 +2722,8 @@ fn describe_declared_funcobj(
     let path = crate::parse::CallPath::from_segments(key.segments().iter().cloned());
     let graph = store.declared_funcobj(&path)?;
     let foreign_callables = registry_foreign_callables(registry);
-    if let Some(reason) = registration_decline(&canonical_dedup_key(&path, &foreign_callables))
+    if let Some(reason) = registration_decline(&path.segments)
+        .or_else(|| registration_decline(&canonical_dedup_key(&path, &foreign_callables)))
         .or_else(|| registration_decline_graph_origin(graph.as_ref(), &foreign_callables))
     {
         crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
@@ -3493,7 +3495,8 @@ pub(crate) fn register_unsafe_fn_stubs(
         // `registration_decline` drops those as user graphs so this stub
         // can occupy the key; declining them here leaves the key empty.
         let path = crate::parse::CallPath::from_segments(segments.iter().cloned());
-        if let Some(reason) = registration_decline(&canonical_dedup_key(&path, &foreign_callables))
+        if let Some(reason) = registration_decline(&path.segments)
+            .or_else(|| registration_decline(&canonical_dedup_key(&path, &foreign_callables)))
             && (reason == SKIP_PTR_COPY_NONOVERLAPPING || reason == SKIP_STD_ALLOC_RAW)
         {
             crate::decline::record(REGISTRY_GATE, reason, format_args!("{path}"));
@@ -4545,10 +4548,10 @@ fn drive_lifted_subject(
 
 fn origin_function_entry(
     call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
     path: &crate::parse::CallPath,
 ) -> Option<Rc<FunctionEntry>> {
-    let origin =
-        crate::codewriter::call::access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+    let origin = function_graphs.access_directly_desc_origin(path);
     call_registry.lookup(&FunctionPathKey::from_segments(
         origin.segments.iter().cloned(),
     ))
@@ -4710,6 +4713,7 @@ fn record_phase_a_skip(
 fn seed_access_direct_lift(
     legacy: &LegacyGraph,
     call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
     path: &crate::parse::CallPath,
 ) -> Result<FlowspaceAdapterOutput, TyperError> {
     // `cachedgraph` HIT appends to `translator.graphs`; that needs the
@@ -4719,7 +4723,7 @@ fn seed_access_direct_lift(
         legacy,
         call_registry,
     )?;
-    let Some(entry) = origin_function_entry(call_registry, path) else {
+    let Some(entry) = origin_function_entry(call_registry, function_graphs, path) else {
         return Err(TyperError::message(format!(
             "AccessDirect subject {path}: origin FunctionDesc is not in CallRegistry"
         )));
@@ -4744,11 +4748,12 @@ fn seed_access_direct_lift(
 fn drive_access_direct_subject(
     legacy: &LegacyGraph,
     call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
     path: &crate::parse::CallPath,
     lifted: FlowspaceAdapterOutput,
 ) -> Result<(DrivenSubject, Rc<PyGraph>), TyperError> {
     let _ = call_registry.ensure_session()?;
-    let Some(entry) = origin_function_entry(call_registry, path) else {
+    let Some(entry) = origin_function_entry(call_registry, function_graphs, path) else {
         return Err(TyperError::message(format!(
             "AccessDirect subject {path}: origin FunctionDesc is not in CallRegistry"
         )));
@@ -5309,7 +5314,7 @@ fn run_two_phase_prepass_inner(
             continue;
         };
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            seed_access_direct_lift(&legacy, call_registry, path)
+            seed_access_direct_lift(&legacy, call_registry, function_graphs, path)
         }));
         match attempt {
             Ok(Ok(lifted)) => {
@@ -5347,7 +5352,7 @@ fn run_two_phase_prepass_inner(
                         "AccessDirect subject {path}: cache holds a graph this subject did not provide"
                     )));
                 };
-                drive_access_direct_subject(&legacy, call_registry, path, lifted)
+                drive_access_direct_subject(&legacy, call_registry, function_graphs, path, lifted)
                     .map(|(driven, pygraph)| subject_with_pygraph(driven, Some(pygraph)))
             } else {
                 drive_subject(&legacy, call_registry, /* do_rtype = */ false)
@@ -6338,6 +6343,10 @@ mod tests {
 
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("std", "alloc::alloc_zeroed");
+        fields.note_foreign_body_callable("alloc", "alloc::alloc_zeroed");
+        registry.set_struct_fields(std::rc::Rc::new(fields));
         let mut graphs = crate::codewriter::call::GraphStore::default();
         for segments in [
             vec!["std", "alloc", "alloc_zeroed"],
@@ -6383,6 +6392,11 @@ mod tests {
         let stub_registry = CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
+        let mut stub_fields = crate::front::StructFieldRegistry::default();
+        stub_fields.note_foreign_body_callable("std", "alloc::alloc_zeroed");
+        stub_fields.note_foreign_body_callable("std", "alloc::alloc");
+        stub_fields.note_foreign_body_callable("alloc", "alloc::alloc_zeroed");
+        stub_registry.set_struct_fields(std::rc::Rc::new(stub_fields));
         let mut specs = vec![(
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
@@ -6445,6 +6459,10 @@ mod tests {
 
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "ptr::copy_nonoverlapping");
+        fields.note_foreign_body_callable("std", "ptr::copy_nonoverlapping");
+        registry.set_struct_fields(std::rc::Rc::new(fields));
         let mut graphs = crate::codewriter::call::GraphStore::default();
         for segments in [
             vec!["core", "ptr", "copy_nonoverlapping"],
@@ -6482,6 +6500,10 @@ mod tests {
         let stub_registry = CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
+        let mut stub_fields = crate::front::StructFieldRegistry::default();
+        stub_fields.note_foreign_body_callable("core", "ptr::copy_nonoverlapping");
+        stub_fields.note_foreign_body_callable("std", "ptr::copy_nonoverlapping");
+        stub_registry.set_struct_fields(std::rc::Rc::new(stub_fields));
         let mut specs = vec![(
             vec!["pyobject".to_string(), "is_none".to_string()],
             Signature::new(vec!["obj".to_string()], None, None),
@@ -7315,13 +7337,14 @@ mod tests {
     /// graph object and the same startblock.
     #[test]
     fn access_direct_subject_reuses_caller_annotated_graph_and_startblock() {
-        let (registry, _, ad_path, ad_legacy, _) = origin_and_access_direct_fixture();
+        let (registry, _, ad_path, ad_legacy, graphs) = origin_and_access_direct_fixture();
         let _ = registry.ensure_session().expect("session");
         let lifted = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
             &ad_legacy, &registry,
         )
         .expect("lift AccessDirect body");
-        let entry = origin_function_entry(&registry, &ad_path).expect("origin FunctionDesc");
+        let entry =
+            origin_function_entry(&registry, &graphs, &ad_path).expect("origin FunctionDesc");
         let cached = {
             let desc = entry.function_desc.borrow();
             let provided = wrap_access_direct_pygraph(&ad_legacy, &lifted.graph, &desc);
@@ -7338,7 +7361,8 @@ mod tests {
             .borrow_mut()
             .insert(bkey_before.clone(), start_before);
         let (driven, pygraph) =
-            drive_access_direct_subject(&ad_legacy, &registry, &ad_path, lifted).expect("drive");
+            drive_access_direct_subject(&ad_legacy, &registry, &graphs, &ad_path, lifted)
+                .expect("drive");
         assert!(
             Rc::ptr_eq(&driven.0, &cached.graph),
             "subject graph must be the cache graph object"
@@ -7355,9 +7379,10 @@ mod tests {
     /// (`description.py FunctionDesc.cachedgraph` keeps the first graph).
     #[test]
     fn access_direct_drive_rejects_a_foreign_cache_graph() {
-        let (registry, _, ad_path, ad_legacy, _) = origin_and_access_direct_fixture();
+        let (registry, _, ad_path, ad_legacy, graphs) = origin_and_access_direct_fixture();
         let _ = registry.ensure_session().expect("session");
-        let entry = origin_function_entry(&registry, &ad_path).expect("origin FunctionDesc");
+        let entry =
+            origin_function_entry(&registry, &graphs, &ad_path).expect("origin FunctionDesc");
         let foreign = test_pygraph("foreign_access_direct");
         foreign.access_directly.set(true);
         entry.function_desc.borrow().cache.borrow_mut().insert(
@@ -7368,7 +7393,7 @@ mod tests {
             &ad_legacy, &registry,
         )
         .expect("lift AccessDirect body");
-        let err = drive_access_direct_subject(&ad_legacy, &registry, &ad_path, lifted)
+        let err = drive_access_direct_subject(&ad_legacy, &registry, &graphs, &ad_path, lifted)
             .expect_err("foreign cache graph must not be overwritten");
         let msg = err.to_string();
         assert!(
@@ -7629,6 +7654,21 @@ mod tests {
             graphs.access_directly_desc_origin(&plain_ad).segments,
             identity.segments,
             "identity-qualified origin must resolve the FunctionDesc"
+        );
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry)
+            .expect("identity FunctionDesc");
+        let origin = origin_function_entry(&registry, &graphs, &plain_ad)
+            .expect("AccessDirect origin FunctionDesc");
+        let identity_entry = registry
+            .lookup(&FunctionPathKey::from_segments(
+                identity.segments.iter().cloned(),
+            ))
+            .expect("identity-qualified FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&origin, &identity_entry),
+            "seed/drive origin lookup must be the identity-qualified FunctionDesc"
         );
     }
 

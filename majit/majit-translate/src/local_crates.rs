@@ -107,7 +107,7 @@ pub(crate) fn strip_alias_crate_prefix_with(
     if is_crate_alias_root(first) {
         return Some(segments[1..].to_vec());
     }
-    if segments.len() > 1 {
+    if !callables.is_empty() && segments.len() > 1 {
         let remainder = segments[1..].join("::");
         if callables
             .iter()

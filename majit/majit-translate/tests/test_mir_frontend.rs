@@ -1784,16 +1784,32 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
             )),
         "a char literal lowers to no __str_const",
     );
+    let is_unichr =
+        |segments: &[String]| segments.first().map(String::as_str) == Some("__majit_unichr");
     assert!(
         graph
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
-            .any(|op| matches!(op.kind, OpKind::ConstInt(0x3e))),
-        "the '>' default is the Int code point 0x3e",
+            .any(|op| {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } = &op.kind
+                else {
+                    return false;
+                };
+                is_unichr(segments)
+                    && args.iter().any(|arg| match arg {
+                        LinkArg::Value(v) => {
+                            matches!(producer(v), Some(OpKind::ConstInt(0x3e)))
+                        }
+                        LinkArg::Const(_) => false,
+                    })
+            }),
+        "the '>' default is the Int code point 0x3e passed to __majit_unichr",
     );
-    let is_unichr =
-        |segments: &[String]| segments.first().map(String::as_str) == Some("__majit_unichr");
     // Every link argument into a block input produced by the unichr
     // literal or by the `Some.__pos_0` payload read is int-kind, and at
     // least one input receives both — the `unwrap_or` join.

@@ -9097,8 +9097,12 @@ impl CallControl {
         target: &CallTarget,
     ) -> Option<(CallPath, std::rc::Rc<FunctionGraph>)> {
         let path = self.target_to_path(target)?;
-        let graph = self.function_graphs.get(&path)?;
-        Some((path, graph))
+        // `call.py` `CallControl.getcalldescr` reads `funcobj.graph`.
+        // `callable_graph_path` is that graph when the call spelling is a
+        // harvested crate-prefixed alias; `fnaddr_for_target` keeps `path`.
+        let graph_path = self.callable_graph_path(&path)?;
+        let graph = self.function_graphs.get(&graph_path)?;
+        Some((graph_path, graph))
     }
 
     /// Convert a CallTarget to a CallPath for lookup.
@@ -11650,6 +11654,10 @@ impl CallControl {
         // `__majit_call_target_<fn>` word-ABI entry is not such a funcobj:
         // it stands for `getfunctionptr(graph)` of the decorated `<fn>`, so
         // the analyzer walks that function's graph.
+        // `getcalldescr` walks `funcobj.graph` (`callable_graph_path`); a
+        // harvested crate-prefixed spelling is that graph, not bottom.
+        let resolved = self.callable_graph_path(path);
+        let path = resolved.as_ref().unwrap_or(path);
         let (Some(key), Some(graph)) = (
             self.function_graphs.key_for(path),
             self.function_graphs.get(path),
@@ -23701,7 +23709,13 @@ mod tests {
         let portal = CallPath::from_segments(["portal"]);
         let spelled = CallTarget::function_path(["core", "num", "<Impl>", "div_ceil"]);
         cc.register_function_graph(portal.clone(), graph_calling("portal", spelled.clone()));
-        cc.register_function_graph(registered.clone(), FunctionGraph::new("div_ceil"));
+        let mut callee = FunctionGraph::new("div_ceil");
+        let write = rw_write_field("Num", "flag");
+        if let OpKind::FieldWrite { base, .. } = &write {
+            callee.push_inputarg_var(callee.startblock, base.clone());
+        }
+        callee.push_op_var(callee.startblock, write, false);
+        cc.register_function_graph(registered.clone(), callee);
         cc.mark_portal(portal.clone());
 
         let mut policy = crate::policy::DefaultJitPolicy::new();
@@ -23724,6 +23738,23 @@ mod tests {
         );
         assert_eq!(cc.guess_call_kind(op), CallKind::Regular);
         assert!(cc.direct_graph_for(&spelled).is_some());
+        assert_eq!(
+            cc.target_to_path_and_graph(&spelled).map(|(p, _)| p),
+            Some(registered.clone()),
+            "getcalldescr signature validation must use the registered graph"
+        );
+        let mut cache = AnalysisCache::default();
+        let spelled_effects = cc.cached_readwrite(&spelled, &mut cache);
+        let registered_effects = cc.cached_readwrite(
+            &CallTarget::function_path(["num", "<Impl>", "div_ceil"]),
+            &mut cache,
+        );
+        assert_eq!(
+            write_fields(&spelled_effects),
+            write_fields(&registered_effects),
+            "getcalldescr readwrite must walk the registered graph"
+        );
+        assert_eq!(write_fields(&spelled_effects).len(), 1);
     }
 
     /// A FunctionPath whose leaf equals an impl method's leaf must not

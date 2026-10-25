@@ -22518,23 +22518,7 @@ impl<'a> Lowering<'a> {
                 // trivial literal initializer to a constant rather than
                 // calling a non-existent accessor.  Statics keep the
                 // address/`FunctionPath` path.
-                if let Some(const_op) = self.fold_named_const_global(id).or_else(|| {
-                    // A by-value `const` use is promoted to an `AnonConst`
-                    // (`&FLAT`) whose init copies one `NamedConst`. Fold
-                    // that named const; do not const-eval every promoted
-                    // rvalue.
-                    let inner = named_const_promoted_in_anon(self.llbc, id)?;
-                    self.fold_named_const_global(inner)
-                        .or_else(|| self.const_eval_global(inner))
-                }) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.emit_bb(mir_bb);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: const_op,
-                    });
+                if let Some(res) = self.emit_named_const_value(mir_bb, id, &place_ty) {
                     return Ok(res);
                 }
                 // rustc promotes `(a..=b)` to an `AnonConst` whose init is
@@ -23769,6 +23753,53 @@ impl<'a> Lowering<'a> {
             }
             named_const_fold_for_path(&gd.item_meta.name_path())
         })
+    }
+
+    /// Emit a folded named constant as a value. A `char` constant goes
+    /// through [`Self::emit_decoded_const`] (`bookkeeper.py`
+    /// `immutablevalue` `SomeUnicodeCodePoint`), the same two ops a
+    /// char literal uses.
+    fn emit_named_const_value(
+        &mut self,
+        mir_bb: usize,
+        def_id: u64,
+        place_ty: &TyRef,
+    ) -> Option<Variable> {
+        let decoded = decoded_named_const_on_llbc(self.llbc, def_id).or_else(|| {
+            let inner = named_const_promoted_in_anon(self.llbc, def_id)?;
+            decoded_named_const_on_llbc(self.llbc, inner)
+        });
+        let const_op = if decoded.is_none() {
+            self.fold_named_const_global(def_id).or_else(|| {
+                let inner = named_const_promoted_in_anon(self.llbc, def_id)?;
+                self.fold_named_const_global(inner)
+                    .or_else(|| self.const_eval_global(inner))
+            })
+        } else {
+            None
+        };
+        if decoded.is_none() && const_op.is_none() {
+            return None;
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(decoded) = decoded {
+            return Some(self.emit_decoded_const(bb_id, decoded));
+        }
+        let const_op = const_op?;
+        if tyref_is_char(place_ty, self.llbc)
+            && let OpKind::ConstInt(code) = const_op
+            && let Ok(code) = u32::try_from(code)
+        {
+            return Some(self.emit_decoded_const(bb_id, DecodedConst::UniChar(code)));
+        }
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: const_op,
+        });
+        Some(res)
     }
 
     /// Fold a `NamedConst` global whose initializer builds a fixed-size
@@ -59665,12 +59696,12 @@ fn trait_impl_match_for_receiver(
         if !trait_generic_args_match(impl_trait, call_types, &subst, llbc) {
             continue;
         }
-        let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
-            continue;
-        };
         if found.is_some() {
             return None;
         }
+        let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
+            return None;
+        };
         found = Some((impl_id, fn_id, impl_generics));
     }
     found
@@ -74370,7 +74401,10 @@ fn global_signed_int(llbc: &Llbc, def_id: u64) -> Option<i64> {
 /// Fold a `NamedConst` whose initializer is the trivial
 /// `_0 = const <lit>; return` shape in `llbc`.  `None` when the
 /// initializer is missing, `Opaque`, or any non-literal assign.
-fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
+/// A `char` stays the integer code point for const-eval
+/// (`const_lit_from_decoded`); value emit goes through
+/// [`Lowering::emit_decoded_const`].
+fn decoded_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<DecodedConst> {
     let gd = llbc.global_by_id(def_id)?;
     if gd
         .rest
@@ -74415,7 +74449,11 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
             }
         }
     }
-    match decode_literal(&found?).ok()? {
+    decode_literal(&found?).ok()
+}
+
+fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
+    match decoded_named_const_on_llbc(llbc, def_id)? {
         DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
         DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
         DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
@@ -88454,6 +88492,111 @@ mod tests {
         );
     }
 
+    fn generic_struct_adt(id: serde_json::Value, type_arg: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "builtin": null,
+                "generics": {
+                    "regions": [],
+                    "types": [type_arg],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn foreign_generic_slot_instantiations_print_and_intern_distinct() {
+        // Harvested foreign-body crate, scalar args: `Slot<i64>` and
+        // `Slot<f64>` are their own classes (`bookkeeper.py`
+        // `getuniqueclassdef`).
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+        let tvar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+        let slot = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["cell", "Slot"], "", false),
+            "kind": {"Struct": [
+                {"name": "value", "ty": tvar, "attr_info": null}
+            ]}
+        });
+        let body = serde_json::json!({
+            "Unstructured": {
+                "span": span_json(),
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span_json(), "ty": {"Scalar": "Bool"}}
+                    ]
+                },
+                "body": [{"statements": [], "terminator": {"span": span_json(), "kind": "Return"}}]
+            }
+        });
+        let getter = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["cell", "get"], "", false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Scalar": "Bool"}
+            },
+            "body": body
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [slot],
+                "fun_decls": [getter],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        assert!(llbc.has_body_under_crate_root("cell"));
+        let node_i64 = generic_struct_adt(serde_json::json!(0), i64_ty);
+        let node_f64 = generic_struct_adt(serde_json::json!(0), f64_ty);
+        let printed_i64 = charon_type_value_to_ast_string(&node_i64, &llbc, 0);
+        let printed_f64 = charon_type_value_to_ast_string(&node_f64, &llbc, 0);
+        assert_eq!(printed_i64, "Slot<i64>");
+        assert_eq!(printed_f64, "Slot<f64>");
+        assert_eq!(
+            super::adt_node_class_root_leaf(&node_i64, &llbc, super::no_tombstoned_leaves()),
+            Some("Slot<i64>".to_string())
+        );
+        assert_eq!(
+            super::adt_node_class_root_leaf(&node_f64, &llbc, super::no_tombstoned_leaves()),
+            Some("Slot<f64>".to_string())
+        );
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        let bk = std::rc::Rc::new(Bookkeeper::new());
+        let mut reg = StructFieldRegistry::default();
+        reg.foreign_body_roots.push("cell".to_string());
+        reg.fields.insert(
+            printed_i64.clone(),
+            vec![("value".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            printed_f64.clone(),
+            vec![("value".to_string(), "f64".to_string())],
+        );
+        bk.set_struct_fields(std::rc::Rc::new(reg));
+        let i64_host = bk.intern_class_by_qualname(&printed_i64);
+        let f64_host = bk.intern_class_by_qualname(&printed_f64);
+        assert_ne!(
+            i64_host, f64_host,
+            "foreign Slot instantiations intern as different ClassDefs"
+        );
+        let cd_i = bk.getuniqueclassdef(&i64_host).expect("Slot<i64> classdef");
+        let cd_f = bk.getuniqueclassdef(&f64_host).expect("Slot<f64> classdef");
+        assert!(!std::rc::Rc::ptr_eq(&cd_i, &cd_f));
+    }
+
     #[test]
     fn range_inclusive_self_after_subst_paints_instantiation_class() {
         // Product `start_bound` encodes `&self` as Dedup → Ref → Adt
@@ -91807,7 +91950,7 @@ mod tests {
             fields.fields.get("ConstantData::Code"),
             Some(&vec![crate::front::semantic::FieldRow::named(
                 "code",
-                "Box<CodeObject<ConstantData>>"
+                "Box<CodeObject>"
             )])
         );
         assert_eq!(
@@ -97820,8 +97963,8 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "fixture",
-                "type_decls": [foo_td],
-                "fun_decls": [null, method],
+                "type_decls": [foo_td.clone()],
+                "fun_decls": [null, method.clone()],
                 "global_decls": [],
                 "trait_decls": [{
                     "def_id": 0,
@@ -97829,7 +97972,7 @@ mod tests {
                     "methods": [{"skip_binder": {"name": "method"}}]
                 }],
                 "trait_impls": [{
-                    "impl_trait": {"id": 0, "generics": {"types": [ref_foo]}},
+                    "impl_trait": {"id": 0, "generics": {"types": [ref_foo.clone()]}},
                     "generics": {"types": [], "const_generics": [], "trait_refs": []},
                     "methods": [{
                         "kind": {"TraitMethod": [0, 0]},
@@ -97852,6 +97995,56 @@ mod tests {
             got.map(|(impl_id, fn_id, _)| (impl_id, fn_id)),
             Some((0, 1)),
             "impl Trait for &Foo must match a &&Foo argument"
+        );
+
+        // A matched impl whose `reconstructed_impl_generics` is None is
+        // unresolvable (`ClassDesc.lookup`); the other candidate is not unique.
+        let mut method_ok = method.clone();
+        method_ok["def_id"] = serde_json::json!(2);
+        let file_two = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [foo_td],
+                "fun_decls": [null, method, method_ok],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "Trait"]),
+                    "methods": [{"skip_binder": {"name": "method"}}]
+                }],
+                "trait_impls": [
+                    {
+                        "impl_trait": {"id": 0, "generics": {"types": [ref_foo.clone()]}},
+                        "generics": {
+                            "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                            "const_generics": [],
+                            "trait_refs": []
+                        },
+                        "methods": [{
+                            "kind": {"TraitMethod": [0, 0]},
+                            "skip_binder": {"id": 1}
+                        }]
+                    },
+                    {
+                        "impl_trait": {"id": 0, "generics": {"types": [ref_foo]}},
+                        "generics": {"types": [], "const_generics": [], "trait_refs": []},
+                        "methods": [{
+                            "kind": {"TraitMethod": [0, 0]},
+                            "skip_binder": {"id": 2}
+                        }]
+                    }
+                ]
+            }
+        });
+        let llbc_two =
+            Llbc::from_slice(file_two.to_string().as_bytes()).expect("two-impl Llbc parses");
+        let got_two = super::trait_impl_match_for_receiver(&recv, &payload, &llbc_two);
+        assert_eq!(
+            got_two.map(|(impl_id, fn_id, _)| (impl_id, fn_id)),
+            None,
+            "a matched impl that cannot reconstruct generics is unresolvable"
         );
     }
 
@@ -105649,6 +105842,174 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("const fixture Llbc parses")
+    }
+
+    fn char_scalar_ty() -> serde_json::Value {
+        serde_json::json!({"Scalar": "Char"})
+    }
+
+    fn char_const_expr(ch: &str) -> serde_json::Value {
+        serde_json::json!([{"Char": ch}, char_scalar_ty()])
+    }
+
+    fn char_init_body(ch: &str) -> serde_json::Value {
+        let ty = char_scalar_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"Use": [{"Const": char_const_expr(ch)}, "No"]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn char_init_fun(def_id: u64, path: &[&str], body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": char_scalar_ty()},
+            "src": {"GlobalInitializer": {"id": def_id}},
+            "body": body
+        })
+    }
+
+    fn char_named_const_global(
+        def_id: u64,
+        path: &[&str],
+        source_text: &str,
+        init: u64,
+    ) -> serde_json::Value {
+        let ty = char_scalar_ty();
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, source_text, true),
+            "global_kind": "NamedConst",
+            "ty": ty,
+            "value": {"Value": [0, [{"Call": [{"kind": {"Fun": init}, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}, []]}, ty]]}
+        })
+    }
+
+    fn char_reader_fun(path: &[&str], global_id: u64) -> serde_json::Value {
+        let ty = char_scalar_ty();
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": ty},
+                            {"Use": [{"Copy": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
+                                "ty": ty
+                            }}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn char_literal_reader_fun(path: &[&str], ch: &str) -> serde_json::Value {
+        let ty = char_scalar_ty();
+        serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": ty},
+                            {"Use": [{"Const": char_const_expr(ch)}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn unichr_ops(graph: &crate::model::FunctionGraph) -> Vec<&SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.first().map(String::as_str)
+                        == Some(crate::runtime_names::shims::UNICHR)
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn named_char_const_and_char_literal_emit_unichr() {
+        let path = ["fixture", "CHAR_CONST"];
+        let llbc = const_artifact(
+            "fixture",
+            serde_json::json!([
+                char_reader_fun(&["fixture", "read_named"], 1),
+                char_init_fun(1, &path, char_init_body(">")),
+                char_literal_reader_fun(&["fixture", "read_lit"], ">")
+            ]),
+            serde_json::json!([
+                null,
+                char_named_const_global(1, &path, "const CHAR_CONST: char = '>';", 1)
+            ]),
+        );
+        let named = super::lower_function(&llbc, "read_named").expect("lower named char const");
+        let lit = super::lower_function(&llbc, "read_lit").expect("lower char literal");
+        let named_ops = unichr_ops(&named);
+        let lit_ops = unichr_ops(&lit);
+        assert_eq!(
+            named_ops.len(),
+            1,
+            "named char const emits __majit_unichr: {named:#?}"
+        );
+        assert_eq!(
+            lit_ops.len(),
+            1,
+            "char literal emits __majit_unichr: {lit:#?}"
+        );
+        let has_code = |graph: &crate::model::FunctionGraph| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::ConstInt(0x3e)))
+        };
+        assert!(
+            has_code(&named),
+            "named char const is code point 0x3e: {named:#?}"
+        );
+        assert!(has_code(&lit), "char literal is code point 0x3e: {lit:#?}");
     }
 
     fn folded_uints(graph: &crate::model::FunctionGraph) -> Vec<u64> {
