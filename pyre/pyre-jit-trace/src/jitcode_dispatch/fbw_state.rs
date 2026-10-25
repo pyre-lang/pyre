@@ -3558,13 +3558,12 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
 ) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(op) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return false;
-        };
+    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
+        return false;
+    };
+    for op in &ops {
         if op.opname.starts_with("residual_call")
-            && residual_call_descr_index_in_body(body_code, &op)
+            && residual_call_descr_index_in_body(body_code, op)
                 .and_then(|index| callee_descr_refs.get(index))
                 .and_then(|descr| descr.as_call_descr())
                 .is_some_and(|descr| {
@@ -3585,7 +3584,6 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
                 return true;
             }
         }
-        pc = op.next_pc;
     }
     false
 }

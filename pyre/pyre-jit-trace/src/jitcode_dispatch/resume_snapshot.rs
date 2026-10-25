@@ -187,6 +187,29 @@ pub(super) fn jit_merge_point_pc_in_containing_floor(
     None
 }
 
+/// True when `op_pc` sits in a loop-header floor *before* that floor's
+/// `jit_merge_point`.
+///
+/// `emit_portal_is_being_profiled_read` lowers `get_is_being_profiled`'s
+/// `debugdata` null-test in that prefix (`interp_jit.py` `dispatch` computes
+/// the green before `jit_merge_point`). `_establish_nullity` at that goto
+/// would record `GUARD_ISNULL` with a resume in the preamble, and the
+/// `dispatch_bytecode` jitted arm after `last_instr` would then see the
+/// heapcache and record none. Defer the guard to the arm so its
+/// `generate_guard(resumepc=orgpc)` is the opcode-body `-live-` after the
+/// merge (`pyopcode.py` jitted arm).
+pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    walked_snapshot_jitcode(ctx)
+        .and_then(|jc| {
+            jit_merge_point_pc_in_containing_floor(&jc.payload, op_pc)
+                .map(|merge_pc| op_pc < merge_pc)
+        })
+        .unwrap_or(false)
+}
+
 /// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise
 /// `op.next_pc` (`jtransform.py handle_jit_marker__jit_merge_point`).
 pub(super) fn resume_pc_past_merge_point(
@@ -860,28 +883,32 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             | OpCode::GuardClass
                             | OpCode::GuardTrue
                             | OpCode::GuardFalse
+                            | OpCode::GuardIsnull
+                            | OpCode::GuardNonnull
                     )
                 )
             {
                 // #366: carry the `-live-` marker offset, NOT the raw guard
-                // `op_pc`. Reached only on the
-                // specialization guards (`GuardValue`/`GuardClass`) and all
-                // branch guards (`GuardTrue`/`GuardFalse`). For every guard
-                // here the codewrite-time twin resolves the
-                // `-live-` marker, keeping the
-                // encoder reg-bank window and decoder liveness symmetric.  It is
-                // a valid startpoint (`can_decode_live_vars` holds).
+                // `op_pc`. Reached on the specialization guards
+                // (`GuardValue`/`GuardClass`), the compare-fused branch
+                // guards (`GuardTrue`/`GuardFalse`), and the pointer-nullity
+                // pair (`GuardIsnull`/`GuardNonnull`) from
+                // `_establish_nullity` (`opimpl_goto_if_not_ptr_iszero` /
+                // `opimpl_goto_if_not_ptr_nonzero`). For every guard here
+                // the codewrite-time twin resolves the `-live-` marker,
+                // keeping the encoder reg-bank window and decoder liveness
+                // symmetric.  It is a valid startpoint
+                // (`can_decode_live_vars` holds).
                 // The `after_residual_call` family is excluded — it routes
                 // through the separate post-call catch-marker twin, so the
                 // ordinary marker would name a different resume point.
                 // Every guard-capture point is emitted after a `-live-` marker;
                 // its populated codewrite-time twin is therefore total here.
-                // Specialization guards (`GuardValue`/`GuardClass`) and branch
-                // guards (`GuardTrue`/`GuardFalse`) source the resume
-                // coordinate from the walk cursor's per-op `-live-` BEFORE
-                // (`ctx.live_before_jit_pc`). Branch guards are
-                // `generate_guard(resumepc=orgpc)` (`pyjitpl.py
-                // opimpl_goto_if_not`); blackhole `bhimpl_goto_if_not`
+                // All of these source the resume coordinate from the walk
+                // cursor's per-op `-live-` BEFORE (`ctx.live_before_jit_pc`).
+                // That is `generate_guard(resumepc=orgpc)` (`pyjitpl.py
+                // opimpl_goto_if_not` / `_establish_nullity`); blackhole
+                // `bhimpl_goto_if_not` / `bhimpl_goto_if_not_ptr_iszero`
                 // re-evaluates the restored condition. `op_pc` is already
                 // that `-live-` for a branch capture; the opcode-start twin
                 // is only the fallback when neither the capture pc nor the

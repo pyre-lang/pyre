@@ -1388,6 +1388,18 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "getfield_gc_i result");
     }
 
+    /// `getfield_gc_r/rd>r` for a field descr the flattener already built.
+    /// Same descr-interning contract as [`Self::getfield_gc_i_bh`].
+    pub fn getfield_gc_r_bh(&mut self, dest: u16, struct_reg: u16, field: CanonicalBhDescr) {
+        self.touch_ref_reg(struct_reg);
+        self.touch_ref_reg(dest);
+        let descr = self.add_bh_descr(field);
+        self.write_insn("getfield_gc_r/rd>r");
+        self.push_reg_u8(struct_reg, "getfield_gc_r struct");
+        self.push_u16(descr);
+        self.push_reg_u8(dest, "getfield_gc_r result");
+    }
+
     /// `setfield_gc_i/rid` for a field descr the flattener already built.
     /// Same width constraint as [`Self::getfield_gc_i_bh`].
     pub fn setfield_gc_i_bh(&mut self, struct_reg: u16, value_reg: u16, field: CanonicalBhDescr) {

@@ -7217,10 +7217,8 @@ pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
 
 /// `FrameDebugData.w_f_trace` — the frame's own trace function, the slot
 /// `pyframe.py get_w_f_trace` reads and `dispatch_bytecode`'s jitted arm tests
-/// (`_d.w_f_trace is not None`).  Recorded at the portal merge point by
-/// `record_portal_debugdata_guard` when the frame already carries a debug
-/// block, which is the state every frame is in once a trace function has been
-/// called on it.
+/// (`_d.w_f_trace is not None`).  The codewriter lowers that test as
+/// `getfield_gc_r` after `getfield_vable_r` of `debugdata`.
 pub fn frame_debug_data_w_f_trace_descr() -> DescrRef {
     frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_F_TRACE_OFFSET)
 }

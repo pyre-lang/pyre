@@ -3660,12 +3660,10 @@ pub enum DispatchError {
     /// `pyjitpl.py get_procedure_token(greenboxes)` always receives
     /// concrete greens at a reached merge point.
     JitMergePointGreenKeyUnresolved { pc: usize },
-    /// The portal frame reached its merge point with a tracer already armed
-    /// (`debugdata.w_f_trace` non-NULL). `dispatch_bytecode`'s jitted arm
-    /// (pyopcode.py) answers that state with `ec.bytecode_only_trace(self)`
-    /// on every opcode; the walker has no route to record that call, so a
-    /// trace taken here would compile a loop that owes `line` events and
-    /// cannot fire them. Decline and leave the frame to the interpreter.
+    /// The portal merge point reached `ec.w_tracefunc` already non-NULL.
+    /// `execute_frame` would run `call_trace` / `return_trace`; the walker
+    /// records neither for an inlined callee, so compiling here would
+    /// silence those events. Decline and leave the frame to the interpreter.
     PortalFrameTracerArmed { pc: usize },
     /// `loop_header/i` or `jit_merge_point/iIRFIRF` could not resolve its
     /// jdindex operand to a concrete Int. The assembler encodes the jdindex as a
@@ -11866,6 +11864,26 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx.heap_cache_mut().nullity_now_known(subject);
     }
+    // `_establish_nullity` (`pyjitpl.py`) calls
+    // `generate_guard(..., resumepc=orgpc)`. `orgpc` is the goto's jitcode
+    // pc; `get_list_of_active_boxes` reads `self.pc - SIZE_LIVE_OP`, the
+    // `-live-` immediately before `goto_if_not_ptr_iszero` /
+    // `goto_if_not_ptr_nonzero`. Carry that marker so a failing
+    // `GUARD_ISNULL` resumes on the goto, after `jit_merge_point` when the
+    // arm sits in the opcode body. The Python-opcode block-head twin names
+    // the loop-header preamble `-live-` and the blackhole would re-enter
+    // the merge point.
+    if nullity.is_some() && ctx.live_before_jit_pc != usize::MAX {
+        return walker_capture_snapshot_for_last_guard_scoped(
+            ctx,
+            op_pc,
+            GuardCaptureScope {
+                carried_resume_jit_pc: Some(ctx.live_before_jit_pc),
+                liveness_jit_pc: Some(ctx.live_before_jit_pc),
+                ..GuardCaptureScope::default()
+            },
+        );
+    }
     walker_capture_snapshot_for_last_guard(ctx, op_pc)
 }
 
@@ -13821,259 +13839,6 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
     goto_if_not_branch_on(code, op, ctx, condbox, switchcase, target)
 }
 
-/// The portal frame's `debugdata` read from `PyFrame.dispatch_bytecode`'s
-/// `we_are_jitted()` arm (pyopcode.py):
-///
-/// ```text
-/// while True:
-///     assert next_instr & 1 == 0
-///     self.last_instr = intmask(next_instr)
-///     if jit.we_are_jitted():
-///         _d = self.debugdata
-///         if ec.space.reverse_debugging or (
-///                 _d is not None and _d.w_f_trace is not None):
-///             ec.bytecode_only_trace(self)
-///             next_instr = r_uint(self.last_instr)
-/// ```
-///
-/// `debugdata` is one of `PyFrame._virtualizable_` (interp_jit.py), so the
-/// read resolves against `virtualizable_boxes` and folds to the value the
-/// frame carried when the trace started.  A trace that folds a virtualizable
-/// field without validating it compiles a loop that cannot observe that field
-/// changing.  Upstream validates it, and its own optimized trace says how:
-/// `patch_new_loop_to_load_virtualizable_fields` (compile.py) loads every
-/// virtualizable field off the frame at loop entry, and virtual-state matching
-/// then pins the one the body was specialized on —
-///
-/// ```text
-/// +280: p5 = getfield_gc_r(p0, descr=<FieldP ...PyFrame.inst_debugdata 16>)
-/// +316: label(p0, p1, i2, p3, i4, p5, ...)
-/// +352: guard_isnull(p5, ...)
-/// ```
-///
-/// so arming `f_trace` on a running frame fails that guard and the interpreter
-/// resumes firing `line` events.  pyre loads the field at entry the same way
-/// but pins nothing, so the compiled loop ran the whole tail blind.
-///
-/// Recorded at the portal merge point — the trace's counterpart of the top of
-/// `dispatch_bytecode`'s loop.  The read is registered with the heapcache, so
-/// a run of merge points with no intervening call collapses to one read and
-/// one guard.  A call does not collapse, so a loop body carrying residual
-/// calls records one pair per call-free window — measured, three for a loop
-/// whose body makes one residual Python call.  Upstream carries exactly one
-/// because its guard comes from virtual-state matching at the label rather
-/// than from the recorded read; matching that would mean pinning the vable
-/// field in the virtual state, which pyre does not do for `debugdata` today.
-fn record_portal_debugdata_guard<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-) -> Result<(), DispatchError> {
-    // An inlined callee's own header is not the portal loop the compiled code
-    // re-enters, and the sub-walk's boxes describe the callee frame.
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(());
-    }
-    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
-        return Ok(());
-    };
-    let Some(field_index) = info.static_field_index_by_name("debugdata") else {
-        return Ok(());
-    };
-    let Some(frame_box) = ctx.trace_ctx.standard_virtualizable_box() else {
-        return Ok(());
-    };
-    // The value the trace is folding, read from `virtualizable_boxes` rather
-    // than from the live frame: the guard exists to validate exactly that fold,
-    // so a live frame that has since diverged from it must still be guarded
-    // against, not silently agreed with.
-    let Some((_, Value::Ref(debugdata))) = ctx.trace_ctx.virtualizable_entry_at(field_index) else {
-        return Ok(());
-    };
-    if debugdata.as_usize() != 0 {
-        let debugdata = debugdata.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
-        // `_d is not None and _d.w_f_trace is not None`.  Upstream answers
-        // that state with `ec.bytecode_only_trace(self)` on every opcode and
-        // records the call, so its bridge out of the failed `guard_isnull`
-        // keeps firing events from compiled code.  pyre's walker has no route
-        // to record that call, so anything it compiles here runs the tail with
-        // no way to fire the events the frame is owed.  Decline and leave the
-        // frame to the interpreter, which fires them.
-        //
-        // Every walk that reaches a merge point in this state is declined, not
-        // only one that has recorded nothing yet.  The walk that would
-        // otherwise lose the tail is the BRIDGE out of the failed guard, and
-        // that one resumes inside the loop body: it reaches its merge point
-        // with the body already recorded, so a decline conditioned on an empty
-        // recording never fires for it — measured, 401 of 1999 `line` events
-        // on `settrace_f_trace_armed_mid_loop`, the rest swallowed by a bridge
-        // that compiled at the 400th guard failure.
-        //
-        // `getorcreatedebug` is the single creation point for the block, and
-        // reading `f_lineno`, `f_locals`, `locals()`, `f_lasti` or `f_back`
-        // does not reach it.  Two things do: `executioncontext.py _trace`,
-        // which takes `getorcreatedebug(init_lineno=...)` before it calls the
-        // callback, so every frame that has reported once carries the block
-        // with `w_f_trace` still null; and `setprofile` / `force_all_frames`,
-        // which mint it as `getorcreatedebug().is_being_profiled = ...` with
-        // no tracer installed at all.
-        //
-        // So this arm is not the rare one it reads as — with the portal
-        // serving traced frames it is the common one, and leaving it unguarded
-        // left a loop that had already reported to a global hook blind to
-        // `f_trace` being armed on it afterwards (measured: 6 `line` events
-        // for a 10 000-iteration tail).  Guard the slot itself.  The profiling
-        // route is why that guard is gated on `ec.w_tracefunc` below rather
-        // than emitted here.  What bounds profiling's own event count is not
-        // this arm, and is no longer open.  Three mechanisms bound it:
-        // `is_being_profiled` is a portal green (`interp_jit.py greens`), so a
-        // profiled activation names a different cell from the one an
-        // unprofiled warm-up filled; `walker_foldable_runtime_helper`
-        // (`residual_call.rs`) answers `RuntimeHelperKind::None` under that
-        // green, so every CALL-family helper stays a residual instead of
-        // folding past its report; and `residual_call_c_profile_frame`
-        // (`call_jit.rs`) reads the PER-FRAME flag live, so a frame
-        // `force_all_frames` marks mid-loop reports from its next residual on
-        // rather than waiting for a re-entry.
-        //
-        // `a_profiler_installed_from_a_call_event_keeps_c_events`
-        // (`pyre/bench/synth`) pins the result as an EXACT per-tail count, not
-        // a floor: `c_call` and `c_return` must each equal the tail and must
-        // grow by the whole difference between two tails, which is what
-        // separates a live bound from a green read once at entry.  Nine
-        // further `setprofile` fixtures beside it cover the frame-identity,
-        // inlined-callee, portal-resume, force-all-frames and call-free-loop
-        // shapes.
-        //
-        // The non-null half stays a decline rather than a guard, and it is
-        // reached: `PYRE_FBW_DEBUG_ABORT` names four `PortalFrameTracerArmed`
-        // aborts in that arm, the same count as when `debugdata` starts null.
-        // Such a frame reports its whole tail either way — 99999 of 99999
-        // `call` events at a 100000 tail, against 1042 with the decline
-        // disabled — because `settrace` forces every frame, so the exit is
-        // `GuardNotForced` where the guard below would otherwise be it, and
-        // the decline then refuses to recompile.
-        if !unsafe { (*debugdata).w_f_trace }.is_null() {
-            census_record("PortalFrameTracerArmed::Decline");
-            return Err(DispatchError::PortalFrameTracerArmed { pc: op_pc });
-        }
-        // Only a trace recorded while a global trace function is live needs the
-        // guard below.  Without one, `record_portal_tracefunc_guard` pins
-        // `ec.w_tracefunc` NULL at this same merge point, and installing a
-        // trace function is what makes an `f_trace` fire at all
-        // (`eval_loop_jit` gates `bytecode_trace` on that slot), so that guard
-        // is already what leaves compiled code.  Emitting this one
-        // unconditionally moved 36 fixtures — `guard_failures 4 -> 204` and a
-        // bridge where there was none on `type_name_attr_fold` — for a state
-        // they never enter: a debug block exists on any frame that has been
-        // handed out, walked for `f_lineno` or asked for `locals()`.
-        let ec = pyre_interpreter::call::getexecutioncontext();
-        if ec.is_null() || unsafe { (*ec).w_tracefunc }.is_null() {
-            return Ok(());
-        }
-        let read = read_portal_debugdata(
-            ctx,
-            op_pc,
-            frame_box,
-            &info,
-            field_index,
-            debugdata as usize,
-        )?;
-        let trace_descr = crate::descr::frame_debug_data_w_f_trace_descr();
-        let trace_descr_index = trace_descr.index();
-        if ctx
-            .trace_ctx
-            .heapcache_getfield_cached(read, trace_descr_index)
-            .is_some()
-        {
-            return Ok(());
-        }
-        let armed = ctx
-            .trace_ctx
-            .record_op_with_descr(OpCode::GetfieldGcR, &[read], trace_descr);
-        ctx.trace_ctx
-            .heapcache_getfield_now_known(read, trace_descr_index, armed);
-        ctx.trace_ctx
-            .set_opref_concrete(armed, Value::Ref(majit_ir::GcRef(0)));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[armed])?;
-        ctx.trace_ctx.heap_cache_mut().nullity_now_known(armed);
-        return Ok(());
-    }
-    read_portal_debugdata(ctx, op_pc, frame_box, &info, field_index, 0)?;
-    Ok(())
-}
-
-/// Record the portal frame's `debugdata` read once and pin what it read: NULL
-/// when the frame carries no debug block, non-null when it does.  Both arms of
-/// `record_portal_debugdata_guard` need the read, and both need it guarded —
-/// the value is the one the trace folded, so a frame whose block appears (or
-/// disappears) under the same green key has to leave compiled code rather than
-/// be agreed with.
-fn read_portal_debugdata<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    frame_box: OpRef,
-    info: &majit_metainterp::virtualizable::VirtualizableInfo,
-    field_index: usize,
-    concrete: usize,
-) -> Result<OpRef, DispatchError> {
-    // Resolved here rather than at the call sites: minting a struct descr
-    // registers it, so resolving it on a path that then declines is an
-    // observable side effect on every later descr index.
-    let descr = info.static_field_struct_descr(field_index);
-    let descr_index = descr.index();
-    // The portal header may already have read this field
-    // (`getfield_vable_r` of `debugdata` for
-    // `pyframe.py PyFrame.get_is_being_profiled`). A Const-folded
-    // vable load is not a runtime guard: `pyjitpl.py generate_guard`
-    // skips `isinstance(box, Const)`, and `ptr_iszero` of CONST_NULL
-    // folds without recording, so a cached Const is re-read to record
-    // the `GuardIsnull` / `GuardNonnull` that makes
-    // `getorcreatedebug` / `f_trace` on a running frame observable.
-    // A non-Const cached box still needs the pin when nullity is
-    // unknown.
-    if let Some(read) = ctx
-        .trace_ctx
-        .heapcache_getfield_cached(frame_box, descr_index)
-        && !read.is_constant()
-    {
-        pin_portal_debugdata_nullity(ctx, op_pc, read, concrete)?;
-        return Ok(read);
-    }
-    let read = ctx
-        .trace_ctx
-        .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], descr);
-    ctx.trace_ctx
-        .heapcache_getfield_now_known(frame_box, descr_index, read);
-    ctx.trace_ctx
-        .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(concrete)));
-    pin_portal_debugdata_nullity(ctx, op_pc, read, concrete)?;
-    Ok(read)
-}
-
-/// `compile.py patch_new_loop_to_load_virtualizable_fields` pins
-/// `debugdata` with `guard_isnull` / `guard_nonnull` at the label.
-/// `pyjitpl.py generate_guard` records nothing when the box is
-/// already a Const, so this is the runtime pin for a folded vable
-/// load of the same field.
-fn pin_portal_debugdata_nullity<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    read: OpRef,
-    concrete: usize,
-) -> Result<(), DispatchError> {
-    if ctx.trace_ctx.heapcache_nullity_known(read).is_some() {
-        return Ok(());
-    }
-    let opcode = if concrete == 0 {
-        OpCode::GuardIsnull
-    } else {
-        OpCode::GuardNonnull
-    };
-    walker_emit_guard_with_snapshot(ctx, op_pc, opcode, &[read])?;
-    ctx.trace_ctx.heap_cache_mut().nullity_now_known(read);
-    Ok(())
-}
-
 /// True while a trace function or a profiler is installed on the running
 /// ExecutionContext — `executioncontext.py call_trace`'s own test,
 /// `self.gettrace() is not None or self.profilefunc is not None`.
@@ -14144,8 +13909,7 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     // (or `GUARD_NOT_INVALIDATED`).  The bridge out of that guard
     // resumes in the body with the hook already live; this walker
     // cannot record `ec.call_trace`, so compiling that bridge would
-    // silence the tail.  Decline, same as `w_f_trace` above, and
-    // leave the events to the interpreter.
+    // silence the tail.  Decline and leave the events to the interpreter.
     if !unsafe { (*ec).w_tracefunc }.is_null() {
         return Err(DispatchError::PortalFrameTracerArmed { pc: op_pc });
     }
@@ -14306,6 +14070,15 @@ fn establish_nullity<Sym: WalkSym>(
         });
     };
     let value = bits != 0;
+    // `get_is_being_profiled` (`pyframe.py`) runs before `jit_merge_point`
+    // (`interp_jit.py` `dispatch`). Its `debugdata` null-test must not
+    // `generate_guard` here: the resume would be the preamble `-live-`, and
+    // heapcache would silence the `dispatch_bytecode` jitted arm after
+    // `last_instr`. Branch on the concrete pointer; the arm's
+    // `goto_if_not_ptr_iszero` records the `GUARD_ISNULL`.
+    if ptr_iszero_is_before_merge_in_floor(ctx, op.pc) {
+        return Ok(value);
+    }
     if value {
         // A known class already implies non-null, so the guard is redundant.
         if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
@@ -17069,14 +16842,13 @@ fn handle<Sym: WalkSym>(
                 }
             }
 
-            // `dispatch_bytecode`'s `we_are_jitted()` arm reads the portal
-            // frame's `debugdata` at the top of every opcode (pyopcode.py).
-            // The merge point is the trace's counterpart of that loop top.
-            record_portal_debugdata_guard(ctx, op.pc)?;
             // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
             // (pyframe.py) read the global trace function on every call the
             // loop makes.  The walker records neither for an inlined callee,
             // so the loop pins the slot instead.
+            // `dispatch_bytecode`'s jitted arm (`_d = self.debugdata` /
+            // `_d.w_f_trace`) is jitcode after `last_instr`, walked as
+            // ordinary `getfield_vable_r` / `goto_if_not_ptr_iszero`.
             record_portal_tracefunc_guard(ctx, op.pc)?;
             record_portal_profilefunc_guard(ctx, op.pc)?;
 

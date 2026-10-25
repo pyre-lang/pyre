@@ -788,6 +788,7 @@ fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
             &mut |_| false,
             &mut |_| None,
             &[(0, len)],
+            &[],
         )
     };
     let empty = scan(0);
@@ -821,6 +822,7 @@ fn an_identity_trampoline_forwards_r0_array_length_into_the_callee() {
         &mut |_| false,
         &mut |_| None,
         &[(0, 2)],
+        &[],
     );
     assert_eq!(forwarded, Some((7, vec![(0, 2)])));
 
@@ -839,6 +841,7 @@ fn an_identity_trampoline_forwards_r0_array_length_into_the_callee() {
         &mut |_| false,
         &mut |_| None,
         &[(0, 2)],
+        &[],
     );
     assert_eq!(empty_forwarded, Some((7, Vec::new())));
 }
@@ -869,6 +872,7 @@ fn a_blocker_behind_an_effect_free_call_is_not_a_decline() {
             true
         },
         &mut |_| None,
+        &[],
         &[],
     );
     assert_eq!(
@@ -944,6 +948,7 @@ fn a_switch_with_a_known_table_does_not_leak_its_state_to_every_start() {
         &mut |_, _| true,
         &mut |_| false,
         &mut |_| Some(vec![10]),
+        &[],
         &[],
     );
     assert_eq!(

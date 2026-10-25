@@ -20405,8 +20405,8 @@ const GET_W_GLOBALS_DESCENT: HelperDescent = HelperDescent {
 /// `PyFrame.get_w_globals` for an inlined callee that is not the portal
 /// virtualizable.
 ///
-/// `emit_new_pyframe_inline_with_params` builds that frame with no
-/// `debugdata` and stores `pycode` on it. The null-`debugdata` arm is
+/// `emit_new_pyframe_inline_with_params` stores PY_NULL into `debugdata`
+/// and stores `pycode` on it. The null-`debugdata` arm is
 /// `jit.promote(self.pycode).w_globals`: a quasi-immutable `PyCode.w_globals`
 /// read, the operand `globals_read_keeps_recorded_namespace` already accepts.
 /// The pycode is this frame's. A non-null `debugdata` (a namespace override)
