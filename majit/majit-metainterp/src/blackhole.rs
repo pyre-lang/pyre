@@ -13946,10 +13946,11 @@ pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
 
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.
 ///
-/// Stricter than `!is_symbolic_fnaddr`: `0` is upstream's own "no address"
-/// spelling (`jitcode.py JitCode.__init__ fnaddr=None`) and must not be called
-/// either.  Both residual and inline calls decline it before reaching a
-/// backend; otherwise a callee that never ran could fabricate a return value.
+/// Stricter than `!is_symbolic_fnaddr`: `0` is `jitcode.py JitCode.__init__`
+/// `fnaddr=None` and must not be called either. Shared with the resume scan
+/// as `majit_jitcode::codewriter::call::is_callable_fnaddr`: a helper
+/// `inline_call_*` whose address is callable runs `bhimpl_inline_call_*`
+/// rather than [`interpret_unresolved_inline_call`].
 #[inline]
 pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)

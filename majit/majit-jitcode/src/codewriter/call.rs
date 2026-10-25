@@ -132,6 +132,18 @@ pub fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
     high != 0 && bits & 0x8000_0000_0000_0000 == 0
 }
 
+/// Whether `fnaddr` can be called as a function pointer.
+///
+/// Stricter than `!is_symbolic_fnaddr`: `0` is `jitcode.py JitCode.__init__`
+/// `fnaddr=None` and must not be called either. Residual and inline blackhole
+/// handlers (`reject_unresolved_call`, `bhimpl_inline_call_*`) decline it
+/// before a backend jump; otherwise a callee that never ran could fabricate
+/// a return value.
+#[inline]
+pub fn is_callable_fnaddr(fnaddr: i64) -> bool {
+    fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
+}
+
 pub fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {
     use std::hash::Hasher;
 

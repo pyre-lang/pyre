@@ -185,6 +185,7 @@ mod recursion_depth_policy_tests {
             helper_resume: HelperResume::Section,
             helper_call_entry: HelperCallEntry::Unavailable,
             helper_entry_array_len: None,
+            entry_trace_index: 0,
             live: None,
         }
     }

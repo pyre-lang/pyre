@@ -250,6 +250,7 @@ mod frame_replacement_tests {
             helper_resume: HelperResume::Section,
             helper_call_entry: HelperCallEntry::Unavailable,
             helper_entry_array_len: None,
+            entry_trace_index: 0,
             live: None,
         });
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, middle);
@@ -412,6 +413,7 @@ mod frame_replacement_tests {
             helper_resume: HelperResume::Section,
             helper_call_entry: HelperCallEntry::Unavailable,
             helper_entry_array_len: None,
+            entry_trace_index: 0,
             live: None,
         });
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);

@@ -609,11 +609,51 @@ fn void_return() -> Vec<u8> {
     ]
 }
 
+fn abort_op() -> Vec<u8> {
+    vec![
+        *insns_opname_to_byte()
+            .get("abort/")
+            .expect("`abort/` must be in insns table"),
+    ]
+}
+
+/// `conditional_call_ir_v/iiIRd` with empty I/R lists, funcbox in the second
+/// Int operand.
+fn conditional_call_ir_v_with_funcbox(funcbox: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("conditional_call_ir_v/iiIRd")
+        .expect("`conditional_call_ir_v/iiIRd` must be in insns table");
+    vec![byte, 0, funcbox, 0, 0, 0, 0]
+}
+
 fn int_copy_const(src: u8, dst: u8) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("int_copy/c>i")
         .expect("`int_copy/c>i` must be in insns table");
     vec![byte, src, dst]
+}
+
+fn int_copy_reg(src: u8, dst: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("int_copy/i>i")
+        .expect("`int_copy/i>i` must be in insns table");
+    vec![byte, src, dst]
+}
+
+fn goto_l(target: u16) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("goto/L")
+        .expect("`goto/L` must be in insns table");
+    vec![byte, target as u8, (target >> 8) as u8]
+}
+
+/// `conditional_call_value_ir_i/iiIRd>i` with empty I/R lists, value in the
+/// first Int operand, funcbox in the second, dest in the last.
+fn conditional_call_value_ir_i_with_funcbox(value: u8, funcbox: u8, dest: u8) -> Vec<u8> {
+    let byte = *insns_opname_to_byte()
+        .get("conditional_call_value_ir_i/iiIRd>i")
+        .expect("`conditional_call_value_ir_i/iiIRd>i` must be in insns table");
+    vec![byte, value, funcbox, 0, 0, 0, 0, dest]
 }
 
 fn arraylen_gc(array: u8, descr: u16, dst: u8) -> Vec<u8> {
@@ -1122,6 +1162,240 @@ fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
     );
 }
 
+/// Whole-body admission does not name a reachable `abort` as a blocker; it
+/// only records that the abort exists, so a resume scan into this body as a
+/// callee can refuse to number a helper section the blackhole cannot finish.
+#[test]
+fn a_reachable_abort_is_not_a_whole_body_blocker() {
+    let mut code = abort_op();
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[], |_| None);
+    assert!(summary.has_reachable_abort);
+    assert_eq!(summary.blocker_effect_free, None);
+    assert_eq!(summary.blocker_after_effect, None);
+}
+
+/// Capture-time resume treats a reachable `abort` as a blocker.
+#[test]
+fn a_reachable_abort_is_a_resume_blocker() {
+    let mut code = abort_op();
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[], |_| None);
+    assert!(summary.has_reachable_abort);
+    assert_eq!(summary.blocker_effect_free, Some(0));
+}
+
+/// A continuation `inline_call` uses the callee's whole-body summary. An
+/// `abort` there is invisible to admission. The resume scan treats that
+/// callee as a blocker only when the blackhole would interpret it
+/// (`interpret_unresolved_inline_call`, `fnaddr=None`) and reach the abort.
+#[test]
+fn a_callees_reachable_abort_is_a_resume_blocker() {
+    let real = 0x1234_5678i64;
+    let callee = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        has_reachable_abort: true,
+        ..Default::default()
+    };
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert!(whole.has_reachable_abort);
+    assert_eq!(whole.blocker_effect_free, None);
+    assert_eq!(whole.blocker_after_effect, None);
+
+    let resume = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[real], |d| {
+        (d == 7).then_some(callee)
+    });
+    assert_eq!(resume.blocker_effect_free, Some(0));
+}
+
+/// A callable `jitcode.fnaddr` runs `bhimpl_inline_call_*` natively, so a
+/// reachable abort inside that callee is not a section the resume scan walks.
+#[test]
+fn a_callable_callees_reachable_abort_is_not_a_resume_blocker() {
+    let real = 0x1234_5678i64;
+    assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
+    let callee = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        has_reachable_abort: true,
+        ..Default::default()
+    };
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+
+    let resume = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[real],
+        |d| (d == 7).then_some(callee),
+        |d| (d == 7).then_some(real),
+    );
+    assert_eq!(resume.blocker_effect_free, None);
+    assert_eq!(resume.blocker_after_effect, None);
+}
+
+/// Resume does not treat a residual whose funcbox register is a runtime-only
+/// unknown as a blocker: `ResumeDataDirectReader.consume_one_section`
+/// restores it. Whole-body admission already agreed.
+#[test]
+fn an_unresolved_funcbox_is_not_a_resume_blocker() {
+    let real = 0x1234_5678i64;
+    assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
+    let mut code = residual_call_with_funcbox(0);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[real], |_| None);
+    assert_eq!(whole.blocker_effect_free, None);
+    assert_eq!(whole.blocker_after_effect, None);
+
+    let resume = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[real], |_| None);
+    assert_eq!(resume.blocker_effect_free, None);
+    assert_eq!(resume.blocker_after_effect, None);
+}
+
+/// A symbolic constant that reaches a funcbox through a join is a blocker:
+/// the scan no longer holds the word, but `may_symbolic_i` records that the
+/// placeholder may still be there (`reject_unresolved_call`).
+#[test]
+fn a_maybe_symbolic_funcbox_join_is_a_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    assert!(majit_jitcode::codewriter::call::is_symbolic_fnaddr(
+        symbolic
+    ));
+    assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
+
+    // i0 red condition, i1 dest; i2 symbolic, i3 real.
+    // 0: goto_if_not i0, 10
+    // 4: int_copy i2 -> i1
+    // 7: goto 13
+    // 10: int_copy i3 -> i1
+    // 13: residual i1
+    // 19: void_return
+    let mut code = goto_if_not(0, 10);
+    code.extend(int_copy_reg(2, 1));
+    code.extend(goto_l(13));
+    code.extend(int_copy_reg(3, 1));
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    assert_eq!(code.len(), 20);
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 2, &[symbolic, real], |_| None);
+    assert_eq!(whole.blocker_effect_free, Some(0));
+
+    let resume =
+        super::inline_call::summarize_body_blockers_resume(0, &code, 2, &[symbolic, real], |_| {
+            None
+        });
+    assert_eq!(resume.blocker_effect_free, Some(0));
+}
+
+/// Overwriting a register with a proven callable constant clears
+/// `may_symbolic_i`, so a later residual of that register is not a blocker.
+#[test]
+fn overwriting_a_symbolic_funcbox_clears_the_maybe_flag() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    // i0 dest; i1 symbolic, i2 real. Copy symbolic, then real, then call i0.
+    let mut code = int_copy_reg(1, 0);
+    code.extend(int_copy_reg(2, 0));
+    code.extend(residual_call_with_funcbox(0));
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic, real], |_| None);
+    assert_eq!(whole.blocker_effect_free, None);
+    let resume =
+        super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[symbolic, real], |_| {
+            None
+        });
+    assert_eq!(resume.blocker_effect_free, None);
+}
+
+/// `conditional_call_ir_v` is a blackhole call form: a symbolic funcbox is a
+/// blocker the same way a `residual_call_*` is.
+#[test]
+fn a_symbolic_conditional_call_is_a_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = conditional_call_ir_v_with_funcbox(1);
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+}
+
+/// `bhimpl_conditional_call_ir_v` does not call when the condition is the
+/// constant 0, so a symbolic funcbox on that arm is not a blocker.
+#[test]
+fn a_false_conditional_call_skips_the_funcbox_check() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    // slot 0 = condition 0, slot 1 = symbolic funcbox. num_regs_i = 0.
+    let mut code = conditional_call_ir_v_with_funcbox(1);
+    code.extend(void_return());
+    let whole = super::inline_call::summarize_body_blockers(&code, 0, &[0, symbolic], |_| None);
+    assert_eq!(whole.blocker_effect_free, None);
+    let resume =
+        super::inline_call::summarize_body_blockers_resume(0, &code, 0, &[0, symbolic], |_| None);
+    assert_eq!(resume.blocker_effect_free, None);
+}
+
+/// `bhimpl_conditional_call_value_ir_i` does not call when the value is
+/// nonzero, so a symbolic funcbox on that arm is not a blocker.
+#[test]
+fn a_nonzero_conditional_call_value_skips_the_funcbox_check() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    // slot 0 = value 1, slot 1 = symbolic funcbox. dest = slot 0.
+    let mut code = conditional_call_value_ir_i_with_funcbox(0, 1, 0);
+    code.extend(void_return());
+    let whole = super::inline_call::summarize_body_blockers(&code, 0, &[1, symbolic], |_| None);
+    assert_eq!(whole.blocker_effect_free, None);
+    let resume =
+        super::inline_call::summarize_body_blockers_resume(0, &code, 0, &[1, symbolic], |_| None);
+    assert_eq!(resume.blocker_effect_free, None);
+}
+
+/// `bhimpl_conditional_call_value_ir_i` calls when the value is zero, so a
+/// symbolic funcbox is a blocker.
+#[test]
+fn a_zero_conditional_call_value_applies_the_funcbox_check() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let mut code = conditional_call_value_ir_i_with_funcbox(0, 1, 0);
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 0, &[0, symbolic], |_| None);
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+}
+
+#[test]
+fn fresh_object_only_residual_paths_match_the_named_leaves() {
+    use super::residual_call::is_fresh_object_only_residual_path;
+    assert!(is_fresh_object_only_residual_path(
+        "pyre_interpreter::error::make_pyerror"
+    ));
+    assert!(is_fresh_object_only_residual_path(
+        "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline"
+    ));
+    assert!(!is_fresh_object_only_residual_path(
+        "majit_rlib::lltypesystem::rvec::ll_vec_arrayclear_r"
+    ));
+    assert!(!is_fresh_object_only_residual_path(
+        "pyre_object::listobject::W_ListObject::object_push"
+    ));
+}
+
+/// CALL-entry replay re-runs from the outermost helper, so a `new*`
+/// OpRef is fresh only when its recorder `_index` is at least the
+/// level's `entry_trace_index`. An inputarg or a Const is never that.
+#[test]
+fn a_new_opref_is_allocated_after_the_helper_entry_index() {
+    use super::residual_call::opref_allocated_after;
+    assert!(opref_allocated_after(OpRef::ref_op(10), 10));
+    assert!(opref_allocated_after(OpRef::ref_op(11), 10));
+    assert!(!opref_allocated_after(OpRef::ref_op(9), 10));
+    assert!(!opref_allocated_after(OpRef::input_arg_ref(11), 10));
+    assert!(!opref_allocated_after(OpRef::NONE, 0));
+}
+
 /// The `s.add(x)` substitution replaces a residual the executed-effect odometer
 /// counts (`CallFn`) with one it judges by descr shape alone.  A `Ref` result
 /// clears the `Void` write proxy, so the helper tag is the only thing left
@@ -1423,6 +1697,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
         helper_resume: HelperResume::Section,
         helper_call_entry: HelperCallEntry::Unavailable,
         helper_entry_array_len: None,
+        entry_trace_index: 0,
         live: None,
     });
     let regs_r = Vec::new();

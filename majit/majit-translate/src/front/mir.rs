@@ -26657,9 +26657,9 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `prebuilt_str_storage(&'static str)` is the literal's prebuilt
-                // `STR` (`StringRepr.convert_const`), which the `&str` operand
-                // already is.
+                // `prebuilt_str_storage(&str)` is the literal's prebuilt
+                // `STR` (`CONST_STR_CACHE`, `BaseLLStringRepr.convert_const`),
+                // which the `&str` operand already is.
                 if args.len() == 1 && self.is_prebuilt_str_storage_identity(&reg) {
                     self.alias_dest_to_arg0(dest_local, args[0].clone(), false);
                     let target_bb = self.block_id[target];
@@ -37005,8 +37005,9 @@ impl<'a> Lowering<'a> {
         fd.item_meta.name_path().rsplit("::").next() == Some("utf8_payload_wtf8")
     }
 
-    /// `prebuilt_str_storage(&'static str) -> *mut UnicodeValueStorage` — the
-    /// prebuilt rstr `STR` of a literal, the value its `&str` already lowers to.
+    /// `prebuilt_str_storage(&str) -> *mut UnicodeValueStorage` — the
+    /// prebuilt rstr `STR` of a literal (`CONST_STR_CACHE`), the value its
+    /// `&str` already lowers to.
     fn is_prebuilt_str_storage_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;

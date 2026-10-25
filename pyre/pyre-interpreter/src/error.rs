@@ -6066,7 +6066,8 @@ pub fn type_name_of(w_obj: PyObjectRef) -> String {
 /// `STR`, so a raise on a walked path records the ctor's malloc + setfield
 /// and no residual call.
 pub fn oefmt_noargs(kind: PyErrorKind, valuefmt: &'static str) -> OperationError {
-    // `prebuilt_str_storage` may collect, so the class is read after it.
+    // `prebuilt_str_storage` is the immortal `CONST_STR_CACHE` STR
+    // (`BaseLLStringRepr.convert_const`); it does not collect.
     let value = pyre_object::unicodeobject::prebuilt_str_storage(valuefmt);
     let w_type = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind_to_exc_kind(kind));
     make_pyerror_noargs(kind, w_type, value as pyre_object::gc_hook::GCREF)
@@ -6114,9 +6115,9 @@ pub fn oefmt_noargs(kind: PyErrorKind, valuefmt: &'static str) -> OperationError
 /// `OpErrFmt._compute_value` defers it.
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
-    // the message verbatim, `%` sequences and all.  Nothing on the way to the
-    // error runs application-level code, but `prebuilt_str_storage` can
-    // collect, so the class is pinned across it.
+    // the message verbatim, `%` sequences and all.  The message is the
+    // immortal `CONST_STR_CACHE` STR (`BaseLLStringRepr.convert_const`) and
+    // does not collect. The class is pinned across `make_pyerror_noargs`.
     if args.is_empty() {
         if w_type.is_null() {
             // The format string is the message verbatim. `from_string(to_string())`

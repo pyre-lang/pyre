@@ -558,6 +558,12 @@ pub struct DescentBlockerSummary {
     /// so too).  Diagnostic only: it names what turned a body's blockers into
     /// declines.
     pub first_effect_pc: Option<usize>,
+    /// Whether an `abort` opcode is reachable from this body's entry,
+    /// including through `inline_call_*` callees. The whole-body descent
+    /// scan does not treat that `abort` as a named blocker (admission stays
+    /// the two slots above); the capture-time resume scan does, because
+    /// `bhimpl_abort` cannot finish a helper section.
+    pub has_reachable_abort: bool,
 }
 
 /// Answers computed on demand from an assembled [`JitCode`] body.

@@ -1166,14 +1166,43 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     intern_publish_const(w_str_from_wtf8_immortal(value.to_owned()), true)
 }
 
+/// `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`): one immortal
+/// `STR` per distinct character sequence. Host-allocated, never collected,
+/// never moved. Separate from `interned_strings`.
+///
+/// Upstream is a `WeakValueDictionary` keyed by the string value; the
+/// blocks here are immortal, so the cache is a strong `IndexMap` (a
+/// Python dict).
+static CONST_STR_CACHE: LazyLock<Mutex<indexmap::IndexMap<Vec<u8>, usize>>> =
+    LazyLock::new(|| Mutex::new(indexmap::IndexMap::new()));
+
 /// The prebuilt rstr `STR` of a string literal (`StringRepr.convert_const`):
-/// the immortal storage of [`box_str_constant`], which is also what the JIT
-/// materializes for the literal's `__str_const`. The front end aliases the
-/// result to that `STR` operand, so a traced caller reads the constant
-/// without a call.
+/// the immortal `CONST_STR_CACHE` block (`BaseLLStringRepr.convert_const`).
+/// Host-allocated, never collected, never moved. Same characters share one
+/// pointer for the life of the process. Does not read or write
+/// `interned_strings`. The JIT materializes the same block for the
+/// literal's `__str_const`. The front end aliases the result to that `STR`
+/// operand, so a traced caller reads the constant without a call.
 #[majit_macros::dont_look_inside]
-pub fn prebuilt_str_storage(value: &'static str) -> *mut UnicodeValueStorage {
-    unsafe { w_str_storage(box_str_constant(Wtf8::new(value))) }
+pub fn prebuilt_str_storage(value: &str) -> *mut UnicodeValueStorage {
+    prebuilt_str_storage_bytes(value.as_bytes())
+}
+
+/// `CONST_STR_CACHE` keyed on the raw `STR` bytes (`BaseLLStringRepr.convert_const`
+/// copies characters with no encoding check). Lone-surrogate WTF-8 is a valid
+/// payload.
+#[majit_macros::dont_look_inside]
+pub fn prebuilt_str_storage_bytes(bytes: &[u8]) -> *mut UnicodeValueStorage {
+    let mut cache = CONST_STR_CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(&p) = cache.get(bytes) {
+        return p as *mut UnicodeValueStorage;
+    }
+    let p = alloc_utf8_payload(bytes, false);
+    let _ = crate::lowlevel_string::ll_strhash(p);
+    cache.insert(bytes.to_vec(), p as usize);
+    p
 }
 
 /// Kind of a `box_str_constant` residual operand.
@@ -2669,6 +2698,58 @@ mod tests {
         ));
         assert_eq!(get_interned_wtf8(live), Some(interned_live));
         assert_eq!(interned_size_immortal(), immortal_before);
+    }
+
+    /// A raw prebuilt `STR` (`CONST_STR_CACHE`, `BaseLLStringRepr.convert_const`)
+    /// does not publish into `interned_strings`. A live managed interned
+    /// identity for the same characters stays canonical, and two lookups
+    /// return the same pointer.
+    #[test]
+    fn prebuilt_str_storage_does_not_replace_live_managed_intern() {
+        let _hook_lock = intern_probe_guard();
+        let _clear = InternProbeClear;
+        assert!(
+            crate::gc_interp::enabled(),
+            "managed intern falls back to immortal while gc_interp is off"
+        );
+
+        let literal = "__pyre_prebuilt_str_cache_keep_managed_a7b8__";
+        let live = Wtf8::new(literal);
+        let managed = w_str_from_wtf8_managed(live.to_owned());
+        assert!(crate::gc_hook::try_gc_owns_object(
+            managed as crate::gc_hook::GCREF
+        ));
+        let interned_live = unsafe { intern_exact_str(managed) };
+        assert_eq!(interned_live, managed);
+        let size_before = interned_size();
+
+        let first = prebuilt_str_storage(literal);
+        let second = prebuilt_str_storage(literal);
+        assert_eq!(first, second);
+        assert!(!first.is_null());
+        assert_eq!(interned_size(), size_before);
+        assert_eq!(
+            intern_lookup(crate::celldict::StrKey(unsafe {
+                w_str_storage(interned_live)
+            })),
+            Some(interned_live)
+        );
+        assert!(unsafe { is_interned_exact_str(interned_live) });
+        assert_eq!(get_interned_wtf8(live), Some(interned_live));
+    }
+
+    /// `BaseLLStringRepr.convert_const` copies characters with no UTF-8 check.
+    /// A lone-surrogate WTF-8 sequence (`ED A0 80`) is a valid `STR` payload
+    /// and keys `CONST_STR_CACHE` by those bytes.
+    #[test]
+    fn prebuilt_str_storage_bytes_accepts_lone_surrogate_wtf8() {
+        let bytes = &[0xED, 0xA0, 0x80];
+        let first = prebuilt_str_storage_bytes(bytes);
+        let second = prebuilt_str_storage_bytes(bytes);
+        assert_eq!(first, second);
+        assert!(!first.is_null());
+        let payload = unsafe { utf8_payload_bytes(first) };
+        assert_eq!(payload, bytes);
     }
 
     /// A `new_interned_w_str` entry stays mortal after the interned string is

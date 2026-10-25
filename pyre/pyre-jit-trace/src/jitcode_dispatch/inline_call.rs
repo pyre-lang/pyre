@@ -1108,16 +1108,22 @@ fn descent_decline(
 }
 
 /// Whether the blackhole, resuming the helper body `jitcode_index` at `pc`,
-/// can reach a residual call whose funcbox is a symbolic placeholder, an
-/// `abort` opcode (`bhimpl_abort`), or a region the scan cannot read.
+/// can reach a residual or conditional call whose funcbox may be a symbolic
+/// placeholder (`is_symbolic_fnaddr`), an `abort` opcode (`bhimpl_abort`),
+/// an `inline_call_*` callee the blackhole would interpret
+/// (`interpret_unresolved_inline_call`) whose whole-body summary can reach
+/// an `abort`, or a region the scan cannot read.
 ///
-/// `reject_unresolved_call` bails at such a call, and a helper section has no
-/// Python coordinate the interpreter could continue from, so a guard whose
-/// helper sections can reach one cannot be numbered. The scan runs from the
-/// body's entry with the facts the descent scan proves there
-/// (`entry_array_len`, the length of a gateway's argument array), so an arm
-/// those facts exclude on every path to `pc` is not counted. Callees named
-/// by `inline_call_*` past `pc` count with their whole-body summary.
+/// `reject_unresolved_call` bails at a symbolic placeholder. A runtime
+/// address the static scan does not know is restored by
+/// `ResumeDataDirectReader.consume_one_section` and is not a blocker.
+/// A helper section has no Python coordinate the interpreter could continue
+/// from, so a guard whose helper sections can reach a blocker cannot be
+/// numbered. The scan runs from the body's entry with the facts the descent
+/// scan proves there (`entry_array_len`, the length of a gateway's argument
+/// array), so an arm those facts exclude on every path to `pc` is not
+/// counted. Callees named by `inline_call_*` past `pc` count with their
+/// whole-body summary.
 pub(crate) fn helper_resume_reaches_blocker(
     jitcode_index: usize,
     pc: usize,
@@ -1148,6 +1154,7 @@ pub(crate) fn helper_resume_reaches_blocker(
             &mut residual_call_is_effect_free,
             &mut switch_descr_targets,
             &entry_array_lengths,
+            &mut jitcode_fnaddr_for_descr,
         );
         summary.body_not_walked
             || summary.blocker_effect_free.is_some()
@@ -1487,8 +1494,9 @@ pub(crate) fn descent_blocker_summary(jitcode_index: usize) -> DescentBlockerSum
 /// One reachable point of [`summarize_descent_blockers`]'s dataflow.
 ///
 /// The carried facts only lose information when two paths meet — `effect` goes
-/// false to true, disagreeing known-value slots go to `None`, and freshness
-/// goes true to false — so the worklist converges.
+/// false to true, disagreeing known-value slots go to `None`, freshness goes
+/// true to false, and `may_symbolic_i` goes false to true — so the worklist
+/// converges.
 #[derive(Clone)]
 struct DescentPoint {
     /// Whether some path to here passed the resume point a resume scan asks
@@ -1509,6 +1517,12 @@ struct DescentPoint {
     /// `new*` result) on every path to here.  A write into such an object is
     /// not an effect: a rewind discards the allocation with it.
     fresh_r: Vec<bool>,
+    /// Whether a symbolic fnaddr constant (`is_symbolic_fnaddr`) may reach
+    /// each Int-bank slot. Union at joins; set when a symbolic constant is
+    /// moved or loaded into the slot; cleared when the slot is overwritten
+    /// by a non-symbolic value or op result. A runtime-only unknown is
+    /// false: `ResumeDataDirectReader.consume_one_section` restores it.
+    may_symbolic_i: Vec<bool>,
 }
 
 /// True when a funcbox constant names a residual
@@ -1625,6 +1639,104 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
         }
     }
     None
+}
+
+/// The Int-bank slot holding the callee address of a `residual_call_*` or
+/// `conditional_call*` op, or `None` when this op is neither.
+///
+/// `residual_call_*` argcodes open with the `i` funcbox.
+/// `conditional_call_ir_v` / `conditional_call_value_ir_{i,r}` put the
+/// condition or fallback value first (`i` or `r`) and the funcbox in the
+/// following `i` (`bhimpl_conditional_call_ir_v` /
+/// `bhimpl_conditional_call_value_ir_{i,r}`).
+fn residual_or_conditional_funcbox(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+) -> Option<usize> {
+    let skip = if op.opname.starts_with("residual_call") {
+        0
+    } else if op.opname.starts_with("conditional_call") {
+        1
+    } else {
+        return None;
+    };
+    let mut cursor = op.pc + 1;
+    let mut seen = 0usize;
+    for c in op.argcodes.chars() {
+        match c {
+            'i' | 'c' | 'r' | 'f' => {
+                if c == 'i' && seen == skip {
+                    return code.get(cursor).map(|&b| b as usize);
+                }
+                cursor += 1;
+                seen += 1;
+            }
+            '>' => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `bhimpl_conditional_call_ir_v` calls only when `condition` is true;
+/// `bhimpl_conditional_call_value_ir_i` calls only when the Int value is
+/// zero; `bhimpl_conditional_call_value_ir_r` calls only when the Ref
+/// value is null. The scan does not carry Ref constants, so the `_r` form
+/// never skips here.
+fn conditional_call_skips(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    known_i: &[Option<i64>],
+) -> bool {
+    if !op.opname.starts_with("conditional_call") {
+        return false;
+    }
+    let Some(&first) = code.get(op.pc + 1) else {
+        return false;
+    };
+    if op.opname.starts_with("conditional_call_value") {
+        if op.argcodes.starts_with('r') {
+            return false;
+        }
+        return known_i
+            .get(first as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|value| value != 0);
+    }
+    known_i.get(first as usize).copied().flatten() == Some(0)
+}
+
+/// The runtime `fnaddr` of the JitCode named by `descr_index`, when the
+/// descriptor pool and jitcode table both hold it.
+fn jitcode_fnaddr_for_descr(descr_index: usize) -> Option<i64> {
+    crate::jitcode_runtime::descr_ref_table()
+        .at(descr_index)
+        .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+        .and_then(crate::jitcode_runtime::get_jitcode_ref_by_index)
+        .map(|jc| jc.fnaddr)
+}
+
+/// Whether the blackhole byte-interprets this `inline_call_*` callee.
+///
+/// `handler_inline_call_*` calls `jitcode.fnaddr` whenever
+/// `is_callable_fnaddr` holds (`bhimpl_inline_call_*`) and only then
+/// [`majit_metainterp::blackhole`]'s `interpret_unresolved_inline_call`.
+fn blackhole_interprets_inline_callee(fnaddr: i64) -> bool {
+    !majit_jitcode::codewriter::call::is_callable_fnaddr(fnaddr)
+}
+
+/// The address `reject_unresolved_call` would refuse at this funcbox, or
+/// `None` when the blackhole can hold a runtime value or a proven callable
+/// constant. A slot that may carry a symbolic constant through a join is
+/// a blocker even when the concrete word is unknown.
+fn funcbox_call_blocker(fnaddr: Option<i64>, may_symbolic: bool) -> Option<i64> {
+    match fnaddr {
+        Some(addr) if !majit_jitcode::codewriter::call::is_callable_fnaddr(addr) => Some(addr),
+        Some(_) => None,
+        None if may_symbolic => Some(0),
+        None => None,
+    }
 }
 
 /// A write set is empty only when it is *known* empty.
@@ -2043,6 +2155,54 @@ pub(crate) fn summarize_body_blockers(
     )
 }
 
+/// [`summarize_body_blockers`] from a resume pc, the capture-time helper
+/// section scan.
+#[cfg(test)]
+pub(crate) fn summarize_body_blockers_resume(
+    resume_pc: usize,
+    code: &[u8],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    callee_summary: impl FnMut(usize) -> Option<DescentBlockerSummary>,
+) -> DescentBlockerSummary {
+    summarize_body_blockers_resume_fnaddr(
+        resume_pc,
+        code,
+        num_regs_i,
+        constants_i,
+        callee_summary,
+        |_| None,
+    )
+}
+
+/// [`summarize_body_blockers_resume`] with a per-descr callee `fnaddr`.
+///
+/// `None` is `jitcode.py JitCode.__init__ fnaddr=None`: the blackhole
+/// interprets that callee (`interpret_unresolved_inline_call`). A callable
+/// address is the native `bhimpl_inline_call_*` path.
+#[cfg(test)]
+pub(crate) fn summarize_body_blockers_resume_fnaddr(
+    resume_pc: usize,
+    code: &[u8],
+    num_regs_i: usize,
+    constants_i: &[i64],
+    mut callee_summary: impl FnMut(usize) -> Option<DescentBlockerSummary>,
+    mut callee_fnaddr: impl FnMut(usize) -> Option<i64>,
+) -> DescentBlockerSummary {
+    summarize_body_blockers_from(
+        Some(resume_pc),
+        code,
+        num_regs_i,
+        constants_i,
+        |descr_index, _caller_effect, _entry_lens| callee_summary(descr_index),
+        &mut |_blocker, _effect| true,
+        &mut |_descr_index| false,
+        &mut |_descr_index| None,
+        &[],
+        &mut callee_fnaddr,
+    )
+}
+
 /// [`summarize_body_blockers`] with the two hooks the diagnostic needs.
 ///
 /// `on_blocker` is told each blocker and whether an effect had been applied
@@ -2093,6 +2253,7 @@ pub(crate) fn summarize_body_blockers_with(
         call_effect_free,
         switch_targets,
         entry_array_lengths,
+        &mut jitcode_fnaddr_for_descr,
     )
 }
 
@@ -2112,6 +2273,7 @@ fn summarize_body_blockers_from(
     call_effect_free: &mut dyn FnMut(usize) -> bool,
     switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
     entry_array_lengths: &[(usize, usize)],
+    callee_fnaddr: &mut dyn FnMut(usize) -> Option<i64>,
 ) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
@@ -2142,16 +2304,21 @@ fn summarize_body_blockers_from(
     }
 
     let mut entry_known = vec![None; num_regs_i + constants_i.len()];
+    let mut entry_may_symbolic = vec![false; num_regs_i + constants_i.len()];
     for (slot, &value) in constants_i.iter().enumerate() {
         entry_known[num_regs_i + slot] = Some(value);
+        entry_may_symbolic[num_regs_i + slot] =
+            majit_jitcode::codewriter::call::is_symbolic_fnaddr(value);
     }
     // A handler runs with the join of every state in the region it protects, so
     // its registers hold no known value -- but a constant slot is never a `>i`
     // destination, so it holds the same value at every one of those points and
     // survives the join exactly.  Blanking those too would drop the operand a
-    // `residual_call` in a handler reads its funcbox from, and a funcbox that
-    // reads unknown is a blocker the scan does not report.
+    // `residual_call` in a handler reads its funcbox from. A register there is
+    // a runtime value `consume_one_section` restores, unless a symbolic
+    // constant still occupies the slot.
     let handler_known = entry_known.clone();
+    let handler_may_symbolic = entry_may_symbolic.clone();
     let mut entry_array_len_r = vec![None; FRESH_SLOTS];
     for &(slot, len) in entry_array_lengths {
         if let Some(value) = entry_array_len_r.get_mut(slot) {
@@ -2171,6 +2338,7 @@ fn summarize_body_blockers_from(
             known_i: entry_known,
             known_array_len_r: entry_array_len_r,
             fresh_r: vec![false; FRESH_SLOTS],
+            may_symbolic_i: entry_may_symbolic,
         },
     );
     let mut work = std::collections::VecDeque::from([0usize]);
@@ -2219,6 +2387,16 @@ fn summarize_body_blockers_from(
                                 widened = true;
                             }
                         }
+                        for (slot, incoming) in existing
+                            .may_symbolic_i
+                            .iter_mut()
+                            .zip(&state.may_symbolic_i)
+                        {
+                            if !*slot && *incoming {
+                                *slot = true;
+                                widened = true;
+                            }
+                        }
                         if widened {
                             $work.push_back(target);
                         }
@@ -2244,24 +2422,29 @@ fn summarize_body_blockers_from(
         let mut known_i = point.known_i;
         let mut known_array_len_r = point.known_array_len_r;
         let mut fresh_r = point.fresh_r;
+        let mut may_symbolic_i = point.may_symbolic_i;
 
-        if d.opname.starts_with("residual_call") {
-            // Every `residual_call_*` argcode string opens with the `i` funcbox
-            // operand, so it is the byte right after the opcode.
-            let funcbox = code.get(d.pc + 1).copied().unwrap_or(0) as usize;
-            if resumed
-                && let Some(Some(fnaddr)) = known_i.get(funcbox)
-                && majit_jitcode::codewriter::call::is_symbolic_fnaddr(*fnaddr)
-            {
-                let slot = if effect {
-                    &mut summary.blocker_after_effect
-                } else {
-                    &mut summary.blocker_effect_free
-                };
-                slot.get_or_insert(*fnaddr);
-                if on_blocker(*fnaddr, effect) {
-                    // The walk stops here, so this op has no successors.
-                    continue;
+        if let Some(funcbox) = residual_or_conditional_funcbox(code, &d) {
+            // `reject_unresolved_call` bails at a symbolic placeholder or
+            // `fnaddr=None` (`is_callable_fnaddr`). A constant slot is seeded
+            // into `known_i` and survives handler joins. A red register is a
+            // runtime address `consume_one_section` restores; only a slot a
+            // symbolic constant may still reach is a blocker.
+            if resumed && !conditional_call_skips(code, &d, &known_i) {
+                let fnaddr = known_i.get(funcbox).copied().flatten();
+                let may_symbolic = may_symbolic_i.get(funcbox).copied().unwrap_or(false);
+                let blocker = funcbox_call_blocker(fnaddr, may_symbolic);
+                if let Some(blocker) = blocker {
+                    let slot = if effect {
+                        &mut summary.blocker_after_effect
+                    } else {
+                        &mut summary.blocker_effect_free
+                    };
+                    slot.get_or_insert(blocker);
+                    if on_blocker(blocker, effect) {
+                        // The walk stops here, so this op has no successors.
+                        continue;
+                    }
                 }
             }
         } else if d.opname.starts_with("inline_call") {
@@ -2296,6 +2479,26 @@ fn summarize_body_blockers_from(
                     summary.blocker_after_effect.get_or_insert(blocker);
                 } else if let Some(blocker) = callee.blocker_effect_free {
                     summary.blocker_effect_free.get_or_insert(blocker);
+                }
+                // `bhimpl_abort` cannot finish a helper section. Whole-body
+                // admission does not name that `abort` as a blocker; the
+                // resume scan does only when the blackhole would interpret
+                // the callee (`interpret_unresolved_inline_call`) and reach
+                // it. A callable `jitcode.fnaddr` runs `bhimpl_inline_call_*`
+                // natively, so that abort is not a section the scan walks.
+                summary.has_reachable_abort |= callee.has_reachable_abort;
+                if resume_pc.is_some() && callee.has_reachable_abort {
+                    let fnaddr = callee_fnaddr(descr_index)
+                        .or_else(|| jitcode_fnaddr_for_descr(descr_index))
+                        .unwrap_or(0);
+                    if blackhole_interprets_inline_callee(fnaddr) {
+                        let slot = if effect {
+                            &mut summary.blocker_after_effect
+                        } else {
+                            &mut summary.blocker_effect_free
+                        };
+                        slot.get_or_insert(0);
+                    }
                 }
                 if callee.may_execute_effect {
                     effect = true;
@@ -2340,12 +2543,8 @@ fn summarize_body_blockers_from(
         // funcbox resolves to, and the field a store writes — so the first one
         // on the entry path is readable.
         if !effect && applies_effect && fbw_inline_diag_enabled() {
-            let funcbox = d
-                .opname
-                .starts_with("residual_call")
-                .then(|| code.get(d.pc + 1).copied())
-                .flatten()
-                .and_then(|slot| known_i.get(slot as usize).copied())
+            let funcbox = residual_or_conditional_funcbox(code, &d)
+                .and_then(|slot| known_i.get(slot).copied())
                 .flatten();
             let field = descr_operand_index(code, &d).and_then(|index| {
                 crate::jitcode_runtime::descr_ref_table()
@@ -2387,8 +2586,18 @@ fn summarize_body_blockers_from(
             && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
         {
             let carried = known_int_result(code, &d, &known_i, &known_array_len_r);
+            let may_symbolic = match d.key {
+                "int_copy/i>i" => code.get(d.pc + 1).is_some_and(|&src| {
+                    carried.is_some_and(majit_jitcode::codewriter::call::is_symbolic_fnaddr)
+                        || may_symbolic_i.get(src as usize).copied().unwrap_or(false)
+                }),
+                _ => carried.is_some_and(majit_jitcode::codewriter::call::is_symbolic_fnaddr),
+            };
             if let Some(slot) = known_i.get_mut(dst as usize) {
                 *slot = carried;
+            }
+            if let Some(slot) = may_symbolic_i.get_mut(dst as usize) {
+                *slot = may_symbolic;
             }
         }
         // The Ref-bank destination color, if this op writes one: the dst byte
@@ -2428,19 +2637,21 @@ fn summarize_body_blockers_from(
             known_i: known_i.clone(),
             known_array_len_r: known_array_len_r.clone(),
             fresh_r: fresh_r.clone(),
+            may_symbolic_i: may_symbolic_i.clone(),
         };
         let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
         match d.opname {
             // Frame exits: the walk leaves this body here.
             "ref_return" | "int_return" | "float_return" | "void_return" => {}
-            // `bhimpl_abort` cannot finish a helper section. Capture-time
-            // resume (`helper_resume_reaches_blocker`) treats a reachable
-            // `abort` as a blocker so the guard takes the CALL-entry fallback
-            // instead of numbering a section that cannot complete. The
-            // whole-body descent scan (`resume_pc` absent) still falls through
-            // so its blocker set is unchanged.
-            "abort" if resume_pc.is_some() => {
-                if resumed {
+            // `bhimpl_abort` cannot finish a helper section. The whole-body
+            // scan records that an `abort` is reachable without naming it as
+            // a descent-admission blocker. Capture-time resume
+            // (`helper_resume_reaches_blocker`) treats a reachable `abort` as
+            // a blocker so the guard takes the CALL-entry fallback instead
+            // of numbering a section that cannot complete.
+            "abort" => {
+                summary.has_reachable_abort = true;
+                if resume_pc.is_some() && resumed {
                     let slot = if effect {
                         &mut summary.blocker_after_effect
                     } else {
@@ -2478,6 +2689,7 @@ fn summarize_body_blockers_from(
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
+                            may_symbolic_i: handler_may_symbolic.clone(),
                         }
                     );
                 }
@@ -2520,6 +2732,7 @@ fn summarize_body_blockers_from(
                             known_i: handler_known.clone(),
                             known_array_len_r: vec![None; FRESH_SLOTS],
                             fresh_r: vec![false; FRESH_SLOTS],
+                            may_symbolic_i: handler_may_symbolic.clone(),
                         }
                     );
                 }
@@ -7412,7 +7625,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     // result is the instance, not `__init__`'s return, so a guard inside
     // `__init__` resumes at the CALL entry. Nested Python must name the
     // caller.
-    let nested_helper_entry = match helper_subwalk_level(ctx, op.pc, HelperReturn::Converted) {
+    let mut nested_helper_entry = match helper_subwalk_level(ctx, op.pc, HelperReturn::Converted) {
         Ok(level) => level,
         Err(_) => {
             if nested_helper && !ctx.fbw_mode.transparent_helper_subwalk {
@@ -7502,6 +7715,12 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     wrapper_item_concretes.push(instance_concrete);
     wrapper_items.extend_from_slice(&r_args[2..]);
     wrapper_item_concretes.extend_from_slice(&arg_concretes[2..]);
+    // Same argument count `builtin_gateway_undescendable_reason` scanned
+    // this `__init__` with; a guard's resume scan proves those facts the
+    // same way.
+    if let Some(level) = nested_helper_entry.as_mut() {
+        level.entry_array_len = Some(wrapper_items.len());
+    }
     for (&item, concrete) in wrapper_items.iter().zip(&wrapper_item_concretes) {
         if let ConcreteValue::Ref(value) = concrete
             && !value.is_null()
@@ -8680,7 +8899,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         u16::MAX
     };
-    let inline_depth = ctx.session.borrow().inline_depth();
+    let python_inline_depth = ctx.session.borrow().python_inline_depth();
 
     // A strict straight-line callee is seeded with its own frame red so guards
     // carry a real two-frame snapshot.  A callee beyond the currently-supported
@@ -8693,7 +8912,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Computed here rather than beside its first use in the seed block, because
     // `seeded_callee_resume` below asks the same question and is 200 lines
     // earlier.
-    let strict_seed = strict_inlinable && inline_depth < fbw_max_multiframe_depth();
+    let strict_seed = strict_inlinable && python_inline_depth < fbw_max_multiframe_depth();
     let contains_raise = body_facts.contains_raise;
     // A callee that raises inline needs the cross-frame bridge the carrier
     // drain builds once a guard inside the compiled chain fails.  The drain
@@ -8730,7 +8949,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `for`, so it stays eligible.
     let try_multiframe = multiframe_eligible
         && !(nparams == 0 && pyre_interpreter::code_has_for_iter(callee_code))
-        && inline_depth < effective_multiframe_depth
+        && python_inline_depth < effective_multiframe_depth
         && callee_fast_path_inlinable_allowing_forward_branch(
             body.code,
             callee_descr_refs,
@@ -8845,7 +9064,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if fbw_inline_diag_enabled() {
             eprintln!(
                 "[seeded-inline-decline] pc={} why={seeded_why} \
-                 strict={strict_inlinable} mf={try_multiframe} depth={inline_depth}",
+                 strict={strict_inlinable} mf={try_multiframe} depth={python_inline_depth}",
                 op.pc
             );
         }
@@ -13420,7 +13639,7 @@ fn try_walker_descend_builtin_getattribute<Sym: WalkSym>(
         );
     }
 
-    let Some(site) = capture_builtin_wrapper_call_site(
+    let Some(mut site) = capture_builtin_wrapper_call_site(
         ctx,
         op,
         callable,
@@ -13432,6 +13651,11 @@ fn try_walker_descend_builtin_getattribute<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
+    // The descent scan above proved its facts for this argument count; a
+    // guard's resume scan proves them the same way.
+    if let Some(level) = site.nested_helper_entry.as_mut() {
+        level.entry_array_len = Some(wrapper_items.len());
+    }
     walk_translated_builtin_wrapper(
         ctx,
         op,
@@ -19302,6 +19526,7 @@ pub(crate) fn enter_helper_level<'sess, Sym: WalkSym>(
 ) -> Option<InlineFrameGuard<'sess>> {
     let mut level = level?;
     super::resume_snapshot::refresh_helper_level(ctx, &mut level);
+    level.entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
     if subwalk_driver_is_active() {
         let mut session = ctx.session.borrow_mut();
         debug_assert!(

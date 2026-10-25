@@ -4841,6 +4841,138 @@ pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::RuntimeHelperKind) 
     )
 }
 
+fn residual_fnaddr_leaf(path: &str) -> &str {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf)
+}
+
+/// Residuals that write only a freshly allocated object, identified by
+/// published path. EffectInfo counts those writes, so identity is the
+/// remaining proof they do not touch an object that existed before the call.
+pub(crate) fn is_fresh_object_only_residual_path(path: &str) -> bool {
+    let leaf = residual_fnaddr_leaf(path);
+    leaf == "make_pyerror" || leaf.ends_with("alloc_and_set_nonnull_r_trampoline")
+}
+
+static FRESH_OBJECT_ONLY_RESIDUAL_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(is_fresh_object_only_residual_path));
+
+/// Recorder `_index` of the outermost helper on `framestack`, if any.
+///
+/// CALL-entry replay re-runs from that level (`numbered_helper_guard_resume`),
+/// so a write into an object allocated before this index would apply twice.
+fn outermost_helper_entry_trace_index<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<u32> {
+    ctx.session
+        .borrow()
+        .framestack
+        .iter()
+        .rev()
+        .take_while(|frame| frame.is_helper_level())
+        .last()
+        .map(|frame| frame.entry_trace_index)
+}
+
+/// Whether `opref` is a `new*` result recorded at or after `entry_index`
+/// (`opencoder.py Trace._index` / `OpRef::op_typed`).
+pub(crate) fn opref_allocated_after(opref: OpRef, entry_index: u32) -> bool {
+    match opref {
+        OpRef::RefOp(pos) | OpRef::IntOp(pos) | OpRef::FloatOp(pos) => pos >= entry_index,
+        _ => false,
+    }
+}
+
+/// Whether `arg` is a this-trace allocation recorded at or after the
+/// outermost helper entry (`heapcache.py HeapCache.is_unescaped` /
+/// `_seen_alloc`; `opencoder.py Trace._index`).
+///
+/// `allow_escaped_alloc` is for `OS_ARRAYCOPY` dest: `pin_root`
+/// (`gc_roots.py`) residualises as `CALL_*` and `_escape_box` clears
+/// `HF_IS_UNESCAPED` while leaving `HF_SEEN_ALLOCATION`. A GETFIELD dest
+/// has neither flag. CALL-entry replay still re-runs the `new*`.
+fn residual_ref_is_fresh_after_entry<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    arg: OpRef,
+    entry_index: Option<u32>,
+    allow_escaped_alloc: bool,
+) -> bool {
+    let heap = ctx.trace_ctx.heap_cache();
+    if !heap.is_unescaped(arg) && !(allow_escaped_alloc && heap.saw_allocation(arg)) {
+        return false;
+    }
+    match entry_index {
+        Some(entry_index) => opref_allocated_after(arg, entry_index),
+        None => true,
+    }
+}
+
+/// Whether every Ref this residual can write is a this-trace allocation
+/// recorded after the outermost helper level's entry.
+/// (`heapcache.py HeapCache.is_unescaped` / `new`).
+/// A Void residual with no Ref argument may write a supplied raw buffer
+/// (Int), which this proof cannot see.
+///
+/// `rgc.py ll_arraycopy` / `jtransform.py do_fixed_list_ll_arraycopy`
+/// (`OS_ARRAYCOPY`) writes dest only; source is read. CALL-entry replay
+/// of the outermost helper re-allocates dest (`tuple_ll_newlist` /
+/// `newlist_clear`), so a dest `NewArrayClear` after that entry is not
+/// a double write (`jit_ll_arraycopy` in a BINARY_SLICE walk).
+fn residual_ref_args_are_unescaped<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    allboxes: &[OpRef],
+) -> bool {
+    let types = call_descr.arg_types();
+    let args = allboxes.get(1..).unwrap_or(&[]);
+    let dest_only = call_descr.get_extra_info().oopspecindex == majit_ir::OopSpecIndex::Arraycopy;
+    let entry_index = outermost_helper_entry_trace_index(ctx);
+    let mut saw_ref = false;
+    for (i, ty) in types.iter().enumerate() {
+        if *ty != majit_ir::Type::Ref {
+            continue;
+        }
+        if dest_only && i != 1 {
+            continue;
+        }
+        let Some(&arg) = args.get(i) else {
+            return false;
+        };
+        if !residual_ref_is_fresh_after_entry(ctx, arg, entry_index, dest_only) {
+            return false;
+        }
+        saw_ref = true;
+    }
+    saw_ref
+}
+
+/// Whether this residual is proven not to write any object that existed
+/// before the call, so a CALL-entry replay may run it again.
+///
+/// Prefer empty write descrs (`effectinfo.py` /
+/// `heapcache.invalidate_caches_varargs`): no
+/// `check_forces_virtual_or_virtualizable`, not `EF_RANDOM_EFFECTS`.
+/// Allocation-only callees write the object they just built, so that proof
+/// fails; those stay exempt by resolved callee identity (`make_pyerror`,
+/// `*alloc_and_set_nonnull_r_trampoline`), never by `RuntimeHelperKind`
+/// and never by function-name families. A Void residual is exempt only
+/// when every Ref it can write is unescaped and allocated after the
+/// outermost helper entry. `OS_ARRAYCOPY` dest may use `_seen_alloc`
+/// in place of `is_unescaped` (`pin_root` residual CALL).
+fn residual_skips_heap_writing_odometer<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    func_ptr: i64,
+    allboxes: &[OpRef],
+) -> bool {
+    if extra_info_is_rewindable_allocation(call_descr.get_extra_info()) {
+        return true;
+    }
+    if FRESH_OBJECT_ONLY_RESIDUAL_FNADDRS.contains(&func_ptr) {
+        return true;
+    }
+    call_descr.result_type() == majit_ir::Type::Void
+        && residual_ref_args_are_unescaped(ctx, call_descr, allboxes)
+}
+
 /// Allocation-only helpers whose residual creates a fresh object and cannot
 /// mutate anything visible before the call.  Omitting one marks a non-pure
 /// residual and `try_walker_call_assembler` denies a later `CALL_ASSEMBLER`.
@@ -6711,14 +6843,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             );
         }
         fbw_bump_executed_effect("residual");
-        // CALL-entry re-runs this residual. `writes_live_heap` is a Void /
-        // CallFn proxy: it counts allocation-only residuals (`make_pyerror`,
-        // `ll_vec_alloc_and_set_nonnull_r_trampoline`) and rvec housekeeping
-        // (`ll_vec_arrayclear_r`, Void `CannotRaise`) that must not move this
-        // odometer — refusing them drops `cffi_lib_attr_cell`. A tagged
-        // mutator or a user frame would apply twice. Journaled stores are
-        // refused through `journal_delta`, not this counter.
-        if entered_frame || helper_kind_writes_live_heap(helper) {
+        // CALL-entry re-runs this residual. Bump unless the call is proven
+        // not to write an object that existed before it. Journaled stores
+        // are refused through `journal_delta`, not this counter.
+        if entered_frame
+            || !residual_skips_heap_writing_odometer(ctx, call_descr, func_ptr, allboxes)
+        {
             fbw_bump_heap_writing_effect("residual");
         }
     } else if helper == majit_ir::RuntimeHelperKind::ForIterNext && !for_iter_journaled {

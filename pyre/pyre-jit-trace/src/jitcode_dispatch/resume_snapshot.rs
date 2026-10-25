@@ -3031,6 +3031,9 @@ pub(crate) struct HelperLevel {
     /// Length of the argument array the helper is entered with, when the
     /// call site knows it (a generated gateway wrapper).
     pub(crate) entry_array_len: Option<usize>,
+    /// Recorder `_index` at the CALL that entered this level, stamped by
+    /// [`enter_helper_level`] from `Trace.get_trace_position`.
+    pub(crate) entry_trace_index: u32,
 }
 
 impl HelperLevel {
@@ -3040,6 +3043,7 @@ impl HelperLevel {
             resume: HelperResume::Section,
             call_entry,
             entry_array_len: None,
+            entry_trace_index: 0,
         }
     }
 
@@ -3053,6 +3057,7 @@ impl HelperLevel {
             resume: HelperResume::Unresumable,
             call_entry: HelperCallEntry::Unavailable,
             entry_array_len: None,
+            entry_trace_index: 0,
         }
     }
 }
@@ -3110,6 +3115,7 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
             resume: HelperResume::CallEntry,
             call_entry: HelperCallEntry::Unavailable,
             entry_array_len: None,
+            entry_trace_index: 0,
         })
     })
 }

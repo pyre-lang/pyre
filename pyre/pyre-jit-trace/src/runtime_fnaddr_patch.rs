@@ -636,16 +636,16 @@ const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 ///
 /// `as_unicode_object` is the `box_str_constant` result — a `W_UnicodeObject`
 /// the residual `w_name` ABI passes as one Ref. Otherwise the slot is rstr
-/// `Ptr(STR)` (`StringRepr.convert_const`): `bh_strlen` / `bh_strgetitem`
-/// read that payload.
+/// `Ptr(STR)` (`CONST_STR_CACHE`, `BaseLLStringRepr.convert_const` /
+/// [`pyre_object::unicodeobject::prebuilt_str_storage`]): `bh_strlen` /
+/// `bh_strgetitem` read that payload.
 fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_object: bool) -> i64 {
-    let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
-        .expect("prebuilt STR constant bytes are not valid WTF-8");
-    let wrapper = pyre_object::unicodeobject::box_str_constant(wtf8);
     if as_unicode_object {
-        wrapper as i64
+        let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
+            .expect("prebuilt STR constant bytes are not valid WTF-8");
+        pyre_object::unicodeobject::box_str_constant(wtf8) as i64
     } else {
-        unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+        pyre_object::unicodeobject::prebuilt_str_storage_bytes(bytes) as i64
     }
 }
 
@@ -658,13 +658,13 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_obj
 /// `OnceCell` publishes the entry — refcount must be 1 (`Arc::get_mut`), so no
 /// consumer can observe the sentinel as a forged GCREF.
 ///
-/// Identical literals are interned by bytes across the whole table so one
-/// immortal block (one identity) is shared, the runtime analog of the
-/// assembler's per-jitcode dedup.  `interned` is only a local fast path over
-/// that: [`materialize_prebuilt_str`] resolves through
-/// `box_str_constant`'s process-wide `WEAK_INTERN` (`rweakvaldict::WeakDict<StrKey>`),
-/// so the one-block identity holds across calls even though entries are
-/// materialized one jitcode at a time.
+/// Identical literals share one immortal block across the whole table, the
+/// runtime analog of the assembler's per-jitcode dedup.  `as_unicode_object`
+/// false is `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`); true is
+/// `box_str_constant`'s process-wide `WEAK_INTERN`.  `interned` is only a
+/// local fast path over that: [`materialize_prebuilt_str`] resolves through
+/// those process-wide stores, so the one-block identity holds across calls
+/// even though entries are materialized one jitcode at a time.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
     let mut interned: HashMap<(Vec<u8>, bool), i64> = HashMap::new();
     for arc in jitcodes.iter_mut() {
@@ -1234,8 +1234,8 @@ mod tests {
 
     /// The lazy per-index loader materializes one entry per call, so the
     /// call-local `interned` map cannot be what shares the block between two
-    /// jitcodes — `box_str_constant`'s process-wide intern table is.  Pins
-    /// that the one-block identity survives the split into separate calls.
+    /// jitcodes — `CONST_STR_CACHE` (`BaseLLStringRepr.convert_const`) is.
+    /// Pins that the one-block identity survives the split into separate calls.
     #[test]
     fn materialize_str_consts_interns_across_separate_calls() {
         std::thread::spawn(|| {
@@ -1252,7 +1252,7 @@ mod tests {
             assert_eq!(
                 first[0].body().constants_r[0],
                 second[0].body().constants_r[0],
-                "identical literals must share one immortal W_UnicodeObject \
+                "identical literals must share one immortal CONST_STR_CACHE STR \
                  even when materialized one jitcode at a time",
             );
         })
