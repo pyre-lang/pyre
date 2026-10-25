@@ -523,11 +523,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_write_barrier_from_array(Some(dynasm_gc_write_barrier_from_array));
     majit_gc::set_active_writebarrier_before_copy(Some(dynasm_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
-    majit_gc::set_active_finalizer_hooks(
-        Some(dynasm_register_finalizer),
-        Some(dynasm_finalizer_next_dead),
-        Some(dynasm_get_finalizer_queue_index),
-    );
+    majit_gc::set_active_finalizer_hooks(Some(dynasm_register_finalizer));
 }
 
 /// Install a GC allocator box into TLS and register all `set_active_*`
@@ -1172,17 +1168,6 @@ fn dynasm_collect_oldgen_nonmoving() {
 
 fn dynasm_register_finalizer(fq_index: usize, obj: GcRef) {
     with_dynasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj));
-}
-
-fn dynasm_get_finalizer_queue_index(tag: majit_gc::FinalizerQueueTag) -> usize {
-    with_dynasm_active_gc_mut(|gc| gc.get_finalizer_queue_index(tag)).unwrap_or(0)
-}
-
-fn dynasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
-    with_dynasm_active_gc(|gc| gc.finalizer_deque(fq_index))
-        .flatten()
-        .and_then(|deque| deque.popleft())
-        .map(GcRef)
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
@@ -5186,6 +5171,47 @@ mod tests {
         assert!(majit_gc::check_is_object(obj));
         assert_eq!(majit_gc::get_actual_typeid(obj), Some(obj_tid));
         assert_eq!(majit_gc::typeid_is_object(obj_tid), Some(true));
+    }
+
+    /// `_StrFinalizerQueue.finalizer_trigger` drains via `ll_next_dead` from
+    /// inside `execute_finalizers`. Index lookup and `next_dead` operate on
+    /// the process-wide table (`framework.py get_finalizer_queue_index`) and
+    /// do not re-enter the boxed collector.
+    #[test]
+    fn boxed_collector_next_dead_from_trigger_does_not_panic() {
+        use std::sync::atomic::AtomicUsize;
+
+        static FQ: u8 = 0;
+        static POPPED: AtomicUsize = AtomicUsize::new(0);
+
+        fn trigger() {
+            let tag = majit_gc::FinalizerQueueTag {
+                fq: std::ptr::addr_of!(FQ) as usize,
+                trigger,
+            };
+            let index = majit_gc::gc_get_finalizer_queue_index(tag);
+            if majit_gc::gc_fq_next_dead(index).is_some() {
+                POPPED.store(1, Ordering::Relaxed);
+            }
+        }
+
+        POPPED.store(0, Ordering::Relaxed);
+        let mut gc = MiniMarkGC::new();
+        register_jitframe_type(&mut gc);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_oldgen_typed(tid, 16);
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let tag = majit_gc::FinalizerQueueTag {
+            fq: std::ptr::addr_of!(FQ) as usize,
+            trigger,
+        };
+        let fq_index = majit_gc::gc_get_finalizer_queue_index(tag);
+        majit_gc::gc_register_finalizer(fq_index, obj);
+        majit_gc::collect_oldgen_nonmoving();
+        assert_eq!(POPPED.load(Ordering::Relaxed), 1);
+        assert!(majit_gc::gc_fq_next_dead(fq_index).is_none());
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use parking_lot::Mutex;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::collections::HashMap;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 
 use super::rstr::{STR_CHARS_OFFSET, StrHeader, str_as_bytes};
 use crate::rffi::{free_charp, str2charp};
@@ -42,6 +42,21 @@ pub fn raw_malloc_varsize_char(size: usize) -> usize {
         (base as *mut usize).write(total);
         base as usize + RAW_BLOCK_ALIGN
     }
+}
+
+/// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw', zero=True)` —
+/// `support.py` `_ll_1_raw_malloc_varsize_zero` when `TYPE.OF` is Char.
+/// `jtransform.py _rewrite_raw_malloc` keeps the `_zero` name and still
+/// attaches `OS_RAW_MALLOC_VARSIZE_CHAR`. `size` is a byte count; for
+/// `Array(Char)` that is the item count `n`.
+#[majit_macros::oopspec("raw_malloc_varsize_zero(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_malloc_varsize_zero(size: usize) -> usize {
+    let ptr = raw_malloc_varsize_char(size);
+    if size > 0 {
+        unsafe { (ptr as *mut u8).write_bytes(0, size) };
+    }
+    ptr
 }
 
 /// `lltype.free(ptr, flavor='raw')` — `support.py ll_raw_free`. Frees a block
@@ -103,9 +118,9 @@ struct _StrFinalizerQueue {
 }
 
 impl _StrFinalizerQueue {
-    /// framework.py `get_finalizer_queue_index`, cached like the
-    /// translation-time constant. `tag.fq` is the address of
-    /// `_fq_addr_from_string`.
+    /// framework.py `get_finalizer_queue_index`. `tag.fq` is the address of
+    /// `_fq_addr_from_string`. The index lives on the process-wide table, not
+    /// on a collector instance.
     fn fq_tag() -> majit_gc::FinalizerQueueTag {
         majit_gc::FinalizerQueueTag {
             fq: std::ptr::addr_of!(_fq_addr_from_string) as usize,
@@ -114,8 +129,7 @@ impl _StrFinalizerQueue {
     }
 
     fn fq_index() -> usize {
-        static INDEX: OnceLock<usize> = OnceLock::new();
-        *INDEX.get_or_init(|| majit_gc::gc_get_finalizer_queue_index(Self::fq_tag()))
+        majit_gc::gc_get_finalizer_queue_index(Self::fq_tag())
     }
 
     fn next_dead() -> Option<majit_ir::GcRef> {
@@ -267,6 +281,12 @@ mod tests {
         let empty = raw_malloc_varsize_char(0);
         assert_ne!(empty, 0);
         raw_free(empty);
+        let zeroed = raw_malloc_varsize_zero(16);
+        unsafe {
+            let bytes = std::slice::from_raw_parts(zeroed as *const u8, 16);
+            assert!(bytes.iter().all(|b| *b == 0));
+        }
+        raw_free(zeroed);
     }
 
     fn alloc_fake_str(text: &[u8], extra_fill: u8) -> Vec<usize> {

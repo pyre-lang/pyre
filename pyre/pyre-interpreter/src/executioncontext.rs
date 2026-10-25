@@ -476,13 +476,11 @@ impl WRootFinalizerQueue {
         }
     }
 
-    /// framework.py `get_finalizer_queue_index`, cached like the
-    /// translation-time constant. `tag.fq` is the address of this queue's
-    /// static instance.
+    /// framework.py `get_finalizer_queue_index`. `tag.fq` is the address of
+    /// this queue's static instance. The index lives on the process-wide
+    /// table, not on a collector instance.
     fn fq_index() -> usize {
-        static INDEX: OnceLock<usize> = OnceLock::new();
-        *INDEX
-            .get_or_init(|| pyre_object::gc_hook::try_gc_get_finalizer_queue_index(Self::fq_tag()))
+        pyre_object::gc_hook::try_gc_get_finalizer_queue_index(Self::fq_tag())
     }
 
     /// `pypy/interpreter/executioncontext.py:640` —

@@ -606,41 +606,31 @@ pub fn try_gc_isenabled() -> bool {
     }
 }
 
-/// RPython `gc_fq_register` / `gc_fq_next_dead` hooks.  The trigger is the
-/// translated FinalizerQueue handler and only schedules interpreter work.
+/// RPython `gc_fq_register` hook.  The trigger is the translated
+/// FinalizerQueue handler and only schedules interpreter work.
 pub type GcFinalizerTriggerFn = majit_gc::FinalizerTriggerFn;
 pub type GcFinalizerQueueTag = majit_gc::FinalizerQueueTag;
 pub type GcRegisterFinalizerHookFn = fn(usize, PyObjectRef);
-pub type GcFinalizerNextDeadHookFn = fn(usize) -> PyObjectRef;
-/// framework.py `get_finalizer_queue_index`.
-pub type GcGetFinalizerQueueIndexHookFn = fn(GcFinalizerQueueTag) -> usize;
 /// `gc_ignore_finalizer` — the third of the finalizer operations
 /// `gctransform/framework.py` binds, and the only one that carries no queue
 /// index: the hint is a property of the object, not of the queue holding it.
 pub type GcIgnoreFinalizerHookFn = fn(PyObjectRef);
 
 majit_gc::global_hook!(static GC_REGISTER_FINALIZER_HOOK: GcRegisterFinalizerHookFn);
-majit_gc::global_hook!(static GC_FINALIZER_NEXT_DEAD_HOOK: GcFinalizerNextDeadHookFn);
-majit_gc::global_hook!(static GC_GET_FINALIZER_QUEUE_INDEX_HOOK: GcGetFinalizerQueueIndexHookFn);
 majit_gc::global_hook!(static GC_IGNORE_FINALIZER_HOOK: GcIgnoreFinalizerHookFn);
 
 pub fn register_gc_finalizer_hooks(
     register: GcRegisterFinalizerHookFn,
-    next_dead: GcFinalizerNextDeadHookFn,
     ignore: GcIgnoreFinalizerHookFn,
-    get_index: GcGetFinalizerQueueIndexHookFn,
 ) {
     GC_REGISTER_FINALIZER_HOOK.set(Some(register));
-    GC_FINALIZER_NEXT_DEAD_HOOK.set(Some(next_dead));
     GC_IGNORE_FINALIZER_HOOK.set(Some(ignore));
-    GC_GET_FINALIZER_QUEUE_INDEX_HOOK.set(Some(get_index));
 }
 
+/// framework.py `get_finalizer_queue_index`. Process-wide table; never
+/// borrows the collector.
 pub fn try_gc_get_finalizer_queue_index(tag: GcFinalizerQueueTag) -> usize {
-    GC_GET_FINALIZER_QUEUE_INDEX_HOOK
-        .get()
-        .map(|get_index| get_index(tag))
-        .unwrap_or(0)
+    majit_gc::gc_get_finalizer_queue_index(tag)
 }
 
 pub fn try_gc_register_finalizer(fq_index: usize, obj: PyObjectRef) {
@@ -659,10 +649,11 @@ pub fn try_gc_ignore_finalizer(obj: PyObjectRef) {
     }
 }
 
+/// framework.py `gct_gc_fq_next_dead` / `ll_next_dead`. Pops the queue's
+/// `AddressDeque` without entering the collector.
 pub fn try_gc_finalizer_next_dead(fq_index: usize) -> PyObjectRef {
-    GC_FINALIZER_NEXT_DEAD_HOOK
-        .get()
-        .map(|next_dead| next_dead(fq_index))
+    majit_gc::gc_fq_next_dead(fq_index)
+        .map(|obj| obj.0 as PyObjectRef)
         .unwrap_or(crate::PY_NULL)
 }
 

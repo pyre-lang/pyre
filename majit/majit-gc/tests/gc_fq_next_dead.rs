@@ -9,11 +9,15 @@ use majit_gc::{
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static FQ: u8 = 0;
-static FQ_INDEX: AtomicUsize = AtomicUsize::new(0);
 static POPPED: AtomicUsize = AtomicUsize::new(0);
 
 fn trigger() {
-    if gc_fq_next_dead(FQ_INDEX.load(Ordering::Relaxed)).is_some() {
+    let tag = FinalizerQueueTag {
+        fq: std::ptr::addr_of!(FQ) as usize,
+        trigger,
+    };
+    let index = majit_gc::gc_get_finalizer_queue_index(tag);
+    if gc_fq_next_dead(index).is_some() {
         POPPED.store(1, Ordering::Relaxed);
     }
 }
@@ -40,14 +44,12 @@ fn gc_fq_next_dead_pops_from_inside_execute_finalizer_triggers() {
             fq: std::ptr::addr_of!(FQ) as usize,
             trigger,
         };
-        let fq_index = gc_sync::gc_op(|gc| {
+        let fq_index = majit_gc::gc_get_finalizer_queue_index(tag);
+        gc_sync::gc_op(|gc| {
             let tid = gc.register_type(TypeInfo::simple(16));
             let obj = GcAllocator::alloc_oldgen_typed(gc, tid, 16);
-            let fq_index = GcAllocator::get_finalizer_queue_index(gc, tag);
             GcAllocator::register_finalizer(gc, fq_index, obj);
-            fq_index
         });
-        FQ_INDEX.store(fq_index, Ordering::Relaxed);
         gc_sync::gc_op(|gc| gc.do_collect_oldgen_nonmoving());
         assert_eq!(POPPED.load(Ordering::Relaxed), 1);
         assert!(gc_fq_next_dead(fq_index).is_none());

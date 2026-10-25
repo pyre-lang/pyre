@@ -442,11 +442,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         gc_writebarrier_before_copy_via_active_runtime,
     ));
     majit_gc::set_active_write_barrier_managed(Some(gc_write_barrier_managed_via_active_runtime));
-    majit_gc::set_active_finalizer_hooks(
-        Some(register_finalizer_via_active_runtime),
-        Some(finalizer_next_dead_via_active_runtime),
-        Some(get_finalizer_queue_index_via_active_runtime),
-    );
+    majit_gc::set_active_finalizer_hooks(Some(register_finalizer_via_active_runtime));
 }
 
 /// Production path: register the `set_active_*` hooks WITHOUT storing a
@@ -1919,22 +1915,6 @@ fn collect_oldgen_nonmoving_via_active_runtime() {
 
 fn register_finalizer_via_active_runtime(fq_index: usize, obj: GcRef) {
     with_cranelift_gc(|gc| gc.register_finalizer(fq_index, obj));
-}
-
-fn get_finalizer_queue_index_via_active_runtime(tag: majit_gc::FinalizerQueueTag) -> usize {
-    with_cranelift_gc(|gc| gc.get_finalizer_queue_index(tag)).unwrap_or(0)
-}
-
-fn finalizer_next_dead_via_active_runtime(fq_index: usize) -> Option<GcRef> {
-    if let Some(deque) = gc_box::with_reentrant_ref(|gc| gc.finalizer_deque(fq_index)) {
-        return deque.and_then(|d| d.popleft()).map(GcRef);
-    }
-    if majit_gc::gc_sync::is_initialized() {
-        return majit_gc::gc_sync::gc_query_reentrant(|gc| gc.finalizer_deque(fq_index))
-            .and_then(|d| d.popleft())
-            .map(GcRef);
-    }
-    None
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
@@ -23949,6 +23929,45 @@ mod tests {
         assert_eq!(resolved, Some(int_tid));
         let unknown = backend.get_typeid_from_classptr_if_gcremovetypeptr(0xCAFE_F00D);
         assert_eq!(unknown, None);
+    }
+
+    /// `_StrFinalizerQueue.finalizer_trigger` drains via `ll_next_dead` from
+    /// inside `execute_finalizers`. Index lookup and `next_dead` operate on
+    /// the process-wide table (`framework.py get_finalizer_queue_index`) and
+    /// do not re-enter the boxed collector.
+    #[test]
+    fn boxed_collector_next_dead_from_trigger_does_not_panic() {
+        static FQ: u8 = 0;
+        static POPPED: AtomicUsize = AtomicUsize::new(0);
+
+        fn trigger() {
+            let tag = majit_gc::FinalizerQueueTag {
+                fq: std::ptr::addr_of!(FQ) as usize,
+                trigger,
+            };
+            let index = majit_gc::gc_get_finalizer_queue_index(tag);
+            if majit_gc::gc_fq_next_dead(index).is_some() {
+                POPPED.store(1, Ordering::Relaxed);
+            }
+        }
+
+        POPPED.store(0, Ordering::Relaxed);
+        let mut gc = MiniMarkGC::new();
+        publish_jitframe_type(&mut gc);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, tid, 16);
+        let mut backend = CraneliftBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let tag = majit_gc::FinalizerQueueTag {
+            fq: std::ptr::addr_of!(FQ) as usize,
+            trigger,
+        };
+        let fq_index = majit_gc::gc_get_finalizer_queue_index(tag);
+        majit_gc::gc_register_finalizer(fq_index, obj);
+        majit_gc::collect_oldgen_nonmoving();
+        assert_eq!(POPPED.load(Ordering::Relaxed), 1);
+        assert!(majit_gc::gc_fq_next_dead(fq_index).is_none());
     }
 
     fn mk_op_with_descr(

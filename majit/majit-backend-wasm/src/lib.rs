@@ -1399,11 +1399,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_minor_collections_since_major(Some(
         active_gc_minor_collections_since_major,
     ));
-    majit_gc::set_active_finalizer_hooks(
-        Some(wasm_register_finalizer),
-        Some(wasm_finalizer_next_dead),
-        Some(wasm_get_finalizer_queue_index),
-    );
+    majit_gc::set_active_finalizer_hooks(Some(wasm_register_finalizer));
 }
 
 /// Live per-thread wasm GC boxes. Root hooks are process-global, so they
@@ -1795,17 +1791,6 @@ fn wasm_id_or_identityhash(addr: usize) -> usize {
 
 fn wasm_register_finalizer(fq_index: usize, obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj));
-}
-
-fn wasm_get_finalizer_queue_index(tag: majit_gc::FinalizerQueueTag) -> usize {
-    with_wasm_active_gc_mut(|gc| gc.get_finalizer_queue_index(tag)).unwrap_or(0)
-}
-
-fn wasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
-    with_wasm_active_gc(|gc| gc.finalizer_deque(fq_index))
-        .flatten()
-        .and_then(|deque| deque.popleft())
-        .map(GcRef)
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`.
@@ -8563,6 +8548,47 @@ mod tests {
         assert_eq!(resolved, Some(int_tid));
         let unknown = backend.get_typeid_from_classptr_if_gcremovetypeptr(0xCAFE_F00D);
         assert_eq!(unknown, None);
+    }
+
+    /// `_StrFinalizerQueue.finalizer_trigger` drains via `ll_next_dead` from
+    /// inside `execute_finalizers`. Index lookup and `next_dead` operate on
+    /// the process-wide table (`framework.py get_finalizer_queue_index`) and
+    /// do not re-enter the boxed collector.
+    #[test]
+    fn boxed_collector_next_dead_from_trigger_does_not_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _compile_guard = failguard::lock_cpu();
+        static FQ: u8 = 0;
+        static POPPED: AtomicUsize = AtomicUsize::new(0);
+
+        fn trigger() {
+            let tag = majit_gc::FinalizerQueueTag {
+                fq: std::ptr::addr_of!(FQ) as usize,
+                trigger,
+            };
+            let index = majit_gc::gc_get_finalizer_queue_index(tag);
+            if majit_gc::gc_fq_next_dead(index).is_some() {
+                POPPED.store(1, Ordering::Relaxed);
+            }
+        }
+
+        POPPED.store(0, Ordering::Relaxed);
+        let mut gc = MiniMarkGC::new();
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, tid, 16);
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let tag = majit_gc::FinalizerQueueTag {
+            fq: std::ptr::addr_of!(FQ) as usize,
+            trigger,
+        };
+        let fq_index = majit_gc::gc_get_finalizer_queue_index(tag);
+        majit_gc::gc_register_finalizer(fq_index, obj);
+        majit_gc::collect_oldgen_nonmoving();
+        assert_eq!(POPPED.load(Ordering::Relaxed), 1);
+        assert!(majit_gc::gc_fq_next_dead(fq_index).is_none());
     }
 
     /// `gcreftracer.py` `llop.gc_writebarrier(tr)`: `compile_loop` must
