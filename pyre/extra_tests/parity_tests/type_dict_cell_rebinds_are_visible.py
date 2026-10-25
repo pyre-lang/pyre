@@ -426,4 +426,30 @@ user_index()
 user_getattr()
 user_getattribute()
 user_with()
+
+
+def cpython_mutable_interpreter_type_sees_class_store():
+    # Interpreter types declared `cpython_mutable` (`_random.Random`,
+    # `_json.Scanner`, …) have `flag_heaptype == false` but accept setattr.
+    # A `version_tag()` that asked PyPy's `is_heaptype()` would bake
+    # `_pure_version_tag` for them and miss the store below.
+    import _random
+
+    cls = _random.Random
+    try:
+        cls._probe_attr = 1
+    except TypeError:
+        return
+    total = 0
+    i = 0
+    while i < N:
+        total += cls._probe_attr
+        if i == SWITCH:
+            cls._probe_attr = 7
+        i += 1
+    expect(total, 1, 7, 'mutable interpreter type missed class store')
+    del cls._probe_attr
+
+
+cpython_mutable_interpreter_type_sees_class_store()
 print('OK')

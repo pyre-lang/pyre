@@ -193,6 +193,7 @@ impl Layout {
 ///
 /// PyPy: pypy/objspace/std/typeobject.py W_TypeObject
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("flag_cpython_immutabletype?")]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
     /// `W_TypeObject._cpy_ref` (`cpyext/pyobject.py:add_direct_pyobj_storage`).
@@ -408,6 +409,19 @@ pub struct W_TypeObject {
     /// Same ownership as [`quasi_immut_watchers`]: an `AtomicPtr` plus a lock,
     /// no GC pointers, reclaimed by `type_object_destructor`.
     pub w_name_watchers: crate::quasiimmut::QuasiImmutField,
+    /// Hidden `mutate_flag_cpython_immutabletype` field `rclass.py
+    /// InstanceRepr._setup_repr` synthesizes as `mutate_<name>` for
+    /// `"flag_cpython_immutabletype?"`.
+    ///
+    /// pyre's 3.14 twin of PyPy's immutable `flag_heaptype` that
+    /// `version_tag()` reads. Interpreter types declared `cpython_mutable`
+    /// have `flag_heaptype == false` but accept setattr, so the 3.14 axis
+    /// is the one the jitted `version_tag()` gate must watch. Changes at
+    /// most once after construction (`PyType_Freeze`).
+    ///
+    /// Same ownership as [`quasi_immut_watchers`]: an `AtomicPtr` plus a lock,
+    /// no GC pointers, reclaimed by `type_object_destructor`.
+    pub mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField,
     /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type join
     /// the collector's traversal. A build that keeps the global interpreter
     /// lock gives them a two-word `PyGC_Head` for it, which is what
@@ -635,6 +649,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
         w_name_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     };
@@ -787,6 +802,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
         w_name_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     }) as PyObjectRef
@@ -1883,11 +1899,19 @@ pub unsafe fn w_type_set_cpython_type_flags(
     static_builtin: bool,
     immutabletype: bool,
 ) {
-    let t = &mut *(obj as *mut W_TypeObject);
-    t.flag_cpython_heaptype = heaptype;
-    t.flag_cpython_static_builtin = static_builtin;
-    t.flag_cpython_immutabletype
-        .store(immutabletype, std::sync::atomic::Ordering::Release);
+    let t = obj as *mut W_TypeObject;
+    (*t).flag_cpython_heaptype = heaptype;
+    (*t).flag_cpython_static_builtin = static_builtin;
+    // `rclass.py hook_setfield` emits `jit_force_quasi_immutable` ahead of
+    // every store to `flag_cpython_immutabletype?`. Construction and
+    // `PyType_Freeze` share this writer; the sweep and the store share the
+    // watcher lock so a recorder cannot publish a watcher for the old
+    // value in between.
+    (*t).mutate_flag_cpython_immutabletype
+        .invalidate_then_store(|| {
+            (*t).flag_cpython_immutabletype
+                .store(immutabletype, std::sync::atomic::Ordering::Release);
+        });
 }
 
 /// CPython 3.14 public HEAPTYPE ownership, distinct from PyPy's
@@ -1908,13 +1932,20 @@ pub unsafe fn w_type_is_cpython_static_builtin(obj: PyObjectRef) -> bool {
 }
 
 /// Set only CPython's public IMMUTABLETYPE axis (used by `PyType_Freeze`).
+///
+/// Revokes the loops that baked the old flag as a constant before
+/// publishing the new one. This is the Freeze writer of the field;
+/// construction goes through [`w_type_set_cpython_type_flags`].
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_cpython_immutabletype(obj: PyObjectRef, value: bool) {
-    (*(obj as *const W_TypeObject))
-        .flag_cpython_immutabletype
-        .store(value, std::sync::atomic::Ordering::Release);
+    let t = obj as *const W_TypeObject;
+    (*t).mutate_flag_cpython_immutabletype
+        .invalidate_then_store(|| {
+            (*t).flag_cpython_immutabletype
+                .store(value, std::sync::atomic::Ordering::Release);
+        });
 }
 
 /// Read CPython's public IMMUTABLETYPE axis.
@@ -1925,6 +1956,19 @@ pub unsafe fn w_type_is_cpython_immutabletype(obj: PyObjectRef) -> bool {
     (*(obj as *const W_TypeObject))
         .flag_cpython_immutabletype
         .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `version_tag()` `self.flag_cpython_immutabletype` on a jitted type.
+/// Relaxed so the codewriter folds the load to a getfield; the
+/// interpreter Acquire reader is [`w_type_is_cpython_immutabletype`].
+///
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_read_cpython_immutabletype_field(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject))
+        .flag_cpython_immutabletype
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Suppress CPython's per-type BASETYPE capability while preserving PyPy's
@@ -2850,6 +2894,39 @@ mod tests {
 
         let w_name2 = crate::w_str_new("E");
         unsafe { w_type_set_name(obj, w_name2) };
+    }
+
+    /// typeobject.py-style `flag_cpython_immutabletype?`: `PyType_Freeze`
+    /// stores without `mutated()`, so the loops that baked the flag revoke
+    /// through this field.
+    #[test]
+    fn cpython_immutabletype_write_unlinks_the_instance_and_revokes_its_loops() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let obj = w_type_new("QuasiImm", PY_NULL, std::ptr::null_mut());
+        let w_type = unsafe { &*(obj as *const W_TypeObject) };
+        assert!(
+            !w_type.mutate_flag_cpython_immutabletype.is_installed(),
+            "no instance until the first registration",
+        );
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = crate::quasiimmut::test_loop_token(&flag);
+        w_type
+            .mutate_flag_cpython_immutabletype
+            .get_current_qmut_instance()
+            .register_loop_token(&token);
+        assert!(w_type.mutate_flag_cpython_immutabletype.is_installed());
+
+        unsafe { w_type_set_cpython_immutabletype(obj, true) };
+        assert!(flag.load(Ordering::Acquire), "the loop must be revoked");
+        assert!(
+            !w_type.mutate_flag_cpython_immutabletype.is_installed(),
+            "the field is nulled before the sweep",
+        );
+
+        unsafe { w_type_set_cpython_immutabletype(obj, true) };
     }
 
     /// A non-type pointer must not be walked as one.

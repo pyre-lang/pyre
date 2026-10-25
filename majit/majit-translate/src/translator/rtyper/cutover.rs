@@ -1367,14 +1367,24 @@ fn collect_divergences_on(
         if !reachable_vars.contains(var) {
             continue;
         }
+        let real_present = real_state.get(var).copied();
+        let real_kind = real_present.unwrap_or(ConcreteType::Unknown);
         if let Some(excluded) = excluded_legacy
             && excluded.contains(var)
         {
-            continue;
+            // An unfollowed `Result::Ok` extract stays out of the compared
+            // set (`annotator_followed_legacy_vars`).  That must not hide a
+            // `real=Void` stamp on a value `flatten.py` `getcolor` still
+            // colors: the assembler default arm then skips the Void operand
+            // and emits a one-operand `int_eq/i>i`.  A positively-typed
+            // Void on a colored operand is the same rejected case as
+            // `real_refines_gcref_to_void` already refuses; untyped
+            // (`real=Unknown`) unfollowed extracts stay excluded.
+            if !(colored_operands.contains(var) && real_kind == ConcreteType::Void) {
+                continue;
+            }
         }
         let legacy_kind = LegacyGraph::concretetype_of(var);
-        let real_present = real_state.get(var).copied();
-        let real_kind = real_present.unwrap_or(ConcreteType::Unknown);
         // A kind the legacy walker resolved must match the real path;
         // conversely the real path must not resolve a kind for a value
         // the legacy walker left Unknown.
@@ -10215,6 +10225,77 @@ mod tests {
             diff_single_var(ConcreteType::Signed, ConcreteType::Void).len(),
             1,
             "legacy=Signed, real=Void is a data-kind divergence, not the accepted GcRef unit drop"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_rejects_excluded_void_on_colored_eq_operand() {
+        // `set_minimum_version`'s `value == -1` is a live `eq` whose lhs is
+        // the success-path phi of a `Result<i32, PyError>` call.  The
+        // annotator can leave that successor unfollowed, so the key sits
+        // in `excluded_legacy`, while the real path still positively types
+        // the twin `Void`.  Excluding it lets Match publish Void onto a
+        // colored integer and the assembler drops the operand (`int_eq/i>i`).
+        // An untyped (`real=Unknown`) unfollowed extract stays excluded —
+        // `collect_divergences_skips_unfollowed_ok_payload`.
+        let mut graph = LegacyGraph::new("excluded_void_eq_operand");
+        let vars = mint_vars(&mut graph, 3);
+        let v_value = vars[0].clone();
+        let v_neg1 = vars[1].clone();
+        let v_cmp = vars[2].clone();
+        let false_id = BlockId(8);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[0, 1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(v_cmp.clone()),
+                kind: crate::model::OpKind::BinOp {
+                    op: "eq".to_string(),
+                    lhs: v_value.clone(),
+                    rhs: v_neg1.clone(),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: Some(crate::model::ExitSwitch::Value(v_cmp.clone())),
+            exits: vec![
+                link_to_returnblock(vec![], graph.returnblock),
+                crate::model::Link::new_mixed(vec![], false_id, None),
+            ],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let falseblock = Block {
+            id: false_id,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, falseblock];
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v_value, ConcreteType::Signed);
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v_neg1, ConcreteType::Signed);
+        crate::model::FunctionGraph::set_concretetype_of_inline(&v_cmp, ConcreteType::Signed);
+        let mut real_state = HashMap::new();
+        real_state.insert(v_value.clone(), ConcreteType::Void);
+        real_state.insert(v_neg1, ConcreteType::Signed);
+        real_state.insert(v_cmp, ConcreteType::Signed);
+        let mut excluded = HashSet::new();
+        excluded.insert(v_value);
+        assert_eq!(
+            collect_divergences_on(&real_state, &graph, Some(&excluded)).len(),
+            1,
+            "a real=Void stamp on an excluded colored eq operand is a divergence"
         );
     }
 

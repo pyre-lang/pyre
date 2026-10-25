@@ -1,4 +1,5 @@
-//! `for _ in a..b` (exclusive int `Range`) → `range(a, b)` + list-iter.
+//! `for _ in a..b` (exclusive int `Range`) and `for _ in a..=b`
+//! (`RangeInclusive::new`) → `range(a, b)` / `range(a, b + 1)` + list-iter.
 //!
 //! ## Positioning
 //!
@@ -15,10 +16,19 @@
 //! `originates_from_iter_op` gate declines and the residual `next()` blocks
 //! as `getattr(range, "next")`.
 //!
+//! The inclusive form `for _ in a..=b` is not an aggregate: MIR emits a call
+//! `RangeInclusive::<T>::new(a, b)` (a `CallTarget::FunctionPath` whose
+//! segments end in `["RangeInclusive", "new"]`), then the same reflexive
+//! `into_iter` alias, then `<RangeInclusive<T> as Iterator>::next`.  RPython
+//! has no inclusive range, so the orthodox spelling is `range(a, b + 1)`
+//! (`builtin.builtin_range`).  A 64-bit inclusive upper bound is diverted
+//! only when it is a known constant strictly less than `i64::MAX`, so
+//! `b + 1` cannot overflow the Signed lowering.
+//!
 //! RPython models `range(a, b)` as a `SomeList` carrying `range_step`
 //! (`builtin.builtin_range`), whose `RangeRepr` `make_iterator_repr` yields
 //! the integer-induction `RangeIteratorRepr` — the orthodox path.  This pass
-//! reroutes the exclusive-int-`Range` for-loop onto it:
+//! reroutes both int-range for-loops onto it:
 //!
 //! ```text
 //!     r = Range{start=a, end=b}          // ctor + FieldWrite(start/end)
@@ -27,6 +37,12 @@
 //!     t = range(a, b)                    // `SomeList` (range_step = 1)
 //!     r = iter(t)                        // `["core","slice","iter"]` → SomeIterator
 //!     ... next(r) folded by front::iter_next into the native `next` op
+//!
+//!     r = RangeInclusive::new(a, b)      // Call FunctionPath
+//!     ... for _ in r ... next(r)
+//! becomes
+//!     t = range(a, b + 1)
+//!     r = iter(t)
 //! ```
 //!
 //! `range` is emitted under the reserved `["__majit_range"]` spelling (see
@@ -35,44 +51,80 @@
 //! `SomeBuiltin("range")` → `builtin_range` (`SomeList` with `range_step`);
 //! `["core","slice","iter"]` is the same `iter`-op bridge the slice/Vec
 //! for-loop uses (`is_concrete_iter_constructor`), and on a range-`SomeList`
-//! receiver it still selects `RangeIteratorRepr`.  Rewriting the aggregate to
-//! that pair makes `originates_from_iter_op` see the `iter` op, so the
-//! ALREADY-CAPTURED `next` site folds through the existing diamond — no new
-//! iteration machinery, no `is_iter_op_segments` change.
+//! receiver it still selects `RangeIteratorRepr`.  Rewriting the aggregate
+//! or `RangeInclusive::new` call to that pair makes `originates_from_iter_op`
+//! see the `iter` op, so the ALREADY-CAPTURED `next` site folds through the
+//! existing diamond — no new iteration machinery, no `is_iter_op_segments`
+//! change.
 //!
 //! ## Consumer gate + fail-safe
 //!
 //! Only a range whose value feeds EXACTLY its own construction
-//! (`FieldWrite`) and this for-loop's `next` is diverted; a range read by any
-//! other op (`v[a..b]` slice-index via `Index::index`, a `.start` field read,
-//! a stored range) keeps the ordinary ADT ctor path — turning it into a
+//! (`FieldWrite` on the exclusive aggregate; the inclusive `new` call
+//! produces the value and does not read it) and this for-loop's `next` is
+//! diverted; a range read by any other op (`v[a..b]` slice-index via
+//! `Index::index`, a `.start` field read, a stored range) keeps the ordinary
+//! ADT ctor / `RangeInclusive::new` path — turning it into a
 //! `SomeList`/iterator would break that consumer.  Every structural mismatch
-//! declines (leaves the ctor + FieldWrite chain, census Skip), so a decline
-//! never regresses a graph the legacy walker already handled.
+//! declines (leaves the ctor + FieldWrite chain or the `new` call, census
+//! Skip), so a decline never regresses a graph the legacy walker already
+//! handled. The inclusive `exhausted` flag is unobservable when the for-loop
+//! is the range's only consumer, and an empty `a > b` range is empty in both
+//! forms.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::Variable;
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
-/// A recognized exclusive int-`Range { start, end }` aggregate captured
-/// during body lowering (`front::mir`'s `Rvalue::Aggregate` arm).  Carries
-/// the ctor result (the range value the reflexive `into_iter` aliases into
-/// the loop iterator). The bounds are read from the live post-simplify
-/// FieldWrite chain when the pass runs.
-#[derive(Clone)]
-pub(crate) struct RangeNewSite {
-    /// The `SyntheticTransparentCtor` result (the `Range` value) — locates
-    /// the ctor op and the `next` iterator's backward-traced origin.
-    pub result_var: Variable,
+/// `true` iff `segments` names `RangeInclusive::new`, including a
+/// `FunctionDesc.cachedgraph` copy whose leaf is `new__spec_…`
+/// (`clause_spec::spec_leaf`). The whole-program lowering specialises
+/// the generic associated function; a for-loop `next` stays the
+/// unspecialized `["ops","range","RangeInclusive","next"]` residual.
+pub(crate) fn is_range_inclusive_new_segments(segments: &[String]) -> bool {
+    segments.len() >= 2
+        && segments[segments.len() - 2] == "RangeInclusive"
+        && segments
+            .last()
+            .is_some_and(|leaf| leaf == "new" || leaf.starts_with("new__spec_"))
 }
 
-/// Rewrite every captured exclusive-int-`Range` aggregate that feeds a
-/// for-loop `next` into the `range(a, b)` builtin + list-iter pair, so the
+/// How a captured int-range site was constructed in MIR.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RangeSiteKind {
+    /// `a..b` aggregate: `SyntheticTransparentCtor` + `start`/`end` FieldWrites.
+    Exclusive,
+    /// `RangeInclusive::new(a, b)` call. `narrow` is true when the element
+    /// integer type is narrower than 64 bits, so `b + 1` cannot overflow the
+    /// Signed lowering.
+    Inclusive { narrow: bool },
+}
+
+/// A recognized int-range site captured during body lowering: either an
+/// exclusive `Range { start, end }` aggregate (`front::mir`'s
+/// `Rvalue::Aggregate` arm) or an inclusive `RangeInclusive::new(a, b)`
+/// call (Call-terminator lowering).  Carries the range value the reflexive
+/// `into_iter` aliases into the loop iterator. Exclusive bounds are read
+/// from the live post-simplify FieldWrite chain; inclusive bounds are the
+/// `new` call's two arguments, with `range(a, b + 1)` subject to the
+/// 64-bit overflow gate.
+#[derive(Clone)]
+pub(crate) struct RangeNewSite {
+    /// The range value — locates the ctor / `RangeInclusive::new` op and
+    /// the `next` iterator's backward-traced origin.
+    pub result_var: Variable,
+    pub kind: RangeSiteKind,
+}
+
+/// Rewrite every captured int-range site that feeds a for-loop `next` into
+/// the `range(a, b)` / `range(a, b + 1)` builtin + list-iter pair, so the
 /// `front::iter_next` diamond (which runs immediately after) folds the loop.
 /// Fail-safe: a site that does not match the expected for-loop shape is left
-/// as the ordinary ctor + FieldWrite chain (census Skip).  Returns the number
-/// of range aggregates rewritten.
+/// as the ordinary ctor + FieldWrite chain or `RangeInclusive::new` call
+/// (census Skip). A 64-bit inclusive upper bound is diverted only when it
+/// is a known constant strictly less than `i64::MAX`. Returns the number
+/// of range sites rewritten.
 pub(crate) fn rewire_range_iter_sites(
     graph: &mut FunctionGraph,
     range_sites: &[RangeNewSite],
@@ -168,9 +220,9 @@ fn rewire_one_range_iter_site(
         }
     };
 
-    // 2. Backward-trace the iterator operand to a captured int-`Range`
-    //    aggregate (the reflexive `into_iter` aliases the range value into
-    //    the loop iterator, so the trace reaches the ctor result var).
+    // 2. Backward-trace the iterator operand to a captured int-range
+    //    site (the reflexive `into_iter` aliases the range value into
+    //    the loop iterator, so the trace reaches the ctor / `new` result var).
     let site = range_sites
         .iter()
         .find(|s| range_iter_origin_matches(flow, &iter_arg, &s.result_var))
@@ -180,6 +232,7 @@ fn rewire_one_range_iter_site(
             )
         })?;
     let res = site.result_var.clone();
+    let kind = site.kind;
 
     // 3. Consumer gate: the range value must feed ONLY its own construction
     //    (`FieldWrite`) and this for-loop's `next`.  A `v[a..b]` slice-index,
@@ -192,6 +245,24 @@ fn rewire_one_range_iter_site(
         ));
     }
 
+    let iter_phi = (*iter_arg).clone();
+    match kind {
+        RangeSiteKind::Exclusive => rewire_exclusive_range_iter(graph, &name, &res)?,
+        RangeSiteKind::Inclusive { narrow } => {
+            rewire_inclusive_range_iter(graph, &name, &res, narrow)?
+        }
+    }
+    fix_iterator_phi_links(graph, flow, &res, &iter_phi);
+    Ok(())
+}
+
+/// Exclusive `a..b`: live FieldWrite bounds, sweep the FieldWrites, replace
+/// the `SyntheticTransparentCtor` with `range(a, b)` + `iter`.
+fn rewire_exclusive_range_iter(
+    graph: &mut FunctionGraph,
+    name: &str,
+    res: &Variable,
+) -> Result<(), String> {
     // 4. Re-read the bounds from the live FieldWrite chain.  The capture is
     //    made while lowering the MIR aggregate, but `simplify_lowered_graph`
     //    runs before this pass and can replace a bound Variable while
@@ -200,7 +271,7 @@ fn rewire_one_range_iter_site(
     //    graph the annotator will consume.  Keeping the captured Variables
     //    here made a valid loop decline when (for example) `save_point` was
     //    forwarded through an emptied block in `w_method_new`.
-    let (start, end) = live_range_bounds(graph, &res).ok_or_else(|| {
+    let (start, end) = live_range_bounds(graph, res).ok_or_else(|| {
         format!("{name}: range construction has no unique live start/end FieldWrite pair")
     })?;
     if !graph_defines(graph, &start) || !graph_defines(graph, &end) {
@@ -212,7 +283,7 @@ fn rewire_one_range_iter_site(
     //    `setattr("start")` would wall on it.
     for b in &mut graph.blocks {
         b.operations
-            .retain(|op| !matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == &res));
+            .retain(|op| !matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == res));
     }
 
     // 6. Replace the `SyntheticTransparentCtor` (still the producer of `res`
@@ -227,7 +298,7 @@ fn rewire_one_range_iter_site(
             b.operations
                 .iter()
                 .position(|op| {
-                    op.result.as_ref() == Some(&res)
+                    op.result.as_ref() == Some(res)
                         && matches!(
                             &op.kind,
                             OpKind::Call {
@@ -240,23 +311,188 @@ fn rewire_one_range_iter_site(
         })
         .ok_or_else(|| format!("{name}: range aggregate ctor op vanished"))?;
     let tmp = graph.alloc_value_var();
-    let iter_var = res.clone();
-    let iter_phi = (*iter_arg).clone();
     graph.blocks[cb].operations[ctor_idx] = range_builtin_call(tmp.clone(), start, end);
     graph.blocks[cb]
         .operations
-        .insert(ctor_idx + 1, slice_iter_call(res, tmp));
-    // The iterator-phi slot must receive the iterator on every predecessor,
-    // including an entry edge that still names the end bound (`w_tuple_len`
-    // in `exception_match`).  `FlowContext.mergeblock` /
-    // `FrameState.getoutputargs` thread each block's live locals as that
-    // block's inputargs, so a `Link.args` slot is a Variable defined in
-    // the source (`flowspace/model.py checkgraph`).  Planting the
-    // preheader `iter()` result on every predecessor breaks loop
-    // back-edges: the latch does not define that result.  Keep a
-    // source-defined alias; otherwise thread the header phi through the
-    // source (`FunctionGraph::ensure_variable_at_block`, the `setstate`
-    // backfill).
+        .insert(ctor_idx + 1, slice_iter_call(res.clone(), tmp));
+    Ok(())
+}
+
+/// Inclusive `a..=b`: replace `RangeInclusive::new(lo, hi)` with
+/// `range(lo, hi + 1)` + `iter`. No FieldWrites to sweep.
+fn rewire_inclusive_range_iter(
+    graph: &mut FunctionGraph,
+    name: &str,
+    res: &Variable,
+    narrow: bool,
+) -> Result<(), String> {
+    let (cb, call_idx) = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .find_map(|(bi, b)| {
+            b.operations
+                .iter()
+                .position(|op| op.result.as_ref() == Some(res))
+                .map(|oi| (bi, oi))
+        })
+        .ok_or_else(|| format!("{name}: RangeInclusive::new producer vanished"))?;
+    let (lo_arg, hi_arg) = match &graph.blocks[cb].operations[call_idx].kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if is_range_inclusive_new_segments(segments) && args.len() == 2 => {
+            (args[0].clone(), args[1].clone())
+        }
+        _ => {
+            return Err(format!(
+                "{name}: RangeInclusive::new producer is not a 2-arg FunctionPath ending in RangeInclusive::new"
+            ));
+        }
+    };
+
+    // Overflow gate before any mutation: a wide (64-bit) upper bound is
+    // diverted only when `hi` is a known constant `c < i64::MAX`.
+    if !narrow && !inclusive_hi_fits_signed(graph, &hi_arg) {
+        return Err(format!(
+            "{name}: 64-bit inclusive upper bound may overflow b+1"
+        ));
+    }
+    inclusive_bound_ready(graph, &lo_arg, name)?;
+    inclusive_bound_ready(graph, &hi_arg, name)?;
+
+    let mut insert_at = call_idx;
+    let lo = materialize_inclusive_bound(graph, cb, &mut insert_at, &lo_arg, name)?;
+    let hi = materialize_inclusive_bound(graph, cb, &mut insert_at, &hi_arg, name)?;
+    let one = graph.alloc_value_var();
+    graph.blocks[cb].operations.insert(
+        insert_at,
+        SpaceOperation {
+            result: Some(one.clone()),
+            kind: OpKind::ConstInt(1),
+        },
+    );
+    insert_at += 1;
+    let hi1 = graph.alloc_value_var();
+    graph.blocks[cb].operations.insert(
+        insert_at,
+        SpaceOperation {
+            result: Some(hi1.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: hi,
+                rhs: one,
+                result_ty: ValueType::Int,
+            },
+        },
+    );
+    insert_at += 1;
+    let tmp = graph.alloc_value_var();
+    graph.blocks[cb].operations[insert_at] = range_builtin_call(tmp.clone(), lo, hi1);
+    graph.blocks[cb]
+        .operations
+        .insert(insert_at + 1, slice_iter_call(res.clone(), tmp));
+    Ok(())
+}
+
+fn inclusive_bound_ready(graph: &FunctionGraph, arg: &LinkArg, name: &str) -> Result<(), String> {
+    match arg {
+        LinkArg::Value(v) => {
+            if graph_defines(graph, v) {
+                Ok(())
+            } else {
+                Err(format!("{name}: range bounds are not defined in the graph"))
+            }
+        }
+        LinkArg::Const(c) => {
+            c.value.as_int().map(|_| ()).ok_or_else(|| {
+                format!("{name}: RangeInclusive::new arg is not an integer constant")
+            })
+        }
+    }
+}
+
+/// Resolve a `RangeInclusive::new` operand to a graph Variable, inserting
+/// a `ConstInt` immediately before the call when the operand is an integer
+/// `LinkArg::Const`.
+fn materialize_inclusive_bound(
+    graph: &mut FunctionGraph,
+    block: usize,
+    insert_at: &mut usize,
+    arg: &LinkArg,
+    name: &str,
+) -> Result<Variable, String> {
+    match arg {
+        LinkArg::Value(v) => {
+            if !graph_defines(graph, v) {
+                return Err(format!("{name}: range bounds are not defined in the graph"));
+            }
+            Ok(v.clone())
+        }
+        LinkArg::Const(c) => {
+            let n = c.value.as_int().ok_or_else(|| {
+                format!("{name}: RangeInclusive::new arg is not an integer constant")
+            })?;
+            let var = graph.alloc_value_var();
+            graph.blocks[block].operations.insert(
+                *insert_at,
+                SpaceOperation {
+                    result: Some(var.clone()),
+                    kind: OpKind::ConstInt(n),
+                },
+            );
+            *insert_at += 1;
+            Ok(var)
+        }
+    }
+}
+
+/// `true` when `hi` is a known integer constant strictly less than
+/// `i64::MAX` — a `LinkArg::Const`, or a Variable whose unique producer
+/// is `OpKind::ConstInt`.
+fn inclusive_hi_fits_signed(graph: &FunctionGraph, hi: &LinkArg) -> bool {
+    let c = match hi {
+        LinkArg::Const(c) => c.value.as_int(),
+        LinkArg::Value(v) => unique_const_int_producer(graph, v),
+    };
+    matches!(c, Some(n) if n < i64::MAX)
+}
+
+fn unique_const_int_producer(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
+    let mut found = None;
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        if op.result.as_ref() != Some(var) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        match &op.kind {
+            OpKind::ConstInt(n) => found = Some(*n),
+            _ => return None,
+        }
+    }
+    found
+}
+
+/// The iterator-phi slot must receive the iterator on every predecessor,
+/// including an entry edge that still names the end bound (`w_tuple_len`
+/// in `exception_match`).  `FlowContext.mergeblock` /
+/// `FrameState.getoutputargs` thread each block's live locals as that
+/// block's inputargs, so a `Link.args` slot is a Variable defined in
+/// the source (`flowspace/model.py checkgraph`).  Planting the
+/// preheader `iter()` result on every predecessor breaks loop
+/// back-edges: the latch does not define that result.  Keep a
+/// source-defined alias; otherwise thread the header phi through the
+/// source (`FunctionGraph::ensure_variable_at_block`, the `setstate`
+/// backfill).
+fn fix_iterator_phi_links(
+    graph: &mut FunctionGraph,
+    flow: &ValueFlow,
+    iter_var: &Variable,
+    iter_phi: &Variable,
+) {
     let n = graph.blocks.len();
     let mut incoming: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for (bi, block) in graph.blocks.iter().enumerate() {
@@ -271,7 +507,7 @@ fn rewire_one_range_iter_site(
         let arity = graph.blocks[ti].inputargs.len();
         for pos in 0..arity {
             let slot_var = graph.blocks[ti].inputargs.get(pos);
-            if slot_var != Some(&iter_var) && slot_var != Some(&iter_phi) {
+            if slot_var != Some(iter_var) && slot_var != Some(iter_phi) {
                 continue;
             }
             for &(bi, ei) in preds {
@@ -286,7 +522,7 @@ fn rewire_one_range_iter_site(
         let keep = match graph.blocks[bi].exits[ei].args.get(pos) {
             Some(LinkArg::Value(v))
                 if graph.variable_defined_in_block(src, v)
-                    && iterator_alias_of(flow, v, &iter_var, &iter_phi) =>
+                    && iterator_alias_of(flow, v, iter_var, iter_phi) =>
             {
                 true
             }
@@ -295,11 +531,11 @@ fn rewire_one_range_iter_site(
         if keep {
             continue;
         }
-        let replacement = if graph.variable_defined_in_block(src, &iter_var) {
+        let replacement = if graph.variable_defined_in_block(src, iter_var) {
             iter_var.clone()
-        } else if graph.variable_defined_in_block(src, &iter_phi) {
+        } else if graph.variable_defined_in_block(src, iter_phi) {
             iter_phi.clone()
-        } else if let Some(local) = graph.ensure_variable_at_block_local(src, &iter_phi) {
+        } else if let Some(local) = graph.ensure_variable_at_block_local(src, iter_phi) {
             local
         } else {
             continue;
@@ -308,7 +544,6 @@ fn rewire_one_range_iter_site(
             *slot = LinkArg::Value(replacement);
         }
     }
-    Ok(())
 }
 
 /// `true` iff `v` is the `iter()` result, the loop-header iterator phi, or
@@ -576,6 +811,36 @@ mod tests {
             .count()
     }
 
+    fn count_range_inclusive_new(g: &FunctionGraph) -> usize {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if is_range_inclusive_new_segments(segments)
+                )
+            })
+            .count()
+    }
+
+    fn dump_function_paths(g: &FunctionGraph) -> Vec<Vec<String>> {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn count_range_ctors(g: &FunctionGraph) -> usize {
         g.blocks
             .iter()
@@ -643,6 +908,7 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
+                kind: RangeSiteKind::Exclusive,
             }],
             &[opt],
         );
@@ -657,6 +923,298 @@ mod tests {
             count_calls_ending(&g, &["core", "slice", "iter"]),
             1,
             "one iter op emitted"
+        );
+    }
+
+    fn inclusive_new_target() -> CallTarget {
+        CallTarget::function_path(["ops", "range", "RangeInclusive", "new"])
+    }
+
+    fn inclusive_new_spec_target() -> CallTarget {
+        CallTarget::function_path([
+            "ops",
+            "range",
+            "RangeInclusive",
+            "new__spec_u8_0123456789abcdef",
+        ])
+    }
+
+    /// `for _ in lo..=hi` — `RangeInclusive::new(lo, hi)` in the entry
+    /// block, the reflexive-into_iter alias delivering the range to a loop
+    /// header, `next(range)` in the header. `hi_op = None` makes `hi` a
+    /// startblock inputarg (non-ConstInt).
+    fn inclusive_range_forloop(
+        name: &str,
+        hi_op: Option<OpKind>,
+    ) -> (FunctionGraph, Variable, Variable, Variable) {
+        inclusive_range_forloop_with(name, hi_op, inclusive_new_target())
+    }
+
+    fn inclusive_range_forloop_with(
+        name: &str,
+        hi_op: Option<OpKind>,
+        new_target: CallTarget,
+    ) -> (FunctionGraph, Variable, Variable, Variable) {
+        let mut g = FunctionGraph::new(name);
+        let n = g.startblock;
+        let lo = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
+        let hi = match hi_op {
+            Some(kind) => g.push_op_var(n, kind, true).unwrap(),
+            None => {
+                let v = g.alloc_value_var();
+                g.block_mut(n).inputargs.push(v.clone());
+                v
+            }
+        };
+        let range = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: new_target,
+                    args: crate::model::call_args(vec![lo, hi.clone()]),
+                    result_ty: ValueType::Ref(Some("core::ops::range::RangeInclusive".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let (h, h_args) = g.create_block_with_arg_vars(1);
+        let it = h_args[0].clone();
+        let opt = g
+            .push_op_var(
+                h,
+                OpKind::Call {
+                    target: CallTarget::method("next", Some("RangeInclusive".to_string())),
+                    args: crate::model::call_args(vec![it.clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(h, Some(opt.clone()));
+        g.set_goto(n, h, vec![range.clone()]);
+        (g, range, hi, opt)
+    }
+
+    fn assert_inclusive_diverted(g: &FunctionGraph, hi: &Variable) {
+        assert_eq!(
+            count_range_inclusive_new(g),
+            0,
+            "no RangeInclusive::new call left"
+        );
+        assert_eq!(
+            count_calls_ending(g, &[crate::runtime_names::shims::RANGE]),
+            1,
+            "one range() builtin emitted"
+        );
+        assert_eq!(
+            count_calls_ending(g, &["core", "slice", "iter"]),
+            1,
+            "one iter op emitted"
+        );
+        let add_result = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::BinOp { op: name, lhs, .. } if name == "add" && lhs == hi => {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("BinOp add whose lhs is hi");
+        let range_second = g
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::RANGE)
+                    && args.len() == 2 =>
+                {
+                    Some(args[1].clone())
+                }
+                _ => None,
+            })
+            .expect("range() second arg");
+        assert_eq!(
+            range_second.as_variable(),
+            Some(&add_result),
+            "range() second arg must be the add result, got {range_second:?}"
+        );
+    }
+
+    fn assert_kind_of_canonical_diverts(graph: &FunctionGraph) {
+        let n_new = count_range_inclusive_new(graph);
+        let n_next = count_calls_ending(graph, &["RangeInclusive", "next"]);
+        let n_range = count_calls_ending(graph, &[crate::runtime_names::shims::RANGE]);
+        let n_iter = count_calls_ending(graph, &["core", "slice", "iter"]);
+        assert!(
+            n_range >= 1 && n_iter >= 1 && n_next == 0 && n_new == 0,
+            "inclusive for-loop in kind_of_canonical_exc_class must divert: \
+             new={n_new} next={n_next} range={n_range} iter={n_iter}\npaths={:#?}\n{}",
+            dump_function_paths(graph),
+            graph.dump()
+        );
+    }
+
+    #[test]
+    fn lower_kind_of_canonical_exc_class_diverts_inclusive_range() {
+        use crate::front::mir::{
+            build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
+        };
+        use majit_charon_reader::Llbc;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("pyre-object.ullbc");
+        let graph = lower_function(&llbc, "kind_of_canonical_exc_class")
+            .expect("lower kind_of_canonical_exc_class");
+        assert_kind_of_canonical_diverts(&graph);
+
+        let llbc = Llbc::load(path).expect("pyre-object.ullbc");
+        let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[llbc],
+            crate::HostStaticAddrs::default(),
+            &[],
+            &["kind_of_canonical_exc_class"],
+        )
+        .expect("semantic program");
+        let func = program
+            .functions
+            .iter()
+            .find(|f| f.name.contains("kind_of_canonical_exc_class"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "kind_of_canonical_exc_class missing; names={:?}",
+                    program
+                        .functions
+                        .iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_kind_of_canonical_diverts(func.graph());
+    }
+
+    #[test]
+    fn rewrite_diverts_inclusive_spec_suffixed_new() {
+        let (mut g, range, hi, opt) = inclusive_range_forloop_with(
+            "test_range_inclusive_spec_new",
+            Some(OpKind::ConstInt(10)),
+            inclusive_new_spec_target(),
+        );
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range,
+                kind: RangeSiteKind::Inclusive { narrow: true },
+            }],
+            &[opt],
+        );
+        assert_eq!(
+            rewritten, 1,
+            "spec-suffixed RangeInclusive::new must be diverted"
+        );
+        assert_inclusive_diverted(&g, &hi);
+    }
+
+    /// Mirror of `rewrite_diverts_int_range_forloop_to_range_plus_iter` for
+    /// `for _ in 0..=10` (`RangeInclusive::new`).
+    #[test]
+    fn rewrite_diverts_int_range_inclusive_forloop_to_range_plus_one() {
+        let (mut g, range, hi, opt) =
+            inclusive_range_forloop("test_range_inclusive_iter", Some(OpKind::ConstInt(10)));
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range,
+                kind: RangeSiteKind::Inclusive { narrow: true },
+            }],
+            &[opt],
+        );
+        assert_eq!(
+            rewritten, 1,
+            "the inclusive range for-loop must be diverted"
+        );
+        assert_inclusive_diverted(&g, &hi);
+    }
+
+    #[test]
+    fn rewrite_inclusive_wide_constant_hi_is_diverted() {
+        let (mut g, range, hi, opt) = inclusive_range_forloop(
+            "test_range_inclusive_wide_const",
+            Some(OpKind::ConstInt(10)),
+        );
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range,
+                kind: RangeSiteKind::Inclusive { narrow: false },
+            }],
+            &[opt],
+        );
+        assert_eq!(
+            rewritten, 1,
+            "wide inclusive range with constant hi < i64::MAX must be diverted"
+        );
+        assert_inclusive_diverted(&g, &hi);
+    }
+
+    #[test]
+    fn rewrite_inclusive_wide_nonconstant_hi_declines() {
+        let (mut g, range, _hi, opt) =
+            inclusive_range_forloop("test_range_inclusive_wide_nonconst", None);
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range,
+                kind: RangeSiteKind::Inclusive { narrow: false },
+            }],
+            &[opt],
+        );
+        assert_eq!(
+            rewritten, 0,
+            "wide inclusive range with non-ConstInt hi declines"
+        );
+        assert_eq!(
+            count_range_inclusive_new(&g),
+            1,
+            "RangeInclusive::new call survives"
+        );
+        assert_eq!(
+            count_calls_ending(&g, &[crate::runtime_names::shims::RANGE]),
+            0,
+            "no range() builtin emitted"
+        );
+    }
+
+    #[test]
+    fn rewrite_inclusive_wide_max_hi_declines() {
+        let (mut g, range, _hi, opt) = inclusive_range_forloop(
+            "test_range_inclusive_wide_max",
+            Some(OpKind::ConstInt(i64::MAX)),
+        );
+        let rewritten = rewire_range_iter_sites(
+            &mut g,
+            &[RangeNewSite {
+                result_var: range,
+                kind: RangeSiteKind::Inclusive { narrow: false },
+            }],
+            &[opt],
+        );
+        assert_eq!(
+            rewritten, 0,
+            "wide inclusive range with hi == i64::MAX declines"
+        );
+        assert_eq!(
+            count_range_inclusive_new(&g),
+            1,
+            "RangeInclusive::new call survives"
         );
     }
 
@@ -716,6 +1274,7 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
+                kind: RangeSiteKind::Exclusive,
             }],
             &[opt],
         );
@@ -786,6 +1345,7 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
+                kind: RangeSiteKind::Exclusive,
             }],
             &[opt],
         );
@@ -892,6 +1452,7 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
+                kind: RangeSiteKind::Exclusive,
             }],
             &[opt],
         );
@@ -1203,6 +1764,7 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
+                kind: RangeSiteKind::Exclusive,
             }],
             &[opt],
         );
@@ -1272,6 +1834,7 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
+                kind: RangeSiteKind::Exclusive,
             }],
             &[opt],
         );

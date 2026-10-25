@@ -2917,6 +2917,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_version_tag",
         crate::baseobjspace::__majit_call_target__orig__pure_version_tag_unlikely_name,
     );
+    // One-word STR payload, same residual ABI as `get_interned_wtf8`'s
+    // trampoline. The generated `__majit_call_target_*` rebuilds `&Wtf8`
+    // from that word (`rstr_payload`); `&Wtf8` itself is two words.
+    cpa1!(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::interned_lookup_w_name",
+        "pyre_interpreter::interned_lookup_w_name",
+        crate::baseobjspace::__majit_call_target_interned_lookup_w_name,
+    );
     cpa3!(
         &mut entries,
         "pyre_interpreter::baseobjspace::_pure_lookup_where_with_method_cache",
@@ -8302,6 +8311,27 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::pyerror_index_error_to_exc_object"],
             ie
+        );
+    }
+
+    /// Type-lookup intern probe. The trampoline takes the STR payload as
+    /// one `i64` word; pin both spellings so a typo does not fall back to a
+    /// symbolic hash and leave `_pure_lookup_where_with_method_cache`
+    /// with a non-constant `w_name`.
+    #[test]
+    fn jit_trace_fnaddrs_covers_interned_lookup_w_name() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let interned: extern "C" fn(i64) -> i64 =
+            crate::baseobjspace::__majit_call_target_interned_lookup_w_name;
+        let interned = interned as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::interned_lookup_w_name"],
+            interned
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::interned_lookup_w_name"],
+            interned
         );
     }
 

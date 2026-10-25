@@ -11621,7 +11621,14 @@ pub(crate) unsafe fn lookup_where_class_uncached(
 /// does not intern (`_lookup_where`, `_lookup_where_all_typeobjects`);
 /// `ObjSpace.new_interned_str` is code-object / constant creation. Probe
 /// `interned_strings.get` only (`get_interned_str`).
-fn interned_lookup_w_name(name: &Wtf8) -> Option<PyObjectRef> {
+///
+/// `@elidable` (`pyjitpl.py` `record_result_of_call_pure`): for a given name
+/// the result only moves from `None` to `Some(obj)` — interning never
+/// replaces a canonical object — so a folded `None` only costs speed (the
+/// uncached split path), and a folded `Some(obj)` is a trace constant that
+/// keeps the canonical object alive.
+#[majit_macros::elidable]
+pub(crate) fn interned_lookup_w_name(name: &Wtf8) -> Option<PyObjectRef> {
     pyre_object::unicodeobject::get_interned_wtf8(name)
 }
 
@@ -12141,16 +12148,16 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 }
 
 /// typeobject.py `version_tag()` — the cache-version reader.
-/// In the interpreter, and for a heap type whose tag can still change,
-/// it reads the live `_version_tag` field; under the JIT for a prebuilt
-/// type it goes through the `@elidable_promote` `_pure_version_tag` so
-/// the value folds away on the trace.  Mirrors the nesting of
-/// `function.rs::getcode`.
+/// PyPy's jitted arm tests `self.is_heaptype()` (`flag_heaptype`, an
+/// immutable field). pyre tests `flag_cpython_immutabletype?` instead:
+/// interpreter types declared `cpython_mutable` have `flag_heaptype ==
+/// false` but still accept setattr, so `_pure_version_tag` would bake a
+/// stale tag for them.
 #[inline]
 pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
     if majit_metainterp::jit::we_are_jitted() {
-        if !pyre_object::w_type_is_cpython_immutabletype(w_type) {
-            // Heap types can still be mutated; read the live field (the
+        if !pyre_object::typeobject::w_type_read_cpython_immutabletype_field(w_type) {
+            // Mutable types can still change; read the live field (the
             // caller promotes the result). typeobject.py `version_tag`
             // returns `self._version_tag` here, a getfield, not the
             // interpreter Acquire residual.

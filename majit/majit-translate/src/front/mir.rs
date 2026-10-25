@@ -9324,9 +9324,10 @@ struct Lowering<'a> {
     /// lowering (same post-pass as `saturating_mul`).
     saturating_sub_sites: Vec<crate::front::saturating_intrinsic::SaturatingSubSite>,
     /// Exclusive int-`Range { start, end }` aggregates (`for _ in a..b`)
-    /// recorded for the `range()` + list-iter divert the
-    /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
-    /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
+    /// and inclusive `RangeInclusive::new(a, b)` calls (`for _ in a..=b`)
+    /// recorded for the `range()` / `range(a, b + 1)` + list-iter divert
+    /// the `front::range_iter` post-pass synthesizes so the `next`-diamond
+    /// folds the loop (see [`crate::front::range_iter::RangeNewSite`]).
     range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
     /// RangeFrom aggregates retained for the orthodox
     /// `getslice(start, None)` rewrite. The slice-index consumer proves the
@@ -15860,6 +15861,7 @@ impl<'a> Lowering<'a> {
                             self.range_iter_new_sites.push(
                                 crate::front::range_iter::RangeNewSite {
                                     result_var: res.clone(),
+                                    kind: crate::front::range_iter::RangeSiteKind::Exclusive,
                                 },
                             );
                             self.slice_index_range_sites.push(
@@ -23305,6 +23307,40 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Integer width class of the single type argument of `head` when `head`
+    /// names `type_path` (`core::ops::range::Range` / `RangeInclusive`) over an
+    /// integer scalar.  `Some(true)` = narrower than 64 bits.
+    fn int_range_head_narrow(
+        &self,
+        head: &serde_json::Map<String, serde_json::Value>,
+        type_path: &str,
+    ) -> Option<bool> {
+        let is_match = type_decl_ref_adt_id(head)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path() == type_path);
+        if !is_match {
+            return None;
+        }
+        let lit = type_decl_ref_generics(head, self.llbc)
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.as_array())
+            .and_then(|t| t.first())
+            .and_then(|n| strip_ty_wrappers(n, self.llbc))
+            .and_then(|e| e.as_object())
+            .and_then(|m| m.get("Scalar"))
+            .and_then(|l| l.as_object())?;
+        let int = lit.get("Integer").and_then(serde_json::Value::as_object)?;
+        match (
+            int.get("Signed").and_then(serde_json::Value::as_str),
+            int.get("Unsigned").and_then(serde_json::Value::as_str),
+        ) {
+            (Some("I8" | "I16" | "I32"), _) | (_, Some("U8" | "U16" | "U32")) => Some(true),
+            (Some("I64" | "Isize"), _) | (_, Some("U64" | "Usize")) => Some(false),
+            _ => None,
+        }
+    }
+
     /// True when the `AggregateKind::Adt` head constructs a
     /// `core::ops::range::Range` whose element type is an integer that
     /// fits a machine word (anything but `i128` / `u128`) — the int-range
@@ -23314,46 +23350,13 @@ impl<'a> Lowering<'a> {
     /// head (bare `type_id`, no generics), or a non-`Range` owner declines,
     /// leaving the ordinary ADT ctor path.
     fn aggregate_head_is_int_range(&self, kind: &serde_json::Value) -> bool {
-        let Some(head) = kind
-            .as_object()
+        kind.as_object()
             .and_then(|m| m.get("Adt"))
             .and_then(|v| v.as_array())
             .and_then(|a| a.first())
-        else {
-            return false;
-        };
-        let is_range = head
-            .as_object()
-            .and_then(type_decl_ref_adt_id)
-            .and_then(|id| self.llbc.type_by_id(id))
-            .is_some_and(|td| td.item_meta.name_path() == "core::ops::range::Range");
-        if !is_range {
-            return false;
-        }
-        let Some(lit) = head
-            .as_object()
-            .and_then(|head| type_decl_ref_generics(head, self.llbc))
-            .and_then(|g| g.as_object())
-            .and_then(|g| g.get("types"))
-            .and_then(|t| t.as_array())
-            .and_then(|t| t.first())
-            .and_then(|n| strip_ty_wrappers(n, self.llbc))
-            .and_then(|e| e.as_object())
-            .and_then(|m| m.get("Scalar"))
-            .and_then(|l| l.as_object())
-        else {
-            return false;
-        };
-        let Some(int) = lit.get("Integer").and_then(serde_json::Value::as_object) else {
-            return false;
-        };
-        matches!(
-            int.get("Signed").and_then(serde_json::Value::as_str),
-            Some("I8" | "I16" | "I32" | "I64" | "Isize")
-        ) || matches!(
-            int.get("Unsigned").and_then(serde_json::Value::as_str),
-            Some("U8" | "U16" | "U32" | "U64" | "Usize")
-        )
+            .and_then(|v| v.as_object())
+            .and_then(|head| self.int_range_head_narrow(head, "core::ops::range::Range"))
+            .is_some()
     }
 
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
@@ -32724,6 +32727,33 @@ impl<'a> Lowering<'a> {
                 })
                 .unwrap_or(ValueType::Ref(None));
             self.next_call_results.push((result_var.clone(), item_ty));
+        }
+        // Capture `RangeInclusive::new(lo, hi)` over an integer element so
+        // `front::range_iter` can divert `for _ in lo..=hi` to `range(lo, hi + 1)`.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op_kind
+            && crate::front::range_iter::is_range_inclusive_new_segments(segments)
+            && args.len() == 2
+            && let Some(narrow) = {
+                let body = match &call.dest.ty {
+                    TyRef::Inline { value: (_, v) } | TyRef::Other(v) => Some(v),
+                    TyRef::Dedup { id } => self.llbc.dedup_body(*id),
+                };
+                body.and_then(|body| strip_ty_indirections(body, self.llbc))
+                    .and_then(|body| {
+                        let head = body.get("Adt")?.as_object()?;
+                        self.int_range_head_narrow(head, "core::ops::range::RangeInclusive")
+                    })
+            }
+        {
+            self.range_iter_new_sites
+                .push(crate::front::range_iter::RangeNewSite {
+                    result_var: result_var.clone(),
+                    kind: crate::front::range_iter::RangeSiteKind::Inclusive { narrow },
+                });
         }
         // Capture `Map::collect` at the construction site, where the
         // closure env is a concrete ADT.  The adapter body is
@@ -69211,21 +69241,24 @@ fn adt_node_class_root_leaf(
         // (lists, wrappers), never to a classdef.  Same crate-root
         // convention as the trait-bound resolver above.
         //
-        // Split-eligible core enums (`Option<i64>`, `Result<i32, E>`) take
-        // the instantiation suffix below so a returned or parameter value
-        // annotates as that class (`bookkeeper.py` `getuniqueclassdef(cls)`).
+        // Split-eligible core enums (`Option<i64>`, `Result<i32, E>`,
+        // `ControlFlow<i32, E>`) take the instantiation suffix below so a
+        // returned or parameter value annotates as that class
+        // (`bookkeeper.py` `getuniqueclassdef(cls)`).
         // `InstanceRepr.rtype_getattr` then reads `__discriminant` off the
         // interned tagged struct (rclass.py); `ok` / `unwrap_or_default` are
         // a match on that tag returning Option or the Ok payload. A
         // pointer-niche Option is the null word, not an enum class, and
-        // stays excluded. Result keeps its tag even when a type argument is
-        // pointer-like, so the niche exclusion does not apply to it.
-        // ControlFlow stays classdef-less: the `?` diamond residual recasts
-        // `branch`. Result-of-carrier call results skip the classdef recast
-        // (`result_narrow_root`); `result_exc` collapses any trailing recast
-        // so the raising call stays last (checkgraph, `simplify.py`). The
-        // `?` rewrite peels the Option recast that this paint inserts on a
-        // call-returned Option.
+        // stays excluded. Result and ControlFlow keep their tag even when a
+        // type argument is pointer-like, so the niche exclusion does not
+        // apply to them. Leaving ControlFlow classdef-less collapsed every
+        // `Continue` onto one template whose `__pos_0` unions `int` with
+        // `()` (`classdesc.py` `generalize_attr` / `unaryop.py` `setattr`);
+        // `consider_op` then never binds the `?` success payload
+        // (`annrpython.py`). The `?` rewrite peels the recast this paint
+        // inserts on a call-returned Option / ControlFlow
+        // (`result_exc::peel_recast_chain_from`). Result-of-carrier call
+        // results skip the classdef recast (`result_narrow_root`).
         let crate_root = name.split("::").next().unwrap_or(&name);
         if matches!(crate_root, "core" | "std" | "alloc") {
             let types = type_decl_ref_generics(adt, llbc)
@@ -69233,6 +69266,7 @@ fn adt_node_class_root_leaf(
                 .and_then(|t| t.as_array());
             let unary = types.is_some_and(|t| t.len() == 1);
             let tagged_result = name.ends_with("::result::Result");
+            let tagged_control_flow = name.ends_with("::control_flow::ControlFlow");
             let split = adt_head_instantiation_suffix(adt, llbc).is_some();
             let pointer_niche = types
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
@@ -69247,7 +69281,9 @@ fn adt_node_class_root_leaf(
                 || range_inclusive_struct_instantiation_suffix(&name, adt, llbc).is_some();
             let foreign_struct =
                 foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
-            let paint_core_enum = (unary && split && !pointer_niche) || (tagged_result && split);
+            let paint_core_enum = (unary && split && !pointer_niche)
+                || (tagged_result && split)
+                || (tagged_control_flow && split);
             if !classed_struct && !foreign_struct && !paint_core_enum {
                 return None;
             }
@@ -109434,6 +109470,69 @@ mod tests {
         assert_eq!(
             usize_u8,
             crate::model::ValueType::Ref(Some("Result<usize,u8>".into()))
+        );
+        assert_ne!(i32_u8, usize_u8);
+    }
+
+    fn control_flow_enum(def_id: u64) -> serde_json::Value {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["ops", 0]},
+                    {"Ident": ["control_flow", 0]},
+                    {"Ident": ["ControlFlow", 0]}
+                ],
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "kind": {"Enum": [
+                {
+                    "name": "Continue",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+                },
+                {
+                    "name": "Break",
+                    "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                    "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+                }
+            ]}
+        })
+    }
+
+    #[test]
+    fn control_flow_integer_instantiations_paint_distinct_class_roots() {
+        // `?` builds `ControlFlow::Continue(payload)` (`unaryop.py`
+        // `setattr` `__pos_0`). Each instantiation is its own class
+        // (`bookkeeper.py` `getuniqueclassdef(cls)`), so Continue(i32)
+        // does not `generalize_attr` against Continue(()) (`int ∪ None`,
+        // `classdesc.py`).
+        let llbc = llbc_with_types("fixture", vec![control_flow_enum(0)], vec![]);
+        let dest = |cont: serde_json::Value, brk: serde_json::Value| {
+            TyRef::Other(serde_json::json!({
+                "Value": [7, result_adt_node(0, brk, cont)]
+            }))
+        };
+        let i32_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}});
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        // ControlFlow<B, C>: type 0 is Break, type 1 is Continue.
+        let i32_u8 = super::tyref_to_value_type(&dest(i32_ty, u8_ty.clone()), &llbc);
+        let usize_u8 = super::tyref_to_value_type(&dest(usize_ty, u8_ty), &llbc);
+        assert_eq!(
+            i32_u8,
+            crate::model::ValueType::Ref(Some("ControlFlow<u8,i32>".into()))
+        );
+        assert_eq!(
+            usize_u8,
+            crate::model::ValueType::Ref(Some("ControlFlow<u8,usize>".into()))
         );
         assert_ne!(i32_u8, usize_u8);
     }

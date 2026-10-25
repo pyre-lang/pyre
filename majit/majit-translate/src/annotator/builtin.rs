@@ -1899,6 +1899,41 @@ fn ll_arraymove_intrinsic(
 /// is narrowed to the root's projected annotation instead — carrying the
 /// operand's nullability, since `cast_opaque_ptr` answers
 /// `nullptr(PTRTYPE.TO)` for a null (`lltype.py`).
+/// `(enum_leaf, variant_leaf)` of a variant spelling after stripping
+/// generic arguments and crate/module prefixes.
+///
+/// `result::Result<i32,PyError>::Ok` and `Result::Ok` both yield
+/// `("Result", "Ok")`.  A non-variant spelling (`Result<i32,PyError>`,
+/// `Result`) has no `::variant` tail and returns `None`.
+fn enum_variant_identity(name: &str) -> Option<(String, String)> {
+    let stripped = majit_ir::descr::strip_generic_args(name);
+    let normalized = stripped.replace('.', "::");
+    let (parent, variant) = normalized.rsplit_once("::")?;
+    if variant.is_empty() {
+        return None;
+    }
+    let enum_leaf = parent.rsplit("::").next()?.to_string();
+    if enum_leaf.is_empty() {
+        return None;
+    }
+    Some((enum_leaf, variant.to_string()))
+}
+
+/// True when `operand_name` is a monomorphized spelling of the same
+/// enum variant as unsuffixed `root`.
+fn instantiated_enum_variant_of(operand_name: &str, root: &str) -> bool {
+    if !operand_name.contains('<') || root.contains('<') {
+        return false;
+    }
+    match (
+        enum_variant_identity(operand_name),
+        enum_variant_identity(root),
+    ) {
+        (Some(op), Some(dest)) => op == dest,
+        _ => false,
+    }
+}
+
 fn cast_instance_intrinsic(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -2173,6 +2208,32 @@ fn cast_instance_intrinsic(
             )));
         }
     };
+    // A FieldRead of `__pos_0` recasts the receiver to the FieldRead
+    // owner (`flowspace_adapter` `enum_payload_getattr_ops` and the
+    // unsuffixed-owner fallback; `resolve_place` `enum_payload_class`).
+    // That owner is often the template variant (`Result::Ok`) because
+    // `resolve_adt_field` uses the enum leaf when the place carries no
+    // instantiation suffix.  The operand is the per-instantiation
+    // variant the constructor interned (`result::Result<i32,PyError>::Ok`).
+    // RPython `bookkeeper.py` `getuniqueclassdef` is one class object
+    // per variant; the template and the instantiation are that one
+    // variant.  Returning the template ClassDef makes
+    // `SomeInstance.getattr("__pos_0")` read the `??TypeVar` row
+    // (`s_ImpossibleValue`), `consider_op` raises `BlockedInference`
+    // (`annrpython.py`), and `follow_link` never sees the success
+    // successor.  Keep the instantiation — the same preference
+    // `prefer_instantiated_variant` uses at a knowntypedata merge
+    // (`model.py` `merge_knowntypedata`).
+    if let SomeValue::Instance(inst) = operand
+        && let Some(cd) = inst.classdef.as_ref()
+        && instantiated_enum_variant_of(&cd.borrow().name, &root)
+    {
+        return Ok(SomeValue::Instance(SomeInstance::new(
+            inst.classdef.clone(),
+            can_be_none,
+            inst.flags.clone(),
+        )));
+    }
     let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
     let flags = match operand {
         SomeValue::Instance(inst)
@@ -3583,6 +3644,84 @@ mod tests {
         assert!(
             matches!(out, SomeValue::Ptr(_)),
             "GCREF must project dest as SomePtr, got {out:?}"
+        );
+    }
+
+    /// FieldRead of `__pos_0` recasts the receiver to the FieldRead owner.
+    /// That owner is the template variant (`Result::Ok`) when the place
+    /// lost its instantiation suffix; the operand is the monomorph the
+    /// constructor interned.  Widening to the template makes
+    /// `getattr("__pos_0")` read the `??TypeVar` row (`s_ImpossibleValue`)
+    /// and `consider_op` blocks (`annrpython.py`).  Keep the instantiation
+    /// (`bookkeeper.py` `getuniqueclassdef` is one class per variant).
+    #[test]
+    fn cast_instance_keeps_instantiated_result_ok_over_template() {
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        let inst = "result::Result<i32,PyError>";
+        reg.fields.insert(
+            inst.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Ok"),
+            vec![("__pos_0".to_string(), "i32".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+
+        let ok_cd = bk
+            .getuniqueclassdef_for_enum_variant(inst, "Ok")
+            .expect("instantiated Ok");
+        let s_ok = SomeValue::Instance(SomeInstance::new(
+            Some(ok_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let mut s_root = crate::annotator::model::s_str0();
+        s_root.set_const_box(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::byte_str("Result::Ok"),
+        ));
+        let out = cast_instance_intrinsic(&bk, &[Some(s_ok), Some(s_root)], &HashMap::new())
+            .expect("cast of instantiated Ok to Result::Ok");
+        let SomeValue::Instance(inst_out) = out else {
+            panic!("expected SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst_out
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| std::rc::Rc::ptr_eq(cd, &ok_cd)),
+            "cast must keep the instantiated Ok, got {:?}",
+            inst_out
+                .classdef
+                .as_ref()
+                .map(|cd| cd.borrow().name.clone())
+        );
+        assert!(
+            instantiated_enum_variant_of("result::Result<i32,PyError>::Ok", "Result::Ok"),
+            "spelling matcher must treat the template as the same variant"
+        );
+        assert!(
+            !instantiated_enum_variant_of("Result::Ok", "Result::Ok"),
+            "template-to-template is not an instantiated keep"
+        );
+        assert!(
+            !instantiated_enum_variant_of("result::Result<i32,PyError>", "Result::Ok"),
+            "enum instantiation is not the Ok variant"
         );
     }
 

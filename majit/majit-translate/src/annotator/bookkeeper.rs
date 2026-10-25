@@ -3671,13 +3671,23 @@ impl Bookkeeper {
                 // the variant base-less, and first-mint-wins would freeze
                 // that, dropping the subclass link the narrowing relies on.
                 //
-                // A monomorphized variant (`StepResult<*mut PyObject>::Continue`)
-                // is the same sum type as the template.  The registry keys the
-                // template, not the `<…>` suffix, so strip the suffix before
-                // the parent test or the variant is minted base-less and a
-                // later `__pos_0` write cannot commonbase with the enum.
+                // A monomorphized variant (`Result<i32,E>::Ok`,
+                // `StepResult<*mut PyObject>::Continue`) subclasses the
+                // instantiation, which then subclasses the template —
+                // the same chain [`Self::intern_enum_variant_host`]
+                // wires (`bookkeeper.py` `getuniqueclassdef` is one
+                // class object per variant).  The registry keys the
+                // template, so strip `<…>` for the parent *test*, but
+                // return the instantiated parent when `lookup` still
+                // carries it.  Returning the template here freezes
+                // `Ok → Result` beside `Result<T,E> → Result`;
+                // `ClassDef::commonbase` of those two is the template
+                // (neither `ca` nor `cb`) and `binaryop.py` `improve`
+                // returns `s_ImpossibleValue`.  `annrpython.py`
+                // `follow_link` then ignores the discriminant-narrowed
+                // success successor.
                 let lookup_for_enum = majit_ir::descr::strip_generic_args(&lookup);
-                if let Some((parent, _variant)) = lookup_for_enum.rsplit_once("::") {
+                if let Some((parent, variant)) = lookup_for_enum.rsplit_once("::") {
                     let parent_leaf = parent.rsplit("::").next().unwrap_or(parent);
                     if !seen.contains(parent_leaf) {
                         // The ctor spells the crate (`pyre_interpreter::pyopcode::
@@ -3685,6 +3695,7 @@ impl Bookkeeper {
                         // crate-relative key (`pyopcode::StepResult`) or the
                         // bare leaf.  Parent to that registered key, not the
                         // longer spelling, or the two intern as distinct classes.
+                        let inst_parent = lookup.strip_suffix(&format!("::{variant}"));
                         let mut candidate = parent;
                         loop {
                             let spelled = if candidate.starts_with("pyre_interpreter::")
@@ -3715,6 +3726,15 @@ impl Bookkeeper {
                                 || reg.is_enum_base(candidate)
                                 || reg.is_enum_base(&spelled)
                             {
+                                if let Some(inst_parent) = inst_parent
+                                    && inst_parent.contains('<')
+                                {
+                                    let inst_suffix = inst_parent
+                                        .find('<')
+                                        .map(|i| &inst_parent[i..])
+                                        .unwrap_or("");
+                                    return Some(format!("{spelled}{inst_suffix}"));
+                                }
                                 return Some(spelled);
                             }
                             match candidate.split_once("::") {
@@ -3738,12 +3758,24 @@ impl Bookkeeper {
                 // per-instantiation `__pos_N` writes could conflict on.
                 if lookup.contains('<') {
                     let stripped = majit_ir::descr::strip_generic_args(&lookup);
-                    // Field annotations use the crate-stripped spelling
-                    // (`pyopcode::StepResult` via `strip_crate_prefix`).
-                    // Parent the monomorphized class to that spelling so a
-                    // `StepResult<*mut PyObject>::Continue` value unions
-                    // with the field's class.
-                    let spelled = crate::front::mir::strip_crate_prefix(stripped.as_ref());
+                    // Field annotations intern the crate-relative template
+                    // (`pyopcode::StepResult`).  Strip only a local-crate
+                    // first segment (`pyre_interpreter::…`), matching the
+                    // variant-parent walk above: `strip_crate_prefix` of
+                    // an already crate-relative name would drop
+                    // `pyopcode::` and parent the instantiation to the
+                    // bare leaf, so `improve(Instance(template),
+                    // Instance(variant))` never sees the template in the
+                    // variant MRO.
+                    let spelled = if stripped.starts_with("pyre_interpreter::")
+                        || stripped.starts_with("pyre_object::")
+                        || stripped.starts_with("pyre_module::")
+                        || stripped.starts_with("pyre_jit::")
+                    {
+                        crate::front::mir::strip_crate_prefix(stripped.as_ref())
+                    } else {
+                        stripped.to_string()
+                    };
                     let spelled_leaf = spelled.rsplit("::").next().unwrap_or(&spelled);
                     let is_enum = reg.is_enum_base(stripped.as_ref())
                         || reg.is_enum_base(&spelled)
@@ -7679,6 +7711,82 @@ mod tests {
             variant.borrow().issubclass(&base),
             "variant must subclass the base even when pre-registered as a struct root first"
         );
+    }
+
+    #[test]
+    fn prologue_minted_generic_result_ok_improves_from_instantiation() {
+        // The session prologue (`CallRegistry::ensure_session`) pre-mints
+        // every `struct_fields` key through `intern_class_by_qualname`
+        // before `intern_enum_variant_host` runs.  A monomorphized
+        // `Result<i32,E>::Ok` must parent to the instantiation
+        // `Result<i32,E>` (then the template), matching
+        // `intern_enum_variant_host`.  Parenting Ok to the template
+        // makes `improve(Instance(Result<i32,E>), Instance(Ok))` return
+        // `s_ImpossibleValue` (`ClassDef::commonbase` is the template,
+        // neither ca nor cb — `binaryop.py` `improve`), so
+        // `annrpython.py` `follow_link` ignores the Ok success successor.
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        let inst = "result::Result<i32,TryFromIntError>";
+        reg.fields.insert(
+            inst.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Ok"),
+            vec![("__pos_0".to_string(), "i32".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Err"),
+            vec![("__pos_0".to_string(), "TryFromIntError".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+
+        let inst_cd = bk
+            .getuniqueclassdef_for_struct_root(inst)
+            .expect("instantiation registers");
+        let ok_cd = bk
+            .getuniqueclassdef_for_enum_variant(inst, "Ok")
+            .expect("Ok registers");
+        assert!(
+            ok_cd.borrow().issubclass(&inst_cd),
+            "prologue-minted Result<i32,E>::Ok must subclass the instantiation, Ok basedef={:?}",
+            ok_cd
+                .borrow()
+                .basedef
+                .as_ref()
+                .map(|c| c.borrow().name.clone())
+        );
+
+        let s_inst = SomeValue::Instance(SomeInstance::new(
+            Some(inst_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_ok = SomeValue::Instance(SomeInstance::new(
+            Some(ok_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let narrowed = crate::annotator::binaryop::improve(&s_inst, &s_ok);
+        match narrowed {
+            SomeValue::Instance(si) => assert!(
+                si.classdef.as_ref().is_some_and(|c| Rc::ptr_eq(c, &ok_cd)),
+                "improve(Result<i32,E>, Ok) must narrow to Ok, got {:?}",
+                si.classdef.as_ref().map(|c| c.borrow().name.clone())
+            ),
+            other => panic!("expected SomeInstance(Ok), got {other:?}"),
+        }
     }
 
     /// `Code` in `lookup_fmt` is a mixed enum: ten fieldless variants plus
