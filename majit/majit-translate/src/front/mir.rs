@@ -19388,7 +19388,7 @@ impl<'a> Lowering<'a> {
             || pair_lens.iter().any(|(at, _)| *at == 0);
         let non_receiver_pair = pair_lens.iter().any(|(at, _)| *at != 0);
         Ok(match method_hint {
-            Some((owner_root, leaf))
+            Some((owner_root, leaf, _))
                 if !args.is_empty() && !receiver_is_pair && !non_receiver_pair =>
             {
                 let mut target = CallTarget::method(leaf, Some(owner_root));
@@ -30988,10 +30988,24 @@ impl<'a> Lowering<'a> {
                 // `rtype_eq` / `rtype_ne` lower the comparison to `ptr_eq`
                 // / `ptr_ne`.
                 if args.len() == 2
-                    && (fmt_path_ends_with(&segments, &["non_null", "NonNull", "eq"])
-                        || fmt_path_ends_with(&segments, &["non_null", "NonNull", "ne"]))
+                    && (fmt_path_ends_with_owner_method(
+                        &segments,
+                        &["non_null", "NonNull"],
+                        &["core", "cmp", "PartialEq"],
+                        "eq",
+                    ) || fmt_path_ends_with_owner_method(
+                        &segments,
+                        &["non_null", "NonNull"],
+                        &["core", "cmp", "PartialEq"],
+                        "ne",
+                    ))
                 {
-                    let leaf = if fmt_path_ends_with(&segments, &["non_null", "NonNull", "ne"]) {
+                    let leaf = if fmt_path_ends_with_owner_method(
+                        &segments,
+                        &["non_null", "NonNull"],
+                        &["core", "cmp", "PartialEq"],
+                        "ne",
+                    ) {
                         "ne"
                     } else {
                         "eq"
@@ -31310,7 +31324,7 @@ impl<'a> Lowering<'a> {
                         let same_callee =
                             segments == original_segments && method_hint == original_method_hint;
                         match method_hint {
-                            Some((owner_root, leaf)) if !args.is_empty() => {
+                            Some((owner_root, leaf, _)) if !args.is_empty() => {
                                 // Method is this FunDecl: stamp its registered
                                 // path so `target_to_path` does not use the
                                 // owner leaf as a suffix of the impl key.
@@ -33913,7 +33927,7 @@ impl<'a> Lowering<'a> {
     fn specialized_trait_target(
         &self,
         payload: &serde_json::Value,
-    ) -> Option<(Vec<String>, Option<(String, String)>)> {
+    ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
         let (fn_id, generics) = crate::front::clause_spec::trait_impl_method(payload, self.llbc)?;
         let fd = self.llbc.fn_by_id(fn_id)?;
         // No unstructured body: keep the ordinary `CallKind::Trait` route.
@@ -33945,7 +33959,7 @@ impl<'a> Lowering<'a> {
     fn opaque_nullary_impl_target(
         &self,
         fd: &FunDecl,
-    ) -> Option<(Vec<String>, Option<(String, String)>)> {
+    ) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
         if !fd.signature.inputs.is_empty() {
             return None;
         }
@@ -34022,7 +34036,10 @@ impl<'a> Lowering<'a> {
 
     /// Segments and method hint `call_target_segments` emits for a direct
     /// call once specialization and blanket `Into` devirtualization decline.
-    fn unspecialized_fun_segments(&self, fd: &FunDecl) -> (Vec<String>, Option<(String, String)>) {
+    fn unspecialized_fun_segments(
+        &self,
+        fd: &FunDecl,
+    ) -> (Vec<String>, Option<(String, String, Option<String>)>) {
         let method_hint = self.impl_method_owner(fd);
         // A `#[dont_look_inside]` inherent method is a residual call, not a
         // trace target. Routing it as `CallTarget::Method` surfaces
@@ -34060,9 +34077,11 @@ impl<'a> Lowering<'a> {
 
     /// Resolve a Charon `CallKind` to a flattened path segment list the
     /// codewriter consumes as `CallTarget::FunctionPath`, plus an
-    /// optional `(owner_root_leaf, method_leaf)` pair for impl methods,
-    /// plus the `[Owner, leaf]` registration spelling when the callee is
-    /// an inherent-impl *associated function* (no receiver).
+    /// optional `(owner_root_leaf, method_leaf, trait_impl_identity)`
+    /// triple for impl methods, plus the `[Owner, leaf]` registration
+    /// spelling when the callee is an inherent-impl *associated function*
+    /// (no receiver). `trait_impl_identity` is `render_trait_impl` of the
+    /// FunDecl's trait-impl id (`None` for an inherent method).
     ///
     /// The method hint is `Some` when the FunDecl's raw name segments
     /// encode an `Impl` block immediately before the leaf `Ident` —
@@ -34089,7 +34108,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         reg: &RegularCall,
         first_arg_ty: Option<&TyRef>,
-    ) -> Result<(Vec<String>, Option<(String, String)>), LowerError> {
+    ) -> Result<(Vec<String>, Option<(String, String, Option<String>)>), LowerError> {
         match &reg.kind {
             CallKind::Fun(FunId::Regular { id }) => self
                 .llbc
@@ -34266,9 +34285,11 @@ impl<'a> Lowering<'a> {
         )
     }
 
-    /// Return `(owner_root_leaf, method_leaf)` when the FunDecl's name
-    /// path encodes an impl block (inherent or trait-impl) whose owner
-    /// type is resolvable through the LLBC tables.
+    /// Return `(owner_root_leaf, method_leaf, trait_impl_identity)` when
+    /// the FunDecl's name path encodes an impl block (inherent or
+    /// trait-impl) whose owner type is resolvable through the LLBC
+    /// tables. `trait_impl_identity` is `render_trait_impl` of the
+    /// FunDecl's trait-impl id; an inherent method leaves it `None`.
     ///
     /// Charon serialises an impl method's name as:
     ///   `[Ident("crate"), Ident("mod"), Other({"Impl": ...}), Ident("method_name")]`
@@ -34278,7 +34299,7 @@ impl<'a> Lowering<'a> {
     /// Trait-impl lookups indirect through the top-level `trait_impls`
     /// table, kept opaque (`schema::Translated.rest["trait_impls"]`)
     /// because no other consumer needs it typed.
-    fn impl_method_owner(&self, fd: &FunDecl) -> Option<(String, String)> {
+    fn impl_method_owner(&self, fd: &FunDecl) -> Option<(String, String, Option<String>)> {
         let segs = &fd.item_meta.name;
         let last_idx = segs
             .iter()
@@ -34473,7 +34494,12 @@ impl<'a> Lowering<'a> {
         if owner_leaf.is_empty() {
             return None;
         }
-        Some((owner_leaf, leaf))
+        Some((
+            owner_leaf,
+            leaf,
+            trait_impl_id_for_fundecl(fd)
+                .and_then(|id| crate::front::clause_spec::render_trait_impl(self.llbc, id)),
+        ))
     }
 
     /// Read the sole upstream field of
@@ -35478,7 +35504,7 @@ impl<'a> Lowering<'a> {
                 .collect()
         };
         let mut target = match method_hint {
-            Some((owner_root, leaf)) => CallTarget::method(leaf, Some(owner_root)),
+            Some((owner_root, leaf, _)) => CallTarget::method(leaf, Some(owner_root)),
             None => CallTarget::FunctionPath {
                 segments,
                 fun_decl_id: None,
@@ -44644,7 +44670,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         segments: &[String],
-        method_hint: Option<&(String, String)>,
+        method_hint: Option<&(String, String, Option<String>)>,
         args: &[Variable],
         first_arg_ty: Option<&TyRef>,
         second_arg_ty: Option<&TyRef>,
@@ -44654,15 +44680,36 @@ impl<'a> Lowering<'a> {
         if args.len() != 2 {
             return Ok(false);
         }
-        let from_path = if fmt_path_ends_with(segments, &["option", "Option", "eq"]) {
+        let from_path = if fmt_path_ends_with_owner_method(
+            segments,
+            &["option", "Option"],
+            &["core", "cmp", "PartialEq"],
+            "eq",
+        ) {
             Some("eq")
-        } else if fmt_path_ends_with(segments, &["option", "Option", "ne"]) {
+        } else if fmt_path_ends_with_owner_method(
+            segments,
+            &["option", "Option"],
+            &["core", "cmp", "PartialEq"],
+            "ne",
+        ) {
             Some("ne")
         } else {
             None
         };
-        let from_method = method_hint.and_then(|(owner, name)| {
-            (owner == "Option" && matches!(name.as_str(), "eq" | "ne")).then_some(name.as_str())
+        // `CallControl.graphs_from` / `FunctionReprBase.call` call the
+        // function the pointer names. Only `core::cmp::PartialEq`'s
+        // `eq`/`ne` lower to this `BinOp`; an extension trait's
+        // same-named method on `Option` stays a call.
+        let from_method = method_hint.and_then(|(owner, name, trait_identity)| {
+            let identity = trait_identity.as_ref()?;
+            (owner == "Option"
+                && matches!(name.as_str(), "eq" | "ne")
+                && trait_impl_identity_names_trait(
+                    &format!("<impl {identity}>"),
+                    &["core", "cmp", "PartialEq"],
+                ))
+            .then_some(name.as_str())
         });
         let Some(leaf) = from_path.or(from_method) else {
             return Ok(false);
@@ -59750,19 +59797,11 @@ fn impl_atomic_alias_leaf(llbc: &Llbc, impl_payload: &serde_json::Value) -> Opti
 
 /// Path segments used to *call* a function named by a `FnDef` constant or
 /// type — the same spelling `decode_constant` stores in a function-item
-/// value and `call_target_segments` emits for a direct call.  Impl-owned
-/// callees use [`spec_segments`] (inherent `for_impl_method`, trait-impl
-/// identity path); free functions keep `name_path()` split on `::`.
+/// value and `call_target_segments` emits for a direct call.  The leaf is
+/// [`instance_leaf`] when Charon instantiated the declaration, matching
+/// [`registered_path_for_fun_decl`] (`FunctionDesc.cachedgraph`).
 fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
-    match impl_method_owner_for_fundecl(llbc, fd) {
-        Some((_, leaf)) => spec_segments(llbc, fd, &leaf),
-        None => fd
-            .item_meta
-            .name_path()
-            .split("::")
-            .map(|s| s.to_string())
-            .collect(),
-    }
+    registered_path_for_fun_decl(llbc, fd).segments
 }
 
 /// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
@@ -73364,7 +73403,7 @@ fn trait_payload_owner(v: &serde_json::Value, llbc: &Llbc) -> Option<(String, St
 fn specialized_trait_clone_list_target(
     v: &serde_json::Value,
     llbc: &Llbc,
-) -> Option<(Vec<String>, Option<(String, String)>)> {
+) -> Option<(Vec<String>, Option<(String, String, Option<String>)>)> {
     if !is_trait_clone_clone(v, llbc) {
         return None;
     }
@@ -77158,6 +77197,56 @@ fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
                     s.as_str() == *t
                 }
             })
+}
+
+fn is_trait_impl_path_segment(segment: &str) -> bool {
+    segment == "<Impl>" || segment.starts_with("<impl ") || segment.starts_with("<Impl#")
+}
+
+/// True when `segment` is `<impl {T}>` and `{T}` with its generic argument
+/// list removed (cut at the first `<`) split on `::` equals `trait_path`.
+/// `CallControl.graphs_from` follows the function object, so a suffix match
+/// would treat `<impl application::cmp::PartialEq<…>>` as `core::cmp::PartialEq`.
+fn trait_impl_identity_names_trait(segment: &str, trait_path: &[&str]) -> bool {
+    let Some(inner) = segment
+        .strip_prefix("<impl ")
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let trait_name = inner.split_once('<').map(|(head, _)| head).unwrap_or(inner);
+    trait_name.split("::").eq(trait_path.iter().copied())
+}
+
+/// `for_impl_method` (`[..., Owner, leaf]`) or a trait-impl identity
+/// (`[..., Owner, <impl {T}>, leaf]`) whose identity segment names
+/// `trait_path`. `spec_segments` emits the latter for an ADT-owned trait
+/// method (`CallControl.graphs_from` keys on the function object).
+fn fmt_path_ends_with_owner_method(
+    segments: &[String],
+    owner: &[&str],
+    trait_path: &[&str],
+    leaf: &str,
+) -> bool {
+    let n = segments.len();
+    if n == 0 || crate::front::clause_spec::unspecialized_leaf(&segments[n - 1]) != leaf {
+        return false;
+    }
+    let owner_end = if n >= 2 && is_trait_impl_path_segment(&segments[n - 2]) {
+        if !trait_impl_identity_names_trait(&segments[n - 2], trait_path) {
+            return false;
+        }
+        n - 2
+    } else {
+        n - 1
+    };
+    if owner_end < owner.len() {
+        return false;
+    }
+    segments[owner_end - owner.len()..owner_end]
+        .iter()
+        .map(String::as_str)
+        .eq(owner.iter().copied())
 }
 
 /// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
@@ -85132,6 +85221,80 @@ mod tests {
         assert!(!fmt_path_ends_with(&spec, &["lltype", "malloc"]));
         let inner = segs(&["malloc_typed__spec_X_0123456789abcdef", "new"]);
         assert!(!fmt_path_ends_with(&inner, &["malloc_typed", "new"]));
+    }
+
+    #[test]
+    fn owner_method_path_accepts_trait_impl_identity() {
+        use crate::front::mir::fmt_path_ends_with_owner_method;
+        let segs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let peq = &["core", "cmp", "PartialEq"][..];
+        let owner = &["non_null", "NonNull"][..];
+        let inherent = segs(&["ptr", "non_null", "NonNull", "eq"]);
+        let identity = segs(&[
+            "ptr",
+            "non_null",
+            "NonNull",
+            "<impl core::cmp::PartialEq<core::ptr::non_null::NonNull<T>>>",
+            "eq",
+        ]);
+        let charon_impl = segs(&["ptr", "non_null", "NonNull", "<Impl>", "ne"]);
+        let foreign_eq = segs(&["ptr", "non_null", "NonNull", "<impl crate::MyEq>", "eq"]);
+        let application_eq = segs(&[
+            "ptr",
+            "non_null",
+            "NonNull",
+            "<impl application::cmp::PartialEq<core::ptr::non_null::NonNull<T>>>",
+            "eq",
+        ]);
+        let partial_ord = segs(&[
+            "ptr",
+            "non_null",
+            "NonNull",
+            "<impl core::cmp::PartialOrd<core::ptr::non_null::NonNull<T>>>",
+            "eq",
+        ]);
+        let option_ext = segs(&["option", "Option", "<impl local::Ext>", "ne"]);
+        assert!(fmt_path_ends_with_owner_method(&inherent, owner, peq, "eq"));
+        assert!(fmt_path_ends_with_owner_method(&identity, owner, peq, "eq"));
+        assert!(!fmt_path_ends_with_owner_method(
+            &charon_impl,
+            owner,
+            peq,
+            "ne"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &identity, owner, peq, "ne"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &segs(&["option", "Option", "eq"]),
+            owner,
+            peq,
+            "eq"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &foreign_eq,
+            owner,
+            peq,
+            "eq"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &application_eq,
+            owner,
+            peq,
+            "eq"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &partial_ord,
+            owner,
+            peq,
+            "eq"
+        ));
+        assert!(!fmt_path_ends_with_owner_method(
+            &option_ext,
+            &["option", "Option"],
+            peq,
+            "ne"
+        ));
     }
 
     /// A Ref pointee is `{"Deduplicated": id}` of the Scalar
@@ -98301,6 +98464,8 @@ mod tests {
             super::trait_impl_identity_path("cmp::impls::<Impl>", &i64_identity, "le")
         );
         assert_ne!(char_path, i64_path);
+        assert_eq!(super::fundecl_fn_item_segments(&llbc, char_le), char_path);
+        assert_eq!(super::fundecl_fn_item_segments(&llbc, i64_le), i64_path);
         assert_eq!(
             super::registered_path_for_fun_decl(&llbc, char_le).segments,
             char_path
@@ -98331,6 +98496,75 @@ mod tests {
             super::semantic_function_dedup_key(&char_fn),
             super::semantic_function_dedup_key(&char_other_artifact)
         );
+    }
+
+    /// A Charon-instantiated FunDecl's function-item path uses the same
+    /// specialized leaf `registered_path_for_fun_decl` registers
+    /// (`FunctionDesc.cachedgraph`).
+    #[test]
+    fn fundecl_fn_item_segments_uses_the_registered_instance_leaf() {
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+        let args = serde_json::json!({
+            "regions": [],
+            "types": [{"Scalar": {"Integer": {"Signed": "I64"}}}],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [
+                            ident("fixture"),
+                            ident("f"),
+                            {"Instantiated": {
+                                "params": {},
+                                "kind": "Other",
+                                "skip_binder": args
+                            }}
+                        ],
+                        "span": span.clone(),
+                        "source_text": null,
+                        "attr_info": {
+                            "attributes": [],
+                            "inline": null,
+                            "rename": null,
+                            "public": true
+                        },
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [],
+                        "output": {"Scalar": "Bool"}
+                    },
+                    "body": {"Unstructured": {
+                        "span": span,
+                        "locals": {"arg_count": 0, "locals": []},
+                        "body": []
+                    }}
+                }],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("instance fixture parses");
+        let fd = llbc.fn_by_id(0).expect("f");
+        let registered = super::registered_path_for_fun_decl(&llbc, fd);
+        let item = super::fundecl_fn_item_segments(&llbc, fd);
+        assert_eq!(item, registered.segments);
+        let leaf = item.last().expect("leaf");
+        assert!(leaf.starts_with("f__spec_"), "{leaf}");
+        assert_ne!(leaf.as_str(), "f");
     }
 
     /// Inherent `Owner::setitem` and `impl Store for Owner { fn setitem }`
@@ -115646,7 +115880,12 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                    } => super::fmt_path_ends_with_owner_method(
+                        segments,
+                        &["Option"],
+                        &["core", "cmp", "PartialEq"],
+                        "ne",
+                    ),
                     _ => false,
                 })
                 .count(),
@@ -115659,16 +115898,10 @@ mod tests {
         );
     }
 
-    /// `opt == Some(p)` on niche `Option<*mut T>`. Charon spells the
-    /// derived `PartialEq` as `core::option::<Impl>::eq` with
-    /// `first_is_self`, so `impl_method_owner` would emit
-    /// `CallTarget::Method { name: "eq" }`. The niche fold must win
-    /// and emit one address `BinOp("eq")` (`rclass.py` `rtype_eq` →
-    /// `ptr_eq`; `rptr.py` `PtrRepr.rtype_eq`).
-    #[test]
-    fn niche_option_ptr_eq_some_lowers_to_binop() {
-        use crate::model::{CallTarget, OpKind};
-
+    /// Niche `Option<*mut T>` `eq` call against a named trait impl.
+    /// Charon spells the callee as `core::option::<Impl>::eq` with
+    /// `{"Impl": {"Trait": id}}` and `first_is_self`.
+    fn niche_option_ptr_eq_llbc(trait_name: &[&str]) -> Llbc {
         let span = serde_json::json!({"data": {"file_id": 0,
             "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
         let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
@@ -115699,10 +115932,9 @@ mod tests {
         });
         let option_ref = serde_json::json!({"Ref": ["Erased", option_ty.clone(), "Shared"]});
         let bool_ty = serde_json::json!({"Scalar": "Bool"});
-        let impl_seg = serde_json::json!({"Impl": {"Ty": {
-            "skip_binder": {"Value": [0, option_ty.clone()]},
-            "kind": "InherentImplBlock"
-        }}});
+        let impl_seg = serde_json::json!({"Impl": {"Trait": 0}});
+        let option_value = serde_json::json!({"Value": [0, option_ty.clone()]});
+        let trait_idents: Vec<serde_json::Value> = trait_name.iter().copied().map(ident).collect();
         let place =
             |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
         let file = serde_json::json!({
@@ -115831,12 +116063,34 @@ mod tests {
                     }
                 ],
                 "global_decls": [],
-                "trait_decls": [],
-                "trait_impls": []
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(trait_idents),
+                    "methods": [{"skip_binder": {"name": "eq"}}]
+                }],
+                "trait_impls": [{
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {"types": [option_value.clone(), option_value]}
+                    },
+                    "methods": []
+                }]
             }
         });
-        let llbc =
-            Llbc::from_slice(file.to_string().as_bytes()).expect("option-ptr-eq fixture parses");
+        Llbc::from_slice(file.to_string().as_bytes()).expect("option-ptr-eq fixture parses")
+    }
+
+    /// `opt == Some(p)` on niche `Option<*mut T>`. Charon spells the
+    /// derived `PartialEq` as `core::option::<Impl>::eq` with
+    /// `first_is_self`, so `impl_method_owner` would emit
+    /// `CallTarget::Method { name: "eq" }`. The niche fold must win
+    /// and emit one address `BinOp("eq")` (`rclass.py` `rtype_eq` →
+    /// `ptr_eq`; `rptr.py` `PtrRepr.rtype_eq`).
+    #[test]
+    fn niche_option_ptr_eq_some_lowers_to_binop() {
+        use crate::model::{CallTarget, OpKind};
+
+        let llbc = niche_option_ptr_eq_llbc(&["core", "cmp", "PartialEq"]);
         let graph =
             super::lower_function(&llbc, "cmp_option_ptr_eq").expect("lower cmp_option_ptr_eq");
         let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
@@ -115856,6 +116110,40 @@ mod tests {
                 .count(),
             1,
             "the comparison lowers to one address `BinOp(eq)`"
+        );
+    }
+
+    /// An extension trait's `eq` on niche `Option` keeps the call
+    /// (`CallControl.graphs_from` / `FunctionReprBase.call`). Only
+    /// `core::cmp::PartialEq` lowers to `BinOp`.
+    #[test]
+    fn niche_option_ext_eq_stays_a_call() {
+        use crate::model::{CallTarget, OpKind};
+
+        let llbc = niche_option_ptr_eq_llbc(&["fixture", "Ext"]);
+        let graph =
+            super::lower_function(&llbc, "cmp_option_ptr_eq").expect("lower cmp_option_ptr_eq");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert_eq!(
+            ops()
+                .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq"))
+                .count(),
+            0,
+            "an Ext::eq on Option is not the PartialEq BinOp fold"
+        );
+        assert!(
+            ops().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "eq",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("eq"),
+                _ => false,
+            }),
+            "Ext::eq on Option stays a call"
         );
     }
 
@@ -116191,7 +116479,12 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } => super::fmt_path_ends_with(segments, &["NonNull", "ne"]),
+                    } => super::fmt_path_ends_with_owner_method(
+                        segments,
+                        &["NonNull"],
+                        &["core", "cmp", "PartialEq"],
+                        "ne",
+                    ),
                     _ => false,
                 })
                 .count(),
@@ -116908,7 +117201,12 @@ mod tests {
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
-                    } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                    } => super::fmt_path_ends_with_owner_method(
+                        segments,
+                        &["Option"],
+                        &["core", "cmp", "PartialEq"],
+                        "ne",
+                    ),
                     _ => false,
                 })
                 .count(),
@@ -116938,7 +117236,12 @@ mod tests {
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
-                } => super::fmt_path_ends_with(segments, &["Option", "ne"]),
+                } => super::fmt_path_ends_with_owner_method(
+                    segments,
+                    &["Option"],
+                    &["core", "cmp", "PartialEq"],
+                    "ne",
+                ),
                 _ => false,
             }),
             "`Option<&u8>` inequality stays a residual `Option::ne` call"

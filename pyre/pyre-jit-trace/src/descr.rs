@@ -4776,6 +4776,12 @@ pub fn type_name_obj_descr() -> DescrRef {
 /// `stable_field_index` of the 8-byte Int so `state.rs quasi_immut_descr`
 /// still selects this slot.
 ///
+/// `caches` is `celldict.py ModuleDictStrategy.caches`. `heaptracker.py
+/// all_fielddescrs` walks every field of the STRUCT; the JIT never loads
+/// this storage, so each of its words is an opaque `Int` the way
+/// `W_ObjectObject.map` is, one word per slot like `FUNCTION_DESCR_GROUP`
+/// `mutate_*_lock`.
+///
 /// `mutate_version` is the hidden OBJECTPTR `rclass.py InstanceRepr._setup_repr`
 /// adds (`quasiimmut.py get_mutate_field_name`). `mutate_version_lock` is the
 /// second word `FUNCTION_DESCR_GROUP` declares for each `mutate_<name>`.
@@ -4784,6 +4790,10 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
         use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
         use pyre_object::celldict::ModuleDictStrategy;
         let version_offset = core::mem::offset_of!(ModuleDictStrategy, version);
+        let caches_offset = core::mem::offset_of!(ModuleDictStrategy, caches);
+        let caches_size = core::mem::size_of::<
+            parking_lot::Mutex<Option<pyre_object::celldict::GlobalCacheRegistry>>,
+        >();
         let mutate_offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
             + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
         let mutate_lock_offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
@@ -4813,41 +4823,67 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
                 load_is_acquire: false,
             }
         };
-        let specs = [
-            field(
-                stable_field_index(version_offset, 8, Type::Int, false),
-                "version",
-                version_offset,
-                8,
+        let mut specs = vec![field(
+            stable_field_index(version_offset, 8, Type::Int, false),
+            "version",
+            version_offset,
+            8,
+            Type::Int,
+            false,
+            true,
+            ArrayFlag::Unsigned,
+            0,
+        )];
+        let mut index_in_parent = 1;
+        let mut remaining = caches_size;
+        let mut caches_offset_cur = caches_offset;
+        let mut caches_word = 0;
+        while remaining > 0 {
+            let field_size = remaining.min(WORD);
+            let key = if caches_word == 0 {
+                "caches".to_string()
+            } else {
+                format!("caches_{caches_word}")
+            };
+            specs.push(field(
+                stable_field_index(caches_offset_cur, field_size, Type::Int, false),
+                &key,
+                caches_offset_cur,
+                field_size,
                 Type::Int,
                 false,
-                true,
+                false,
                 ArrayFlag::Unsigned,
-                0,
-            ),
-            field(
-                stable_field_index(mutate_offset, WORD, Type::Ref, false),
-                "mutate_version",
-                mutate_offset,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                ArrayFlag::Pointer,
-                1,
-            ),
-            field(
-                stable_field_index(mutate_lock_offset, WORD, Type::Ref, false),
-                "mutate_version_lock",
-                mutate_lock_offset,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                ArrayFlag::Pointer,
-                2,
-            ),
-        ];
+                index_in_parent,
+            ));
+            caches_offset_cur += field_size;
+            remaining -= field_size;
+            caches_word += 1;
+            index_in_parent += 1;
+        }
+        specs.push(field(
+            stable_field_index(mutate_offset, WORD, Type::Ref, false),
+            "mutate_version",
+            mutate_offset,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            index_in_parent,
+        ));
+        index_in_parent += 1;
+        specs.push(field(
+            stable_field_index(mutate_lock_offset, WORD, Type::Ref, false),
+            "mutate_version_lock",
+            mutate_lock_offset,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            index_in_parent,
+        ));
         let cache_key = majit_ir::descr::path_hash("celldict::ModuleDictStrategy");
         let type_id = pyre_object::celldict::module_dict_strategy_gc_type_id();
         // `gc_alloc_storage_box` (`gc_storage.rs`) lays `[GcHeader | T]` and
@@ -4873,8 +4909,17 @@ pub fn module_dict_version_descr() -> DescrRef {
     MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[0].clone() as DescrRef
 }
 
+fn module_dict_strategy_field_descr(field_key: &str) -> DescrRef {
+    MODULE_DICT_STRATEGY_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .find(|descr| descr.field_key() == field_key)
+        .unwrap_or_else(|| panic!("ModuleDictStrategy.{field_key}"))
+        .clone() as DescrRef
+}
+
 pub fn module_dict_mutate_version_descr() -> DescrRef {
-    MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[1].clone() as DescrRef
+    module_dict_strategy_field_descr("mutate_version")
 }
 
 // These headerless-map-node descrs deliberately retain `parent_descr = None`
@@ -12235,8 +12280,30 @@ mod tests {
                 pyre_object::celldict::ModuleDictStrategy,
             >()),
         );
+        let caches_size = core::mem::size_of::<
+            parking_lot::Mutex<Option<pyre_object::celldict::GlobalCacheRegistry>>,
+        >();
+        let caches_words = caches_size.div_ceil(WORD);
         assert_eq!(version_field.index_in_parent(), 0);
-        assert_eq!(mutate_field.index_in_parent(), 1);
+        let caches = &MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[1];
+        assert_eq!(caches.field_key(), "caches");
+        assert_eq!(
+            caches.offset(),
+            core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, caches),
+        );
+        assert_eq!(caches.field_type(), Type::Int);
+        assert_eq!(caches.index_in_parent(), 1);
+        assert_eq!(mutate_field.index_in_parent(), 1 + caches_words);
+        let mutate_lock = &MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[2 + caches_words];
+        assert_eq!(mutate_lock.field_key(), "mutate_version_lock");
+        assert_eq!(mutate_lock.index_in_parent(), 2 + caches_words);
+        for (i, descr) in MODULE_DICT_STRATEGY_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(descr.index_in_parent(), i, "{}", descr.field_key());
+        }
         assert_eq!(
             version.index(),
             stable_field_index(
@@ -15174,8 +15241,12 @@ fn mint_field(
         && let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
         && is_module_dict_strategy_struct(*struct_id)
     {
-        let canonical = &MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[1];
-        if *field_size == canonical.field_size() || *field_size == 2 * WORD {
+        if let Some(canonical) = MODULE_DICT_STRATEGY_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .find(|descr| descr.field_key() == "mutate_version")
+            && (*field_size == canonical.field_size() || *field_size == 2 * WORD)
+        {
             return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
         }
     }

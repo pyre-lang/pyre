@@ -6780,7 +6780,14 @@ fn build_class_inner(
     // run-sites) so a hot class-level loop can warm and compile.  The body's
     // NEWLOCALS bindings land in `body_ns`; that object's values are rooted by
     // the `debugdata.w_locals` walk in `walk_pyframe_roots`.
-    frame.run_with_jit()?;
+    // compiling.py `build_class`: `w_cell = frame.run()`.  When the body
+    // referenced `__class__`, `compile_class_body` returns that cell
+    // (`LoadClosure` `__class__`, `Copy 1`, `STORE_NAME` `__classcell__`,
+    // `RETURN_VALUE`); otherwise it returns None.  The post-metaclass
+    // check below uses this return value, not a later mapping lookup.
+    let w_cell = frame.run_with_jit()?;
+    let w_cell_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_cell);
 
     // A minor collection during the body (a hot class-level loop compiles
     // and runs through the JIT portal) can promote the namespace young ->
@@ -6812,68 +6819,6 @@ fn build_class_inner(
         )?;
     }
 
-    // type_new_classcell (typeobject.c) — capture the `__classcell__` cell
-    // so its content can be set to the new class below.  The `__class__` /
-    // `__classdict__` cells themselves never reach the namespace (the body
-    // writes through `setdictscope`, and their cells stay empty during the
-    // body), so a `__class__` key here is an explicit class-body assignment
-    // (e.g. a `__class__` property) that must survive into the class dict.
-    // `__classcell__` / `__classdictcell__` ARE real namespace entries the
-    // class body stores explicitly: a custom metaclass observes them
-    // (type.__new__ receives the full namespace) and `type.__new__`
-    // (type_new_classcell) consumes them, so they are dropped per
-    // construction path below rather than up front.
-    let classcell = crate::baseobjspace::finditem_str(
-        pyre_object::gc_roots::shadow_stack_get(w_namespace_root),
-        "__classcell__",
-    )?;
-    // Read the Option once. Later checks reload the word from the slot:
-    // metaclass construction collects before the cell is stored into.
-    let has_classcell = classcell.is_some();
-    let classcell_word = classcell.unwrap_or(pyre_object::PY_NULL);
-    let classcell_is_cell = has_classcell && unsafe { pyre_object::is_cell(classcell_word) };
-    if !has_metaclass && has_classcell && !classcell_is_cell {
-        return Err(crate::builtins::cell_slot_type_error(
-            "__classcell__",
-            classcell_word,
-        ));
-    }
-    // `_store_type_in_classcell` runs after metaclass / `w_type_new` /
-    // `__set_name__`, all of which collect. Pin the cell the way
-    // `__classdictcell__` is pinned below.
-    let classcell_slot = if has_classcell {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(classcell_word);
-        Some(slot)
-    } else {
-        None
-    };
-    let classcell_root = classcell_slot.filter(|_| classcell_is_cell);
-    // type_new_set_classdict: compiler-generated annotation functions and
-    // comprehensions capture `__classdict__` through this separate cell.
-    // type.__new__ consumes the namespace entry and replaces the cell's
-    // provisional body namespace with the completed type dict.
-    let classdictcell_root = {
-        let cell = crate::baseobjspace::finditem_str(
-            pyre_object::gc_roots::shadow_stack_get(w_namespace_root),
-            "__classdictcell__",
-        )?;
-        // `type_new_set_classdictcell` refuses a non-cell value; only the
-        // default shortcut has to spell it here, because a custom metaclass
-        // reaches `type.__new__` and is refused there.
-        if !has_metaclass && cell.is_some_and(|value| unsafe { !pyre_object::is_cell(value) }) {
-            return Err(crate::builtins::cell_slot_type_error(
-                "__classdictcell__",
-                cell.unwrap(),
-            ));
-        }
-        cell.filter(|value| unsafe { pyre_object::is_cell(*value) })
-            .map(|cell| {
-                let _ = pyre_object::gc_roots::pin_root(cell);
-                pyre_object::gc_roots::shadow_stack_len() - 1
-            })
-    };
-
     // Create W_TypeObject from the class namespace
     // PyPy: type.__new__(type, name, bases, dict_w) + compute_mro + ready()
     // PyPy: typeobject.py — if not bases_w: bases_w = [space.w_object]
@@ -6897,10 +6842,8 @@ fn build_class_inner(
     let w_effective_bases = pyre_object::gc_roots::pin_root(w_effective_bases);
     // A custom metaclass owns its bases until (and unless) it invokes
     // type.__new__; do not perform type's C3 validation before dispatch.
-    if !has_metaclass {
-        let w_effective_bases = pyre_object::gc_roots::shadow_stack_get(bases_root);
-        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
-    }
+    // The default path runs that check after `_store_type_in_classcell`
+    // (`typeobject.py _create_new_type`).
     // Create class via metaclass or default type()
     // PyPy: typeobject.py — metaclass(name, bases, dict_w) or type.__new__
     // Keep the default path's fresh managed namespace rooted until slot
@@ -6966,29 +6909,12 @@ fn build_class_inner(
         // type.__new__ must not be repaired or overwritten here.
         result
     } else {
-        // No metaclass observes the namespace on the default path, so
-        // consume the explicit class cells here (type_new_classcell leaves
-        // them out of the class `__dict__`); the captured `classcell` is
-        // bound to the new type below.
-        // typeobject.py `_store_type_in_classcell` validates the value before
-        // deleting it.  The default-metaclass shortcut bypasses
-        // `type.__new__`, so it must preserve that check here too.
-        if let Some(classcell_slot) = classcell_slot
-            && !classcell_is_cell
-        {
-            return Err(crate::builtins::cell_slot_type_error(
-                "__classcell__",
-                pyre_object::gc_roots::shadow_stack_get(classcell_slot),
-            ));
-        }
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classcell__") };
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_ns, "__classdictcell__") };
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-        crate::builtins::type_new_set_hash_if_eq(class_ns);
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-        crate::builtins::type_new_wrap_special_methods(class_ns);
+        // typeobject.py `_create_new_type`: `dict_w = {}` copied from
+        // `w_dict` first. `_store_type_in_classcell` then reads, validates,
+        // and `del`s `__classcell__` from that copy — the body namespace is
+        // left intact. `__classdictcell__` is consumed here because this
+        // shortcut never reaches `type.__new__`.
+        //
         // `PyDict_Copy(ctx->orig_dict)` — the class dict is the namespace as
         // the body left it, keys of every type included.  The clone carries
         // each key's cached hash across, where a per-key re-store would call
@@ -6999,13 +6925,61 @@ fn build_class_inner(
         let dict_root = pyre_object::gc_roots::shadow_stack_len();
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
         let _ = pyre_object::gc_roots::pin_root(dict_obj);
+        let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        let classcell = unsafe { pyre_object::w_dict_getitem_str(class_dict, "__classcell__") };
+        let classcell_is_cell =
+            classcell.is_some_and(|value| unsafe { pyre_object::is_cell(value) });
+        if let Some(value) = classcell
+            && !classcell_is_cell
+        {
+            return Err(crate::builtins::cell_slot_type_error(
+                "__classcell__",
+                value,
+            ));
+        }
+        let classcell_root = classcell.filter(|_| classcell_is_cell).map(|cell| {
+            let _ = pyre_object::gc_roots::pin_root(cell);
+            pyre_object::gc_roots::shadow_stack_len() - 1
+        });
+        let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        let classdictcell =
+            unsafe { pyre_object::w_dict_getitem_str(class_dict, "__classdictcell__") };
+        if let Some(value) = classdictcell
+            && unsafe { !pyre_object::is_cell(value) }
+        {
+            return Err(crate::builtins::cell_slot_type_error(
+                "__classdictcell__",
+                value,
+            ));
+        }
+        let classdictcell_root = classdictcell
+            .filter(|value| unsafe { pyre_object::is_cell(*value) })
+            .map(|cell| {
+                let _ = pyre_object::gc_roots::pin_root(cell);
+                pyre_object::gc_roots::shadow_stack_len() - 1
+            });
+        // `_store_type_in_classcell` deletes the key from `dict_w` after
+        // validating it. Drop both compiler cells from the copy.
+        let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_dict, "__classcell__") };
+        let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        unsafe { pyre_object::w_dict_delitem_str_no_proxy(class_dict, "__classdictcell__") };
+        let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        crate::builtins::type_new_set_hash_if_eq(class_dict);
+        let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        crate::builtins::type_new_wrap_special_methods(class_dict);
         // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
         // `RuntimeWarning` reported below; reading the keys answers it
         // without hashing any of them.
-        let class_ns = pyre_object::gc_roots::shadow_stack_get(w_namespace_root);
-        let has_non_string_key = unsafe { pyre_object::w_dict_items(class_ns) }
+        let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
+        let has_non_string_key = unsafe { pyre_object::w_dict_items(class_dict) }
             .iter()
             .any(|&(key, _)| !unsafe { pyre_object::is_str(key) });
+        // `_create_new_type` validates the cell before `W_TypeObject.__init__`
+        // (MRO / C3). Duplicate bases therefore lose to a non-cell
+        // `__classcell__`.
+        let w_effective_bases = pyre_object::gc_roots::shadow_stack_get(bases_root);
+        unsafe { crate::baseobjspace::validate_c3_mro(w_effective_bases, false)? };
         // Slot creation, C3 validation and `__set_name__` below all allocate
         // and can execute Python; the nascent type has no other referrer
         // until its mro is installed, so keep it rooted and reread it after
@@ -7017,6 +6991,14 @@ fn build_class_inner(
             pyre_object::gc_roots::shadow_stack_get(dict_root) as pyre_object::gc_hook::GCREF,
         );
         let _ = pyre_object::gc_roots::pin_root(w);
+        // typeobject.py `_store_type_in_classcell` after `allocate_instance`,
+        // before `W_TypeObject.__init__` / `ready` / `_set_names`.
+        if let Some(classcell_root) = classcell_root {
+            let classcell = pyre_object::gc_roots::shadow_stack_get(classcell_root);
+            unsafe {
+                pyre_object::w_cell_set(classcell, pyre_object::gc_roots::shadow_stack_get(w_root))
+            };
+        }
         // `w_type_new` is `malloc_fixedsize` (`incminimark.py`); a nursery-full
         // minor moves the namespace dict. `typeobject.py W_TypeObject.__init__`
         // consumes `__qualname__` off that dict. RPython's gctransform reloads
@@ -7134,59 +7116,57 @@ fn build_class_inner(
     let _ = pyre_object::gc_roots::pin_root(w_type);
     let w_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
 
-    // `_store_type_in_classcell` runs inside type.__new__, which the
-    // metaclass path reaches; the default path builds via raw
-    // `w_type_new`, so bind the cell here in its stead.  After a
-    // metaclass call, compiling.py:232-246 validates that the cell was
-    // propagated to type.__new__ and holds the class that came back:
-    //
-    //     if isinstance(w_cell, Cell) and isinstance(w_class, W_TypeObject):
-    //         if w_cell.empty():
-    //             raise oefmt(space.w_RuntimeError,
-    //                 "__class__ not set defining %S as %S. "
-    //                 "Was __classcell__ propagated to type.__new__?", ...)
-    //         else:
-    //             w_class_from_cell = w_cell.get()
-    //             if not space.is_w(w_class, w_class_from_cell):
-    //                 raise oefmt(space.w_TypeError,
-    //                     "__class__ set to %S defining %S as %S", ...)
-    if let Some(classcell_root) = classcell_root {
-        let classcell = pyre_object::gc_roots::shadow_stack_get(classcell_root);
-        if has_metaclass && unsafe { pyre_object::is_type(w_type()) } {
-            let cell_value = unsafe { pyre_object::w_cell_get(classcell) };
-            if cell_value.is_null() {
-                let class_str = unsafe { crate::py_str_wtf8(w_type()) }?;
-                return Err(PyError::runtime_error(crate::display::wtf8_format!(
-                    format!("__class__ not set defining {name} as "),
-                    class_str,
-                    ". Was __classcell__ propagated to type.__new__?",
-                )));
-            }
-            if !std::ptr::eq(cell_value, w_type()) {
-                let cell_str = unsafe { crate::py_str_wtf8(cell_value) }?;
-                let class_str = unsafe { crate::py_str_wtf8(w_type()) }?;
-                return Err(PyError::type_error(crate::display::wtf8_format!(
-                    "__class__ set to ",
-                    cell_str,
-                    format!(" defining {name} as "),
-                    class_str,
-                )));
-            }
-        } else {
-            unsafe { pyre_object::w_cell_set(classcell, w_type()) };
-        }
-    }
-
-    // The default path bound this before __set_name__; the metaclass path
-    // normally binds it inside type.__new__.  Retain this final validation/
-    // fallback for a custom metaclass returning a type without delegating.
-    if let Some(classdictcell_root) = classdictcell_root
+    // compiling.py `build_class` after `space.call_args(w_meta, args)`:
+    // `if isinstance(w_cell, Cell) and isinstance(w_class, W_TypeObject)`.
+    // `w_cell` is the body's return value. The default path is `w_meta = type`,
+    // so the check runs there too. A `__set_name__` that overwrites the cell
+    // is visible here because `_set_names` already ran.
+    let w_cell = pyre_object::gc_roots::shadow_stack_get(w_cell_slot);
+    if !w_cell.is_null()
+        && unsafe { pyre_object::is_cell(w_cell) }
         && unsafe { pyre_object::is_type(w_type()) }
     {
-        let classdictcell = pyre_object::gc_roots::shadow_stack_get(classdictcell_root);
-        let type_dict = unsafe { pyre_object::w_type_get_dict_ptr(w_type()) as PyObjectRef };
-        if !type_dict.is_null() {
-            unsafe { pyre_object::w_cell_set(classdictcell, type_dict) };
+        let cell_value = unsafe { pyre_object::w_cell_get(w_cell) };
+        // [3.15-spec] compiling.py `build_class` formats every operand with
+        // `%S` (`defining C as`). `bltinmodule.c builtin___build_class__`
+        // uses `%.200R` for the cell contents, the name object, and the
+        // class (`defining 'C' as`). Artefact: v3.15.1 `Python/bltinmodule.c`
+        // plus a 3.15.1t measurement.
+        if cell_value.is_null() {
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+            let name_repr = crate::builtins::py_repr_clipped_200(
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+            )?;
+            let class_repr = crate::builtins::py_repr_clipped_200(w_type())?;
+            return Err(PyError::runtime_error(crate::display::wtf8_format!(
+                "__class__ not set defining ",
+                name_repr,
+                " as ",
+                class_repr,
+                ". Was __classcell__ propagated to type.__new__?",
+            )));
+        }
+        if !std::ptr::eq(cell_value, w_type()) {
+            let cell_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cell_value);
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
+            let cell_repr = crate::builtins::py_repr_clipped_200(
+                pyre_object::gc_roots::shadow_stack_get(cell_slot),
+            )?;
+            let name_repr = crate::builtins::py_repr_clipped_200(
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+            )?;
+            let class_repr = crate::builtins::py_repr_clipped_200(w_type())?;
+            return Err(PyError::type_error(crate::display::wtf8_format!(
+                "__class__ set to ",
+                cell_repr,
+                " defining ",
+                name_repr,
+                " as ",
+                class_repr,
+            )));
         }
     }
 

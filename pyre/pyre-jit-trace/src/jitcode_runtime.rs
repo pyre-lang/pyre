@@ -329,15 +329,22 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
                 );
             }
             // Bind the rustc vtable slot the tracer loads (`FieldDescr.offset`
-            // of `method_{leaf}` on the matching `{vtable}`). Mirrors
+            // of `method_{leaf}` on the matching `{vtable}`). The identity
+            // segment names the trait whose vtable holds the slot. Mirrors
             // `CodeWriter.setup_indirectcalltargets` / `CallControl.graphs_from`
             // without a method-name list.
             let Some((impl_path, method)) = path.rsplit_once("::") else {
                 continue;
             };
+            let (owner_path, identity_trait) = ict_split_impl_identity(impl_path);
             for impl_entry in impls {
-                if !ict_impl_path_matches(impl_path, impl_entry.impl_key) {
+                if !ict_impl_path_matches(owner_path, impl_entry.impl_key) {
                     continue;
+                }
+                if let Some(t) = identity_trait {
+                    if t != impl_entry.trait_leaf {
+                        continue;
+                    }
                 }
                 let Some(offset) =
                     slot_offsets
@@ -371,6 +378,31 @@ fn ict_impl_path_matches(impl_path: &str, impl_key: &str) -> bool {
     impl_path == impl_key
         || impl_path.ends_with(&format!("::{impl_key}"))
         || impl_key.ends_with(&format!("::{impl_path}"))
+}
+
+fn ict_split_impl_identity(impl_path: &str) -> (&str, Option<&str>) {
+    if !impl_path.ends_with('>') {
+        return (impl_path, None);
+    }
+    let (owner_path, after_impl) = if let Some(idx) = impl_path.rfind("::<impl ") {
+        (&impl_path[..idx], &impl_path[idx + "::<impl ".len()..])
+    } else if impl_path.starts_with("<impl ") {
+        ("", &impl_path["<impl ".len()..])
+    } else {
+        return (impl_path, None);
+    };
+    let Some(identity) = after_impl.strip_suffix('>') else {
+        return (impl_path, None);
+    };
+    let without_generics = identity
+        .split_once('<')
+        .map(|(head, _)| head)
+        .unwrap_or(identity);
+    let trait_leaf = without_generics
+        .rsplit_once("::")
+        .map(|(_, leaf)| leaf)
+        .unwrap_or(without_generics);
+    (owner_path, Some(trait_leaf))
 }
 
 fn ict_insert_fnaddr(
@@ -4525,6 +4557,27 @@ mod tests {
             "patched fnaddr / path / vtable slot of one graph is one jitcode: {by_fnaddr:?}"
         );
         assert!(declined.is_empty());
+    }
+
+    #[test]
+    fn ict_split_impl_identity_parses_plain_and_identity_paths() {
+        assert_eq!(
+            ict_split_impl_identity("crate::IntDictStrategy"),
+            ("crate::IntDictStrategy", None)
+        );
+        assert_eq!(
+            ict_split_impl_identity(
+                "pyre_object::dictmultiobject::IntDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy>"
+            ),
+            (
+                "pyre_object::dictmultiobject::IntDictStrategy",
+                Some("DictStrategy")
+            )
+        );
+        assert_eq!(
+            ict_split_impl_identity("<impl a::b::Store<x::Owner>>"),
+            ("", Some("Store"))
+        );
     }
 
     #[test]
