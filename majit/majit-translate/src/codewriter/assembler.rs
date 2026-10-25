@@ -4904,11 +4904,63 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
         .unwrap_or(BhFieldLookup::Missing)
 }
 
+/// One step of the `fielddescrof` mint. `Layout` still has the
+/// `transparent_scalar_field` sub-arm at the mint; this enum is only the
+/// lookup order.
+enum FieldLayoutResolution {
+    Parent(crate::jitcode::BhFieldSpec),
+    Layout(crate::codewriter::call::StructFieldLayout),
+    Heuristic {
+        offset: usize,
+        size: usize,
+        field_type: majit_ir::value::Type,
+        flag: majit_ir::descr::ArrayFlag,
+        signed: bool,
+    },
+    ScalarWord(crate::model::ScalarFieldWord),
+    Unresolved,
+}
+
+/// Resolution order of the `fielddescrof` mint: `bh_field_lookup` (Parent /
+/// Layout), then `heuristic_field_layout`, then `scalar_word`.
+/// `require_mutate_field_resolved` panics only on `Unresolved`.
+/// `descr.py get_field_descr` / `getattr(STRUCT, fieldname)` raise only
+/// when the field does not exist.
+fn resolve_field_layout(
+    cc: &CallControl,
+    field: &crate::model::FieldDescriptor,
+) -> FieldLayoutResolution {
+    match bh_field_lookup(cc, field) {
+        BhFieldLookup::Parent(spec) => FieldLayoutResolution::Parent(spec),
+        BhFieldLookup::Layout(row) => FieldLayoutResolution::Layout(row),
+        BhFieldLookup::Missing => {
+            if let Some(owner) = canonical_field_owner(field)
+                && let Some((offset, size, field_type, flag, signed)) =
+                    heuristic_field_layout(cc, &owner, &field.name)
+            {
+                FieldLayoutResolution::Heuristic {
+                    offset,
+                    size,
+                    field_type,
+                    flag,
+                    signed,
+                }
+            } else if let Some(word) = field.scalar_word {
+                FieldLayoutResolution::ScalarWord(word)
+            } else {
+                FieldLayoutResolution::Unresolved
+            }
+        }
+    }
+}
+
 /// `cpu.fielddescrof(STRUCT, get_mutate_field_name(name))` raises at
 /// translation when the hidden field `rclass.py InstanceRepr._setup_repr`
 /// synthesizes as `mutate_<name>` is absent. Ordinary field `Missing`
 /// still mints offset 0; only a mutate operand of
 /// `record_quasiimmut_field` / `jit_force_quasi_immutable` is required.
+///
+/// Uses `resolve_field_layout`, the same order `fielddescrof` mints with.
 fn require_mutate_field_resolved(
     callcontrol: Option<&CallControl>,
     mutate_field: &crate::model::FieldDescriptor,
@@ -4918,7 +4970,10 @@ fn require_mutate_field_resolved(
     let Some(cc) = callcontrol else {
         return;
     };
-    if !matches!(bh_field_lookup(cc, mutate_field), BhFieldLookup::Missing) {
+    if !matches!(
+        resolve_field_layout(cc, mutate_field),
+        FieldLayoutResolution::Unresolved
+    ) {
         return;
     }
     let owner = mutate_field.owner_root.as_deref().unwrap_or("<unknown>");
@@ -5709,7 +5764,6 @@ fn fielddescrof(
     };
 
     let canonical_owner = canonical_field_owner(field);
-    let mut layout_resolved = false;
     if let (Some(cc), Some(owner)) = (callcontrol, canonical_owner.as_deref()) {
         parent = bh_size_spec_from_callcontrol(cc, owner);
         // RPython `descr.py` keys both the SizeDescr and
@@ -5735,10 +5789,15 @@ fn fielddescrof(
                 majit_ir::descr::path_hash_for_gc_kind(owner, false)
             };
         }
-        let field_lookup = bh_field_lookup(cc, field);
-        let mut found_parent_field = matches!(field_lookup, BhFieldLookup::Parent(_));
-        match field_lookup {
-            BhFieldLookup::Parent(spec) => {
+        // `resolve_field_layout` is the same order `require_mutate_field_resolved`
+        // judges: `bh_field_lookup` (Parent / Layout), then
+        // `heuristic_field_layout`, then `scalar_word`. The Layout arm still
+        // runs `transparent_scalar_field` here so a one-word newtype stays a
+        // leaf load.
+        let resolution = resolve_field_layout(cc, field);
+        let mut found_parent_field = matches!(resolution, FieldLayoutResolution::Parent(_));
+        match resolution {
+            FieldLayoutResolution::Parent(spec) => {
                 offset = spec.offset;
                 field_size = spec.field_size;
                 field_type = spec.field_type;
@@ -5748,9 +5807,8 @@ fn fielddescrof(
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = Some(spec.index_in_parent);
                 load_is_acquire = spec.load_is_acquire;
-                layout_resolved = true;
             }
-            BhFieldLookup::Layout(layout_field) => {
+            FieldLayoutResolution::Layout(layout_field) => {
                 if layout_field.flag == majit_ir::descr::ArrayFlag::Struct
                     && field_type != majit_ir::value::Type::Ref
                     && let Some(spec) = parent.as_ref().and_then(|parent| {
@@ -5781,41 +5839,37 @@ fn fielddescrof(
                     is_immutable = layout_field.is_immutable();
                     is_quasi_immutable = layout_field.is_quasi_immutable();
                 }
-                layout_resolved = true;
             }
-            BhFieldLookup::Missing => {
-                if let Some((
-                    computed_offset,
-                    computed_size,
-                    computed_type,
-                    computed_flag,
-                    computed_signed,
-                )) = heuristic_field_layout(cc, owner, &field.name)
-                {
-                    offset = computed_offset;
-                    field_size = computed_size;
-                    field_type = computed_type;
-                    field_flag = computed_flag;
-                    is_field_signed = computed_signed;
-                    layout_resolved = true;
-                }
+            FieldLayoutResolution::Heuristic {
+                offset: computed_offset,
+                size: computed_size,
+                field_type: computed_type,
+                flag: computed_flag,
+                signed: computed_signed,
+            } => {
+                offset = computed_offset;
+                field_size = computed_size;
+                field_type = computed_type;
+                field_flag = computed_flag;
+                is_field_signed = computed_signed;
             }
-        }
-        // An opaque dependency struct has a layout and no field list, so
-        // the name lookup misses. The front records that scalar's byte
-        // offset on the descriptor. A parent, layout, or heuristic hit
-        // already named the slot and keeps its own offset. Apply the word
-        // before `unique_slot_at_offset` so the slot follows the offset
-        // that is actually emitted.
-        if !layout_resolved && let Some(word) = field.scalar_word {
-            apply_scalar_field_word(
-                word,
-                &mut offset,
-                &mut field_size,
-                &mut field_type,
-                &mut field_flag,
-                &mut is_field_signed,
-            );
+            FieldLayoutResolution::ScalarWord(word) => {
+                // An opaque dependency struct has a layout and no field list, so
+                // the name lookup misses. The front records that scalar's byte
+                // offset on the descriptor. A parent, layout, or heuristic hit
+                // already named the slot and keeps its own offset. Apply the word
+                // before `unique_slot_at_offset` so the slot follows the offset
+                // that is actually emitted.
+                apply_scalar_field_word(
+                    word,
+                    &mut offset,
+                    &mut field_size,
+                    &mut field_type,
+                    &mut field_flag,
+                    &mut is_field_signed,
+                );
+            }
+            FieldLayoutResolution::Unresolved => {}
         }
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
             is_immutable = rank.is_immutable();
@@ -9771,6 +9825,48 @@ mod tests {
     }
 
     const QUASIIMMUT_CELL_OWNER: &str = "assembler_quasiimmut_mutate_layout_test::Cell";
+    const QUASIIMMUT_EMBEDDED_OWNER: &str = "assembler_quasiimmut_mutate_layout_test::EmbeddedCell";
+    const QUASIIMMUT_MUTATE_STRUCT: &str = "assembler_quasiimmut_mutate_layout_test::MutateValue";
+    const QUASIIMMUT_WATCHER_OWNER: &str = "assembler_quasiimmut_mutate_layout_test::SizeOwner";
+
+    fn assemble_quasiimmut_field_read(
+        owner: &str,
+        field_name: &str,
+        mut cc: crate::call::CallControl,
+    ) -> Assembler {
+        use crate::flatten::flatten_graph;
+        use crate::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("read_cell");
+        let base_var = push_input_var(&mut graph, "cell", ValueType::Ref(None));
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new(field_name, Some(owner.to_string())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut rewritten = transformer.transform(&graph).graph;
+
+        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, crate::model::ConcreteType::Signed);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
+        let mut flat = flatten_graph(&rewritten, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        asm
+    }
 
     /// Assemble a quasi-immut `value` read. `include_mutate` registers the
     /// hidden `mutate_value` field `rclass.py InstanceRepr._setup_repr`
@@ -9778,9 +9874,7 @@ mod tests {
     /// raises on.
     fn assemble_record_quasiimmut_cell(include_mutate: bool) -> Assembler {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
-        use crate::flatten::flatten_graph;
-        use crate::jtransform::{GraphTransformConfig, Transformer};
-        use crate::model::{FieldDescriptor, FunctionGraph, ImmutableRank, OpKind, ValueType};
+        use crate::model::ImmutableRank;
 
         let owner = QUASIIMMUT_CELL_OWNER;
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
@@ -9827,35 +9921,7 @@ mod tests {
                 ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
-
-        let mut graph = FunctionGraph::new("read_cell");
-        let base_var = push_input_var(&mut graph, "cell", ValueType::Ref(None));
-        let result_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::FieldRead {
-                    base: base_var.clone(),
-                    field: FieldDescriptor::new("value", Some(owner.to_string())),
-                    ty: ValueType::Int,
-                    pure: false,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(graph.startblock, Some(result_var.clone()));
-
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
-        let mut rewritten = transformer.transform(&graph).graph;
-
-        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::GcRef);
-        FunctionGraph::set_concretetype_of_inline(&result_var, crate::model::ConcreteType::Signed);
-        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
-        let mut regallocs = regalloc::perform_all_register_allocations(&rewritten);
-        let mut flat = flatten_graph(&rewritten, &mut regallocs);
-        let mut asm = Assembler::new();
-        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
-        asm
+        assemble_quasiimmut_field_read(owner, "value", cc)
     }
 
     /// `OpKind::RecordQuasiImmutField` must lower to a single opcode
@@ -9919,6 +9985,157 @@ mod tests {
     )]
     fn record_quasiimmut_field_missing_mutate_field_fails_translation() {
         let _ = assemble_record_quasiimmut_cell(false);
+    }
+
+    /// Owner known only through `struct_field_entries`, with an embedded
+    /// `mutate_value` whose layout is registered separately. The parent's
+    /// flattened descrs hold `mutate_value.ptr` / `mutate_value.lock`, so
+    /// `bh_field_lookup` misses and `heuristic_field_layout` supplies the
+    /// offset. `descr.py get_field_descr` / `getattr(STRUCT, fieldname)`
+    /// succeed when that field exists.
+    #[test]
+    fn record_quasiimmut_field_assembles_when_heuristic_resolves_embedded_mutate() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let owner = QUASIIMMUT_EMBEDDED_OWNER;
+        let embedded = QUASIIMMUT_MUTATE_STRUCT;
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let embedded_id = majit_ir::descr::StructId::from_canonical(embedded);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (embedded.to_string(), Some(embedded_id)),
+            ]));
+
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("value".to_string(), "i64".to_string()),
+                ("mutate_value".to_string(), embedded.to_string()),
+            ],
+        );
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(struct_fields);
+        cc.set_known_struct_names([embedded.to_string()].into_iter().collect());
+        cc.immutable_fields_by_struct.insert(
+            owner.to_string(),
+            vec![("value".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+        cc.set_struct_layout(
+            embedded_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "ptr".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "lock".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mutate_field = FieldDescriptor::new("mutate_value", Some(owner.to_string()));
+        assert!(
+            matches!(bh_field_lookup(&cc, &mutate_field), BhFieldLookup::Missing),
+            "counterexample requires bh_field_lookup to miss mutate_value"
+        );
+        let parent = bh_size_spec_from_callcontrol(&cc, owner)
+            .expect("textual field entries must still produce a parent size spec");
+        let parent_keys: Vec<&str> = parent
+            .all_fielddescrs
+            .iter()
+            .map(|spec| spec.field_key())
+            .collect();
+        assert!(
+            parent_keys.contains(&"mutate_value.ptr") && parent_keys.contains(&"mutate_value.lock"),
+            "flattened parent descrs must hold mutate_value.ptr / .lock, got {parent_keys:?}"
+        );
+        assert!(
+            !parent_keys.iter().any(|key| *key == "mutate_value"),
+            "flattened parent descrs must not hold a mutate_value row, got {parent_keys:?}"
+        );
+        let (heuristic_offset, ..) = heuristic_field_layout(&cc, owner, "mutate_value")
+            .expect("heuristic_field_layout must find the embedded mutate_value row");
+        assert_ne!(heuristic_offset, 0);
+
+        let asm = assemble_quasiimmut_field_read(owner, "value", cc);
+        assert!(
+            asm.insns.contains_key("record_quasiimmut_field/rdd"),
+            "expected key record_quasiimmut_field/rdd, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let mutate_offsets: Vec<usize> = asm
+            .snapshot_descrs()
+            .into_iter()
+            .filter_map(|descr| match descr {
+                crate::jitcode::BhDescr::Field {
+                    name,
+                    owner,
+                    offset,
+                    ..
+                } if owner == QUASIIMMUT_EMBEDDED_OWNER && name == "mutate_value" => Some(offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            mutate_offsets,
+            vec![heuristic_offset],
+            "mutate descr must carry the heuristic offset, not 0"
+        );
+    }
+
+    /// Watcher listed under another name (`size_watchers`) while the
+    /// codewriter asks for `mutate_size`. `getattr(STRUCT, fieldname)`
+    /// raises; the mutate check must still fail translation.
+    #[test]
+    #[should_panic(
+        expected = "the hidden field must be named mutate_<name> (rclass.py InstanceRepr._setup_repr)"
+    )]
+    fn record_quasiimmut_field_wrong_watcher_name_fails_translation() {
+        use crate::call::CallControl;
+        use crate::model::ImmutableRank;
+
+        let owner = QUASIIMMUT_WATCHER_OWNER;
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("size".to_string(), "i64".to_string()),
+                ("size_watchers".to_string(), "*mut u8".to_string()),
+            ],
+        );
+        let mut cc = CallControl::new();
+        cc.set_struct_fields(struct_fields);
+        cc.immutable_fields_by_struct.insert(
+            owner.to_string(),
+            vec![("size".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+        let _ = assemble_quasiimmut_field_read(owner, "size", cc);
     }
 
     /// `OpKind::JitForceQuasiImmutable` must lower to a single opcode
