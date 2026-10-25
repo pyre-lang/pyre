@@ -8009,7 +8009,7 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(Vec::new())
     }
 
-    /// `jtransform.py rewrite_op_jit_force_quasi_immutable`:
+    /// `jtransform.py Transformer.rewrite_op_jit_force_quasi_immutable`:
     ///
     /// ```text
     /// v_inst, c_fieldname = op.args
@@ -8018,7 +8018,9 @@ impl<'a> Transformer<'a> {
     ///         SpaceOperation('jit_force_quasi_immutable', [v_inst, descr1], None)]
     /// ```
     ///
-    /// The owner is the method's impl type standing in for `v_inst.concretetype.TO`.
+    /// Owner is `v_inst.concretetype.TO` (`fielddescrof(STRUCT, field)`),
+    /// mapped to the `FieldDescriptor.owner_root` leaf `resolve_adt_field`
+    /// uses. A non-STRUCT TO panics the same way upstream `.TO` would.
     fn rewrite_op_jit_force_quasi_immutable(
         &mut self,
         target: &CallTarget,
@@ -8036,8 +8038,16 @@ impl<'a> Transformer<'a> {
             .unwrap_or_else(|| {
                 panic!("jit_force_quasi_immutable fieldname is not a constant: {target}")
             });
-        let owner = jit_force_quasi_immutable_struct_owner(target)
-            .unwrap_or_else(|| panic!("jit_force_quasi_immutable: no impl type on {target}"));
+        let inst_ct = match &v_inst {
+            crate::model::LinkArg::Value(var) => var.concretetype(),
+            crate::model::LinkArg::Const(c) => c.concretetype.clone(),
+        };
+        let owner = ptr_struct_owner_root(inst_ct.as_ref()).unwrap_or_else(|| {
+            panic!(
+                "jit_force_quasi_immutable: v_inst has no STRUCT concretetype: \
+                 graph={graph_name} target={target} ct={inst_ct:?}"
+            )
+        });
         let mutate_field = FieldDescriptor::new(fieldname, Some(owner));
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -16788,28 +16798,29 @@ pub(crate) fn is_jit_force_quasi_immutable_target(
     callcontrol.callee_llop(target).as_deref() == Some("jit_force_quasi_immutable")
 }
 
-/// STRUCT for `fielddescrof(STRUCT, c_fieldname.value)`: the method's impl type.
-fn jit_force_quasi_immutable_struct_owner(target: &CallTarget) -> Option<String> {
-    match target {
-        CallTarget::FunctionPath { segments, .. } if segments.len() >= 2 => {
-            Some(crate::parse::canonical_leaf(&segments[segments.len() - 2]).to_string())
-        }
-        CallTarget::Method {
-            resolved_path,
-            receiver_root,
-            ..
-        } => {
-            if let Some(path) = resolved_path {
-                let prefix = path.impl_type_prefix();
-                let leaf = crate::parse::canonical_leaf(&prefix);
-                if !leaf.is_empty() {
-                    return Some(leaf.to_string());
-                }
-            }
-            receiver_root.clone()
-        }
-        _ => None,
-    }
+/// STRUCT `_name` of `v_inst.concretetype.TO` for
+/// `jtransform.py Transformer.rewrite_op_jit_force_quasi_immutable`
+/// `fielddescrof(v_inst.concretetype.TO, c_fieldname.value)`.
+///
+/// `stroruni_first_arg_kind` resolves `ForwardReference` the same way.
+/// The leaf is the `FieldDescriptor.owner_root` spelling
+/// `resolve_adt_field` uses (`name_path.rsplit("::")`).
+fn ptr_struct_owner_root(
+    ct: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let Some(LowLevelType::Ptr(ptr)) = ct else {
+        return None;
+    };
+    let name = match &ptr.TO {
+        PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(LowLevelType::Struct(s)) => s._name.clone(),
+            _ => return None,
+        },
+        PtrTarget::Struct(s) => s._name.clone(),
+        _ => return None,
+    };
+    Some(name.rsplit("::").next().unwrap_or("").to_string())
 }
 
 /// `c_fieldname` is always a Constant upstream. After `fold_str_consts`,
@@ -26209,6 +26220,15 @@ mod tests {
             .transform(graph)
     }
 
+    fn qi_ptr_struct(name: &str) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc(name, vec![])),
+        }))
+    }
+
     #[test]
     fn is_jit_force_quasi_immutable_target_matches_method_and_function_path() {
         let mut cc = crate::call::CallControl::new();
@@ -26286,15 +26306,6 @@ mod tests {
                 "jit_force_quasi_immutable"
             ])
         ));
-        assert_eq!(
-            jit_force_quasi_immutable_struct_owner(&CallTarget::function_path([
-                "celldict",
-                "ModuleDictStrategy",
-                "jit_force_quasi_immutable"
-            ]))
-            .as_deref(),
-            Some("ModuleDictStrategy")
-        );
     }
 
     #[test]
@@ -26303,6 +26314,7 @@ mod tests {
 
         let mut graph = FunctionGraph::new("set_code");
         let inst = graph.alloc_value_var();
+        inst.set_concretetype(Some(qi_ptr_struct("function::Function")));
         graph.push_inputarg_var(graph.startblock, inst.clone());
         let path = crate::parse::CallPath::for_impl_method(
             "function::Function",
@@ -26361,6 +26373,7 @@ mod tests {
 
         let mut graph = FunctionGraph::new("mutated");
         let inst = graph.alloc_value_var();
+        inst.set_concretetype(Some(qi_ptr_struct("celldict::ModuleDictStrategy")));
         graph.push_inputarg_var(graph.startblock, inst.clone());
         let path = crate::parse::CallPath::for_impl_method(
             "celldict::ModuleDictStrategy",
@@ -26474,7 +26487,10 @@ mod tests {
         use crate::flowspace::model::{ConstValue, Constant};
 
         let mut graph = FunctionGraph::new("set_code_prebuilt");
-        let inst = LinkArg::Const(Constant::new(ConstValue::None));
+        let inst = LinkArg::Const(Constant::with_concretetype(
+            ConstValue::None,
+            qi_ptr_struct("function::Function"),
+        ));
         let path = crate::parse::CallPath::for_impl_method(
             "function::Function",
             "jit_force_quasi_immutable",
@@ -26525,6 +26541,98 @@ mod tests {
             !ops.iter().any(|o| matches!(o, OpKind::Call { .. })),
             "call must be rewritten, got {ops:?}"
         );
+    }
+
+    #[test]
+    fn rewrite_op_jit_force_quasi_immutable_owner_comes_from_v_inst_to() {
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let mut graph = FunctionGraph::new("force_on_other");
+        let inst = graph.alloc_value_var();
+        inst.set_concretetype(Some(qi_ptr_struct("OtherStruct")));
+        graph.push_inputarg_var(graph.startblock, inst.clone());
+        let path = crate::parse::CallPath::for_impl_method(
+            "function::Function",
+            "jit_force_quasi_immutable",
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("Function".to_string()),
+                    resolved_path: Some(path.clone()),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: vec![
+                    LinkArg::from(inst.clone()),
+                    LinkArg::Const(Constant::new(ConstValue::byte_str("mutate_code"))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_with_qi_llop(&graph, path);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live))
+            .expect("Live marker present");
+        assert!(
+            matches!(
+                ops[live_idx + 1],
+                OpKind::JitForceQuasiImmutable { mutate_field, .. }
+                    if mutate_field.name == "mutate_code"
+                        && mutate_field.owner_root.as_deref() == Some("OtherStruct")
+            ),
+            "owner must be v_inst.concretetype.TO, got {ops:?}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no STRUCT concretetype")]
+    fn rewrite_op_jit_force_quasi_immutable_opaque_v_inst_panics() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+
+        let mut graph = FunctionGraph::new("opaque_force");
+        let inst = graph.alloc_value_var();
+        inst.set_concretetype(Some(GCREF.clone()));
+        graph.push_inputarg_var(graph.startblock, inst.clone());
+        let path = crate::parse::CallPath::for_impl_method(
+            "function::Function",
+            "jit_force_quasi_immutable",
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("Function".to_string()),
+                    resolved_path: Some(path.clone()),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: vec![
+                    LinkArg::from(inst.clone()),
+                    LinkArg::Const(Constant::new(ConstValue::byte_str("mutate_code"))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let _ = transform_with_qi_llop(&graph, path);
     }
 
     #[test]
